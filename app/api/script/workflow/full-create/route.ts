@@ -1,26 +1,108 @@
 import { NextRequest } from 'next/server';
-import { jsonOk } from '@/lib/api-helpers';
+import { getCurrentUser } from '@/lib/auth';
+import { sseResponse } from '@/lib/sse';
+import { chatStream, chatComplete, parseJsonLoose } from '@/lib/llm';
+import {
+  buildFullCreateMessages,
+  buildStyleBibleMessages,
+  buildRetagMessages,
+} from '@/lib/prompts';
+import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { getJson } from '@/lib/kv-db';
 
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+/**
+ * 一句话 → 完整剧本（跳过老问路径）。
+ * 流程同 consult/confirm，只是入口直接给一句话。
+ * 为了和原站接口契约对齐，本路由也走 SSE。
+ */
 export async function POST(req: NextRequest) {
-  const body = await req.json().catch(() => ({}));
-  const idea = body.oneSentence || body.idea || '一段示例创意';
-  return jsonOk({
-    title: '示例剧本：' + idea.slice(0, 24),
-    script: `# ${idea}\n\n[场景一] 清晨的城市天台。\n主角仰望天空，独白：\n"如果今天是最后一天，我想做点不一样的事。"\n\n[场景二] 镜头切换到地铁站，主角穿过人群，与各色路人擦肩而过。\n旁白：\n"每个人都在赶路，但谁在等我？"\n\n[场景三] 黄昏，主角站在桥上，远处霓虹亮起。\n微笑：\n"也许，明天会更好。"\n`,
-    styleBible: {
-      vision: '电影感、低饱和、暖色调',
-      narrative: '内心独白驱动，节奏舒缓',
-      camera: '手持轻微晃动 + 中近景特写',
-      mood: '怀旧、希望、温柔',
-      promptHabits: '中英混排，风格关键词靠前',
-    },
-    emotions: [
-      { time: '0:00-0:08', label: '低落', intensity: 0.4 },
-      { time: '0:08-0:18', label: '平静', intensity: 0.5 },
-      { time: '0:18-0:30', label: '希望', intensity: 0.8 },
-    ],
-    tokens: 1200,
+  const user = await getCurrentUser(req);
+  if (!user) return new Response(JSON.stringify({ detail: 'unauthorized' }), { status: 401 });
+
+  const body = await req.json().catch(() => ({} as any));
+  const projectId: string | undefined = body.projectId;
+  const oneSentence: string = (body.oneSentence || body.idea || body.text || '').toString();
+  const durationSec: number | undefined = body.durationSec || body.targetDurationSec;
+  const audience: string | undefined = body.audience;
+
+  return sseResponse(async (writer) => {
+    writer.step('正在生成剧本…');
+    const persona = user ? (getJson('user_profiles', user.id, null) as any) : null;
+    const proj = projectId ? getProjectByIdForUser(projectId, user.id) : null;
+    const finalSentence = oneSentence || (proj as any)?.oneSentence || '';
+
+    if (!finalSentence) {
+      writer.error('请先填写一句话创意');
+      return;
+    }
+
+    let scriptText = '';
+    const messages = buildFullCreateMessages({
+      oneSentence: finalSentence,
+      durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
+      audience,
+      creatorPersona: persona,
+    });
+    await chatStream(user, messages, { temperature: 0.8, maxTokens: 3000 }, (delta) => {
+      scriptText += delta;
+      writer.chunk(delta);
+    });
+
+    writer.step('正在提取风格圣经…');
+    let styleBible: any = null;
+    try {
+      const sbRaw = await chatComplete(user, buildStyleBibleMessages(scriptText), {
+        temperature: 0.4,
+        responseFormat: 'json_object',
+        maxTokens: 800,
+      });
+      styleBible = parseJsonLoose(sbRaw);
+    } catch (e: any) {
+      console.warn('[full-create] styleBible failed:', e?.message);
+      styleBible = { vision: '', colorPalette: '', fashion: '', mood: '', cameraStyle: '', worldRules: '' };
+    }
+
+    writer.step('正在打情绪标签…');
+    let emotions: any[] = [];
+    try {
+      const emoRaw = await chatComplete(
+        user,
+        buildRetagMessages(scriptText, durationSec || (proj as any)?.scriptTargetDurationSec),
+        { temperature: 0.4, responseFormat: 'json_object', maxTokens: 800 },
+      );
+      const emoJson = parseJsonLoose<{ emotions: any[] }>(emoRaw);
+      emotions = Array.isArray(emoJson?.emotions) ? emoJson.emotions : [];
+    } catch (e: any) {
+      console.warn('[full-create] emotions failed:', e?.message);
+    }
+
+    if (projectId && proj) {
+      updateProjectForUser(projectId, user.id, {
+        oneSentence: finalSentence,
+        scriptDraft: scriptText,
+        script: scriptText,
+        styleBible,
+        emotions,
+        scriptApproved: false,
+        scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
+        currentStep: 1,
+      });
+    }
+
+    writer.done({
+      script: scriptText,
+      styleBible,
+      emotions,
+      title: extractTitle(scriptText, finalSentence),
+    });
   });
+}
+
+function extractTitle(script: string, fallback: string): string {
+  const firstLine = (script || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
+  if (firstLine.length > 0 && firstLine.length <= 40) return firstLine.replace(/^#+\s*/, '');
+  return (fallback || '未命名项目').slice(0, 40);
 }

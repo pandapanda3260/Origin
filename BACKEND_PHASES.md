@@ -3,7 +3,7 @@
 | 阶段 | 范围 | 状态 | 是否需要 API Key |
 | --- | --- | --- | --- |
 | **一** | 用户系统 + 项目持久化 + 设置/创作偏好保存 | ✅ **已完成** | 不需要 |
-| 二 | AI 剧本生成 + 资产抽取 + 镜头设计 + 视频提示词 | ⏳ 待做 | 需要 1 个 LLM Key（OpenAI / DeepSeek 任选） |
+| **二** | AI 剧本生成 + 资产抽取 + 镜头设计 + 视频提示词 + Agent 对话 | ✅ **已完成** | 需要 1 个 LLM Key（OpenAI / DeepSeek 任选） |
 | 三 | AI 角色参考图 + 分镜图 | ⏳ 待做 | 需要图像生成 Key（nano-banana / 即梦 / SD） |
 | 四 | AI 视频生成 + 智能剪辑（FFmpeg） | ⏳ 待做 | 需要视频模型 Key（Seedance / 可灵） |
 | 五 | 套餐积分 + 真支付（微信/支付宝/Stripe） + 管理面板真数据 | ⏳ 待做 | 看是否真接支付 |
@@ -54,28 +54,84 @@
 
 ---
 
-## 阶段二预告：AI 剧本生成
+## 阶段二已交付（你现在能用的）
 
-下一步要做的事：
+### 真 AI 剧本生成
 
-1. 在 `lib/llm.ts` 里写一个统一的 LLM 调用封装：
-   - 根据用户设置（settings 表里存的 provider/baseUrl/apiKey/model），自动选用 OpenAI 兼容、DeepSeek、智谱、Claude 等
-2. 重写 `app/api/script/workflow/full-create`：拼提示词 → 调 LLM → 流式或一次性返回剧本
-3. 重写 `app/api/script/workflow/expand` / `continue` / `extract-style-bible` 同理
-4. 重写 `app/api/assets/extract`、`/api/shots/generate`、`/api/video-prompt/generate`：都是结构化输出，调 LLM 让它返回 JSON
-5. 在 `app/api/agent/chat` 里实现 Creative Agent 真对话（对当前项目做局部修改 patch）
+- **多轮顾问对话**（`/api/script/workflow/consult/turn`）：SSE 流式，AI 询问意图/人群/时长，给到 [READY] 大纲
+- **从大纲生成完整剧本**（`/api/script/workflow/consult/confirm`）：流式生成剧本 → 提取风格圣经 → 打情绪标签
+- **一句话直接出剧本**（`/api/script/workflow/full-create`）：跳过老问，直接生成五段式剧本
+- **扩充剧本** / **续写剧本**：`/expand` 和 `/continue`
+- **重新提取风格圣经**：`/extract-style-bible`
+- **重新打情绪标签**：`/retag-emotions`
+- **确认剧本进入资产**：`/confirm`
 
-### 进入阶段二之前你需要准备
+### 真 AI 资产抽取
 
-选一个就行，告诉我你选哪个我就按那个写：
+- **抽取角色/场景/道具**（`/api/assets/extract`）：SSE 流式，按用户业务逻辑结构化输出
+  - 角色字段：`name / intro / detail / temperament / actionTraits / tags`
+  - 场景字段：`name / description / isMain / baseSceneRef / tags`（区分主场景/区域场景）
+  - 道具字段：`propType / function / ownership / features`（含关联角色 id）
+- **重建资产参考图提示词**：`/api/assets/rebuild-prompt`
+- **角色装备变化检测**：`/api/assets/check-equipment-change`
 
-- **A. OpenAI**（贵但好用）：去 https://platform.openai.com 充值后拿到 `sk-...` 开头的 key
-- **B. DeepSeek**（便宜，国内能直连）：去 https://platform.deepseek.com 注册拿 key
-- **C. 智谱 AI**（国内合规）：去 https://bigmodel.cn 注册拿 key
-- **D. 国内 OpenAI 中转商**：你自己挑一家，我会按 OpenAI 协议调
-- **E. Ollama 本地**（零成本但需要本地 GPU）：装 https://ollama.com/ 装好之后填 `http://localhost:11434/v1`
+### 真 AI 镜头设计
 
-把 key（和 baseUrl 如果有的话）告诉我，或者你自己登录到 [http://localhost:3000/workspace](http://localhost:3000/workspace) 的"设置"页填进去（设置会保存进数据库）。
+- **生成镜头表**（`/api/shots/generate`）：6-15 个镜头，每个含 `序号 / 时长 / 景别 / 运镜 / 画面描述 / 台词音效 / 风格关键词`
+- 景别枚举：广角全景 / 中景 / 近景 / 特写 / 大特写
+- 运镜枚举：固定机位 / 推 / 拉 / 摇 / 跟 / 航拍 / 手持 / 轨道
+
+### 真 AI 视频提示词
+
+- **按 group 流式生成英文提示词**（`/api/video-prompt/generate`）
+- 结构化为 `[CAMERA] / [STYLE] / [CONSTRAINTS] / [AUDIO]` 四段
+- **微调单个 group 提示词**：`/api/video-prompt/refine`
+- **解析 + 敏感词扫描**：`/api/prompt/parse` 和 `/scan-sensitive`
+- **分镜图提示词转换**：`/api/storyboard/convert-prompt`
+
+### 真 AI 创作偏好对话
+
+- **Creative Agent 全局对话**（`/api/agent/chat`）：流式回复 + [PATCH] 行表示可执行修改
+- **应用对话产生的剧本修改**：`/api/agent/patch-script`
+- **创作偏好画像对话**（`/api/profile/chat`）：每 4 轮自动提炼"创作画像"
+
+### 关键架构
+
+| 文件 | 作用 |
+| --- | --- |
+| `lib/llm.ts` | OpenAI 兼容 LLM 调用（流式 / 非流式 / fake 兜底） |
+| `lib/sse.ts` | Next.js Route 端 SSE 响应封装 |
+| `lib/prompts.ts` | 全部系统提示词集中目录（便后续调优） |
+
+### 安全/可靠性
+
+- 用户没配 API Key 时自动进 **fake 模式**：所有接口仍能跑通、SSE 协议正常，但内容是占位文本（前端能看到正确的"加载/进度"状态）
+- LLM 调用失败时，路由层把错误消息直接通过 SSE `{type:"error"}` 推给前端，前端会展示 toast
+- 所有"长生成"路径（剧本/资产/镜头/视频提示词）都是流式，避免被网关超时砍掉
+
+---
+
+## 阶段三预告：AI 角色参考图 + 分镜图
+
+下一阶段要做：
+
+1. 在 `lib/image-gen.ts` 里写图像生成统一封装：
+   - 支持 OpenAI 兼容（gpt-image-1 / dall-e-3）、即梦、SD WebUI、ComfyUI 等
+   - 入参：prompt + 参考图（可选） + 尺寸 + 风格
+2. 重写 `/api/asset/[id]` 的图像生成 → 调真模型出参考图
+3. 实现批量"生成全部参考图"动画
+4. 实现 `/api/images/submit` 真生成分镜原图
+5. 加一个"分镜图风格化为手稿"步骤（可用 ControlNet 或后期 LUT/postprocess）
+6. 把生成的图持久化到 `data/images/` 目录，URL 通过 `/api/images/file/[id]` 提供
+
+### 进入阶段三需要准备
+
+去这几家任选其一拿图像生成 API Key：
+
+- **A. OpenAI gpt-image-1**：和你的 OpenAI Key 同一个（直接复用）
+- **B. 即梦 / 字节豆包**：去 https://www.volcengine.com/ 申请
+- **C. nano-banana**：第三方 OpenAI 兼容（有些中转商提供）
+- **D. ComfyUI 本地**：装一下 ComfyUI 拿到本地接口（要点显卡知识）
 
 ---
 

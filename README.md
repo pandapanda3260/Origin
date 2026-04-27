@@ -5,7 +5,7 @@
 - **前端**：100% 视觉一致——直接复用了对方原始的 HTML / CSS / JavaScript / 图片
 - **后端**：分 5 阶段做（详见 [BACKEND_PHASES.md](./BACKEND_PHASES.md)）
   - ✅ **阶段一**（已完成）：真用户系统（注册/登录/JWT）+ 项目数据持久化（SQLite）+ 设置/创作偏好保存
-  - ⏳ 阶段二：AI 真生成剧本 / 镜头表 / 视频提示词
+  - ✅ **阶段二**（已完成）：AI 真生成剧本（五段式 + 风格圣经 + 情绪标签）/ 资产抽取 / 镜头表 / 视频提示词 / Agent 对话
   - ⏳ 阶段三：AI 真生成角色参考图 / 分镜图
   - ⏳ 阶段四：AI 真生成视频 + FFmpeg 智能剪辑
   - ⏳ 阶段五：套餐积分 + 真支付 + 管理面板真数据
@@ -191,11 +191,16 @@ export async function GET(req: NextRequest) {
 | 用户登录注册 (`/api/auth/*`) | ✅ 真后端（SQLite + bcrypt + JWT） |
 | 项目 CRUD (`/api/projects/*`) | ✅ 真后端（SQLite，按用户隔离） |
 | 用户设置 (`/api/settings`) | ✅ 真后端（API Key 持久化） |
-| 创作偏好 (`/api/profile`) | ✅ 真后端 |
-| 套餐积分 (`/api/billing/*`) | ⏳ Mock（阶段五替换） |
-| AI 生成接口（剧本、资产、镜头、图片、视频） | ⏳ Mock 假数据（阶段二/三/四替换） |
-| 管理面板统计 (`/api/auth/admin/*`) | ⏳ Mock（阶段五替换） |
-| 其他 70+ 接口 | ⏳ Mock 或兜底返回空数据 |
+| 创作偏好 (`/api/profile`) + 偏好对话 (`/api/profile/chat`) | ✅ 真后端 + AI 对话 |
+| 剧本工作流 (`/api/script/workflow/*`) | ✅ 真 LLM（OpenAI 兼容，流式） |
+| 资产抽取 (`/api/assets/*`) | ✅ 真 LLM（结构化 JSON） |
+| 镜头设计 (`/api/shots/generate`) | ✅ 真 LLM（结构化 JSON） |
+| 视频提示词 (`/api/video-prompt/*`、`/api/prompt/*`) | ✅ 真 LLM（流式 + 解析） |
+| Creative Agent (`/api/agent/*`) | ✅ 真 LLM（流式对话 + 局部修改） |
+| 角色参考图 / 分镜图 (`/api/images/submit` 等) | ⏳ Mock（阶段三替换） |
+| 视频生成 / 智能剪辑 (`/api/video/*`、`/api/edit/*`) | ⏳ Mock（阶段四替换） |
+| 套餐积分 / 管理面板 (`/api/billing/*`、`/api/auth/admin/*`) | ⏳ Mock（阶段五替换） |
+| 其他兜底接口 | ⏳ 兜底返回空数据 |
 
 前端 HTML / CSS / JS / 图片 / 视频全部是原站原版文件，未做任何修改。
 
