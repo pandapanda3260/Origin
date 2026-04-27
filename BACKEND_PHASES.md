@@ -4,7 +4,7 @@
 | --- | --- | --- | --- |
 | **一** | 用户系统 + 项目持久化 + 设置/创作偏好保存 | ✅ **已完成** | 不需要 |
 | **二** | AI 剧本生成 + 资产抽取 + 镜头设计 + 视频提示词 + Agent 对话 | ✅ **已完成** | 需要 1 个 LLM Key（OpenAI / DeepSeek 任选） |
-| 三 | AI 角色参考图 + 分镜图 | ⏳ 待做 | 需要图像生成 Key（nano-banana / 即梦 / SD） |
+| **三** | AI 角色参考图 + 分镜图 + 批量任务调度 + 文件存储 | ✅ **已完成** | 需要图像生成 Key（gpt-image-1 / DALL-E-3 / 兼容服务） |
 | 四 | AI 视频生成 + 智能剪辑（FFmpeg） | ⏳ 待做 | 需要视频模型 Key（Seedance / 可灵） |
 | 五 | 套餐积分 + 真支付（微信/支付宝/Stripe） + 管理面板真数据 | ⏳ 待做 | 看是否真接支付 |
 
@@ -111,27 +111,68 @@
 
 ---
 
-## 阶段三预告：AI 角色参考图 + 分镜图
+## 阶段三已交付（你现在能用的）
+
+### 真 AI 图像生成（OpenAI 兼容协议）
+
+- `lib/image-gen.ts` 统一封装 `/v1/images/generations` 调用
+- 支持 OpenAI 官方（gpt-image-1 / dall-e-3）和任意兼容中转
+- 输出：图像文件存到 `data/images/<userId>/<imageId>.png`，元数据落 `images` 表
+- **fake 兜底**：没配图像 Key 时返 1×1 占位图，UI 流程仍通
+
+### 批量任务调度（与原站契约一致）
+
+- `POST /api/batch/start { batchType, projectId, targets, options }` → 返回 `{ batchId }`，立即响应
+- `GET /api/batch/<id>/stream?token=...` → EventSource 流，命名事件：
+  - `snapshot`（连接后第一帧）
+  - `task_started` / `task_progress` / `task_completed` / `task_failed`
+  - `batch_completed` / `batch_cancelled`
+- `GET /api/batch/<id>` → 同步状态查询
+- 并发度=2，避免触发图像 API 限流
+- 状态持久化到 `batches` 和 `batch_tasks` 表（重启可看历史，但不会自动重跑）
+
+### 三个真 executor
+
+| batchType | 说明 |
+| --- | --- |
+| `asset_images` | 给角色/场景/道具生成参考图（自动拼提示词、按类型选尺寸） |
+| `storyboard_prompts` | 把镜头描述转成英文图像生成提示词（LLM） |
+| `storyboard_images` | 给每个分镜组生成手稿风分镜图（pencil sketch style 关键词写进 prompt） |
+
+每个 executor 完成后会自动**写回项目对应字段**：
+- 角色：`assets.characters[i].imageUrl` + 顶层 `characters[i].imageUrl`
+- 场景：`assets.scenes[i].imageUrl` + 顶层 `environments[i].imageUrl`
+- 道具：`assets.props[i].imageUrl` + 顶层 `props[i].imageUrl`
+- 镜头提示词：`shots[i].imagePrompt`、`imagePromptGenerated=true`
+- 分镜图：`storyboards[i].url` 和 `storyboards[i].pencilUrl`（前端 `pencilUrl || url`）
+
+### 单图直生 + 用户上传
+
+- `POST /api/images/submit` —— 同步生成单张图（不走批量）
+- `POST /api/assets/upload-char-image` —— 用户上传自定义角色照片做参考
+- `GET /api/images/file/<id>` —— 读取生成图（带 long cache header，浏览器自动缓存）
+
+---
+
+## 阶段四预告：AI 视频生成 + FFmpeg 智能剪辑
 
 下一阶段要做：
 
-1. 在 `lib/image-gen.ts` 里写图像生成统一封装：
-   - 支持 OpenAI 兼容（gpt-image-1 / dall-e-3）、即梦、SD WebUI、ComfyUI 等
-   - 入参：prompt + 参考图（可选） + 尺寸 + 风格
-2. 重写 `/api/asset/[id]` 的图像生成 → 调真模型出参考图
-3. 实现批量"生成全部参考图"动画
-4. 实现 `/api/images/submit` 真生成分镜原图
-5. 加一个"分镜图风格化为手稿"步骤（可用 ControlNet 或后期 LUT/postprocess）
-6. 把生成的图持久化到 `data/images/` 目录，URL 通过 `/api/images/file/[id]` 提供
+1. 在 `lib/video-gen.ts` 里封装视频模型调用（Seedance / 可灵 / Sora 等）
+2. 重写 `/api/video/submit` 真生成视频片段，用 batch 调度（新加 `video_segments` batchType）
+3. 真实现 `/api/edit/generate-edl` —— 调用 LLM 给出剪辑决策表
+4. 接 FFmpeg 做真剪辑：合并片段 + 加 BGM + 字幕
+5. `/api/edit/export` 真渲染 mp4 文件，存到 `data/videos/`
 
-### 进入阶段三需要准备
+### 进入阶段四需要准备
 
-去这几家任选其一拿图像生成 API Key：
+视频模型 API（任选其一）：
+- **A. Sora**（最贵但最好，OpenAI 平台访问）
+- **B. 即梦 / Seedance**（字节，国内可用）
+- **C. 可灵**（快手，国内可用）
+- **D. 自部署 ComfyUI + AnimateDiff**（零成本但慢）
 
-- **A. OpenAI gpt-image-1**：和你的 OpenAI Key 同一个（直接复用）
-- **B. 即梦 / 字节豆包**：去 https://www.volcengine.com/ 申请
-- **C. nano-banana**：第三方 OpenAI 兼容（有些中转商提供）
-- **D. ComfyUI 本地**：装一下 ComfyUI 拿到本地接口（要点显卡知识）
+外加：本机要装 ffmpeg（`brew install ffmpeg`）。
 
 ---
 

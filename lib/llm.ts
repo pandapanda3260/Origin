@@ -44,7 +44,10 @@ const FAKE_NOTE = '[本地无 Key 假回复] 这条内容来自占位生成，�
 /**
  * 读用户的 LLM 配置：优先 user_settings.models.text → 环境变量 → fake 兜底
  */
-export function resolveLLMConfig(user: UserRow | null, slot: 'text' | 'storyboard' = 'text'): LLMResolved {
+export function resolveLLMConfig(
+  user: UserRow | null,
+  slot: 'text' | 'image' | 'video' | 'storyboard' = 'text',
+): LLMResolved {
   let baseUrl = '';
   let apiKey = '';
   let model = '';
@@ -78,7 +81,11 @@ export function resolveLLMConfig(user: UserRow | null, slot: 'text' | 'storyboar
   }
 
   if (!baseUrl) baseUrl = 'https://api.openai.com/v1';
-  if (!model) model = 'gpt-4o-mini';
+  if (!model) {
+    if (slot === 'image') model = 'gpt-image-1';
+    else if (slot === 'video') model = 'sora';
+    else model = 'gpt-4o-mini';
+  }
 
   if (apiKey) {
     return { baseUrl: baseUrl.replace(/\/+$/, ''), apiKey, model, mode: 'real', source };

@@ -82,6 +82,56 @@ function bootstrap(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+    -- 阶段三：图像存储
+    CREATE TABLE IF NOT EXISTS images (
+      id           TEXT PRIMARY KEY,
+      owner_id     INTEGER NOT NULL,
+      project_id   TEXT,
+      kind         TEXT NOT NULL,        -- character | scene | prop | storyboard | other
+      asset_ref    TEXT,                  -- 关联到 project.data_json 里的资产路径，例如 characters[0]
+      filename     TEXT NOT NULL,         -- 在 data/images/<owner>/ 下的文件名
+      mime         TEXT NOT NULL DEFAULT 'image/png',
+      size_bytes   INTEGER NOT NULL DEFAULT 0,
+      width        INTEGER,
+      height       INTEGER,
+      prompt       TEXT NOT NULL DEFAULT '',
+      style        TEXT,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_images_owner_project ON images(owner_id, project_id, created_at DESC);
+
+    -- 阶段三：批量任务
+    CREATE TABLE IF NOT EXISTS batches (
+      id            TEXT PRIMARY KEY,
+      owner_id      INTEGER NOT NULL,
+      project_id    TEXT,
+      batch_type    TEXT NOT NULL,        -- asset_images | storyboard_prompts | storyboard_images
+      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed | cancelled
+      total         INTEGER NOT NULL DEFAULT 0,
+      succeeded     INTEGER NOT NULL DEFAULT 0,
+      failed        INTEGER NOT NULL DEFAULT 0,
+      options_json  TEXT NOT NULL DEFAULT '{}',
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_batches_owner ON batches(owner_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS batch_tasks (
+      id            TEXT PRIMARY KEY,
+      batch_id      TEXT NOT NULL,
+      seq           INTEGER NOT NULL,
+      target_json   TEXT NOT NULL DEFAULT '{}',
+      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+      result_json   TEXT NOT NULL DEFAULT '{}',
+      error_msg     TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_batch_tasks_batch ON batch_tasks(batch_id, seq);
   `);
 
   seedDefaultUser(db);

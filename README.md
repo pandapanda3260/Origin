@@ -6,7 +6,7 @@
 - **后端**：分 5 阶段做（详见 [BACKEND_PHASES.md](./BACKEND_PHASES.md)）
   - ✅ **阶段一**（已完成）：真用户系统（注册/登录/JWT）+ 项目数据持久化（SQLite）+ 设置/创作偏好保存
   - ✅ **阶段二**（已完成）：AI 真生成剧本（五段式 + 风格圣经 + 情绪标签）/ 资产抽取 / 镜头表 / 视频提示词 / Agent 对话
-  - ⏳ 阶段三：AI 真生成角色参考图 / 分镜图
+  - ✅ **阶段三**（已完成）：AI 真生成角色参考图 / 场景图 / 道具图 / 分镜图（手稿风格）+ 批量调度 + 文件存储
   - ⏳ 阶段四：AI 真生成视频 + FFmpeg 智能剪辑
   - ⏳ 阶段五：套餐积分 + 真支付 + 管理面板真数据
 
@@ -197,7 +197,7 @@ export async function GET(req: NextRequest) {
 | 镜头设计 (`/api/shots/generate`) | ✅ 真 LLM（结构化 JSON） |
 | 视频提示词 (`/api/video-prompt/*`、`/api/prompt/*`) | ✅ 真 LLM（流式 + 解析） |
 | Creative Agent (`/api/agent/*`) | ✅ 真 LLM（流式对话 + 局部修改） |
-| 角色参考图 / 分镜图 (`/api/images/submit` 等) | ⏳ Mock（阶段三替换） |
+| 图像生成 / 批量调度 (`/api/images/*`、`/api/batch/*`、`/api/asset/*`) | ✅ 真后端（OpenAI 兼容图像 API + 本地存储） |
 | 视频生成 / 智能剪辑 (`/api/video/*`、`/api/edit/*`) | ⏳ Mock（阶段四替换） |
 | 套餐积分 / 管理面板 (`/api/billing/*`、`/api/auth/admin/*`) | ⏳ Mock（阶段五替换） |
 | 其他兜底接口 | ⏳ 兜底返回空数据 |

@@ -51,7 +51,14 @@ export async function verifyToken(token: string): Promise<{ userId: number; user
 export function readBearer(req: NextRequest | Request): string | null {
   const h = req.headers.get('authorization') || '';
   const m = /^Bearer\s+(.+)$/i.exec(h);
-  return m ? m[1].trim() : null;
+  if (m) return m[1].trim();
+  // EventSource 不能带自定义 header，前端会把 token 放到 query string ?token=...
+  try {
+    const url = new URL((req as any).url || '');
+    const q = url.searchParams.get('token');
+    if (q) return q.trim();
+  } catch (_) {}
+  return null;
 }
 
 export async function getCurrentUser(req: NextRequest | Request): Promise<UserRow | null> {
