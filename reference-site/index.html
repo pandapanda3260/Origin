@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+
+<html class="light" lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>QD INFINITY · 视频Agent</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "primary-fixed-dim": "#d1d4e1",
+                    "tertiary-fixed": "#dbf2fb",
+                    "on-background": "#26353b",
+                    "primary-dim": "#4e525d",
+                    "inverse-on-surface": "#999da0",
+                    "surface-container-lowest": "#ffffff",
+                    "surface-variant": "#d5e5ed",
+                    "on-error": "#fff7f6",
+                    "tertiary-dim": "#42565e",
+                    "surface-container-high": "#ddeaf1",
+                    "on-primary-fixed": "#3b3f4a",
+                    "error-container": "#fe8983",
+                    "background": "#f6fafd",
+                    "error-dim": "#4e0309",
+                    "inverse-surface": "#0a0f11",
+                    "secondary-fixed-dim": "#c8d6e8",
+                    "primary": "#5a5e6a",
+                    "secondary-container": "#d6e4f7",
+                    "on-surface": "#26353b",
+                    "on-secondary": "#f7f9ff",
+                    "inverse-primary": "#edf0fe",
+                    "surface": "#f6fafd",
+                    "on-secondary-container": "#465362",
+                    "on-surface-variant": "#526168",
+                    "on-primary-fixed-variant": "#575b67",
+                    "on-primary": "#f7f7ff",
+                    "surface-tint": "#5a5e6a",
+                    "secondary-dim": "#475464",
+                    "surface-bright": "#f6fafd",
+                    "surface-container-low": "#eef5f9",
+                    "on-secondary-fixed": "#34404f",
+                    "tertiary-container": "#dbf2fb",
+                    "surface-container": "#e6eff5",
+                    "secondary-fixed": "#d6e4f7",
+                    "outline": "#6e7d84",
+                    "on-primary-container": "#4e525d",
+                    "on-tertiary-container": "#475c63",
+                    "tertiary": "#4d626a",
+                    "primary-fixed": "#dfe2f0",
+                    "error": "#9f403d",
+                    "on-tertiary-fixed": "#354951",
+                    "on-secondary-fixed-variant": "#505d6d",
+                    "surface-container-highest": "#d5e5ed",
+                    "on-tertiary-fixed-variant": "#51666e",
+                    "secondary": "#536070",
+                    "on-tertiary": "#f1faff",
+                    "primary-container": "#dfe2f0",
+                    "surface-dim": "#cadde7",
+                    "tertiary-fixed-dim": "#cde3ed",
+                    "outline-variant": "#a5b4bc",
+                    "on-error-container": "#752121"
+            },
+            "borderRadius": {
+                    "DEFAULT": "1rem",
+                    "lg": "2rem",
+                    "xl": "3rem",
+                    "full": "9999px"
+            },
+            "fontFamily": {
+                    "headline": ["Inter"],
+                    "body": ["Inter"],
+                    "label": ["Inter"]
+            }
+          },
+        },
+      }
+    </script>
+<style>
+        .halftone-overlay {
+            /* 波点加深：更高不透明度 + 偏墨蓝灰 */
+            background-image: radial-gradient(rgba(11, 19, 32, 0.22) 1px, transparent 0);
+            background-size: 22px 22px;
+            mask-image: linear-gradient(to bottom, black, transparent);
+        }
+        .glass-card {
+            backdrop-filter: blur(40px);
+            background: rgba(255, 255, 255, 0.04);
+        }
+        .hero-gradient {
+            background: linear-gradient(135deg, #5a5e6a 0%, #4e525d 100%);
+        }
+        /* 全屏背景视频：与 object-cover 类似，铺满且裁切 */
+        .hero-video-bg {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            pointer-events: none;
+        }
+        /* 暗角：中心略亮、四角渐暗，类似镜头暗角滤镜 */
+        .hero-vignette {
+            pointer-events: none;
+            background: radial-gradient(
+                ellipse 92% 88% at 50% 42%,
+                transparent 0%,
+                transparent 30%,
+                rgba(11, 19, 32, 0.24) 64%,
+                rgba(11, 19, 32, 0.58) 100%
+            );
+        }
+        .dark .hero-vignette {
+            background: radial-gradient(
+                ellipse 92% 88% at 50% 42%,
+                transparent 0%,
+                transparent 24%,
+                rgba(0, 0, 0, 0.35) 58%,
+                rgba(0, 0, 0, 0.86) 100%
+            );
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f6fafd;
+            color: #26353b;
+            overflow-x: hidden;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-background">
+<!-- Top Navigation Bar -->
+<nav class="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-8 py-3 bg-white/10 dark:bg-slate-900/10 backdrop-blur-2xl rounded-full mt-6 mx-auto max-w-5xl shadow-[0_0_60px_rgba(90,92,106,0.04)]">
+<a href="#" class="flex items-center shrink-0" aria-label="QD INFINITY">
+<img src="./logo.png" alt="" class="h-[7.15rem] w-[7.15rem] object-contain rounded-xl" />
+</a>
+<div class="hidden md:flex items-center gap-8">
+<a class="group flex flex-col items-center gap-0 hover:text-slate-800 dark:hover:text-slate-200 transition-colors" href="#">
+  <span class="text-sm font-semibold text-slate-600 dark:text-slate-300 tracking-tight">平台</span>
+  <span class="text-[9px] font-light tracking-[0.15em] uppercase text-slate-400/70 font-['Space_Grotesk']">Platform</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:text-slate-800 dark:hover:text-slate-200 transition-colors" href="#">
+  <span class="text-sm font-semibold text-slate-600 dark:text-slate-300 tracking-tight">智能体</span>
+  <span class="text-[9px] font-light tracking-[0.15em] uppercase text-slate-400/70 font-['Space_Grotesk']">Agents</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:text-slate-800 dark:hover:text-slate-200 transition-colors" href="#">
+  <span class="text-sm font-semibold text-slate-600 dark:text-slate-300 tracking-tight">案例</span>
+  <span class="text-[9px] font-light tracking-[0.15em] uppercase text-slate-400/70 font-['Space_Grotesk']">Showcase</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:text-slate-800 dark:hover:text-slate-200 transition-colors" href="#">
+  <span class="text-sm font-semibold text-slate-600 dark:text-slate-300 tracking-tight">定价</span>
+  <span class="text-[9px] font-light tracking-[0.15em] uppercase text-slate-400/70 font-['Space_Grotesk']">Pricing</span>
+</a>
+</div>
+<div class="flex items-center gap-4">
+<a href="#" onclick="openAuthModal(event)" class="text-slate-500 dark:text-slate-400 hover:text-slate-900 transition-colors text-sm font-medium">登录 / 注册</a>
+<a href="#" onclick="goCreate(event)" class="bg-primary text-on-primary px-6 py-2.5 rounded-full text-sm font-bold shadow-sm hover:scale-98 active:scale-95 transition-all duration-200 inline-block">开始创作</a>
+</div>
+</nav>
+<!-- Hero Section -->
+<header class="relative w-full min-h-screen flex flex-col items-center justify-center pt-24 pb-20 overflow-hidden">
+<!-- 背景视频：与 code.html 同目录放置 hero-bg.mp4（静音循环自动播放） -->
+<div class="absolute inset-0 z-0 overflow-hidden">
+<video
+    class="hero-video-bg opacity-25 dark:opacity-40"
+    autoplay
+    muted
+    loop
+    playsinline
+    preload="metadata"
+    aria-hidden="true"
+>
+    <source src="./hero-bg.mp4" type="video/mp4"/>
+</video>
+<div class="absolute inset-0 bg-gradient-to-b from-background/14 via-background/28 to-background/52 pointer-events-none z-[1]"></div>
+<div class="absolute inset-0 halftone-overlay z-[1]"></div>
+<div class="absolute inset-0 hero-vignette z-[2]" aria-hidden="true"></div>
+</div>
+<div class="relative z-10 text-center max-w-5xl px-6">
+<div class="mb-12 inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-surface-container-low border border-outline-variant/20">
+<span class="material-symbols-outlined text-[18px] text-primary" data-icon="auto_awesome">auto_awesome</span>
+<span class="text-xs font-bold tracking-widest uppercase text-on-surface-variant">Next-Gen Production Engine</span>
+</div>
+<h1 class="text-[clamp(3rem,8vw,5.5rem)] font-extralight tracking-tight leading-[0.95] mb-8 text-on-background">
+                One Sentence.<br/>
+<span class="font-black italic">Infinite Masterpieces.</span>
+</h1>
+<p class="text-xl md:text-2xl text-on-surface-variant font-normal leading-relaxed mb-12 max-w-2xl mx-auto">
+                将一点灵感的火花转化为电影大片。全球首个统一的「创意到电影」工作流。
+            </p>
+<div class="flex flex-col items-center justify-center gap-6 w-full">
+<a href="#" onclick="goCreate(event)" class="bg-primary text-on-primary px-10 py-5 rounded-xl text-lg font-bold shadow-xl hover:scale-[1.02] active:scale-98 transition-all hero-gradient inline-block">
+                    开始创作
+                </a>
+</div>
+</div>
+<!-- Scroll Indicator -->
+<div class="absolute bottom-10 left-1/2 -translate-x-1/2 opacity-30">
+<div class="w-px h-16 bg-primary"></div>
+</div>
+</header>
+<!-- Workflow Section (Bento Grid) -->
+<section class="max-w-7xl mx-auto px-8 py-32">
+<div class="flex flex-col md:flex-row justify-between items-end mb-20 gap-8">
+<div class="max-w-xl">
+<h2 class="text-4xl md:text-5xl font-bold tracking-tighter mb-6">The Zero-Gravity Process</h2>
+<p class="text-on-surface-variant text-lg font-medium leading-relaxed">六步核心工作流，消除从灵感到成片之间的一切阻力。</p>
+<p class="text-on-surface-variant/40 text-sm font-light font-['Space_Grotesk'] tracking-wide mt-2">A 6-step workflow designed to remove the friction between thought and realization.</p>
+</div>
+<div class="hidden md:block h-px flex-1 mx-12 bg-surface-container-high"></div>
+<span class="text-xs font-light uppercase tracking-widest text-primary/40 font-['Space_Grotesk']">Workflow v2.0</span>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-12 gap-6">
+<!-- Step 1: Script -->
+<div class="md:col-span-8 group relative overflow-hidden bg-surface-container-low rounded-xl p-8 hover:bg-surface-container transition-colors duration-500 h-[400px]">
+<div class="flex justify-between items-start relative z-10">
+<div>
+<span class="text-xs font-black text-primary/40 mb-2 block tracking-widest">01</span>
+<h3 class="text-3xl font-bold mb-0.5 font-['Space_Grotesk']">Script Synthesis</h3>
+<p class="text-primary/50 text-[13px] font-semibold mb-3 tracking-wide">剧本生成</p>
+<p class="text-on-surface-variant max-w-sm text-sm font-medium leading-relaxed">从一句话创意到完整剧本，涵盖角色弧光与叙事深度。</p>
+<p class="text-on-surface-variant/35 max-w-sm text-[11px] font-light font-['Space_Grotesk'] tracking-wide mt-1.5 leading-relaxed">From a one-sentence prompt to a detailed screenplay, complete with character arcs and narrative depth.</p>
+</div>
+<span class="material-symbols-outlined text-4xl text-primary/20" data-icon="description">description</span>
+</div>
+<div class="absolute bottom-0 right-0 w-3/4 h-2/3 rounded-tl-xl overflow-hidden shadow-2xl translate-y-8 group-hover:translate-y-4 transition-transform duration-500">
+<img class="w-full h-full object-cover" alt="QD INFINITY 剧本创作界面" src="./showcase-script.png"/>
+</div>
+</div>
+<!-- Step 2: Assets -->
+<div class="md:col-span-4 bg-surface-container-low rounded-xl p-8 flex flex-col justify-between hover:bg-surface-container transition-colors duration-500">
+<div class="flex justify-between items-start">
+<span class="text-xs font-black text-primary/40 tracking-widest">02</span>
+<span class="material-symbols-outlined text-3xl text-primary/20" data-icon="category">category</span>
+</div>
+<div>
+<h3 class="text-2xl font-bold mb-0.5 font-['Space_Grotesk']">Asset Foundry</h3>
+<p class="text-primary/50 text-xs font-semibold mb-3 tracking-wide">资产工坊</p>
+<p class="text-on-surface-variant text-sm font-medium leading-relaxed">自动生成角色、道具与场景，保持统一的艺术风格。</p>
+<p class="text-on-surface-variant/35 text-[11px] font-light font-['Space_Grotesk'] tracking-wide mt-1.5">Automated generation of characters, props, and environments in a consistent artistic style.</p>
+</div>
+<div class="mt-8 grid grid-cols-3 gap-2">
+<div class="aspect-square rounded-lg bg-surface-container-high overflow-hidden">
+<img class="w-full h-full object-cover hover:scale-110 transition-transform duration-500" alt="机甲战士概念设计" src="./showcase-asset-1.jpg"/>
+</div>
+<div class="aspect-square rounded-lg bg-surface-container-high overflow-hidden">
+<img class="w-full h-full object-cover hover:scale-110 transition-transform duration-500" alt="角色概念设计" src="./showcase-asset-2.jpg"/>
+</div>
+<div class="aspect-square rounded-lg bg-surface-container-high overflow-hidden">
+<img class="w-full h-full object-cover hover:scale-110 transition-transform duration-500" alt="道具概念设计" src="./showcase-asset-3.png"/>
+</div>
+</div>
+</div>
+<!-- Step 3: Shots -->
+<div class="md:col-span-4 bg-primary text-on-primary rounded-xl p-8 flex flex-col justify-between hover:scale-[0.98] transition-transform duration-500">
+<div class="flex justify-between items-start">
+<span class="text-xs font-black text-white/40 tracking-widest">03</span>
+<span class="material-symbols-outlined text-3xl text-white/30" data-icon="videocam">videocam</span>
+</div>
+<div>
+<h3 class="text-2xl font-bold mb-0.5 font-['Space_Grotesk']">Cinematic Shots</h3>
+<p class="text-white/50 text-xs font-semibold mb-3 tracking-wide">电影镜头</p>
+<p class="text-white/70 text-sm font-medium leading-relaxed">AI 驱动的镜头调度，一键选择广角、微距或航拍视角。</p>
+<p class="text-white/30 text-[11px] font-light font-['Space_Grotesk'] tracking-wide mt-1.5">AI-driven camera direction — wide, macro, or drone perspectives with one click.</p>
+</div>
+</div>
+<!-- Step 4: Storyboard -->
+<div class="md:col-span-4 bg-surface-container-low rounded-xl p-8 hover:bg-surface-container transition-colors duration-500">
+<div class="flex justify-between items-start mb-8">
+<span class="text-xs font-black text-primary/40 tracking-widest">04</span>
+<span class="material-symbols-outlined text-3xl text-primary/20" data-icon="view_quilt">view_quilt</span>
+</div>
+<h3 class="text-2xl font-bold mb-0.5 font-['Space_Grotesk']">Storyboard Engine</h3>
+<p class="text-primary/50 text-xs font-semibold mb-3 tracking-wide">分镜引擎</p>
+<p class="text-on-surface-variant text-sm font-medium leading-relaxed">实时可视化完整序列，即时编辑节奏与节拍。</p>
+<p class="text-on-surface-variant/35 text-[11px] font-light font-['Space_Grotesk'] tracking-wide mt-1.5 mb-4">Real-time visualization of your entire sequence. Edit rhythm and pacing instantly.</p>
+<div class="space-y-2">
+<div class="h-1 w-full bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full w-2/3 bg-primary"></div>
+</div>
+<div class="h-1 w-full bg-surface-container-highest rounded-full overflow-hidden">
+<div class="h-full w-1/2 bg-primary"></div>
+</div>
+</div>
+</div>
+<!-- Step 5 & 6: Motion & Batch -->
+<div class="md:col-span-4 bg-surface-container-low rounded-xl p-8 hover:bg-surface-container transition-colors duration-500 flex flex-col justify-between">
+<div class="flex justify-between items-start">
+<span class="text-xs font-black text-primary/40 tracking-widest">05+06</span>
+<span class="material-symbols-outlined text-3xl text-primary/20" data-icon="speed">speed</span>
+</div>
+<div>
+<h3 class="text-2xl font-bold mb-0.5 font-['Space_Grotesk']">Motion &amp; Batch</h3>
+<p class="text-primary/50 text-xs font-semibold mb-3 tracking-wide">动态渲染 · 批量生成</p>
+<p class="text-on-surface-variant text-sm font-medium leading-relaxed">超流畅动画与大规模并行渲染，分钟级出片而非数月。</p>
+<p class="text-on-surface-variant/35 text-[11px] font-light font-['Space_Grotesk'] tracking-wide mt-1.5">Hyper-fluid animation and massive parallel rendering. Masterpieces in minutes, not months.</p>
+</div>
+<div class="mt-4 flex -space-x-2">
+<div class="w-10 h-10 rounded-full border-2 border-surface-container-low bg-surface-container-highest"></div>
+<div class="w-10 h-10 rounded-full border-2 border-surface-container-low bg-primary"></div>
+<div class="w-10 h-10 rounded-full border-2 border-surface-container-low bg-surface-variant"></div>
+</div>
+</div>
+</div>
+</section>
+<!-- Visual Showcase -->
+<section class="py-32 bg-surface-container-low">
+<div class="max-w-7xl mx-auto px-8 text-center mb-16">
+<h2 class="text-5xl font-extralight tracking-tight mb-3 font-['Space_Grotesk']">QD INFINITY</h2>
+<p class="text-on-surface-variant/60 text-sm font-semibold tracking-wide mb-1">极致保真</p>
+<p class="text-on-surface-variant/30 uppercase tracking-[0.2em] text-[10px] font-light font-['Space_Grotesk']">Uncompromising Fidelity</p>
+</div>
+<div class="flex overflow-hidden gap-6 px-4">
+<div class="flex-none w-[450px] aspect-[16/9] rounded-xl overflow-hidden shadow-2xl">
+<img class="w-full h-full object-cover" data-alt="atmospheric cinematic shot of a misty dark forest with a single beam of light breaking through" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBOJWiZKLw3bR7tkAJ22mYSyj5qomvPE7KdwD0W-Hkimq2Lo6SOy2Y4LhXP6MzoJMHBu4vTtdezIuu__55ZL9cJZYpgb4F6XdT2hdGzhpo3Joy_SbTC3aWplODc5fPvL0NoZ035afVT7V0bhw62XjIpq7PLHUDJ2ajESzDFW-jnWdwdR_q_n1eMrwMkjpjDijPzdYFk4gSiD5tu5-OPdpEOkR3kykAWVsIbgvGxnbYYPF8L9gxKo3Bjx_3qB8GFknw9uHIx0O1yxH4"/>
+</div>
+<div class="flex-none w-[450px] aspect-[16/9] rounded-xl overflow-hidden shadow-2xl">
+<img class="w-full h-full object-cover" data-alt="epic view of a space station orbiting a blue planet with realistic lens flares and textures" src="https://lh3.googleusercontent.com/aida-public/AB6AXuC83JIJZEUl2o01gg__tMCGTQoOt24cxun9CFi1kkaVfewvi-r5O4tVIj6nrgJ_GMiTT7tfK3WiU5KFWv_M08aHrCXqLklTnsfbcmwH3xSwBKbfBtJyytEvRvzJFs_bZR9PLXd74S5ZR0wgx18HKJf3V7HB2DA726ZGoR2AQ0CPcYobbRnWKFQt8aC4_au0VD357vmoImgM4s4FoANyRDka6rowmoTL-zIZz1qYSvV93BynvL_D817fbJtcKC_4enp5Fcb6lJtxFy4"/>
+</div>
+<div class="flex-none w-[450px] aspect-[16/9] rounded-xl overflow-hidden shadow-2xl">
+<img class="w-full h-full object-cover" data-alt="modern neon-lit cyberpunk street scene with rain reflections and deep blue shadows" src="https://lh3.googleusercontent.com/aida-public/AB6AXuASk-MjaOz3MoBdT2rv8bFc0vt2EiXWlzIe2omzy0mWWjDAqHSElNoqUcAanHw6-0ooGUW3bSUPHvdduF6wW1W1st3u-DWyxgBhWcw4LHSg3wXwgeNQjvxj1d9bVUqa2C24AJiM7McC-n8EF_xUpTqt_JSMHs5yiBs94zjm4aVowMIZqfII-WaZ-fGzO3xiT_xTpFQ4CHEtZTAvw3InNavv9I3ksbZ7xZORNUfqVL7CWc8MmOrtaU-1u0XKOe_ODlgxIaNxWMhAKpI"/>
+</div>
+</div>
+</section>
+<!-- Final CTA -->
+<section class="py-40 text-center px-8">
+<div class="max-w-4xl mx-auto">
+<h2 class="text-6xl font-black italic tracking-tighter mb-8 text-on-background font-['Space_Grotesk']">The future is directed by you.</h2>
+<p class="text-xl text-on-surface-variant font-medium mb-2">加入 50,000+ 创作者，一起突破 AI 电影的边界。</p>
+<p class="text-on-surface-variant/35 text-sm font-light font-['Space_Grotesk'] tracking-wide mb-12">Join 50,000+ creators pushing the boundaries of AI cinematography.</p>
+<div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+<a href="#" onclick="goCreate(event)" class="bg-on-background text-background px-12 py-5 rounded-xl text-lg font-bold shadow-2xl hover:scale-105 transition-transform inline-block">开始创作</a>
+<button class="bg-transparent border-2 border-outline-variant px-12 py-5 rounded-xl text-lg font-bold hover:bg-surface-container-low transition-colors">查看定价</button>
+</div>
+</div>
+</section>
+<!-- Footer -->
+<footer class="pt-24 pb-12 bg-transparent">
+<div class="max-w-7xl mx-auto px-8 flex flex-col md:flex-row justify-between items-center">
+<div class="mb-8 md:mb-0">
+<div class="flex items-center justify-center gap-3 mb-3">
+<img src="./logo.png" alt="QD INFINITY" class="h-12 w-12 object-contain" />
+<div class="text-lg font-bold text-slate-900 dark:text-white">QD INFINITY</div>
+</div>
+<div class="text-sm font-medium tracking-widest uppercase Inter text-slate-600 dark:text-slate-400">© QD INFINITY · AI 可视化分镜 / 视频工作流</div>
+</div>
+<div class="flex flex-wrap justify-center gap-10">
+<a class="group flex flex-col items-center gap-0 hover:opacity-100 transition-all opacity-70" href="#">
+  <span class="text-xs font-medium text-slate-500 dark:text-slate-400">隐私政策</span>
+  <span class="text-[8px] font-light tracking-[0.15em] uppercase text-slate-400/50 font-['Space_Grotesk']">Privacy</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:opacity-100 transition-all opacity-70" href="#">
+  <span class="text-xs font-medium text-slate-500 dark:text-slate-400">服务条款</span>
+  <span class="text-[8px] font-light tracking-[0.15em] uppercase text-slate-400/50 font-['Space_Grotesk']">Terms</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:opacity-100 transition-all opacity-70" href="#">
+  <span class="text-xs font-medium text-slate-500 dark:text-slate-400">安全</span>
+  <span class="text-[8px] font-light tracking-[0.15em] uppercase text-slate-400/50 font-['Space_Grotesk']">Security</span>
+</a>
+<a class="group flex flex-col items-center gap-0 hover:opacity-100 transition-all opacity-70" href="#">
+  <span class="text-xs font-medium text-slate-500 dark:text-slate-400">状态</span>
+  <span class="text-[8px] font-light tracking-[0.15em] uppercase text-slate-400/50 font-['Space_Grotesk']">Status</span>
+</a>
+</div>
+</div>
+</footer>
+<!-- ==================== Auth Modal (Portal Style) ==================== -->
+<style>
+  #authModal { display:none; position:fixed; inset:0; z-index:999; align-items:center; justify-content:center; }
+  #authModal.show { display:flex !important; }
+  #authModal .modal-inner { animation: portalIn 0.4s cubic-bezier(0.16,1,0.3,1); width:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  @keyframes portalIn { from{opacity:0;transform:scale(0.92)} to{opacity:1;transform:scale(1)} }
+  .m-portal { position:relative; width:min(580px,88vw); height:min(320px,55vw); min-height:260px; display:flex; align-items:center; justify-content:center; perspective:2000px; margin:0 auto; }
+  .m-glass { background:linear-gradient(180deg,rgba(255,255,255,0.12) 0%,rgba(255,255,255,0) 40%); backdrop-filter:blur(24px); border:1px solid rgba(255,255,255,0.15); box-shadow:0 20px 50px rgba(0,0,0,0.3); transform-style:preserve-3d; transition:transform 1.2s cubic-bezier(0.645,0.045,0.355,1); }
+  .m-core-btn {
+    position:relative;
+    background-color:#0B1320;
+    background-image:radial-gradient(rgba(255,255,255,0.05) 1px,transparent 0);
+    background-size:6px 6px;
+    border:1px solid rgba(255,255,255,0.1);
+    box-shadow:0 0 50px rgba(8,12,21,0.3),inset 0 0 20px rgba(255,255,255,0.1);
+    transform-style:preserve-3d;
+    transition:transform 1.2s cubic-bezier(0.645,0.045,0.355,1),border-color 0.3s,box-shadow 0.4s;
+    --pointer-x:50%; --pointer-y:50%; --pointer-from-center:0;
+    --background-x:50%; --background-y:50%; --card-opacity:0;
+    --sunpillar-1:hsl(2,100%,73%); --sunpillar-2:hsl(53,100%,69%);
+    --sunpillar-3:hsl(93,100%,69%); --sunpillar-4:hsl(176,100%,76%);
+    --sunpillar-5:hsl(228,100%,74%); --sunpillar-6:hsl(283,100%,73%);
+  }
+  .m-core-btn:hover {
+    border-color:rgba(0,229,255,0.55);
+    box-shadow:0 24px 60px -12px rgba(0,0,0,0.45),0 0 40px -8px rgba(0,229,255,0.15);
+  }
+  .m-core-energy {
+    position:absolute; inset:-1px; border-radius:inherit; padding:2px;
+    background:conic-gradient(from 0deg,transparent 0deg,#00E5FF 60deg,transparent 120deg,transparent 360deg);
+    -webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);
+    -webkit-mask-composite:xor; mask-composite:exclude;
+    animation:m-energy-rotate 4s linear infinite; opacity:0.2; pointer-events:none;
+  }
+  .m-core-btn:hover .m-core-energy { opacity:0.55; }
+  @keyframes m-energy-rotate { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+  .m-holo-shine {
+    position:absolute; inset:0; border-radius:inherit; pointer-events:none; z-index:3; overflow:hidden;
+    opacity:calc(var(--card-opacity) * 0.22); mix-blend-mode:color-dodge;
+    background-image:
+      repeating-linear-gradient(0deg,var(--sunpillar-1) 5%,var(--sunpillar-2) 10%,var(--sunpillar-3) 15%,var(--sunpillar-4) 20%,var(--sunpillar-5) 25%,var(--sunpillar-6) 30%,var(--sunpillar-1) 35%),
+      repeating-linear-gradient(-45deg,#0e152e 0%,hsl(180,20%,60%) 3.8%,hsl(180,29%,66%) 4.5%,hsl(180,20%,60%) 5.2%,#0e152e 10%,#0e152e 12%),
+      radial-gradient(farthest-corner circle at var(--pointer-x) var(--pointer-y),rgba(0,0,0,0.10) 12%,rgba(0,0,0,0.15) 20%,rgba(0,0,0,0.25) 120%);
+    background-position:0 var(--background-y),var(--background-x) var(--background-y),center;
+    background-size:500% 500%,300% 300%,200% 200%;
+    background-blend-mode:color,hard-light;
+    filter:brightness(0.88) contrast(1.22) saturate(1.1);
+    transition:opacity 300ms ease;
+    animation:m-holo-drift 22s linear infinite;
+  }
+  .m-holo-logo {
+    position:absolute; inset:0; border-radius:inherit; pointer-events:none; z-index:3; overflow:hidden;
+    opacity:calc(var(--card-opacity) * 0.95); mix-blend-mode:color-dodge;
+    background-image:
+      repeating-linear-gradient(0deg,var(--sunpillar-1) 5%,var(--sunpillar-2) 10%,var(--sunpillar-3) 15%,var(--sunpillar-4) 20%,var(--sunpillar-5) 25%,var(--sunpillar-6) 30%,var(--sunpillar-1) 35%),
+      repeating-linear-gradient(-45deg,#0e152e 0%,hsl(180,20%,60%) 3.8%,hsl(180,29%,66%) 4.5%,hsl(180,20%,60%) 5.2%,#0e152e 10%,#0e152e 12%),
+      radial-gradient(farthest-corner circle at var(--pointer-x) var(--pointer-y),rgba(255,255,255,0.45) 12%,rgba(255,255,255,0.18) 45%,rgba(0,0,0,0.20) 120%);
+    background-position:0 var(--background-y),var(--background-x) var(--background-y),center;
+    background-size:400% 400%,260% 260%,200% 200%;
+    background-blend-mode:color,hard-light;
+    filter:brightness(1.12) contrast(1.3) saturate(1.35);
+    -webkit-mask-image:url('./logo.png'); mask-image:url('./logo.png');
+    -webkit-mask-mode:alpha; mask-mode:alpha;
+    -webkit-mask-repeat:no-repeat; mask-repeat:no-repeat;
+    -webkit-mask-size:72% auto; mask-size:72% auto;
+    -webkit-mask-position:50% 50%; mask-position:50% 50%;
+    transition:opacity 300ms ease;
+    animation:m-holo-drift 18s linear infinite;
+  }
+  .m-holo-glare {
+    position:absolute; inset:0; border-radius:inherit; pointer-events:none; z-index:4;
+    opacity:calc(var(--card-opacity) * 0.32); mix-blend-mode:overlay;
+    background:radial-gradient(farthest-corner circle at var(--pointer-x) var(--pointer-y),hsl(248,25%,85%) 10%,hsla(207,40%,30%,0.7) 85%);
+    filter:brightness(1.1) contrast(1.15); transition:opacity 300ms ease;
+  }
+  @keyframes m-holo-drift {
+    0%   { background-position:0 var(--background-y),0 0,center; }
+    100% { background-position:0 var(--background-y),90% 90%,center; }
+  }
+  .m-face-front,.m-face-back { position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center; }
+  .m-face-back,.m-btn-back { transform:rotateY(180deg); }
+  .m-portal.flipped .m-glass { transform:rotateY(180deg); }
+  .m-portal.flipped .m-core-btn { transform:rotateY(180deg); }
+  .m-otp-row { display:flex; gap:6px; width:100%; align-items:center; margin-top:10px; }
+  .m-otp-row input { flex:1 1 auto; min-width:0; }
+  .m-otp-send { flex:0 0 auto; border:1px solid rgba(255,255,255,0.18); border-radius:9999px; padding:7px 10px; color:rgba(255,255,255,0.8); background:rgba(255,255,255,0.06); font-size:9px; font-weight:800; letter-spacing:0.16em; text-transform:uppercase; white-space:nowrap; cursor:pointer; }
+  .m-otp-send[disabled] { opacity:0.4; cursor:not-allowed; }
+  #m_msg.err { color:#f87171; } #m_msg.ok { color:#4ade80; }
+  .m-oauth-row { display:flex; gap:8px; justify-content:center; margin-top:14px; }
+  .m-oauth-btn { display:flex; align-items:center; gap:6px; padding:7px 14px; border-radius:9999px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.5); font-size:11px; font-weight:600; cursor:pointer; transition:all 0.2s; }
+  .m-oauth-btn:hover { background:rgba(255,255,255,0.1); color:#fff; }
+  @media(max-width:768px) {
+    .m-portal { width:92vw; height:280px; min-height:240px; }
+    .m-portal .m-glass { width:150px!important; height:150px!important; }
+    .m-portal .m-core-btn { width:100px!important; height:100px!important; }
+    .m-otp-row { flex-direction:column; align-items:stretch; }
+    .m-otp-send { width:100%; text-align:center; }
+    .m-oauth-row { flex-direction:column; align-items:center; }
+  }
+</style>
+
+<div id="authModal" role="dialog" aria-modal="true">
+  <div class="absolute inset-0 bg-[#0a0f18]/85 backdrop-blur-md" onclick="closeAuthModal()"></div>
+  <div class="relative z-10 p-4 modal-inner">
+    <button onclick="closeAuthModal()" class="absolute top-6 right-6 z-50 w-10 h-10 rounded-full bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-white/40 hover:text-white transition-all">
+      <span class="material-symbols-outlined text-xl">close</span>
+    </button>
+
+    <div class="m-portal" id="m_portalContainer">
+      <!-- Left circle: username (login) / username+email (register) -->
+      <div class="m-glass absolute left-0 w-56 h-56 rounded-full z-20">
+        <div class="m-face-front p-7">
+          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">用户名 · Neural ID</label>
+          <input id="m_loginUser" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-lg" placeholder="请输入用户名或邮箱" type="text" autocomplete="username"/>
+          <div class="mt-5 flex flex-col items-center">
+            <button class="text-[8px] font-black uppercase tracking-[0.18em] bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent hover:from-cyan-300 hover:to-blue-300 transition-all" onclick="togglePortal()">注册新账号 · Register →</button>
+          </div>
+        </div>
+        <div class="m-face-back p-6">
+          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">注册信息 · Sign Up</label>
+          <input id="m_regUser" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-base" placeholder="新用户名（中文/字母/数字/下划线）" type="text" autocomplete="username"/>
+          <div class="mt-3 w-full">
+            <input id="m_regEmail" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-sm" placeholder="注册邮箱" type="email" autocomplete="email"/>
+          </div>
+          <div class="mt-4 flex flex-col items-center">
+            <button class="text-[8px] font-black uppercase tracking-[0.18em] text-white/40 hover:text-white transition-colors" onclick="togglePortal()">← 返回登录</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right circle: password (login) / password+OTP (register) -->
+      <div class="m-glass absolute right-0 w-56 h-56 rounded-full z-20">
+        <div class="m-face-front p-10">
+          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">密码 · Access Token</label>
+          <input id="m_loginPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.4em] p-0 placeholder:text-white/20 w-full text-xl" placeholder="••••••••" type="password" autocomplete="current-password"/>
+          <div class="mt-5 flex flex-col items-center gap-2">
+            <button class="text-[8px] font-bold uppercase tracking-[0.12em] text-white/30 hover:text-white/60 transition-colors" onclick="showComingSoon('忘记密码')">忘记密码 · Forgot?</button>
+          </div>
+        </div>
+        <div class="m-face-back p-7">
+          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">设置密码 · Set Password</label>
+          <input id="m_regPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.25em] p-0 placeholder:text-white/25 w-full text-base" placeholder="••••••••" type="password" autocomplete="new-password"/>
+          <div class="m-otp-row mt-4">
+            <input id="m_regOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="8位验证码" type="text" inputmode="numeric" autocomplete="one-time-code"/>
+            <button id="m_otpSendBtn" class="m-otp-send" type="button" onclick="handleSendOtp()">发送验证码</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Center button -->
+      <div class="m-core-btn group absolute z-30 w-40 h-40 rounded-full cursor-pointer" id="m_initBtn" onclick="handleAction()">
+        <div class="m-core-energy"></div>
+        <div class="m-holo-shine" aria-hidden="true"></div>
+        <div class="m-holo-logo" aria-hidden="true"></div>
+        <div class="m-holo-glare" aria-hidden="true"></div>
+        <div class="m-face-front pointer-events-none" style="z-index:10">
+          <span class="material-symbols-outlined text-white text-4xl mb-1" style="font-variation-settings:'FILL' 1">login</span>
+          <span class="text-white font-black tracking-[0.25em] text-[10px] uppercase">登录 · Init</span>
+        </div>
+        <div class="m-face-back m-btn-back pointer-events-none" style="z-index:10">
+          <span class="material-symbols-outlined text-white text-4xl mb-1" style="font-variation-settings:'FILL' 1">person_add</span>
+          <span class="text-white font-black tracking-[0.25em] text-[10px] uppercase">验证码注册</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Message -->
+    <div id="m_msg" class="mt-4 text-center text-sm font-medium tracking-wide min-h-[22px]"></div>
+
+    <!-- OAuth row -->
+    <div class="m-oauth-row mt-2">
+      <button class="m-oauth-btn" onclick="showComingSoon('Discord')">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.36-.698.772-1.362 1.225-1.993a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.12-.094.246-.194.373-.292a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/></svg>
+        Discord 登录
+      </button>
+      <button class="m-oauth-btn" onclick="showComingSoon('Google')">
+        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        Google 登录
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+var _isLoggedIn = false;
+var _isFlipped = false;
+var _otpCountdown = 0;
+var _otpTimer = null;
+
+function _swapFaces(flipped) {
+  var fronts = document.querySelectorAll('#m_portalContainer .m-face-front, #m_portalContainer .m-core-btn .m-face-front');
+  var backs  = document.querySelectorAll('#m_portalContainer .m-face-back, #m_portalContainer .m-core-btn .m-btn-back');
+  fronts.forEach(function(el) { el.style.visibility = flipped ? 'hidden' : 'visible'; });
+  backs.forEach(function(el)  { el.style.visibility = flipped ? 'visible' : 'hidden'; });
+}
+
+function togglePortal() {
+  _isFlipped = !_isFlipped;
+  document.getElementById('m_portalContainer').classList.toggle('flipped', _isFlipped);
+  _clearMsg();
+  setTimeout(function() { _swapFaces(_isFlipped); }, 350);
+}
+
+(function checkAuth() {
+  var token = localStorage.getItem('sw_auth_token');
+  if (!token) return;
+  fetch('/api/auth/me', { headers: { Authorization: 'Bearer ' + token } })
+    .then(function (r) {
+      if (r.ok) {
+        _isLoggedIn = true;
+        var signInLink = document.querySelector('nav a[onclick="openAuthModal(event)"]');
+        if (signInLink) { signInLink.textContent = '进入工作台'; signInLink.onclick = function(e){ e.preventDefault(); window.location.href = '/workspace'; }; }
+      }
+    })
+    .catch(function () {});
+})();
+
+_swapFaces(false);
+
+(function mountCoreHolo() {
+  var el = document.getElementById('m_initBtn');
+  if (!el) return;
+  function clamp(v,lo,hi){return Math.min(Math.max(v,lo),hi);}
+  function adj(v,fMin,fMax,tMin,tMax){return tMin+((tMax-tMin)*(v-fMin))/(fMax-fMin);}
+  function setVars(x,y){
+    var r=el.getBoundingClientRect(),w=r.width||1,h=r.height||1;
+    var lx=x-r.left, ly=y-r.top;
+    var px=clamp(100/w*lx,0,100), py=clamp(100/h*ly,0,100);
+    el.style.setProperty('--pointer-x',px+'%');
+    el.style.setProperty('--pointer-y',py+'%');
+    el.style.setProperty('--background-x',adj(px,0,100,35,65).toFixed(2)+'%');
+    el.style.setProperty('--background-y',adj(py,0,100,35,65).toFixed(2)+'%');
+    el.style.setProperty('--pointer-from-center',String(clamp(Math.hypot(py-50,px-50)/50,0,1)));
+  }
+  el.addEventListener('pointerenter',function(e){
+    el.style.setProperty('--card-opacity','1');
+    setVars(e.clientX,e.clientY);
+  });
+  el.addEventListener('pointermove',function(e){ setVars(e.clientX,e.clientY); });
+  el.addEventListener('pointerleave',function(){
+    el.style.setProperty('--card-opacity','0');
+  });
+})();
+
+if (new URLSearchParams(window.location.search).get('auth') === '1' && !_isLoggedIn) {
+  requestAnimationFrame(function() { openAuthModal(); });
+}
+
+function goCreate(e) {
+  e.preventDefault();
+  if (_isLoggedIn) { window.location.href = '/workspace'; return; }
+  openAuthModal();
+}
+
+function openAuthModal(e) {
+  if (e) e.preventDefault();
+  if (_isLoggedIn) { window.location.href = '/workspace'; return; }
+  document.getElementById('authModal').classList.add('show');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeAuthModal() {
+  document.getElementById('authModal').classList.remove('show');
+  document.body.style.overflow = '';
+  _clearMsg();
+}
+
+function _clearMsg() {
+  var el = document.getElementById('m_msg');
+  el.textContent = ''; el.className = 'mt-4 text-center text-sm font-medium tracking-wide min-h-[22px]';
+}
+function _showMsg(text, type) {
+  var el = document.getElementById('m_msg');
+  el.textContent = text;
+  el.className = 'mt-4 text-center text-sm font-medium tracking-wide min-h-[22px] ' + type;
+}
+
+function _persistAuth(data) {
+  try {
+    localStorage.setItem('sw_auth_token', data.token);
+    localStorage.setItem('sw_auth_user', JSON.stringify(data.user));
+    return true;
+  } catch (_e) {
+    try { localStorage.removeItem('sw_auth_token'); localStorage.removeItem('sw_auth_user'); } catch (_) {}
+    return false;
+  }
+}
+
+async function handleAction() {
+  _clearMsg();
+  var btn = document.getElementById('m_initBtn');
+  btn.style.pointerEvents = 'none'; btn.style.opacity = '.4';
+
+  try {
+    if (!_isFlipped) {
+      var user = document.getElementById('m_loginUser').value.trim();
+      var pwd  = document.getElementById('m_loginPwd').value;
+      if (!user || !pwd) { _showMsg('请填写用户名/邮箱和密码', 'err'); return; }
+      var resp = await fetch('/api/auth/login', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ username:user, password:pwd })
+      });
+      var data = await resp.json();
+      if (!resp.ok) { _showMsg(data.detail || '登录失败', 'err'); return; }
+      if (!_persistAuth(data)) { _showMsg('浏览器存储不可用', 'err'); return; }
+      _showMsg('登录成功，正在跳转…', 'ok');
+      setTimeout(function(){ window.location.href = '/workspace'; }, 500);
+    } else {
+      var ru = document.getElementById('m_regUser').value.trim();
+      var re = document.getElementById('m_regEmail').value.trim();
+      var rp = document.getElementById('m_regPwd').value;
+      var ro = document.getElementById('m_regOtp').value.trim();
+      if (!ru||!re||!rp||!ro) { _showMsg('请填写所有注册字段和验证码', 'err'); return; }
+      var resp2 = await fetch('/api/auth/register/verify', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ username:ru, password:rp, email:re, token:ro })
+      });
+      var data2 = await resp2.json();
+      if (!resp2.ok) { _showMsg(data2.detail || '注册失败', 'err'); return; }
+      if (!_persistAuth(data2)) { _showMsg('浏览器存储不可用', 'err'); return; }
+      _showMsg('注册成功，正在跳转…', 'ok');
+      setTimeout(function(){ window.location.href = '/workspace'; }, 500);
+    }
+  } catch (err) {
+    _showMsg('网络错误：' + err.message, 'err');
+  } finally {
+    btn.style.pointerEvents = ''; btn.style.opacity = '';
+  }
+}
+
+async function handleSendOtp() {
+  _clearMsg();
+  var user = document.getElementById('m_regUser').value.trim();
+  var email = document.getElementById('m_regEmail').value.trim();
+  var pwd = document.getElementById('m_regPwd').value;
+  if (!user||!email||!pwd) { _showMsg('请先填写用户名、邮箱和密码', 'err'); return; }
+  var btn = document.getElementById('m_otpSendBtn');
+  btn.disabled = true;
+  try {
+    var resp = await fetch('/api/auth/register/send-code', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username:user, password:pwd, email:email })
+    });
+    var data = await resp.json();
+    if (!resp.ok) { _showMsg(data.detail || '验证码发送失败', 'err'); btn.disabled = false; return; }
+    _showMsg('验证码已发送，请查收邮箱', 'ok');
+    _otpCountdown = 60; _updateOtpBtn();
+    if (_otpTimer) clearInterval(_otpTimer);
+    _otpTimer = setInterval(function(){ _otpCountdown--; if(_otpCountdown<=0){_otpCountdown=0;clearInterval(_otpTimer);_otpTimer=null;} _updateOtpBtn(); }, 1000);
+  } catch(err) { _showMsg('网络错误：'+err.message,'err'); btn.disabled=false; }
+}
+
+function _updateOtpBtn() {
+  var btn = document.getElementById('m_otpSendBtn');
+  btn.disabled = _otpCountdown > 0;
+  btn.textContent = _otpCountdown > 0 ? ('重发 '+_otpCountdown+'s') : '发送验证码';
+}
+
+function showComingSoon(provider) {
+  _showMsg(provider + ' 登录即将开放，敬请期待', 'err');
+  setTimeout(_clearMsg, 2500);
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeAuthModal();
+  if (e.key === 'Enter' && document.getElementById('authModal').classList.contains('show')) handleAction();
+});
+document.getElementById('m_initBtn').addEventListener('touchend', function(e) { e.preventDefault(); handleAction(); }, { passive:false });
+</script>
+</body></html>
