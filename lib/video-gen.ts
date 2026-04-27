@@ -95,55 +95,56 @@ export async function generateVideo(
     // ---- 火山引擎 Seedance 适配 ----
     try {
       onProgress?.(5, '提交火山 Seedance 任务…');
-      const submitResp = await fetch(`${cfg.baseUrl}/contents/generations/tasks`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-        body: JSON.stringify({
-          model: cfg.model || 'doubao-seedance-1-0-pro-250528',
-          content: [
-            { type: 'text', text: input.prompt + ` --ratio ${size === '1080x1920' ? '9:16' : size === '1920x1080' ? '16:9' : '1:1'} --duration ${dur}` },
-          ],
-        }),
-      });
-      if (!submitResp.ok) {
-        const t = await submitResp.text();
-        throw new Error(`Seedance submit ${submitResp.status}: ${t.slice(0, 400)}`);
-      }
-      const submit: any = await submitResp.json();
+      const ratio = size === '1080x1920' ? '9:16' : size === '1920x1080' ? '16:9' : '1:1';
+      const submit: any = await retryFetch(
+        `${cfg.baseUrl}/contents/generations/tasks`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+          body: JSON.stringify({
+            model: cfg.model || 'doubao-seedance-2-0-260128',
+            content: [
+              { type: 'text', text: `${input.prompt} --ratio ${ratio} --duration ${dur}` },
+            ],
+          }),
+        },
+        '[seedance submit]',
+      );
       const remoteId = submit.id;
       if (!remoteId) throw new Error('Seedance API 返回缺 id');
+      console.log(`[video-gen][seedance] task created id=${remoteId}`);
       db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
 
-      const deadline = Date.now() + 8 * 60 * 1000;
+      const deadline = Date.now() + 10 * 60 * 1000;
       let status = (submit.status || '').toLowerCase();
       let videoUrl = '';
+      let pollCount = 0;
       while (!['succeeded', 'failed', 'cancelled'].includes(status)) {
-        if (Date.now() > deadline) throw new Error('视频生成超时（8 分钟）');
-        await sleep(5000);
-        const r = await fetch(`${cfg.baseUrl}/contents/generations/tasks/${remoteId}`, {
-          headers: { Authorization: `Bearer ${cfg.apiKey}` },
-        });
-        if (!r.ok) {
-          const t = await r.text();
-          throw new Error(`Seedance poll ${r.status}: ${t.slice(0, 400)}`);
-        }
-        const j: any = await r.json();
+        if (Date.now() > deadline) throw new Error('视频生成超时（10 分钟）');
+        await sleep(6000);
+        pollCount++;
+        const j: any = await retryFetch(
+          `${cfg.baseUrl}/contents/generations/tasks/${remoteId}`,
+          { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
+          `[seedance poll #${pollCount}]`,
+        );
         status = (j.status || '').toLowerCase();
         videoUrl = j?.content?.video_url || j?.video_url || videoUrl;
-        const stageHint = status === 'queued' ? 20 : status === 'running' || status === 'in_progress' ? 60 : 80;
+        const stageHint = status === 'queued' ? 20 : status === 'running' || status === 'in_progress' ? Math.min(70, 30 + pollCount * 3) : 85;
         onProgress?.(stageHint, `Seedance 状态：${status}`);
         db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(stageHint, taskId);
       }
       if (status !== 'succeeded') throw new Error(`Seedance 任务结束状态: ${status}`);
       if (!videoUrl) throw new Error('Seedance 完成但没返回 video_url');
+      console.log(`[video-gen][seedance] succeeded after ${pollCount} polls, url=${videoUrl.slice(0, 80)}…`);
 
       onProgress?.(90, '下载视频…');
-      const dl = await fetch(videoUrl);
-      if (!dl.ok) throw new Error(`下载 ${dl.status}`);
-      const buf = Buffer.from(await dl.arrayBuffer());
+      const buf = await retryDownload(videoUrl);
       require('node:fs').writeFileSync(fullPath, buf);
+      console.log(`[video-gen][seedance] downloaded ${buf.length} bytes to ${fullPath}`);
     } catch (e: any) {
-      console.warn('[video-gen][seedance] fallback to placeholder:', e?.message);
+      console.warn('[video-gen][seedance] fallback to placeholder:', e?.message || e);
+      console.warn('[video-gen][seedance] full error:', String(e?.stack || e).slice(0, 500));
       try { require('node:fs').unlinkSync(fullPath); } catch (_) {}
       await makeBlackVideo({ outputPath: fullPath, durationSec: dur, withTone: true });
       mode = 'fake';
@@ -256,6 +257,61 @@ export async function generateVideo(
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 带重试的 fetch + JSON 解析（Volcano 偶尔抖一下，重试 3 次）。
+ */
+async function retryFetch(url: string, init: any, label: string, retries = 3): Promise<any> {
+  let lastErr: any;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await fetch(url, init);
+      if (!resp.ok) {
+        const t = await resp.text();
+        if (resp.status >= 500 && i < retries - 1) {
+          console.warn(`${label} status=${resp.status}, retrying...`);
+          await sleep(2000 * (i + 1));
+          continue;
+        }
+        throw new Error(`${label} HTTP ${resp.status}: ${t.slice(0, 300)}`);
+      }
+      return await resp.json();
+    } catch (e: any) {
+      lastErr = e;
+      const msg = e?.message || String(e);
+      if (i < retries - 1) {
+        console.warn(`${label} attempt ${i + 1}/${retries} failed: ${msg}, retrying...`);
+        await sleep(2000 * (i + 1));
+        continue;
+      }
+      throw new Error(`${label} 失败（${retries} 次重试后）: ${msg}`);
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * 带重试的下载（视频 URL 是 CDN，可能抖一下）。
+ */
+async function retryDownload(url: string, retries = 3): Promise<Buffer> {
+  let lastErr: any;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const dl = await fetch(url);
+      if (!dl.ok) throw new Error(`下载 HTTP ${dl.status}`);
+      return Buffer.from(await dl.arrayBuffer());
+    } catch (e: any) {
+      lastErr = e;
+      if (i < retries - 1) {
+        console.warn(`[video-gen] download retry ${i + 1}/${retries}:`, e?.message || e);
+        await sleep(3000 * (i + 1));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 export function getVideoTaskMeta(id: string, ownerId: number) {
