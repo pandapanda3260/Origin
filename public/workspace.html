@@ -4,24 +4,6 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>QD INFINITY · 视频Agent</title>
-    <script>
-      // [DEV-CLONE] 1:1 复刻：本地开发环境跳过登录，注入 mock token & user。
-      // 仅在本地（localhost / 127.x）有效；接真后端时删除此 <script> 即可。
-      (function(){
-        try {
-          var host = location.hostname;
-          var isLocal = host === 'localhost' || host === '127.0.0.1' || host.endsWith('.local');
-          if (!isLocal) return;
-          if (!localStorage.getItem('sw_auth_token')) {
-            localStorage.setItem('sw_auth_token', 'mock-dev-token');
-            localStorage.setItem('sw_auth_user', JSON.stringify({
-              id: 1, username: 'pokerman', displayName: 'pokerman',
-              email: 'demo@local.dev', emailVerified: true, isAdmin: true
-            }));
-          }
-        } catch(e) {}
-      })();
-    </script>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />

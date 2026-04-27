@@ -1,0 +1,147 @@
+/**
+ * SQLite 数据库连接层（阶段一：用户/项目/设置/创作偏好）
+ *
+ * 设计原则：
+ *   - 单文件数据库 data/qd.sqlite，零运维
+ *   - 模块加载时自动建表（首次启动即可用）
+ *   - 进程内单例：避免 Next.js dev 热重载导致重复打开
+ */
+
+import Database from 'better-sqlite3';
+import { hashSync } from 'bcryptjs';
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+const DATA_DIR = join(process.cwd(), 'data');
+const DB_PATH = process.env.DB_PATH || join(DATA_DIR, 'qd.sqlite');
+
+mkdirSync(DATA_DIR, { recursive: true });
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __qd_db: Database.Database | undefined;
+}
+
+function open(): Database.Database {
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
+  bootstrap(db);
+  return db;
+}
+
+function bootstrap(db: Database.Database) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      username      TEXT UNIQUE NOT NULL,
+      email         TEXT UNIQUE,
+      display_name  TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      is_admin      INTEGER NOT NULL DEFAULT 0,
+      email_verified INTEGER NOT NULL DEFAULT 0,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS projects (
+      id           TEXT PRIMARY KEY,
+      owner_id     INTEGER NOT NULL,
+      title        TEXT NOT NULL DEFAULT '未命名项目',
+      description  TEXT NOT NULL DEFAULT '',
+      cover_url    TEXT,
+      status       TEXT NOT NULL DEFAULT 'draft',
+      data_json    TEXT NOT NULL DEFAULT '{}',
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id     INTEGER PRIMARY KEY,
+      data_json   TEXT NOT NULL DEFAULT '{}',
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      user_id     INTEGER PRIMARY KEY,
+      data_json   TEXT NOT NULL DEFAULT '{}',
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token        TEXT PRIMARY KEY,
+      user_id      INTEGER NOT NULL,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      last_active  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  `);
+
+  seedDefaultUser(db);
+}
+
+function seedDefaultUser(db: Database.Database) {
+  const count = db.prepare<[], { c: number }>('SELECT COUNT(*) AS c FROM users').get();
+  if (count && count.c > 0) return;
+
+  const username = process.env.SEED_USER || 'pokerman';
+  const password = process.env.SEED_PASSWORD || 'joker0606';
+  const email = process.env.SEED_EMAIL || 'demo@local.dev';
+
+  db.prepare(
+    `INSERT INTO users (username, email, display_name, password_hash, is_admin, email_verified)
+     VALUES (?, ?, ?, ?, 1, 1)`,
+  ).run(username, email, username, hashSync(password, 10));
+
+  console.log(`[db] Seeded default user: ${username} / ${password} (admin, email: ${email})`);
+}
+
+export function getDb(): Database.Database {
+  if (!global.__qd_db) {
+    global.__qd_db = open();
+  }
+  return global.__qd_db;
+}
+
+export type UserRow = {
+  id: number;
+  username: string;
+  email: string | null;
+  display_name: string;
+  password_hash: string;
+  is_admin: number;
+  email_verified: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectRow = {
+  id: string;
+  owner_id: number;
+  title: string;
+  description: string;
+  cover_url: string | null;
+  status: string;
+  data_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export function userToPublic(u: UserRow) {
+  return {
+    id: u.id,
+    username: u.username,
+    displayName: u.display_name,
+    email: u.email || '',
+    emailVerified: !!u.email_verified,
+    isAdmin: !!u.is_admin,
+    createdAt: u.created_at,
+  };
+}

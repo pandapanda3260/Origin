@@ -2,10 +2,13 @@
 
 这是一个对 [https://inf.apiqd.com](https://inf.apiqd.com)（QD INFINITY · 视频Agent）网站的 1:1 复刻。
 
-- 前端：**100% 视觉一致**——直接复用了对方原始的 HTML / CSS / JavaScript / 图片
-- 后端：**全套 mock 假数据**——所有 `/api/*` 都由本地 Next.js 接管，返回示例数据
-
-后续接真后端时，只需要替换 `app/api/` 里的 mock 即可，前端代码完全不用动。
+- **前端**：100% 视觉一致——直接复用了对方原始的 HTML / CSS / JavaScript / 图片
+- **后端**：分 5 阶段做（详见 [BACKEND_PHASES.md](./BACKEND_PHASES.md)）
+  - ✅ **阶段一**（已完成）：真用户系统（注册/登录/JWT）+ 项目数据持久化（SQLite）+ 设置/创作偏好保存
+  - ⏳ 阶段二：AI 真生成剧本 / 镜头表 / 视频提示词
+  - ⏳ 阶段三：AI 真生成角色参考图 / 分镜图
+  - ⏳ 阶段四：AI 真生成视频 + FFmpeg 智能剪辑
+  - ⏳ 阶段五：套餐积分 + 真支付 + 管理面板真数据
 
 ---
 
@@ -56,9 +59,14 @@ npm run dev
 打开浏览器，访问：
 
 - 落地页：[http://localhost:3000](http://localhost:3000)
-- 工作台：[http://localhost:3000/workspace](http://localhost:3000/workspace)
+- 工作台：[http://localhost:3000/workspace](http://localhost:3000/workspace)（未登录会被踢回登录页）
 
-工作台**会自动登录**（本地开发跳过了登录步骤），打开就能看到所有 13 个页面。
+**默认账号**（首次启动自动创建）：
+- 用户名：`pokerman`
+- 密码：`joker0606`
+- 这是 admin 身份，能看到管理面板和设置页面
+
+也可以点"注册新账号"自己注册一个（验证码任意 8 位数字，比如 `12345678`）。
 
 ### 5. 怎么停止？
 
@@ -174,14 +182,22 @@ export async function GET(req: NextRequest) {
 
 ---
 
-## 四、本次复刻做了哪些"小动作"？
+## 四、当前后端实现状态
 
-为了让对方网站在本地能跑起来 + 不被踢回登录页，我们做了 2 处微小改动（其他都是原版）：
+**阶段一已完成**（详见 [BACKEND_PHASES.md](./BACKEND_PHASES.md)）：
 
-1. **`public/workspace.html` 顶部**：加了一段 `<script>`，在 `localhost` 下自动塞 mock token 到 `localStorage`，跳过登录。生产部署/接真后端时删除这段 `<script>` 即可。
-2. **所有 `/api/*` 接口**：由本地 Next.js 提供 mock 数据。
+| API 模块 | 状态 |
+| --- | --- |
+| 用户登录注册 (`/api/auth/*`) | ✅ 真后端（SQLite + bcrypt + JWT） |
+| 项目 CRUD (`/api/projects/*`) | ✅ 真后端（SQLite，按用户隔离） |
+| 用户设置 (`/api/settings`) | ✅ 真后端（API Key 持久化） |
+| 创作偏好 (`/api/profile`) | ✅ 真后端 |
+| 套餐积分 (`/api/billing/*`) | ⏳ Mock（阶段五替换） |
+| AI 生成接口（剧本、资产、镜头、图片、视频） | ⏳ Mock 假数据（阶段二/三/四替换） |
+| 管理面板统计 (`/api/auth/admin/*`) | ⏳ Mock（阶段五替换） |
+| 其他 70+ 接口 | ⏳ Mock 或兜底返回空数据 |
 
-剩下的 HTML / CSS / JS / 图片 / 视频，全部是原站下载下来的原版文件。
+前端 HTML / CSS / JS / 图片 / 视频全部是原站原版文件，未做任何修改。
 
 ---
 

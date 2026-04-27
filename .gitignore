@@ -5,5 +5,10 @@ out/
 .env
 .env.local
 *.log
+data/
 reference-site/screenshots/
 reference-site/dom/
+reference-site/local-screenshots/
+reference-site/local-screenshots-final/
+reference-site/phase1-screenshots/
+reference-site/__pycache__/
