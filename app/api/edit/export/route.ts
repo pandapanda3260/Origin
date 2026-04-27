@@ -6,6 +6,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { concatClips, addBgm } from '@/lib/ffmpeg';
 import { getDb } from '@/lib/db';
+import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -32,6 +33,25 @@ export async function POST(req: NextRequest) {
   if (!projectId) return jsonError('缺 projectId', 400);
   if (!edl.length) return jsonError('EDL 不能为空', 400);
 
+  // 计费：导出
+  try {
+    chargeCredits({
+      userId: user.id,
+      amount: CREDIT_PRICES.export,
+      kind: 'export',
+      reason: 'edit.export',
+      refId: projectId,
+    });
+  } catch (e: any) {
+    if (e instanceof InsufficientCreditsError) {
+      return new Response(
+        JSON.stringify({ detail: e.message, errorCode: 'INSUFFICIENT_CREDITS', required: e.required, balance: e.balance }),
+        { status: 402, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    return jsonError(e?.message || String(e), 500);
+  }
+
   const exportId = randomUUID();
   const ownerDir = join(EXPORTS_DIR, String(user.id));
   mkdirSync(ownerDir, { recursive: true });
@@ -45,9 +65,21 @@ export async function POST(req: NextRequest) {
   ).run(exportId, user.id, projectId, filename, JSON.stringify({ edl }), bgmId || null);
 
   // 后台异步执行（立即返回 exportId）
-  setImmediate(() => doExport(exportId, user.id, edl, bgmId, fullPath).catch((e) => {
-    console.error('[export]', exportId, e);
-  }));
+  const refundOnFailure = () => {
+    try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.export, reason: 'edit.export.failed', refId: exportId }); } catch (_) {}
+  };
+  setImmediate(async () => {
+    try {
+      await doExport(exportId, user.id, edl, bgmId, fullPath);
+      // 检查是否真的成功（doExport 内部会把失败 status 写入 DB）
+      const db2 = getDb();
+      const cur = db2.prepare<{ id: string }, any>('SELECT status FROM exports WHERE id = @id').get({ id: exportId });
+      if (cur?.status === 'failed') refundOnFailure();
+    } catch (e) {
+      console.error('[export]', exportId, e);
+      refundOnFailure();
+    }
+  });
 
   return jsonOk({ ok: true, taskId: exportId, status: 'queued' });
 }

@@ -6,7 +6,7 @@
 | **二** | AI 剧本生成 + 资产抽取 + 镜头设计 + 视频提示词 + Agent 对话 | ✅ **已完成** | 需要 1 个 LLM Key（OpenAI / DeepSeek 任选） |
 | **三** | AI 角色参考图 + 分镜图 + 批量任务调度 + 文件存储 | ✅ **已完成** | 需要图像生成 Key（gpt-image-1 / DALL-E-3 / 兼容服务） |
 | **四** | AI 视频生成 + FFmpeg 剪辑导出 + 任务中心 SSE | ✅ **已完成** | 需要视频模型 Key（Sora / Seedance / 可灵） + 本机 ffmpeg |
-| 五 | 套餐积分 + 真支付（微信/支付宝/Stripe） + 管理面板真数据 | ⏳ 待做 | 看是否真接支付 |
+| **五** | 套餐积分 + 兑换码 + Stripe 脚手架 + 管理面板真数据 + 系统日志 | ✅ **已完成** | 真支付需 Stripe Key（可选） |
 
 ---
 
@@ -221,16 +221,93 @@
 
 ---
 
-## 阶段五预告：套餐积分 + 真支付 + 管理面板真数据
+## 阶段五已交付（你现在能用的）
 
-下一阶段要做：
+### 真积分系统
 
-1. 积分扣减系统：每次生成（剧本/图/视频/导出）扣不同积分，免费档每月 100，超出降级
-2. `/api/billing/checkout` 真对接微信/支付宝/Stripe 支付：商户号、回调验签、订单状态机
-3. `/api/billing/orders/[id]` 真订单查询 + 支付完成自动加积分
-4. `/api/auth/admin/stats` 真统计：用户表 / 项目表 / video_tasks 表实际计算
-5. `/api/auth/admin/logs` 接服务器日志（pino 写文件）
-6. 限流：单用户并发任务上限、API 调用频率上限
+- `lib/credits.ts` 集中管理：余额 / 预扣 / 退还 / 入账 / 明细
+- 计费表（在 `CREDIT_PRICES` 集中维护）：
+  - text 1 积分/请求（剧本/资产/镜头/EDL 等所有 LLM 文本）
+  - image 30 积分/张（角色/场景/道具/分镜图）
+  - video 150 积分/段（单段视频）
+  - export 5 积分/次（FFmpeg 拼接成片）
+- 扣减优先级：bonus → topup → subscription（自动选最便宜的桶）
+- 任务失败自动退还（已接 batch executors 和 export 路由）
+- 不足时返 `errorCode: INSUFFICIENT_CREDITS` + HTTP 402，前端会跳"购买"弹窗
+
+### 默认账号自动开户
+
+- pokerman 注入 5000 积分（便于测试），新用户 100 积分（免费档）
+- 入账记录在 `credit_ledger` 里有 'gift' 类型条目
+
+### 兑换码（替代真支付，立即可用）
+
+- 内置 3 个测试码：
+  - `QDDEMO-1000` → +1000 积分
+  - `QDDEMO-5000` → +5000 积分
+  - `QDDEMO-10000` → +10000 积分
+- 每个码每个用户只能兑换一次（防重）
+- 通过 `/api/billing/redeem` 兑换，前端"购买积分"流程可直接调用
+
+### Stripe / 微信 / 支付宝 脚手架
+
+- `/api/billing/checkout` 接受 `provider: stripe|wechat|alipay`，落 `billing_orders` 表
+- 当前 Stripe / 微信 / 支付宝都返"占位提示"，等用户去申请商户后补真实 SDK 调用
+- `/api/billing/orders/[id]` 真订单状态查询（含完整生命周期）
+- `/api/billing/subscription/{cancel,resume}` 自动续订开关（修改 `user_credits.cancel_at_period_end`）
+
+### 管理面板真数据
+
+- `/api/auth/admin/stats` 全部从 DB 实时查询：
+  - 总用户数 / 总项目数（COUNT）
+  - 近 5 分钟在线（基于 `user_credits.updated_at`）
+  - 付费用户（来自 `billing_orders` 中 status=paid 且金额>0）
+  - 已入账金额（按币种聚合）
+  - 用量明细（按用户聚合 credit_ledger，分文本/图片/视频）
+  - 最近注册（最近 20 个）
+- 仅 admin 用户可访问（403 守卫）
+
+### 系统日志（管理面板看真日志）
+
+- `lib/sys-logs.ts` 内存环形缓冲（最近 1000 条）
+- 启动时 hook 进 console.log/info/warn/error，所有日志自动入环
+- `/api/auth/admin/logs?level=warning|all&lines=300` 拉日志
+- 仅 admin 可访问
+
+### 维护横幅
+
+- `/api/maintenance/banner` GET 公开，PUT 仅 admin
+- 启用后前端顶部横幅条会显示告警消息
+- 状态存 `system_config` 表
+
+### 设置 Key 池状态
+
+- `/api/admin/key-pool/status` 实时检查 4 个 slot（text/image/video/storyboard）的配置状态
+- 返回每个 slot 的 mode（real/fake）、source（user-settings/env/fallback）、model、baseUrl
+- admin 可一眼看出哪些 Key 还没配
+- 仅 admin 可访问
+
+### 测试通过
+
+- 兑换 QDDEMO-1000 → 余额 +1000
+- 重复兑换同一码 → 409 拒绝
+- export 失败 → charge + refund 两条 ledger entry，余额回到原状
+- /admin/stats 返回真实 DB 计数（2 用户、9 项目、2 在线）
+- /admin/logs 显示 console hook 安装记录
+- 维护横幅 PUT/GET 双向工作
+
+---
+
+## 后续可选优化（不属于核心 5 阶段）
+
+1. 真实接 Stripe（需注册商户 + 写 webhook）
+2. 真实接微信支付/支付宝（需备案 + 商户号 + ICP）
+3. 限流：单用户并发任务数（基于 `running` 状态行计数）
+4. 集群部署：用 Redis 替代内存事件总线、迁移到 Postgres
+5. 实时 SSE 优化：用 EventEmitter 取代轮询
+6. 安全：JWT secret 强制环境变量、图片签名 URL、上传文件大小限制
+7. 性能：图像 / 视频生成的并发限流、超时配置
+8. 监控：接 Sentry / OpenTelemetry
 
 ---
 

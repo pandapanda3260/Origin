@@ -188,9 +188,118 @@ function bootstrap(db: Database.Database) {
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_uploads_owner_project ON uploads(owner_id, project_id, created_at DESC);
+
+    -- 阶段五：用户积分余额（按用户单行）
+    CREATE TABLE IF NOT EXISTS user_credits (
+      user_id              INTEGER PRIMARY KEY,
+      total_credits        INTEGER NOT NULL DEFAULT 0,
+      subscription_credits INTEGER NOT NULL DEFAULT 0,
+      topup_credits        INTEGER NOT NULL DEFAULT 0,
+      bonus_credits        INTEGER NOT NULL DEFAULT 0,
+      plan_code            TEXT NOT NULL DEFAULT 'free',
+      plan_status          TEXT NOT NULL DEFAULT 'active',
+      period_end           TEXT,
+      cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
+      updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- 阶段五：积分明细（每条扣费/入账都有一行）
+    CREATE TABLE IF NOT EXISTS credit_ledger (
+      id          TEXT PRIMARY KEY,
+      user_id     INTEGER NOT NULL,
+      amount      INTEGER NOT NULL,           -- 正数=入账，负数=扣减
+      kind        TEXT NOT NULL,              -- script | image | video | export | topup | redeem | refund | gift | adjust
+      reason      TEXT NOT NULL DEFAULT '',
+      ref_id      TEXT,                        -- 关联的 task_id / order_id / batch_id 等
+      balance_after INTEGER NOT NULL,
+      created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ledger_user_time ON credit_ledger(user_id, created_at DESC);
+
+    -- 阶段五：订单（兑换码 / Stripe / 微信支付都进这一张表）
+    CREATE TABLE IF NOT EXISTS billing_orders (
+      id              TEXT PRIMARY KEY,
+      user_id         INTEGER NOT NULL,
+      kind            TEXT NOT NULL,         -- subscription | topup
+      plan_code       TEXT,                   -- 套餐订阅时填 plan code，积分包填 pack code
+      provider        TEXT NOT NULL,          -- redeem | stripe | wechat | alipay | manual
+      provider_ref    TEXT,                   -- 远端订单 id
+      amount_cents    INTEGER NOT NULL DEFAULT 0,
+      currency        TEXT NOT NULL DEFAULT 'CNY',
+      credits_added   INTEGER NOT NULL DEFAULT 0,
+      status          TEXT NOT NULL DEFAULT 'pending',  -- pending | paid | failed | cancelled
+      meta_json       TEXT NOT NULL DEFAULT '{}',
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_orders_user_time ON billing_orders(user_id, created_at DESC);
+
+    -- 阶段五：兑换码（管理员预生成，用户输入即入账）
+    CREATE TABLE IF NOT EXISTS redeem_codes (
+      code         TEXT PRIMARY KEY,
+      credits      INTEGER NOT NULL,
+      plan_code    TEXT,                      -- 兑换的套餐（可空，仅积分时为空）
+      max_uses     INTEGER NOT NULL DEFAULT 1,
+      used_count   INTEGER NOT NULL DEFAULT 0,
+      expires_at   TEXT,
+      memo         TEXT,
+      created_by   INTEGER,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- 阶段五：系统配置（key-value，单例字段）
+    CREATE TABLE IF NOT EXISTS system_config (
+      key         TEXT PRIMARY KEY,
+      value_json  TEXT NOT NULL DEFAULT '{}',
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
   `);
 
   seedDefaultUser(db);
+  seedDefaultCredits(db);
+  seedDefaultRedeemCodes(db);
+}
+
+function seedDefaultCredits(db: Database.Database) {
+  // 给所有还没积分记录的用户开户
+  const rows = db
+    .prepare<[], { id: number }>(
+      `SELECT u.id FROM users u
+       LEFT JOIN user_credits c ON c.user_id = u.id
+       WHERE c.user_id IS NULL`,
+    )
+    .all();
+  for (const u of rows) {
+    // 默认账号 pokerman（id=1）给 5000 积分方便测试，其他人给 100
+    const seedCredits = u.id === 1 ? 5000 : 100;
+    db.prepare(
+      `INSERT INTO user_credits (user_id, total_credits, subscription_credits, plan_code)
+       VALUES (?, ?, ?, 'free')`,
+    ).run(u.id, seedCredits, seedCredits);
+    db.prepare(
+      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, balance_after)
+       VALUES (?, ?, ?, 'gift', '账号初始化赠送', ?)`,
+    ).run(`seed-${u.id}-${Date.now()}`, u.id, seedCredits, seedCredits);
+  }
+}
+
+function seedDefaultRedeemCodes(db: Database.Database) {
+  const count = db.prepare<[], { c: number }>('SELECT COUNT(*) AS c FROM redeem_codes').get();
+  if (count && count.c > 0) return;
+  // 预置几个测试兑换码
+  const codes: Array<[string, number, string]> = [
+    ['QDDEMO-1000', 1000, '示例兑换码 1000 积分'],
+    ['QDDEMO-5000', 5000, '示例兑换码 5000 积分'],
+    ['QDDEMO-10000', 10000, '示例兑换码 10000 积分'],
+  ];
+  const stmt = db.prepare(
+    `INSERT INTO redeem_codes (code, credits, max_uses, used_count, memo) VALUES (?, ?, 100, 0, ?)`,
+  );
+  for (const [c, n, m] of codes) stmt.run(c, n, m);
+  console.log('[db] Seeded redeem codes:', codes.map((c) => c[0]).join(', '));
 }
 
 function seedDefaultUser(db: Database.Database) {

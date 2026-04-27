@@ -9,6 +9,7 @@ import {
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
+import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -36,6 +37,25 @@ export async function POST(req: NextRequest) {
 
     if (!finalSentence) {
       writer.error('请先填写一句话创意');
+      return;
+    }
+
+    // 计费：剧本生成 ≈ 3 次 LLM 调用（剧本 + 风格圣经 + 情绪标签）
+    let charge: { ledgerId: string; balanceAfter: number } | null = null;
+    try {
+      charge = chargeCredits({
+        userId: user.id,
+        amount: CREDIT_PRICES.text * 3,
+        kind: 'text',
+        reason: 'script.full-create',
+        refId: projectId,
+      });
+    } catch (e: any) {
+      if (e instanceof InsufficientCreditsError) {
+        writer.event('error', { error: e.message, errorCode: 'INSUFFICIENT_CREDITS', required: e.required, balance: e.balance });
+        return;
+      }
+      writer.error(e?.message || String(e));
       return;
     }
 

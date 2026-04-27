@@ -15,6 +15,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { UserRow } from './db';
+import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from './credits';
 
 export type BatchEventName =
   | 'snapshot'
@@ -184,6 +185,33 @@ async function runBatch(opts: {
       db.prepare(`UPDATE batch_tasks SET status='running', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(t.id);
       _emit(opts.batchId, 'task_started', { taskId: t.id, targetSeq: t.seq, target });
 
+      // 单任务计费（图片/视频每条扣一份）
+      const cost = costPerTask(opts.batchType);
+      let chargeId: string | null = null;
+      if (cost > 0) {
+        try {
+          const r = chargeCredits({
+            userId: opts.user.id,
+            amount: cost,
+            kind: cost === CREDIT_PRICES.video ? 'video' : 'image',
+            reason: `batch:${opts.batchType}`,
+            refId: t.id,
+          });
+          chargeId = r.ledgerId;
+        } catch (e: any) {
+          const msg = e?.message || String(e);
+          db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
+            .run(msg.slice(0, 1000), t.id);
+          failed++;
+          db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
+          _emit(opts.batchId, 'task_failed', {
+            taskId: t.id, targetSeq: t.seq, target, errorMsg: msg, reason: msg,
+            errorCode: e instanceof InsufficientCreditsError ? 'INSUFFICIENT_CREDITS' : undefined,
+          });
+          return;
+        }
+      }
+
       try {
         const result = await exec({
           user: opts.user,
@@ -211,6 +239,10 @@ async function runBatch(opts: {
         });
       } catch (e: any) {
         const msg = e?.message || String(e);
+        // 任务失败：把刚预扣的积分退还
+        if (cost > 0) {
+          try { refundCredits({ userId: opts.user.id, amount: cost, reason: `refund:${opts.batchType}`, refId: t.id }); } catch (_) {}
+        }
         db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
           .run(msg.slice(0, 1000), t.id);
         failed++;
@@ -218,6 +250,13 @@ async function runBatch(opts: {
         _emit(opts.batchId, 'task_failed', { taskId: t.id, targetSeq: t.seq, target, errorMsg: msg, reason: msg });
       }
     };
+
+    function costPerTask(batchType: string): number {
+      if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
+      if (batchType === 'video_segments') return CREDIT_PRICES.video;
+      if (batchType === 'storyboard_prompts') return CREDIT_PRICES.text;
+      return 0;
+    }
 
     tryNext();
   });
