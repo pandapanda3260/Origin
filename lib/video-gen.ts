@@ -83,14 +83,76 @@ export async function generateVideo(
     dur,
   );
 
+  // 选择适配器：火山引擎 Seedance / OpenAI Sora / fake
+  const isVolcano = /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl) || /seedance|doubao/i.test(cfg.model);
+
   if (cfg.mode === 'fake' || !cfg.apiKey) {
     onProgress?.(20, '[fake] 生成黑场视频…');
     await makeBlackVideo({ outputPath: fullPath, durationSec: dur, withTone: true });
     onProgress?.(80, '[fake] 提取封面…');
     mode = 'fake';
-  } else {
+  } else if (isVolcano) {
+    // ---- 火山引擎 Seedance 适配 ----
     try {
-      onProgress?.(5, '提交视频任务…');
+      onProgress?.(5, '提交火山 Seedance 任务…');
+      const submitResp = await fetch(`${cfg.baseUrl}/contents/generations/tasks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+        body: JSON.stringify({
+          model: cfg.model || 'doubao-seedance-1-0-pro-250528',
+          content: [
+            { type: 'text', text: input.prompt + ` --ratio ${size === '1080x1920' ? '9:16' : size === '1920x1080' ? '16:9' : '1:1'} --duration ${dur}` },
+          ],
+        }),
+      });
+      if (!submitResp.ok) {
+        const t = await submitResp.text();
+        throw new Error(`Seedance submit ${submitResp.status}: ${t.slice(0, 400)}`);
+      }
+      const submit: any = await submitResp.json();
+      const remoteId = submit.id;
+      if (!remoteId) throw new Error('Seedance API 返回缺 id');
+      db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+
+      const deadline = Date.now() + 8 * 60 * 1000;
+      let status = (submit.status || '').toLowerCase();
+      let videoUrl = '';
+      while (!['succeeded', 'failed', 'cancelled'].includes(status)) {
+        if (Date.now() > deadline) throw new Error('视频生成超时（8 分钟）');
+        await sleep(5000);
+        const r = await fetch(`${cfg.baseUrl}/contents/generations/tasks/${remoteId}`, {
+          headers: { Authorization: `Bearer ${cfg.apiKey}` },
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(`Seedance poll ${r.status}: ${t.slice(0, 400)}`);
+        }
+        const j: any = await r.json();
+        status = (j.status || '').toLowerCase();
+        videoUrl = j?.content?.video_url || j?.video_url || videoUrl;
+        const stageHint = status === 'queued' ? 20 : status === 'running' || status === 'in_progress' ? 60 : 80;
+        onProgress?.(stageHint, `Seedance 状态：${status}`);
+        db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(stageHint, taskId);
+      }
+      if (status !== 'succeeded') throw new Error(`Seedance 任务结束状态: ${status}`);
+      if (!videoUrl) throw new Error('Seedance 完成但没返回 video_url');
+
+      onProgress?.(90, '下载视频…');
+      const dl = await fetch(videoUrl);
+      if (!dl.ok) throw new Error(`下载 ${dl.status}`);
+      const buf = Buffer.from(await dl.arrayBuffer());
+      require('node:fs').writeFileSync(fullPath, buf);
+    } catch (e: any) {
+      console.warn('[video-gen][seedance] fallback to placeholder:', e?.message);
+      try { require('node:fs').unlinkSync(fullPath); } catch (_) {}
+      await makeBlackVideo({ outputPath: fullPath, durationSec: dur, withTone: true });
+      mode = 'fake';
+      db.prepare('UPDATE video_tasks SET error_msg=? WHERE id=?').run(String(e?.message || e).slice(0, 1000), taskId);
+    }
+  } else {
+    // ---- OpenAI Sora 适配 ----
+    try {
+      onProgress?.(5, '提交 Sora 任务…');
       const submitResp = await fetch(`${cfg.baseUrl}/videos`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
@@ -110,7 +172,6 @@ export async function generateVideo(
       if (!remoteId) throw new Error('Video API 返回缺 id');
       db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
 
-      // 轮询，最多 6 分钟
       const deadline = Date.now() + 6 * 60 * 1000;
       let status = submit.status || 'queued';
       let progress = 0;
@@ -140,8 +201,7 @@ export async function generateVideo(
       const buf = Buffer.from(await dl.arrayBuffer());
       require('node:fs').writeFileSync(fullPath, buf);
     } catch (e: any) {
-      // 真调失败 → fake 兜底（避免整条流程因为单条视频崩溃）
-      console.warn('[video-gen] fallback to placeholder:', e?.message);
+      console.warn('[video-gen][sora] fallback to placeholder:', e?.message);
       try { require('node:fs').unlinkSync(fullPath); } catch (_) {}
       await makeBlackVideo({ outputPath: fullPath, durationSec: dur, withTone: true });
       mode = 'fake';
