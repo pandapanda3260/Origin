@@ -9,6 +9,7 @@
 
 import { registerExecutor, type BatchExecCtx } from './batches';
 import { generateImage } from './image-gen';
+import { generateVideo } from './video-gen';
 import { chatComplete } from './llm';
 import { getProjectByIdForUser, updateProjectForUser } from './projects-db';
 
@@ -201,5 +202,77 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     resultUrl: result.url,
     patch: { type: 'storyboard_image', idx: groupIdx, url: result.url, pencilUrl: result.url },
     extra: { mode: result.mode },
+  };
+});
+
+/* ============================================================
+   4. video_segments executor —— 给每个分镜组生成视频片段
+   ============================================================ */
+registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
+  const proj = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  if (!proj) throw new Error('项目不存在');
+
+  const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? ctx.seq;
+  const storyboards = (proj as any).storyboards || [];
+  const sb = storyboards[groupIdx];
+  if (!sb) throw new Error(`找不到 storyboards[${groupIdx}]`);
+
+  // 提示词来源优先：sb.videoPrompt（视频提示词页生成的）→ shot.imagePrompt → shot.description
+  const shots = (proj as any).shots || [];
+  const shot = shots[groupIdx] || {};
+  const prompt =
+    sb.videoPrompt || shot.imagePrompt || shot.description || `Video segment for shot ${groupIdx + 1}`;
+  const durationSec = Math.max(2, Math.min(12, Number(shot.durationSec || 4)));
+
+  ctx.progress({ stage: 'submitting', durationSec });
+
+  const result = await generateVideo(
+    ctx.user,
+    {
+      prompt,
+      size: '1080x1920',
+      durationSec,
+      projectId: ctx.projectId,
+      groupIdx,
+    },
+    (pct, hint) => ctx.progress({ stage: 'gen', pct, hint }),
+  );
+
+  // 写回 project.videoTasks 数组（前端 batch 页读这里）
+  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  if (fresh) {
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? (fresh as any).videoTasks : [];
+    while (videoTasks.length <= groupIdx) videoTasks.push({});
+    videoTasks[groupIdx] = {
+      groupIdx,
+      taskId: result.taskId,
+      status: 'completed',
+      url: result.url,
+      coverUrl: result.coverUrl,
+      durationSec: result.durationSec,
+      prompt,
+    };
+    // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
+    const sbs = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+    if (sbs[groupIdx]) {
+      sbs[groupIdx] = { ...sbs[groupIdx], videoUrl: result.url, videoTaskId: result.taskId };
+    }
+    updateProjectForUser(ctx.projectId, ctx.user.id, {
+      videoTasks,
+      storyboards: sbs,
+    });
+  }
+
+  return {
+    resultUrl: result.url,
+    patch: {
+      type: 'video_segment',
+      groupIdx,
+      url: result.url,
+      coverUrl: result.coverUrl,
+      durationSec: result.durationSec,
+      taskId: result.taskId,
+    },
+    extra: { mode: result.mode, durationSec: result.durationSec },
   };
 });

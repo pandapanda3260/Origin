@@ -5,7 +5,7 @@
 | **一** | 用户系统 + 项目持久化 + 设置/创作偏好保存 | ✅ **已完成** | 不需要 |
 | **二** | AI 剧本生成 + 资产抽取 + 镜头设计 + 视频提示词 + Agent 对话 | ✅ **已完成** | 需要 1 个 LLM Key（OpenAI / DeepSeek 任选） |
 | **三** | AI 角色参考图 + 分镜图 + 批量任务调度 + 文件存储 | ✅ **已完成** | 需要图像生成 Key（gpt-image-1 / DALL-E-3 / 兼容服务） |
-| 四 | AI 视频生成 + 智能剪辑（FFmpeg） | ⏳ 待做 | 需要视频模型 Key（Seedance / 可灵） |
+| **四** | AI 视频生成 + FFmpeg 剪辑导出 + 任务中心 SSE | ✅ **已完成** | 需要视频模型 Key（Sora / Seedance / 可灵） + 本机 ffmpeg |
 | 五 | 套餐积分 + 真支付（微信/支付宝/Stripe） + 管理面板真数据 | ⏳ 待做 | 看是否真接支付 |
 
 ---
@@ -154,25 +154,83 @@
 
 ---
 
-## 阶段四预告：AI 视频生成 + FFmpeg 智能剪辑
+## 阶段四已交付（你现在能用的）
+
+### 真 AI 视频生成
+
+- `lib/video-gen.ts` 统一封装 OpenAI Sora 风格的"提交-轮询-下载"三步流程
+- 用户没配 Key 时 **fake 兜底**：用本机 ffmpeg 生成 4s 黑场（带 440Hz 提示音），mp4 文件 valid，前端 `<video>` 能播
+- 真模式下：POST `/v1/videos` → poll `/v1/videos/{id}` → GET `/v1/videos/{id}/content` → 保存 `data/videos/<userId>/<taskId>.mp4`
+- 所有任务记录在 `video_tasks` 表，重启可查询历史
+
+### 视频片段 batch executor
+
+- 新加 `video_segments` batchType，与 storyboard_images 一样接入批量调度
+- 前端在 **批量** 页点 "一键生成" → 后端为每个分镜组并发 2 路生视频
+- 每个片段完成后**自动抽首帧做封面**（写入 `images` 表），前端 `<video poster="...">` 能用
+- 写回 `project.videoTasks[]` 和 `project.storyboards[i].videoUrl`
+
+### FFmpeg 智能剪辑
+
+- `lib/ffmpeg.ts` 4 个核心能力：
+  - `makeBlackVideo` 生成纯色视频
+  - `concatClips` 拼接多段（filter_complex 同步重编码到 1080×1920）
+  - `addBgm` 盖背景音乐（音量可调，可选保留原声）
+  - `extractCover` 抽首帧作为封面 PNG
+- `/api/edit/generate-edl` 真 LLM 决策剪辑：clipId / in / out / transition × 4 种
+  - 对 LLM 返回做严格枚举校验 + 范围 clamp
+  - LLM 失败/无效时 fallback 到"原顺序拼接"，永远不会卡住
+- `/api/edit/export` 异步导出：返回 exportId 立即响应，后台 spawn ffmpeg 渲染
+  - 进度持久化到 `exports` 表
+  - 前端轮询 `/api/edit/export-status/<id>`
+  - 完成后通过 `/api/edit/export-file/<id>` 流式下载（支持 HTTP Range）
+
+### 任务中心实时推送
+
+- `/api/tasks/all-active` 真 DB 查询：聚合 video_tasks + batches + exports
+- `/api/tasks/all-active/stream` EventSource SSE：每 1.5s 轮询 DB 推差量（snapshot / tasks_changed 事件）
+- `/api/tasks/[id]` 单任务详情查询
+- `/api/tasks/active` / `/api/tasks/video-by-project` / `/api/tasks/register`：全部接 DB
+
+### 剪辑工作台素材库
+
+- `/api/edit/upload-media` 用户上传 mp4/mov/png/mp3 → 存 `data/uploads/<userId>/`
+- `/api/edit/media/[id]` 文件读取（带 Range 支持，HTML5 拖动可用）
+- `/api/edit/media-library/[scope]` 列素材：scope=project 或 scope=user
+  - 自动包含已生成的视频片段 + 用户上传素材
+
+### BGM 库
+
+- `/api/edit/bgm-library` 扫描 `data/bgm/` 目录，自动列出所有 mp3/wav/m4a/aac
+- 用户把音乐文件丢到目录就立即可见，无需 DB 注册
+- `/api/edit/bgm/[id]` 流式播放（带 Range）
+
+### 时间轴状态
+
+- `/api/edit/timeline` GET / PUT，把整个 timeline 对象保存到 `project.timeline`
+
+### 测试验证
+
+通过完整端到端测试（fake 模式）：
+1. 创建项目 + 3 个分镜组
+2. video_segments batch 生成 3 段 3s 视频（ffmpeg 黑场 + 提示音）
+3. 自动出 3 个封面图
+4. /api/edit/generate-edl 给出有效 EDL
+5. /api/edit/export 用 ffmpeg 拼接 → 9s 成片
+6. ffprobe 验证：mp4 valid，duration=9.0s 正确
+
+---
+
+## 阶段五预告：套餐积分 + 真支付 + 管理面板真数据
 
 下一阶段要做：
 
-1. 在 `lib/video-gen.ts` 里封装视频模型调用（Seedance / 可灵 / Sora 等）
-2. 重写 `/api/video/submit` 真生成视频片段，用 batch 调度（新加 `video_segments` batchType）
-3. 真实现 `/api/edit/generate-edl` —— 调用 LLM 给出剪辑决策表
-4. 接 FFmpeg 做真剪辑：合并片段 + 加 BGM + 字幕
-5. `/api/edit/export` 真渲染 mp4 文件，存到 `data/videos/`
-
-### 进入阶段四需要准备
-
-视频模型 API（任选其一）：
-- **A. Sora**（最贵但最好，OpenAI 平台访问）
-- **B. 即梦 / Seedance**（字节，国内可用）
-- **C. 可灵**（快手，国内可用）
-- **D. 自部署 ComfyUI + AnimateDiff**（零成本但慢）
-
-外加：本机要装 ffmpeg（`brew install ffmpeg`）。
+1. 积分扣减系统：每次生成（剧本/图/视频/导出）扣不同积分，免费档每月 100，超出降级
+2. `/api/billing/checkout` 真对接微信/支付宝/Stripe 支付：商户号、回调验签、订单状态机
+3. `/api/billing/orders/[id]` 真订单查询 + 支付完成自动加积分
+4. `/api/auth/admin/stats` 真统计：用户表 / 项目表 / video_tasks 表实际计算
+5. `/api/auth/admin/logs` 接服务器日志（pino 写文件）
+6. 限流：单用户并发任务上限、API 调用频率上限
 
 ---
 

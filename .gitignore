@@ -5,7 +5,11 @@ out/
 .env
 .env.local
 *.log
-data/
+data/*
+!data/bgm/
+data/bgm/*
+!data/bgm/README.md
+!data/bgm/.gitkeep
 reference-site/screenshots/
 reference-site/dom/
 reference-site/local-screenshots/

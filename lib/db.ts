@@ -132,6 +132,62 @@ function bootstrap(db: Database.Database) {
       FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_batch_tasks_batch ON batch_tasks(batch_id, seq);
+
+    -- 阶段四：视频任务（单条片段生成）
+    CREATE TABLE IF NOT EXISTS video_tasks (
+      id            TEXT PRIMARY KEY,
+      owner_id      INTEGER NOT NULL,
+      project_id    TEXT,
+      group_idx     INTEGER,                  -- 关联 storyboards[group_idx]
+      prompt        TEXT NOT NULL DEFAULT '',
+      provider      TEXT NOT NULL DEFAULT 'openai',  -- openai | seedance | keling | fake
+      provider_task TEXT,                      -- 远端任务 id（用于轮询）
+      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+      progress      INTEGER NOT NULL DEFAULT 0,      -- 0-100
+      filename      TEXT,                            -- data/videos/<owner>/<filename>
+      duration_sec  REAL,
+      cover_image_id TEXT,                           -- 关联 images.id（视频封面）
+      error_msg     TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_video_tasks_owner ON video_tasks(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_video_tasks_project ON video_tasks(project_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_video_tasks_status ON video_tasks(status, owner_id);
+
+    -- 阶段四：剪辑导出任务
+    CREATE TABLE IF NOT EXISTS exports (
+      id            TEXT PRIMARY KEY,
+      owner_id      INTEGER NOT NULL,
+      project_id    TEXT NOT NULL,
+      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+      progress      INTEGER NOT NULL DEFAULT 0,
+      filename      TEXT,                            -- data/exports/<owner>/<filename>.mp4
+      edl_json      TEXT NOT NULL DEFAULT '{}',
+      bgm_id        TEXT,
+      duration_sec  REAL,
+      error_msg     TEXT,
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_exports_owner ON exports(owner_id, created_at DESC);
+
+    -- 阶段四：用户上传素材（剪辑工作台导入）
+    CREATE TABLE IF NOT EXISTS uploads (
+      id           TEXT PRIMARY KEY,
+      owner_id     INTEGER NOT NULL,
+      project_id   TEXT,
+      kind         TEXT NOT NULL,            -- video | image | audio
+      filename     TEXT NOT NULL,
+      mime         TEXT NOT NULL,
+      size_bytes   INTEGER NOT NULL DEFAULT 0,
+      duration_sec REAL,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_uploads_owner_project ON uploads(owner_id, project_id, created_at DESC);
   `);
 
   seedDefaultUser(db);
