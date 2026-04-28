@@ -435,27 +435,84 @@ export function buildAssetsExtractMessages(scriptText: string, styleBible?: any)
    ===================================================== */
 export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 
-【任务】把剧本分解为 6-15 个镜头，每个镜头给出完整生产参数。
+【你的身份】资深短视频/广告导演，要把一段剧本拆成可直接进棚拍摄的镜头表。
+【任务】把剧本分解为 8-25 个镜头（短视频默认 10-18 个），每个镜头给出**真实可拍**的细致参数。
+
 【输出严格 JSON】
 {
   "shots": [
     {
       "idx": 1,
-      "durationSec": 4,
-      "framing": "广角全景|中景|近景|特写|大特写",
-      "movement": "固定机位|推|拉|摇|跟|航拍|手持|轨道",
-      "description": "画面内容描述（人物动作、构图、光线、关键道具）80 字以内",
-      "dialog": "台词或音效，没有就写 ——",
-      "stylePillar": "本镜头主打风格关键词（≤10 字，如：暖光暖调|冷光冷峻|霓虹反射|逆光剪影）"
+      "duration": 3,
+      "shotType": "大全景",
+      "camera": "缓慢推进",
+      "visual": "画面具体描述：场景环境 + 主体人物 + 姿态/神态 + 光线 + 关键道具 + 构图，80-130 字，要让美术和摄影师能直接照着搭",
+      "dialogue": "台词或旁白原文（含说话人），没有就写 ——",
+      "keyInfo": "本镜头的简短主题词，2-6 字，例如：打烊环境 / 老周出场 / 蟹军压场 / 龙虾翻页 / 摊主总结",
+      "audio": "环境音或音效（脚步声 / 自助台金属碰撞 / 人声窃语 / 收银机），没有写 ——",
+      "emotion": "setup",
+      "intensity": 2,
+      "scriptRef": "对应剧本中的原文片段（10-40 字，直接复制原文，便于前端高亮联动）",
+      "characters": ["老周", "龙虾"]
     }
   ]
 }
-【规则】
-  · idx 从 1 开始连续递增
-  · 每个镜头时长 2-8 秒，整体加起来贴近用户给的总时长
-  · 关键剧情节点必须分到独立镜头
-  · 同一场景里建议用 2-3 个机位制造剪辑节奏
-  · framing 和 movement 必须从枚举里选`;
+
+【字段细则——必须照做】
+
+▸ shotType（景别）：从下列里选；不要写"全景镜头""特写画面"这种废话
+  ["大全景","远景","全景","中景","中近景","近景","特写","大特写","俯拍","仰拍","主观镜头","过肩镜头"]
+
+▸ camera（运镜）：**必须带速度修饰**，不要只写"推镜头"。从下列里选：
+  ["固定镜头","缓慢推进","轻微推近","推近","快速推进",
+   "缓慢拉远","拉远","快速拉远",
+   "左移","右移","上移","下移",
+   "跟随","环绕","摇镜头","手持轻晃","升降","甩镜头"]
+  · 静态铺垫场景多用：固定镜头 / 缓慢推进 / 轻微推近
+  · 情绪升温多用：推近 / 跟随
+  · 高潮爆点多用：快速推进 / 甩镜头 / 手持轻晃
+  · 收尾余韵多用：缓慢拉远
+
+▸ visual（画面描述）：80-130 字，必须包含至少 4 项：
+  ① 场景细节（地点、时间、氛围）
+  ② 主体人物的动作和神态（"先清了下嗓子又低头翻一下纸页，脸绷着，但嘴角像快忍不住笑出来"这种细节）
+  ③ 光线（顶灯/逆光/暖光/冷光/侧光）
+  ④ 构图或前景元素（前景虚影/中景主体/后景虚化）
+  · 严禁写"画面内容"、"主角说话"这种空话
+  · 严禁直接复述台词，台词放在 dialogue 字段
+
+▸ dialogue（对白/旁白）：
+  · 有台词就**逐字复制剧本原文**，包括说话人，例如："老周："来，复盘。先说好的。""
+  · 没台词写 ——
+  · 不要改写或总结台词
+
+▸ keyInfo（关键信息）：**简短主题词**，2-6 个汉字，给制片速读用
+  · 好例子："打烊环境"、"老周出场"、"军容压阵"、"嘴硬反驳"、"摊主收尾"、"翻页耍宝"
+  · 反例（不要这样写）："这是一个表现紧张氛围的镜头"、"情绪/道具/特效"
+
+▸ emotion ∈ ["setup","rising","climax","falling","resolution","transition"]
+  · setup=铺垫 rising=升温 climax=高潮 falling=回落 resolution=余韵 transition=过渡
+
+▸ intensity ∈ 1|2|3|4|5（情绪强度）
+  · setup 通常 1-2，rising 2-3，climax 4-5，falling 3-2，resolution 1-2
+
+▸ scriptRef：必须是剧本中的**原文片段**（10-40 字直接复制），用于前端联动剧本高亮
+
+▸ characters：本镜头**实际入画**的角色名（中文短名数组）；空场景写 []
+
+【整体规则】
+  · idx 从 1 连续递增不跳号
+  · 每个 duration 在 2-6 秒（铺垫 2-3 秒，主戏 3-5 秒，过渡 1-2 秒）
+  · 总时长尽量贴近用户给的"目标总时长"
+  · 关键剧情节点（开场环境、人物登场、冲突爆发、转折、收尾）必须各自独立镜头
+  · 同一场景内用 2-4 个不同机位（远→中→近、固定→推/拉）制造剪辑节奏
+  · 一段长台词可以拆成多个镜头穿插反应
+
+【自检】
+  · 如果某条镜头的 visual 字数 < 50，必须补细节
+  · 如果 keyInfo 超过 8 个字，必须缩短为主题词
+  · 如果 camera 只写了"推镜头""拉镜头"没有速度修饰，必须改为"推近"或"缓慢推进"
+  · 不要输出除 JSON 外的任何文字、注释、markdown`;
 
 export function buildShotsMessages(opts: {
   script: string;
@@ -478,34 +535,59 @@ export function buildShotsMessages(opts: {
    ===================================================== */
 export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
 
-【任务】为一组连贯镜头生成 Seedance / 可灵 / Sora 等"视频生成模型"可用的英文提示词。
-【输出协议】纯文本（不是 JSON），按下面的"提示词三段结构"组织，前端会解析：
+【你是谁】资深视频导演 + 中文视频提示词工程师。要把"本组的多个连贯镜头"翻译成下面这套**完全中文**的结构化段落 prompt（给可灵 / 即梦 / Veo / 国产视频模型用，中文最好用）。
 
-[CAMERA] 全局运镜系统
-- shot 1: <camera language for shot 1, e.g., slow push-in, low angle>
-- shot 2: <...>
-...
+⚠️【绝对禁止】输出英文段落式 prompt，比如 "shot 1: slow push-in from a wide shot..."。看到 shot 1 / shot 2 / camera: / characters: / environments: / aspect ratio: 之类的英文键值对就是错的，必须重写。
+⚠️【绝对禁止】输出 [CAMERA]、[STYLE]、[CONSTRAINTS]、[AUDIO] 这种英文方括号段标签。
+⚠️【绝对禁止】把整段 prompt 用英文写。整体必须 95% 以上是**中文白话**，仅在摄影术语（如 24mm / cinematic / film grain / live-action realistic）处掺英文。
 
-[STYLE] 视觉风格 / 角色 / 场景
-- style: <consistent visual keywords>
-- characters: <character refs map>
-- environments: <env refs>
+═══════════════════════════════════════════
+下面是一个完整的"标准答案"示范，你必须严格照这个结构和文风输出（内容随当前镜头变化，但段落标题、行格式、用词风格一字不差）：
+═══════════════════════════════════════════
 
-[CONSTRAINTS] 约束
-- aspect ratio: 9:16
-- avoid: <not allowed>
-- continuity: <character consistency rules>
+运镜系统
+以客观观察视角做平稳缓推，从门框前景建立打烊后营业区纵深，再在同一180度轴线内自然推到老周的管理者中景，不快切，靠空间收束完成出场转场。两个镜头之间不切换，靠相机本身做物理位移，保持时间空间连贯。
 
-[AUDIO] 音频
-- BGM mood: <mood>
-- sfx: <sound effects per shot>
-- voice: <narration style>
+角色
+老周，中年中国男性、短黑发、身形结实匀称，真人皮肤毛孔可见，穿黑色T恤和深色防水围裙，画面状态：站立训话前准备状态。
 
-【规则】
-  · 全英文（视频模型只懂英文）
-  · 每个 shot 的相机语言要紧扣镜头表里的 framing 和 movement
-  · 角色一定要有 ID 引用（如 character_c1）保持跨镜头一致性
-  · 不要超过 800 词`;
+场景
+奔海海鲜自助餐厅营业区，夜晚打烊后仍灯火通明的现实风格海鲜自助餐厅，长条金属自助台与不锈钢台面被擦得锃亮整洁，空气里残留海水气息与烤黄油暖反光，前景带半开木门虚焦边缘造纵深。
+
+0-3s
+⟦内景大全景·24mm缓慢推近⟧
+镜头从半开木门虚焦边缘后方朝奔海海鲜自助餐厅营业区平稳缓推，空店中央通道笔直延伸，两侧长条金属自助台和不锈钢台面被擦得发亮，冷白顶灯一排排压出整洁秩序，台面与湿润边角反出黄油色暖光，地面微微泛亮并留有清后水迹反光，整个空间干净得像刚做完卫生检查，空场里只有静止的陈列区、轻微回响和克制却鲜活的开场前奏。
+
+3-5s
+⟦内景中景·50mm轻微推近⟧
+老周站在营业区中央通道前方、面朝镜头稳稳压住画面，右手捏着记账板贴在胸前，肩背收紧站定不晃，先微微抬下巴清了清嗓子再低头单手翻开纸页查看，压眉收唇的严肃表情绷在脸上，眉眼末端却悄悄泛出一点憨笑感，黑色T恤与深色防水围裙在明亮顶灯下显得利落克制，真实布料褶皱顺着重力自然下坠，不锈钢自助台从他身两侧向后退开，像一场职场复盘喜剧即将开始。
+
+基调
+社交网络/华尔街之狼式冷峻都市商业摄影，结合当代海鲜自助餐厅拟人喜剧写实语境，洁净硬光、玻璃金属反射、冷白色温、Stainless Silver与Butter Gold为主，live-action realistic cinematic，真人实景电影感，电影胶片颗粒感、自然镜头光学、真实景深。
+
+约束
+禁止插画/动漫/卡通；角色全部按真人写实呈现；老周外貌全片严格一致；可见真实皮肤毛孔与细微眉眼不对称；真实布料重力褶皱与餐饮空间物理反射；不要出现六宫格线条，不要魔幻化空间，不要把海鲜员工直接出镜成人类替代物。
+
+音障
+无BGM；仅保留顶灯轻微电流声、远处排风机低鸣、清洁后残留水声轻微回响、老周清嗓声、纸页翻动声、空场自然混响。
+
+═══════════════════════════════════════════
+（示范结束）
+═══════════════════════════════════════════
+
+【你输出时要做到】
+  1. 段落标题就是"运镜系统 / 角色 / 场景 / 0-3s / 3-5s / 5-8s / 基调 / 约束 / 音障"这 8 类，独立成行，前后不加任何符号（不用 #、[]、**）
+  2. 时间段（0-3s、3-5s 等）的**第一行**必须是 ⟦景别·焦距·运镜⟧ 视觉标签（用全角方括号 ⟦⟧），第二行起才是中文画面段
+  3. 时间段的数量 = 本组镜头数量；时间起止跟镜头 duration 严格对应（第 1 个镜头 4s → 0-4s；第 2 个镜头 3s → 4-7s 以此类推）
+  4. **绝对不要在 prompt 里出现"参考图1"、"参考图2"、"（参考图X）"这种字样**——直接用角色名（老周）、场景名（奔海海鲜自助餐厅）、道具名（记账板）即可
+  5. 总字数 800-1500 字，**不要写英文 shot 1: / camera: / characters: / aspect ratio: 这类键值对**
+  6. 直接以"运镜系统"四个字开头，不要写"以下是..."不要写 markdown 围栏
+
+【输出前自检】
+  ✗ 出现"shot 1:" / "shot 2:" / "camera:" / "characters:" / "[CAMERA]" / "[STYLE]" → 是错的，重写
+  ✗ 出现"参考图1" / "参考图2" / "（参考图N）" → 是错的，重写
+  ✗ 整段是英文 → 是错的，重写
+  ✓ 像上面示范那样：每段中文白话 + 8 个段落标题 + ⟦…⟧ 视觉标签 + 直接用名字不要参考图编号 → 对`;
 
 export function buildVideoPromptMessages(opts: {
   shots: any[];
@@ -516,13 +598,79 @@ export function buildVideoPromptMessages(opts: {
   totalGroups?: number;
 }): ChatMessage[] {
   const parts: string[] = [];
-  parts.push(`本组镜头（共 ${opts.shots.length} 个）：${JSON.stringify(opts.shots)}`);
-  parts.push(`风格圣经：${JSON.stringify(opts.styleBible)}`);
-  parts.push(`资产：${JSON.stringify(opts.assets || {})}`);
-  if (opts.narrations) parts.push(`旁白/台词：${JSON.stringify(opts.narrations)}`);
+
+  // 1) 资产清单（按类别列名字 + 描述，不带"参考图X"序号）
+  const chars = (opts.assets?.characters || []) as any[];
+  const scenes = (opts.assets?.scenes || opts.assets?.environments || []) as any[];
+  const props = (opts.assets?.props || []) as any[];
+
+  const charLines = chars.map((c: any, i: number) => {
+    const name = c.name || c.role || `角色${i + 1}`;
+    const desc = [c.role, c.identity, c.appearance, c.clothing].filter(Boolean).join('；');
+    const ent = c.entityType === 'non-human' ? '（非人/拟人）' : '';
+    return `- ${name}${ent}${desc ? '：' + desc : ''}`;
+  });
+  const sceneLines = scenes.map((s: any, i: number) => {
+    const name = s.name || `场景${i + 1}`;
+    const desc = s.description || s.detail || '';
+    return `- ${name}${desc ? '：' + desc : ''}`;
+  });
+  const propLines = props.map((p: any, i: number) => {
+    const name = p.name || `道具${i + 1}`;
+    const desc = p.description || p.detail || '';
+    return `- ${name}${desc ? '：' + desc : ''}`;
+  });
+
+  const assetSections: string[] = [];
+  if (charLines.length) assetSections.push('【角色】\n' + charLines.join('\n'));
+  if (sceneLines.length) assetSections.push('【场景】\n' + sceneLines.join('\n'));
+  if (propLines.length) assetSections.push('【道具】\n' + propLines.join('\n'));
+  if (assetSections.length) {
+    parts.push(
+      '资产清单（在 prompt 中**直接用名字**引用，禁止使用"参考图X"这种编号）：\n\n' +
+        assetSections.join('\n\n'),
+    );
+  }
+
+  // 2) 本组镜头（精简字段，避免上下文太长）
+  const slimShots = (opts.shots || []).map((s: any, i: number) => ({
+    idx: s.idx ?? i + 1,
+    duration: s.duration ?? s.durationSec ?? 4,
+    shotType: s.shotType || s.framing || '',
+    camera: s.camera || s.movement || '',
+    visual: s.visual || s.description || '',
+    dialogue: s.dialogue || s.dialog || '',
+    keyInfo: s.keyInfo || '',
+    audio: s.audio || '',
+    emotion: s.emotion || '',
+    characters: s.characters || [],
+  }));
+  parts.push(`本组镜头（共 ${slimShots.length} 个，按时间顺序）：\n${JSON.stringify(slimShots, null, 2)}`);
+
+  // 3) 风格圣经精简
+  if (opts.styleBible) {
+    const sb = opts.styleBible;
+    const sbCondensed = {
+      visualStyle: sb.visualStyle || sb.vision,
+      colorPalette: sb.colorPalette,
+      cameraStyle: sb.cameraStyle,
+      mood: sb.mood || sb.tone,
+      lighting: sb.lighting,
+      audio: sb.audio || sb.audioStyle,
+    };
+    parts.push(`风格圣经：${JSON.stringify(sbCondensed)}`);
+  }
+
+  // 4) 旁白/台词（仅本组涉及的）
+  if (opts.narrations && opts.narrations.length) {
+    parts.push(`本组可用旁白/台词候选：${JSON.stringify(opts.narrations)}`);
+  }
+
+  // 5) 上下文位置
   if (opts.groupIdx !== undefined && opts.totalGroups !== undefined) {
     parts.push(`本组在故事中的位置：第 ${opts.groupIdx + 1}/${opts.totalGroups} 组`);
   }
+
   return [
     { role: 'system', content: SP_VIDEO_PROMPT_GENERATE },
     { role: 'user', content: parts.join('\n\n') },

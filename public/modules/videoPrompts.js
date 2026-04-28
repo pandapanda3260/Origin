@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags } from './utils.js';
 import { attachDiagnostic } from './diagnostic.js';
 import { renderVpCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
@@ -561,12 +561,19 @@ export async function generateAllVideoPrompts() {
   var targets = [];
   for (var i = 0; i < groups.length; i++) {
     if (!project.storyboards[i] || !project.storyboards[i].videoPrompt) {
-      targets.push({ groupIdx: i, idx: i });
+      targets.push({
+        groupIdx: i,
+        idx: i,
+        shotIndices: groups[i].shotIndices || [],
+        totalGroups: groups.length,
+      });
     }
   }
   if (!targets.length) {
     // 全部都有提示词——保留旧语义（用户可能想重新生成全部）
-    targets = groups.map(function (_, idx) { return { groupIdx: idx, idx: idx }; });
+    targets = groups.map(function (g, idx) {
+      return { groupIdx: idx, idx: idx, shotIndices: g.shotIndices || [], totalGroups: groups.length };
+    });
   }
   var totalCount = targets.length;
   targets.forEach(function (t) { updateVpCard(t.groupIdx, "loading", null, "AI 分析图片与剧本…"); });
@@ -616,6 +623,75 @@ export async function generateAllVideoPrompts() {
     setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);
   }
 
+  // 去重保护：SSE + polling 同时跑，避免一个 group 处理两次
+  var _seenDone = Object.create(null);
+  var _seenFailed = Object.create(null);
+
+  function _applyTaskCompleted(gIdx, cleaned, narrationsUsed) {
+    if (typeof gIdx !== 'number' || !cleaned) return;
+    if (_seenDone[gIdx]) return;
+    _seenDone[gIdx] = true;
+    doneCount++;
+
+    var isCurrent = _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
+      proj.storyboards[gIdx].videoPrompt = cleaned;
+      if (Array.isArray(narrationsUsed)) proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
+      if (proj._staleFlags) delete proj._staleFlags["video_prompt_" + gIdx];
+    });
+    if (isCurrent) updateVpCard(gIdx, "done", cleaned);
+    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+  }
+
+  function _applyTaskFailed(gIdx, errMsg) {
+    if (typeof gIdx !== 'number') return;
+    if (_seenFailed[gIdx] || _seenDone[gIdx]) return;
+    _seenFailed[gIdx] = true;
+    failCount++;
+    updateVpCard(gIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
+    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+  }
+
+  // ============================================================
+  // 兜底轮询：每 5 秒主动 GET /api/batch/<id>。SSE 不稳定时由它兜底。
+  // ============================================================
+  var pollTimer = null;
+  function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+  async function _pollOnce() {
+    if (finished) return;
+    try {
+      var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
+      if (!snap || finished) return;
+      var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+      tasks.forEach(function (t) {
+        if (t.status === 'completed') {
+          var result = t.result || {};
+          var extra = result.extra || {};
+          var patch = result.patch || {};
+          var gIdx = (typeof extra.groupIdx === 'number')
+            ? extra.groupIdx
+            : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
+          var cleaned = (extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, "");
+          var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
+          _applyTaskCompleted(gIdx, cleaned, narrationsUsed);
+        } else if (t.status === 'failed') {
+          var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
+          _applyTaskFailed(gIdx2, t.errorMsg);
+        }
+      });
+      if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled') {
+        console.log('[VideoPrompt] poll detected batch finished status=' + snap.status);
+        _stopPoll();
+        finish();
+      }
+    } catch (e) {
+      console.warn('[VideoPrompt] poll failed:', (e && e.message) || e);
+    }
+  }
+  pollTimer = setInterval(_pollOnce, 5000);
+
   subscribeBatch(startResp.batchId, {
     onSnapshot: function (snap) {
       if (hint && snap && typeof snap.total === 'number') {
@@ -625,41 +701,29 @@ export async function generateAllVideoPrompts() {
     onTaskStarted: function (data) {
       var extra = data.target || {};
       var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      if (typeof gIdx === 'number') updateVpCard(gIdx, "loading", null, "生成中…");
+      if (typeof gIdx === 'number' && !_seenDone[gIdx]) {
+        updateVpCard(gIdx, "loading", null, "生成中…");
+      }
     },
     onTaskCompleted: function (data) {
-      doneCount++;
       var extra = data.extra || {};
       var patch = data.patch || {};
       var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
       var cleaned = (extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, "");
       var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
-      if (typeof gIdx !== 'number' || !cleaned) return;
-
-      var isCurrent = _safeWriteBack(originId, function (proj) {
-        if (!proj.storyboards) proj.storyboards = [];
-        if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-        proj.storyboards[gIdx].videoPrompt = cleaned;
-        proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
-        if (proj._staleFlags) delete proj._staleFlags["video_prompt_" + gIdx];
-      }, data && data.serverVersion);
-      if (isCurrent) updateVpCard(gIdx, "done", cleaned);
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+      _applyTaskCompleted(gIdx, cleaned, narrationsUsed);
     },
     onTaskFailed: function (data) {
-      failCount++;
       var extra = data.extra || {};
       var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      var errMsg = (data.errorMsg || '生成失败').toString().slice(0, 120);
-      if (typeof gIdx === 'number') updateVpCard(gIdx, "error", null, errMsg);
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+      _applyTaskFailed(gIdx, data.errorMsg);
     },
     onBatchCompleted: function () {
+      _stopPoll();
       finish();
     },
     onClose: function () {
-      // SSE 正常关闭 / 异常断开都兜底 —— 按钮还给用户，可重试
-      finish();
+      // SSE 断开不立即 finish，让 polling 接管
     },
   });
 }

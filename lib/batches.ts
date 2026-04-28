@@ -267,7 +267,7 @@ async function runBatch(opts: {
     function costPerTask(batchType: string): number {
       if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
       if (batchType === 'video_segments') return CREDIT_PRICES.video;
-      if (batchType === 'storyboard_prompts') return CREDIT_PRICES.text;
+      if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
       return 0;
     }
 
@@ -321,4 +321,54 @@ export function getBatchSnapshot(batchId: string): any | null {
 
 function safeParse(s: string) {
   try { return JSON.parse(s || '{}'); } catch { return {}; }
+}
+
+/**
+ * 查询当前用户在某项目下所有"未完成"（queued/running）的批次。
+ * 前端刷新后调 /api/batch/active 用来 reattach SSE 订阅，恢复 UI 进度。
+ */
+export function getActiveBatchesForUser(opts: {
+  ownerId: number;
+  projectId?: string;
+}): Array<{
+  batchId: string;
+  batchType: string;
+  status: string;
+  snapshot: any;
+  tasks: any[];
+}> {
+  const db = getDb();
+  let rows: any[];
+  if (opts.projectId) {
+    rows = db
+      .prepare<any[], any>(
+        `SELECT id, batch_type, status FROM batches
+         WHERE owner_id = ? AND project_id = ?
+           AND status IN ('queued', 'running')
+         ORDER BY created_at DESC
+         LIMIT 20`,
+      )
+      .all(opts.ownerId, opts.projectId);
+  } else {
+    rows = db
+      .prepare<any[], any>(
+        `SELECT id, batch_type, status FROM batches
+         WHERE owner_id = ?
+           AND status IN ('queued', 'running')
+         ORDER BY created_at DESC
+         LIMIT 20`,
+      )
+      .all(opts.ownerId);
+  }
+
+  return rows.map((r: any) => {
+    const snap = getBatchSnapshot(r.id);
+    return {
+      batchId: r.id,
+      batchType: r.batch_type,
+      status: r.status,
+      snapshot: snap || {},
+      tasks: snap?.tasks || [],
+    };
+  });
 }

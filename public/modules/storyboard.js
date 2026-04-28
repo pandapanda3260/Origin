@@ -263,13 +263,34 @@ export function getStoryboardGroups() {
   var rawGroups = [];
 
   if (!hasGroupBoundary) {
-    for (var i = 0; i < shots.length; i += 3) {
+    // 按情绪段切组：同 emotion 连续的镜头放一组，emotion 变化就切；
+    // 同时单组最多 3 个镜头，避免某段太长，1 张分镜稿盖不住
+    var bucket = [];
+    var bucketIndices = [];
+    var bucketEmotion = null;
+    var flush = function () {
+      if (!bucket.length) return;
       rawGroups.push({
-        shotIndices: shots.slice(i, i + 3).map(function (_, j) { return i + j; }),
-        shots: shots.slice(i, i + 3),
-        emotion: (shots[i] && shots[i].emotion) || "general"
+        shotIndices: bucketIndices.slice(),
+        shots: bucket.slice(),
+        emotion: bucketEmotion || 'general',
       });
-    }
+      bucket = [];
+      bucketIndices = [];
+    };
+    shots.forEach(function (shot, idx) {
+      var em = shot.emotion || 'general';
+      if (bucketEmotion === null) bucketEmotion = em;
+      var emotionChanged = (em !== bucketEmotion);
+      var bucketFull = (bucket.length >= 3);
+      if (emotionChanged || bucketFull) {
+        flush();
+        bucketEmotion = em;
+      }
+      bucket.push(shot);
+      bucketIndices.push(idx);
+    });
+    flush();
   } else {
     var curShots = [];
     var curIndices = [];
@@ -611,13 +632,21 @@ export function renderImageGrid() {
     }
     var emotionTag = groupEmotion ? emotionBadgeHtml(groupEmotion, groupIntensity) : "";
 
+    // 英文 prompt（仅给图像模型用，调试时折叠展示）
     var promptText = group.shots.map(function (s) {
       return s.imagePrompt || '';
     }).filter(function (p) { return p; }).join('\n---\n');
 
-    var fullPromptDisplay = promptText || ((group.shots[0] && group.shots[0].visual) || "");
+    // 用户主显示：中文画面描述（拼接同组每个镜头的 visual / shotType）
+    var visualText = group.shots.map(function (s, _i) {
+      var st = s.shotType ? '【' + s.shotType + '】' : '';
+      var v = s.visual || s.description || '';
+      return (st + v).trim();
+    }).filter(function (v) { return v; }).join(' ');
+
+    var fullPromptDisplay = visualText || promptText || '';
     var hasFullPrompt = !!String(fullPromptDisplay).trim();
-    var promptSummaryLine = hasFullPrompt ? _sbPromptShort(fullPromptDisplay, 100) : "";
+    var promptSummaryLine = hasFullPrompt ? _sbPromptShort(fullPromptDisplay, 120) : "";
 
     var card = document.createElement("div");
     card.className = "sb-sheet flex-none w-[75vw] md:w-[65vw] lg:w-[60vw] h-full snap-center-custom flex flex-col";
@@ -879,7 +908,7 @@ export async function generateStoryboardSheet(gIdx) {
     startResp = await apiPost('/api/batch/start', {
       batchType: 'storyboard_images',
       projectId: originId,
-      targets: [{ groupIdx: gIdx, idx: gIdx }],
+      targets: [{ groupIdx: gIdx, idx: gIdx, shotIndices: group.shotIndices || [] }],
     });
   } catch (e) {
     var errMsg = ((e && e.message) || e).toString().slice(0, 120);
@@ -901,35 +930,77 @@ export async function generateStoryboardSheet(gIdx) {
 
   return new Promise(function (resolve) {
     var settled = false;
-    function finish() { if (!settled) { settled = true; resolve(); } }
+    var pollTimer = null;
+    var _gotResult = false;
+    function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function finish() { if (!settled) { settled = true; _stopPoll(); resolve(); } }
+
+    function _applyResult(rawUrl, extra) {
+      if (!rawUrl || _gotResult) return;
+      _gotResult = true;
+      var isCurrent = _safeWriteBack(originId, function (proj) {
+        if (!proj.storyboards) proj.storyboards = [];
+        var existing = proj.storyboards[gIdx] || {};
+        _archiveOldImage(existing, "storyboard");
+        existing.imageUrl = rawUrl;
+        existing.rawUrl = rawUrl;
+        if (extra && extra.assetId) existing.imageAssetId = extra.assetId;
+        if (extra && extra.fetchStatus) existing.fetchStatus = extra.fetchStatus;
+        existing.shotIndices = (extra && extra.shotIndices) || group.shotIndices;
+        if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+        proj.storyboards[gIdx] = existing;
+        if (proj._staleFlags) delete proj._staleFlags["storyboard_" + gIdx];
+      });
+      if (isCurrent) updateStoryboardCard(gIdx, "done", rawUrl);
+    }
+
+    // 5 秒兜底轮询：SSE 偶尔丢事件，靠它从 /api/batch/<id> 拿权威结果
+    async function _pollOnce() {
+      if (settled) return;
+      try {
+        var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
+        if (!snap || settled) return;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        tasks.forEach(function (t) {
+          if (t.status === 'completed' && !_gotResult) {
+            var result = t.result || {};
+            var extra = result.extra || {};
+            var patch = result.patch || {};
+            var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+            _applyResult(url, extra);
+          } else if (t.status === 'failed' && !_gotResult) {
+            var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
+            if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgPoll);
+            showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
+            _gotResult = true;
+          }
+        });
+        if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled') {
+          finish();
+        }
+      } catch (e) {
+        console.warn('[StoryboardImg-single] poll failed:', (e && e.message) || e);
+      }
+    }
+    pollTimer = setInterval(_pollOnce, 5000);
+
     subscribeBatch(startResp.batchId, {
       onTaskCompleted: function (data) {
         var extra = (data && data.extra) || {};
         var patch = (data && data.patch) || {};
-        var rawUrl = extra.rawUrl || patch.value || "";
-        if (!rawUrl) return;
-        var isCurrent = _safeWriteBack(originId, function (proj) {
-          if (!proj.storyboards) proj.storyboards = [];
-          var existing = proj.storyboards[gIdx] || {};
-          _archiveOldImage(existing, "storyboard");
-          existing.imageUrl = rawUrl;
-          existing.rawUrl = rawUrl;
-          if (extra.assetId) existing.imageAssetId = extra.assetId;
-          if (extra.fetchStatus) existing.fetchStatus = extra.fetchStatus;
-          existing.shotIndices = extra.shotIndices || group.shotIndices;
-          if (existing.realPhotoUrl) delete existing.realPhotoUrl;
-          proj.storyboards[gIdx] = existing;
-          if (proj._staleFlags) delete proj._staleFlags["storyboard_" + gIdx];
-        }, data && data.serverVersion);
-        if (isCurrent) updateStoryboardCard(gIdx, "done", rawUrl);
+        var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || (data && data.resultUrl) || "";
+        _applyResult(rawUrl, extra);
       },
       onTaskFailed: function (data) {
         var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
         if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgInner);
         showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgInner), "error");
+        _gotResult = true;
       },
       onBatchCompleted: finish,
-      onClose: finish,
+      onClose: function () {
+        // SSE 断了不立即 finish，让 polling 跑到 batch 真完成
+      },
     });
   });
 }
@@ -990,13 +1061,15 @@ export async function generateAllImages() {
   var targets = [];
   for (var gk = 0; gk < groups.length; gk++) {
     var sb = project.storyboards[gk];
-    if (!sb || !sb.imageUrl) {
-      targets.push({ groupIdx: gk, idx: gk });
+    if (!sb || (!sb.imageUrl && !sb.url)) {
+      targets.push({ groupIdx: gk, idx: gk, shotIndices: groups[gk].shotIndices || [] });
     }
   }
   if (!targets.length) {
     // 所有组都有图——按旧语义还是重跑一遍（用户可能点了想重生成全部）
-    targets = groups.map(function (_, idx) { return { groupIdx: idx, idx: idx }; });
+    targets = groups.map(function (g, idx) {
+      return { groupIdx: idx, idx: idx, shotIndices: g.shotIndices || [] };
+    });
   }
   var totalCount = targets.length;
   if (hint) hint.textContent = "正在生成 " + totalCount + " 张分镜图…";
@@ -1047,6 +1120,90 @@ export async function generateAllImages() {
     setTimeout(function () { _checkAndSuggest("images"); }, 1000);
   }
 
+  // 已经在本地标记完成的 groupIdx —— polling/SSE 收到重复事件时去重
+  var _seenDone = Object.create(null);
+  var _seenFailed = Object.create(null);
+
+  function _applyTaskCompleted(groupIdx, rawUrl, extra) {
+    if (typeof groupIdx !== 'number' || !rawUrl) return;
+    if (_seenDone[groupIdx]) return;  // 已处理过
+    _seenDone[groupIdx] = true;
+    doneCount++;
+
+    var imageAssetId = (extra && extra.assetId) || '';
+    var shotIndices = (extra && Array.isArray(extra.shotIndices)) ? extra.shotIndices : null;
+
+    var isCurrent = _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      var existing = proj.storyboards[groupIdx] || {};
+      _archiveOldImage(existing, "storyboard");
+      existing.imageUrl = rawUrl;
+      existing.rawUrl = rawUrl;
+      if (imageAssetId) {
+        existing.imageAssetId = imageAssetId;
+        existing.fetchStatus = 'done';
+      }
+      if (shotIndices) existing.shotIndices = shotIndices;
+      if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+      proj.storyboards[groupIdx] = existing;
+      if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
+    });
+    if (isCurrent) updateStoryboardCard(groupIdx, "done", rawUrl);
+    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+  }
+
+  function _applyTaskFailed(groupIdx, errMsg) {
+    if (typeof groupIdx !== 'number') return;
+    if (_seenFailed[groupIdx] || _seenDone[groupIdx]) return;
+    _seenFailed[groupIdx] = true;
+    failCount++;
+    updateStoryboardCard(groupIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
+    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+  }
+
+  // ============================================================
+  // 兜底轮询：每 5 秒主动 GET /api/batch/<id>，拿后端权威 snapshot。
+  // SSE 在中转站 / 浏览器后台 / 反向代理下偶尔会丢事件，轮询保证 UI 最终
+  // 能追上后端真实状态——哪怕 task_completed 一条都没收到，5 秒内也能恢复。
+  // ============================================================
+  var pollTimer = null;
+  var pollSettled = false;
+  function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+  async function _pollOnce() {
+    if (pollSettled) return;
+    try {
+      var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
+      if (!snap || pollSettled) return;
+      var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+      tasks.forEach(function (t) {
+        if (t.status === 'completed') {
+          var result = t.result || {};
+          var extra = result.extra || {};
+          var patch = result.patch || {};
+          var gIdx = (typeof extra.groupIdx === 'number')
+            ? extra.groupIdx
+            : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
+          var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+          _applyTaskCompleted(gIdx, url, extra);
+        } else if (t.status === 'failed') {
+          var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
+          _applyTaskFailed(gIdx2, t.errorMsg);
+        }
+      });
+      if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled') {
+        console.log('[StoryboardImg] poll detected batch finished status=' + snap.status);
+        pollSettled = true;
+        _stopPoll();
+        renderImageGrid();
+        finish();
+      }
+    } catch (e) {
+      console.warn('[StoryboardImg] poll failed:', (e && e.message) || e);
+    }
+  }
+  pollTimer = setInterval(_pollOnce, 5000);
+
   subscribeBatch(startResp.batchId, {
     onSnapshot: function (snap) {
       if (hint && snap && typeof snap.total === 'number') {
@@ -1056,51 +1213,31 @@ export async function generateAllImages() {
     onTaskStarted: function (data) {
       var extra = data.target || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      if (typeof groupIdx === 'number') updateStoryboardCard(groupIdx, "loading", null, "生成中…");
+      if (typeof groupIdx === 'number' && !_seenDone[groupIdx]) {
+        updateStoryboardCard(groupIdx, "loading", null, "生成中…");
+      }
     },
     onTaskCompleted: function (data) {
-      doneCount++;
       var extra = data.extra || {};
       var patch = data.patch || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      var rawUrl = extra.rawUrl || patch.value || data.resultUrl || '';
-      var imageAssetId = extra.assetId || '';
-      var shotIndices = Array.isArray(extra.shotIndices) ? extra.shotIndices : null;
-      if (typeof groupIdx !== 'number' || !rawUrl) return;
-
-      var isCurrent = _safeWriteBack(originId, function (proj) {
-        if (!proj.storyboards) proj.storyboards = [];
-        var existing = proj.storyboards[groupIdx] || {};
-        _archiveOldImage(existing, "storyboard");
-        existing.imageUrl = rawUrl;
-        existing.rawUrl = rawUrl;
-        if (imageAssetId) {
-          existing.imageAssetId = imageAssetId;
-          existing.fetchStatus = 'done';
-        }
-        if (shotIndices) existing.shotIndices = shotIndices;
-        if (existing.realPhotoUrl) delete existing.realPhotoUrl;
-        proj.storyboards[groupIdx] = existing;
-        if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
-      }, data && data.serverVersion);
-      if (isCurrent) updateStoryboardCard(groupIdx, "done", rawUrl);
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+      var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || data.resultUrl || '';
+      _applyTaskCompleted(groupIdx, rawUrl, extra);
     },
     onTaskFailed: function (data) {
-      failCount++;
       var extra = data.extra || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      var errMsg = (data.errorMsg || '生成失败').toString().slice(0, 120);
-      if (typeof groupIdx === 'number') updateStoryboardCard(groupIdx, "error", null, errMsg);
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+      _applyTaskFailed(groupIdx, data.errorMsg);
     },
     onBatchCompleted: function () {
+      pollSettled = true;
+      _stopPoll();
       renderImageGrid();
       finish();
     },
     onClose: function () {
-      // SSE 断开（非正常结束）兜底：按钮还回来，用户可重试
-      finish();
+      // SSE 断开（非正常结束）：保留 polling，让它跑完所有 task
+      // polling 自己会在 batch 真完成时调 finish
     },
   });
 }

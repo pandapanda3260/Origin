@@ -67,7 +67,12 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   //     保证最终风格统一（参考原网站效果）
   const finalPrompt = (() => {
     if (input.style === 'pencil') {
-      return `${input.prompt}\n\nstyle: pencil sketch, hand-drawn line art, monochrome graphite, paper texture, storyboard illustration`;
+      // 手稿风格锁定：精炼版（避免 prompt 过长被中转站拒绝/超时）
+      const PENCIL_PREFIX =
+        'Black-and-white pencil storyboard sketch on textured paper, hand-drawn graphite, visible pencil strokes and cross-hatching, monochrome only (no color). ';
+      const PENCIL_SUFFIX =
+        '\n\nStyle: pencil storyboard sketch, monochrome graphite on paper, hand-drawn line art with shading, cinematic pre-production frame. NOT photorealistic, NOT 3D render, NOT anime, NOT painted, NOT colored. No text, captions, or borders.';
+      return `${PENCIL_PREFIX}${input.prompt}${PENCIL_SUFFIX}`;
     }
     return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
   })();
