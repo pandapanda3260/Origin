@@ -171,15 +171,16 @@ export async function extractAssets() {
   } catch (e) {
     var _errProgressBar = $("assetsExtractProgress");
     if (_errProgressBar) _errProgressBar.classList.remove("extract-bar-pulse");
-    var errText = ((e && e.message) || e).toString().slice(0, 120);
-    _setExtractProgress(0, "提取失败", errText);
+    var errRaw = ((e && e.message) || e).toString();
+    var friendly = _diagnoseApiError(errRaw);
+    _setExtractProgress(0, "提取失败", friendly);
     var _errBanner = $("assetsExtractBanner");
     if (_errBanner) {
       var icon = _errBanner.querySelector(".animate-spin");
       if (icon) { icon.classList.remove("animate-spin"); icon.textContent = "error"; }
     }
     console.error("[Assets] Extract error:", e);
-    showToast("资产分析失败：" + _diagnoseApiError(errText), "error");
+    showToast("资产分析失败：" + friendly, "error");
   }
   _assetsExtracting = false;
   if (btn) btn.disabled = false;
@@ -770,12 +771,49 @@ export function _toastErrorWithActions(rawMsg) {
 }
 
 /**
- * 对外错误文案一刀切：用户只看到「生成失败，请稍后重试」。
- * 真实原因只写入 console.debug 给开发排查。
+ * 把后端返回的原始错误转成用户看得懂的中文。
+ * 优先识别这几类常见错误（按出现概率排）：
+ *   - 中转站余额不足（yungpt: "user quota is not enough"）
+ *   - 官方 OpenAI 余额/限额（"insufficient_quota" / "billing"）
+ *   - 频率限制（"rate limit" / "429"）
+ *   - Key 失效 / 没权限（"401" / "403" / "invalid api key"）
+ *   - 模型不存在（"model_not_found" / "404"）
+ *   - 上下文超限（"context length"）
+ *   - 网络超时（"timeout" / "ETIMEDOUT" / "AbortError"）
+ *   - 中转站连不上（5xx / "connect" / "ECONNREFUSED"）
+ * 都没匹配上 → 显示截断后的原文，比"请稍后重试"更有帮助。
  */
 export function _diagnoseApiError(msg) {
-  try { if (msg) console.debug('[diagnoseApiError] raw:', String(msg).slice(0, 300)); } catch (_e) {}
-  return "生成失败，请稍后重试";
+  var raw = String(msg == null ? "" : msg);
+  try { if (raw) console.debug('[diagnoseApiError] raw:', raw.slice(0, 400)); } catch (_e) {}
+  var s = raw.toLowerCase();
+  if (s.indexOf("quota is not enough") >= 0 || s.indexOf("insufficient_quota") >= 0 || s.indexOf("insufficient quota") >= 0 || s.indexOf("billing") >= 0) {
+    return "中转站/账户余额不足，请到中转站充值或换一个 Key";
+  }
+  if (s.indexOf("rate limit") >= 0 || s.indexOf("rate_limit") >= 0 || s.indexOf("429") >= 0 || s.indexOf("too many requests") >= 0) {
+    return "调用太频繁触发限流，请等 30 秒后重试";
+  }
+  if (s.indexOf("invalid api key") >= 0 || s.indexOf("invalid_api_key") >= 0 || s.indexOf("incorrect api key") >= 0 || s.indexOf("401") >= 0 || s.indexOf("unauthorized") >= 0 || s.indexOf("403") >= 0 || s.indexOf("forbidden") >= 0) {
+    return "API Key 无效或没权限，请到设置页检查 Key";
+  }
+  if (s.indexOf("model_not_found") >= 0 || s.indexOf("model not found") >= 0 || s.indexOf("does not exist") >= 0 || (s.indexOf("404") >= 0 && s.indexOf("model") >= 0)) {
+    return "中转站不支持这个模型，请到设置页换一个模型";
+  }
+  if (s.indexOf("context length") >= 0 || s.indexOf("maximum context") >= 0 || s.indexOf("token limit") >= 0) {
+    return "剧本/上下文太长超出模型限制，可考虑换更大上下文的模型";
+  }
+  if (s.indexOf("timeout") >= 0 || s.indexOf("etimedout") >= 0 || s.indexOf("aborterror") >= 0 || s.indexOf("超时") >= 0) {
+    return "请求超时（中转站响应太慢），请重试或换中转站";
+  }
+  if (s.indexOf("econnrefused") >= 0 || s.indexOf("enotfound") >= 0 || s.indexOf("network") >= 0 || s.indexOf("fetch failed") >= 0) {
+    return "无法连接到中转站，请检查网络或中转站地址";
+  }
+  if (/\b5\d\d\b/.test(s)) {
+    return "中转站服务异常（5xx），请稍后重试或换中转站";
+  }
+  // 都没匹配上 → 截断原文（去掉前缀的"图像生成失败：" 之类，更干净）
+  var cleaned = raw.replace(/^([\u4e00-\u9fa5]+(?:失败)?[:：]\s*)+/, "").trim();
+  return cleaned ? cleaned.slice(0, 120) : "生成失败，请稍后重试";
 }
 
 /**

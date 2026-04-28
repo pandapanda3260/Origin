@@ -98,6 +98,9 @@ export function resolveLLMConfig(
 /* ============================================================
    非流式调用：拿一个完整字符串
    ============================================================ */
+// 单次 LLM 文本调用最长等 90 秒；超过就 abort，避免中转站挂掉时无限等待
+const LLM_REQUEST_TIMEOUT_MS = 90_000;
+
 export async function chatComplete(
   user: UserRow | null,
   messages: ChatMessage[],
@@ -120,22 +123,53 @@ export async function chatComplete(
     body.response_format = { type: 'json_object' };
   }
 
-  const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LLM_REQUEST_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    if (e?.name === 'AbortError') {
+      throw new Error(`LLM 请求超时（>${LLM_REQUEST_TIMEOUT_MS / 1000}s 未返回）`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`LLM ${resp.status}: ${text.slice(0, 500)}`);
+    const text = await resp.text().catch(() => '');
+    // 试着把中转站返回的 JSON 错误体里的 message 抽出来，体验更好
+    const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
+    throw new Error(`LLM ${resp.status}: ${friendly}`);
   }
   const json: any = await resp.json();
+  // 即使 200 也可能塞了一个 error 体（某些中转站这么干）
+  if (json?.error) {
+    const friendly = (typeof json.error === 'string' ? json.error : json.error?.message) || JSON.stringify(json.error).slice(0, 400);
+    throw new Error(`LLM 错误: ${friendly}`);
+  }
   const content = json?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回结构异常（缺 message.content）');
   return content;
+}
+
+/** 从中转站/OpenAI 风格的错误体中抽 message，方便上层显示友好提示 */
+function extractApiErrorMessage(text: string): string {
+  if (!text) return '';
+  try {
+    const j = JSON.parse(text);
+    return j?.error?.message || j?.message || j?.detail || '';
+  } catch {
+    return '';
+  }
 }
 
 /* ============================================================
@@ -208,17 +242,32 @@ export async function chatStream(
     body.response_format = { type: 'json_object' };
   }
 
-  const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  // 流式调用整段 timeout 给 180s（流式天然更慢；超时主要兜底"中转站完全挂了不返回"）
+  const streamController = new AbortController();
+  const streamTimer = setTimeout(() => streamController.abort(), 180_000);
+  let resp: Response;
+  try {
+    resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: streamController.signal,
+    });
+  } catch (e: any) {
+    clearTimeout(streamTimer);
+    if (e?.name === 'AbortError') {
+      throw new Error('LLM 流式请求超时（>180s 未返回）');
+    }
+    throw e;
+  }
   if (!resp.ok || !resp.body) {
+    clearTimeout(streamTimer);
     const text = await resp.text().catch(() => '');
-    throw new Error(`LLM ${resp.status}: ${text.slice(0, 500)}`);
+    const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
+    throw new Error(`LLM ${resp.status}: ${friendly}`);
   }
 
   const reader = resp.body.getReader();
@@ -226,30 +275,40 @@ export async function chatStream(
   let buffer = '';
   let full = '';
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() || '';
-    for (const part of parts) {
-      const line = part.trim();
-      if (!line.startsWith('data: ')) continue;
-      const payload = line.slice(6).trim();
-      if (payload === '[DONE]') return full;
-      try {
-        const evt: any = JSON.parse(payload);
-        const delta = evt?.choices?.[0]?.delta?.content;
-        if (typeof delta === 'string' && delta.length) {
-          full += delta;
-          onChunk(delta);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (payload === '[DONE]') return full;
+        try {
+          const evt: any = JSON.parse(payload);
+          // 中转站可能在流里塞 error 帧
+          if (evt?.error) {
+            const m = (typeof evt.error === 'string' ? evt.error : evt.error?.message) || JSON.stringify(evt.error).slice(0, 300);
+            throw new Error(`LLM 流错误: ${m}`);
+          }
+          const delta = evt?.choices?.[0]?.delta?.content;
+          if (typeof delta === 'string' && delta.length) {
+            full += delta;
+            onChunk(delta);
+          }
+        } catch (parseErr: any) {
+          // 真正的 LLM 错误帧要抛出去；普通解析失败的心跳行忽略
+          if (parseErr?.message?.startsWith('LLM 流错误')) throw parseErr;
         }
-      } catch {
-        // ignore parse errors on heartbeat lines
       }
     }
+    return full;
+  } finally {
+    clearTimeout(streamTimer);
   }
-  return full;
 }
 
 /* ============================================================
