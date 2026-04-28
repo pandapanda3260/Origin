@@ -3001,6 +3001,31 @@ var _projectEpoch = 0;
       getProjectList: () => getProjectList(),
       refreshScriptPage: () => refreshScriptPage(),
       getStoryboardGroups: () => getStoryboardGroups(),
+      // 安全网：批次完成时调一次，从服务端整包重新拉项目并把 in-memory 替换掉，
+      // 这样即便 SSE 单帧丢失（网络抖动 / 浏览器节流），UI 最终一定会和服务器
+      // 真实状态一致——相当于"自动帮用户按一次 F5"。
+      reloadProjectFromServer: async () => {
+        if (!project || !project.id) return false;
+        try {
+          var resp = await fetch("/api/projects/" + encodeURIComponent(project.id), { headers: _getAuthHeaders() });
+          if (!resp.ok) return false;
+          var p = await resp.json();
+          if (!p || !p.id || p.id !== project.id) return false;
+          project = p;
+          syncEditProject(project);
+          syncTasksProject(project);
+          syncVideoTasksProject(project);
+          syncVideoPromptsProject(project);
+          syncShotsProject(project);
+          syncStoryboardProject(project);
+          syncScriptProject(project);
+          syncAssetsProject(project);
+          return true;
+        } catch (e) {
+          console.warn("[reloadProjectFromServer] failed:", e);
+          return false;
+        }
+      },
     });
     syncAssetsProject(project);
     // Phase 5.10 · 启动时序补丁：`loadProject()`（line 2633）内部触发的

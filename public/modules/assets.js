@@ -1076,8 +1076,9 @@ function _attachAssetImageBatch(opts) {
       var type = tgt.type;
       var idx = tgt.idx;
       var url = extra.rawUrl || patch.value || "";
+      console.log("[AssetImg] task_completed seq=" + data.targetSeq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
       if (!type || typeof idx !== "number" || !url) {
-        console.warn("[AssetImg] task_completed missing target/url:", data);
+        console.warn("[AssetImg] task_completed missing target/url — UI will not update without refresh:", data);
       doneCount++;
         return;
       }
@@ -1109,6 +1110,7 @@ function _attachAssetImageBatch(opts) {
         if (proj._staleFlags) delete proj._staleFlags["asset_img_" + type + "_" + idx];
       }, data && data.serverVersion);
 
+      console.log("[AssetImg] writeback isCurrent=" + isCurrent + " displayUrl=" + (displayUrl || "").slice(0, 60));
       if (isCurrent) updateAssetCardImage(type, idx, "done", displayUrl);
       _refreshHint();
     },
@@ -1125,7 +1127,22 @@ function _attachAssetImageBatch(opts) {
       }
       _refreshHint();
     },
-    onBatchCompleted: function () {
+    onBatchCompleted: async function () {
+      console.log("[AssetImg] batch_completed → safety-net: reloading project from server");
+      // 安全网：批次完成后从服务端整包拉一次项目数据，把 in-memory 替换掉。
+      // 这样即便单条 task_completed SSE 帧因任何原因丢失，最终 UI 也一定会
+      // 反映服务器真实状态（图都已经落到 DB 上了）。等于"自动帮用户按 F5"。
+      try {
+        if (_ctx.reloadProjectFromServer) {
+          var ok = await _ctx.reloadProjectFromServer();
+          console.log("[AssetImg] reloadProjectFromServer ok=" + ok);
+        }
+      } catch (e) {
+        console.warn("[AssetImg] reloadProjectFromServer failed:", e);
+      }
+      // 安全网渲染：不管之前 task_completed 有没有走完，到这里把三个 grid
+      // 全部按服务端权威数据重渲一次
+      try { renderAssets(); } catch (e) { console.warn("[AssetImg] renderAssets after reload failed:", e); }
       finish({ done: doneCount, failed: failCount });
     },
     onClose: function () {
