@@ -1026,7 +1026,14 @@ function _attachAssetImageBatch(opts) {
   var doneCount = opts.initialDone || 0;
   var failCount = opts.initialFailed || 0;
   var settled = false;
-  function finish(res) { if (settled) return; settled = true; onFinish(res); }
+  var pollTimer = null;
+  function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  function finish(res) {
+    if (settled) return;
+    settled = true;
+    _stopPoll();
+    onFinish(res);
+  }
 
   // 启动时刻 + 每张完成时间，用来动态算"平均 X 秒/张" → 估剩余时间
   var startTs = Date.now();
@@ -1053,6 +1060,37 @@ function _attachAssetImageBatch(opts) {
   }
   // 给一个初始 hint，避免空白
   _refreshHint();
+
+  // ====================================================================
+  // 兜底轮询：每 5 秒主动 GET /api/batch/<id> 拿后端权威状态。
+  // SSE 在某些环境下不稳定（开发热重载、浏览器后台节流、反代 buffer 等），
+  // 轮询保证不管 SSE 通不通，UI 最终一定追得上。
+  // 轮询发现 status=completed/failed/cancelled → 立即触发 onBatchCompleted
+  // 流程（reload + rerender + finish），并停掉自身。
+  // ====================================================================
+  async function _pollOnce() {
+    if (settled) return;
+    try {
+      var snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
+      if (!snap || settled) return;
+      // 用后端权威值修正本地计数（即便 SSE 帧全丢，hint 也会刷新）
+      if (typeof snap.succeeded === "number" && snap.succeeded > doneCount) doneCount = snap.succeeded;
+      if (typeof snap.failed === "number" && snap.failed > failCount) failCount = snap.failed;
+      _refreshHint();
+      if (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled") {
+        console.log("[AssetImg] poll detected batch finished status=" + snap.status + " — triggering safety net");
+        try {
+          if (_ctx.reloadProjectFromServer) await _ctx.reloadProjectFromServer();
+        } catch (e) { console.warn("[AssetImg] reload after poll failed:", e); }
+        try { renderAssets(); } catch (_) {}
+        finish({ done: doneCount, failed: failCount });
+      }
+    } catch (e) {
+      // 轮询失败不致命，下一轮重试
+      console.warn("[AssetImg] poll failed:", (e && e.message) || e);
+    }
+  }
+  pollTimer = setInterval(_pollOnce, 5000);
 
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {
