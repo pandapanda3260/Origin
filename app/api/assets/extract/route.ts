@@ -54,11 +54,26 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 兜底：如果 LLM 漏了 imagePrompt 字段，用其他字段拼一个
-    parsed.characters = parsed.characters.map((c: any) => ({
-      ...c,
-      imagePrompt: c.imagePrompt || buildCharacterPrompt(c, styleBible),
-    }));
+    // 兜底：如果 LLM 漏了某些必填字段，用其他字段拼一个，免得前端卡片显示空白
+    parsed.characters = parsed.characters.map((c: any) => {
+      const entityType = (c.entityType === 'non-human' ? 'non-human' : 'human') as 'human' | 'non-human';
+      return {
+        ...c,
+        entityType,
+        // role / identity 是前端卡片小字一行；缺了就拿 intro 顶上，否则空
+        role: c.role || c.intro || '',
+        identity: c.identity || c.intro || '',
+        // appearance / clothing / equipment 拼起来是详情段；旧字段 detail 兜底拆给 appearance
+        appearance: c.appearance || c.detail || c.intro || '',
+        clothing: c.clothing || '',
+        equipment: c.equipment || '',
+        // temperament / actionTraits 必须是逗号分隔的字符串，前端拆成多个标签胶囊
+        temperament: c.temperament || '',
+        actionTraits: c.actionTraits || '',
+        tags: Array.isArray(c.tags) ? c.tags : [],
+        imagePrompt: c.imagePrompt || buildCharacterPrompt(c, styleBible),
+      };
+    });
     parsed.environments = parsed.environments.map((e: any) => ({
       ...e,
       imagePrompt: e.imagePrompt || buildScenePrompt(e, styleBible),
@@ -143,15 +158,16 @@ function styleSuffix(sb: any): string {
   return parts.length ? parts.join(', ') : 'cinematic illustration style';
 }
 
-function buildCharacterPrompt(c: any, sb: any): string {
+function buildCharacterPrompt(c: any, _sb: any): string {
+  // 风格 / 光线 / 背景 / 三视图布局都由 image-gen 的 forceStyleSuffix 强制统一加
+  // 这里只描述"主体本身"
   const bits = [
-    'character portrait of',
-    c.name ? `${c.name},` : '',
-    c.detail || c.intro || '',
-    c.temperament ? `temperament: ${c.temperament},` : '',
-    c.actionTraits ? `action: ${c.actionTraits},` : '',
-    'natural lighting, clean background,',
-    styleSuffix(sb),
+    c.name ? `Subject: ${c.name}.` : '',
+    c.appearance || c.detail || c.intro || '',
+    c.clothing ? `Clothing: ${c.clothing}.` : '',
+    c.equipment ? `Equipment: ${c.equipment}.` : '',
+    c.temperament ? `Temperament: ${c.temperament}.` : '',
+    c.entityType === 'non-human' ? 'NOTE: this is a non-human creature, keep its actual non-human anatomy, do NOT redraw as a person.' : '',
   ];
   return bits.filter(Boolean).join(' ').trim();
 }

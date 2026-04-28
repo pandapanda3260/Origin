@@ -23,6 +23,10 @@ export type ImageGenInput = {
   quality?: 'low' | 'medium' | 'high' | 'auto' | 'standard' | 'hd';
   // 用于持久化分类
   kind: 'character' | 'scene' | 'prop' | 'storyboard' | 'other';
+  // 角色生成时区分人 / 非人（如海鲜拟人、机甲、动物）。
+  // 默认 'human'：走"白底+真人摄影+三视图"风格；
+  // 'non-human' 时换成"白底+实物写实+保留生物形态"风格，避免把蟹盾画成真人。
+  entityType?: 'human' | 'non-human';
   projectId?: string;
   assetRef?: string; // e.g. 'characters[0]' / 'storyboards[2]'
 };
@@ -65,7 +69,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     if (input.style === 'pencil') {
       return `${input.prompt}\n\nstyle: pencil sketch, hand-drawn line art, monochrome graphite, paper texture, storyboard illustration`;
     }
-    return `${input.prompt}\n\n${forceStyleSuffix(input.kind)}`;
+    return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
   })();
 
   // 解析尺寸
@@ -197,8 +201,30 @@ function parseSize(s: string): [number, number] {
  *   - LLM 抽资产时写出来的 imagePrompt 风格千差万别（半写实插画、动漫、CG…）
  *   - 这里在最终调图像 API 前强行追加一段 hard rule，覆盖掉风格漂移
  */
-function forceStyleSuffix(kind: ImageGenInput['kind']): string {
+function forceStyleSuffix(
+  kind: ImageGenInput['kind'],
+  entityType: ImageGenInput['entityType'] = 'human',
+): string {
   if (kind === 'character') {
+    if (entityType === 'non-human') {
+      // 非人实体（拟人化海鲜、机甲、动物、异形）：保留生物本来的形态，
+      // 不能强行画成真人；但白底+写实摄影+三视图布局保持一致。
+      return [
+        '=== MANDATORY STYLE OVERRIDE (must follow) ===',
+        'Style: photorealistic creature/object photography, sharp focus, high detail, magazine-grade quality.',
+        'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, NO shadows on backdrop, NO gradient, NO other objects.',
+        'Layout: reference sheet showing the SAME subject in THREE views side-by-side, evenly spaced:',
+        '  · Left:   front view',
+        '  · Middle: 3/4 or side view',
+        '  · Right:  back view',
+        'IMPORTANT: keep the subject\'s actual non-human anatomy (e.g. crab, shrimp, mech, animal) — do NOT redraw it as a human.',
+        'Lighting: even soft studio lighting, no harsh shadows.',
+        'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, stylized art.',
+        'STRICTLY NOT allowed: turning the subject into a human person if it is not one.',
+        'STRICTLY NOT allowed: any text, watermark, logo, frame, border.',
+      ].join('\n');
+    }
+    // 人类角色：白底 + 真人摄影 + 三视图（正/侧/背全身）
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
       'Style: photorealistic photography, professional studio headshot quality, sharp focus, magazine-grade photography, high detail.',

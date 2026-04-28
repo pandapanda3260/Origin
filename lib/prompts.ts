@@ -328,18 +328,22 @@ export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
 
 【任务】从剧本中识别所有需要做参考图的角色、场景、道具，并为**每个资产**生成图像生成 prompt。
 
-【输出严格 JSON】
+【输出严格 JSON】（字段名必须完全照搬）
 {
   "characters": [
     {
       "id": "c1",
-      "name": "角色名",
-      "intro": "30 字以内的人物简介",
-      "detail": "100-200 字的详细介绍（年龄、外貌、衣着、性格、关键动作偏好）",
-      "temperament": "气质标签（坚定/温柔/狡黠/天真）",
-      "actionTraits": "动作特征（爱皱眉/手不离咖啡杯）",
-      "tags": ["主角","女性","30岁"],
-      "imagePrompt": "图像生成提示词（英文，60-120 词，详细描述外貌+服装+表情+姿态+背景环境，参考风格圣经的整体风格）"
+      "name": "角色名（如：老周）",
+      "role": "在故事中的身份角色（如：主导者、对手、旁观员工、客人）",
+      "identity": "一句话身份定位（如：海鲜自助餐厅老板、拟人化海鲜员工）",
+      "entityType": "human 或 non-human（拟人化海鲜/机甲/动物/异形等填 non-human）",
+      "appearance": "外貌描述（年龄、性别、身形、面部、发型、肤色等，60-120 字）",
+      "clothing": "服装描述（上衣/下装/配饰/材质/颜色，30-80 字）",
+      "equipment": "随身物品（手里拿什么、佩戴什么），无则填空字符串",
+      "temperament": "气质标签，**用中文逗号分隔的多个词**（如：干练，威严，克制幽默，管理者气场，接地气）",
+      "actionTraits": "动作特征，**用中文逗号分隔的多个词**（如：爱扶额，皱眉，手插腰）",
+      "tags": ["主角","男","50岁"],
+      "imagePrompt": "英文 60-120 词，只描述主体（人/生物的外貌+服装+姿态），不写风格/光线/背景，由后台统一加"
     }
   ],
   "environments": [
@@ -350,7 +354,7 @@ export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
       "isMain": true,
       "baseSceneRef": null,
       "tags": ["室内","海鲜店","打烊"],
-      "imagePrompt": "图像生成提示词（英文，60-120 词，详细描述空间布局+光线+物品陈设+整体氛围，参考风格圣经的色彩调板）"
+      "imagePrompt": "英文 60-120 词，描述空间布局+物品陈设。不写风格、白底、光线（后台会加）"
     },
     {
       "id": "e2",
@@ -359,7 +363,7 @@ export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
       "isMain": false,
       "baseSceneRef": "e1",
       "tags": ["室内","海鲜店","后厨"],
-      "imagePrompt": "图像生成提示词（保留主场景的色彩、材质、光线基调，但描述不同的具体角落）"
+      "imagePrompt": "英文 60-120 词，描述这个具体角落的布局/陈设"
     }
   ],
   "props": [
@@ -370,37 +374,50 @@ export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
       "function": "在剧本里的作用（线索/情感寄托/工具）",
       "ownership": "关联哪位角色 id（如 c1，公共道具填 null）",
       "features": "外观/材质/颜色",
-      "imagePrompt": "图像生成提示词（英文，40-80 词，详细描述材质、颜色、形状、磨损程度、光照下的质感）"
+      "imagePrompt": "英文 40-80 词，描述材质+颜色+形状+磨损"
     }
   ]
 }
 
-【规则 - 重要】
-  · **角色**：只抽出有"画面亮相"的，旁白者不算角色。每个角色必须有 imagePrompt
-  · **场景**：
-    - 第一个"主场景"放 isMain=true，baseSceneRef=null
-    - **必须**至少生成 1-2 个**副场景**（isMain=false，baseSceneRef 指向主场景 id）
-    - 副场景定义：和主场景在同一个空间但不同区域/角度，比如：
-      · 主场景=海鲜店主厅 → 副场景=海鲜店后厨、海鲜店收银台角落
-      · 主场景=咖啡馆 → 副场景=咖啡馆吧台、咖啡馆窗边座位
-      · 主场景=办公室 → 副场景=办公室茶水间、办公室会议室
-    - 副场景要保持和主场景**视觉一致**（同样的光线、色调、材质语言）
-  · **道具**：只抽出推动剧情或反复出现的关键道具
-  · 数量：3-6 个角色、2-4 个场景（**至少 1 个主场景 + 1 个副场景**）、3-6 个道具
+【字段填写要点 - 重要】
+  · entityType：**必填**，判断标准：
+    - human：现实中的真人（哪怕是虚构角色，只要外形是人）
+    - non-human：拟人化的动物/海鲜/机甲/异形/AI 生物（如"虾盾""蟹盾""帝王蟹""锅老板"等）
+  · role + identity：合起来要能让人秒懂这个角色在故事里是干嘛的，对应原网站卡片
+    上"老周 / 主导者 · 海鲜自助餐厅老板"那一行小字。**两者都不能空**。
+  · appearance + clothing + equipment 三个字段会被前端拼起来当详细介绍展示
+    （类似"中年中国男性，东亚面孔... | 黑色 T 恤，深色防水围裙 | 手里拿着记账板"），
+    所以三段要清晰互不重复。equipment 可以为空字符串。
+  · temperament 和 actionTraits 必须是**用中文逗号「，」分隔的多个标签**，
+    前端会按逗号拆成多个胶囊小标签展示。每个字段建议 3-6 个词。
+  · 非人角色（entityType=non-human）：appearance 写它本身的形态（蟹腿、甲壳、
+    钳子、触手等），不要硬画成人；clothing 可以填空字符串或微小拟人配件
+    （工牌/肩带等）；imagePrompt 用英文写出"crab"/"shrimp"/"creature"等真实物种名。
 
-【imagePrompt 写作要求 - 重要】
-  · 用英文，因为图像生成模型对英文理解更准
-  · 只描述"主体本身"——长什么样、穿什么、什么材质、什么动作、是什么人/物
-  · **不要**写画面风格、背景颜色、光线、布局——这些后台会强制统一为
-    "白底 + 真人写实摄影 + 角色三视图"，你写了也会被覆盖掉
-  · 角色 prompt 示例："a middle-aged Chinese man in his 50s, weathered face with friendly smile, short salt-and-pepper hair, wearing a dark waterproof apron over a black t-shirt, dark trousers, holding a wooden clipboard"
-  · 场景 prompt 示例："interior of a small Chinese seafood restaurant, dim warm lighting from pendant lamps, glowing fish tanks along the wall, wooden tables and stacked chairs, weathered tile floor"
-  · 道具 prompt 示例："a worn wooden clipboard with handwritten notes pinned under the metal clip, slightly scratched surface"
-  · ❌ 不要出现这类词："cinematic", "illustration style", "anime", "cartoon",
-    "warm lighting", "studio backdrop", "white background"——后台会强制加
+【场景规则】
+  · 第一个"主场景"放 isMain=true，baseSceneRef=null
+  · **必须**至少生成 1-2 个**副场景**（isMain=false，baseSceneRef 指向主场景 id）
+  · 副场景定义：和主场景在同一个空间但不同区域/角度，比如：
+    - 主场景=海鲜店主厅 → 副场景=海鲜店后厨、收银台角落
+    - 主场景=咖啡馆 → 副场景=咖啡馆吧台、窗边座位
+  · 副场景要保持和主场景**视觉一致**（光线、色调、材质语言一致）
+
+【数量】
+  · 3-6 个角色、2-4 个场景（**至少 1 主 1 副**）、3-6 个道具
+
+【imagePrompt 写作要求】
+  · 全英文（图像模型对英文理解更准）
+  · 只描述"主体本身"——长什么样、穿什么、什么形态、什么动作
+  · **不要**写画面风格 / 背景颜色 / 光线 / 布局 / "三视图"——后台会强制统一加
+  · 真人示例："a middle-aged Chinese man in his 50s, weathered face with friendly smile, short salt-and-pepper hair, wearing a dark waterproof apron over a black t-shirt, holding a wooden clipboard"
+  · 非人示例（蟹盾）："a giant anthropomorphic king crab, massive red-orange spiny carapace, thick crab legs, large pincers, alert expression, wearing only a small employee name tag clipped to its shell, no human body parts"
+  · 场景示例："interior of a small Chinese seafood restaurant after closing, fish tanks along the wall, wooden tables and stacked chairs, weathered tile floor"
+  · 道具示例："a worn wooden clipboard with handwritten notes pinned under the metal clip, slightly scratched surface"
+  · ❌ 不要出现："cinematic", "illustration style", "anime", "cartoon", "warm lighting", "studio backdrop", "white background"
 
 【绝对禁止】
   · 任何资产的 imagePrompt 字段为空字符串
+  · 把拟人化的非人角色（蟹/虾/AI 生物）的 entityType 误写成 human
   · 只生成主场景而不生成副场景
   · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要解释）`;
 

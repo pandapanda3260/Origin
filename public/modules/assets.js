@@ -1028,17 +1028,40 @@ function _attachAssetImageBatch(opts) {
   var settled = false;
   function finish(res) { if (settled) return; settled = true; onFinish(res); }
 
+  // 启动时刻 + 每张完成时间，用来动态算"平均 X 秒/张" → 估剩余时间
+  var startTs = Date.now();
+  function _refreshHint() {
+    if (!hint) return;
+    var done = doneCount;
+    var fail = failCount;
+    var pending = Math.max(0, totalTasks - done - fail);
+    var parts = ["生成中… " + done + "/" + totalTasks];
+    if (fail > 0) parts.push(fail + " 张失败");
+    if (pending > 0) {
+      // 已完成至少 1 张：用真实速度估剩余；否则给 35 秒/张的初始猜测
+      var avgSec;
+      if (done + fail >= 1) {
+        avgSec = (Date.now() - startTs) / 1000 / (done + fail);
+      } else {
+        avgSec = 35;
+      }
+      // 并发 3 → 实际墙钟时间约为 pending × avgSec ÷ 3
+      var remain = Math.ceil(pending * avgSec / 3);
+      parts.push("约剩 " + remain + " 秒");
+    }
+    hint.textContent = parts.join("，");
+  }
+  // 给一个初始 hint，避免空白
+  _refreshHint();
+
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {
-      if (hint && snap && typeof snap.total === "number") {
-        var done = snap.succeeded || 0;
-        var fail = snap.failed || 0;
-        var pending = totalTasks - done - fail;
-        var parts = ["生成中… " + done + "/" + totalTasks];
-        if (fail > 0) parts.push(fail + " 张失败");
-        if (pending > 0) parts.push("剩余约 " + Math.ceil(pending * 30 / 3) + " 秒");
-        hint.textContent = parts.join("，");
+      if (snap && typeof snap.total === "number") {
+        // snapshot 里 succeeded/failed 是后端权威值，refresh 用它修正本地计数
+        if (typeof snap.succeeded === "number") doneCount = Math.max(doneCount, snap.succeeded);
+        if (typeof snap.failed === "number") failCount = Math.max(failCount, snap.failed);
       }
+      _refreshHint();
     },
     onTaskStarted: function (data) {
       var tgt = (data && data.target) || seqToTarget[data.targetSeq] || {};
@@ -1087,7 +1110,7 @@ function _attachAssetImageBatch(opts) {
       }, data && data.serverVersion);
 
       if (isCurrent) updateAssetCardImage(type, idx, "done", displayUrl);
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalTasks;
+      _refreshHint();
     },
     onTaskFailed: function (data) {
       failCount++;
@@ -1100,7 +1123,7 @@ function _attachAssetImageBatch(opts) {
       if (type && typeof idx === "number") {
         updateAssetCardImage(type, idx, "error");
       }
-      if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalTasks;
+      _refreshHint();
     },
     onBatchCompleted: function () {
       finish({ done: doneCount, failed: failCount });

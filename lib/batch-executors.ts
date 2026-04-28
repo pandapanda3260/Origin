@@ -73,42 +73,72 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   const prompt = item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible);
 
   ctx.progress({ stage: 'calling_image_api' });
-  // 角色：宽图（1536×1024），让"正面+侧面+背面"三视图能横着排开，对齐原网站的展示
-  // 场景：宽图（1536×1024），适合做 establishing shot
-  // 道具：方图（1024×1024），适合做白底 product shot
+  // 尺寸策略：
+  //   - 真人角色：1536×1024（宽图），三视图横向排开
+  //   - 非人角色（拟人海鲜/机甲/动物）：1536×1024 也用三视图（前/侧/背）
+  //   - 场景：1536×1024 establishing shot
+  //   - 道具：1024×1024 白底 product shot
+  const entityType: 'human' | 'non-human' =
+    type === 'char' && (item.entityType === 'non-human') ? 'non-human' : 'human';
+
   const result = await generateImage(ctx.user, {
     prompt,
     size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : '1024x1024',
     style: 'natural',
     kind: type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop',
+    entityType: type === 'char' ? entityType : undefined,
     projectId: ctx.projectId,
     assetRef: `${cat}[${idx}]`,
   });
 
-  // 写回项目：把 imageUrl + imagePrompt 落到资产对象
+  // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
+  // 注意：写入 imageUrl + rawUrl 两个字段，因为前端不同卡片读不同字段（兼容历史）
   const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
   if (fresh) {
     const assets = (fresh as any).assets || { characters: [], scenes: [], props: [] };
     if (!assets[cat]) assets[cat] = [];
     if (!assets[cat][idx]) assets[cat][idx] = {};
+    const charExtra = type === 'char'
+      ? { realPhotoUrl: result.url, pencilUrl: result.url, skippedStylize: true }
+      : {};
     assets[cat][idx] = {
       ...assets[cat][idx],
       imageUrl: result.url,
+      rawUrl: result.url,
       imagePrompt: prompt,
       imageGeneratedAt: new Date().toISOString(),
+      ...charExtra,
     };
     // 顶层 characters/environments/props 也同步（前端两种结构都读）
     const topKey = cat === 'characters' ? 'characters' : cat === 'scenes' ? 'environments' : 'props';
     const top = (fresh as any)[topKey] || [];
     if (!top[idx]) top[idx] = {};
-    top[idx] = { ...top[idx], imageUrl: result.url, imagePrompt: prompt };
+    top[idx] = {
+      ...top[idx],
+      imageUrl: result.url,
+      rawUrl: result.url,
+      imagePrompt: prompt,
+      ...charExtra,
+    };
     updateProjectForUser(ctx.projectId, ctx.user.id, { assets, [topKey]: top });
   }
 
+  // task_completed 事件 payload：前端 onTaskCompleted 读 extra.rawUrl / extra.pencilUrl
+  // 来实时更新卡片 UI（不刷新就能看到图）。之前我们漏发这两个字段，所以图必须
+  // 刷新页面才显示——这里补上。
   return {
     resultUrl: result.url,
-    patch: { type: 'asset_image', cat, idx, imageUrl: result.url, imagePrompt: prompt },
-    extra: { mode: result.mode, width: result.width, height: result.height },
+    patch: { type: 'asset_image', cat, idx, value: result.url, imageUrl: result.url, imagePrompt: prompt },
+    extra: {
+      type,
+      idx,
+      rawUrl: result.url,
+      pencilUrl: type === 'char' ? result.url : undefined,
+      skippedStylize: type === 'char' ? true : undefined,
+      mode: result.mode,
+      width: result.width,
+      height: result.height,
+    },
   };
 });
 
