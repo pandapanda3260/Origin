@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { chatComplete, parseJsonLoose } from '@/lib/llm';
+import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { buildStyleBibleMessages } from '@/lib/prompts';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
@@ -22,12 +22,13 @@ export async function POST(req: NextRequest) {
 
   let styleBible: any = null;
   try {
-    const raw = await chatComplete(user, buildStyleBibleMessages(finalScript), {
-      temperature: 0.4,
-      responseFormat: 'json_object',
-      maxTokens: 800,
-    });
-    styleBible = parseJsonLoose(raw);
+    styleBible = await chatCompleteJsonWithRetry(
+      user,
+      buildStyleBibleMessages(finalScript),
+      { temperature: 0.4, maxTokens: 2500 },
+      (raw) => parseJsonLoose(raw),
+      'styleBible',
+    );
   } catch (e: any) {
     return jsonError('风格圣经生成失败：' + (e?.message || String(e)), 502);
   }

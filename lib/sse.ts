@@ -18,6 +18,12 @@
 
 export type SSEWriter = {
   chunk: (text: string) => void;
+  // 命名分块：前端 script.js / episodes.js 等模块按事件类型分流（剧本流、咨询对话流、风格圣经流……）
+  aiChunk: (text: string) => void;
+  scriptChunk: (text: string) => void;
+  styleBibleChunk: (text: string) => void;
+  // 阶段切换提示：phase(name, extra?) → 前端按 evt.name 切状态文案
+  phase: (name: string, extra?: Record<string, any>) => void;
   step: (label: string) => void;
   event: (eventName: string, data: any) => void; // 任意自定义事件
   done: (data?: Record<string, any>) => void;
@@ -42,6 +48,10 @@ export function sseResponse(handler: (writer: SSEWriter) => Promise<void> | void
 
       const writer: SSEWriter = {
         chunk: (text) => send({ type: 'chunk', content: text }),
+        aiChunk: (text) => send({ type: 'ai_chunk', content: text }),
+        scriptChunk: (text) => send({ type: 'script_chunk', content: text }),
+        styleBibleChunk: (text) => send({ type: 'style_bible_chunk', content: text }),
+        phase: (name, extra) => send({ type: 'phase', name, ...(extra || {}) }),
         step: (label) => send({ type: 'chunk', content: `<step>${label}</step>` }),
         event: (eventName, data) => send({ type: eventName, ...(data || {}) }),
         done: (data = {}) => {

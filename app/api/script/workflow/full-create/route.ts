@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
-import { chatStream, chatComplete, parseJsonLoose } from '@/lib/llm';
+import { chatStream, chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import {
   buildFullCreateMessages,
   buildStyleBibleMessages,
@@ -68,35 +68,42 @@ export async function POST(req: NextRequest) {
     });
     await chatStream(user, messages, { temperature: 0.8, maxTokens: 3000 }, (delta) => {
       scriptText += delta;
-      writer.chunk(delta);
+      writer.scriptChunk(delta);
     });
 
+    // 兜底：如果 LLM 还是输出了 <step> 标签，剥掉
+    scriptText = scriptText.replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
+
+    writer.phase('style_bible_start');
     writer.step('正在提取风格圣经…');
     let styleBible: any = null;
     try {
-      const sbRaw = await chatComplete(user, buildStyleBibleMessages(scriptText), {
-        temperature: 0.4,
-        responseFormat: 'json_object',
-        maxTokens: 800,
-      });
-      styleBible = parseJsonLoose(sbRaw);
+      styleBible = await chatCompleteJsonWithRetry(
+        user,
+        buildStyleBibleMessages(scriptText),
+        { temperature: 0.4, maxTokens: 2500 },
+        (raw) => parseJsonLoose(raw),
+        'styleBible',
+      );
     } catch (e: any) {
-      console.warn('[full-create] styleBible failed:', e?.message);
-      styleBible = { vision: '', colorPalette: '', fashion: '', mood: '', cameraStyle: '', worldRules: '' };
+      console.warn('[full-create] styleBible failed after retries:', e?.message);
+      styleBible = { visualStyle: '提取失败（请点击重新生成）', visualStyleDesc: '', colorPalette: [], era: '', mood: '', cameraStyle: '', worldRules: '' };
     }
 
+    writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
     let emotions: any[] = [];
     try {
-      const emoRaw = await chatComplete(
+      const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
         user,
         buildRetagMessages(scriptText, durationSec || (proj as any)?.scriptTargetDurationSec),
-        { temperature: 0.4, responseFormat: 'json_object', maxTokens: 800 },
+        { temperature: 0.4, maxTokens: 1200 },
+        (raw) => parseJsonLoose<{ emotions: any[] }>(raw),
+        'emotions',
       );
-      const emoJson = parseJsonLoose<{ emotions: any[] }>(emoRaw);
       emotions = Array.isArray(emoJson?.emotions) ? emoJson.emotions : [];
     } catch (e: any) {
-      console.warn('[full-create] emotions failed:', e?.message);
+      console.warn('[full-create] emotions failed after retries:', e?.message);
     }
 
     if (projectId && proj) {
@@ -115,7 +122,10 @@ export async function POST(req: NextRequest) {
     writer.done({
       script: scriptText,
       styleBible,
+      // 前端 script.js 读 emotionSegments + durationSec
+      emotionSegments: emotions,
       emotions,
+      durationSec: durationSec || (proj as any)?.scriptTargetDurationSec || null,
       title: extractTitle(scriptText, finalSentence),
     });
   });

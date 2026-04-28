@@ -57,9 +57,11 @@ export function resolveLLMConfig(
     try {
       const s: any = getJson('user_settings', user.id, MOCK_USER_SETTINGS);
       const slotCfg = (s && s.models && s.models[slot]) || {};
-      if (slotCfg.apiKey) {
-        baseUrl = String(slotCfg.baseUrl || '').trim();
-        apiKey = String(slotCfg.apiKey || '').trim();
+      // 前端设置页用 key/base；服务端/ mock 用 apiKey/baseUrl，两者都认
+      const key = String(slotCfg.apiKey || slotCfg.key || '').trim();
+      if (key) {
+        baseUrl = String(slotCfg.baseUrl || slotCfg.base || '').trim();
+        apiKey = key;
         model = String(slotCfg.model || '').trim();
         source = 'user-settings';
       }
@@ -134,6 +136,40 @@ export async function chatComplete(
   const content = json?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回结构异常（缺 message.content）');
   return content;
+}
+
+/* ============================================================
+   带重试的 JSON 调用
+   适用场景：风格圣经 / 情绪标签 / 资产抽取等"必须返回有效 JSON"的任务
+   - 失败原因可能是网络抖动、模型偶发非 JSON 回包、token 不够导致 JSON 截断
+   - 我们最多重试 2 次（共调用 3 次）
+   ============================================================ */
+export async function chatCompleteJsonWithRetry<T = any>(
+  user: UserRow | null,
+  messages: ChatMessage[],
+  opts: LLMOptions = {},
+  parser: (raw: string) => T,
+  taskName = 'json-task',
+): Promise<T> {
+  const maxAttempts = 3;
+  let lastErr: any = null;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const raw = await chatComplete(user, messages, {
+        ...opts,
+        responseFormat: 'json_object',
+      });
+      return parser(raw);
+    } catch (e: any) {
+      lastErr = e;
+      console.warn(`[${taskName}] attempt ${i + 1}/${maxAttempts} failed:`, e?.message);
+      if (i < maxAttempts - 1) {
+        // 指数退避：1秒、2秒
+        await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      }
+    }
+  }
+  throw lastErr || new Error(`${taskName} 调用失败（已重试 ${maxAttempts} 次）`);
 }
 
 /* ============================================================

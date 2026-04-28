@@ -29,6 +29,7 @@ export async function POST(req: NextRequest) {
   }
 
   return sseResponse(async (writer) => {
+    writer.phase('continue_start');
     writer.step('正在续写…');
     let buf = '';
     await chatStream(
@@ -40,7 +41,7 @@ export async function POST(req: NextRequest) {
       { temperature: 0.8, maxTokens: 1200 },
       (delta) => {
         buf += delta;
-        writer.chunk(delta);
+        writer.scriptChunk(delta);
       },
     );
 
@@ -51,6 +52,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    writer.done({ script: buf });
+    writer.done({
+      script: buf,
+      // 前端 episodes.js 读 emotionSegments / durationSec / title；本端点不做情绪标注，给空数组
+      emotionSegments: [],
+      durationSec: (proj as any)?.scriptTargetDurationSec || null,
+    });
   });
 }

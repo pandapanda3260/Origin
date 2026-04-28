@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
       { temperature: 0.7, maxTokens: 3500 },
       (delta) => {
         buf += delta;
-        writer.chunk(delta);
+        writer.scriptChunk(delta);
       },
     );
 

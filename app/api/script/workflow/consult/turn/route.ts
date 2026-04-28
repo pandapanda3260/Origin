@@ -8,6 +8,11 @@ import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+/** 去掉 <step>...</step> 标签，对话场景不需要这些 */
+function stripStepTags(text: string): string {
+  return text.replace(/<step>[^<]*<\/step>\s*/gi, '');
+}
+
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return new Response(JSON.stringify({ detail: 'unauthorized' }), { status: 401 });
@@ -35,14 +40,16 @@ export async function POST(req: NextRequest) {
     const messages = buildConsultMessages(history, userMsg);
     await chatStream(user, messages, { temperature: 0.6, maxTokens: 800 }, (delta) => {
       buf += delta;
-      writer.chunk(delta);
+      writer.aiChunk(delta);
     });
 
     // 检查 [READY] 标志，前端据此判断"够不够生成完整剧本"
     const readyIdx = buf.indexOf('[READY]');
     const ready = readyIdx >= 0;
     const outline = ready ? buf.slice(readyIdx + '[READY]'.length).trim() : '';
-    const replyMain = ready ? buf.slice(0, readyIdx).trim() : buf.trim();
+    // 去掉可能残留的 <step> 标签，对话场景不需要
+    // 显示给用户的内容：把 [READY] 标记本身去掉，但保留前后所有文字（包括大纲）
+    const replyMain = stripStepTags(buf.replace(/\[READY\]\s*/g, '').trim());
 
     // 把这一轮对话写回项目
     if (projectId) {
@@ -65,9 +72,12 @@ export async function POST(req: NextRequest) {
     }
 
     writer.done({
+      // 兼容前端 script.js（读 aiMessage / readyToDraft）和老调用方（读 reply / ready）
       reply: replyMain,
+      aiMessage: replyMain,
       outline,
       ready,
+      readyToDraft: ready,
       // 用户本轮消息直接含"确认/可以/直接生成"等意图时，前端会自动触发 confirm
       shouldAutoTrigger: ready && /(确认|可以|直接.{0,3}生成|开始|就这样|没问题)/.test(userMsg),
     });
