@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, apiPost } from './utils.js';
+import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders } from './utils.js';
 import { subscribeBatch } from './backend_stream.js';
 
 let _ctx = {};
@@ -353,12 +353,69 @@ export async function generateShots(opts) {
   }
 
   var finished = false;
+  var pollTimer = null;
+  function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
   function finish() {
     if (finished) return;
     finished = true;
+    _stopPoll();
     if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
     if (btn) btn.disabled = false;
   }
+
+  // 兜底轮询：每 5 秒主动 GET /api/batch/<id> 拿权威状态。
+  // SSE 在某些环境下不稳定（开发热重载、浏览器节流、反代 buffer 等），
+  // 轮询保证不管 SSE 通不通，UI 最终一定追得上。
+  // 检测到 status=completed → 从服务端整包重拉项目（shots 已经被
+  // executor 落盘）+ 触发渲染；status=failed → 显示错误提示。
+  async function _pollOnce() {
+    if (finished) return;
+    try {
+      var snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
+      if (!snap || finished) return;
+      if (snap.status === "completed") {
+        console.log("[Shots] poll detected batch completed → reload project");
+        try {
+          var resp = await fetch("/api/projects/" + encodeURIComponent(originId), { headers: getAuthHeaders() });
+          if (resp.ok) {
+            var p = await resp.json();
+            if (p && p.id === originId && Array.isArray(p.shots)) {
+              _safeWriteBack(originId, function (proj) {
+                proj.shots = p.shots;
+                proj.shotsApproved = !!p.shotsApproved;
+                if (proj._staleFlags) {
+                  Object.keys(proj._staleFlags).forEach(function (k) {
+                    if (k.indexOf("shot_") === 0 || k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
+                      delete proj._staleFlags[k];
+                    }
+                  });
+                }
+              });
+              _setShotsProgress(100, "镜头设计完成", "共生成 " + p.shots.length + " 个镜头");
+              setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 2000);
+              renderShotList();
+              showToast("镜头设计完成：共 " + p.shots.length + " 个镜头", "success");
+            }
+          }
+        } catch (e) { console.warn("[Shots] reload after poll failed:", e); }
+        finish();
+      } else if (snap.status === "failed" || snap.status === "cancelled") {
+        var taskErr = "";
+        if (Array.isArray(snap.tasks)) {
+          var f = snap.tasks.find(function (t) { return t.status === "failed"; });
+          if (f && f.errorMsg) taskErr = f.errorMsg;
+        }
+        var failMsg = taskErr || "请稍后重试";
+        console.warn("[Shots] poll detected batch failed: " + failMsg);
+        _setShotsProgress(0, "镜头设计失败", failMsg.slice(0, 120));
+        showToast("镜头设计失败：" + _diagnoseApiError(failMsg), "error");
+        finish();
+      }
+    } catch (e) {
+      console.warn("[Shots] poll failed:", (e && e.message) || e);
+    }
+  }
+  pollTimer = setInterval(_pollOnce, 5000);
 
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {

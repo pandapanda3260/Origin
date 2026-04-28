@@ -10,7 +10,8 @@
 import { registerExecutor, type BatchExecCtx } from './batches';
 import { generateImage } from './image-gen';
 import { generateVideo } from './video-gen';
-import { chatComplete } from './llm';
+import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from './llm';
+import { buildShotsMessages } from './prompts';
 import { getProjectByIdForUser, updateProjectForUser } from './projects-db';
 
 /* ============================================================
@@ -320,5 +321,107 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       taskId: result.taskId,
     },
     extra: { mode: result.mode, durationSec: result.durationSec },
+  };
+});
+
+/* ============================================================
+   5. shots executor —— 把剧本拆成 6-15 个镜头（一次 LLM 调用）
+   ============================================================
+   前端 generateShots() 的 stage hint 命名约定：
+     prepare → planning → reasoning → writing → parsing → assembling
+   这里我们没法精细拆 LLM 内部阶段，但能在调用前后发几个粗粒度
+   stage 让进度条至少动起来。
+   返回 patch.value = shots 数组，前端 onTaskCompleted 直接读。
+   ============================================================ */
+registerExecutor('shots', async (ctx: BatchExecCtx) => {
+  const { script, styleBible, assets, durationSec } = (ctx.options || {}) as {
+    script?: string;
+    styleBible?: any;
+    assets?: any;
+    durationSec?: number | null;
+  };
+  if (!script || !script.trim()) {
+    throw new Error('当前没有剧本，请先生成剧本再做镜头设计');
+  }
+
+  ctx.progress({ stage: 'prepare', percent: 8, hint: '正在准备剧本与资产上下文…' });
+
+  // 把资产瘦身：只发名字 + 简短描述给 LLM，避免上下文炸掉
+  const slimAssets = (() => {
+    if (!assets) return null;
+    const trim = (a: any) => a && {
+      id: a.id,
+      name: a.name,
+      role: a.role,
+      identity: a.identity,
+      description: a.description || a.appearance || '',
+    };
+    return {
+      characters: (assets.characters || []).map(trim),
+      scenes: (assets.scenes || assets.environments || []).map(trim),
+      props: (assets.props || []).map(trim),
+    };
+  })();
+
+  ctx.progress({ stage: 'planning', percent: 18, hint: 'AI 正在分析剧本结构…' });
+  const messages = buildShotsMessages({
+    script,
+    styleBible,
+    assets: slimAssets,
+    totalDurationSec: durationSec || undefined,
+  });
+
+  ctx.progress({ stage: 'writing', percent: 45, hint: 'AI 正在生成镜头表（这一步比较慢，请耐心等）…' });
+
+  // 用带重试的 JSON 调用：镜头表是大段 JSON，模型偶尔会截断或多嘴
+  let parsed: any;
+  try {
+    parsed = await chatCompleteJsonWithRetry(
+      ctx.user,
+      messages,
+      // 镜头表可能很长（10+ 镜头），给足 token
+      { temperature: 0.6, maxTokens: 4000 },
+      (raw) => parseJsonLoose(raw),
+      'shots-generate',
+    );
+  } catch (e: any) {
+    throw new Error('镜头设计失败：' + (e?.message || String(e)));
+  }
+
+  ctx.progress({ stage: 'parsing', percent: 88, hint: '正在整理镜头表…' });
+
+  let shotsArr: any[] = Array.isArray(parsed?.shots) ? parsed.shots : [];
+  if (!shotsArr.length && Array.isArray(parsed)) shotsArr = parsed;
+  if (!shotsArr.length) {
+    throw new Error('AI 未返回有效镜头列表（shots 字段为空）');
+  }
+
+  // 兜底：补 idx + 限制时长合理
+  shotsArr = shotsArr.map((sh, i) => ({
+    idx: typeof sh.idx === 'number' && sh.idx > 0 ? sh.idx : i + 1,
+    durationSec: Math.max(2, Math.min(12, Number(sh.durationSec) || 4)),
+    framing: sh.framing || '中景',
+    movement: sh.movement || '固定机位',
+    description: sh.description || '',
+    dialog: sh.dialog || '——',
+    stylePillar: sh.stylePillar || '',
+  }));
+
+  ctx.progress({ stage: 'assembling', percent: 95, hint: '正在保存镜头表…' });
+
+  // 写回项目：shots + 重置下游审批/分镜
+  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  if (fresh) {
+    updateProjectForUser(ctx.projectId, ctx.user.id, {
+      shots: shotsArr,
+      shotsApproved: false,
+      storyboards: [],
+      currentStep: 3,
+    });
+  }
+
+  return {
+    patch: { type: 'shots', value: shotsArr },
+    extra: { count: shotsArr.length },
   };
 });
