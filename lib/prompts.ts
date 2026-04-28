@@ -390,10 +390,14 @@ export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
 
 【imagePrompt 写作要求 - 重要】
   · 用英文，因为图像生成模型对英文理解更准
-  · 必须包含：主体描述 + 视觉风格关键词（参考风格圣经）+ 光线 + 构图
-  · 角色 prompt 示例："portrait of a middle-aged Chinese restaurant owner, weathered face, friendly smile, wearing dark waterproof apron over black t-shirt, holding a clipboard, warm seafood restaurant lighting, semi-realistic illustration style, rich color palette of cream and ocean blue"
-  · 场景 prompt 示例："interior of a Chinese seafood restaurant at closing time, dim warm lighting, fish tanks glowing on the side, wooden tables stacked with chairs, atmospheric haze, semi-realistic illustration style, cream and ocean blue color palette"
-  · 道具 prompt 示例："wooden clipboard with handwritten notes, slightly worn, warm spotlight, close-up shot, semi-realistic illustration"
+  · 只描述"主体本身"——长什么样、穿什么、什么材质、什么动作、是什么人/物
+  · **不要**写画面风格、背景颜色、光线、布局——这些后台会强制统一为
+    "白底 + 真人写实摄影 + 角色三视图"，你写了也会被覆盖掉
+  · 角色 prompt 示例："a middle-aged Chinese man in his 50s, weathered face with friendly smile, short salt-and-pepper hair, wearing a dark waterproof apron over a black t-shirt, dark trousers, holding a wooden clipboard"
+  · 场景 prompt 示例："interior of a small Chinese seafood restaurant, dim warm lighting from pendant lamps, glowing fish tanks along the wall, wooden tables and stacked chairs, weathered tile floor"
+  · 道具 prompt 示例："a worn wooden clipboard with handwritten notes pinned under the metal clip, slightly scratched surface"
+  · ❌ 不要出现这类词："cinematic", "illustration style", "anime", "cartoon",
+    "warm lighting", "studio backdrop", "white background"——后台会强制加
 
 【绝对禁止】
   · 任何资产的 imagePrompt 字段为空字符串

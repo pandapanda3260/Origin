@@ -28,22 +28,35 @@ function resolveAssetTarget(project: any, target: any) {
   return { item, type, idx, cat };
 }
 
-function buildAssetPrompt(asset: any, type: string, styleBible: any): string {
-  const sb = styleBible || {};
-  const styleHint = [sb.vision, sb.colorPalette, sb.cameraStyle, sb.mood]
-    .filter(Boolean)
-    .join('; ');
-  const base = (() => {
-    if (type === 'char') {
-      const tags = [asset.temperament, asset.actionTraits, ...(asset.tags || [])].filter(Boolean).join(', ');
-      return `Character reference portrait: ${asset.name || 'unnamed'}.\n${asset.detail || asset.intro || ''}\nTags: ${tags}.\nFull-body or 3/4 view, neutral background, clean reference sheet style.`;
-    }
-    if (type === 'scene') {
-      return `Environment / scene reference: ${asset.name || 'unnamed'}.\n${asset.description || ''}\nWide establishing shot, no people, atmospheric lighting.`;
-    }
-    return `Prop / object reference: ${asset.name || 'unnamed'}.\n${asset.features || ''}; type: ${asset.propType || ''}.\nIsolated on neutral background, studio product-shot style.`;
-  })();
-  return [base, styleHint && `Style: ${styleHint}`].filter(Boolean).join('\n');
+/**
+ * 当 LLM 没写 imagePrompt 时的兜底 prompt。
+ * 注意：风格统一（白底 + 写实摄影 + 三视图）已经在 image-gen.ts 的
+ * forceStyleSuffix() 里强制兜底了，这里只描述"主体"，不再写风格。
+ */
+function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
+  if (type === 'char') {
+    const traits = [asset.temperament, asset.actionTraits, ...(asset.tags || [])]
+      .filter(Boolean)
+      .join(', ');
+    return [
+      `Subject: ${asset.name || 'unnamed character'}.`,
+      asset.detail || asset.intro || '',
+      traits && `Traits: ${traits}.`,
+      asset.appearance && `Appearance: ${asset.appearance}.`,
+      asset.clothing && `Clothing: ${asset.clothing}.`,
+    ].filter(Boolean).join('\n');
+  }
+  if (type === 'scene') {
+    return [
+      `Subject: ${asset.name || 'unnamed scene'}.`,
+      asset.description || '',
+    ].filter(Boolean).join('\n');
+  }
+  return [
+    `Subject: ${asset.name || 'unnamed prop'}.`,
+    asset.features && `Appearance: ${asset.features}.`,
+    asset.propType && `Type: ${asset.propType}.`,
+  ].filter(Boolean).join('\n');
 }
 
 /* ============================================================
@@ -60,9 +73,12 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   const prompt = item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible);
 
   ctx.progress({ stage: 'calling_image_api' });
+  // 角色：宽图（1536×1024），让"正面+侧面+背面"三视图能横着排开，对齐原网站的展示
+  // 场景：宽图（1536×1024），适合做 establishing shot
+  // 道具：方图（1024×1024），适合做白底 product shot
   const result = await generateImage(ctx.user, {
     prompt,
-    size: type === 'char' ? '1024x1536' : type === 'scene' ? '1536x1024' : '1024x1024',
+    size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : '1024x1024',
     style: 'natural',
     kind: type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop',
     projectId: ctx.projectId,

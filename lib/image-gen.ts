@@ -56,10 +56,17 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   let height = 1024;
   let mode: 'real' | 'fake' = 'real';
 
-  // 拼接 pencil 风格关键词（仅在 style=pencil 时）
-  const finalPrompt = input.style === 'pencil'
-    ? `${input.prompt}\n\nstyle: pencil sketch, hand-drawn line art, monochrome graphite, paper texture, storyboard illustration`
-    : input.prompt;
+  // 拼接风格关键词
+  //   - storyboard 用 pencil 手稿
+  //   - character/scene/prop 强制锁定为"白底 + 写实摄影"
+  //     LLM 写出来的 imagePrompt 五花八门，这里兜底加一段 hard rule，
+  //     保证最终风格统一（参考原网站效果）
+  const finalPrompt = (() => {
+    if (input.style === 'pencil') {
+      return `${input.prompt}\n\nstyle: pencil sketch, hand-drawn line art, monochrome graphite, paper texture, storyboard illustration`;
+    }
+    return `${input.prompt}\n\n${forceStyleSuffix(input.kind)}`;
+  })();
 
   // 解析尺寸
   const [w, h] = parseSize(input.size || '1024x1024');
@@ -180,6 +187,53 @@ function parseSize(s: string): [number, number] {
   const m = /^(\d+)x(\d+)$/.exec(s);
   if (m) return [Number(m[1]), Number(m[2])];
   return [1024, 1024];
+}
+
+/**
+ * 资产参考图统一风格后缀（白底 + 写实摄影；角色额外要求三视图布局）。
+ *
+ * 设计动机：
+ *   - 原网站效果是"白底 + 真人写实摄影 + 角色三视图（正/侧/背）"
+ *   - LLM 抽资产时写出来的 imagePrompt 风格千差万别（半写实插画、动漫、CG…）
+ *   - 这里在最终调图像 API 前强行追加一段 hard rule，覆盖掉风格漂移
+ */
+function forceStyleSuffix(kind: ImageGenInput['kind']): string {
+  if (kind === 'character') {
+    return [
+      '=== MANDATORY STYLE OVERRIDE (must follow) ===',
+      'Style: photorealistic photography, professional studio headshot quality, sharp focus, magazine-grade photography, high detail.',
+      'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, NO shadows, NO gradient, NO objects.',
+      'Layout: character model sheet showing the SAME person in THREE full-body views side-by-side, evenly spaced:',
+      '  · Left:   front view, facing camera, arms relaxed at sides, neutral standing pose',
+      '  · Middle: 3/4 or side profile view, same pose',
+      '  · Right:  back view, same pose',
+      'Lighting: even soft studio lighting from the front, no harsh shadows.',
+      'Camera: full body in frame, head to feet visible in all three views.',
+      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, stylized art.',
+      'STRICTLY NOT allowed: any text, watermark, logo, frame, border.',
+    ].join('\n');
+  }
+  if (kind === 'scene') {
+    return [
+      '=== MANDATORY STYLE OVERRIDE (must follow) ===',
+      'Style: photorealistic photography, cinematic establishing shot, sharp focus, high detail, professional photography.',
+      'No people / no human figures in the frame.',
+      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch.',
+      'STRICTLY NOT allowed: any text, watermark, logo.',
+    ].join('\n');
+  }
+  if (kind === 'prop') {
+    return [
+      '=== MANDATORY STYLE OVERRIDE (must follow) ===',
+      'Style: photorealistic product photography, studio shot, sharp focus, high detail.',
+      'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, soft drop shadow only under the object.',
+      'Camera: object centered in frame, fills 70% of canvas.',
+      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch.',
+      'STRICTLY NOT allowed: any text, watermark, logo.',
+    ].join('\n');
+  }
+  // storyboard / other: 不加额外约束
+  return '';
 }
 
 /**
