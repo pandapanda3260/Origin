@@ -828,7 +828,7 @@ export async function generateAllAssetImages() {
   var btn = $("btnGenAssetImages");
   var hint = $("assetImgHint");
   if (btn) btn.disabled = true;
-  if (hint) hint.textContent = "正在批量生成参考图（角色风格化 + 场景 + 道具）…";
+  if (hint) hint.textContent = "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
 
   var originId = project.id;
 
@@ -993,7 +993,13 @@ function _attachAssetImageBatch(opts) {
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {
       if (hint && snap && typeof snap.total === "number") {
-        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + totalTasks;
+        var done = snap.succeeded || 0;
+        var fail = snap.failed || 0;
+        var pending = totalTasks - done - fail;
+        var parts = ["生成中… " + done + "/" + totalTasks];
+        if (fail > 0) parts.push(fail + " 张失败");
+        if (pending > 0) parts.push("剩余约 " + Math.ceil(pending * 30 / 3) + " 秒");
+        hint.textContent = parts.join("，");
       }
     },
     onTaskStarted: function (data) {

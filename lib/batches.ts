@@ -51,7 +51,19 @@ export type BatchExecutor = (ctx: BatchExecCtx) => Promise<{
 
 const _executors = new Map<string, BatchExecutor>();
 const _emitters = new Map<string, EventEmitter>();
-const CONCURRENCY = 2;
+
+/**
+ * 不同 batchType 用不同的并发上限：
+ *   - 图像 / 分镜：3（gpt-image-1 单张 30-60s，并发 2 时用户感觉"卡住"，
+ *     3 在多数中转上仍稳定，速度提升 ~50%）
+ *   - 视频：1（视频生成更慢、计费更高，避免触发限流和大额并发预扣）
+ *   - 其它（纯文本类）：3
+ */
+function _concurrencyFor(batchType: string): number {
+  if (batchType === 'video_segments') return 1;
+  if (batchType === 'asset_images' || batchType === 'storyboard_images') return 3;
+  return 3;
+}
 
 export function registerExecutor(batchType: string, fn: BatchExecutor) {
   _executors.set(batchType, fn);
@@ -161,10 +173,11 @@ async function runBatch(opts: {
   let succeeded = 0;
   let failed = 0;
   let running = 0;
+  const concurrency = _concurrencyFor(opts.batchType);
 
   await new Promise<void>((resolveAll) => {
     const tryNext = () => {
-      while (running < CONCURRENCY && queue.length) {
+      while (running < concurrency && queue.length) {
         const t = queue.shift();
         if (!t) break;
         running++;

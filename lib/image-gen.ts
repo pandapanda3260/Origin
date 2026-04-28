@@ -73,20 +73,29 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     bytes = placeholder.length;
     mode = 'fake';
   } else {
+    const t0 = Date.now();
+    const modelName = cfg.model || 'gpt-image-1';
+    // 超时保护：单次图像调用最长 180s（gpt-image-1 一般 30-60s，留足余量但不让它无限挂）
+    // 注意：base64 下载通常是同一连接内传输，这里 timeout 包含了下载时间
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 180_000);
     try {
       // OpenAI 兼容 image generation 接口
       // 不同后端字段命名略有差异：gpt-image-1 / dall-e-3 都是 /v1/images/generations
       const body: any = {
-        model: input.kind === 'storyboard' && input.style === 'pencil'
-          ? cfg.model || 'gpt-image-1'
-          : cfg.model || 'gpt-image-1',
+        model: modelName,
         prompt: finalPrompt,
         size: input.size || '1024x1024',
         n: 1,
       };
-      // gpt-image-1 vs dall-e-3 quality 字段不同，传通用值
-      if (input.quality) body.quality = input.quality;
+      // gpt-image-1 / dall-e-3 / dall-e-2 的 quality 字段取值不同，自动按模型挑：
+      //   - gpt-image-1: low | medium | high | auto（默认 low —— 参考图够用且明显更快）
+      //   - dall-e-3:    standard | hd                （默认 standard）
+      //   - 其它：       不传
+      const q = pickQuality(modelName, input.quality);
+      if (q) body.quality = q;
 
+      console.log(`[image-gen] start model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind}`);
       const resp = await fetch(`${cfg.baseUrl}/images/generations`, {
         method: 'POST',
         headers: {
@@ -94,6 +103,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           Authorization: `Bearer ${cfg.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
@@ -108,21 +118,32 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       if (item.b64_json) {
         buf = Buffer.from(item.b64_json, 'base64');
       } else if (item.url) {
-        const r = await fetch(item.url);
-        if (!r.ok) throw new Error(`下载图片失败 ${r.status}`);
-        buf = Buffer.from(await r.arrayBuffer());
+        // 下载阶段也加超时（30s 通常够 5MB 图片，慢的中转站可能更久 → 用 60s）
+        const dlController = new AbortController();
+        const dlTimer = setTimeout(() => dlController.abort(), 60_000);
+        try {
+          const r = await fetch(item.url, { signal: dlController.signal });
+          if (!r.ok) throw new Error(`下载图片失败 ${r.status}`);
+          buf = Buffer.from(await r.arrayBuffer());
+        } finally {
+          clearTimeout(dlTimer);
+        }
       } else {
         throw new Error('图像 API 没返回 b64_json 也没返回 url');
       }
       writeFileSync(fullPath, buf);
       bytes = buf.length;
+      const elapsed = Date.now() - t0;
+      console.log(`[image-gen] ok model=${modelName} bytes=${buf.length} elapsed=${elapsed}ms`);
     } catch (e: any) {
-      // 真调失败 → 退回占位 + 抛错给 caller 决定是否软失败
-      const placeholder = makePlaceholderPng(w, h);
-      writeFileSync(fullPath, placeholder);
-      bytes = placeholder.length;
-      mode = 'fake';
-      console.warn('[image-gen] fallback to placeholder due to:', e?.message);
+      const elapsed = Date.now() - t0;
+      const aborted = e?.name === 'AbortError';
+      const reason = aborted ? `请求超时（>180s 未返回）` : (e?.message || String(e));
+      console.warn(`[image-gen] fail model=${modelName} elapsed=${elapsed}ms reason=${reason}`);
+      // 真调失败 → 抛错让 batch 走 task_failed，UI 上显示"失败"而不是一直转
+      throw new Error('图像生成失败：' + reason);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -159,6 +180,29 @@ function parseSize(s: string): [number, number] {
   const m = /^(\d+)x(\d+)$/.exec(s);
   if (m) return [Number(m[1]), Number(m[2])];
   return [1024, 1024];
+}
+
+/**
+ * 根据模型挑 quality 字段。
+ *   - gpt-image-1: low | medium | high | auto（默认 low —— 参考图够用且明显更快，
+ *     auto 会跑到 high 模式，单张能 60-90s，用户体验上看起来"卡住"）
+ *   - dall-e-3:    standard | hd                （默认 standard）
+ *   - dall-e-2 / 其它: 不传（接口不接受 quality 字段）
+ *
+ * 如果 caller 传了 requested 且对当前模型合法，就用 requested。
+ */
+function pickQuality(model: string, requested?: string): string | undefined {
+  const m = (model || '').toLowerCase();
+  const req = (requested || '').toLowerCase();
+  if (m.includes('gpt-image')) {
+    if (['low', 'medium', 'high', 'auto'].includes(req)) return req;
+    return 'low';
+  }
+  if (m.includes('dall-e-3')) {
+    if (['standard', 'hd'].includes(req)) return req;
+    return 'standard';
+  }
+  return undefined;
 }
 
 /**
