@@ -60,13 +60,22 @@ const _emitters = new Map<string, EventEmitter>();
  *   - 其它（纯文本类）：3
  */
 function _concurrencyFor(batchType: string): number {
-  if (batchType === 'video_segments') return 1;
+  // 视频生成：grok 中转端是异步的（提交后轮询），所以可以并行多个
+  // 5 个片段并行 → 总时间约 = 单个片段时间 (1~2 分钟) 而非 5 倍
+  if (batchType === 'video_segments' || batchType === 'videos') return 3;
   if (batchType === 'asset_images' || batchType === 'storyboard_images') return 3;
   return 3;
 }
 
 export function registerExecutor(batchType: string, fn: BatchExecutor) {
   _executors.set(batchType, fn);
+}
+
+/** 给已注册的 batchType 加一个别名（共享同一个 executor） */
+export function aliasExecutor(existing: string, alias: string) {
+  const fn = _executors.get(existing);
+  if (!fn) throw new Error(`aliasExecutor: '${existing}' 尚未注册`);
+  _executors.set(alias, fn);
 }
 
 function _getEmitter(batchId: string): EventEmitter {
@@ -266,7 +275,7 @@ async function runBatch(opts: {
 
     function costPerTask(batchType: string): number {
       if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
-      if (batchType === 'video_segments') return CREDIT_PRICES.video;
+      if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
       if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
       return 0;
     }

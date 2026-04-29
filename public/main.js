@@ -118,6 +118,8 @@ var _projectEpoch = 0;
   };
   var VIDEO_ADAPTERS = {
     seedance:      { name: "豆包视频 2.0（火山方舟）", submitPath: "/contents/generations/tasks", pollPath: "/contents/generations/tasks/{id}" },
+    "seedance-fast": { name: "豆包视频 2.0 Fast（火山方舟）", submitPath: "/contents/generations/tasks", pollPath: "/contents/generations/tasks/{id}" },
+    grok:          { name: "Grok（xAI / 中转）", submitPath: "/v1/videos/generations", pollPath: "/v1/videos/generations/{id}" },
     kling:         { name: "可灵 Kling（快手）", submitPath: "/v1/videos/text2video", pollPath: "/v1/videos/text2video/{id}" },
     hailuo:        { name: "海螺 Hailuo（MiniMax）", submitPath: "/v1/video_generation", pollPath: "/v1/query/video_generation?task_id={id}" },
     runway:        { name: "Runway Gen-4", submitPath: "/v1/image_to_video", pollPath: "/v1/tasks/{id}" },

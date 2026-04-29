@@ -298,23 +298,51 @@ export function showToast(msg, type, actions) {
   setTimeout(() => _dismissToast(el), dismissMs);
 }
 
-export function showConfirm(title, message, onOk, onCancel) {
-  const overlay = document.createElement('div');
-  overlay.className = 'fixed inset-0 z-[10002] flex items-center justify-center bg-black/45 backdrop-blur-sm p-4';
-  overlay.innerHTML =
-    '<div class="bg-surface-container-lowest rounded-2xl shadow-2xl max-w-md w-full border border-outline-variant/20 p-6">' +
-      '<h3 class="text-lg font-bold text-on-background mb-2">' + escapeHtml(title || '确认') + '</h3>' +
-      '<p class="text-sm text-on-surface-variant leading-relaxed whitespace-pre-wrap mb-6">' + escapeHtml(message || '') + '</p>' +
-      '<div class="flex justify-end gap-3">' +
-        '<button type="button" class="qd-confirm-cancel px-5 py-2.5 rounded-full text-sm font-bold text-on-surface-variant border border-outline-variant/30 hover:bg-surface-container transition-colors">取消</button>' +
-        '<button type="button" class="qd-confirm-ok px-5 py-2.5 rounded-full text-sm font-bold bg-primary text-on-primary hover:opacity-90 transition-opacity">确定</button>' +
-      '</div>' +
-    '</div>';
-  const close = () => { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
-  overlay.querySelector('.qd-confirm-cancel').onclick = () => { close(); if (onCancel) onCancel(); };
-  overlay.querySelector('.qd-confirm-ok').onclick    = () => { close(); if (onOk) onOk(); };
-  overlay.addEventListener('click', e => { if (e.target === overlay) { close(); if (onCancel) onCancel(); } });
-  document.body.appendChild(overlay);
+/**
+ * 通用确认弹窗。支持两种用法：
+ *   1. 回调式：showConfirm(title, msg, () => onOk(), () => onCancel())
+ *   2. 文案式 + Promise：const ok = await showConfirm(title, msg, '确定文案', '取消文案')
+ *
+ * 第 3、4 个参数若为 function 则当作回调；为 string/undefined 则当按钮文案。
+ * 函数总是返回 Promise<boolean>（true=确定/false=取消），方便 await。
+ */
+export function showConfirm(title, message, arg3, arg4) {
+  const okIsFn = typeof arg3 === 'function';
+  const cancelIsFn = typeof arg4 === 'function';
+  const okText = okIsFn ? '确定' : (typeof arg3 === 'string' && arg3 ? arg3 : '确定');
+  const cancelText = cancelIsFn ? '取消' : (typeof arg4 === 'string' && arg4 ? arg4 : '取消');
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'fixed inset-0 z-[10002] flex items-center justify-center bg-black/45 backdrop-blur-sm p-4';
+    overlay.innerHTML =
+      '<div class="bg-surface-container-lowest rounded-2xl shadow-2xl max-w-md w-full border border-outline-variant/20 p-6">' +
+        '<h3 class="text-lg font-bold text-on-background mb-2">' + escapeHtml(title || '确认') + '</h3>' +
+        '<p class="text-sm text-on-surface-variant leading-relaxed whitespace-pre-wrap mb-6">' + escapeHtml(message || '') + '</p>' +
+        '<div class="flex justify-end gap-3">' +
+          '<button type="button" class="qd-confirm-cancel px-5 py-2.5 rounded-full text-sm font-bold text-on-surface-variant border border-outline-variant/30 hover:bg-surface-container transition-colors">' + escapeHtml(cancelText) + '</button>' +
+          '<button type="button" class="qd-confirm-ok px-5 py-2.5 rounded-full text-sm font-bold bg-primary text-on-primary hover:opacity-90 transition-opacity">' + escapeHtml(okText) + '</button>' +
+        '</div>' +
+      '</div>';
+    const close = () => { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); };
+    let settled = false;
+    const finishOk = () => {
+      if (settled) return; settled = true;
+      close();
+      if (okIsFn) { try { arg3(); } catch (_e) {} }
+      resolve(true);
+    };
+    const finishCancel = () => {
+      if (settled) return; settled = true;
+      close();
+      if (cancelIsFn) { try { arg4(); } catch (_e) {} }
+      resolve(false);
+    };
+    overlay.querySelector('.qd-confirm-cancel').onclick = finishCancel;
+    overlay.querySelector('.qd-confirm-ok').onclick = finishOk;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finishCancel(); });
+    document.body.appendChild(overlay);
+  });
 }
 
 export function consumeStreamStepTags(chunk, state, onStep) {

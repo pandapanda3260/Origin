@@ -7,7 +7,7 @@
  * 注册时机：lib/init-executors.ts 在 app 启动时调用一次。
  */
 
-import { registerExecutor, type BatchExecCtx } from './batches';
+import { registerExecutor, aliasExecutor, type BatchExecCtx } from './batches';
 import { generateImage } from './image-gen';
 import { generateVideo } from './video-gen';
 import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from './llm';
@@ -343,7 +343,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const sb = storyboards[groupIdx];
   if (!sb) throw new Error(`找不到 storyboards[${groupIdx}]`);
 
-  // 提示词来源优先：sb.videoPrompt（视频提示词页生成的）→ shot.imagePrompt → shot.visual / shot.description
+  // 提示词来源优先：sb.videoPrompt（视频提示词页生成的）→ shot.imagePrompt → shot.visual
   const shots = (proj as any).shots || [];
   const shot = shots[groupIdx] || {};
   const _shotVisual = shot.visual || shot.description || shot.desc || '';
@@ -351,16 +351,35 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     sb.videoPrompt || shot.imagePrompt || _shotVisual || `Video segment for shot ${groupIdx + 1}`;
   const durationSec = Math.max(2, Math.min(12, Number(shot.duration || shot.durationSec || 4)));
 
+  // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给 grok
+  // —— 视频提示词页 LLM 经常把对话遗漏掉，这里直接从源头数据拿
+  const groupShotIndices: number[] = Array.isArray(sb.shotIndices) && sb.shotIndices.length
+    ? sb.shotIndices
+    : [groupIdx];
+  const dialogueLines: string[] = [];
+  for (const si of groupShotIndices) {
+    const sh = shots[si];
+    if (!sh) continue;
+    const line = String(sh.dialogue || sh.scriptRef || '').trim();
+    // 过滤占位符
+    if (line && line !== '——' && line !== '-' && line !== '无') dialogueLines.push(line);
+  }
+  const dialogueCombined = dialogueLines.join(' ');
+
+  // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
+  const userRatio = (ctx.options?.ratio as string) || '16:9';
+
   ctx.progress({ stage: 'submitting', durationSec });
 
   const result = await generateVideo(
     ctx.user,
     {
       prompt,
-      size: '1080x1920',
+      ratio: userRatio,
       durationSec,
       projectId: ctx.projectId,
       groupIdx,
+      dialogue: dialogueCombined || undefined,
     },
     (pct, hint) => ctx.progress({ stage: 'gen', pct, hint }),
   );
@@ -716,3 +735,9 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     },
   };
 });
+
+/* ============================================================
+   batchType 别名：前端 videoTasks.js 提交 batchType="videos"，
+   reattach 时也用这个名字过滤 → 复用 video_segments executor
+   ============================================================ */
+aliasExecutor('video_segments', 'videos');

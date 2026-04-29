@@ -14,11 +14,23 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const batchType: string = (body.batchType || '').toString();
   const projectId: string = (body.projectId || '').toString();
-  const targets: any[] = Array.isArray(body.targets) ? body.targets : [];
   const options: any = body.options || {};
 
   if (!batchType) return jsonError('缺 batchType', 400);
   if (!projectId) return jsonError('缺 projectId', 400);
+
+  // targets 兼容：
+  //   1. 标准：body.targets = [{...}, ...]
+  //   2. videoTasks.js 老协议：body.storyboardIndices = [0, 2, 3]
+  //      → 自动展开成 [{ groupIdx, idx, storyboardIdx }]
+  let targets: any[] = Array.isArray(body.targets) ? body.targets : [];
+  if (!targets.length && Array.isArray(body.storyboardIndices)) {
+    targets = body.storyboardIndices
+      .map((v: any) => Number(v))
+      .filter((n: number) => Number.isFinite(n) && n >= 0)
+      .map((n: number) => ({ groupIdx: n, idx: n, storyboardIdx: n }));
+  }
+
   if (!targets.length) return jsonError('targets 不能为空', 400);
 
   try {
