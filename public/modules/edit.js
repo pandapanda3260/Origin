@@ -342,6 +342,16 @@ export function syncEditProject(p) {
     _loadUploadedMedia().then(function () { _renderMediaLibrary(); });
     _renderMediaLibrary();
 
+    // 刷新时也要把 BGM 选择器渲出来——之前只在 _analyzeEditSegments / _generateEditEdl
+    // 之后才 render，导致用户刷新页面就完全看不到 BGM 区域，反馈"刷新后没看到 bgm"。
+    _renderBgmSelector();
+
+    // 刷新进来如果 EDL 已经选了 BGM，把 audio 元素 src 同步上，但不 autoplay
+    // （等用户按播放才起播）。这样用户一进剪辑页就有正确的 BGM 状态。
+    if (_editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId) {
+      setTimeout(_syncBgmPlayback, 0);
+    }
+
     // E-2.2：若上一次导出任务尚未完成（editData.exportTaskId 有值且无 exportUrl），
     // 刷新回来时自动重订 SSE，保证"刷新不丢状态"宪法。
     _tryResumeExportStream();
@@ -1074,6 +1084,41 @@ export function syncEditProject(p) {
     area.appendChild(_editState._vidA);
     area.appendChild(_editState._vidB);
 
+    // 字幕浮层：底部居中、白字黑边、跟着 globalTime 切换内容
+    if (!_editState._subtitleEl) {
+      var sub = document.createElement('div');
+      sub.id = 'editSubtitleOverlay';
+      sub.style.cssText =
+        'position:absolute;left:0;right:0;bottom:32px;text-align:center;' +
+        'pointer-events:none;z-index:20;padding:0 24px;';
+      sub.innerHTML = '<span style="display:inline-block;max-width:90%;font:600 18px/1.4 \'PingFang SC\',sans-serif;' +
+        'color:#fff;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 0 6px rgba(0,0,0,.7);"></span>';
+      area.appendChild(sub);
+      _editState._subtitleEl = sub;
+    }
+
+    // BGM 播放器：单例 audio，selected 时 src 跟着变；播放/暂停/seek 跟随 globalTime
+    if (!_editState._bgmAudio) {
+      var bgm = document.createElement('audio');
+      bgm.id = 'editBgmPlayer';
+      bgm.preload = 'auto';
+      bgm.loop = true;
+      bgm.volume = 0.32;
+      document.body.appendChild(bgm);
+      _editState._bgmAudio = bgm;
+    }
+    // SFX whoosh 池：用 Web Audio + buffer 一次合成 4 段不同长度的 whoosh，转场时按需 play()
+    if (!_editState._sfxAudio) {
+      var sfx = document.createElement('audio');
+      sfx.id = 'editSfxPlayer';
+      sfx.preload = 'auto';
+      sfx.volume = 0.6;
+      // data URL: 一段 0.4s 的褐噪声 whoosh —— 浏览器没有 Brown noise gen 的快捷方式，
+      // 这里用一段静态 .wav header + 程序合成的样本就好。先留空，第一次切转场时合成。
+      document.body.appendChild(sfx);
+      _editState._sfxAudio = sfx;
+    }
+
     var segs = _getTimelineSegs();
     if (segs.length > 0) {
       var url = _segVideoUrl(segs[0], 0);
@@ -1089,6 +1134,51 @@ export function syncEditProject(p) {
 
     _editState._preloaded = true;
     console.log("[Edit] Double-buffer initialized");
+  }
+
+  /** 播放一次转场 whoosh（用 Web Audio API 现合成褐噪声 + bandpass + 包络） */
+  function _playTransitionSfx(transType) {
+    try {
+      var t = String(transType || '').toLowerCase();
+      if (t === 'cut' || !t) return;
+      // 单例 AudioContext —— iOS Safari 要求用户交互后才能 resume；播放按钮已经触发过了
+      if (!_editState._audioCtx) {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        _editState._audioCtx = new Ctx();
+      }
+      var ctx = _editState._audioCtx;
+      if (ctx.state === 'suspended') ctx.resume();
+      // SFX 时长比转场略长一点点，让 whoosh 尾音盖过整段过渡（dissolve 1s → sfx 0.8s）
+      var dur = (t === 'dissolve') ? 0.85
+              : (t === 'wipe' || t === 'wipeleft' || t === 'wiperight') ? 0.65
+              : 0.7; // fade
+      var rate = ctx.sampleRate;
+      var buf = ctx.createBuffer(2, Math.floor(rate * dur), rate);
+      // brown noise 通过累加白噪声生成
+      for (var ch = 0; ch < 2; ch++) {
+        var data = buf.getChannelData(ch);
+        var last = 0;
+        for (var i = 0; i < data.length; i++) {
+          var white = Math.random() * 2 - 1;
+          last = (last + 0.02 * white) / 1.02;
+          // 包络：短促 attack + 指数 decay；衰减系数随时长缩放保持音色不变
+          var env = Math.exp(-3 * (i / data.length));
+          data[i] = last * env * 4;
+        }
+      }
+      var src = ctx.createBufferSource();
+      src.buffer = buf;
+      // 带通：fade/dissolve 用 1.8kHz 低频，wipe 用 4kHz 高频
+      var bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = (t === 'wipe' || t === 'wipeleft' || t === 'wiperight') ? 4000 : 1800;
+      bp.Q.value = 1.2;
+      var gain = ctx.createGain();
+      gain.gain.value = 0.45;
+      src.connect(bp).connect(gain).connect(ctx.destination);
+      src.start();
+    } catch (e) { console.warn('[Edit] sfx play failed:', e); }
   }
 
   function _getActiveVid() {
@@ -1119,7 +1209,18 @@ export function syncEditProject(p) {
     var placeholder = $("editPreviewPlaceholder");
     if (placeholder) placeholder.hidden = true;
 
-    if (!transType || transType === "cut") {
+    // 把 EDL 里的 transition 类型归一到这里能识别的几类。
+    // 关键 BUG：之前 fade/dissolve/wipe 走到下面 if-else 全 miss，结果新 vid 永远不
+    // display:block —— 用户看到的就是"画面卡死在前一段最后一帧"（收尾段尤其明显，
+    // 因为它本身就是 fade 进场）。这里把所有非 cut 的转场都映射成 crossfade，
+    // 预览有个柔和过渡，导出还是按 EDL 真实类型走 ffmpeg xfade。
+    var t = String(transType || 'cut').toLowerCase();
+    if (t === 'fade' || t === 'dissolve' || t === 'wipe' ||
+        t === 'wipeleft' || t === 'wiperight' || t === 'slideleft' || t === 'slideright') {
+      t = 'crossfade';
+    }
+
+    if (!t || t === "cut") {
       if (_editState._vidA) { _editState._vidA.style.display = "none"; _editState._vidA.style.opacity = "1"; }
       if (_editState._vidB) { _editState._vidB.style.display = "none"; _editState._vidB.style.opacity = "1"; }
       if (vid) vid.style.display = "block";
@@ -1127,10 +1228,13 @@ export function syncEditProject(p) {
       return;
     }
 
-    var dur = 500;
+    // 预览转场时长（毫秒）；与 lib/ffmpeg.ts defaultTransDuration 对齐让用户预览到啥导出就是啥
+    var dur = (transType === 'dissolve') ? 1000
+            : (transType === 'wipe' || transType === 'wipeleft' || transType === 'wiperight') ? 700
+            : 800; // fade & 默认
     var area = $("editPreviewArea");
 
-    if (transType === "crossfade") {
+    if (t === "crossfade") {
       var outgoing = _getActiveVid();
       if (vid) { vid.style.display = "block"; vid.style.opacity = "0"; }
       if (outgoing && outgoing !== vid) outgoing.style.display = "block";
@@ -1144,7 +1248,7 @@ export function syncEditProject(p) {
       }
       requestAnimationFrame(crossfadeTick);
 
-    } else if (transType === "fade_to_black" || transType === "fade_from_black") {
+    } else if (t === "fade_to_black" || t === "fade_from_black") {
       var overlay = _getTransOverlay(area);
       var outVid = (transType === "fade_to_black") ? _getActiveVid() : null;
       overlay.style.opacity = transType === "fade_to_black" ? "0" : "1";
@@ -1152,7 +1256,7 @@ export function syncEditProject(p) {
       var s2 = performance.now();
       function fadeTick(now) {
         var p = Math.min((now - s2) / dur, 1);
-        if (transType === "fade_to_black") {
+        if (t === "fade_to_black") {
           overlay.style.opacity = p;
           if (p >= 1) {
             if (outVid) { outVid.style.display = "none"; }
@@ -1330,6 +1434,10 @@ export function syncEditProject(p) {
     if (_tickCache.playBtnSpan) _tickCache.playBtnSpan.textContent = "pause";
     _highlightActiveSeg(segIdx);
 
+    // BGM 跟着 globalTime 起播：如果选了 BGM 就 sync 播放，让用户在剪辑工作台
+    // 听到的就是导出后的 BGM；没选就静音。
+    _syncBgmPlayback();
+
     if (_editState._rafId) cancelAnimationFrame(_editState._rafId);
     _editState._rafId = requestAnimationFrame(_editTickLoop);
   }
@@ -1344,7 +1452,38 @@ export function syncEditProject(p) {
     var vid = _getActiveVid();
     if (vid) vid.pause();
 
+    // 暂停 BGM
+    if (_editState._bgmAudio) { try { _editState._bgmAudio.pause(); } catch (_) {} }
+
     if (_tickCache.playBtnSpan) _tickCache.playBtnSpan.textContent = "play_arrow";
+  }
+
+  /** 把 BGM audio 同步到当前播放状态：选了 BGM 就 play 并按 globalTime 起跳 */
+  function _syncBgmPlayback() {
+    var bgm = _editState._bgmAudio;
+    if (!bgm) return;
+    var trackId = _editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId;
+    if (!trackId) {
+      try { bgm.pause(); } catch (_) {}
+      bgm.removeAttribute('src');
+      return;
+    }
+    var url = '/api/edit/bgm/' + encodeURIComponent(trackId);
+    if (bgm.getAttribute('src') !== url) {
+      bgm.src = url;
+      bgm.load();
+    }
+    var setStart = function () {
+      // BGM 循环播放：currentTime = globalTime mod bgmDuration
+      var bgmDur = isFinite(bgm.duration) && bgm.duration > 0 ? bgm.duration : 28;
+      var startAt = ((_editState.globalTime || 0) % bgmDur);
+      try { bgm.currentTime = startAt; } catch (_) {}
+      if (_editState.isPlaying) {
+        bgm.play().catch(function () { /* autoplay blocked，无视即可 */ });
+      }
+    };
+    if (bgm.readyState >= 1) setStart();
+    else bgm.addEventListener('loadedmetadata', setStart, { once: true });
   }
 
   function _seekThenPlay(vid, seekTime) {
@@ -1410,6 +1549,16 @@ export function syncEditProject(p) {
   function _editTickLoop() {
     if (!_editState.isPlaying) return;
 
+    // 切换中：standby 还没就绪，不要推进时间也不要再次触发下一次切换，
+    // 否则 globalTime 会读到旧 vid 的越界 currentTime → playhead 抽搐
+    // 或者还没切到 nextIdx 就又触发一次切到 nextIdx+1 的连锁错位。
+    if (_editState._swapping) {
+      _updatePlayheadFast();
+      _updateTimeDisplayFast();
+      _editState._rafId = requestAnimationFrame(_editTickLoop);
+      return;
+    }
+
     var segs = _tickCache.segs;
     var starts = _tickCache.starts;
     var curIdx = _editState.currentSegIdx;
@@ -1418,7 +1567,11 @@ export function syncEditProject(p) {
 
     if (vid && seg) {
       var inPt = seg.inPoint || 0;
-      _editState.globalTime = (starts[curIdx] || 0) + Math.max(0, vid.currentTime - inPt);
+      var localTime = Math.max(0, vid.currentTime - inPt);
+      // 防越界：vid 偶发 stall 时 currentTime 可能超过 outPoint，把它截到段长内
+      var segDur = _segDuration(seg);
+      if (localTime > segDur) localTime = segDur;
+      _editState.globalTime = (starts[curIdx] || 0) + localTime;
     }
 
     var segEnd = (starts[curIdx] || 0) + _segDuration(seg);
@@ -1433,9 +1586,6 @@ export function syncEditProject(p) {
         return;
       }
 
-      vid.pause();
-      _editState.currentSegIdx = nextIdx;
-
       var standby = _getStandbyVid();
       var nextSeg = segs[nextIdx];
       var nextUrl = _segVideoUrl(nextSeg, nextIdx);
@@ -1443,23 +1593,135 @@ export function syncEditProject(p) {
 
       if (standby) {
         var nextInPt = nextSeg.inPoint || 0;
-        if (standby.getAttribute("src") !== nextUrl) {
-          standby.src = nextUrl;
-          standby.currentTime = nextInPt;
-        }
-        _showVid(standby, transType);
-        _swapBuffers();
-        _seekThenPlay(standby, nextInPt);
-      }
+        var srcChanged = standby.getAttribute("src") !== nextUrl;
+        if (srcChanged) { standby.src = nextUrl; standby.load(); }
 
-      _highlightActiveSeg(nextIdx);
-      _prebufferNext(nextIdx);
+        // 切换流程修正（v3）：
+        //   v1 立刻 _showVid → 黑屏 + 音频先到
+        //   v2 等 readyState≥2 → play() 立刻 stall
+        //   v3 等 seeked + readyState≥3 → 上一版有 BUG：1.5s 兜底定时器无脑把
+        //       currentTime 跳回 inPoint，已经播了 1.5s 又被拉回起点，所以"第一秒重播"
+        //
+        //   现在的 v3 修正版：
+        //     - 兜底定时器只在 swapped=false 时执行（已经成功切换的不再骚扰）
+        //     - 不再在切换流程里二次 setCurrentTime（standby 已经在 inPoint 了）
+        //     - _seekThenPlay 已经会处理 seek，不需要重复
+        _editState._swapping = true;
+
+        var swapped = false;
+        var doSwap = function () {
+          if (swapped) return;
+          swapped = true;
+          // 移除所有事件监听，避免 swapped 之后还有事件触发 doSwap 或 seek
+          try { standby.removeEventListener("seeked", onSeeked); } catch (_) {}
+          try { standby.removeEventListener("canplay", onCanplay); } catch (_) {}
+          try { standby.removeEventListener("canplaythrough", onCanplay); } catch (_) {}
+          if (vid) { try { vid.pause(); } catch (_) {} }
+          _editState.currentSegIdx = nextIdx;
+          _editState.globalTime = _editState.segStartTimes[nextIdx] || 0;
+          _showVid(standby, transType);
+          _swapBuffers();
+          _seekThenPlay(standby, nextInPt);
+          _highlightActiveSeg(nextIdx);
+          _prebufferNext(nextIdx);
+          _editState._swapping = false;
+          // 转场 SFX：非 cut 转场就同步播一个 whoosh，让用户在工作台预览就能听到
+          if (transType && transType !== 'cut') _playTransitionSfx(transType);
+        };
+
+        var seekedOk = false;
+        var canplayOk = false;
+        var maybeSwap = function () {
+          if (seekedOk && canplayOk && standby.readyState >= 3) doSwap();
+        };
+        var onSeeked = function () {
+          if (swapped) return;
+          standby.removeEventListener("seeked", onSeeked);
+          seekedOk = true;
+          maybeSwap();
+        };
+        var onCanplay = function () {
+          if (swapped) return;
+          if (standby.readyState >= 3) {
+            standby.removeEventListener("canplay", onCanplay);
+            standby.removeEventListener("canplaythrough", onCanplay);
+            canplayOk = true;
+            maybeSwap();
+          }
+        };
+        standby.addEventListener("seeked", onSeeked);
+        standby.addEventListener("canplay", onCanplay);
+        standby.addEventListener("canplaythrough", onCanplay);
+
+        // 触发 seek（如果 src 没变，currentTime= 立刻触发 seeked）
+        try { standby.currentTime = nextInPt; } catch (_) {}
+        // readyState >= 3 = HAVE_FUTURE_DATA，可以直接 play 不会立刻 stall
+        if (standby.readyState >= 3) { canplayOk = true; }
+        // 如果 currentTime 已经吻合（inPoint=0 + 刚 load 完时常见），不会再触发 seeked 事件，
+        // 这里同步标记一下，否则 swap 会永远卡在等 seeked，最后只能靠 1.5s 兜底超时切。
+        if (Math.abs(standby.currentTime - nextInPt) < 0.05) { seekedOk = true; }
+        maybeSwap();
+
+        // 兜底：1.5s 后强切——但如果已经 swapped，绝对不再动 currentTime！
+        // 否则就是把已经播了 1.5s 的视频 seek 回起点，制造"第一秒重播"
+        setTimeout(function () {
+          if (swapped) return;
+          try { standby.currentTime = nextInPt; } catch (_) {}
+          doSwap();
+        }, 1500);
+      } else if (vid) {
+        try { vid.pause(); } catch (_) {}
+        _editState.currentSegIdx = nextIdx;
+        _highlightActiveSeg(nextIdx);
+      }
     }
 
     _updatePlayheadFast();
     _updateTimeDisplayFast();
+    _updateSubtitleFast();
 
     _editState._rafId = requestAnimationFrame(_editTickLoop);
+  }
+
+  /** 当前 globalTime 应该展示的字幕文本（含 speaker 前缀剥除） */
+  function _currentSubtitleText() {
+    var segs = _tickCache.segs;
+    var starts = _tickCache.starts;
+    var idx = _editState.currentSegIdx;
+    var seg = segs && segs[idx];
+    if (!seg || !project) return '';
+    var gIdx = seg.groupIdx != null ? seg.groupIdx : idx;
+    var sbs = Array.isArray(project.storyboards) ? project.storyboards : [];
+    var shots = Array.isArray(project.shots) ? project.shots : [];
+    var sb = sbs[gIdx];
+    var shotIdxs = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
+    var lines = [];
+    for (var i = 0; i < shotIdxs.length; i++) {
+      var sh = shots[shotIdxs[i]];
+      if (!sh) continue;
+      var raw = String(sh.dialogue || '').trim();
+      if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
+      // 剥 "角色名："前缀
+      lines.push(raw.replace(/^\s*[^：:]{1,12}\s*[：:]\s*/, '').replace(/^["'"'「]+|["'"'」]+$/g, '').trim());
+    }
+    if (!lines.length) return '';
+    // 把段时长按行数均分；预留头 0.15s + 尾 0.15s
+    var segDur = _segDuration(seg);
+    var segStart = starts[idx] || 0;
+    var localT = _editState.globalTime - segStart;
+    var usable = Math.max(0.5, segDur - 0.3);
+    var each = usable / lines.length;
+    var k = Math.floor((localT - 0.15) / each);
+    if (k < 0 || k >= lines.length) return '';
+    return lines[k];
+  }
+
+  function _updateSubtitleFast() {
+    var sub = _editState._subtitleEl;
+    if (!sub) return;
+    var text = _currentSubtitleText();
+    var span = sub.firstElementChild;
+    if (span && span.textContent !== text) span.textContent = text;
   }
 
   /* ── UI update helpers (fast path uses cached DOM refs) ── */
@@ -1668,7 +1930,9 @@ export function syncEditProject(p) {
           // E-4.2：BGM 选择 PATCH bgm-select。
           _sendTimelineOp({ op: "bgm-select", trackId: bgmId });
           _renderBgmSelector();
-          showToast("已选择 BGM", "ok");
+          // 立即同步到预览的 BGM player —— 用户点完应当立刻能在工作台听到效果
+          _syncBgmPlayback();
+          showToast("已选择 BGM，预览即时生效", "ok");
         } else {
           showToast("请先生成剪辑方案", "warn");
         }
@@ -1825,10 +2089,30 @@ export function syncEditProject(p) {
         project.editData.edl = resp.result; // arch-guard:allow-editdata 内存镜像（后端 SSE 已落盘）
       }
 
+      // 自动选 BGM：按 AI 分析的 suggestedBGMCategory 命中第一首匹配类别的 BGM —— 
+      // 用户点完 AI 剪辑就能在工作台预览听到 BGM、看到字幕，不用再去选。
+      if (!_editState.edl.bgm || !_editState.edl.bgm.trackId) {
+        var bgmList = await _loadBgmLibrary(); // ensure cache populated
+        var sugCat = _editState.segmentTags && _editState.segmentTags.suggestedBGMCategory;
+        var picked = sugCat && bgmList.find(function (t) { return t.category === sugCat; });
+        if (!picked && bgmList.length) picked = bgmList[0]; // 兜底：实在没匹配就拿第一首（hopeful，最通用）
+        if (picked) {
+          _editState.edl.bgm = { trackId: picked.id };
+          _sendTimelineOp({ op: "bgm-select", trackId: picked.id });
+        }
+      }
+
       _renderEditTimeline();
       _renderBgmSelector();
+      _syncBgmPlayback();
       $("btnEditExport").disabled = false;
-      showToast("AI 剪辑方案已生成", "ok");
+      // 把 LLM 给的剪辑思路一起 toast 出来，方便用户看出"AI 怎么剪的"
+      var narr = (resp.result && resp.result.narrative) || (resp && resp.narrative) || "";
+      var dur = (resp.result && resp.result.duration) || 0;
+      var msg = "AI 剪辑方案已生成";
+      if (dur > 0) msg += "（共 " + dur.toFixed(1) + "s）";
+      if (narr) msg += "：" + narr;
+      showToast(msg, "ok");
     } catch (e) {
       showToast("AI 剪辑失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
     }

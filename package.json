@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.100",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.5.0",
     "jose": "^5.9.6",
