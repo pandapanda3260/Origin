@@ -160,7 +160,8 @@ export async function chatComplete(
   }
   const content = json?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回结构异常（缺 message.content）');
-  return content;
+  // 推理模型把 <think>...</think> 当 content 流出来，整段过滤后返回干净文本
+  return stripThinkBlocks(content);
 }
 
 /** 从中转站/OpenAI 风格的错误体中抽 message，方便上层显示友好提示 */
@@ -277,6 +278,14 @@ export async function chatStream(
   let buffer = '';
   let full = '';
 
+  // 推理模型（gpt-5.5 / o1 / claude thinking / gemini 3 thinking）会把
+  // <think>...</think> / <thinking>...</thinking> 当成 content 流出来，
+  // 用户看到的就是一大段英文乱码。这里做流式状态机，跨 chunk 兜住分裂的标签。
+  const stripper = makeThinkStripper((clean) => {
+    full += clean;
+    if (clean) onChunk(clean);
+  });
+
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -288,7 +297,10 @@ export async function chatStream(
         const line = part.trim();
         if (!line.startsWith('data: ')) continue;
         const payload = line.slice(6).trim();
-        if (payload === '[DONE]') return full;
+        if (payload === '[DONE]') {
+          stripper.flush();
+          return full;
+        }
         try {
           const evt: any = JSON.parse(payload);
           // 中转站可能在流里塞 error 帧
@@ -298,8 +310,7 @@ export async function chatStream(
           }
           const delta = evt?.choices?.[0]?.delta?.content;
           if (typeof delta === 'string' && delta.length) {
-            full += delta;
-            onChunk(delta);
+            stripper.feed(delta);
           }
         } catch (parseErr: any) {
           // 真正的 LLM 错误帧要抛出去；普通解析失败的心跳行忽略
@@ -307,10 +318,74 @@ export async function chatStream(
         }
       }
     }
+    stripper.flush();
     return full;
   } finally {
     clearTimeout(streamTimer);
   }
+}
+
+/**
+ * 流式剥离 <think>...</think> / <thinking>...</thinking> 推理块。
+ *
+ * 工作原理：
+ *   - 维护 inThink 状态，进入 think 块期间所有内容都丢弃
+ *   - 处理跨 chunk 分裂的开/闭标签：保留尾部最多 12 字符在 buf 里
+ *   - 不在 think 块内时，遇到看似"标签前缀"的尾部（如 chunk 以 "<thin" 结尾）
+ *     先压住不发出，等下个 chunk 拼接后再判定
+ */
+function makeThinkStripper(emit: (clean: string) => void) {
+  let buf = '';
+  let inThink = false;
+  const OPEN_RE = /<think(?:ing)?>/i;
+  const CLOSE_RE = /<\/think(?:ing)?>/i;
+  const PARTIAL_TAG_RE = /<\/?[a-zA-Z]{0,9}$/; // 12 字符内的"未闭合标签"
+
+  function process() {
+    while (buf.length > 0) {
+      if (!inThink) {
+        const m = buf.match(OPEN_RE);
+        if (!m) {
+          const tail = buf.match(PARTIAL_TAG_RE);
+          const safeLen = tail ? buf.length - tail[0].length : buf.length;
+          if (safeLen > 0) emit(buf.slice(0, safeLen));
+          buf = buf.slice(safeLen);
+          return;
+        }
+        const idx = m.index || 0;
+        if (idx > 0) emit(buf.slice(0, idx));
+        buf = buf.slice(idx + m[0].length);
+        inThink = true;
+      } else {
+        const m = buf.match(CLOSE_RE);
+        if (!m) {
+          // 没看到结束标签：丢弃 buf，但保留最后 12 字符兜住分裂的 </thinking>
+          if (buf.length > 12) buf = buf.slice(-12);
+          return;
+        }
+        buf = buf.slice((m.index || 0) + m[0].length);
+        inThink = false;
+      }
+    }
+  }
+
+  return {
+    feed(chunk: string) {
+      buf += chunk;
+      process();
+    },
+    flush() {
+      // 流结束：如果仍在 think 状态，剩下的内容丢弃；否则把残留 buf 全部 emit
+      if (!inThink && buf.length > 0) emit(buf);
+      buf = '';
+    },
+  };
+}
+
+/** 非流式调用专用：直接把整段文本里的 <think> 块剔除 */
+export function stripThinkBlocks(text: string): string {
+  if (!text) return text;
+  return text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '').trim();
 }
 
 /* ============================================================

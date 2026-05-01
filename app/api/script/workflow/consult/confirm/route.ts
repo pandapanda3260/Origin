@@ -9,6 +9,7 @@ import {
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
+import { sinicizeColorPalette } from '@/lib/style-bible';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -87,6 +88,7 @@ export async function POST(req: NextRequest) {
         _error: e?.message || String(e),
       };
     }
+    styleBible = sinicizeColorPalette(styleBible);
 
     // === 3. 情绪标记（非流式 JSON，带 3 次重试）===
     writer.phase('tag_emotions_start');

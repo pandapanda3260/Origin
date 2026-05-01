@@ -10,6 +10,7 @@ import {
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
+import { sinicizeColorPalette } from '@/lib/style-bible';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -89,6 +90,8 @@ export async function POST(req: NextRequest) {
       console.warn('[full-create] styleBible failed after retries:', e?.message);
       styleBible = { visualStyle: '提取失败（请点击重新生成）', visualStyleDesc: '', colorPalette: [], era: '', mood: '', cameraStyle: '', worldRules: '' };
     }
+    // 兜底：把 LLM 偷懒输出的英文色名翻成中文，避免前端展示 "TEAL · AMBER · CREAM" 这种
+    styleBible = sinicizeColorPalette(styleBible);
 
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');

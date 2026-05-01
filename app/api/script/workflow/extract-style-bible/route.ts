@@ -4,6 +4,7 @@ import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { buildStyleBibleMessages } from '@/lib/prompts';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { sinicizeColorPalette } from '@/lib/style-bible';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -32,6 +33,8 @@ export async function POST(req: NextRequest) {
   } catch (e: any) {
     return jsonError('风格圣经生成失败：' + (e?.message || String(e)), 502);
   }
+
+  styleBible = sinicizeColorPalette(styleBible);
 
   if (projectId && proj) {
     updateProjectForUser(projectId, user.id, { styleBible });
