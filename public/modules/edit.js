@@ -1623,7 +1623,25 @@ export function syncEditProject(p) {
           _swapBuffers();
           _seekThenPlay(standby, nextInPt);
           _highlightActiveSeg(nextIdx);
-          _prebufferNext(nextIdx);
+
+          // 关键修复：非 cut 转场时，绝对不能立即 _prebufferNext，否则会把
+          // N+2 段的 src 灌进还在 crossfade 淡出中的"上一段"video 元素，
+          // 用户就会看到淡出层突然闪出毫不相干的下下段画面。
+          // 等 crossfade 完全结束、outgoing 元素 display:none 之后再换 src 就安全了。
+          var t = String(transType || 'cut').toLowerCase();
+          var isCut = (!t || t === 'cut');
+          if (isCut) {
+            _prebufferNext(nextIdx);
+          } else {
+            var prebufDelay = (t === 'dissolve') ? 1100
+                            : (t === 'wipe' || t === 'wipeleft' || t === 'wiperight') ? 800
+                            : 900; // fade & 其它（与 _showVid 的 dur 同步 + 100ms 缓冲）
+            setTimeout(function () {
+              // 防御：如果用户已经 seek 到别的段，prebuffer 由 _editSeekToSeg 的下次 play
+              // 自然接管即可，这里不再强行改 standby 的 src
+              if (_editState.currentSegIdx === nextIdx) _prebufferNext(nextIdx);
+            }, prebufDelay);
+          }
           _editState._swapping = false;
           // 转场 SFX：非 cut 转场就同步播一个 whoosh，让用户在工作台预览就能听到
           if (transType && transType !== 'cut') _playTransitionSfx(transType);
