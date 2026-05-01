@@ -98,8 +98,10 @@ export function resolveLLMConfig(
 /* ============================================================
    非流式调用：拿一个完整字符串
    ============================================================ */
-// 单次 LLM 文本调用最长等 90 秒；超过就 abort，避免中转站挂掉时无限等待
-const LLM_REQUEST_TIMEOUT_MS = 90_000;
+// 单次 LLM 文本调用最长等 180 秒；之前 90s 对 gemini-3.x / claude-thinking
+// 这种带"思考过程"的模型经常误伤（思考期间 0 字节流回，被 AbortController 砍掉），
+// 给到 3 分钟兜底就够覆盖常见慢模型；如果中转站真挂了也不会无限等。
+const LLM_REQUEST_TIMEOUT_MS = 180_000;
 
 export async function chatComplete(
   user: UserRow | null,
