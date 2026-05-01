@@ -62,6 +62,16 @@ export async function POST(req: NextRequest) {
 
     // 兜底：如果 LLM 还是输出了 <step> 标签，剥掉
     scriptText = scriptText.replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
+    // 兜底：把 LLM 字面量 "\n" 还原为真换行（prompt 里的 \\n 字面，
+    // gpt-5.5/o1 等推理模型经常老老实实照打）
+    scriptText = scriptText
+      .replace(/\\r\\n|\\n/g, '\n')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((l) => l.replace(/[ \t]+$/g, ''))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
 
     // === 2. 提取风格圣经（非流式 JSON，带 3 次重试）===
     writer.phase('style_bible_start');
