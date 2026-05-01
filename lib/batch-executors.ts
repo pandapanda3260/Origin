@@ -8,7 +8,7 @@
  */
 
 import { registerExecutor, aliasExecutor, type BatchExecCtx } from './batches';
-import { generateImage } from './image-gen';
+import { generateImage, resolveLocalImagePath } from './image-gen';
 import { generateVideo } from './video-gen';
 import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from './llm';
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
@@ -17,6 +17,108 @@ import { getProjectByIdForUser, updateProjectForUser } from './projects-db';
 /* ============================================================
    helper：根据 target.{type, idx} 找到对应资产 + 构造提示词
    ============================================================ */
+
+/**
+ * 把 styleBible 转成一段固定的英文 "STYLE BIBLE LOCK"——同一个项目下的
+ * **每一张场景图**都拼上完全相同的这段，从 prompt 层面强行让所有场景共享
+ * 同一套色调 / 灯光 / 风格关键字，避免主场景偏暖黄、副场景跑去冷白这种割裂。
+ *
+ * 注意：这段会作为权威约束放在 prompt 末尾，覆盖前面 imagePrompt 里可能写
+ * 出来的局部冲突。如果 styleBible 缺失就返回空串，不强加约束。
+ */
+function buildSceneStyleLock(styleBible: any): string {
+  if (!styleBible || typeof styleBible !== 'object') return '';
+  const parts: string[] = [];
+  // 视觉风格关键词（治愈系 / 王家卫怀旧 等）
+  const vs = styleBible.visualStyle || styleBible.vision;
+  if (vs) parts.push(`Project visual style: ${vs}.`);
+  if (styleBible.visualStyleDesc) parts.push(`Style detail: ${styleBible.visualStyleDesc}`);
+  // 色板：6 个 hex+中文名拼成英文友好的 list
+  if (Array.isArray(styleBible.colorPalette) && styleBible.colorPalette.length) {
+    const palette = styleBible.colorPalette
+      .filter((c: any) => c && (c.hex || c.name))
+      .map((c: any) => `${c.hex || ''}${c.name ? ` (${c.name})` : ''}`.trim())
+      .join(', ');
+    if (palette) parts.push(`Project color palette (the image's overall color must come from this palette, NOT from the model's default white-balance guess): ${palette}.`);
+  }
+  // 时代/世界观（决定材质 / 道具风格 / 整体光线倾向）
+  if (styleBible.era) parts.push(`Era & setting: ${styleBible.era}`);
+  if (styleBible.mood || styleBible.tone) parts.push(`Overall mood: ${styleBible.mood || styleBible.tone}`);
+  // 镜头风格（决定景别偏好 / 构图）
+  if (styleBible.cameraStyle) parts.push(`Camera language: ${styleBible.cameraStyle}`);
+  // worldRules 太长会挤掉别的提示，截到 240 字
+  if (styleBible.worldRules) {
+    const wr = String(styleBible.worldRules).slice(0, 240);
+    parts.push(`World rules: ${wr}`);
+  }
+  if (!parts.length) return '';
+  return [
+    '=== PROJECT STYLE BIBLE LOCK (every scene image in this project MUST share this exact look) ===',
+    ...parts,
+    'CRITICAL: do NOT introduce colors, lighting temperatures, or material styles outside the project palette above. All scenes in this project must look like they came from the same DP and the same color grading session.',
+  ].join('\n');
+}
+
+/**
+ * 副场景跑前等主场景图就绪，并返回主场景 PNG 在磁盘上的绝对路径——给
+ * `/v1/images/edits` 当参考图用。最长 timeoutMs 还没就绪就返回 null，
+ * 调用方应 fallback 到纯文本 prompt（文本 lock 至少能保色调一致）。
+ *
+ * 实现思路：每 1.5s 重读 project，从 project.environments / assets.scenes
+ * 里找主场景的 imageUrl（形如 `/api/images/file/<uuid>`），然后用
+ * `resolveLocalImagePath` 反查到磁盘 PNG。
+ */
+async function waitForMainSceneReference(
+  projectId: string,
+  ownerId: number,
+  baseSceneRef: string,
+  timeoutMs: number,
+  onWait?: (msg: string) => void,
+): Promise<string | null> {
+  const start = Date.now();
+  let logged = false;
+  while (Date.now() - start < timeoutMs) {
+    const fresh = getProjectByIdForUser(projectId, ownerId);
+    if (fresh) {
+      const main = findSceneByRef(fresh, baseSceneRef);
+      const url = main?.imageUrl || main?.rawUrl;
+      if (url) {
+        const path = resolveLocalImagePath(url, ownerId);
+        if (path) return path;
+      }
+    }
+    if (!logged) {
+      onWait?.(`等待主场景 ${baseSceneRef} 就绪…`);
+      logged = true;
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  return null;
+}
+
+/**
+ * 副场景找它绑定的主场景。baseSceneRef 是 LLM 在 SP_ASSETS_EXTRACT 阶段塞的
+ * id（如 "e1"），主场景候选既可能在 project.environments 也可能在
+ * project.assets.scenes 下，两个数组都看一眼。
+ */
+function findSceneByRef(project: any, ref: string): any | null {
+  if (!ref) return null;
+  const candidates: any[] = [];
+  if (Array.isArray(project?.environments)) candidates.push(...project.environments);
+  if (Array.isArray(project?.assets?.scenes)) candidates.push(...project.assets.scenes);
+  for (const s of candidates) {
+    if (!s) continue;
+    if (s.id === ref) return s;
+    // 兜底：有些项目用 name 或 isMain 标识主场景
+    if (ref === 'main' && s.isMain) return s;
+  }
+  // 再兜一次：直接拿第一个 isMain=true 的
+  for (const s of candidates) {
+    if (s && s.isMain) return s;
+  }
+  return null;
+}
+
 function resolveAssetTarget(project: any, target: any) {
   const type: 'char' | 'scene' | 'prop' = target.type;
   const idx: number = target.idx;
@@ -48,10 +150,15 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
     ].filter(Boolean).join('\n');
   }
   if (type === 'scene') {
-    return [
-      `Subject: ${asset.name || 'unnamed scene'}.`,
-      asset.description || '',
-    ].filter(Boolean).join('\n');
+    const parts: string[] = [`Subject: ${asset.name || 'unnamed scene'}.`];
+    if (asset.location) parts.push(`Located in: ${asset.location}.`);
+    if (asset.description) parts.push(asset.description);
+    if (asset.timeSetting) parts.push(`Shot at: ${asset.timeSetting}.`);
+    if (asset.weather) parts.push(`Weather: ${asset.weather}.`);
+    if (asset.lighting) parts.push(`Lighting: ${asset.lighting}.`);
+    if (asset.atmosphere) parts.push(`Atmosphere: ${asset.atmosphere}.`);
+    if (Array.isArray(asset.elements) && asset.elements.length) parts.push(`Key elements: ${asset.elements.join(', ')}.`);
+    return parts.filter(Boolean).join('\n');
   }
   return [
     `Subject: ${asset.name || 'unnamed prop'}.`,
@@ -71,7 +178,70 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   if (!item) throw new Error(`找不到 ${cat}[${idx}]`);
 
   ctx.progress({ stage: 'building_prompt' });
-  const prompt = item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible);
+  let prompt = item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible);
+
+  // 场景元数据注入：原网站效果之所以好看，是因为它把"时段/天气/灯光/氛围/位置"
+  // 这些场景级参数也喂进了图像 prompt（不光显示在卡上）。我们的 LLM 现在会抽
+  // 这些字段（参考 SP_ASSETS_EXTRACT），这里在出图前拼一段"SCENE METADATA"
+  // 段落让图像模型必须 reflect 出来。即便 imagePrompt 已经写过部分氛围，
+  // 这段也作为权威约束追加到末尾。
+  if (type === 'scene') {
+    const sceneMeta: string[] = [];
+    if (item.location) sceneMeta.push(`Location context: ${item.location}.`);
+    if (item.timeSetting) sceneMeta.push(`Time of day: ${item.timeSetting} — lighting and shadows must match this time.`);
+    if (item.weather) sceneMeta.push(`Weather: ${item.weather}.`);
+    if (item.lighting) sceneMeta.push(`Lighting style: ${item.lighting}.`);
+    if (item.atmosphere) sceneMeta.push(`Atmosphere / mood keywords (the image must feel like these): ${item.atmosphere}.`);
+    if (Array.isArray(item.elements) && item.elements.length) sceneMeta.push(`Key elements that must appear: ${item.elements.join(', ')}.`);
+    if (sceneMeta.length) {
+      prompt = `${prompt}\n\n=== SCENE METADATA (must reflect in image, override conflicting hints above) ===\n${sceneMeta.join('\n')}`;
+    }
+
+    // ----- 项目级色调锁定 -----
+    // 用户反馈："主场景和各个分场景的色调要统一，不能一个黄一个白"。
+    // 之前每个场景独立生成 → 灯光/白平衡/色温由模型自己定 → 同一个项目下
+    // 主场景偏暖黄、副场景偏冷白。这里从 styleBible 抽出 color palette /
+    // visualStyle / mood / era，每张场景图都带**完全相同**的 lock 段落，
+    // 强制整个项目共享一套色调；副场景再额外锁定到主场景的 name + description，
+    // 让图像模型把它当成"同一地点的另一角度"，不能跑偏。
+    const styleLock = buildSceneStyleLock((proj as any).styleBible);
+    if (styleLock) {
+      prompt = `${prompt}\n\n${styleLock}`;
+    }
+    if (item.baseSceneRef) {
+      const mainScene = findSceneByRef(proj, item.baseSceneRef);
+      if (mainScene) {
+        const mainHints: string[] = [];
+        mainHints.push(`This is a SUB-AREA / DIFFERENT ANGLE of the main scene "${mainScene.name || ''}" — it is the SAME physical location, just a different corner / camera angle.`);
+        if (mainScene.description) mainHints.push(`Main scene description (must share the SAME architecture, materials, fixtures, props): ${mainScene.description}`);
+        if (mainScene.timeSetting) mainHints.push(`Main scene time of day: ${mainScene.timeSetting}.`);
+        if (mainScene.lighting) mainHints.push(`Main scene lighting: ${mainScene.lighting}.`);
+        if (mainScene.atmosphere) mainHints.push(`Main scene atmosphere keywords: ${mainScene.atmosphere}.`);
+        if (Array.isArray(mainScene.elements) && mainScene.elements.length) {
+          mainHints.push(`Main scene key elements (some of these should remain visible): ${mainScene.elements.join(', ')}.`);
+        }
+        mainHints.push('CRITICAL — same-location consistency:');
+        mainHints.push('  · Same wall paint, same floor material, same ceiling type, same window/door style.');
+        mainHints.push('  · Same furniture pieces and same equipment style as visible in the main scene.');
+        mainHints.push('  · Same lighting fixtures and same color temperature / white balance / contrast / grading.');
+        mainHints.push('  · Same era, same construction style, same level of cleanliness/wear.');
+        mainHints.push('If the main scene is a stainless-steel commercial back-kitchen at night with warm tungsten lights, the sub-scene MUST also look like a different corner of THAT SAME kitchen — NOT a clean classroom, NOT a different building, NOT a different time of day.');
+        prompt = `${prompt}\n\n=== MAIN-SCENE LOCK (sub-scenes must match the main scene's look) ===\n${mainHints.join('\n')}`;
+      }
+    }
+  }
+
+  // 角色元数据注入：气质/动作特征也影响表演气场（皱眉/手插腰），让 reference
+  // 图能体现出来。equipment 同样写进去，避免漏画手里的物件。
+  if (type === 'char') {
+    const charMeta: string[] = [];
+    if (item.equipment) charMeta.push(`Holding / wearing: ${item.equipment}.`);
+    if (item.temperament) charMeta.push(`Temperament keywords (must show in face/posture): ${item.temperament}.`);
+    if (item.actionTraits) charMeta.push(`Signature gestures (pose hints for the front view): ${item.actionTraits}.`);
+    if (charMeta.length) {
+      prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image) ===\n${charMeta.join('\n')}`;
+    }
+  }
 
   ctx.progress({ stage: 'calling_image_api' });
   // 尺寸策略：
@@ -82,6 +252,34 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   const entityType: 'human' | 'non-human' =
     type === 'char' && (item.entityType === 'non-human') ? 'non-human' : 'human';
 
+  // ----- 副场景的参考图（image-to-image）-----
+  // 用户反馈："分场景得参考主场景来生成 不止是色调 环境什么的也是"。
+  // 文本描述对模型来说太弱了——主场景是工业不锈钢后厨，副场景照样画成
+  // 干净小教室。这里走 gpt-image-* 的 /v1/images/edits 端点，把已经生成
+  // 出来的主场景 PNG 当视觉锚点喂进去，让模型用同一套材质 / 灯光 / 色温
+  // 画"同一地点的另一角度"。
+  //
+  // 时序：主场景 + 多个副场景同时被批量生成，副场景可能比主场景早开跑。
+  // 这里用最长 90s 的轮询等主场景图就绪；超时就 fallback 到无参考图，
+  // 至少有文本 lock 兜底。
+  let referenceImagePath: string | undefined;
+  if (type === 'scene' && item.baseSceneRef) {
+    referenceImagePath = await waitForMainSceneReference(
+      ctx.projectId,
+      ctx.user.id,
+      item.baseSceneRef,
+      90_000,
+      (msg) => ctx.progress({ stage: 'waiting_main_scene', msg }),
+    ) || undefined;
+    if (referenceImagePath) {
+      console.log(`[asset_images] sub-scene scenes[${idx}] using main scene as reference image: ${referenceImagePath}`);
+      // 给 prompt 再加一行明确指令，告诉模型那张参考图是同一个地点
+      prompt = `${prompt}\n\n=== REFERENCE IMAGE NOTE ===\nThe attached reference image IS the main scene of this same physical location. Generate a DIFFERENT camera angle / sub-area of THAT SAME location — keep all materials, fixtures, lighting, color temperature, and overall photographic look IDENTICAL to the reference. Do NOT change the building, the room style, the time of day, or the color grading.`;
+    } else {
+      console.warn(`[asset_images] sub-scene scenes[${idx}]: main scene image not ready in 90s, falling back to text-only`);
+    }
+  }
+
   const result = await generateImage(ctx.user, {
     prompt,
     size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : '1024x1024',
@@ -90,6 +288,10 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     entityType: type === 'char' ? entityType : undefined,
     projectId: ctx.projectId,
     assetRef: `${cat}[${idx}]`,
+    // 角色 4 宫格（头部特写 + 三视图）和场景 6 宫格细节多，低画质会糊掉脸
+    // 和场景纹理；prop 单图保持 low 既快又够用。
+    quality: type === 'prop' ? 'low' : 'medium',
+    referenceImagePath,
   });
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
@@ -154,12 +356,19 @@ const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）
 - 描述对象就是一张分镜稿，所以只描写：①主体（人物名 + 服装外观 + 表情/姿态）②动作（只描述这一帧定格的动作）③ 构图与景别（wide shot / medium / close-up / over-shoulder）④ 机位（low angle / high angle / eye-level / POV）⑤ 光照方向（key light from left / backlit / overhead / silhouette）⑥ 关键道具与场景元素（counter, fish trays, apron, clipboard 等）
 - 如果给了角色描述，必须保留外观/服装一致性（同一角色多个镜头里穿同样的衣服）
 
+【非人/拟人角色规则 —— 极其重要】
+- 如果角色被标记为 "非人/拟人"（NON-HUMAN），或者画面描述里出现了拟人化的海鲜 / 动物 / 机甲 / AI 生物（例如"帝王蟹队长 / 龙虾 / 生蚝 / 三文鱼 / 扇贝 / 章鱼 / 机甲战士"等），**必须保留它们的物种本体**（anthropomorphic king crab with carapace and pincers / anthropomorphic lobster / anthropomorphic salmon / anthropomorphic oyster shell with tiny limbs ...）。
+- **绝对禁止把这些非人角色画成穿围裙的真人员工**。如果同一画面里同时有人类老板和拟人海鲜，那么人类只画给定的人类角色，其余成员必须是对应物种的拟人形态（壳、鳃、触手、眼柄、钳等清晰可辨）。
+- 对于群像（"一排员工 / 一群成员 / 后厨工会"等），必须按画面描述里点名的物种逐个画出（例："a king crab raising large pincers in the center, behind it a lobster, an oyster shell, a salmon, a scallop standing in a row" —— 不要写成"a row of human workers in aprons"）。
+- **体型必须接近现实物种 + 至多到人类肩膀高**：拟人海鲜是"小员工尺寸"，不是巨型怪兽。请在描述里显式写 "human-shoulder-height anthropomorphic king crab"、"small lobster-sized anthropomorphic lobster standing on hind legs"、"hand-sized anthropomorphic oyster" 之类，并明确标注 "smaller than the human character" / "the human boss is the tallest figure in the frame"。绝不能让蟹钳比人脸还大、海鲜覆盖整个画面；如果一定要给中近景，描述时也要保持人类比海鲜更高的比例。
+
 【禁止】
 - 不要写 "photorealistic / cinematic film / 35mm / film grain / hyper-real / 4K / vivid color / teal-orange / saturated"——这些会破坏手稿风
 - 不要写 "color palette / warm color tone"，分镜稿是黑白
 - 不要写"运镜动词"作为单独陈述（如 "the camera slowly pushes in"），改用"frame composition implies a slow push-in"或直接给静止构图
 - 不要写台词或字幕
 - 不要写 "three-view" 或 "white background"（那是资产图，不是分镜图）
+- 不要把任何拟人化的非人角色降级成"a human worker / employee / staff member in apron"
 - 不要解释，不要复述中文，不要写"Description:"前缀，直接输出 prompt 段落`;
 
 registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
@@ -187,19 +396,35 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
   const characters: string[] = Array.isArray(shot.characters) ? shot.characters : [];
   const keyInfo = shot.keyInfo || '';
 
-  // 拼角色上下文（保持跨镜头服装/外观一致性）
+  // 拼角色上下文（保持跨镜头服装/外观一致性 + 非人物种保护）
+  const allChars = ((proj as any).assets?.characters || []) as any[];
   let charContext = '';
   if (characters.length) {
-    const allChars = ((proj as any).assets?.characters || []) as any[];
     charContext = characters
       .map((nm) => allChars.find((c: any) => c.name === nm || c.role === nm))
       .filter(Boolean)
       .map((c: any) => {
         const desc = c.appearance || c.description || c.detail || '';
         const cloth = c.clothing ? `, clothing: ${c.clothing}` : '';
-        return `${c.name || c.role}: ${desc}${cloth}`.trim();
+        const ent = c.entityType === 'non-human' ? ' [NON-HUMAN / 拟人化，必须保留物种形态]' : '';
+        return `${c.name || c.role}${ent}: ${desc}${cloth}`.trim();
       })
       .join(' | ');
+  }
+
+  // 兜底：扫一遍画面描述，把项目里登记过的非人角色名字都列出来，
+  // 防止 shot.characters 漏写时 LLM 把"帝王蟹队长"画成真人。
+  const nonHumanMentions: string[] = [];
+  if (visual && allChars.length) {
+    for (const c of allChars) {
+      if (c.entityType !== 'non-human') continue;
+      const nm = c.name || c.role;
+      if (!nm) continue;
+      if (visual.includes(nm) && !characters.includes(nm)) {
+        const desc = c.appearance || c.description || c.detail || '';
+        nonHumanMentions.push(`${nm} [NON-HUMAN]: ${desc}`.trim());
+      }
+    }
   }
 
   const userMsg = [
@@ -210,6 +435,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     dialogue && dialogue !== '——' && `台词/旁白：${dialogue}`,
     keyInfo && `主题词：${keyInfo}`,
     charContext && `本镜头角色（必须保留外观/服装一致性）：${charContext}`,
+    nonHumanMentions.length && `画面中提及的其它非人/拟人角色（绝对不能画成真人）：${nonHumanMentions.join(' | ')}`,
     styleHint && `整体视觉风格：${styleHint}`,
   ].filter(Boolean).join('\n');
 
@@ -282,14 +508,79 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   });
 
   // 多镜头：让模型把它们画成一张多格分镜稿（panel grid）
-  const isMulti = groupShots.length > 1;
-  const sheetIntro = isMulti
-    ? `Storyboard sheet with ${groupShots.length} sequential panels showing different beats of the same scene. `
-    : '';
+  // 用户要求 layout 必须是 1×2（2 格）或 2×2（4 格），不要 3 格不规则布局。
+  // 所以这里精确告诉模型 panel 数 + 排布方式，并放在 prompt 最前面让权重最高。
+  const n = groupShots.length;
+  let sheetIntro = '';
+  if (n === 1) {
+    sheetIntro = 'A SINGLE storyboard frame (NOT a multi-panel sheet) — one full image showing this single beat. ';
+  } else if (n === 2) {
+    sheetIntro = 'A TWO-PANEL storyboard sheet, layout = 1 row × 2 columns (left panel + right panel, evenly split, thin pencil-line border between panels). Panels are read LEFT to RIGHT in time order. ';
+  } else if (n === 3) {
+    // 上游分组算法已经基本不会输出 3，但万一冒出来 (用户手动 groupBoundary)，
+    // 走 2x2 布局把第 4 格留空 / 收尾镜头，避免 1×3 难看。
+    sheetIntro = 'A FOUR-PANEL storyboard sheet, layout = 2 rows × 2 columns (top-left, top-right, bottom-left, bottom-right, evenly sized, thin pencil-line borders between panels). Use the first 3 panels for the 3 shots in time order; the 4th (bottom-right) panel must be a recap close-up of the most important visual element from the previous 3 panels. ';
+  } else if (n === 4) {
+    sheetIntro = 'A FOUR-PANEL storyboard sheet, layout = 2 rows × 2 columns (top-left → top-right → bottom-left → bottom-right, evenly sized, thin pencil-line borders between panels). Panels are read in this Z-order in time. ';
+  } else {
+    sheetIntro = `A storyboard sheet with ${n} sequential panels showing different beats of the same scene. `;
+  }
   let basePrompt = sheetIntro + promptSections.join(' | ');
   if (basePrompt.length > MAX_PROMPT_CHARS) {
     basePrompt = basePrompt.slice(0, MAX_PROMPT_CHARS) + '…';
   }
+  // 在末尾再加一段硬性 layout 约束，避免模型自由发挥成 1×3 或 3×1
+  if (n > 1) {
+    basePrompt += '\n\n=== LAYOUT LOCK (must follow) ===\n';
+    if (n === 2) {
+      basePrompt += 'EXACTLY 2 panels, side by side (1 row × 2 columns). NEVER stack vertically. NEVER split into 3 panels. NEVER add a tiny inset panel.\n';
+    } else if (n === 3 || n === 4) {
+      basePrompt += 'EXACTLY 4 panels in a 2×2 grid (top row 2 panels, bottom row 2 panels, all four panels evenly sized). NEVER 1×3, NEVER 3×1, NEVER 1×4, NEVER irregular layout.\n';
+    }
+    basePrompt += 'All panels share ONE consistent pencil-sketch line style; same character look across panels (same person = same face/clothes everywhere).';
+  }
+
+  // 非人/拟人角色保险丝：扫描这一组所有镜头，如果文本里出现任何拟人化的非人角色，
+  // 在 prompt 末尾追加一条强约束，避免 gpt-image 把蟹/虾/三文鱼默认画成真人。
+  try {
+    const projChars: any[] = ((proj as any).assets?.characters || []) as any[];
+    const nonHumanSpeciesUsed = new Set<string>();
+    for (const sh of groupShots) {
+      const text = [
+        sh.imagePrompt || '',
+        sh.visual || sh.description || sh.desc || '',
+        Array.isArray(sh.characters) ? sh.characters.join(' ') : '',
+      ].join(' ');
+      for (const c of projChars) {
+        if (c?.entityType !== 'non-human') continue;
+        const nm = c.name || c.role;
+        if (!nm) continue;
+        if (text.includes(nm)) {
+          const appearance = (c.appearance || c.description || '').slice(0, 120);
+          nonHumanSpeciesUsed.add(`${nm} (${appearance || 'anthropomorphic creature, keep species body'})`);
+        }
+      }
+    }
+    if (nonHumanSpeciesUsed.size) {
+      basePrompt +=
+        '\n\n=== NON-HUMAN CHARACTER LOCK (must follow) ===\n' +
+        'The following characters are anthropomorphic NON-HUMAN creatures and MUST be drawn with their actual species body (carapace / shell / fins / tentacles / pincers / etc.), NEVER as ordinary human workers in aprons:\n' +
+        Array.from(nonHumanSpeciesUsed).map((s) => '- ' + s).join('\n') +
+        '\nIf a panel shows a group of "employees / staff / union members" that includes any of the above, draw each one as its correct anthropomorphic species — DO NOT replace any of them with humans.' +
+        // 体型约束：不能画成"巨型海鲜怪兽" / 与人类对比悬殊。
+        // 用户反馈："海鲜个头太大了 不像正常海鲜那么大"——所以这里强制要求：
+        //   · 拟人海鲜的总高度 ≈ 人类员工的肩膀高 - 头顶（即 0.6×~1.0× 人类身高）
+        //   · 不能让蟹钳比人脸还大、蟹腿覆盖整个画面
+        //   · 物种保留特征但比例服从"小员工"设定（拟人小怪 ≠ kaiju 巨兽）
+        '\n\n=== NON-HUMAN CHARACTER SCALE LOCK (must follow) ===\n' +
+        'These anthropomorphic seafood/animal characters are SMALL EMPLOYEE-SCALE creatures, NOT giant kaiju monsters:\n' +
+        '- Total body height of each non-human character must be roughly the same as a real-world version of that species (a king crab ≈ 60-80cm tall standing on hind legs, a lobster ≈ 50-70cm, an oyster ≈ 20-30cm, a salmon ≈ 60-90cm), or at most up to a human worker\'s shoulder/chest height.\n' +
+        '- They must NEVER tower over the human character — if a human boss is in the same frame, the human is the TALLEST figure.\n' +
+        '- Pincers / claws / shells must be proportionate to the character\'s small size — a crab\'s pincer should NOT be bigger than a human face.\n' +
+        '- They stand or pose at human-friendly scale (like small mascots / kitchen staff), NOT as monstrous giants.\n' +
+        'If any non-human character ends up taller than a human character in the same frame, the image is REJECTED.';
+    }
+  } catch {}
 
   ctx.progress({
     stage: 'calling_image_api',
@@ -303,6 +594,8 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     kind: 'storyboard',
     projectId: ctx.projectId,
     assetRef: `storyboards[${groupIdx}]`,
+    // 多格分镜把面部 / 道具 / 透视都压在一张图里，low 画质会糊脸
+    quality: 'medium',
   });
 
   // 写回 project.storyboards[groupIdx]：注意 imageUrl + url 都写，前端两边都会读
@@ -349,25 +642,222 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const _shotVisual = shot.visual || shot.description || shot.desc || '';
   const prompt =
     sb.videoPrompt || shot.imagePrompt || _shotVisual || `Video segment for shot ${groupIdx + 1}`;
-  const durationSec = Math.max(2, Math.min(12, Number(shot.duration || shot.durationSec || 4)));
 
-  // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给 grok
-  // —— 视频提示词页 LLM 经常把对话遗漏掉，这里直接从源头数据拿
-  const groupShotIndices: number[] = Array.isArray(sb.shotIndices) && sb.shotIndices.length
-    ? sb.shotIndices
-    : [groupIdx];
-  const dialogueLines: string[] = [];
+  // 收集本组所有 shot（按情绪段切分后的真实镜头索引）。
+  // 优先级：
+  //   1) ctx.target.shotIndices（前端最新分组，一定是正确的）
+  //   2) sb.shotIndices（DB 缓存，老 storyboards 没存所以可能空）
+  //   3) [groupIdx]（兜底，仅在没分组信息时用——会导致台词错位但不至于崩）
+  let groupShotIndices: number[] = [];
+  const tgtSi = (ctx.target as any).shotIndices;
+  if (Array.isArray(tgtSi) && tgtSi.length) {
+    groupShotIndices = tgtSi.filter((x: any) => Number.isInteger(x));
+  } else if (Array.isArray(sb.shotIndices) && sb.shotIndices.length) {
+    groupShotIndices = sb.shotIndices;
+  } else {
+    groupShotIndices = [groupIdx];
+    console.warn(
+      `[video_segments] group ${groupIdx} 没拿到 shotIndices（前端没传 + DB 缓存空），` +
+        `兜底用 [${groupIdx}]——可能导致台词错位，建议前端重生成提示词页`,
+    );
+  }
+
+  // 用户反馈："视频节奏太慢了 每一段都把时间卡在5秒"——Seedance 2.0 (Doubao
+  // doubao-seedance-2-0-260128) 只支持 3/5/10/15s 等固定档，不能任意秒数。
+  // 之前 >5s 的组会用 10s 档导致视频节奏拖沓。改成每段固定 5s，靠新的
+  // `getStoryboardGroups` 把内容压紧到 5s 内；个别极长镜头超 5s 也截到 5s
+  // 让模型自适应加快节奏（这是用户明确要求的"加快视频节奏"）。
+  const durationSec = 5;
+  let totalGroupDur = 0;
   for (const si of groupShotIndices) {
     const sh = shots[si];
     if (!sh) continue;
-    const line = String(sh.dialogue || sh.scriptRef || '').trim();
-    // 过滤占位符
-    if (line && line !== '——' && line !== '-' && line !== '无') dialogueLines.push(line);
+    totalGroupDur += Number(sh.duration || sh.durationSec || 4);
   }
-  const dialogueCombined = dialogueLines.join(' ');
+  if (totalGroupDur > durationSec) {
+    console.log(
+      `[video_segments] group ${groupIdx} 镜头总时长 ${totalGroupDur}s > 5s，` +
+        `Seedance 会自适应加快演绎（${groupShotIndices.length} 个镜头压到 5s）`,
+    );
+  }
+  // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给视频模型
+  // —— 视频提示词页 LLM 经常把对话遗漏/改写，这里直接从源头数据拿。
+  //
+  // 用户反馈："角色说词的时候有把自己名字念出来的 比如老板 明天翻倍"——
+  // shot.dialogue 在 DB 里存的是 "老板：'明天目标，客单翻倍。'" 这种
+  // "说话人：内容" 格式，直接当台词送 Seedance，模型把"老板"也读出来了。
+  // 这里拆成 { speaker, text }：speaker 给 video-gen 当"指定说话人"元信息
+  // （用于选音色/口型），text 才是实际念出来的台词。
+  const dialoguePairs: Array<{ speaker: string; text: string }> = [];
+  for (const si of groupShotIndices) {
+    const sh = shots[si];
+    if (!sh) continue;
+    const raw = String(sh.dialogue || sh.scriptRef || '').trim();
+    if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
+    // 单个 shot.dialogue 里可能包含多句对白（"老板：xxx 帝王蟹：yyy"），按
+    // "新行 / 多空格 / 」』""」后接「」""』前" 等候选切分；最稳的是按"角色名："
+    // 这种 anchor 切。匹配 "汉字+：" 不超过 12 字的前缀。
+    const PIECE_RE = /([^：:\s「『""'']{1,12})[：:]\s*[「『""'']?([^「『""''「』""'']+?)[」』""'']?(?=(?:[^：:\s「『""'']{1,12}[：:])|$)/g;
+    let mm: RegExpExecArray | null;
+    let any = false;
+    while ((mm = PIECE_RE.exec(raw)) !== null) {
+      const sp = mm[1].trim();
+      const tx = mm[2].trim().replace(/[，。！？]+$/, (s) => s);
+      if (sp && tx) {
+        dialoguePairs.push({ speaker: sp, text: tx });
+        any = true;
+      }
+    }
+    if (!any) {
+      // 单一冒号格式
+      const m = /^([^：:]{1,12})[：:]\s*[「『""'']?(.+?)[」』""'']?$/.exec(raw);
+      if (m) {
+        dialoguePairs.push({ speaker: m[1].trim(), text: m[2].trim() });
+      } else {
+        dialoguePairs.push({ speaker: '', text: raw });
+      }
+    }
+  }
 
   // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
   const userRatio = (ctx.options?.ratio as string) || '16:9';
+
+  // 用户反馈："前面有场景彩色图和人物角色彩色图，不能单一参考分镜图"
+  // —— 之前只把黑白分镜草图当 i2v 主参考，前面"资产"步骤生成的彩色场景图和
+  // 角色三视图全没传过来，等于让视频模型基于黑白调凭空想象彩色画面。
+  //
+  // 这里把整条工作流串起来：
+  //   1) 分镜草图 (storyboardPath)：给镜头构图/景别参考
+  //   2) **彩色场景图 (sceneReferencePath)**：定环境、色调、光照、材质
+  //   3) **彩色角色图 (characterReferencePaths[])**：定角色外形、服装、物种
+  // video-gen 会把三者合成成一张"视觉圣经参考图"再送 Seedance。
+
+  // ① 分镜草图本地路径
+  let referenceImagePath: string | undefined;
+  const sbImageUrl: string = sb.rawUrl || sb.url || sb.imageUrl || '';
+  const sbMatch = /\/api\/images\/file\/([0-9a-f-]{36})/.exec(sbImageUrl);
+  if (sbMatch) {
+    referenceImagePath = `${process.cwd()}/data/images/${ctx.user.id}/${sbMatch[1]}.png`;
+  }
+
+  // ② 彩色场景图：从 proj.assets.scenes / proj.environments 里挑
+  //    匹配优先级：
+  //      a. 镜头 visual / location 文本里命中场景 name → 用该场景
+  //      b. 命不中 → 用第一张有 imageUrl 的（多数项目就一个主场景）
+  let sceneReferencePath: string | undefined;
+  const allScenes: any[] = [
+    ...((proj as any).assets?.scenes || []),
+    ...((proj as any).environments || []),
+  ];
+  const scenesWithImg = allScenes.filter((s) => s && (s.imageUrl || s.rawUrl));
+  if (scenesWithImg.length) {
+    const allText = groupShotIndices
+      .map((i) => {
+        const sh = shots[i];
+        return [sh?.visual, sh?.location, sh?.scene].filter(Boolean).join(' ');
+      })
+      .join(' ');
+    let chosen = scenesWithImg.find(
+      (s) => s.name && allText.includes(s.name),
+    );
+    // 没命中 → 优先用 isMain，再不行用第一张
+    if (!chosen) chosen = scenesWithImg.find((s) => s.isMain) || scenesWithImg[0];
+    const scenePath = resolveLocalImagePath(
+      chosen.imageUrl || chosen.rawUrl,
+      ctx.user.id,
+    );
+    if (scenePath) sceneReferencePath = scenePath;
+  }
+
+  // ③ 彩色角色图：本组所有 shot.characters 名字去 assets.characters / characters 里查
+  const allChars: any[] = [
+    ...((proj as any).assets?.characters || []),
+    ...((proj as any).characters || []),
+  ];
+  const charNames = new Set<string>();
+  for (const si of groupShotIndices) {
+    const sh = shots[si];
+    if (Array.isArray(sh?.characters)) {
+      for (const cn of sh.characters) {
+        if (typeof cn === 'string' && cn.trim()) charNames.add(cn.trim());
+      }
+    }
+  }
+  const characterReferencePaths: string[] = [];
+  for (const name of charNames) {
+    const ch = allChars.find(
+      (c) => c && (c.name === name || c.role === name),
+    );
+    const url = ch?.imageUrl || ch?.rawUrl;
+    if (url) {
+      const p = resolveLocalImagePath(url, ctx.user.id);
+      if (p) characterReferencePaths.push(p);
+    }
+    // 最多带 4 张角色图（合成时底部缩略图条只有 4 格）
+    if (characterReferencePaths.length >= 4) break;
+  }
+
+  // ===== 角色声音 roster（跨片段保持声音一致） =====
+  // 用户反馈："角色的声音前后不一致"——每条视频独立生成 → Seedance 给同一个
+  // 角色随机分配音色。修法：把整张项目的角色清单（含外形 + 推测音色）作为
+  // 显式锁附在 prompt 里，让模型基于固定描述给同一个名字配同一个声音。
+  const voiceRosterLines: string[] = [];
+  for (const ch of allChars) {
+    if (!ch || !(ch.name || ch.role)) continue;
+    const nm = ch.name || ch.role;
+    if (!charNames.has(nm) && voiceRosterLines.length >= 6) continue;
+    const isNonHuman = ch.entityType === 'non-human';
+    const traits = [ch.appearance, ch.clothing, ch.temperament]
+      .filter(Boolean)
+      .join('，')
+      .slice(0, 80);
+    voiceRosterLines.push(
+      `- ${nm}${isNonHuman ? '【拟人化非人角色】' : ''}：${traits || '外形见对应彩色资产图'}`,
+    );
+  }
+
+  // ===== 前后片段衔接信息（避免镜头硬切 / 角色姿态突变） =====
+  // 用户反馈："有些镜头前后连不上 因为每条是独立生成的"——这里把上一组终幅
+  // 镜头的 visual 描述、本组首幅、下一组首幅都简短摘出来给模型，让 Seedance
+  // 能"知道镜头衔接到哪里来 / 要去哪里"。
+  const allSb: any[] = (proj as any).storyboards || [];
+  const _summarizeShot = (sh: any): string => {
+    if (!sh) return '';
+    const st = sh.shotType ? `【${sh.shotType}】` : '';
+    const cm = sh.camera ? `【${sh.camera}】` : '';
+    const v = String(sh.visual || sh.description || '').slice(0, 120);
+    return `${st}${cm}${v}`.trim();
+  };
+  const _firstShotIdxOf = (gi: number): number | null => {
+    const t = allSb[gi];
+    if (!t) return null;
+    if (Array.isArray(t.shotIndices) && t.shotIndices.length) return t.shotIndices[0];
+    return gi; // 兜底
+  };
+  const _lastShotIdxOf = (gi: number): number | null => {
+    const t = allSb[gi];
+    if (!t) return null;
+    if (Array.isArray(t.shotIndices) && t.shotIndices.length) {
+      return t.shotIndices[t.shotIndices.length - 1];
+    }
+    return gi;
+  };
+  let prevTailSummary = '';
+  let nextHeadSummary = '';
+  if (groupIdx > 0) {
+    const prevLastIdx = _lastShotIdxOf(groupIdx - 1);
+    if (prevLastIdx != null) prevTailSummary = _summarizeShot(shots[prevLastIdx]);
+  }
+  if (groupIdx < allSb.length - 1) {
+    const nextFirstIdx = _firstShotIdxOf(groupIdx + 1);
+    if (nextFirstIdx != null) nextHeadSummary = _summarizeShot(shots[nextFirstIdx]);
+  }
+
+  console.log(
+    `[video_segments] group ${groupIdx} refs: scene=${!!sceneReferencePath} ` +
+      `chars=${characterReferencePaths.length} sb=${!!referenceImagePath} ` +
+      `dialoguePairs=${dialoguePairs.length} prev=${!!prevTailSummary} next=${!!nextHeadSummary}`,
+  );
 
   ctx.progress({ stage: 'submitting', durationSec });
 
@@ -379,7 +869,13 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       durationSec,
       projectId: ctx.projectId,
       groupIdx,
-      dialogue: dialogueCombined || undefined,
+      dialoguePairs,
+      voiceRoster: voiceRosterLines.join('\n') || undefined,
+      prevTailSummary: prevTailSummary || undefined,
+      nextHeadSummary: nextHeadSummary || undefined,
+      referenceImagePath,
+      sceneReferencePath,
+      characterReferencePaths,
     },
     (pct, hint) => ctx.progress({ stage: 'gen', pct, hint }),
   );

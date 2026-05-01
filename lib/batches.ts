@@ -63,7 +63,12 @@ function _concurrencyFor(batchType: string): number {
   // 视频生成：grok 中转端是异步的（提交后轮询），所以可以并行多个
   // 5 个片段并行 → 总时间约 = 单个片段时间 (1~2 分钟) 而非 5 倍
   if (batchType === 'video_segments' || batchType === 'videos') return 3;
-  if (batchType === 'asset_images' || batchType === 'storyboard_images') return 3;
+  // 分镜图通常 ≤ 6 张：concurrency 6 会把中转站打到排队 → 后面的请求超时；
+  // 4 是一个相对稳的折中：5-6 张里"4 并行 + 1-2 即时补位"，比 3 体感快很多
+  // 又不会让中转排队太久。
+  if (batchType === 'storyboard_images') return 4;
+  // 资产图可能有 10+ 张，concurrency 太高反而触发中转限流
+  if (batchType === 'asset_images') return 3;
   return 3;
 }
 

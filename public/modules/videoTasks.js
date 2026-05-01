@@ -1221,11 +1221,22 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     task.status = "submitting"; task.statusCn = "提交中"; task.statusEn = "提交中";
     updateTaskCard(task);
 
+    // 单段重生成同样把 shotIndices 顶一份过去，避免后端拿到错误的 shot.dialogue
+    var groupsForSingle = getStoryboardGroups();
+    var gForSingle = groupsForSingle[gIdx];
+    var targetsForSingle = [{
+      groupIdx: gIdx,
+      idx: gIdx,
+      storyboardIdx: gIdx,
+      shotIndices: (gForSingle && gForSingle.shotIndices) || [],
+    }];
+
     try {
       var resp = await apiPost("/api/batch/start", {
         batchType: "videos",
         projectId: project.id,
         storyboardIndices: [gIdx],
+        targets: targetsForSingle,
         options: {
           quality: quality,
           videoModel: videoModel,
@@ -1866,12 +1877,27 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     syncTaskListVisibility(); updateBadge();
     renderBatchClipList();
 
+    // 用户反馈："片段台词重复 / 跟剧本不对"——根因是后端拿不到本组对应的
+    // shot.dialogue（老 storyboards 没存 shotIndices）。前端这里把当前分组
+    // 的 shotIndices 一起传过去，video_segments executor 就能精确取本组台词。
+    var groupsForBatch = getStoryboardGroups();
+    var targetsForBatch = indices.map(function (gi) {
+      var g = groupsForBatch[gi];
+      return {
+        groupIdx: gi,
+        idx: gi,
+        storyboardIdx: gi,
+        shotIndices: (g && g.shotIndices) || [],
+      };
+    });
+
     var resp;
     try {
       resp = await apiPost("/api/batch/start", {
         batchType: "videos",
         projectId: project.id,
         storyboardIndices: indices,
+        targets: targetsForBatch,
         options: {
           quality: batchOpts.quality,
           videoModel: batchOpts.videoModel,

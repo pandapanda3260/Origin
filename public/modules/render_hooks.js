@@ -114,7 +114,16 @@ export function renderStoryboardCard(gIdx, status, payload) {
     if (loading) loading.hidden = true;
     if (error) {
       error.hidden = false;
-      error.textContent = (payload.errMsg || "生成失败").slice(0, 150);
+      // 新版错误卡片是个含图标 + 标题 + 详情 + 提示的多段结构，
+      // 这里只往 .sb-error-msg 这个详情段写错误原因，其它段固定文案不动。
+      var msgSpan = error.querySelector('.sb-error-msg');
+      var msg = (payload.errMsg || "生成失败，请稍后重试").slice(0, 200);
+      if (msgSpan) {
+        msgSpan.textContent = msg;
+      } else {
+        // 兼容老结构：如果模板还是单段错误条，直接 textContent
+        error.textContent = msg;
+      }
     }
     return { ok: true };
   }

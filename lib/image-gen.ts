@@ -9,7 +9,7 @@
  * 输出：把生成图保存到 data/images/<userId>/<imageId>.png，并把元数据写进 images 表。
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
@@ -29,6 +29,16 @@ export type ImageGenInput = {
   entityType?: 'human' | 'non-human';
   projectId?: string;
   assetRef?: string; // e.g. 'characters[0]' / 'storyboards[2]'
+  /**
+   * 可选：参考图 PNG 在磁盘上的绝对路径。一旦提供，调用方式从
+   * `/v1/images/generations` 切到 `/v1/images/edits`（multipart），把这张
+   * 图作为视觉锚点喂给 gpt-image-1 / gpt-image-2，让生成图保留参考图的
+   * 材质 / 色调 / 建筑结构 / 物件风格。当前主要用途：
+   *   - 副场景以主场景为参考，做"同一地点不同角度"
+   *   - 镜头分镜以场景图为参考，保证场景一致
+   * 如果文件不存在或读取失败，会自动 fallback 到 generations 路径。
+   */
+  referenceImagePath?: string;
 };
 
 export type ImageGenResult = {
@@ -67,12 +77,32 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   //     保证最终风格统一（参考原网站效果）
   const finalPrompt = (() => {
     if (input.style === 'pencil') {
-      // 手稿风格锁定：精炼版（避免 prompt 过长被中转站拒绝/超时）
-      const PENCIL_PREFIX =
-        'Black-and-white pencil storyboard sketch on textured paper, hand-drawn graphite, visible pencil strokes and cross-hatching, monochrome only (no color). ';
-      const PENCIL_SUFFIX =
-        '\n\nStyle: pencil storyboard sketch, monochrome graphite on paper, hand-drawn line art with shading, cinematic pre-production frame. NOT photorealistic, NOT 3D render, NOT anime, NOT painted, NOT colored. No text, captions, or borders.';
-      return `${PENCIL_PREFIX}${input.prompt}${PENCIL_SUFFIX}`;
+      // 手稿风格锁定：参考原站效果——干净线稿 + 中灰阴影 + 工业制图般的
+      // 严谨度（不是糙笔速写）。关键词侧重：
+      //   · "ink + pencil hybrid" → 主线条干净像针管笔，阴影才用铅笔渐变
+      //   · "tonal washes + cross-hatching" → 既有大面积灰调也有交叉影线
+      //   · "industrial production storyboard" → 行业级专业感而非草稿
+      //   · "characters fully rendered, faces detailed" → 人物面部不能模糊
+      //   · "consistent line weight" → 多格之间风格统一
+      const PENCIL_PREFIX = [
+        'Professional film pre-production storyboard frame, drawn in the style of a senior storyboard artist working for a feature animation studio.',
+        'Medium: ink-and-pencil hybrid on smooth bristol paper — clean confident ink-pen outlines for figures and architecture, soft graphite tonal shading for volumes, cross-hatching for shadows, light tonal wash for atmosphere.',
+        'Strictly monochrome (true black + warm-grey graphite tones + paper white). Absolutely NO color, NO digital painting look.',
+        'High level of finish: faces and hands are fully rendered with anatomy, not vague smudges; clothing folds visible; perspective lines accurate; environment rendered with depth via hatching not blank space.',
+        'Composition: cinematic framing, clear silhouette / staging, characters readable at small sizes.',
+        '',
+      ].join('\n');
+      const PENCIL_SUFFIX = [
+        '',
+        '=== STYLE LOCK (do not deviate) ===',
+        'Style: black-and-white pencil + ink storyboard sheet, professional pre-production grade, hand-drawn on white paper, visible graphite tone and crosshatch shading. Like classic Pixar / Studio Ghibli / Spielberg-era industrial storyboards.',
+        'Line work: confident ink outlines for figures + architectural lines, no scratchy nervous lines, no doodle look.',
+        'Shading: soft graphite gradients + crosshatching for shadows, leave paper white for highlights.',
+        'STRICTLY NOT allowed: photorealistic photo, 3D render, watercolor, anime / manga style, cartoon / chibi, comic book ink (heavy black fills), vector illustration, painted, colored, flat color, gradient color, blueprint, schematic.',
+        'STRICTLY NOT allowed: any visible text / captions / panel labels / signatures / watermarks / page borders.',
+        'STRICTLY NOT allowed: rough scratchy "napkin doodle" look — this MUST look like a finished pre-production deliverable.',
+      ].join('\n');
+      return `${PENCIL_PREFIX}\n${input.prompt}\n${PENCIL_SUFFIX}`;
     }
     return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
   })();
@@ -91,76 +121,121 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   } else {
     const t0 = Date.now();
     const modelName = cfg.model || 'gpt-image-1';
-    // 超时保护：单次图像调用最长 180s（gpt-image-1 一般 30-60s，留足余量但不让它无限挂）
-    // 注意：base64 下载通常是同一连接内传输，这里 timeout 包含了下载时间
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 180_000);
-    try {
-      // OpenAI 兼容 image generation 接口
-      // 不同后端字段命名略有差异：gpt-image-1 / dall-e-3 都是 /v1/images/generations
-      const body: any = {
-        model: modelName,
-        prompt: finalPrompt,
-        size: input.size || '1024x1024',
-        n: 1,
-      };
-      // gpt-image-1 / dall-e-3 / dall-e-2 的 quality 字段取值不同，自动按模型挑：
-      //   - gpt-image-1: low | medium | high | auto（默认 low —— 参考图够用且明显更快）
-      //   - dall-e-3:    standard | hd                （默认 standard）
-      //   - 其它：       不传
-      const q = pickQuality(modelName, input.quality);
-      if (q) body.quality = q;
-
-      console.log(`[image-gen] start model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind}`);
-      const resp = await fetch(`${cfg.baseUrl}/images/generations`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${cfg.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new Error(`Image API ${resp.status}: ${text.slice(0, 400)}`);
-      }
-      const json: any = await resp.json();
-      // 兼容两种返回：{data:[{b64_json}]} 或 {data:[{url}]}
-      const item = json?.data?.[0];
-      if (!item) throw new Error('图像 API 返回结构异常');
-
-      let buf: Buffer;
-      if (item.b64_json) {
-        buf = Buffer.from(item.b64_json, 'base64');
-      } else if (item.url) {
-        // 下载阶段也加超时（30s 通常够 5MB 图片，慢的中转站可能更久 → 用 60s）
-        const dlController = new AbortController();
-        const dlTimer = setTimeout(() => dlController.abort(), 60_000);
-        try {
-          const r = await fetch(item.url, { signal: dlController.signal });
-          if (!r.ok) throw new Error(`下载图片失败 ${r.status}`);
-          buf = Buffer.from(await r.arrayBuffer());
-        } finally {
-          clearTimeout(dlTimer);
-        }
-      } else {
-        throw new Error('图像 API 没返回 b64_json 也没返回 url');
-      }
-      writeFileSync(fullPath, buf);
-      bytes = buf.length;
-      const elapsed = Date.now() - t0;
-      console.log(`[image-gen] ok model=${modelName} bytes=${buf.length} elapsed=${elapsed}ms`);
-    } catch (e: any) {
-      const elapsed = Date.now() - t0;
-      const aborted = e?.name === 'AbortError';
-      const reason = aborted ? `请求超时（>180s 未返回）` : (e?.message || String(e));
-      console.warn(`[image-gen] fail model=${modelName} elapsed=${elapsed}ms reason=${reason}`);
-      // 真调失败 → 抛错让 batch 走 task_failed，UI 上显示"失败"而不是一直转
-      throw new Error('图像生成失败：' + reason);
-    } finally {
-      clearTimeout(timeoutId);
+    // 是否走 image-edit（参考图 → 同地点不同角度 / 同角色不同动作）
+    // 兼容性：gpt-image-1 / gpt-image-2 / dall-e-2 都支持 /v1/images/edits，
+    // dall-e-3 不支持（只有 generations）。如果调方给了参考图但模型不支持，
+    // 会 fallback 到普通 generations + 文本 prompt（色调/构图至少有 styleBible
+    // lock 兜底）。
+    const editSupported = (() => {
+      const m = (modelName || '').toLowerCase();
+      return m.includes('gpt-image') || m.includes('dall-e-2');
+    })();
+    const useEdit = !!(input.referenceImagePath && existsSync(input.referenceImagePath) && editSupported);
+    if (input.referenceImagePath && !editSupported) {
+      console.warn(`[image-gen] reference image provided but model ${modelName} does not support edits — falling back to text-only generation`);
     }
+    const q = pickQuality(modelName, input.quality);
+
+    // 一次失败就重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
+    // 4xx（除 429）与 401/403 视为永久错误，立刻抛出，避免无意义浪费积分。
+    const MAX_ATTEMPTS = 2;
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // 单次调用 240s 超时（gpt-image-* medium + 中转排队，180s 偏紧）
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 240_000);
+      const tA = Date.now();
+      try {
+        let resp: Response;
+        if (useEdit) {
+          console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit ref=${input.referenceImagePath}`);
+          const fd = new FormData();
+          fd.append('model', modelName);
+          fd.append('prompt', finalPrompt);
+          fd.append('size', input.size || '1024x1024');
+          fd.append('n', '1');
+          if (q) fd.append('quality', q);
+          const refBuf = readFileSync(input.referenceImagePath!);
+          fd.append('image', new Blob([refBuf], { type: 'image/png' }), 'reference.png');
+          resp = await fetch(`${cfg.baseUrl}/images/edits`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cfg.apiKey}` },
+            body: fd as any,
+            signal: controller.signal,
+          });
+        } else {
+          const body: any = {
+            model: modelName,
+            prompt: finalPrompt,
+            size: input.size || '1024x1024',
+            n: 1,
+          };
+          if (q) body.quality = q;
+          console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind} mode=generate`);
+          resp = await fetch(`${cfg.baseUrl}/images/generations`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${cfg.apiKey}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        }
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '');
+          const err: any = new Error(`Image API ${resp.status}: ${text.slice(0, 400)}`);
+          err.status = resp.status;
+          throw err;
+        }
+        const json: any = await resp.json();
+        const item = json?.data?.[0];
+        if (!item) throw new Error('图像 API 返回结构异常');
+
+        let buf: Buffer;
+        if (item.b64_json) {
+          buf = Buffer.from(item.b64_json, 'base64');
+        } else if (item.url) {
+          const dlController = new AbortController();
+          const dlTimer = setTimeout(() => dlController.abort(), 60_000);
+          try {
+            const r = await fetch(item.url, { signal: dlController.signal });
+            if (!r.ok) throw new Error(`下载图片失败 ${r.status}`);
+            buf = Buffer.from(await r.arrayBuffer());
+          } finally {
+            clearTimeout(dlTimer);
+          }
+        } else {
+          throw new Error('图像 API 没返回 b64_json 也没返回 url');
+        }
+        writeFileSync(fullPath, buf);
+        bytes = buf.length;
+        const elapsed = Date.now() - t0;
+        console.log(`[image-gen] ok attempt=${attempt} model=${modelName} bytes=${buf.length} elapsed=${elapsed}ms`);
+        lastErr = null;
+        break; // 成功
+      } catch (e: any) {
+        const elapsed = Date.now() - tA;
+        const aborted = e?.name === 'AbortError';
+        const status = e?.status as number | undefined;
+        const transient = aborted || status === 429 || (status !== undefined && status >= 500 && status < 600);
+        const reason = aborted ? `请求超时（>240s 未返回）` : (e?.message || String(e));
+        console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}`);
+        lastErr = e;
+        if (attempt < MAX_ATTEMPTS && transient) {
+          // 退避 2-4s 再试。中转站短暂排队 / 抖动多数能在第 2 次成功。
+          const delay = 2000 + Math.floor(Math.random() * 2000);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        // 永久错误 / 用尽重试次数 → 抛出最终错误
+        throw new Error('图像生成失败：' + reason);
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+    // 理论上不会走到这里，break 或 throw 二选一
+    if (lastErr) throw new Error('图像生成失败：' + (lastErr?.message || lastErr));
   }
 
   // 落 DB
@@ -213,44 +288,67 @@ function forceStyleSuffix(
   if (kind === 'character') {
     if (entityType === 'non-human') {
       // 非人实体（拟人化海鲜、机甲、动物、异形）：保留生物本来的形态，
-      // 不能强行画成真人；但白底+写实摄影+三视图布局保持一致。
+      // 不能强行画成真人；白底+写实摄影+三视图（前/严格 90° 侧/背），不要头部特写。
+      // 用户反馈：拟人海鲜画头部特写没有意义（壳/钳子比脸更像它的"id"），
+      // 三视图正侧背已经够用。布局回到 1×3 三栏。
       return [
         '=== MANDATORY STYLE OVERRIDE (must follow) ===',
         'Style: photorealistic creature/object photography, sharp focus, high detail, magazine-grade quality.',
         'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, NO shadows on backdrop, NO gradient, NO other objects.',
-        'Layout: reference sheet showing the SAME subject in THREE views side-by-side, evenly spaced:',
-        '  · Left:   front view',
-        '  · Middle: 3/4 or side view',
-        '  · Right:  back view',
-        'IMPORTANT: keep the subject\'s actual non-human anatomy (e.g. crab, shrimp, mech, animal) — do NOT redraw it as a human.',
+        'Layout: ONE canvas split into THREE panels in a single row, evenly sized (each panel ~33% of canvas width), NO gaps between panels:',
+        '  · Panel 1 (left): FRONT VIEW — full subject, facing camera, neutral pose.',
+        '  · Panel 2 (middle): SIDE VIEW — STRICT pure 90° profile, body axis exactly perpendicular to the camera. Same pose as front view. NEVER 3/4, NEVER angled.',
+        '  · Panel 3 (right): BACK VIEW — full subject from behind, same pose.',
+        'CRITICAL: the SAME subject must appear in all three panels — same colors, same anatomy, same proportions, only the camera angle changes.',
+        'IMPORTANT: keep the subject\'s actual non-human anatomy (e.g. crab, shrimp, mech, animal) — do NOT redraw it as a human, do NOT add a human body or human face.',
         'Lighting: even soft studio lighting, no harsh shadows.',
         'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, stylized art.',
         'STRICTLY NOT allowed: turning the subject into a human person if it is not one.',
-        'STRICTLY NOT allowed: any text, watermark, logo, frame, border.',
+        'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels.',
+        'STRICTLY NOT allowed: 3/4 view in the side panel — if Panel 2 is not a strict 90° profile, the image is REJECTED.',
+        'STRICTLY NOT allowed: a head close-up panel — only the three full-body angle views.',
       ].join('\n');
     }
-    // 人类角色：白底 + 真人摄影 + 三视图（正/侧/背全身）
+    // 人类角色：白底 + 真人摄影 + 四宫格 character model sheet
+    // 布局：左 ~40% 大头部特写 + 右 ~60% 三视图（正面 / 严格 90° 侧面 / 背面）
+    // ※ 用户反馈中"侧面是斜的"= 之前允许 3/4 视角 → 这里强制纯正侧 90°，并用
+    //   "if humanoid, only ONE eye and ONE ear visible" 这种可验证规则收紧描述。
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
-      'Style: photorealistic photography, professional studio headshot quality, sharp focus, magazine-grade photography, high detail.',
-      'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, NO shadows, NO gradient, NO objects.',
-      'Layout: character model sheet showing the SAME person in THREE full-body views side-by-side, evenly spaced:',
-      '  · Left:   front view, facing camera, arms relaxed at sides, neutral standing pose',
-      '  · Middle: 3/4 or side profile view, same pose',
-      '  · Right:  back view, same pose',
+      'Style: photorealistic photography, professional studio headshot quality, sharp focus, magazine-grade photography, high detail of skin texture / hair / clothing fabric.',
+      'Background: PURE WHITE (#FFFFFF) seamless studio backdrop, NO shadows on backdrop, NO gradient, NO other objects.',
+      'Layout: ONE canvas split into FOUR panels in a single row, evenly spaced, NO gaps between panels:',
+      '  · Panel 1 (LARGEST, left ~40% of canvas): LARGE HEAD CLOSE-UP — head and shoulders only, face fills the panel from top to bottom, sharp portrait crop, eyes at upper third, looking straight at camera, neutral expression. Background still pure white.',
+      '  · Panel 2 (right ~20% of canvas, 1st of three views): FRONT FULL-BODY VIEW — head to feet visible, facing camera squarely, arms relaxed at sides, neutral standing pose.',
+      '  · Panel 3 (right ~20% of canvas, 2nd of three views): SIDE FULL-BODY VIEW — STRICT pure 90° profile, body axis exactly perpendicular to the camera, ONLY ONE EYE AND ONE EAR VISIBLE, nose silhouette pointing left or right, shoulders perfectly aligned to one side. Same pose as front. NEVER 3/4, NEVER angled, NEVER turned partially.',
+      '  · Panel 4 (right ~20% of canvas, 3rd of three views): BACK FULL-BODY VIEW — full body from behind, head to feet visible, same pose as front.',
+      'CRITICAL: the SAME PERSON must appear in all four panels — same face, same hair, same clothing, same body type, same skin tone — only the camera angle changes.',
       'Lighting: even soft studio lighting from the front, no harsh shadows.',
-      'Camera: full body in frame, head to feet visible in all three views.',
       'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, stylized art.',
-      'STRICTLY NOT allowed: any text, watermark, logo, frame, border.',
+      'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels, names.',
+      'STRICTLY NOT allowed: 3/4 view, three-quarter view, angled view in the side panel — if Panel 3 is not a strict 90° profile, the image is REJECTED.',
     ].join('\n');
   }
   if (kind === 'scene') {
+    // 场景：六宫格多角度参考图（2 行 × 3 列），每格一个不同角度。
+    // 用户反馈："原网站是六宫格图 各个角度的场景图"——把单张 establishing shot
+    // 升级成 6-panel reference sheet，便于后续分镜覆盖更多视角。
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
-      'Style: photorealistic photography, cinematic establishing shot, sharp focus, high detail, professional photography.',
-      'No people / no human figures in the frame.',
-      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch.',
-      'STRICTLY NOT allowed: any text, watermark, logo.',
+      'Style: photorealistic photography, cinematic establishing shots, sharp focus, high detail, professional location photography.',
+      'Layout: ONE canvas split into SIX panels arranged in a 2-row × 3-column grid (top row 3 panels, bottom row 3 panels), evenly sized cells, thin black gaps (~4px) between panels, white outer border.',
+      'Each of the SIX panels shows the SAME ONE LOCATION from a DIFFERENT camera angle / focal length, so they read as a complete location reference sheet:',
+      '  · Top-Left: WIDE establishing shot, eye-level, full overview of the space.',
+      '  · Top-Middle: HIGH-ANGLE / overhead-ish wide shot revealing the floor plan / layout.',
+      '  · Top-Right: LOW-ANGLE wide shot looking up, emphasizing height / ceiling / vertical features.',
+      '  · Bottom-Left: MEDIUM shot of one signature corner / area, eye-level (e.g. counter, workstation, entry).',
+      '  · Bottom-Middle: MEDIUM shot of a different corner / area from the opposite direction.',
+      '  · Bottom-Right: CLOSE-UP / detail shot of a key prop / texture / surface that defines the location\'s mood (e.g. wood grain, neon sign, equipment, food display).',
+      'CRITICAL: ALL SIX panels must show the SAME LOCATION — same architecture, same lighting mood, same color palette, same era/style. They are reference photos of one place from different angles, NOT six different rooms.',
+      'No people / no human figures in any panel.',
+      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+      'STRICTLY NOT allowed: any text, watermark, logo, panel labels, captions.',
+      'STRICTLY NOT allowed: rendering this as a single image instead of a 6-panel grid — if there are not 6 visible panels, the image is REJECTED.',
     ].join('\n');
   }
   if (kind === 'prop') {
@@ -318,4 +416,22 @@ export function getImageMeta(id: string, ownerId: number) {
     fullPath: join(IMAGES_DIR, String(row.owner_id), row.filename),
     publicUrl: `/api/images/file/${row.id}`,
   };
+}
+
+/**
+ * 把项目里存的 imageUrl（形如 `/api/images/file/<uuid>`）反查回磁盘绝对路径。
+ * 用于副场景拿主场景的 PNG 当参考图。如果 url 不是这种内部格式 / 找不到对应
+ * 行 / 文件不存在，返回 null，调用方应自动 fallback 到无参考图的纯文本 prompt。
+ */
+export function resolveLocalImagePath(
+  imageUrl: string | undefined | null,
+  ownerId: number,
+): string | null {
+  if (!imageUrl) return null;
+  const m = /\/api\/images\/file\/([0-9a-fA-F-]{36})/.exec(imageUrl);
+  if (!m) return null;
+  const meta = getImageMeta(m[1], ownerId);
+  if (!meta) return null;
+  if (!existsSync(meta.fullPath)) return null;
+  return meta.fullPath;
 }

@@ -898,6 +898,17 @@ export async function generateAllAssetImages() {
     }
   });
 
+  // 排序：副场景必须排在它对应的主场景**之后**，否则 batch_runner 并发跑时
+  // 副场景的 executor 会一直 polling 等主场景 PNG 生成出来，可能撑爆 90s
+  // 超时 → 强制 fallback 到无参考图模式，色调和环境就脱钩了。
+  // 简单做法：所有非场景资产保持原顺序，scenes 内部把 isVariant=false
+  // 的全部排到 isVariant=true 之前。
+  allTargets.sort(function (a, b) {
+    if (a.type !== "scene" || b.type !== "scene") return 0;
+    if (a.isVariant === b.isVariant) return 0;
+    return a.isVariant ? 1 : -1;
+  });
+
   // executor 端不需要 isVariant，这是前端 UI hint，发 batch 前剥掉。
   var batchTargets = allTargets.map(function (t) { return { type: t.type, idx: t.idx }; });
 
@@ -1027,6 +1038,9 @@ function _attachAssetImageBatch(opts) {
   var failCount = opts.initialFailed || 0;
   var settled = false;
   var pollTimer = null;
+  // 同一批里多张图同时撞积分上限时，只弹一次付费墙。否则用户每张失败都被弹
+  // 一次会很烦。批次结束时自动 reset。
+  var creditPaywallShown = false;
   function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
   function finish(res) {
     if (settled) return;
@@ -1056,7 +1070,14 @@ function _attachAssetImageBatch(opts) {
       var remain = Math.ceil(pending * avgSec / 3);
       parts.push("约剩 " + remain + " 秒");
     }
-    hint.textContent = parts.join("，");
+    // 积分不足场景：所有 pending 都不会再跑（积分预扣环节失败），换一行更醒目的文案
+    if (creditPaywallShown) {
+      hint.textContent = "积分不足，剩余 " + (totalTasks - done) + " 张已停 — 请充值后重试（已成功 " + done + "/" + totalTasks + "）";
+      hint.style.color = "#dc2626";
+    } else {
+      hint.textContent = parts.join("，");
+      hint.style.color = "";
+    }
   }
   // 给一个初始 hint，避免空白
   _refreshHint();
@@ -1068,6 +1089,12 @@ function _attachAssetImageBatch(opts) {
   // 轮询发现 status=completed/failed/cancelled → 立即触发 onBatchCompleted
   // 流程（reload + rerender + finish），并停掉自身。
   // ====================================================================
+  // 上一轮看到的 succeeded —— 只要数字涨了就触发"中途增量刷新"，不再傻等
+  // 整个 batch 完成才显图。这是这次修 "读秒在动 / 图不显示 / 必须 F5" 的关键：
+  // 当 SSE task_completed 因任何原因丢帧（dev server 缓冲、反向代理、浏览器
+  // 后台节流），轮询是唯一能 catch 到的兜底；以前轮询只更新计数 hint，不刷
+  // 新图，导致用户 9/15 但所有卡都还在转。
+  var lastPolledSucceeded = -1;
   async function _pollOnce() {
     if (settled) return;
     try {
@@ -1077,7 +1104,27 @@ function _attachAssetImageBatch(opts) {
       if (typeof snap.succeeded === "number" && snap.succeeded > doneCount) doneCount = snap.succeeded;
       if (typeof snap.failed === "number" && snap.failed > failCount) failCount = snap.failed;
       _refreshHint();
-      if (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled") {
+
+      var succeededNow = (typeof snap.succeeded === "number") ? snap.succeeded : 0;
+      var statusTerminal = (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled");
+
+      // 中途增量刷新：只要新增完成的任务 ≥ 1 张，就 reload 一次 project 把
+      // DB 里已落盘的图同步到内存，再重渲三个 grid 让卡片立刻显图。
+      // 这一段独立于"终态分支"——避免必须等所有 15 张全完成才看到前 9 张。
+      if (succeededNow > lastPolledSucceeded && lastPolledSucceeded >= 0 && !statusTerminal) {
+        console.log("[AssetImg] poll detected new succeeded " + lastPolledSucceeded + " → " + succeededNow + " — incremental reload");
+        try {
+          if (_ctx.reloadProjectFromServer) {
+            var ok = await _ctx.reloadProjectFromServer();
+            if (ok) {
+              try { renderAssets(); } catch (e2) { console.warn("[AssetImg] renderAssets (incremental) failed:", e2); }
+            }
+          }
+        } catch (e) { console.warn("[AssetImg] incremental reload failed:", e); }
+      }
+      lastPolledSucceeded = succeededNow;
+
+      if (statusTerminal) {
         console.log("[AssetImg] poll detected batch finished status=" + snap.status + " — triggering safety net");
         try {
           if (_ctx.reloadProjectFromServer) await _ctx.reloadProjectFromServer();
@@ -1090,7 +1137,10 @@ function _attachAssetImageBatch(opts) {
       console.warn("[AssetImg] poll failed:", (e && e.message) || e);
     }
   }
-  pollTimer = setInterval(_pollOnce, 5000);
+  // 3s 间隔：图像生成单张 30-60s，3s 轮询比 5s 更早看到新完成的图，开销可忽略
+  pollTimer = setInterval(_pollOnce, 3000);
+  // 立即跑一次，捕捉"刚发起 batch 时已有缓存图秒回"这种情况（不必等 3s）
+  setTimeout(_pollOnce, 500);
 
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {
@@ -1111,13 +1161,33 @@ function _attachAssetImageBatch(opts) {
       var extra = (data && data.extra) || {};
       var patch = (data && data.patch) || {};
       var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
+      // patch.cat ('characters'/'scenes'/'props') → type ('char'/'scene'/'prop') 兜底
+      if (!tgt.type && patch.cat) {
+        var cat2type = { characters: "char", scenes: "scene", props: "prop" };
+        tgt.type = cat2type[patch.cat];
+      }
+      if (!tgt.type && patch.type === "asset_image" && patch.cat) {
+        var cat2type2 = { characters: "char", scenes: "scene", props: "prop" };
+        tgt.type = cat2type2[patch.cat];
+      }
+      if (typeof tgt.idx !== "number" && typeof patch.idx === "number") tgt.idx = patch.idx;
       var type = tgt.type;
       var idx = tgt.idx;
-      var url = extra.rawUrl || patch.value || "";
+      var url = extra.rawUrl || patch.value || patch.imageUrl || "";
       console.log("[AssetImg] task_completed seq=" + data.targetSeq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
       if (!type || typeof idx !== "number" || !url) {
-        console.warn("[AssetImg] task_completed missing target/url — UI will not update without refresh:", data);
-      doneCount++;
+        // SSE 帧缺信息：图已落盘但 UI 收不到必要字段。改成主动从 server 拉一次
+        // project，让 renderAssets() 按权威数据补图——而不是默默吞掉等用户 F5。
+        console.warn("[AssetImg] task_completed missing target/url — pulling project from server to recover", data);
+        doneCount++;
+        if (_ctx.reloadProjectFromServer) {
+          _ctx.reloadProjectFromServer().then(function (ok) {
+            if (ok) {
+              try { renderAssets(); } catch (e) { console.warn("[AssetImg] renderAssets after recovery failed:", e); }
+            }
+          }).catch(function (e) { console.warn("[AssetImg] recovery reload failed:", e); });
+        }
+        _refreshHint();
         return;
       }
       doneCount++;
@@ -1162,6 +1232,16 @@ function _attachAssetImageBatch(opts) {
       console.error("[AssetImg] task_failed:", type, idx, err);
       if (type && typeof idx === "number") {
         updateAssetCardImage(type, idx, "error");
+      }
+      // 积分不足专门处理：弹一次付费墙、把 hint 改成醒目的提示，避免用户
+      // 误以为是 bug 反复点"重新生成"。errorCode 由 batches.ts 的 _emit
+      // task_failed 帧塞过来；老格式里只有中文 errorMsg，所以两条都判。
+      var isCreditError = (data && data.errorCode === 'INSUFFICIENT_CREDITS')
+        || /积分不足|insufficient/i.test(err);
+      if (isCreditError && !creditPaywallShown) {
+        creditPaywallShown = true;
+        try { showBillingPaywall((data && data.billing) || null); } catch (_) {}
+        try { showToast("积分不足，剩余 " + Math.max(0, totalTasks - doneCount - failCount) + " 张未生成 — 充值后可继续", "error"); } catch (_) {}
       }
       _refreshHint();
     },

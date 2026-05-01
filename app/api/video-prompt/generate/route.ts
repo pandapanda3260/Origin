@@ -26,6 +26,12 @@ export async function POST(req: NextRequest) {
   const narrations: any[] = Array.isArray(body.narrations) ? body.narrations : [];
   const groupIdx: number = Number.isInteger(body.groupIdx) ? body.groupIdx : 0;
   const totalGroups: number = Number.isInteger(body.totalGroups) ? body.totalGroups : 1;
+  // 用户反馈：videoPrompt 的内容跟 storyboards[i].shotIndices 对不上→视频段
+  // 阶段抓不准本组对应的 shot.dialogue。这里把前端传过来的 shotIndices 和
+  // 实际入参的 shots 一并落库，video_segments executor 才能拿到正确映射。
+  const shotIndices: number[] = Array.isArray(body.shotIndices)
+    ? body.shotIndices.filter((x: any) => Number.isInteger(x))
+    : [];
 
   if (!shots.length) {
     return new Response(JSON.stringify({ detail: '本组没有镜头' }), { status: 400 });
@@ -50,16 +56,18 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 写回到对应 storyboard group 的 videoPrompt
+    // 写回到对应 storyboard group 的 videoPrompt + shotIndices
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
         const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
+        const patch: any = { videoPrompt: prompt, _vpCache: null };
+        if (shotIndices.length) patch.shotIndices = shotIndices;
         if (storyboards[groupIdx]) {
-          storyboards[groupIdx] = { ...storyboards[groupIdx], videoPrompt: prompt, _vpCache: null };
+          storyboards[groupIdx] = { ...storyboards[groupIdx], ...patch };
         } else {
           while (storyboards.length <= groupIdx) storyboards.push({});
-          storyboards[groupIdx] = { videoPrompt: prompt, _vpCache: null };
+          storyboards[groupIdx] = patch;
         }
         updateProjectForUser(projectId, user.id, { storyboards });
       }

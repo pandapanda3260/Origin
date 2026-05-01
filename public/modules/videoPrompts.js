@@ -184,8 +184,8 @@ function _makeSegmentEditable(pEl, gIdx, segIdx, segments) {
   var rawText = segments[segIdx].text;
   pEl.textContent = rawText;
   pEl.contentEditable = "true";
-  pEl.classList.remove("text-2xl", "font-light");
-  pEl.classList.add("text-lg", "font-normal", "outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-4", "bg-white/60", "whitespace-pre-wrap");
+  // 进编辑态：保持和展示态同字号（text-base / font-normal），只追加焦点环和编辑底色
+  pEl.classList.add("outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-3", "bg-white/60", "whitespace-pre-wrap");
   pEl.focus();
   var range = document.createRange();
   range.selectNodeContents(pEl);
@@ -210,8 +210,7 @@ function _makeSegmentEditable(pEl, gIdx, segIdx, segments) {
     }
     pEl.dataset.editing = "0";
     pEl.contentEditable = "false";
-    pEl.classList.add("text-2xl", "font-light");
-    pEl.classList.remove("text-lg", "font-normal", "outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-4", "bg-white/60", "whitespace-pre-wrap");
+    pEl.classList.remove("outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-3", "bg-white/60", "whitespace-pre-wrap");
     renderVideoPromptList();
   }
 
@@ -359,28 +358,35 @@ export function renderVideoPromptList() {
 
     var segments = parsed.segments || [];
     var glassPanel = document.createElement("div");
-    glassPanel.className = "bg-white/40 backdrop-blur-[40px] rounded-xl p-10 border-b-2 border-primary-fixed-dim/30 shadow-sm relative overflow-y-auto no-scrollbar flex-grow";
+    // 用户反馈："右面按钮啥的都变形了 字体也特别大"——参考原站的紧凑排版：
+    //   · padding p-10 → p-6（40 → 24px）
+    //   · 段间距 space-y-8 → space-y-5（32 → 20px）
+    glassPanel.className = "bg-white/40 backdrop-blur-[40px] rounded-xl p-6 border-b-2 border-primary-fixed-dim/30 shadow-sm relative overflow-y-auto no-scrollbar flex-grow";
     glassPanel.innerHTML = '<div class="absolute -right-20 -top-20 w-64 h-64 bg-primary-container/20 blur-[100px] rounded-full pointer-events-none"></div>';
 
     var segContainer = document.createElement("div");
-    segContainer.className = "relative z-10 space-y-8";
+    segContainer.className = "relative z-10 space-y-5";
 
     segments.forEach(function (seg, sIdx) {
       var segDiv = document.createElement("div");
       segDiv.className = "group/line";
 
       if (seg.time) {
+        // 段名/时间码徽章：原站是浅灰圆角 pill，不是黑底白字 mono code 块。
+        // 把"运镜系统/角色/场景/0-Xs..."这些做成温和的标签风格。
         var header = document.createElement("div");
-        header.className = "flex items-center gap-4 mb-3 opacity-40 group-hover/line:opacity-100 transition-opacity";
+        header.className = "flex items-center gap-3 mb-2";
         header.innerHTML =
-          '<span class="text-[10px] font-black font-mono bg-on-background text-background px-2 py-0.5 rounded">' + escapeHtml(seg.time) + '</span>' +
-          '<div class="h-[1px] flex-grow bg-outline-variant/30"></div>' +
+          '<span class="text-[11px] font-semibold bg-surface-container-highest/80 text-on-surface-variant px-2.5 py-0.5 rounded-full">' + escapeHtml(seg.time) + '</span>' +
+          '<div class="h-[1px] flex-grow bg-outline-variant/20"></div>' +
           '<span class="material-symbols-outlined text-xs text-outline/40 opacity-0 group-hover/line:opacity-100 transition-opacity cursor-pointer">edit</span>';
         segDiv.appendChild(header);
       }
 
       var p = document.createElement("p");
-      p.className = "vp-seg-text text-2xl font-light text-on-background leading-snug tracking-tight cursor-text hover:bg-white/30 rounded-lg transition-colors px-2 py-1 -mx-2";
+      // text-2xl font-light + tracking-tight 让中文挤成一团又特别巨大；
+      // 改成 text-base font-normal + leading-relaxed，对应原站正常段落字号。
+      p.className = "vp-seg-text text-base font-normal text-on-background leading-relaxed cursor-text hover:bg-white/30 rounded-lg transition-colors px-2 py-1 -mx-2";
       p.innerHTML = _highlightLargePrompt(seg.text, seg.highlights, sensitiveHits);
       p.title = "点击编辑";
       p.addEventListener("click", function () { _makeSegmentEditable(p, gIdx, sIdx, segments); });
@@ -390,7 +396,7 @@ export function renderVideoPromptList() {
 
     glassPanel.appendChild(segContainer);
     var cursor = document.createElement("div");
-    cursor.className = "mt-6 inline-block w-0.5 h-6 bg-primary animate-pulse ml-1";
+    cursor.className = "mt-4 inline-block w-0.5 h-4 bg-primary animate-pulse ml-1";
     glassPanel.appendChild(cursor);
     card.appendChild(glassPanel);
   } else {
@@ -525,6 +531,10 @@ export async function generateGroupVideoPrompt(gIdx) {
     }, _vpDiagCaptor ? _vpDiagCaptor.onEvent : null);
 
     var cleaned = (resp.videoPrompt || "").trim().replace(/^["']|["']$/g, "");
+    if (!cleaned) {
+      // 不能写空覆盖现有 prompt，也不能让 UI 静默回到"待生成"状态
+      throw new Error('AI 返回为空，未生成提示词');
+    }
     var narrationsUsed = Array.isArray(resp.narrationsUsed) ? resp.narrationsUsed : [];
     var isCurrent = _safeWriteBack(originId, function (proj) {
       if (!proj.storyboards) proj.storyboards = [];
@@ -603,10 +613,38 @@ export async function generateAllVideoPrompts() {
   var doneCount = 0;
   var failCount = 0;
   var finished = false;
+  // 去重保护：SSE + polling 同时跑，避免一个 group 处理两次
+  var _seenDone = Object.create(null);
+  var _seenFailed = Object.create(null);
 
-  function finish() {
+  // 当 SSE 报"任务完成"但 extra.videoPrompt 是空字符串时（旧版 silent-drop bug），
+  // 强制从服务器重读 project，把后端 executor 已经写入 DB 的 videoPrompt 拉回来。
+  // 旧逻辑下 cleaned='' → _applyTaskCompleted 早 return → 既不算成功也不算失败 →
+  // 用户看到 "0/5 条已生成" + 无任何 toast，体感"提示生成完了但啥也没有"。
+  async function _rescueFromServerForGroup(gIdx) {
+    if (!_ctx.reloadProjectFromServer) return '';
+    try {
+      await _ctx.reloadProjectFromServer();
+      _syncRefs();
+      var sb = project && project.storyboards && project.storyboards[gIdx];
+      return (sb && sb.videoPrompt) || '';
+    } catch (e) {
+      console.warn('[VideoPrompt] _rescueFromServerForGroup failed:', e);
+      return '';
+    }
+  }
+
+  async function finish() {
     if (finished) return;
     finished = true;
+    // 在最终统计前，再做一次权威同步——后端 executor 是先写 DB 再返回 extra，
+    // 所以即使所有 SSE 事件都丢了，DB 里也应该是最新的；这一步把 UI 拉回真相。
+    try {
+      if (_ctx.reloadProjectFromServer) {
+        await _ctx.reloadProjectFromServer();
+        _syncRefs();
+      }
+    } catch (_e) {}
     _videoPromptsGenerating = false;
     if (btn) btn.disabled = false;
     var done = 0;
@@ -614,22 +652,43 @@ export async function generateAllVideoPrompts() {
       if (project.storyboards[j] && project.storyboards[j].videoPrompt) done++;
     }
     if (hint) hint.textContent = done + "/" + groups.length + " 条已生成";
+    // 可能 reload 之后 done > 0 而 doneCount 还是 0（SSE 全丢的情况）——把卡片状态也刷一遍
+    for (var jj = 0; jj < groups.length; jj++) {
+      var sbJ = project.storyboards[jj];
+      if (sbJ && sbJ.videoPrompt) updateVpCard(jj, "done", sbJ.videoPrompt);
+    }
     var allDone = groups.length > 0 && groups.every(function (_, k) {
       return project.storyboards[k] && project.storyboards[k].videoPrompt;
     });
-    if (allDone) showToast("全部视频提示词已生成", "success");
-    if (failCount > 0) showToast(failCount + " 条提示词生成失败，请手动重试", "warn");
+    if (allDone) {
+      showToast("全部视频提示词已生成", "success");
+    } else if (done === 0 && failCount === 0) {
+      // 既没成功也没失败 = 后端任务都"completed"了但内容空 / SSE 全丢且 DB 也没写 → 一定是后端故障
+      showToast("批量生成结束但 0 条返回，请检查模型 / 网络后重试", "error");
+    } else if (failCount > 0) {
+      showToast(failCount + " 条提示词生成失败，请手动重试", "warn");
+    } else if (done < groups.length) {
+      showToast("已完成 " + done + "/" + groups.length + " 条，剩余可点单条「重新生成」补齐", "warn");
+    }
     checkVideoPromptsConfirm();
     setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);
   }
 
-  // 去重保护：SSE + polling 同时跑，避免一个 group 处理两次
-  var _seenDone = Object.create(null);
-  var _seenFailed = Object.create(null);
-
   function _applyTaskCompleted(gIdx, cleaned, narrationsUsed) {
-    if (typeof gIdx !== 'number' || !cleaned) return;
+    if (typeof gIdx !== 'number') return;
     if (_seenDone[gIdx]) return;
+    if (!cleaned) {
+      // SSE/polling 报告任务完成但 extra/patch 都空——后端 executor 已经写过 DB，
+      // 拉回来兜底；如果 DB 里也没有，标记为失败让用户能看到"重新生成"按钮。
+      _rescueFromServerForGroup(gIdx).then(function (vp) {
+        if (vp) {
+          _applyTaskCompleted(gIdx, vp, narrationsUsed);
+        } else if (!_seenFailed[gIdx] && !_seenDone[gIdx]) {
+          _applyTaskFailed(gIdx, '后端任务返回为空');
+        }
+      });
+      return;
+    }
     _seenDone[gIdx] = true;
     doneCount++;
 

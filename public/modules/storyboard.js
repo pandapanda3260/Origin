@@ -100,10 +100,42 @@ function _reattachImagesBatch(b) {
   if (btn) btn.disabled = true;
   if (hint) hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + (snap.total || "?");
 
+  // 刷新后重连场景：把 #sbDiagnostic 改成倒计时（同 generateAllImages 路径）
+  var rDiagBox = $("sbDiagnostic");
+  var rDoneCount = snap.succeeded || 0;
+  var rFailCount = snap.failed || 0;
+  var rTotal = snap.total || 0;
+  // 刷新后没有"本次生成开始时刻"，从 batch 创建时间近似（不准但够用）
+  var rStartTs = b.createdAt ? new Date(b.createdAt).getTime() : Date.now();
+  function _renderEtaR() {
+    if (!rDiagBox || !rTotal) return;
+    var pending = Math.max(0, rTotal - rDoneCount - rFailCount);
+    var lines = ["生成中… " + rDoneCount + "/" + rTotal];
+    if (rFailCount > 0) lines.push(rFailCount + " 张失败");
+    if (pending > 0) {
+      var avg = (rDoneCount + rFailCount >= 1)
+        ? Math.max(8, (Date.now() - rStartTs) / 1000 / (rDoneCount + rFailCount))
+        : 70;
+      var remain = Math.ceil(pending * avg / 4);
+      lines.push("约剩 " + remain + " 秒");
+    }
+    rDiagBox.innerHTML = '<div class="diag-empty" style="text-align:center;padding:8px 0;font-weight:500;color:#475569;">' +
+      escapeHtml(lines.join("，")) +
+      '</div>';
+  }
+  _renderEtaR();
+  var rTick = setInterval(_renderEtaR, 1000);
+  function _stopTickR() { if (rTick) { clearInterval(rTick); rTick = null; } }
+  function _clearEtaR() { if (rDiagBox) rDiagBox.innerHTML = ''; }
+
   subscribeBatch(batchId, {
     onSnapshot: function (s) {
-      if (hint && s && typeof s.total === 'number') {
-        hint.textContent = "生成中… " + (s.succeeded || 0) + "/" + s.total;
+      if (s && typeof s.total === 'number') {
+        rTotal = s.total;
+        if (typeof s.succeeded === 'number') rDoneCount = s.succeeded;
+        if (typeof s.failed === 'number') rFailCount = s.failed;
+        if (hint) hint.textContent = "生成中… " + rDoneCount + "/" + rTotal;
+        _renderEtaR();
       }
     },
     onTaskStarted: function (data) {
@@ -132,22 +164,30 @@ function _reattachImagesBatch(b) {
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
       }, data && data.serverVersion);
       updateStoryboardCard(groupIdx, "done", rawUrl);
+      rDoneCount++;
+      _renderEtaR();
     },
     onTaskFailed: function (data) {
       var extra = data.extra || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
       var errMsg = (data.errorMsg || '生成失败').toString().slice(0, 120);
       if (typeof groupIdx === 'number') updateStoryboardCard(groupIdx, "error", null, errMsg);
+      rFailCount++;
+      _renderEtaR();
     },
     onBatchCompleted: function () {
       _imagesGenerating = false;
       if (btn) btn.disabled = false;
+      _stopTickR();
+      _clearEtaR();
       renderImageGrid();
       checkImagesConfirm();
     },
     onClose: function () {
       _imagesGenerating = false;
       if (btn) btn.disabled = false;
+      _stopTickR();
+      _clearEtaR();
     },
   });
 }
@@ -264,7 +304,8 @@ export function getStoryboardGroups() {
 
   if (!hasGroupBoundary) {
     // 按情绪段切组：同 emotion 连续的镜头放一组，emotion 变化就切；
-    // 同时单组最多 3 个镜头，避免某段太长，1 张分镜稿盖不住
+    // 单组上限放到 4——分镜稿一张图最多画 2x2 四格，超过 4 个镜头时另起一组。
+    // 之前 cap=3 会导致出现 3 格不规则布局，原网站只用 1×2 或 2×2 两种。
     var bucket = [];
     var bucketIndices = [];
     var bucketEmotion = null;
@@ -282,7 +323,7 @@ export function getStoryboardGroups() {
       var em = shot.emotion || 'general';
       if (bucketEmotion === null) bucketEmotion = em;
       var emotionChanged = (em !== bucketEmotion);
-      var bucketFull = (bucket.length >= 3);
+      var bucketFull = (bucket.length >= 4);
       if (emotionChanged || bucketFull) {
         flush();
         bucketEmotion = em;
@@ -309,23 +350,84 @@ export function getStoryboardGroups() {
     });
   }
 
-  var groups = [];
-  rawGroups.forEach(function (rg) {
-    if (rg.shotIndices.length <= MAX_SHOTS_PER_GROUP) {
-      rg.groupIdx = groups.length;
-      groups.push(rg);
+  // —— Normalize 阶段 ——
+  // 用户要求："分镜图的排布要么 2 张要么 4 张 不要 3 张的"。这里把所有
+  // 大小为 1 / 3 / >4 的分组拆并合并成清一色的 4 / 2（必要时单尾允许 1）。
+  // 算法：把所有 raw groups 拍平成镜头序列（保留情绪标记），然后贪心切片：
+  //   - 剩余 ≥ 4 → 切 4
+  //   - 剩余 == 3 → 切 2 + 留 1（让下一轮处理；最终单尾才允许 1 格）
+  //   - 剩余 == 2 → 切 2
+  //   - 剩余 == 1 → 单格（仅在最后一格，无法和前一组并入时出现）
+  // 同时尽量按情绪边界对齐：贪心时如果第 4 张和第 1 张情绪相差太远，优先
+  // 切 2 而不是切 4——避免一张分镜稿里前后情绪拧得太别扭。
+  var flat = [];
+  rawGroups.forEach(function (g) {
+    g.shotIndices.forEach(function (si, i) {
+      flat.push({ idx: si, shot: g.shots[i], emotion: g.emotion });
+    });
+  });
+
+  // 用户反馈："视频节奏太慢了 我觉得是分镜图太多了的原因 ... 把在5秒内能完成
+  // 的内容放在一块 但是要保证能演完 比如前三个分镜其实一个分镜就能搞定了"
+  //
+  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持固定 3/5/10/15s 几档；
+  // 后端已锁死每段 5s。这里前端的分组算法配合：每段尽量打包 MAX_SHOTS_PER_GROUP
+  // 个连续同情绪镜头，让最终分镜数量大幅减少（实测 8 段→约 5-6 段）。
+  //
+  // 算法：
+  //   · 严格按情绪段切分（setup / rising / climax / falling / resolution
+  //     之间一定是不同的分镜稿——情绪转折是讲故事节奏的天然边界）
+  //   · 每段最多打包 MAX_SHOTS_PER_GROUP（4）个镜头，让一张分镜稿正好画 2×2
+  //   · 同情绪段 5+ 镜头 → 平均切（3+2 而不是 4+1，避免孤儿镜头）
+  //
+  // 注意：之前还做过"单镜头台词密集（>50 字）独立成组"的处理——这是错的，
+  // 用户的剧本里多角色对白经常 50+ 字一镜，独立成组反而又把分镜数顶回 8 张。
+  // 现在去掉密集检测：信任模型在 5s 视频里用快剪表现多角色对白。
+  var MAX_SHOTS_PER_GROUP = 4;
+
+  // 第一步：按情绪段切成 emotion buckets
+  var emoBuckets = [];
+  var curBucket = [];
+  var curEm = null;
+  flat.forEach(function (item) {
+    if (curEm === null) curEm = item.emotion;
+    if (item.emotion !== curEm) {
+      if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
+      curBucket = [item];
+      curEm = item.emotion;
     } else {
-      for (var j = 0; j < rg.shotIndices.length; j += MAX_SHOTS_PER_GROUP) {
-        var sliceEnd = Math.min(j + MAX_SHOTS_PER_GROUP, rg.shotIndices.length);
-        groups.push({
-          groupIdx: groups.length,
-          shotIndices: rg.shotIndices.slice(j, sliceEnd),
-          shots: rg.shots.slice(j, sliceEnd),
-          emotion: rg.emotion
-        });
-      }
+      curBucket.push(item);
     }
   });
+  if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
+
+  // 第二步：每个情绪 bucket 内部均匀切成 MAX_SHOTS 张/组
+  var groups = [];
+  emoBuckets.forEach(function (eb) {
+    var items = eb.items;
+    var n = items.length;
+    if (!n) return;
+    // 计算切几组：n=1 → 1, n=2-4 → 1, n=5 → 2 (3+2), n=6 → 2 (3+3),
+    //            n=7 → 2 (4+3), n=8 → 2 (4+4), n=9 → 3 (3+3+3), 以此类推
+    var groupCount = Math.ceil(n / MAX_SHOTS_PER_GROUP);
+    var perGroup = Math.ceil(n / groupCount); // 平均每组数量（向上取整）
+    var k = 0;
+    for (var gi = 0; gi < groupCount; gi++) {
+      var remainingGroups = groupCount - gi;
+      var remainingItems = n - k;
+      // 让最后几组不会太小：用动态平均 ceil(remaining / remainingGroups)
+      var take = Math.min(perGroup, Math.ceil(remainingItems / remainingGroups));
+      var slice = items.slice(k, k + take);
+      groups.push({
+        groupIdx: groups.length,
+        shotIndices: slice.map(function (x) { return x.idx; }),
+        shots: slice.map(function (x) { return x.shot; }),
+        emotion: eb.emotion,
+      });
+      k += take;
+    }
+  });
+
   return groups;
 }
 
@@ -654,13 +756,23 @@ export function renderImageGrid() {
 
     card.innerHTML =
       '<div class="flex-1 bg-surface-container-lowest/40 backdrop-blur-xl rounded-[2.5rem] border border-white/30 overflow-hidden shadow-2xl transition-transform duration-500 hover:scale-[1.005] group relative">' +
-        '<div class="sb-sheet-loading absolute inset-0 flex items-center justify-center bg-white/60 backdrop-blur-md z-20 rounded-[2.5rem]" hidden>' +
+        // 用户反馈："生成分镜图的时候 前面图还在 然后生成失败"——之前 loading
+        // 用 bg-white/60 半透明，老图透出来；现在改成完全不透明，再生成时
+        // 用户看到的就是干净的 loading 状态而不是"老图 + 一层蒙版"。
+        '<div class="sb-sheet-loading absolute inset-0 flex items-center justify-center bg-white z-30 rounded-[2.5rem]" hidden>' +
           '<div class="text-center">' +
             '<div class="inline-block w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin mb-3"></div>' +
             '<span class="block text-xs font-bold text-on-surface-variant">生成中…</span>' +
           '</div>' +
         '</div>' +
-        '<div class="sb-sheet-error absolute bottom-6 left-6 right-6 bg-error/90 text-on-error text-xs p-3 rounded-2xl text-center z-20" hidden></div>' +
+        // 错误态也改成全屏不透明卡片，覆盖老图。失败时用户能立刻看到红色提示
+        // 而不是"老图依旧 + 底部一行小字"。
+        '<div class="sb-sheet-error absolute inset-0 flex flex-col items-center justify-center bg-white z-30 rounded-[2.5rem] p-8 text-center" hidden>' +
+          '<span class="material-symbols-outlined text-5xl text-error mb-3">error_outline</span>' +
+          '<span class="text-sm font-bold text-error mb-2">分镜图生成失败</span>' +
+          '<span class="sb-error-msg text-xs text-on-surface-variant/80 max-w-md leading-relaxed"></span>' +
+          '<span class="text-[10px] text-on-surface-variant/40 mt-4">点击下方「重新生成」可再次尝试</span>' +
+        '</div>' +
         '<div class="absolute inset-0 p-8 flex flex-col">' +
           '<div class="flex items-center justify-between mb-5">' +
             '<div class="flex items-center gap-4">' +
@@ -932,8 +1044,25 @@ export async function generateStoryboardSheet(gIdx) {
     var settled = false;
     var pollTimer = null;
     var _gotResult = false;
+    // —— 单张分镜倒计时 ——
+    // 用户反馈："单独生成第一张的时候没有倒计时"——和批量入口一样，
+    // 单张重生成也给一个"约剩 N 秒"的友好提示。medium 画质 + 中转排队
+    // 实测一张 60-90 秒，初始猜测 70 秒，每秒 -1 直到 5 秒兜底（避免
+    // 显示 0 / 负数让用户以为卡住）。
+    var etaStart = Date.now();
+    var initialEtaSec = 70;
+    var etaTimer = null;
+    function _updateEta() {
+      if (settled) return;
+      var elapsed = Math.floor((Date.now() - etaStart) / 1000);
+      var remain = Math.max(5, initialEtaSec - elapsed);
+      try { updateStoryboardCard(gIdx, "loading", null, "生成分镜中…约剩 " + remain + " 秒"); } catch (_e) {}
+    }
+    function _stopEta() { if (etaTimer) { clearInterval(etaTimer); etaTimer = null; } }
+    _updateEta();
+    etaTimer = setInterval(_updateEta, 1000);
     function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-    function finish() { if (!settled) { settled = true; _stopPoll(); resolve(); } }
+    function finish() { if (!settled) { settled = true; _stopPoll(); _stopEta(); resolve(); } }
 
     function _applyResult(rawUrl, extra) {
       if (!rawUrl || _gotResult) return;
@@ -1058,6 +1187,38 @@ export async function generateAllImages() {
   groups = getStoryboardGroups();
 
   // Step 2：过滤仍缺图的组
+  // 同时**裁剪 storyboards 数组**到当前分组数：之前用旧分组算法生成的
+  // 多余 panel（比如旧算法 cap=3 出 7 组，新算法 cap=4 只出 5 组）会残留
+  // 在尾部，并且前几个 slot 里的 shotIndices 和当前分组对不上时，UI 取
+  // storyboards[i] 拿到的就是错位的旧图——表现为"前 N 张图布局对不上"。
+  // 这里在开新 batch 前先做一次清理：
+  //   1. 截短到当前分组数
+  //   2. 任何 slot 里 shotIndices 和当前分组的 shotIndices 不一致 → 视为脏图丢掉
+  if (!Array.isArray(project.storyboards)) project.storyboards = [];
+  if (project.storyboards.length > groups.length) {
+    project.storyboards.length = groups.length;
+  }
+  var dirtyCleared = 0;
+  for (var ck = 0; ck < groups.length; ck++) {
+    var existing = project.storyboards[ck];
+    if (!existing) continue;
+    var savedSi = Array.isArray(existing.shotIndices) ? existing.shotIndices : null;
+    var newSi = groups[ck].shotIndices || [];
+    var match = savedSi && savedSi.length === newSi.length
+      && savedSi.every(function (v, j) { return v === newSi[j]; });
+    if (!match) {
+      // 旧图配的 shotIndices 和新分组对不上 → 视为脏数据，清掉留待重生成
+      project.storyboards[ck] = {};
+      dirtyCleared++;
+    }
+  }
+  if (dirtyCleared > 0) {
+    console.log('[generateAllImages] cleared ' + dirtyCleared + ' stale storyboard slot(s) due to grouping change');
+    saveProject();
+    // 重渲一次让脏 slot 立即变回"待生成"占位
+    try { renderImageGrid(); } catch (_) {}
+  }
+
   var targets = [];
   for (var gk = 0; gk < groups.length; gk++) {
     var sb = project.storyboards[gk];
@@ -1074,6 +1235,42 @@ export async function generateAllImages() {
   var totalCount = targets.length;
   if (hint) hint.textContent = "正在生成 " + totalCount + " 张分镜图…";
   targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成分镜图中…"); });
+
+  // —— 倒计时区域 ——
+  // 用户反馈："这个位置改成倒计时吧 还有多久能生成完"。
+  // 借用之前给"门控诊断"留的 #sbDiagnostic 容器，生成期间把它改成
+  // 动态倒计时（done/total + 估算剩余秒数）；批次结束后清空。
+  // 估算逻辑：等真实跑完 1 张以后用实测速度，否则给 70 秒/张的初始猜测
+  //（gpt-image medium 实测）；后端并发 4 → 墙钟剩余时间 ≈ pending × avgSec ÷ 4。
+  var diagBox = $("sbDiagnostic");
+  var etaStartTs = Date.now();
+  function _renderEta() {
+    if (!diagBox) return;
+    var done = doneCount;
+    var fail = failCount;
+    var pending = Math.max(0, totalCount - done - fail);
+    var lines = ["生成中… " + done + "/" + totalCount];
+    if (fail > 0) lines.push(fail + " 张失败");
+    if (pending > 0) {
+      var avg = (done + fail >= 1)
+        ? (Date.now() - etaStartTs) / 1000 / (done + fail)
+        : 70;
+      var remain = Math.ceil(pending * avg / 4);
+      lines.push("约剩 " + remain + " 秒");
+    }
+    diagBox.innerHTML = '<div class="diag-empty" style="text-align:center;padding:8px 0;font-weight:500;color:#475569;">' +
+      escapeHtml(lines.join("，")) +
+      '</div>';
+  }
+  function _clearEta() {
+    if (!diagBox) return;
+    // 批次结束后清空——后续门控诊断面板自己回填（如果有数据的话）
+    diagBox.innerHTML = '';
+  }
+  _renderEta();
+  // 兜底：定期 tick 让"约剩 N 秒"自然减少（即便 SSE / poll 没新事件）
+  var etaTick = setInterval(_renderEta, 1000);
+  function _stopEtaTick() { if (etaTick) { clearInterval(etaTick); etaTick = null; } }
 
   // seq -> groupIdx 反查，task_failed 缺 extra 时用
   var seqToGroupIdx = {};
@@ -1112,6 +1309,8 @@ export async function generateAllImages() {
     finished = true;
     _imagesGenerating = false;
     if (btn) btn.disabled = false;
+    _stopEtaTick();
+    _clearEta();
     var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
     if (hint) hint.textContent = done + "/" + groups.length + " 张分镜图已生成";
     var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
@@ -1150,6 +1349,7 @@ export async function generateAllImages() {
     });
     if (isCurrent) updateStoryboardCard(groupIdx, "done", rawUrl);
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+    _renderEta();
   }
 
   function _applyTaskFailed(groupIdx, errMsg) {
@@ -1159,6 +1359,7 @@ export async function generateAllImages() {
     failCount++;
     updateStoryboardCard(groupIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
+    _renderEta();
   }
 
   // ============================================================
