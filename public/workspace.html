@@ -1179,6 +1179,25 @@
                     </div>
                   </div>
                 </div>
+                <!-- Transition control -->
+                <div class="px-3 py-3 edit-hairline-top">
+                  <div class="flex items-center gap-1.5 mb-2">
+                    <span class="w-1 h-1 rounded-full bg-white/15"></span>
+                    <span class="text-xs font-medium text-white/80">转场控制</span>
+                    <span class="text-[8px] font-bold tracking-[0.12em] text-white/30 uppercase">Transition</span>
+                  </div>
+                  <div id="editTransitionSummary" class="text-[10px] text-white/40 mb-2">AI 剪辑后显示当前转场分布</div>
+                  <button type="button" id="btnEditClearTransitions"
+                          class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md
+                                 border border-white/10 hover:border-white/25 hover:bg-white/5
+                                 text-[11px] font-medium text-white/60 hover:text-white/90
+                                 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                          disabled>
+                    <span class="material-symbols-outlined text-sm">content_cut</span>
+                    <span>去除全部转场</span>
+                  </button>
+                  <p class="text-[9px] text-white/25 mt-1.5 leading-relaxed">把所有转场改为硬切。可用「撤销」恢复</p>
+                </div>
               </div>
             </div>
 

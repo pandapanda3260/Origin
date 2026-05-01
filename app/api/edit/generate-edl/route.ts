@@ -39,16 +39,20 @@ const SP_GENERATE_EDL = `你是工业级 AI 剪辑师。下面这组视频片段
 - "递进"段：完整保留，节奏开始加快（不要裁对白）
 - "高潮"段：完整保留，开始时用 cut 强化冲击
 - "回落 / 收尾"段：完整保留 + 尾部留白
-- 转场（transitionIn）数量与配比：
-   * 第 0 段固定 cut（开头不需要转场）
-   * 其余段 60% cut + 40% 非 cut（情绪曲线越剧烈，越多非 cut 转场）
-   * **必须至少有 1 个 fade 和 1 个 dissolve / wipe**（5 段时要有 2 段非 cut，3 段时要有 1 段非 cut）
-   * 选择规则：
-     - 情绪基调显著切换（如紧张→温暖、激动→收尾）：用 **dissolve**（约 1.0s）—— 时间在淡化里流过，给观众充分回味
-     - 段落分隔（铺垫→高潮、第一幕收/第二幕开）：用 **fade**（约 0.8s）—— 章节呼吸
-     - 时空 / 场景跳跃（同一角色不同地点 / 时间）：用 **wipe**（约 0.7s）—— 暗示位移
-   注意：转场会"吃掉"前后两段各一半时长（如 dissolve 占 1s = 前段尾 0.5s + 后段头 0.5s 重叠），所以含对白的段间尽量用 cut 或更短转场
-     - 同场景同情绪连续动作：用 **cut**（0s）—— 保持动势
+- 转场（transitionIn）—— **默认 cut，能 cut 就 cut**：
+   * Walter Murch 原则：cut 是最强的剪辑工具，干脆有力是工业级剪辑的常态
+   * 用户反馈："该硬切的地方加转场反倒别扭"——所以宁可少加转场，也不要在错误位置加
+   * 第 0 段固定 cut
+   * **绝大多数段都应该是 cut**。整片只有当你能明确说出"这里不 cut 不行"的理由时，才考虑非 cut
+   * 全片建议：5 段以上最多 1 处非 cut；少于 5 段全 cut 即可
+   * 何时才该非 cut（必须满足其一才能用）：
+     - **情绪基调发生剧烈反转**（如紧张惊恐→温暖治愈，emotionIntensity 差≥4）：用 **fade**（约 0.8s）让观众有缓冲
+     - **明确的章节分隔**（剧本明显的"第一幕完→第二幕开"）：用 **fade**（约 0.8s）做呼吸
+     - **同角色跨明显时空**（"上午公司"→"晚上家里"）：用 **dissolve**（约 1.0s）暗示时间流逝
+   * 【绝对禁止用转场的场景】
+     - 同一场景内的镜头切换（人物对话、连续动作、反应镜头）—— 一律 cut
+     - 含对白的段间转场会把对白前后吞掉 0.4-0.5s，会切坏台词
+     - 任何"我也不太确定要不要加"的位置 —— 一律 cut
 - 不要写"运镜"或"画面变化"——你只决定时间和切点，不决定画面内容
 - J-cut / L-cut（音画错位）：仅在没对白的段才考虑
 
@@ -59,7 +63,7 @@ const SP_GENERATE_EDL = `你是工业级 AI 剪辑师。下面这组视频片段
 - 不含 dialogue 的 clip：in/out 在 [0, durationSec]，可以裁但不要砍超过 30%
 - transitionIn / transitionOut 只用 cut / fade / dissolve / wipe
 - 不要砍片段（每段都必须出现在 edl 里）
-- 转场分布：5 段时至少 2 段非 cut；3-4 段时至少 1 段非 cut；2 段时可全 cut
+- **转场分布上限**：全片最多 1 处非 cut 转场；如不必要可以全 cut（cut 永远是安全选择）
 
 输出格式：
 {
@@ -268,42 +272,47 @@ export async function POST(req: NextRequest) {
       }));
     }
 
-    // ── 转场最低数量兜底：AI 经常给全 cut，按 segmentTags.emotionIntensity 差异
-    //    最大的两个切点强制注入 fade / dissolve，让成片有节奏感。
-    //    用户反馈："镜头之间没有转场 全是硬切"——所以这里一定要主动加。
+    // ── 转场注入：只在"绝对应该有"的强情绪/段落跳跃处加，其它一律保留 cut。
+    //    设计原则（用户反馈"该硬切的地方加转场反倒别扭"）：
+    //      1. 默认 0 强制注入。AI 觉得该 cut 就 cut，干净利落是工业级剪辑的常态。
+    //      2. 只有情绪差 ≥ 4 (1-10 量表的强落差) 才考虑注入，且总片段≥5才会触发。
+    //      3. 永远不向"已经是 cut 序列里"插超过 1 个转场——避免观感破碎。
+    //      4. 收尾 / 回落 段落用 fade（章节呼吸感），不用 dissolve（避免拖沓）。
     const _injectTransitions = () => {
       const n = aiEdl.length;
-      if (n < 2) return;
-      // 最少应有的非 cut 转场数：5 段→2，3-4 段→1，<3 段→0
-      const minNonCut = n >= 5 ? 2 : (n >= 3 ? 1 : 0);
-      const currentNonCut = aiEdl.slice(1).filter((e) => e.transitionIn && e.transitionIn !== 'cut').length;
-      if (currentNonCut >= minNonCut) return;
+      if (n < 5) return; // 短片（4 段以下）全 cut 反而更紧凑
 
-      // 找情绪差最大的边界（segTags 里的 emotionIntensity）作为候选转场点
       const intensityFor = (gi: number) => {
         const t = segTags.find((s: any) => Number(s?.groupIdx) === gi);
         return Number(t?.emotionIntensity) || 5;
       };
-      const candidates: { idx: number; delta: number; toRole: string }[] = [];
+      const STRONG_DELTA = 4; // 情绪差至少 4 档（1-10）才算"必须转场"
+      const candidates: { idx: number; delta: number; toRole: string; fromRole: string }[] = [];
       for (let i = 1; i < n; i++) {
         const d = Math.abs(intensityFor(aiEdl[i].groupIdx) - intensityFor(aiEdl[i - 1].groupIdx));
-        const tag = segTags.find((s: any) => Number(s?.groupIdx) === aiEdl[i].groupIdx);
-        candidates.push({ idx: i, delta: d, toRole: String(tag?.plotRole || '') });
+        if (d < STRONG_DELTA) continue;
+        const toTag = segTags.find((s: any) => Number(s?.groupIdx) === aiEdl[i].groupIdx);
+        const fromTag = segTags.find((s: any) => Number(s?.groupIdx) === aiEdl[i - 1].groupIdx);
+        candidates.push({
+          idx: i, delta: d,
+          toRole: String(toTag?.plotRole || ''),
+          fromRole: String(fromTag?.plotRole || ''),
+        });
       }
+      if (!candidates.length) return;
       candidates.sort((a, b) => b.delta - a.delta);
 
-      const need = minNonCut - currentNonCut;
-      let added = 0;
-      for (const c of candidates) {
-        if (added >= need) break;
-        if (aiEdl[c.idx].transitionIn !== 'cut') continue;
-        // role 是"收尾"用 fade，是"高潮"或情绪剧烈切换用 dissolve，否则 fade
-        const role = c.toRole;
+      // 已经有非 cut 转场的总数 + 新注入数，硬上限 = 1（AI 已给的不动）
+      const currentNonCut = aiEdl.slice(1).filter((e) => e.transitionIn && e.transitionIn !== 'cut').length;
+      if (currentNonCut >= 1) return; // AI 自己加过转场了就不再插手
+
+      const top = candidates[0];
+      if (aiEdl[top.idx].transitionIn === 'cut') {
+        const role = top.toRole;
         const trans = (role === '收尾' || role === '回落') ? 'fade'
-                    : (role === '高潮' || c.delta >= 4) ? 'dissolve'
+                    : (role === '高潮' && top.delta >= 5) ? 'dissolve'
                     : 'fade';
-        aiEdl[c.idx].transitionIn = trans;
-        added++;
+        aiEdl[top.idx].transitionIn = trans;
       }
     };
     _injectTransitions();

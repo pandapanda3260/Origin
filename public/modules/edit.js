@@ -345,6 +345,8 @@ export function syncEditProject(p) {
     // 刷新时也要把 BGM 选择器渲出来——之前只在 _analyzeEditSegments / _generateEditEdl
     // 之后才 render，导致用户刷新页面就完全看不到 BGM 区域，反馈"刷新后没看到 bgm"。
     _renderBgmSelector();
+    _renderTransitionPanel();
+    _wireTransitionControls();
 
     // 刷新进来如果 EDL 已经选了 BGM，把 audio 元素 src 同步上，但不 autoplay
     // （等用户按播放才起播）。这样用户一进剪辑页就有正确的 BGM 状态。
@@ -364,6 +366,9 @@ export function syncEditProject(p) {
 
     var segs = _editState.edl ? _editState.edl.timeline : _editState.segments;
     var pps = _editState.pixelsPerSecond * _editState.zoom;
+
+    // 任意时间线变化都顺手刷新右侧"转场控制"面板的统计 + 按钮可用态
+    if (typeof _renderTransitionPanel === "function") _renderTransitionPanel();
 
     var PLOT_COLORS = {
       setup: "#ECEFF1", rising: "#CFD8DC", falling: "#90A4AE",
@@ -1983,6 +1988,91 @@ export function syncEditProject(p) {
         }
       });
     });
+  }
+
+  /* ── 转场控制面板（BGM 下方） ── */
+
+  /** 渲染转场分布摘要 + 启用/禁用"去除全部转场"按钮 */
+  function _renderTransitionPanel() {
+    var summary = $("editTransitionSummary");
+    var btn = $("btnEditClearTransitions");
+    if (!summary || !btn) return;
+
+    var timeline = (_editState.edl && _editState.edl.timeline) || [];
+    if (!timeline.length) {
+      summary.textContent = "AI 剪辑后显示当前转场分布";
+      summary.className = "text-[10px] text-white/40 mb-2";
+      btn.disabled = true;
+      return;
+    }
+
+    var counts = { cut: 0, fade: 0, dissolve: 0, wipe: 0, other: 0 };
+    timeline.forEach(function (seg, i) {
+      if (i === 0) return; // 首段无入转场
+      var t = String((seg.transitionIn && seg.transitionIn.type) || "cut").toLowerCase();
+      if (counts[t] != null) counts[t]++;
+      else counts.other++;
+    });
+    var nonCut = counts.fade + counts.dissolve + counts.wipe + counts.other;
+
+    if (nonCut === 0) {
+      summary.textContent = "全部硬切（" + (timeline.length - 1) + " 处衔接）";
+      summary.className = "text-[10px] text-white/40 mb-2";
+      btn.disabled = true;
+    } else {
+      var parts = [];
+      if (counts.fade) parts.push(counts.fade + " fade");
+      if (counts.dissolve) parts.push(counts.dissolve + " dissolve");
+      if (counts.wipe) parts.push(counts.wipe + " wipe");
+      if (counts.other) parts.push(counts.other + " 其它");
+      summary.textContent = "当前 " + nonCut + " 处转场（" + parts.join(" · ") + "）";
+      summary.className = "text-[10px] text-white/55 mb-2";
+      btn.disabled = false;
+    }
+  }
+
+  /** 绑定"去除全部转场"按钮（只绑一次） */
+  function _wireTransitionControls() {
+    var btn = $("btnEditClearTransitions");
+    if (!btn || btn.dataset.wired === "1") return;
+    btn.dataset.wired = "1";
+    btn.addEventListener("click", _clearAllTransitions);
+  }
+
+  /** 把 timeline 里所有 transitionIn 改成 cut，写盘 + 重渲染。可用 Undo 恢复。 */
+  function _clearAllTransitions() {
+    if (!_editState.edl || !Array.isArray(_editState.edl.timeline)) {
+      showToast("还没有剪辑方案", "warn");
+      return;
+    }
+    var timeline = _editState.edl.timeline;
+    var hasAny = timeline.some(function (s, i) {
+      if (i === 0) return false;
+      var t = (s.transitionIn && s.transitionIn.type) || "cut";
+      return t !== "cut";
+    });
+    if (!hasAny) { showToast("已经全是硬切了", "ok"); return; }
+
+    _editSaveUndo();
+    timeline.forEach(function (s, i) {
+      if (i === 0) return;
+      s.transitionIn = { type: "cut", duration: 0 };
+      // transitionOut 影响下一段的入转场预览，保持对齐
+      if (i < timeline.length - 1) s.transitionOut = { type: "cut", duration: 0 };
+    });
+
+    // 同步内存镜像 + 持久化
+    if (project) {
+      if (!project.editData) project.editData = {};
+      project.editData.edl = _editState.edl; // arch-guard:allow-editdata
+    }
+    _sendTimelineOp({ op: "set-edl", edl: _editState.edl });
+
+    _buildSegStartTimes();
+    _renderEditTimeline();
+    _renderTransitionPanel();
+    _updatePlayhead();
+    showToast("已去除全部转场，可用「撤销」恢复", "ok");
   }
 
   var _editActionBusy = {};
