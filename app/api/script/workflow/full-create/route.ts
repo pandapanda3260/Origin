@@ -109,20 +109,26 @@ export async function POST(req: NextRequest) {
     writer.phase('style_bible_start');
     writer.step('正在提取风格圣经…');
     let styleBible: any = null;
+    let styleBibleStatus: 'ready' | 'failed' = 'failed';
+    let styleBibleError = '';
+    let styleBibleGeneratedAt: string | null = null;
     try {
       styleBible = await chatCompleteJsonWithRetry(
         user,
         buildStyleBibleMessages(scriptText),
-        { temperature: 0.4, maxTokens: 2500, modelRole: 'structured' },
+        { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
         (raw) => parseJsonLoose(raw),
         'styleBible',
       );
+      // 兜底：把 LLM 偷懒输出的英文色名翻成中文，避免前端展示 "TEAL · AMBER · CREAM" 这种
+      styleBible = sinicizeColorPalette(styleBible);
+      styleBibleStatus = 'ready';
+      styleBibleGeneratedAt = new Date().toISOString();
     } catch (e: any) {
-      console.warn('[full-create] styleBible failed after retries:', e?.message);
-      styleBible = { visualStyle: '提取失败（请点击重新生成）', visualStyleDesc: '', colorPalette: [], era: '', mood: '', cameraStyle: '', worldRules: '' };
+      styleBibleError = e?.message || String(e);
+      console.warn('[full-create] styleBible failed after retries:', styleBibleError);
+      writer.event('style_bible_failed', { styleBibleStatus, styleBibleError });
     }
-    // 兜底：把 LLM 偷懒输出的英文色名翻成中文，避免前端展示 "TEAL · AMBER · CREAM" 这种
-    styleBible = sinicizeColorPalette(styleBible);
 
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
@@ -145,6 +151,9 @@ export async function POST(req: NextRequest) {
         scriptDraft: scriptText,
         script: scriptText,
         styleBible,
+        styleBibleStatus,
+        styleBibleError,
+        styleBibleGeneratedAt,
         emotions,
         scriptApproved: false,
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
@@ -167,6 +176,9 @@ export async function POST(req: NextRequest) {
     writer.done({
       script: scriptText,
       styleBible,
+      styleBibleStatus,
+      styleBibleError,
+      styleBibleGeneratedAt,
       // 前端 script.js 读 emotionSegments + durationSec
       emotionSegments: emotions,
       emotions,

@@ -64,8 +64,7 @@ export async function POST(req: NextRequest) {
             temperature: 0.3,
             responseFormat: 'json_object',
             maxTokens: 700,
-            modelRole: 'structured',
-            reasoningEffort: 'medium',
+            modelRole: 'profileDerive',
             requestTimeoutMs: 45_000,
           },
         );

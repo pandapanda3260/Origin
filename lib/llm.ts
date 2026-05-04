@@ -166,8 +166,15 @@ async function responsesComplete(
     opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS,
     `LLM 请求超时（>${Math.round((opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS) / 1000)}s 未返回）`,
   );
+  const incompleteReason = getResponsesIncompleteReason(json);
+  if (incompleteReason) {
+    throw new Error(`LLM Responses 输出不完整（reason=${incompleteReason}）：请提高 maxTokens 或降低 reasoningEffort`);
+  }
   const content = extractResponsesText(json);
-  if (!content) throw new Error('LLM 返回结构异常（缺 Responses output_text）');
+  if (!content) {
+    const status = typeof json?.status === 'string' ? `，status=${json.status}` : '';
+    throw new Error(`LLM 返回结构异常（缺 Responses output_text${status}）`);
+  }
   return stripThinkBlocks(content);
 }
 
@@ -339,6 +346,18 @@ function extractResponsesText(json: any): string {
   if (chunks.length) return chunks.join('');
   const chatContent = json?.choices?.[0]?.message?.content;
   return typeof chatContent === 'string' ? chatContent : '';
+}
+
+function getResponsesIncompleteReason(json: any): string {
+  const status = String(json?.status || json?.response?.status || '').toLowerCase();
+  if (status !== 'incomplete') return '';
+
+  const details = json?.incomplete_details || json?.response?.incomplete_details || {};
+  const reason = details?.reason
+    || json?.incomplete_reason
+    || json?.response?.incomplete_reason
+    || 'unknown';
+  return String(reason || 'unknown');
 }
 
 /* ============================================================

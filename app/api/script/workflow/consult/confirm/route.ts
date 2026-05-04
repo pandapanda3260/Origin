@@ -77,28 +77,25 @@ export async function POST(req: NextRequest) {
     writer.phase('style_bible_start');
     writer.step('正在提取风格圣经…');
     let styleBible: any = null;
+    let styleBibleStatus: 'ready' | 'failed' = 'failed';
+    let styleBibleError = '';
+    let styleBibleGeneratedAt: string | null = null;
     try {
       styleBible = await chatCompleteJsonWithRetry(
         user,
         buildStyleBibleMessages(scriptText),
-        { temperature: 0.4, maxTokens: 2500, modelRole: 'structured' },
+        { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
         (raw) => parseJsonLoose(raw),
         'styleBible',
       );
+      styleBible = sinicizeColorPalette(styleBible);
+      styleBibleStatus = 'ready';
+      styleBibleGeneratedAt = new Date().toISOString();
     } catch (e: any) {
-      console.warn('[consult/confirm] styleBible failed after retries:', e?.message);
-      styleBible = {
-        visualStyle: '提取失败（请点击重新生成）',
-        visualStyleDesc: '',
-        colorPalette: [],
-        era: '',
-        mood: '',
-        cameraStyle: '',
-        worldRules: '',
-        _error: e?.message || String(e),
-      };
+      styleBibleError = e?.message || String(e);
+      console.warn('[consult/confirm] styleBible failed after retries:', styleBibleError);
+      writer.event('style_bible_failed', { styleBibleStatus, styleBibleError });
     }
-    styleBible = sinicizeColorPalette(styleBible);
 
     // === 3. 情绪标记（非流式 JSON，带 3 次重试）===
     writer.phase('tag_emotions_start');
@@ -123,6 +120,9 @@ export async function POST(req: NextRequest) {
         scriptDraft: scriptText,
         script: scriptText,
         styleBible,
+        styleBibleStatus,
+        styleBibleError,
+        styleBibleGeneratedAt,
         emotions,
         scriptApproved: false,
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
@@ -133,6 +133,9 @@ export async function POST(req: NextRequest) {
     writer.done({
       script: scriptText,
       styleBible,
+      styleBibleStatus,
+      styleBibleError,
+      styleBibleGeneratedAt,
       // 前端 script.js 读 emotionSegments；同时保留 emotions 便于其它老调用方
       emotionSegments: emotions,
       emotions,

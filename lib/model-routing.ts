@@ -4,7 +4,7 @@ import { loadExternalEnv } from './env';
 import { MOCK_USER_SETTINGS } from '@/mocks/settings';
 
 export type ModelSlot = 'text' | 'image' | 'video' | 'storyboard';
-export type TextModelRole = 'brain' | 'structured' | 'legacy';
+export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDerive' | 'legacy';
 export type ProviderKind =
   | 'openai_chat'
   | 'zerail_messages'
@@ -55,18 +55,19 @@ export function resolveTextModelConfig(
     }
   }
 
-  if (role === 'structured') {
-    const key = env('TEXT_API_KEY') || env('CLAUDE_API_KEY');
+  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive') {
+    const prefix = roleEnvPrefix(role);
+    const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('CLAUDE_API_KEY');
     if (key) {
       return real({
-        baseUrl: env('TEXT_API_BASE') || env('CLAUDE_API_BASE') || 'https://gateway.zerail.com/v1',
+        baseUrl: prefixedEnv(prefix, 'API_BASE') || env('TEXT_API_BASE') || env('CLAUDE_API_BASE') || 'https://gateway.zerail.com/v1',
         apiKey: key,
-        model: env('TEXT_MODEL') || env('MODEL_STRUCTURED_WORKER') || 'gpt-5.4-pro',
+        model: prefixedEnv(prefix, 'MODEL') || env('TEXT_MODEL') || env('MODEL_STRUCTURED_WORKER') || 'gpt-5.4-pro',
         provider: 'zerail_responses',
-        endpoint: env('TEXT_API_ENDPOINT') || '/responses',
+        endpoint: prefixedEnv(prefix, 'API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses',
         role,
         source: 'env',
-        reasoningEffort: env('TEXT_REASONING_EFFORT') || undefined,
+        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || env('TEXT_REASONING_EFFORT') || undefined,
       });
     }
   }
@@ -141,6 +142,8 @@ export function getModelRoutingStatus(user: UserRow | null) {
   return {
     brain: redactConfig(resolveTextModelConfig(user, 'brain')),
     structured: redactConfig(resolveTextModelConfig(user, 'structured')),
+    styleBible: redactConfig(resolveTextModelConfig(user, 'styleBible')),
+    profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
     image: redactConfig(resolveSlotModelConfig(user, 'image')),
     video: redactConfig(resolveSlotModelConfig(user, 'video')),
     env: {
@@ -244,6 +247,16 @@ function defaultModel(slot: ModelSlot): string {
 
 function env(name: string): string {
   return (process.env[name] || '').trim();
+}
+
+function roleEnvPrefix(role: TextModelRole): string {
+  if (role === 'styleBible') return 'STYLE_BIBLE';
+  if (role === 'profileDerive') return 'PROFILE_DERIVE';
+  return '';
+}
+
+function prefixedEnv(prefix: string, suffix: string): string {
+  return prefix ? env(`${prefix}_${suffix}`) : '';
 }
 
 function normalizeBaseUrl(baseUrl: string): string {

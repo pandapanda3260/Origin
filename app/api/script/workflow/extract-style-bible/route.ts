@@ -26,18 +26,31 @@ export async function POST(req: NextRequest) {
     styleBible = await chatCompleteJsonWithRetry(
       user,
       buildStyleBibleMessages(finalScript),
-      { temperature: 0.4, maxTokens: 2500, modelRole: 'structured' },
+      { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
       (raw) => parseJsonLoose(raw),
       'styleBible',
     );
   } catch (e: any) {
-    return jsonError('风格圣经生成失败：' + (e?.message || String(e)), 502);
+    const styleBibleError = e?.message || String(e);
+    if (projectId && proj) {
+      updateProjectForUser(projectId, user.id, {
+        styleBibleStatus: 'failed',
+        styleBibleError,
+      });
+    }
+    return jsonError('风格圣经生成失败：' + styleBibleError, 502);
   }
 
   styleBible = sinicizeColorPalette(styleBible);
+  const styleBibleGeneratedAt = new Date().toISOString();
 
   if (projectId && proj) {
-    updateProjectForUser(projectId, user.id, { styleBible });
+    updateProjectForUser(projectId, user.id, {
+      styleBible,
+      styleBibleStatus: 'ready',
+      styleBibleError: '',
+      styleBibleGeneratedAt,
+    });
   }
-  return jsonOk({ styleBible });
+  return jsonOk({ styleBible, styleBibleStatus: 'ready', styleBibleError: '', styleBibleGeneratedAt });
 }

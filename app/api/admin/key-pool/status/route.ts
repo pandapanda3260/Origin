@@ -13,7 +13,7 @@ export async function GET(req: NextRequest) {
   if (!user.is_admin) return jsonError('forbidden', 403);
 
   const status = getModelRoutingStatus(user);
-  const pools = (['brain', 'structured', 'image', 'video'] as const).map((slot) => {
+  const pools = (['brain', 'structured', 'styleBible', 'profileDerive', 'image', 'video'] as const).map((slot) => {
     const cfg = status[slot];
     return {
       name: slot,
@@ -26,6 +26,7 @@ export async function GET(req: NextRequest) {
       baseUrl: cfg.baseUrl,
       provider: cfg.provider,
       endpoint: cfg.endpoint || cfg.imageGenerationEndpoint || null,
+      reasoningEffort: cfg.reasoningEffort || null,
       lastUsed: null,
     };
   });
