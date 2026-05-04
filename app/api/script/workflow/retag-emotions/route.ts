@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
     const raw = await chatComplete(
       user,
       buildRetagMessages(finalScript, durationSec || (proj as any)?.scriptTargetDurationSec),
-      { temperature: 0.4, responseFormat: 'json_object', maxTokens: 800 },
+      { temperature: 0.4, responseFormat: 'json_object', maxTokens: 800, modelRole: 'structured' },
     );
     const json = parseJsonLoose<{ emotions: any[] }>(raw);
     emotions = Array.isArray(json?.emotions) ? json.emotions : [];

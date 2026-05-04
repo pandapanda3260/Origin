@@ -112,6 +112,21 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
   const decoder = new TextDecoder();
   let buffer = '';
   let finalData = null;
+  function handleEventPart(part) {
+    const line = part.trim();
+    if (!line.startsWith('data: ')) return;
+    try {
+      const evt = JSON.parse(line.slice(6));
+      if (onEvent) {
+        try { onEvent(evt); } catch (_e) { /* ignore listener errors */ }
+      }
+      if (evt.type === 'chunk' && onChunk) onChunk(evt.content || '');
+      else if (evt.type === 'done') finalData = evt;
+      else if (evt.type === 'error') throw new Error(friendlyModelError(evt.error));
+    } catch (parseErr) {
+      if (parseErr.message && !parseErr.message.startsWith('Unexpected')) throw parseErr;
+    }
+  }
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -119,21 +134,10 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
     const parts = buffer.split('\n\n');
     buffer = parts.pop() || '';
     for (const part of parts) {
-      const line = part.trim();
-      if (!line.startsWith('data: ')) continue;
-      try {
-        const evt = JSON.parse(line.slice(6));
-        if (onEvent) {
-          try { onEvent(evt); } catch (_e) { /* ignore listener errors */ }
-        }
-        if (evt.type === 'chunk' && onChunk) onChunk(evt.content || '');
-        else if (evt.type === 'done') finalData = evt;
-        else if (evt.type === 'error') throw new Error(friendlyModelError(evt.error));
-      } catch (parseErr) {
-        if (parseErr.message && !parseErr.message.startsWith('Unexpected')) throw parseErr;
-      }
+      handleEventPart(part);
     }
   }
+  if (buffer.trim()) handleEventPart(buffer);
   if (!finalData) throw new Error('生成失败，请稍后重试');
   return finalData;
 }
@@ -145,6 +149,7 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
 // 这里仅保留注释占位，勿复活。
 
 const _assetUrlCache = new Map();
+const _protectedImageBlobCache = new Map();
 
 export async function fetchAssetSignedUrl(assetId, ttl) {
   assetId = (assetId || '').trim();
@@ -219,6 +224,60 @@ export async function hydrateProjectAssetUrls(project) {
   });
   await Promise.all(jobs);
   return project;
+}
+
+function _isProtectedImageUrl(url) {
+  url = String(url || '').trim();
+  if (!url) return false;
+  try {
+    var u = new URL(url, window.location.origin);
+    return u.origin === window.location.origin && u.pathname.indexOf('/api/images/file/') === 0;
+  } catch (_e) {
+    return url.indexOf('/api/images/file/') === 0;
+  }
+}
+
+async function _resolveProtectedImageBlobUrl(url) {
+  url = String(url || '').trim();
+  if (!_isProtectedImageUrl(url)) return url;
+  var cached = _protectedImageBlobCache.get(url);
+  if (cached) return cached;
+
+  var resp = await fetch(url, { headers: getAuthHeaders(), cache: 'force-cache' });
+  checkAuth(resp);
+  if (!resp.ok) throw new Error('图片加载失败 (' + resp.status + ')');
+  var blobUrl = URL.createObjectURL(await resp.blob());
+  _protectedImageBlobCache.set(url, blobUrl);
+  return blobUrl;
+}
+
+export function hydrateProtectedImageElements(root) {
+  root = root || document;
+  var nodes = [];
+  if (root.matches && (root.matches('img[src]') || root.matches('[data-img]'))) nodes.push(root);
+  if (root.querySelectorAll) {
+    root.querySelectorAll('img[src], [data-img]').forEach(function (node) { nodes.push(node); });
+  }
+
+  nodes.forEach(function (node) {
+    var imgUrl = node.getAttribute && node.getAttribute('src');
+    if (imgUrl && _isProtectedImageUrl(imgUrl)) {
+      _resolveProtectedImageBlobUrl(imgUrl).then(function (blobUrl) {
+        node.setAttribute('src', blobUrl);
+      }).catch(function (e) {
+        try { console.warn('[image] protected image hydrate failed:', imgUrl, e); } catch (_e) {}
+      });
+    }
+
+    var dataImg = node.getAttribute && node.getAttribute('data-img');
+    if (dataImg && _isProtectedImageUrl(dataImg)) {
+      _resolveProtectedImageBlobUrl(dataImg).then(function (blobUrl) {
+        node.setAttribute('data-img', blobUrl);
+      }).catch(function (e) {
+        try { console.warn('[image] protected data-img hydrate failed:', dataImg, e); } catch (_e) {}
+      });
+    }
+  });
 }
 
 // ── DOM / UI helpers ──────────────────────────────────────────────────────

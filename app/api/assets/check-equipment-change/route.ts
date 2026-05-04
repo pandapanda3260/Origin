@@ -23,7 +23,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_CHECK },
         { role: 'user', content: `对比：\n${JSON.stringify({ before: body.before, after: body.after })}` },
       ],
-      { temperature: 0.2, responseFormat: 'json_object', maxTokens: 500 },
+      { temperature: 0.2, responseFormat: 'json_object', maxTokens: 500, modelRole: 'structured' },
     );
     const json = parseJsonLoose<{ changed: boolean; items: any[] }>(raw);
     return jsonOk({ changed: !!json.changed, items: Array.isArray(json.items) ? json.items : [] });

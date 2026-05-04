@@ -55,7 +55,7 @@ export async function POST(req: NextRequest) {
       audience,
       creatorPersona: persona,
     });
-    await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000 }, (delta) => {
+    await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
       scriptText += delta;
       writer.scriptChunk(delta);
     });
@@ -81,7 +81,7 @@ export async function POST(req: NextRequest) {
       styleBible = await chatCompleteJsonWithRetry(
         user,
         buildStyleBibleMessages(scriptText),
-        { temperature: 0.4, maxTokens: 2500 },
+        { temperature: 0.4, maxTokens: 2500, modelRole: 'structured' },
         (raw) => parseJsonLoose(raw),
         'styleBible',
       );
@@ -108,7 +108,7 @@ export async function POST(req: NextRequest) {
       const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
         user,
         buildRetagMessages(scriptText, durationSec || (proj as any)?.scriptTargetDurationSec),
-        { temperature: 0.4, maxTokens: 1200 },
+        { temperature: 0.4, maxTokens: 1200, modelRole: 'structured' },
         (raw) => parseJsonLoose<{ emotions: any[] }>(raw),
         'emotions',
       );

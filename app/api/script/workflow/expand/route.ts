@@ -34,7 +34,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_EXPAND },
         { role: 'user', content: `当前剧本：\n${baseScript}` },
       ],
-      { temperature: 0.7, maxTokens: 3500 },
+      { temperature: 0.7, maxTokens: 3500, modelRole: 'brain' },
       (delta) => {
         buf += delta;
         writer.scriptChunk(delta);

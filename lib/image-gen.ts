@@ -134,7 +134,8 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     if (input.referenceImagePath && !editSupported) {
       console.warn(`[image-gen] reference image provided but model ${modelName} does not support edits — falling back to text-only generation`);
     }
-    const q = pickQuality(modelName, input.quality);
+    const q = pickQuality(modelName, cfg.imageQuality || input.quality);
+    const requestTimeoutMs = cfg.timeoutMs || 240_000;
 
     // 失败重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
     // 4xx（除 429）与 401/403 视为永久错误，立刻抛出，避免无意义浪费积分。
@@ -143,9 +144,9 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     const MAX_ATTEMPTS = 3;
     let lastErr: any = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      // 单次调用 240s 超时（gpt-image-* medium + 中转排队，180s 偏紧）
+      // 单次调用超时由平台 env 控制；未配置时保留原来的 240s。
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 240_000);
+      const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
       const tA = Date.now();
       try {
         let resp: Response;
@@ -159,7 +160,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           if (q) fd.append('quality', q);
           const refBuf = readFileSync(input.referenceImagePath!);
           fd.append('image', new Blob([refBuf], { type: 'image/png' }), 'reference.png');
-          resp = await fetch(`${cfg.baseUrl}/images/edits`, {
+          resp = await fetch(`${cfg.baseUrl}${cfg.imageEditEndpoint || '/images/edits'}`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${cfg.apiKey}` },
             body: fd as any,
@@ -174,7 +175,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           };
           if (q) body.quality = q;
           console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind} mode=generate`);
-          resp = await fetch(`${cfg.baseUrl}/images/generations`, {
+          resp = await fetch(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -221,7 +222,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         const aborted = e?.name === 'AbortError';
         const status = e?.status as number | undefined;
         const transient = aborted || status === 429 || (status !== undefined && status >= 500 && status < 600);
-        const reason = aborted ? `请求超时（>240s 未返回）` : (e?.message || String(e));
+        const reason = aborted ? `请求超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）` : (e?.message || String(e));
         console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}`);
         lastErr = e;
         if (attempt < MAX_ATTEMPTS && transient) {
@@ -243,7 +244,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         } else if (status === 402) {
           friendly = `图像 API 余额不足（402），请到中转站充值后再试`;
         } else if (aborted) {
-          friendly = `图像生成超时（>240s 未返回），中转站可能在排队，请稍后重试`;
+          friendly = `图像生成超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回），中转站可能在排队，请稍后重试`;
         } else if (status && status >= 500 && status < 600) {
           friendly = `中转站服务异常（${status}），${MAX_ATTEMPTS} 次重试均失败，请稍后再试`;
         } else {

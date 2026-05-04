@@ -36,7 +36,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_PATCH },
         { role: 'user', content: `原剧本：\n${baseScript}\n\n修改意图：${intent}` },
       ],
-      { temperature: 0.6, maxTokens: 3500 },
+      { temperature: 0.6, maxTokens: 3500, modelRole: 'brain' },
     );
   } catch (e: any) {
     return jsonError('修改失败：' + (e?.message || String(e)), 502);

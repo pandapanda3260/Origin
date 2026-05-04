@@ -45,7 +45,7 @@ export async function POST(req: NextRequest) {
       await chatStream(
         user,
         buildVideoPromptMessages({ shots, styleBible, assets, narrations, groupIdx, totalGroups }),
-        { temperature: 0.7, maxTokens: 1800 },
+        { temperature: 0.7, maxTokens: 1800, modelRole: 'brain' },
         (delta) => {
           prompt += delta;
           writer.chunk(delta);

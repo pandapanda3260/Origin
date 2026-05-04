@@ -446,7 +446,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
       { role: 'system', content: SP_SHOT_TO_IMG_PROMPT },
       { role: 'user', content: userMsg },
     ],
-    { temperature: 0.5, maxTokens: 600 },
+    { temperature: 0.5, maxTokens: 600, modelRole: 'structured' },
   );
   const cleaned = prompt.trim().replace(/^["'`]+|["'`]+$/g, '');
   if (!cleaned) throw new Error('AI 没有返回提示词');
@@ -1015,7 +1015,7 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
       ctx.user,
       messages,
       // 镜头表可能很长（10+ 镜头），给足 token
-      { temperature: 0.6, maxTokens: 4000 },
+      { temperature: 0.6, maxTokens: 4000, modelRole: 'structured' },
       (raw) => parseJsonLoose(raw),
       'shots-generate',
     );
@@ -1222,7 +1222,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
       prompt = await chatComplete(
         ctx.user,
         retryMessages,
-        { temperature: temp, maxTokens: 2200 },
+        { temperature: temp, maxTokens: 2200, modelRole: 'structured' },
       );
       if (!looksLikeOldFormat(prompt)) break;
       console.warn(`[video_prompts] attempt ${attempt} produced old format, retrying…`);

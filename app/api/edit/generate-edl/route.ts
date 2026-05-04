@@ -225,7 +225,7 @@ export async function POST(req: NextRequest) {
           { role: 'system', content: SP_GENERATE_EDL },
           { role: 'user', content: JSON.stringify(ctx) },
         ],
-        { temperature: 0.5, responseFormat: 'json_object', maxTokens: 1500 },
+        { temperature: 0.5, responseFormat: 'json_object', maxTokens: 1500, modelRole: 'structured' },
         (delta) => { raw += delta; writer.chunk(delta); },
       );
     } catch (e: any) {

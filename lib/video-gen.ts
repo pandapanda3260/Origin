@@ -398,6 +398,8 @@ export async function generateVideo(
   const fullPath = join(ownerDir, filename);
   // 选择适配器（提前算，决定时长）
   const cfgIsGrok = /^grok-video/i.test(cfg.model || '');
+  const isVolcano = /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl) || /seedance|doubao/i.test(cfg.model);
+  const isGrok = cfgIsGrok;
   // grok 模型时长策略：
   //   grok-video-3-10s → 固定 10 秒
   //   grok-video-3-Ns  → 固定 N 秒
@@ -405,7 +407,10 @@ export async function generateVideo(
   const grokFixedDur = cfgIsGrok
     ? (/-(\d+)s$/i.test(cfg.model) ? Number(RegExp.$1) : 5)
     : null;
-  const dur = grokFixedDur ?? input.durationSec ?? 4;
+  const rawDur = grokFixedDur ?? input.durationSec ?? (isVolcano ? (cfg.minDurationSec || 5) : 4);
+  const dur = isVolcano && !grokFixedDur
+    ? Math.max(rawDur, cfg.minDurationSec || 5)
+    : rawDur;
   // ratio 优先；没传 ratio 时尊重 size，否则按 size 反推
   const sizeArgPresent = !!input.size;
   const { ratio: aspectRatio, size: sizeFromRatio } = normalizeRatio(
@@ -433,8 +438,6 @@ export async function generateVideo(
   );
 
   // 选择适配器：grok（中转） / 火山引擎 Seedance / OpenAI Sora / fake
-  const isVolcano = /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl) || /seedance|doubao/i.test(cfg.model);
-  const isGrok = cfgIsGrok;
 
   if (cfg.mode === 'fake' || !cfg.apiKey) {
     onProgress?.(20, '[fake] 生成黑场视频…');

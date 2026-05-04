@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
           },
           totalDurationSec: totalDurationSec || (proj as any)?.scriptTargetDurationSec,
         }),
-        { temperature: 0.5, responseFormat: 'json_object', maxTokens: 3500 },
+        { temperature: 0.5, responseFormat: 'json_object', maxTokens: 3500, modelRole: 'structured' },
       );
       const json = parseJsonLoose<{ shots: any[] }>(raw);
       shots = Array.isArray(json?.shots) ? json.shots : [];

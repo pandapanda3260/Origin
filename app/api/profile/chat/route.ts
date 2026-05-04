@@ -8,7 +8,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const SP_PERSONA = `你是创作偏好研究员。通过简短对话弄清用户的创作风格倾向（视觉/叙事/镜头/情绪/提示词习惯），
-每轮回复保持 ≤120 字，多用反问与示例帮用户自己说清楚。`;
+每轮回复保持 ≤120 字，多用反问与示例帮用户自己说清楚。
+只输出给用户看的自然语言正文，不要输出 <step>、XML 标签、JSON 或 markdown。`;
 
 const SP_PERSONA_DERIVE = `根据下面对话历史，提炼出用户的创作偏好画像，输出严格 JSON：
 {
@@ -33,7 +34,6 @@ export async function POST(req: NextRequest) {
   const dialog = Array.isArray(cur.rawDialog) ? cur.rawDialog : [];
 
   return sseResponse(async (writer) => {
-    writer.step('正在思考…');
     let buf = '';
     await chatStream(
       user,
@@ -42,9 +42,13 @@ export async function POST(req: NextRequest) {
         ...dialog.map((m: any) => ({ role: m.role, content: m.content })),
         { role: 'user', content: userMsg },
       ],
-      { temperature: 0.7, maxTokens: 600 },
-      (d) => { buf += d; writer.chunk(d); },
+      { temperature: 0.7, maxTokens: 600, modelRole: 'brain' },
+      (d) => {
+        buf += d;
+        writer.chunk(d);
+      },
     );
+    buf = stripStepTags(buf).trim();
 
     const newDialog = [...dialog, { role: 'user', content: userMsg }, { role: 'assistant', content: buf.trim() }];
     let persona = { ...cur };
@@ -58,7 +62,14 @@ export async function POST(req: NextRequest) {
             { role: 'system', content: SP_PERSONA_DERIVE },
             { role: 'user', content: JSON.stringify(newDialog.slice(-12)) },
           ],
-          { temperature: 0.3, responseFormat: 'json_object', maxTokens: 700 },
+          {
+            temperature: 0.3,
+            responseFormat: 'json_object',
+            maxTokens: 700,
+            modelRole: 'structured',
+            reasoningEffort: 'medium',
+            requestTimeoutMs: 12_000,
+          },
         );
         const j = parseJsonLoose(raw);
         persona = { ...persona, ...j };
@@ -69,6 +80,10 @@ export async function POST(req: NextRequest) {
     persona.updatedAt = new Date().toISOString();
     setJson('user_profiles', user.id, persona);
 
-    writer.done({ reply: buf.trim(), persona });
+    writer.done({ reply: buf.trim(), profile: persona, persona });
   });
+}
+
+function stripStepTags(text: string): string {
+  return String(text || '').replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
 }

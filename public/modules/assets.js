@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements } from './utils.js';
 import { loadProjectData } from './project.js';
 import { subscribeBatch, subscribeTask } from './backend_stream.js';
 import { renderAssetCard } from './render_hooks.js';
@@ -255,6 +255,7 @@ export function renderAssetGrid(containerId, items, type, placeholderIcon) {
   } else {
     _renderPropCards(container, items);
   }
+  hydrateProtectedImageElements(container);
 }
 
 function _renderCharCards(container, items) {

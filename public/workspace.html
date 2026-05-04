@@ -102,20 +102,41 @@
 
     <!-- ===== Scrolling Announcement Banner ===== -->
     <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:32px;display:flex;align-items:center;">
-      <div style="display:inline-block;white-space:nowrap;animation:bannerScroll 28s linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;">
-        <span style="margin-right:80px;">吸烟有害健康</span>
-        <span style="margin-right:80px;">您大点声不费电！</span>
-        <span style="margin-right:80px;">劳驾，大爷，美国怎么走啊？</span>
-        <span style="margin-right:80px;">大难不死，必有下回</span>
-        <span style="margin-right:80px;">高雅不是装的，孙子才是装的</span>
-        <span style="margin-right:80px;">吸烟有害健康</span>
-        <span style="margin-right:80px;">您大点声不费电！</span>
-        <span style="margin-right:80px;">劳驾，大爷，美国怎么走啊？</span>
-        <span style="margin-right:80px;">大难不死，必有下回</span>
-        <span style="margin-right:80px;">高雅不是装的，孙子才是装的</span>
-      </div>
+      <div id="announceTrack" style="display:inline-block;white-space:nowrap;animation:bannerScroll 72s linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;"></div>
     </div>
-    <style>@keyframes bannerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}</style>
+    <style>
+      #announceTrack .announce-item{margin-right:80px}
+      @keyframes bannerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+    </style>
+    <script>
+      (function(){
+        var messages = [
+          '吸烟有害健康',
+          '您大点声不费电！',
+          '劳驾，大爷，美国怎么走啊？',
+          '大难不死，必有下回',
+          '高雅不是装的，孙子才是装的'
+        ];
+        var repetitionsPerHalf = 4;
+        var track = document.getElementById('announceTrack');
+        if (!track) return;
+
+        function appendMessages(hidden) {
+          for (var repeat = 0; repeat < repetitionsPerHalf; repeat += 1) {
+            for (var i = 0; i < messages.length; i += 1) {
+              var item = document.createElement('span');
+              item.className = 'announce-item';
+              item.textContent = messages[i];
+              if (hidden) item.setAttribute('aria-hidden', 'true');
+              track.appendChild(item);
+            }
+          }
+        }
+
+        appendMessages(false);
+        appendMessages(true);
+      })();
+    </script>
 
     <!-- ===== Maintenance Banner (hidden by default, polled every 10s) ===== -->
     <div id="maintenanceBanner" class="maintenance-banner" hidden>
@@ -181,10 +202,10 @@
             ></div>
           </div>
           <div class="space-y-1 relative z-10 pl-6">
-            <button type="button" id="navOverview" data-page="overview" title="项目总览"
+            <button type="button" id="navOverview" data-page="overview" title="任务列表"
               class="sw-nav-item is-active flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
               <span class="material-symbols-outlined">dashboard</span>
-              <span>总览</span>
+              <span>任务列表</span>
             </button>
             <button type="button" id="navScript" data-page="script" title="剧本生成"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
@@ -1638,29 +1659,29 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=95",
-        "/modules/backend_stream.js": "/modules/backend_stream.js?v=95",
-        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=95",
-        "/modules/edit.js":           "/modules/edit.js?v=95",
-        "/modules/episodes.js":       "/modules/episodes.js?v=95",
-        "/modules/error_hub.js":      "/modules/error_hub.js?v=95",
-        "/modules/project.js":        "/modules/project.js?v=95",
-        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=95",
-        "/modules/script.js":         "/modules/script.js?v=95",
-        "/modules/settings.js":       "/modules/settings.js?v=95",
-        "/modules/shots.js":          "/modules/shots.js?v=95",
-        "/modules/store.js":          "/modules/store.js?v=95",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=95",
-        "/modules/tasks.js":          "/modules/tasks.js?v=95",
-        "/modules/utils.js":          "/modules/utils.js?v=95",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=95",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=95"
+        "/modules/assets.js":         "/modules/assets.js?v=96",
+        "/modules/backend_stream.js": "/modules/backend_stream.js?v=96",
+        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=96",
+        "/modules/edit.js":           "/modules/edit.js?v=96",
+        "/modules/episodes.js":       "/modules/episodes.js?v=96",
+        "/modules/error_hub.js":      "/modules/error_hub.js?v=96",
+        "/modules/project.js":        "/modules/project.js?v=96",
+        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=96",
+        "/modules/script.js":         "/modules/script.js?v=96",
+        "/modules/settings.js":       "/modules/settings.js?v=96",
+        "/modules/shots.js":          "/modules/shots.js?v=96",
+        "/modules/store.js":          "/modules/store.js?v=96",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=96",
+        "/modules/tasks.js":          "/modules/tasks.js?v=96",
+        "/modules/utils.js":          "/modules/utils.js?v=96",
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=96",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=96"
       }
     }
     </script>
-    <script type="module" src="modules/store.js?v=95"></script>
-    <script type="module" src="modules/utils.js?v=95"></script>
-    <script type="module" src="main.js?v=95"></script>
+    <script type="module" src="modules/store.js?v=96"></script>
+    <script type="module" src="modules/utils.js?v=96"></script>
+    <script type="module" src="main.js?v=96"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

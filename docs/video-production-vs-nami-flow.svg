@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1480" viewBox="0 0 1600 1480" role="img" aria-labelledby="title desc">
+  <title id="title">Origin 视频生产任务逻辑与纳米漫剧流水线对比</title>
+  <desc id="desc">并排展示 Origin 当前源码中的视频生产任务流程，以及根据公开资料整理的纳米漫剧流水线，再标注双方功能差异。</desc>
+  <defs>
+    <marker id="arrowOrigin" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#146C7C"/>
+    </marker>
+    <marker id="arrowNami" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9A4D1E"/>
+    </marker>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#1b2733" flood-opacity="0.14"/>
+    </filter>
+    <style>
+      .bg { fill: #F7FAFC; }
+      .title { font: 800 36px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #17212B; }
+      .subtitle { font: 500 18px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #53606C; }
+      .laneTitle { font: 800 24px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .laneHint { font: 500 14px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .boxTitle { font: 800 18px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #13242A; }
+      .boxText { font: 500 14px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #41505B; }
+      .small { font: 600 12px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #5A6874; }
+      .originLane { fill: #EAF8FB; stroke: #A8DDE5; stroke-width: 2; }
+      .namiLane { fill: #FFF4E8; stroke: #F2C596; stroke-width: 2; }
+      .originBox { fill: #FFFFFF; stroke: #64B9C6; stroke-width: 2; filter: url(#softShadow); }
+      .namiBox { fill: #FFFFFF; stroke: #E39B54; stroke-width: 2; filter: url(#softShadow); }
+      .sharedBox { fill: #FFFFFF; stroke: #9AA7B4; stroke-width: 2; filter: url(#softShadow); }
+      .originLine { stroke: #146C7C; stroke-width: 3; fill: none; marker-end: url(#arrowOrigin); }
+      .namiLine { stroke: #9A4D1E; stroke-width: 3; fill: none; marker-end: url(#arrowNami); }
+      .chipOrigin { fill: #DDF3F7; stroke: #64B9C6; }
+      .chipNami { fill: #FFE3C7; stroke: #E39B54; }
+      .chipShared { fill: #EEF2F6; stroke: #B5C0CB; }
+      .diffTitle { font: 800 20px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #17212B; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1480"/>
+
+  <text class="title" x="80" y="72">视频生产任务逻辑对比图</text>
+  <text class="subtitle" x="80" y="106">Origin 基于当前仓库源码梳理；纳米漫剧侧基于公开资料整理，未做源码级确认。</text>
+
+  <rect class="originLane" x="70" y="140" width="710" height="960" rx="18"/>
+  <rect class="namiLane" x="820" y="140" width="710" height="960" rx="18"/>
+
+  <text class="laneTitle" x="105" y="186" fill="#146C7C">Origin 当前视频生产任务</text>
+  <text class="laneHint" x="105" y="212" fill="#376C75">完整 Web 工作台：项目持久化、批量任务、视频生成、剪辑导出、任务中心</text>
+
+  <text class="laneTitle" x="855" y="186" fill="#9A4D1E">纳米漫剧流水线（公开资料口径）</text>
+  <text class="laneHint" x="855" y="212" fill="#84522F">偏 AI 漫剧工业化：世界模型、空间记忆、多智能体、多视图资产、宫格生图/视频</text>
+
+  <!-- Origin flow -->
+  <rect class="originBox" x="105" y="250" width="290" height="108" rx="12"/>
+  <text class="boxTitle" x="130" y="282">1. 创作与项目入口</text>
+  <text class="boxText" x="130" y="310">登录鉴权 / 多用户项目隔离</text>
+  <text class="boxText" x="130" y="334">剧本顾问对话、直出、扩写、续写</text>
+
+  <rect class="originBox" x="455" y="250" width="290" height="108" rx="12"/>
+  <text class="boxTitle" x="480" y="282">2. 资产与风格圣经</text>
+  <text class="boxText" x="480" y="310">抽取角色 / 场景 / 道具</text>
+  <text class="boxText" x="480" y="334">场景色调锁、主/副场景参考图</text>
+
+  <path class="originLine" d="M395 304 L455 304"/>
+
+  <rect class="originBox" x="105" y="415" width="290" height="126" rx="12"/>
+  <text class="boxTitle" x="130" y="447">3. 镜头与分镜图</text>
+  <text class="boxText" x="130" y="475">镜头表 6-15 条</text>
+  <text class="boxText" x="130" y="499">storyboard_prompts / storyboard_images</text>
+  <text class="boxText" x="130" y="523">铅笔分镜、多格布局、非人角色锁</text>
+
+  <path class="originLine" d="M600 358 C600 390 250 382 250 415"/>
+
+  <rect class="originBox" x="455" y="415" width="290" height="126" rx="12"/>
+  <text class="boxTitle" x="480" y="447">4. 视频提示词</text>
+  <text class="boxText" x="480" y="475">按分镜组生成 videoPrompt</text>
+  <text class="boxText" x="480" y="499">保存 shotIndices / narrationsUsed</text>
+  <text class="boxText" x="480" y="523">旧英文格式、参考图编号自动拦截</text>
+
+  <path class="originLine" d="M395 478 L455 478"/>
+
+  <rect class="originBox" x="105" y="600" width="290" height="154" rx="12"/>
+  <text class="boxTitle" x="130" y="632">5. 批量调度</text>
+  <text class="boxText" x="130" y="660">POST /api/batch/start</text>
+  <text class="boxText" x="130" y="684">batches + batch_tasks 入库</text>
+  <text class="boxText" x="130" y="708">并发 3、SSE 事件、轮询兜底</text>
+  <text class="boxText" x="130" y="732">积分预扣、失败退款、孤儿任务回收</text>
+
+  <path class="originLine" d="M600 541 C600 574 250 568 250 600"/>
+
+  <rect class="originBox" x="455" y="600" width="290" height="154" rx="12"/>
+  <text class="boxTitle" x="480" y="632">6. video_segments 执行器</text>
+  <text class="boxText" x="480" y="660">取本组 videoPrompt + shotIndices</text>
+  <text class="boxText" x="480" y="684">解析对白 speaker/text，禁止少字</text>
+  <text class="boxText" x="480" y="708">按台词字数自动选 5s / 10s</text>
+  <text class="boxText" x="480" y="732">传场景图 + 角色图 + 分镜图</text>
+
+  <path class="originLine" d="M395 677 L455 677"/>
+
+  <rect class="originBox" x="105" y="815" width="290" height="166" rx="12"/>
+  <text class="boxTitle" x="130" y="847">7. 视频模型适配</text>
+  <text class="boxText" x="130" y="875">Seedance：合成彩色视觉圣经参考图</text>
+  <text class="boxText" x="130" y="899">Grok：压缩视觉 prompt + 保留台词</text>
+  <text class="boxText" x="130" y="923">Sora：OpenAI 风格提交/轮询/下载</text>
+  <text class="boxText" x="130" y="947">fake：ffmpeg 黑场兜底</text>
+
+  <path class="originLine" d="M600 754 C600 790 250 780 250 815"/>
+
+  <rect class="originBox" x="455" y="815" width="290" height="166" rx="12"/>
+  <text class="boxTitle" x="480" y="847">8. 落库与剪辑导出</text>
+  <text class="boxText" x="480" y="875">video_tasks 记录远端任务、进度、文件</text>
+  <text class="boxText" x="480" y="899">抽首帧封面写 images 表</text>
+  <text class="boxText" x="480" y="923">AI 分析片段、生成 EDL</text>
+  <text class="boxText" x="480" y="947">ffmpeg 拼接、字幕、BGM、loudnorm</text>
+
+  <path class="originLine" d="M395 898 L455 898"/>
+
+  <!-- Nami flow -->
+  <rect class="namiBox" x="855" y="250" width="290" height="108" rx="12"/>
+  <text class="boxTitle" x="880" y="282">1. 题材 / 剧情输入</text>
+  <text class="boxText" x="880" y="310">用户输入故事、角色、世界观</text>
+  <text class="boxText" x="880" y="334">面向漫剧连续内容生产</text>
+
+  <rect class="namiBox" x="1205" y="250" width="290" height="108" rx="12"/>
+  <text class="boxTitle" x="1230" y="282">2. 世界模型与空间记忆</text>
+  <text class="boxText" x="1230" y="310">公开资料强调空间记忆</text>
+  <text class="boxText" x="1230" y="334">用于场景/人物连续一致</text>
+
+  <path class="namiLine" d="M1145 304 L1205 304"/>
+
+  <rect class="namiBox" x="855" y="415" width="290" height="126" rx="12"/>
+  <text class="boxTitle" x="880" y="447">3. 多智能体编排</text>
+  <text class="boxText" x="880" y="475">剧情、分镜、画面、视频分工</text>
+  <text class="boxText" x="880" y="499">资料称可做 Agent 流水线协作</text>
+  <text class="boxText" x="880" y="523">更接近漫剧生产中台</text>
+
+  <path class="namiLine" d="M1350 358 C1350 390 1000 382 1000 415"/>
+
+  <rect class="namiBox" x="1205" y="415" width="290" height="126" rx="12"/>
+  <text class="boxTitle" x="1230" y="447">4. 角色 / 场景资产</text>
+  <text class="boxText" x="1230" y="475">三视图 / 四视图角色设定</text>
+  <text class="boxText" x="1230" y="499">面向跨镜头、跨集复用</text>
+  <text class="boxText" x="1230" y="523">资产一致性是核心卖点</text>
+
+  <path class="namiLine" d="M1145 478 L1205 478"/>
+
+  <rect class="namiBox" x="855" y="600" width="290" height="154" rx="12"/>
+  <text class="boxTitle" x="880" y="632">5. 漫剧分镜 / 画面生成</text>
+  <text class="boxText" x="880" y="660">漫画/漫剧镜头画面生成</text>
+  <text class="boxText" x="880" y="684">多格预览、图生图一致性</text>
+  <text class="boxText" x="880" y="708">偏 IP 连载和角色稳定</text>
+  <text class="boxText" x="880" y="732">公开资料未见本地源码细节</text>
+
+  <path class="namiLine" d="M1350 541 C1350 574 1000 568 1000 600"/>
+
+  <rect class="namiBox" x="1205" y="600" width="290" height="154" rx="12"/>
+  <text class="boxTitle" x="1230" y="632">6. 多参数 / 宫格生视频</text>
+  <text class="boxText" x="1230" y="660">公开资料提到多参数预览</text>
+  <text class="boxText" x="1230" y="684">九宫格/候选探索式生成</text>
+  <text class="boxText" x="1230" y="708">用户挑选更优镜头结果</text>
+  <text class="boxText" x="1230" y="732">更强在生成前中期试错</text>
+
+  <path class="namiLine" d="M1145 677 L1205 677"/>
+
+  <rect class="namiBox" x="1030" y="815" width="290" height="166" rx="12"/>
+  <text class="boxTitle" x="1055" y="847">7. 漫剧成片 / 发布链路</text>
+  <text class="boxText" x="1055" y="875">资料侧重“从创意到漫剧”闭环</text>
+  <text class="boxText" x="1055" y="899">源码层面的任务表、SSE、计费、导出</text>
+  <text class="boxText" x="1055" y="923">未在公开资料中确认</text>
+  <text class="boxText" x="1055" y="947">需要纳米源码/产品文档进一步核对</text>
+
+  <path class="namiLine" d="M1350 754 C1350 790 1175 780 1175 815"/>
+
+  <!-- Shared and diff summary -->
+  <rect class="sharedBox" x="70" y="1140" width="1460" height="265" rx="18"/>
+  <text class="diffTitle" x="105" y="1182">功能差异速览</text>
+
+  <rect class="chipOrigin" x="105" y="1212" width="420" height="146" rx="12"/>
+  <text class="boxTitle" x="130" y="1244">Origin 有、纳米公开资料未确认</text>
+  <text class="boxText" x="130" y="1272">任务中心：DB 聚合 video_tasks / batches / exports + SSE</text>
+  <text class="boxText" x="130" y="1296">积分扣费、失败退款、孤儿任务回收</text>
+  <text class="boxText" x="130" y="1320">剪辑工作台：AI EDL、时间线、字幕、BGM、ffmpeg 导出</text>
+  <text class="boxText" x="130" y="1344">多视频适配：Seedance / Grok / Sora / fake</text>
+
+  <rect class="chipNami" x="590" y="1212" width="420" height="146" rx="12"/>
+  <text class="boxTitle" x="615" y="1244">纳米有、Origin 目前缺失或较弱</text>
+  <text class="boxText" x="615" y="1272">显式世界模型 / 空间记忆 / 长线一致性中台</text>
+  <text class="boxText" x="615" y="1296">多智能体协同式漫剧生产编排</text>
+  <text class="boxText" x="615" y="1320">角色三视图/四视图作为产品级资产机制</text>
+  <text class="boxText" x="615" y="1344">九宫格/多参数候选探索与筛选体验</text>
+
+  <rect class="chipShared" x="1075" y="1212" width="420" height="146" rx="12"/>
+  <text class="boxTitle" x="1100" y="1244">双方共同覆盖</text>
+  <text class="boxText" x="1100" y="1272">从剧本/故事输入到分镜，再到视频片段</text>
+  <text class="boxText" x="1100" y="1296">都把角色/场景一致性当核心问题</text>
+  <text class="boxText" x="1100" y="1320">都支持以参考图约束后续生成</text>
+  <text class="boxText" x="1100" y="1344">都面向批量化内容生产，而非单次玩具生成</text>
+
+  <text class="small" x="105" y="1432">注：Origin 侧来自 /Users/mark/Documents/origin 当前源码；纳米侧来自公开网页资料，待纳米源码或内部 PRD 可进一步校准。</text>
+</svg>

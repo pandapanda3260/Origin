@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
     await chatStream(
       user,
       buildAgentMessages({ project: proj, refs, userMsg }),
-      { temperature: 0.5, maxTokens: 1000 },
+      { temperature: 0.5, maxTokens: 1000, modelRole: 'brain' },
       (delta) => {
         buf += delta;
         writer.chunk(delta);

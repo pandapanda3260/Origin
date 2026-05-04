@@ -1706,6 +1706,7 @@ var _projectEpoch = 0;
 
     _showProfileLoading(true);
     var _profileStreamTarget = null;
+    var _profileStepState = { buf: "" };
 
     try {
       _appendProfileBubble("assistant", "");
@@ -1722,7 +1723,8 @@ var _projectEpoch = 0;
         history: _profileChatHistory,
         currentProfile: _globalCreatorProfile,
       }, function (chunk) {
-        if (_profileStreamTarget) _profileStreamTarget.textContent += chunk;
+        var cleanChunk = _consumeStreamStepTags(chunk, _profileStepState, function () {});
+        if (_profileStreamTarget && cleanChunk) _profileStreamTarget.textContent += cleanChunk;
         if (_profileChatWrap) _profileChatWrap.scrollTop = _profileChatWrap.scrollHeight;
       });
 

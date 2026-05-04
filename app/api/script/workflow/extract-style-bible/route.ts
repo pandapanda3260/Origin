@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
     styleBible = await chatCompleteJsonWithRetry(
       user,
       buildStyleBibleMessages(finalScript),
-      { temperature: 0.4, maxTokens: 2500 },
+      { temperature: 0.4, maxTokens: 2500, modelRole: 'structured' },
       (raw) => parseJsonLoose(raw),
       'styleBible',
     );

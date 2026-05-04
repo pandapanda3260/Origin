@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
       parsed = await chatCompleteJsonWithRetry(
         user,
         buildAssetsExtractMessages(finalScript, styleBible),
-        { temperature: 0.4, maxTokens: 5000 },
+        { temperature: 0.4, maxTokens: 5000, modelRole: 'structured' },
         (raw) => {
           const json = parseJsonLoose(raw);
           return {

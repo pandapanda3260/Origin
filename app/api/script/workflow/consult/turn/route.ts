@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
     writer.step('正在分析意图…');
     let buf = '';
     const messages = buildConsultMessages(history, userMsg);
-    await chatStream(user, messages, { temperature: 0.6, maxTokens: 800 }, (delta) => {
+    await chatStream(user, messages, { temperature: 0.6, maxTokens: 800, modelRole: 'brain' }, (delta) => {
       buf += delta;
       writer.aiChunk(delta);
     });

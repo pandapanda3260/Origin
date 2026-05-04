@@ -11,13 +11,14 @@
  */
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { resolveLLMConfig } from '@/lib/llm';
+import { chatComplete } from '@/lib/llm';
+import { resolveSlotModelConfig, resolveTextModelConfig, type TextModelRole } from '@/lib/model-routing';
 import { jsonOk, jsonError } from '@/lib/api-helpers';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-type Slot = 'text' | 'image' | 'video' | 'storyboard';
+type Slot = 'text' | 'brain' | 'structured' | 'image' | 'video' | 'storyboard';
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
@@ -25,7 +26,11 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({} as any));
   const slot = (body.slot || 'text') as Slot;
-  const cfg = resolveLLMConfig(user, slot);
+  const isTextSlot = slot === 'text' || slot === 'brain' || slot === 'structured';
+  const role: TextModelRole = slot === 'structured' ? 'structured' : 'brain';
+  const cfg = isTextSlot
+    ? resolveTextModelConfig(user, role)
+    : resolveSlotModelConfig(user, slot);
 
   if (cfg.mode === 'fake' || !cfg.apiKey) {
     return jsonOk({
@@ -35,57 +40,43 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  const t0 = Date.now();
-  let resp: Response;
-  try {
-    resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: cfg.model,
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 5,
-        temperature: 0,
-      }),
+  if (!isTextSlot) {
+    return jsonOk({
+      ok: true,
+      model: cfg.model,
+      provider: cfg.provider,
+      baseUrl: cfg.baseUrl,
+      source: cfg.source,
+      reply: `${slot} 配置已读取；为避免扣费，本测试不发起真实生成任务`,
+      checked: 'config-only',
     });
+  }
+
+  const t0 = Date.now();
+  let reply = '';
+  try {
+    reply = await chatComplete(
+      user,
+      [{ role: 'user', content: 'ping，回复 pong 即可。' }],
+      { temperature: 0, maxTokens: role === 'structured' ? 256 : 64, modelRole: role },
+    );
   } catch (e: any) {
     return jsonOk({
       ok: false,
-      error: '网络请求失败：' + (e?.message || String(e)),
-      hint: '检查 API 地址是否可访问、是否需要 /v1 后缀、本机网络是否可达',
+      error: '模型请求失败：' + (e?.message || String(e)),
+      hint: '检查 API 地址、Key、模型名、provider endpoint 是否匹配',
+      latencyMs: Date.now() - t0,
+      provider: cfg.provider,
+      model: cfg.model,
+      source: cfg.source,
     });
   }
   const latencyMs = Date.now() - t0;
 
-  if (!resp.ok) {
-    const text = (await resp.text().catch(() => '')).slice(0, 300);
-    return jsonOk({
-      ok: false,
-      error: `HTTP ${resp.status}`,
-      hint: text || '检查 Key 是否正确、模型名是否被服务商支持',
-      latencyMs,
-    });
-  }
-
-  let json: any = null;
-  try {
-    json = await resp.json();
-  } catch (e: any) {
-    return jsonOk({
-      ok: false,
-      error: '响应不是 JSON',
-      hint: '该 API 地址可能不是 OpenAI 兼容协议',
-      latencyMs,
-    });
-  }
-
-  const reply = (json?.choices?.[0]?.message?.content || '').toString().slice(0, 80);
   return jsonOk({
     ok: true,
     model: cfg.model,
+    provider: cfg.provider,
     reply: reply || '(模型返回为空，但 HTTP 200，连接正常)',
     latencyMs,
     source: cfg.source,

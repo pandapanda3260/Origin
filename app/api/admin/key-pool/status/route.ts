@@ -1,19 +1,20 @@
 import { NextRequest } from 'next/server';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, verifyToken } from '@/lib/auth';
+import { getDb, type UserRow } from '@/lib/db';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { resolveLLMConfig } from '@/lib/llm';
+import { getModelRoutingStatus } from '@/lib/model-routing';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest) {
-  const user = await getCurrentUser(req);
+  const user = await getAdminStatusUser(req);
   if (!user) return jsonError('unauthorized', 401);
   if (!user.is_admin) return jsonError('forbidden', 403);
 
-  const slots: ('text' | 'image' | 'video' | 'storyboard')[] = ['text', 'image', 'video', 'storyboard'];
-  const pools = slots.map((slot) => {
-    const cfg = resolveLLMConfig(user, slot);
+  const status = getModelRoutingStatus(user);
+  const pools = (['brain', 'structured', 'image', 'video'] as const).map((slot) => {
+    const cfg = status[slot];
     return {
       name: slot,
       total: 1,
@@ -23,9 +24,24 @@ export async function GET(req: NextRequest) {
       source: cfg.source,
       model: cfg.model,
       baseUrl: cfg.baseUrl,
+      provider: cfg.provider,
+      endpoint: cfg.endpoint || cfg.imageGenerationEndpoint || null,
       lastUsed: null,
     };
   });
 
-  return jsonOk({ pools, updatedAt: new Date().toISOString() });
+  return jsonOk({ pools, env: status.env, updatedAt: new Date().toISOString() });
+}
+
+async function getAdminStatusUser(req: NextRequest): Promise<UserRow | null> {
+  const bearerUser = await getCurrentUser(req);
+  if (bearerUser) return bearerUser;
+
+  const headerToken = (req.headers.get('x-admin-token') || '').trim();
+  if (!headerToken) return null;
+  const decoded = await verifyToken(headerToken);
+  if (!decoded) return null;
+  return getDb()
+    .prepare<{ id: number }, UserRow>('SELECT * FROM users WHERE id = @id')
+    .get({ id: decoded.userId }) ?? null;
 }

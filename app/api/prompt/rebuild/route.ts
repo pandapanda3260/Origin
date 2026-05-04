@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_REBUILD },
         { role: 'user', content: text },
       ],
-      { temperature: 0.4, maxTokens: 1500 },
+      { temperature: 0.4, maxTokens: 1500, modelRole: 'brain' },
     );
   } catch (e: any) {
     return jsonError('重建失败：' + (e?.message || String(e)), 502);

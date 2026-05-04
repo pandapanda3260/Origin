@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_CONTINUE },
         { role: 'user', content: `已有剧本：\n${baseScript}\n\n续写方向（可空）：${direction}` },
       ],
-      { temperature: 0.8, maxTokens: 1200 },
+      { temperature: 0.8, maxTokens: 1200, modelRole: 'brain' },
       (delta) => {
         buf += delta;
         writer.scriptChunk(delta);

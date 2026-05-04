@@ -114,7 +114,7 @@ export async function POST(req: NextRequest) {
           { role: 'system', content: SP_SHOT_TO_IMG_PROMPT },
           { role: 'user', content: userMsg },
         ],
-        { temperature: 0.5, maxTokens: 600 },
+        { temperature: 0.5, maxTokens: 600, modelRole: 'brain' },
         (delta) => {
           promptText += delta;
           writer.chunk(delta);
