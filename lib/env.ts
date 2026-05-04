@@ -1,10 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 
-const DEFAULT_EXTERNAL_ENV_FILE = '/Users/mark/Documents/key/origin.env.local';
+const DEFAULT_EXTERNAL_ENV_FILES = [
+  '/Users/mark/Documents/key/origin.env.local',
+  '/Users/mark/Documents/key/openai.env.local',
+];
 
 let loaded = false;
 let loadResult: {
   path: string;
+  paths: string[];
   loaded: boolean;
   keys: string[];
   error?: string;
@@ -14,30 +18,31 @@ export function loadExternalEnv() {
   if (loaded && loadResult) return loadResult;
   loaded = true;
 
-  const path = (process.env.ORIGIN_ENV_FILE || DEFAULT_EXTERNAL_ENV_FILE).trim();
+  const paths = getExternalEnvPaths();
+  const protectedKeys = new Set(Object.keys(process.env));
   const result = {
-    path,
+    path: paths.join(','),
+    paths,
     loaded: false,
     keys: [] as string[],
     error: undefined as string | undefined,
   };
 
-  if (!path || !existsSync(path)) {
-    loadResult = result;
-    return result;
-  }
+  for (const path of paths) {
+    if (!path || !existsSync(path)) continue;
 
-  try {
-    const parsed = parseDotEnv(readFileSync(path, 'utf8'));
-    for (const [key, value] of Object.entries(parsed)) {
-      if (process.env[key] === undefined) {
+    try {
+      const parsed = parseDotEnv(readFileSync(path, 'utf8'));
+      for (const [key, value] of Object.entries(parsed)) {
+        if (protectedKeys.has(key)) continue;
         process.env[key] = value;
-        result.keys.push(key);
+        if (!result.keys.includes(key)) result.keys.push(key);
       }
+      result.loaded = true;
+    } catch (e: any) {
+      const message = `${path}: ${e?.message || String(e)}`;
+      result.error = result.error ? `${result.error}; ${message}` : message;
     }
-    result.loaded = true;
-  } catch (e: any) {
-    result.error = e?.message || String(e);
   }
 
   loadResult = result;
@@ -46,6 +51,21 @@ export function loadExternalEnv() {
 
 export function getExternalEnvLoadResult() {
   return loadResult || loadExternalEnv();
+}
+
+function getExternalEnvPaths(): string[] {
+  const single = (process.env.ORIGIN_ENV_FILE || '').trim();
+  if (single) return [single];
+
+  const list = (process.env.ORIGIN_ENV_FILES || '').trim();
+  if (list) {
+    return list
+      .split(/[,;]/)
+      .map((path) => path.trim())
+      .filter(Boolean);
+  }
+
+  return DEFAULT_EXTERNAL_ENV_FILES;
 }
 
 function parseDotEnv(text: string): Record<string, string> {

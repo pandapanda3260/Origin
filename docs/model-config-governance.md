@@ -1,0 +1,163 @@
+# Model Configuration Governance
+
+This document defines how Origin should manage AI model calls. The goal is to keep model, provider, endpoint, and reasoning changes centralized, auditable, and easy to swap without hunting through business routes.
+
+## Core Rule
+
+Do not hardcode variable model-call settings inside business code.
+
+Variable settings include:
+
+- `model`
+- `provider`
+- `baseUrl`
+- `endpoint`
+- `apiKey`
+- `reasoningEffort`
+- `timeout`
+- `maxTokens`
+- `quality`
+- `tier`
+
+Business routes should usually choose a task role, for example:
+
+```ts
+{ modelRole: 'styleBible' }
+```
+
+The concrete model configuration should be resolved by `lib/model-routing.ts` from `.env.local` or the external env file.
+
+## Why
+
+Origin needs to swap models, gateways, and quality/speed tiers frequently. If settings such as `reasoningEffort` are hardcoded in individual API routes, the project ends up with split configuration:
+
+- some calls follow env/config;
+- some calls silently ignore env/config;
+- future model migrations become hard to audit;
+- performance tuning becomes unreliable.
+
+## Current Model Roles
+
+| Role | Purpose | Default Config Source |
+|---|---|---|
+| `brain` | Creative reasoning, dialogue, script generation | `CLAUDE_*`, then `TEXT_*` |
+| `structured` | Generic JSON repair, validation, extraction | `TEXT_*` |
+| `styleBible` | Style bible extraction | `STYLE_BIBLE_*`, then `TEXT_*` |
+| `profileDerive` | Creator profile derivation | `PROFILE_DERIVE_*`, then `TEXT_*` |
+| `image` | Image generation/editing | `IMAGE_*` |
+| `video` | Video generation | `VIDEO_*` |
+
+## Env Naming Pattern
+
+Task-specific workers should use a clear prefix and fall back to `TEXT_*` only when the task-specific variable is missing.
+
+Example:
+
+```env
+STYLE_BIBLE_MODEL="gpt-5.5"
+STYLE_BIBLE_REASONING_EFFORT="xhigh"
+
+PROFILE_DERIVE_MODEL="gpt-5.5"
+PROFILE_DERIVE_REASONING_EFFORT="xhigh"
+```
+
+The shared structured worker remains:
+
+```env
+TEXT_PROVIDER="openai_responses"
+TEXT_API_BASE="https://api.openai.com/v1"
+TEXT_API_ENDPOINT="/responses"
+TEXT_MODEL="gpt-5.5"
+TEXT_REASONING_EFFORT="xhigh"
+```
+
+## Allowed Exceptions
+
+Hardcoding is allowed only for:
+
+- fallback defaults used when env/config is missing;
+- UI placeholders and example labels;
+- mock/test fixtures clearly marked as mock;
+- temporary incident mitigation with a comment explaining the reason, scope, and removal plan.
+
+## Configuration Boundary
+
+Business routes may set task-intrinsic values:
+
+- `maxTokens`
+- `responseFormat` / schema shape
+- prompt builders
+- `modelRole`
+
+Business routes must not hardcode global tuning knobs:
+
+- `model`
+- `reasoningEffort`
+- provider/base URL/endpoint/API key
+
+Those belong in env and `lib/model-routing.ts`.
+
+## Disallowed Pattern
+
+Avoid this in business API routes:
+
+```ts
+{ reasoningEffort: 'medium' }
+```
+
+Prefer:
+
+```ts
+{ modelRole: 'styleBible' }
+```
+
+and configure:
+
+```env
+STYLE_BIBLE_REASONING_EFFORT="high"
+```
+
+## Change Workflow
+
+When changing any model call:
+
+1. Check existing env variables and `lib/model-routing.ts`.
+2. Reuse an existing role when possible.
+3. Add a new role only when the task needs independent model or tuning control.
+4. Keep business code focused on `modelRole`; avoid hardcoded model-call settings.
+5. Expose the resolved runtime configuration in an admin/status endpoint when useful.
+6. Run a hardcode scan.
+7. Run type checks and at least one relevant endpoint test.
+
+## Hardcode Scan
+
+Use these checks after model-related changes:
+
+```bash
+rg -n "reasoningEffort:\s*['\"]|modelOverride:\s*['\"]|baseUrl:\s*['\"]https|apiKey:\s*['\"]" app lib
+```
+
+```bash
+rg -n "model:\s*['\"]gpt" app lib
+```
+
+```bash
+rg -n "gpt-|claude-|gemini-|seedance|gateway|api.openai|/responses|/messages" app lib public
+```
+
+Interpretation matters:
+
+- fallback defaults and env routing in `lib/model-routing.ts` are acceptable;
+- request assembly in `lib/llm.ts` is acceptable when it forwards resolved config instead of hardcoding a model or effort;
+- UI placeholders are acceptable;
+- business-route hardcoding of variable model-call settings is not acceptable.
+
+## Verification Checklist
+
+Before considering a model configuration change complete:
+
+- `npx tsc --noEmit --pretty false` passes;
+- runtime status shows the expected role, model, endpoint, and reasoning effort;
+- the affected endpoint works or fails with a clear external provider error;
+- no business route contains hardcoded variable model-call settings;
+- the local app still returns `200` for `/workspace`.

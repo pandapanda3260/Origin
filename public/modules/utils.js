@@ -97,6 +97,17 @@ export async function apiGet(path) {
 export function friendlyModelError(rawMsg) {
   const msg = String(rawMsg || '').trim();
   try { if (msg) console.debug('[friendlyModelError] raw:', msg); } catch (_e) {}
+  if (
+    msg &&
+    (
+      msg.indexOf('Responses 输出不完整') >= 0 ||
+      msg.indexOf('max_output_tokens') >= 0 ||
+      msg.indexOf('reason=') >= 0 ||
+      msg.indexOf('资产抽取失败') >= 0
+    )
+  ) {
+    return msg.slice(0, 300);
+  }
   return '生成失败，请稍后重试';
 }
 

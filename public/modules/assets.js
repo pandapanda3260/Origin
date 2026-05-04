@@ -96,14 +96,10 @@ export async function extractAssets() {
 
   try {
     var extractBody = {
+      projectId: project.id,
       script: project.script,
-      styleBible: project.styleBible,
-      creatorProfile: _ctx.formatCreatorProfileForApi(),
     };
-    var prevAssets = _ctx.getPreviousEpisodeAssets();
-    if (prevAssets) {
-      extractBody.existingAssets = prevAssets;
-    }
+    if (!extractBody.projectId && project.styleBible) extractBody.styleBible = project.styleBible;
 
     _setExtractProgress(20, "正在提取资产", "");
     var _extractProgressBar = $("assetsExtractProgress");

@@ -2,7 +2,11 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
-import { buildAssetsExtractMessages } from '@/lib/prompts';
+import {
+  buildAssetCharactersExtractMessages,
+  buildAssetPropsExtractMessages,
+  buildAssetScenesExtractMessages,
+} from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 
 export const runtime = 'nodejs';
@@ -22,33 +26,71 @@ export async function POST(req: NextRequest) {
 
   const proj = projectId ? getProjectByIdForUser(projectId, user.id) : null;
   const finalScript = scriptText || (proj as any)?.scriptDraft || (proj as any)?.script || '';
-  const styleBible = (proj as any)?.styleBible || null;
+  const bodyStyleBible = normalizeStyleBible(body.styleBible);
+  const styleBible = (proj as any)?.styleBible || bodyStyleBible || null;
+  const styleBibleSource = (proj as any)?.styleBible ? 'project' : (bodyStyleBible ? 'request' : 'none');
 
   return sseResponse(async (writer) => {
     if (!finalScript) {
       writer.error('当前没有剧本，请先生成或上传剧本');
       return;
     }
+    console.info(
+      `[assets/extract] start projectId=${projectId || 'none'} scriptChars=${finalScript.length} ` +
+      `styleBible=${styleBibleSource}`,
+    );
 
     writer.step('正在分析剧本结构…');
     writer.chunk('开始抽取角色 / 场景 / 道具…\n');
 
     let parsed: any = { characters: [], environments: [], props: [] };
     try {
-      parsed = await chatCompleteJsonWithRetry(
+      writer.step('正在识别角色…');
+      const characters = await chatCompleteJsonWithRetry(
         user,
-        buildAssetsExtractMessages(finalScript, styleBible),
-        { temperature: 0.4, maxTokens: 5000, modelRole: 'structured' },
+        buildAssetCharactersExtractMessages(finalScript, styleBible),
+        { temperature: 0.35, maxTokens: 3500, modelRole: 'structured' },
         (raw) => {
           const json = parseJsonLoose(raw);
-          return {
-            characters: ensureArray(json.characters),
-            environments: ensureArray(json.environments || json.scenes),
-            props: ensureArray(json.props),
-          };
+          return ensureArray(json.characters);
         },
-        'assetsExtract',
+        'assetsCharacters',
       );
+
+      writer.step('正在识别场景与道具…');
+      const characterRefs = characters.map((c: any, index: number) => ({
+        id: c.id || `c${index + 1}`,
+        name: c.name || '',
+        role: c.role || c.identity || '',
+      }));
+      const [environments, props] = await Promise.all([
+        chatCompleteJsonWithRetry(
+          user,
+          buildAssetScenesExtractMessages(finalScript, styleBible, characterRefs),
+          { temperature: 0.35, maxTokens: 5000, modelRole: 'structured' },
+          (raw) => {
+            const json = parseJsonLoose(raw);
+            return ensureArray(json.environments || json.scenes);
+          },
+          'assetsScenes',
+        ),
+        chatCompleteJsonWithRetry(
+          user,
+          buildAssetPropsExtractMessages(finalScript, styleBible, characterRefs),
+          { temperature: 0.35, maxTokens: 2500, modelRole: 'structured' },
+          (raw) => {
+            const json = parseJsonLoose(raw);
+            return ensureArray(json.props);
+          },
+          'assetsProps',
+        ),
+      ]);
+
+      parsed = {
+        characters,
+        environments,
+        props: normalizePropOwnership(props, characterRefs),
+      };
     } catch (e: any) {
       writer.error('资产抽取失败：' + (e?.message || String(e)));
       return;
@@ -141,6 +183,28 @@ export async function POST(req: NextRequest) {
 
 function ensureArray(v: any): any[] {
   return Array.isArray(v) ? v : [];
+}
+
+function normalizeStyleBible(value: any): any | null {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function normalizePropOwnership(props: any[], characters: Array<{ id: string }>): any[] {
+  const validIds = new Set(characters.map((c) => String(c.id || '')).filter(Boolean));
+  return props.map((prop) => {
+    const owner = prop?.ownership == null ? null : String(prop.ownership || '').trim();
+    if (!owner || validIds.has(owner)) return { ...prop, ownership: owner || null };
+    return { ...prop, ownership: null };
+  });
 }
 
 /** 抽出风格圣经里能用作画面 prompt 后缀的关键词 */

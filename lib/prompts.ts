@@ -610,6 +610,127 @@ export function buildAssetsExtractMessages(scriptText: string, styleBible?: any)
   ];
 }
 
+const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
+
+【任务】只从剧本中识别需要做参考图的角色，不要输出场景和道具。
+
+【输出严格 JSON】
+{
+  "characters": [
+    {
+      "id": "c1",
+      "name": "角色名",
+      "role": "在故事中的身份角色",
+      "identity": "一句话身份定位",
+      "entityType": "human 或 non-human",
+      "appearance": "外貌描述，30-60 字",
+      "clothing": "服装描述，20-40 字",
+      "equipment": "随身物品，无则空字符串",
+      "temperament": "中文逗号分隔的 3-5 个气质标签",
+      "actionTraits": "中文逗号分隔的 2-4 个动作特征",
+      "tags": ["主角","男","50岁"],
+      "imagePrompt": "英文 35-70 词，只描述主体外貌、服装、姿态，不写风格/光线/背景/三视图"
+    }
+  ]
+}
+
+【数量】3-5 个角色。覆盖主要角色、对手/旁观者、重要非人角色即可，不要把一句台词的路人也做成资产。
+
+【重点】
+  · role + identity 不能空。
+  · entityType 必填：真人外形填 human，拟人化动物/海鲜/机甲/异形/AI 生物填 non-human。
+  · 非人角色必须写真实物种/形态，不要画成人。
+  · imagePrompt 必须英文且不能为空。
+  · 不要输出任何 JSON 之外的内容。`;
+
+const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
+
+【任务】只从剧本中识别需要做参考图的场景/环境，不要输出角色和道具。
+
+【输出严格 JSON】
+{
+  "environments": [
+    {
+      "id": "e1",
+      "name": "场景名",
+      "location": "上一级地理位置，1 行内",
+      "description": "100 字以内的场景描述",
+      "timeSetting": "清晨 / 白天 / 黄昏 / 夜晚 / 深夜 / 凌晨",
+      "weather": "晴 / 多云 / 雨 / 雪 / 雾 / 室内",
+      "lighting": "自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
+      "atmosphere": "中文逗号分隔 3-6 个氛围词",
+      "isMain": true,
+      "baseSceneRef": null,
+      "tags": ["室内","主场景"],
+      "imagePrompt": "英文 35-70 词，描述空间布局和陈设，不写风格/白底/光线"
+    }
+  ]
+}
+
+【数量】2-3 个场景，至少 1 个主场景和 1 个副场景。
+
+【重点】
+  · 第一个主场景 isMain=true，baseSceneRef=null。
+  · 副场景 isMain=false，baseSceneRef 指向主场景 id。
+  · 每个场景必须填齐 location / timeSetting / weather / lighting / atmosphere。
+  · atmosphere 必须中文逗号分隔。
+  · imagePrompt 必须英文且不能为空。
+  · 不要输出任何 JSON 之外的内容。`;
+
+const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
+
+【任务】只从剧本中识别需要做参考图的道具/标志物，不要输出角色和场景。
+
+【输出严格 JSON】
+{
+  "props": [
+    {
+      "id": "p1",
+      "name": "道具名",
+      "propType": "手持物/服装/家具/标志物",
+      "function": "在剧本里的作用",
+      "ownership": "关联角色 id，例如 c1；公共道具填 null",
+      "features": "外观/材质/颜色",
+      "imagePrompt": "英文 25-50 词，描述材质、颜色、形状、磨损"
+    }
+  ]
+}
+
+【数量】2-5 个道具，优先选择会影响剧情、动作、身份识别或画面记忆点的物件。
+
+【重点】
+  · ownership 只能填用户给你的角色 id；不确定或公共道具填 null。
+  · imagePrompt 必须英文且不能为空。
+  · 不要输出任何 JSON 之外的内容。`;
+
+export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any): ChatMessage[] {
+  return [
+    { role: 'system', content: SP_ASSET_CHARACTERS_EXTRACT },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible) },
+  ];
+}
+
+export function buildAssetScenesExtractMessages(scriptText: string, styleBible: any, characters: any[]): ChatMessage[] {
+  return [
+    { role: 'system', content: SP_ASSET_SCENES_EXTRACT },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters) },
+  ];
+}
+
+export function buildAssetPropsExtractMessages(scriptText: string, styleBible: any, characters: any[]): ChatMessage[] {
+  return [
+    { role: 'system', content: SP_ASSET_PROPS_EXTRACT },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters) },
+  ];
+}
+
+function buildAssetContext(scriptText: string, styleBible?: any, characters?: any[]): string {
+  const parts = [`剧本：\n${scriptText}`];
+  if (styleBible) parts.push(`风格圣经：${JSON.stringify(styleBible)}`);
+  if (characters && characters.length) parts.push(`已识别角色，只能引用这些 id：${JSON.stringify(characters)}`);
+  return parts.join('\n\n');
+}
+
 /* =====================================================
    6) 镜头表生成
    ===================================================== */

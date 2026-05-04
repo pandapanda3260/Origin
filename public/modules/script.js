@@ -99,6 +99,25 @@ function _scrollChatToBottom() {
   if (box) { setTimeout(function() { box.scrollTop = box.scrollHeight; }, 60); }
 }
 
+function _showScriptConfirmArea() {
+  var confirmArea = $("scriptConfirmArea");
+  if (!confirmArea) return;
+  var innerWrap = document.querySelector("#chatMessages .max-w-2xl");
+  if (innerWrap) innerWrap.appendChild(confirmArea);
+  confirmArea.hidden = false;
+  _scrollChatToBottom();
+}
+
+function _hideScriptConfirmArea() {
+  var confirmArea = $("scriptConfirmArea");
+  if (confirmArea) confirmArea.hidden = true;
+}
+
+function _announceStyleBibleReady() {
+  chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，右侧可查看详情；请点击下方按钮确认剧本并进入资产库</span>');
+  _showScriptConfirmArea();
+}
+
 export function refreshScriptPage() {
   if (!project) return;
   if (_scriptGenerating) return;
@@ -108,7 +127,6 @@ export function refreshScriptPage() {
   _replayScriptConsultHistory();
   var resultCard = $("scriptResultCard");
   var bibleCard = $("styleBibleCard");
-  var confirmArea = $("scriptConfirmArea");
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
 
@@ -121,17 +139,17 @@ export function refreshScriptPage() {
     if (hasUsableStyleBible(project.styleBible, project)) {
       bibleCard.hidden = false;
       renderStyleBible(project.styleBible);
-      confirmArea.hidden = false;
+      _showScriptConfirmArea();
     } else {
       bibleCard.hidden = false;
       renderStyleBibleFailure(_styleBibleErrorText(project, "风格圣经尚未提取或提取失败"));
-      confirmArea.hidden = true;
+      _hideScriptConfirmArea();
     }
     _scrollChatToBottom();
   } else {
     resultCard.hidden = true;
     bibleCard.hidden = true;
-    confirmArea.hidden = true;
+    _hideScriptConfirmArea();
     if (displayText) displayText.textContent = "";
     if (editArea) editArea.value = "";
   }
@@ -449,7 +467,6 @@ async function _consultConfirm() {
   var editArea = $("scriptOutput");
   var editBtn = $("btnEditScript");
   var expandBtn = $("btnExpandScript");
-  var confirmArea = $("scriptConfirmArea");
   var resultCard = $("scriptResultCard");
   if (resultCard) {
     resultCard.hidden = false;
@@ -460,7 +477,7 @@ async function _consultConfirm() {
   if (editArea) editArea.value = "";
   if (editBtn) editBtn.hidden = true;
   if (expandBtn) expandBtn.hidden = true;
-  if (confirmArea) confirmArea.hidden = true;
+  _hideScriptConfirmArea();
   showScriptDisplay();
   _scrollChatToBottom();
 
@@ -533,20 +550,17 @@ async function _consultConfirm() {
           bibleCard.classList.add("sb-entrance");
         }
         renderStyleBible(resp.styleBible);
-        var confirmArea2 = $("scriptConfirmArea");
-        if (confirmArea2) confirmArea2.hidden = false;
         var bibleText = formatStyleBibleForChat(resp.styleBible);
         var aiMsg2 = chatAddMsg("ai", "");
         var bubble2 = aiMsg2.querySelector(".chat-bubble--ai");
         await typewriter(bubble2, bibleText, 3, 12);
-        chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，可在下方查看详情并确认剧本</span>');
+        _announceStyleBibleReady();
       } else {
         var bibleErr = _styleBibleErrorText(resp);
         var failCard = $("styleBibleCard");
         if (failCard) failCard.hidden = false;
         renderStyleBibleFailure(bibleErr);
-        var failConfirm = $("scriptConfirmArea");
-        if (failConfirm) failConfirm.hidden = true;
+        _hideScriptConfirmArea();
         chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
       }
       renderEmotionSegments();
@@ -663,7 +677,6 @@ export async function generateScript(idea) {
   var editArea = $("scriptOutput");
   var editBtn = $("btnEditScript");
   var expandBtn = $("btnExpandScript");
-  var confirmArea = $("scriptConfirmArea");
   var resultCard = $("scriptResultCard");
   resultCard.hidden = false;
   var _chatInner = document.querySelector("#chatMessages .max-w-2xl");
@@ -674,7 +687,7 @@ export async function generateScript(idea) {
   if (editArea) editArea.value = "";
   if (editBtn) editBtn.hidden = true;
   if (expandBtn) expandBtn.hidden = true;
-  if (confirmArea) confirmArea.hidden = true;
+  _hideScriptConfirmArea();
   showScriptDisplay();
   _scrollChatToBottom();
 
@@ -748,20 +761,17 @@ export async function generateScript(idea) {
           bibleCard.classList.add("sb-entrance");
         }
         renderStyleBible(resp.styleBible);
-        var confirmArea2 = $("scriptConfirmArea");
-        if (confirmArea2) confirmArea2.hidden = false;
         var bibleText = formatStyleBibleForChat(resp.styleBible);
         var aiMsg = chatAddMsg("ai", "");
         var bubble = aiMsg.querySelector(".chat-bubble--ai");
         await typewriter(bubble, bibleText, 3, 12);
-        chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，可在下方查看详情并确认剧本</span>');
+        _announceStyleBibleReady();
       } else {
         var bibleErr = _styleBibleErrorText(resp);
         var failCard = $("styleBibleCard");
         if (failCard) failCard.hidden = false;
         renderStyleBibleFailure(bibleErr);
-        var failConfirm = $("scriptConfirmArea");
-        if (failConfirm) failConfirm.hidden = true;
+        _hideScriptConfirmArea();
         chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
       }
       renderEmotionSegments();
@@ -858,13 +868,11 @@ export async function extractStyleBible() {
         bibleCard.classList.add("sb-entrance");
       }
       renderStyleBible(resp.styleBible);
-      var confirmArea = $("scriptConfirmArea");
-      if (confirmArea) confirmArea.hidden = false;
       var bibleText = formatStyleBibleForChat(resp.styleBible);
       var aiMsg = chatAddMsg("ai", "");
       var bubble = aiMsg.querySelector(".chat-bubble--ai");
       await typewriter(bubble, bibleText, 3, 12);
-      chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，可在下方查看详情并确认剧本</span>');
+      _announceStyleBibleReady();
     }
   } catch (e) {
     chatRemoveDots();
@@ -876,8 +884,7 @@ export async function extractStyleBible() {
     var bibleCard = $("styleBibleCard");
     if (bibleCard) bibleCard.hidden = false;
     renderStyleBibleFailure(errText);
-    var confirmArea = $("scriptConfirmArea");
-    if (confirmArea) confirmArea.hidden = true;
+    _hideScriptConfirmArea();
     chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(errText) + '</span>');
   }
 }
@@ -1465,7 +1472,6 @@ export async function reviseScript(instruction) {
   var editArea = $("scriptOutput");
   var editBtn = $("btnEditScript");
   var expandBtn = $("btnExpandScript");
-  var confirmArea = $("scriptConfirmArea");
   var _reviseCard = $("scriptResultCard");
   var _reviseInner = document.querySelector("#chatMessages .max-w-2xl");
   if (_reviseInner && _reviseCard && _reviseCard.parentNode === _reviseInner) {
@@ -1474,7 +1480,7 @@ export async function reviseScript(instruction) {
   if (displayText) { displayText.textContent = ""; displayText.style.pointerEvents = "none"; displayText.classList.add("streaming-wave"); }
   if (editBtn) editBtn.hidden = true;
   if (expandBtn) expandBtn.hidden = true;
-  if (confirmArea) confirmArea.hidden = true;
+  _hideScriptConfirmArea();
   showScriptDisplay();
 
   var _userScrolledUp = false;
@@ -1541,20 +1547,17 @@ export async function reviseScript(instruction) {
           bibleCard2.classList.add("sb-entrance");
         }
         renderStyleBible(resp.styleBible);
-        var confirmArea3 = $("scriptConfirmArea");
-        if (confirmArea3) confirmArea3.hidden = false;
         var bibleText2 = formatStyleBibleForChat(resp.styleBible);
         var aiMsg2 = chatAddMsg("ai", "");
         var bubble2 = aiMsg2.querySelector(".chat-bubble--ai");
         await typewriter(bubble2, bibleText2, 3, 12);
-        chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，可在下方查看详情并确认剧本</span>');
+        _announceStyleBibleReady();
       } else {
         var bibleErr = _styleBibleErrorText(resp);
         var failCard = $("styleBibleCard");
         if (failCard) failCard.hidden = false;
         renderStyleBibleFailure(bibleErr);
-        var failConfirm = $("scriptConfirmArea");
-        if (failConfirm) failConfirm.hidden = true;
+        _hideScriptConfirmArea();
         chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
       }
       renderEmotionSegments();

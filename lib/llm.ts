@@ -10,6 +10,9 @@
  *   - 失败时抛带 friendly message 的 Error，路由层会序列化成前端能展示的中文
  */
 
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { connect as tlsConnect } from 'node:tls';
 import type { UserRow } from './db';
 import {
   resolveSlotModelConfig,
@@ -72,7 +75,7 @@ export async function chatComplete(
   if (cfg.provider === 'zerail_messages') {
     return claudeMessagesComplete(cfg, messages, opts);
   }
-  if (cfg.provider === 'zerail_responses') {
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
     return responsesComplete(cfg, messages, opts);
   }
   return openAIChatComplete(cfg, messages, opts);
@@ -95,40 +98,14 @@ async function openAIChatComplete(
     body.response_format = { type: 'json_object' };
   }
 
-  const controller = new AbortController();
   const timeoutMs = opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let resp: Response;
-  try {
-    resp = await fetch(`${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } catch (e: any) {
-    if (e?.name === 'AbortError') {
-      throw new Error(`LLM 请求超时（>${Math.round(timeoutMs / 1000)}s 未返回）`);
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    // 试着把中转站返回的 JSON 错误体里的 message 抽出来，体验更好
-    const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
-    throw new Error(`LLM ${resp.status}: ${friendly}`);
-  }
-  const json: any = await resp.json();
-  // 即使 200 也可能塞了一个 error 体（某些中转站这么干）
-  if (json?.error) {
-    const friendly = (typeof json.error === 'string' ? json.error : json.error?.message) || JSON.stringify(json.error).slice(0, 400);
-    throw new Error(`LLM 错误: ${friendly}`);
-  }
+  const json: any = await postJsonWithTimeout(
+    `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
+    cfg.apiKey,
+    body,
+    timeoutMs,
+    `LLM 请求超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+  );
   const content = json?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回结构异常（缺 message.content）');
   // 推理模型把 <think>...</think> 当 content 流出来，整段过滤后返回干净文本
@@ -168,7 +145,16 @@ async function responsesComplete(
   );
   const incompleteReason = getResponsesIncompleteReason(json);
   if (incompleteReason) {
-    throw new Error(`LLM Responses 输出不完整（reason=${incompleteReason}）：请提高 maxTokens 或降低 reasoningEffort`);
+    const usage = summarizeResponsesUsage(json);
+    console.warn(
+      `[llm.responses] incomplete role=${cfg.role || 'unknown'} model=${opts.modelOverride || cfg.model} ` +
+      `reason=${incompleteReason} usage=${formatUsageSummary(usage)}`,
+    );
+    const err: any = new Error(`LLM Responses 输出不完整（reason=${incompleteReason}）：请提高 maxTokens 或降低 reasoningEffort`);
+    err.llmStatus = 'incomplete';
+    err.incompleteReason = incompleteReason;
+    err.usage = usage;
+    throw err;
   }
   const content = extractResponsesText(json);
   if (!content) {
@@ -176,6 +162,27 @@ async function responsesComplete(
     throw new Error(`LLM 返回结构异常（缺 Responses output_text${status}）`);
   }
   return stripThinkBlocks(content);
+}
+
+function summarizeResponsesUsage(json: any) {
+  const usage = json?.usage || json?.response?.usage || {};
+  const outputDetails = usage?.output_tokens_details || {};
+  return {
+    inputTokens: typeof usage?.input_tokens === 'number' ? usage.input_tokens : null,
+    outputTokens: typeof usage?.output_tokens === 'number' ? usage.output_tokens : null,
+    totalTokens: typeof usage?.total_tokens === 'number' ? usage.total_tokens : null,
+    reasoningTokens: typeof outputDetails?.reasoning_tokens === 'number' ? outputDetails.reasoning_tokens : null,
+  };
+}
+
+function formatUsageSummary(usage: ReturnType<typeof summarizeResponsesUsage> | undefined): string {
+  if (!usage) return 'n/a';
+  return [
+    `input=${usage.inputTokens ?? 'n/a'}`,
+    `output=${usage.outputTokens ?? 'n/a'}`,
+    `total=${usage.totalTokens ?? 'n/a'}`,
+    `reasoning=${usage.reasoningTokens ?? 'n/a'}`,
+  ].join(',');
 }
 
 /** 从中转站/OpenAI 风格的错误体中抽 message，方便上层显示友好提示 */
@@ -202,6 +209,11 @@ async function postJsonWithTimeout(
   timeoutMs: number,
   timeoutMessage: string,
 ): Promise<any> {
+  const proxyUrl = getProxyUrlForRequest(url);
+  if (proxyUrl) {
+    return postJsonViaHttpProxy(url, proxyUrl, apiKey, body, timeoutMs, timeoutMessage);
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let resp: Response;
@@ -234,6 +246,123 @@ async function postJsonWithTimeout(
     throw new Error(`LLM 错误: ${friendly}`);
   }
   return json;
+}
+
+function getProxyUrlForRequest(url: string): string {
+  const proxyUrl = (process.env.OPENAI_API_PROXY || '').trim();
+  if (!proxyUrl) return '';
+
+  try {
+    const target = new URL(url);
+    if (target.protocol !== 'https:' || target.hostname !== 'api.openai.com') return '';
+    return proxyUrl;
+  } catch {
+    return '';
+  }
+}
+
+function postJsonViaHttpProxy(
+  url: string,
+  proxyUrl: string,
+  apiKey: string,
+  body: any,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const proxy = new URL(proxyUrl);
+    const targetPort = Number(target.port || 443);
+    const proxyPort = Number(proxy.port || (proxy.protocol === 'https:' ? 443 : 80));
+    const payload = JSON.stringify(body);
+    const proxyRequest = proxy.protocol === 'https:' ? httpsRequest : httpRequest;
+
+    let settled = false;
+    let connectReq: ReturnType<typeof httpRequest> | null = null;
+    let apiReq: ReturnType<typeof httpsRequest> | null = null;
+    let rawSocket: any = null;
+    let secureSocket: any = null;
+
+    const timer = setTimeout(() => {
+      try { connectReq?.destroy(); } catch (_) {}
+      try { apiReq?.destroy(); } catch (_) {}
+      try { rawSocket?.destroy(); } catch (_) {}
+      try { secureSocket?.destroy(); } catch (_) {}
+      done(new Error(timeoutMessage));
+    }, timeoutMs);
+
+    function done(err: any, value?: any) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(value);
+    }
+
+    connectReq = proxyRequest({
+      hostname: proxy.hostname,
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${target.hostname}:${targetPort}`,
+      headers: { Host: `${target.hostname}:${targetPort}` },
+    });
+
+    connectReq.on('connect', (connectRes, socket) => {
+      rawSocket = socket;
+      if (connectRes.statusCode !== 200) {
+        try { socket.destroy(); } catch (_) {}
+        done(new Error(`OpenAI 代理 CONNECT 失败（HTTP ${connectRes.statusCode || 'unknown'}）`));
+        return;
+      }
+
+      secureSocket = tlsConnect({ socket, servername: target.hostname });
+      secureSocket.once('secureConnect', () => {
+        apiReq = httpsRequest({
+          hostname: target.hostname,
+          port: targetPort,
+          method: 'POST',
+          path: `${target.pathname}${target.search}`,
+          headers: {
+            Host: target.host,
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Length': Buffer.byteLength(payload),
+          },
+          createConnection: () => secureSocket,
+        }, (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+          resp.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            if (!resp.statusCode || resp.statusCode < 200 || resp.statusCode >= 300) {
+              const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
+              done(new Error(`LLM ${resp.statusCode || 'unknown'}: ${friendly}`));
+              return;
+            }
+
+            let json: any = null;
+            try {
+              json = JSON.parse(text);
+            } catch (e: any) {
+              done(new Error(`LLM 返回 JSON 解析失败：${e?.message || String(e)}`));
+              return;
+            }
+            if (json?.error) {
+              const friendly = (typeof json.error === 'string' ? json.error : json.error?.message) || JSON.stringify(json.error).slice(0, 400);
+              done(new Error(`LLM 错误: ${friendly}`));
+              return;
+            }
+            done(null, json);
+          });
+        });
+        apiReq.on('error', done);
+        apiReq.end(payload);
+      });
+      secureSocket.on('error', done);
+    });
+    connectReq.on('error', done);
+    connectReq.end();
+  });
 }
 
 function buildClaudeMessagesBody(
@@ -374,18 +503,36 @@ export async function chatCompleteJsonWithRetry<T = any>(
   taskName = 'json-task',
 ): Promise<T> {
   const maxAttempts = 3;
+  const role = opts.modelRole || 'structured';
+  const cfg = resolveTextModelConfig(user, role);
+  const model = opts.modelOverride || cfg.model;
+  const reasoningEffort = opts.reasoningEffort === null
+    ? 'off'
+    : (opts.reasoningEffort || cfg.reasoningEffort || 'default');
+  const taskMeta = `role=${role},provider=${cfg.provider},model=${model},maxTokens=${opts.maxTokens ?? 4096},reasoning=${reasoningEffort}`;
   let lastErr: any = null;
   for (let i = 0; i < maxAttempts; i++) {
+    const attempt = i + 1;
+    const t0 = Date.now();
     try {
       const raw = await chatComplete(user, messages, {
         ...opts,
         responseFormat: 'json_object',
         modelRole: opts.modelRole || 'structured',
       });
-      return parser(raw);
+      const parsed = parser(raw);
+      console.info(`[${taskName}] attempt ${attempt}/${maxAttempts} succeeded in ${Date.now() - t0}ms (${taskMeta})`);
+      return parsed;
     } catch (e: any) {
       lastErr = e;
-      console.warn(`[${taskName}] attempt ${i + 1}/${maxAttempts} failed:`, e?.message);
+      const decision = classifyJsonRetryError(e);
+      const elapsedMs = Date.now() - t0;
+      console.warn(
+        `[${taskName}] attempt ${attempt}/${maxAttempts} failed in ${elapsedMs}ms ` +
+        `(reason=${decision.reason}, retryable=${decision.retryable}, ${taskMeta}, usage=${formatUsageSummary(e?.usage)}):`,
+        e?.message,
+      );
+      if (!decision.retryable) throw e;
       if (i < maxAttempts - 1) {
         // 指数退避：1秒、2秒
         await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
@@ -393,6 +540,55 @@ export async function chatCompleteJsonWithRetry<T = any>(
     }
   }
   throw lastErr || new Error(`${taskName} 调用失败（已重试 ${maxAttempts} 次）`);
+}
+
+function classifyJsonRetryError(e: any): { retryable: boolean; reason: string } {
+  const message = String(e?.message || e || '');
+  const lower = message.toLowerCase();
+
+  if (
+    lower.includes('responses 输出不完整') ||
+    lower.includes('status=incomplete') ||
+    lower.includes('reason=max_output_tokens') ||
+    lower.includes('max_output_tokens') ||
+    lower.includes('context_length') ||
+    lower.includes('maximum context')
+  ) {
+    return { retryable: false, reason: 'output_incomplete' };
+  }
+  if (message.includes('请求超时') || lower.includes('timeout') || lower.includes('abort')) {
+    return { retryable: false, reason: 'timeout' };
+  }
+
+  const httpStatus = message.match(/^LLM\s+(\d{3})/i)?.[1];
+  if (httpStatus) {
+    const status = Number(httpStatus);
+    return {
+      retryable: status === 429 || status >= 500,
+      reason: `http_${status}`,
+    };
+  }
+
+  if (
+    message.includes('JSON') ||
+    message.includes('Unexpected') ||
+    lower.includes('parse') ||
+    lower.includes('unterminated') ||
+    lower.includes('invalid')
+  ) {
+    return { retryable: true, reason: 'json_parse' };
+  }
+
+  if (
+    lower.includes('fetch failed') ||
+    lower.includes('econnreset') ||
+    lower.includes('socket') ||
+    lower.includes('network')
+  ) {
+    return { retryable: true, reason: 'network' };
+  }
+
+  return { retryable: false, reason: 'non_retryable' };
 }
 
 /* ============================================================
@@ -421,7 +617,7 @@ export async function chatStream(
   if (cfg.provider === 'zerail_messages') {
     return claudeMessagesStream(cfg, messages, opts, onChunk);
   }
-  if (cfg.provider === 'zerail_responses') {
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
     return responsesStream(cfg, messages, opts, onChunk);
   }
   return openAIChatStream(cfg, messages, opts, onChunk);

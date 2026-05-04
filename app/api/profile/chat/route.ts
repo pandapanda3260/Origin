@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     const newDialog = [...dialog, { role: 'user', content: userMsg }, { role: 'assistant', content: buf.trim() }];
     let persona = normalizeCreatorProfile(cur);
 
-    // 画像为空时立即补提炼；之后降低频率，避免 gpt-5.4-pro 结构化调用频繁阻塞聊天。
+    // 画像为空时立即补提炼；之后降低频率，避免结构化调用频繁阻塞聊天。
     if (newDialog.length >= 4 && (!hasProfileFields(persona) || newDialog.length % 12 === 0)) {
       try {
         const raw = await chatComplete(

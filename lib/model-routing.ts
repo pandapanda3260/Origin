@@ -7,6 +7,7 @@ export type ModelSlot = 'text' | 'image' | 'video' | 'storyboard';
 export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDerive' | 'legacy';
 export type ProviderKind =
   | 'openai_chat'
+  | 'openai_responses'
   | 'zerail_messages'
   | 'zerail_responses'
   | 'zerail_images'
@@ -57,13 +58,15 @@ export function resolveTextModelConfig(
 
   if (role === 'structured' || role === 'styleBible' || role === 'profileDerive') {
     const prefix = roleEnvPrefix(role);
-    const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('CLAUDE_API_KEY');
+    const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('OPENAI_API_KEY');
     if (key) {
+      const baseUrl = prefixedEnv(prefix, 'API_BASE') || env('TEXT_API_BASE') || env('OPENAI_BASE_URL') || 'https://api.openai.com/v1';
+      const provider = inferResponsesProvider(prefixedEnv(prefix, 'PROVIDER') || env('TEXT_PROVIDER'), baseUrl);
       return real({
-        baseUrl: prefixedEnv(prefix, 'API_BASE') || env('TEXT_API_BASE') || env('CLAUDE_API_BASE') || 'https://gateway.zerail.com/v1',
+        baseUrl,
         apiKey: key,
-        model: prefixedEnv(prefix, 'MODEL') || env('TEXT_MODEL') || env('MODEL_STRUCTURED_WORKER') || 'gpt-5.4-pro',
-        provider: 'zerail_responses',
+        model: prefixedEnv(prefix, 'MODEL') || env('TEXT_MODEL') || env('OPENAI_MODEL') || env('MODEL_STRUCTURED_WORKER') || 'gpt-5.5',
+        provider,
         endpoint: prefixedEnv(prefix, 'API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses',
         role,
         source: 'env',
@@ -232,6 +235,7 @@ function inferProvider(provider: string, slot: ModelSlot): ProviderKind {
   const p = provider.toLowerCase();
   if (p.includes('seedance')) return 'seedance';
   if (p.includes('image')) return 'zerail_images';
+  if (p.includes('openai') && p.includes('response')) return 'openai_responses';
   if (p.includes('response')) return 'zerail_responses';
   if (p.includes('message') || p.includes('claude')) return 'zerail_messages';
   if (slot === 'image') return 'zerail_images';
@@ -243,6 +247,13 @@ function defaultModel(slot: ModelSlot): string {
   if (slot === 'image') return 'gpt-image-1';
   if (slot === 'video') return 'sora';
   return 'gpt-4o-mini';
+}
+
+function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind {
+  const p = provider.toLowerCase();
+  if (p.includes('openai') && p.includes('response')) return 'openai_responses';
+  if (p.includes('zerail') && p.includes('response')) return 'zerail_responses';
+  return baseUrl.toLowerCase().includes('api.openai.com') ? 'openai_responses' : 'zerail_responses';
 }
 
 function env(name: string): string {
