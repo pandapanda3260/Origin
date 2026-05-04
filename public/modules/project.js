@@ -323,11 +323,12 @@ export function getProject() { return _getProject(); }
     return JSON.stringify(proj, function (key, value) {
       if (key === "_vpCache" || key === "_vpKey") return undefined;
       if (key.indexOf("_origin") === 0) return undefined;
-      if (this && key === 'videoUrl' && this.videoAssetId && typeof this._originVideoUrl !== 'undefined') return this._originVideoUrl;
-      if (this && key === 'pencilUrl' && this.pencilAssetId && typeof this._originPencilUrl !== 'undefined') return this._originPencilUrl;
-      if (this && key === 'realPhotoUrl' && this.assetId && typeof this._originRealPhotoUrl !== 'undefined') return this._originRealPhotoUrl;
-      if (this && key === 'imageUrl' && (this.assetId || this.imageAssetId) && typeof this._originImageUrl !== 'undefined') return this._originImageUrl;
-      if (this && key === 'rawUrl' && (this.assetId || this.imageAssetId) && typeof this._originRawUrl !== 'undefined') return this._originRawUrl;
+      if (this && key === 'videoUrl' && typeof this._originVideoUrl !== 'undefined') return this._originVideoUrl;
+      if (this && key === 'pencilUrl' && typeof this._originPencilUrl !== 'undefined') return this._originPencilUrl;
+      if (this && key === 'realPhotoUrl' && typeof this._originRealPhotoUrl !== 'undefined') return this._originRealPhotoUrl;
+      if (this && key === 'imageUrl' && typeof this._originImageUrl !== 'undefined') return this._originImageUrl;
+      if (this && key === 'rawUrl' && typeof this._originRawUrl !== 'undefined') return this._originRawUrl;
+      if (this && key === 'coverUrl' && typeof this._originCoverUrl !== 'undefined') return this._originCoverUrl;
       return value;
     });
   }

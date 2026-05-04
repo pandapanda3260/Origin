@@ -149,6 +149,7 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
 // 这里仅保留注释占位，勿复活。
 
 const _assetUrlCache = new Map();
+const _INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
 const _protectedImageBlobCache = new Map();
 
 export async function fetchAssetSignedUrl(assetId, ttl) {
@@ -200,6 +201,46 @@ async function _applyResolvedUrl(obj, assetKey, urlKeys) {
   } catch (_e) {}
 }
 
+async function _applySignedUrlForStoredImage(obj, urlKeys) {
+  if (!obj || !urlKeys || !urlKeys.length) return;
+  await Promise.all(urlKeys.map(async function (key) {
+    var current = obj[key] || '';
+    var originKey = '_origin' + key.charAt(0).toUpperCase() + key.slice(1);
+    var origin = obj[originKey] || current;
+    if (!origin) return;
+    var m = _INTERNAL_IMAGE_RE.exec(origin);
+    if (!m) return;
+
+    var cleanOrigin = '/api/images/file/' + m[1];
+    var url = await fetchAssetSignedUrl(m[1]);
+    if (!url) return;
+    if (typeof obj[originKey] === 'undefined') {
+      obj[originKey] = current && current.indexOf('?') >= 0 ? cleanOrigin : current;
+    }
+    obj[key] = url;
+  }));
+}
+
+function _hydrateAssetCollection(assets, jobs) {
+  if (!assets || !jobs) return;
+  (assets.characters || []).forEach(function (ch) {
+    if (!ch) return;
+    jobs.push(_applyResolvedUrl(ch, 'assetId', ['realPhotoUrl', 'imageUrl', 'rawUrl']));
+    jobs.push(_applyResolvedUrl(ch, 'pencilAssetId', ['pencilUrl']));
+    jobs.push(_applySignedUrlForStoredImage(ch, ['realPhotoUrl', 'imageUrl', 'rawUrl', 'pencilUrl']));
+  });
+  (assets.scenes || []).forEach(function (it) {
+    if (!it) return;
+    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
+    jobs.push(_applySignedUrlForStoredImage(it, ['imageUrl', 'rawUrl']));
+  });
+  (assets.props || []).forEach(function (it) {
+    if (!it) return;
+    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
+    jobs.push(_applySignedUrlForStoredImage(it, ['imageUrl', 'rawUrl']));
+  });
+}
+
 export async function hydrateProjectAssetUrls(project) {
   if (!project || typeof project !== 'object') return project;
   var jobs = [];
@@ -207,20 +248,26 @@ export async function hydrateProjectAssetUrls(project) {
     if (!sb) return;
     jobs.push(_applyResolvedUrl(sb, 'imageAssetId', ['imageUrl', 'rawUrl']));
     jobs.push(_applyResolvedUrl(sb, 'videoAssetId', ['videoUrl']));
+    jobs.push(_applySignedUrlForStoredImage(sb, ['imageUrl', 'rawUrl', 'pencilUrl']));
   });
-  var assets = project.assets || {};
-  (assets.characters || []).forEach(function (ch) {
-    if (!ch) return;
-    jobs.push(_applyResolvedUrl(ch, 'assetId', ['realPhotoUrl', 'imageUrl', 'rawUrl']));
-    jobs.push(_applyResolvedUrl(ch, 'pencilAssetId', ['pencilUrl']));
+
+  _hydrateAssetCollection(project.assets || {}, jobs);
+  _hydrateAssetCollection({
+    characters: project.characters || [],
+    scenes: project.environments || [],
+    props: project.props || [],
+  }, jobs);
+  (project.episodes || []).forEach(function (ep) {
+    if (!ep) return;
+    _hydrateAssetCollection(ep.assets || {}, jobs);
+    (ep.storyboards || []).forEach(function (sb) {
+      if (!sb) return;
+      jobs.push(_applySignedUrlForStoredImage(sb, ['imageUrl', 'rawUrl', 'pencilUrl']));
+    });
   });
-  (assets.scenes || []).forEach(function (it) {
-    if (!it) return;
-    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
-  });
-  (assets.props || []).forEach(function (it) {
-    if (!it) return;
-    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
+  (project.videoTasks || []).forEach(function (task) {
+    if (!task) return;
+    jobs.push(_applySignedUrlForStoredImage(task, ['coverUrl']));
   });
   await Promise.all(jobs);
   return project;

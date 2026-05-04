@@ -1691,12 +1691,6 @@ export function handleAssetAction(e) {
 
   if (action === "regen-asset") {
     if (_assetImagesGenerating) { showToast("正在批量生成中", "warn"); return; }
-    _ctx.archiveOldImage(item, type === "char" ? "character" : type);
-    item.imageUrl = "";
-    item.rawUrl = "";
-    item.realPhotoUrl = "";
-    item.pencilUrl = "";
-    _ctx.saveProject();
     generateSingleAssetImage(type, idx);
   } else if (action === "edit-asset") {
     var wrap = card.querySelector(".asset-desc-wrap");

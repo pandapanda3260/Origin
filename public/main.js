@@ -2212,15 +2212,7 @@ var _projectEpoch = 0;
         var _raType = first.assetType;
         var _raIdx = first.assetIdx;
         var _raList = _raType === "char" ? project.assets.characters : _raType === "scene" ? project.assets.scenes : project.assets.props;
-        if (_raList && _raList[_raIdx]) {
-          _archiveOldImage(_raList[_raIdx], _raType === "char" ? "character" : _raType);
-          _raList[_raIdx].imageUrl = "";
-          _raList[_raIdx].rawUrl = "";
-          _raList[_raIdx].realPhotoUrl = "";
-          _raList[_raIdx].pencilUrl = "";
-          saveProject();
-          refreshAssetsPage();
-        }
+        if (!_raList || !_raList[_raIdx]) return;
         generateSingleAssetImage(_raType, _raIdx);
         showToast("开始重新生成参考图…", "ok");
       }
@@ -2420,15 +2412,7 @@ var _projectEpoch = 0;
       var _raType = action.assetType;
       var _raIdx = action.assetIdx;
       var _raList = _raType === "char" ? project.assets.characters : _raType === "scene" ? project.assets.scenes : project.assets.props;
-      if (_raList && _raList[_raIdx]) {
-        _archiveOldImage(_raList[_raIdx], _raType === "char" ? "character" : _raType);
-        _raList[_raIdx].imageUrl = "";
-        _raList[_raIdx].rawUrl = "";
-        _raList[_raIdx].realPhotoUrl = "";
-        _raList[_raIdx].pencilUrl = "";
-        saveProject();
-        refreshAssetsPage();
-      }
+      if (!_raList || !_raList[_raIdx]) return;
       generateSingleAssetImage(_raType, _raIdx);
       showToast("开始重新生成参考图…", "ok");
 
@@ -2489,14 +2473,7 @@ var _projectEpoch = 0;
 
     impacts.push({ key: "asset_img_" + aType + "_" + aIdx, label: assetName + " 参考图", action: async function () {
       var _l = aType === "char" ? project.assets.characters : aType === "scene" ? project.assets.scenes : project.assets.props;
-      if (_l && _l[aIdx]) {
-        _archiveOldImage(_l[aIdx], aType === "char" ? "character" : aType);
-        _l[aIdx].imageUrl = "";
-        _l[aIdx].rawUrl = "";
-        _l[aIdx].realPhotoUrl = "";
-        _l[aIdx].pencilUrl = "";
-        saveProject();
-      }
+      if (!_l || !_l[aIdx]) return;
       try {
         await generateSingleAssetImage(aType, aIdx);
       } catch (e) {
@@ -2525,9 +2502,6 @@ var _projectEpoch = 0;
       (project.assets.scenes || []).forEach(function (s, si) {
         if (relatedScenes[s.name] && s.imageUrl) {
           impacts.push({ key: "asset_img_scene_" + si, label: "关联场景「" + s.name + "」参考图", action: async function () {
-            _archiveOldImage(s, "scene");
-            s.imageUrl = ""; s.rawUrl = "";
-            saveProject();
             try { await generateSingleAssetImage("scene", si); } catch (e) {
               console.error("[Cascade] scene regen failed:", si, e);
               showToast("场景重新生成失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
@@ -2539,9 +2513,6 @@ var _projectEpoch = 0;
       (project.assets.props || []).forEach(function (p, pi) {
         if (relatedProps[p.name] && p.imageUrl) {
           impacts.push({ key: "asset_img_prop_" + pi, label: "关联道具「" + p.name + "」参考图", action: async function () {
-            _archiveOldImage(p, "prop");
-            p.imageUrl = ""; p.rawUrl = "";
-            saveProject();
             try { await generateSingleAssetImage("prop", pi); } catch (e) {
               console.error("[Cascade] prop regen failed:", pi, e);
               showToast("道具重新生成失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");

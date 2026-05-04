@@ -32,6 +32,37 @@ const EMPTY_DATA = {
   preferences: null as any,
 };
 
+const PROTECTED_ASSET_URL_KEYS = new Set([
+  'imageUrl',
+  'rawUrl',
+  'realPhotoUrl',
+  'pencilUrl',
+  'coverUrl',
+]);
+
+function isEmptyAssetUrlValue(value: any) {
+  return value === '' || value === null || typeof value === 'undefined';
+}
+
+function preserveExistingAssetUrls(existing: any, next: any) {
+  if (!existing || !next || typeof existing !== 'object' || typeof next !== 'object') return;
+  if (Array.isArray(existing) && Array.isArray(next)) {
+    for (let i = 0; i < next.length; i += 1) preserveExistingAssetUrls(existing[i], next[i]);
+    return;
+  }
+  if (Array.isArray(existing) || Array.isArray(next)) return;
+
+  for (const key of Object.keys(next)) {
+    if (PROTECTED_ASSET_URL_KEYS.has(key)) {
+      if (isEmptyAssetUrlValue(next[key]) && !isEmptyAssetUrlValue(existing[key])) {
+        next[key] = existing[key];
+      }
+      continue;
+    }
+    preserveExistingAssetUrls(existing[key], next[key]);
+  }
+}
+
 function rowToPublic(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
@@ -122,10 +153,17 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   let data: any = {};
   try { data = JSON.parse(existing.data_json || '{}'); } catch { data = {}; }
   const newData = { ...data, ...(patch || {}) };
+  const shouldPreserveAssetUrls = !patch?.allowEmptyAssetUrls;
+  if (shouldPreserveAssetUrls) preserveExistingAssetUrls(data, newData);
 
   const title = patch.name ?? patch.title ?? existing.title;
   const description = patch.description ?? existing.description;
-  const coverUrl = patch.coverUrl ?? existing.cover_url;
+  const coverUrl = shouldPreserveAssetUrls
+    && Object.prototype.hasOwnProperty.call(patch || {}, 'coverUrl')
+    && isEmptyAssetUrlValue(patch.coverUrl)
+    && !isEmptyAssetUrlValue(existing.cover_url)
+    ? existing.cover_url
+    : patch.coverUrl ?? existing.cover_url;
   const status = patch.status ?? existing.status;
 
   delete newData.id;
@@ -137,6 +175,7 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   delete newData.createdAt;
   delete newData.updatedAt;
   delete newData.ownerId;
+  delete newData.allowEmptyAssetUrls;
 
   return {
     title,
