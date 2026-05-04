@@ -12,7 +12,7 @@ import { generateImage, resolveLocalImagePath } from './image-gen';
 import { generateVideo } from './video-gen';
 import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from './llm';
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
-import { getProjectByIdForUser, updateProjectForUser } from './projects-db';
+import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 
 /* ============================================================
    helper：根据 target.{type, idx} 找到对应资产 + 构造提示词
@@ -296,8 +296,8 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
   // 注意：写入 imageUrl + rawUrl 两个字段，因为前端不同卡片读不同字段（兼容历史）
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
     const assets = (fresh as any).assets || { characters: [], scenes: [], props: [] };
     if (!assets[cat]) assets[cat] = [];
     if (!assets[cat][idx]) assets[cat][idx] = {};
@@ -323,8 +323,8 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       imagePrompt: prompt,
       ...charExtra,
     };
-    updateProjectForUser(ctx.projectId, ctx.user.id, { assets, [topKey]: top });
-  }
+    return { assets, [topKey]: top };
+  });
 
   // task_completed 事件 payload：前端 onTaskCompleted 读 extra.rawUrl / extra.pencilUrl
   // 来实时更新卡片 UI（不刷新就能看到图）。之前我们漏发这两个字段，所以图必须
@@ -451,14 +451,15 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
   const cleaned = prompt.trim().replace(/^["'`]+|["'`]+$/g, '');
   if (!cleaned) throw new Error('AI 没有返回提示词');
 
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
-    const shots = (fresh as any).shots || [];
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const shots = Array.isArray((fresh as any).shots) ? [...(fresh as any).shots] : [];
     if (shots[idx]) {
       shots[idx] = { ...shots[idx], imagePrompt: cleaned, imagePromptGenerated: true };
-      updateProjectForUser(ctx.projectId, ctx.user.id, { shots });
+      return { shots };
     }
-  }
+    return null;
+  });
 
   return {
     patch: { type: 'shot_prompt', idx, imagePrompt: cleaned },
@@ -599,9 +600,9 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   });
 
   // 写回 project.storyboards[groupIdx]：注意 imageUrl + url 都写，前端两边都会读
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
-    const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     while (storyboards.length <= groupIdx) storyboards.push({});
     storyboards[groupIdx] = {
       ...storyboards[groupIdx],
@@ -614,8 +615,8 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
       shotIndices,
     };
-    updateProjectForUser(ctx.projectId, ctx.user.id, { storyboards });
-  }
+    return { storyboards };
+  });
 
   return {
     resultUrl: result.url,
@@ -654,32 +655,28 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     groupShotIndices = tgtSi.filter((x: any) => Number.isInteger(x));
   } else if (Array.isArray(sb.shotIndices) && sb.shotIndices.length) {
     groupShotIndices = sb.shotIndices;
-  } else {
+  } else if (sb.videoPrompt) {
+    // 已经有视频提示词时（由 video_prompts 生成），prompt 已自包含台词信息，
+    // 即使没有 shotIndices 也不会走错台词——只用 [groupIdx] 做兜底就行。
     groupShotIndices = [groupIdx];
     console.warn(
-      `[video_segments] group ${groupIdx} 没拿到 shotIndices（前端没传 + DB 缓存空），` +
-        `兜底用 [${groupIdx}]——可能导致台词错位，建议前端重生成提示词页`,
+      `[video_segments] group ${groupIdx} 缺 shotIndices，但 videoPrompt 存在，兜底用 [${groupIdx}]`,
+    );
+  } else {
+    // 既没有分组索引，又没有 sb.videoPrompt ——这种情况强行兜底到 shots[groupIdx]
+    // 会用错误 shot 的台词和视觉，浪费视频生成额度（audit 原话）。直接抛错让用户重新生成提示词页。
+    throw new Error(
+      `group ${groupIdx} 分组索引丢失且缺 videoPrompt，请回到"视频提示词"页重新生成后再来这一步`,
     );
   }
 
-  // 用户反馈："视频节奏太慢了 每一段都把时间卡在5秒"——Seedance 2.0 (Doubao
-  // doubao-seedance-2-0-260128) 只支持 3/5/10/15s 等固定档，不能任意秒数。
-  // 之前 >5s 的组会用 10s 档导致视频节奏拖沓。改成每段固定 5s，靠新的
-  // `getStoryboardGroups` 把内容压紧到 5s 内；个别极长镜头超 5s 也截到 5s
-  // 让模型自适应加快节奏（这是用户明确要求的"加快视频节奏"）。
-  const durationSec = 5;
   let totalGroupDur = 0;
   for (const si of groupShotIndices) {
     const sh = shots[si];
     if (!sh) continue;
     totalGroupDur += Number(sh.duration || sh.durationSec || 4);
   }
-  if (totalGroupDur > durationSec) {
-    console.log(
-      `[video_segments] group ${groupIdx} 镜头总时长 ${totalGroupDur}s > 5s，` +
-        `Seedance 会自适应加快演绎（${groupShotIndices.length} 个镜头压到 5s）`,
-    );
-  }
+  // 注意：durationSec 在 dialoguePairs 构建完成后再决策（因为要按台词字数选 5s / 10s）
   // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给视频模型
   // —— 视频提示词页 LLM 经常把对话遗漏/改写，这里直接从源头数据拿。
   //
@@ -689,35 +686,73 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   // 这里拆成 { speaker, text }：speaker 给 video-gen 当"指定说话人"元信息
   // （用于选音色/口型），text 才是实际念出来的台词。
   const dialoguePairs: Array<{ speaker: string; text: string }> = [];
+  // 按"角色名："anchor 切：先用 RegExp.exec 收集所有 speaker 出现位置，
+  // 然后取每两个 speaker 之间的内容作为 text（最后一个 speaker 取到 raw 末尾）。
+  // 旧的"一个大正则一次匹配整段"写法在多句对白里只会匹配最后一句（lookahead lazy bug）。
+  function parseDialogue(raw: string): Array<{ speaker: string; text: string }> {
+    if (!raw) return [];
+    // 角色名 = 最多 24 个非冒号/空白/引号的字符（涵盖中英文、长称谓）。
+    // 字符类用 \u 转义去重：之前字面量引号在多次保存后被规范成 ASCII 引号重复塞进去，
+    // 实际只排除了一两种引号，且 12 字符上限对"XX帝王蟹队长长官大人"之类的长称谓会掉。
+    const SPEAKER_RE = /([^：:\s“”‘’"'「」『』]{1,24})[：:]/g;
+    const anchors: Array<{ speaker: string; textStart: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = SPEAKER_RE.exec(raw)) !== null) {
+      anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
+    }
+    if (anchors.length === 0) {
+      // 没识别出"角色:" 模式，整段作为旁白
+      return [{ speaker: '', text: raw.trim() }];
+    }
+    const pairs: Array<{ speaker: string; text: string }> = [];
+    for (let i = 0; i < anchors.length; i++) {
+      const cur = anchors[i];
+      // 下一个 speaker 在 raw 里的起始位置 = 它的 anchor 字符串前
+      const nextStart =
+        i + 1 < anchors.length
+          ? // 下一个 anchor 的"角色名+冒号"在原文里的起始位置
+            anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
+          : raw.length;
+      let text = raw.slice(cur.textStart, nextStart).trim();
+      // 去除首尾的引号 / 全角引号
+      text = text
+        .replace(/^[「『""''""''『]+/, '')
+        .replace(/[」』""''""''』]+$/, '')
+        .trim();
+      if (text) pairs.push({ speaker: cur.speaker, text });
+    }
+    return pairs;
+  }
   for (const si of groupShotIndices) {
     const sh = shots[si];
     if (!sh) continue;
     const raw = String(sh.dialogue || sh.scriptRef || '').trim();
     if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-    // 单个 shot.dialogue 里可能包含多句对白（"老板：xxx 帝王蟹：yyy"），按
-    // "新行 / 多空格 / 」』""」后接「」""』前" 等候选切分；最稳的是按"角色名："
-    // 这种 anchor 切。匹配 "汉字+：" 不超过 12 字的前缀。
-    const PIECE_RE = /([^：:\s「『""'']{1,12})[：:]\s*[「『""'']?([^「『""''「』""'']+?)[」』""'']?(?=(?:[^：:\s「『""'']{1,12}[：:])|$)/g;
-    let mm: RegExpExecArray | null;
-    let any = false;
-    while ((mm = PIECE_RE.exec(raw)) !== null) {
-      const sp = mm[1].trim();
-      const tx = mm[2].trim().replace(/[，。！？]+$/, (s) => s);
-      if (sp && tx) {
-        dialoguePairs.push({ speaker: sp, text: tx });
-        any = true;
-      }
-    }
-    if (!any) {
-      // 单一冒号格式
-      const m = /^([^：:]{1,12})[：:]\s*[「『""'']?(.+?)[」』""'']?$/.exec(raw);
-      if (m) {
-        dialoguePairs.push({ speaker: m[1].trim(), text: m[2].trim() });
-      } else {
-        dialoguePairs.push({ speaker: '', text: raw });
-      }
-    }
+    const parsed = parseDialogue(raw);
+    for (const p of parsed) dialoguePairs.push(p);
   }
+  // 注意：用户明确要求"台词一个字都不能少"，这里**不做任何截断**。
+  // 如果一组台词太长 5 秒念不完，下面会把视频时长拉到 10 秒（Seedance 支持的另一档）。
+
+  // ===== 动态视频时长（5s / 10s）=====
+  // 用户的两条核心约束：
+  //   (a) "加快视频节奏 不要每段都 5 秒"  → 短台词的片段用 5s
+  //   (b) "台词一个字都不能少"             → 长台词的片段必须用 10s（5s 念不完）
+  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持 5s / 10s 两档。
+  // 决策依据：本组**台词总字数**——中文一般每秒念 4 字，5 秒念 20 字封顶；
+  //   ≤ 18 字  → 5s 视频（节奏快、台词从容）
+  //   > 18 字  → 10s 视频（保证一字不少）
+  let dialogueCharSum = 0;
+  for (const dp of dialoguePairs) {
+    dialogueCharSum += (dp.text || '').replace(/[\s「『""''，。！？]/g, '').length;
+  }
+  const FIVE_SEC_DIALOGUE_BUDGET = 18;
+  const durationSec: number = dialogueCharSum > FIVE_SEC_DIALOGUE_BUDGET ? 10 : 5;
+  console.log(
+    `[video_segments] group ${groupIdx} 台词 ${dialogueCharSum} 字 → ` +
+      `用 ${durationSec}s 视频（${dialoguePairs.length} 句台词）` +
+      (totalGroupDur > durationSec ? `；镜头总时长 ${totalGroupDur}s 超出，Seedance 会自适应` : ''),
+  );
 
   // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
   const userRatio = (ctx.options?.ratio as string) || '16:9';
@@ -881,9 +916,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   );
 
   // 写回 project.videoTasks 数组（前端 batch 页读这里）
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
-    const videoTasks = Array.isArray((fresh as any).videoTasks) ? (fresh as any).videoTasks : [];
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
     while (videoTasks.length <= groupIdx) videoTasks.push({});
     videoTasks[groupIdx] = {
       groupIdx,
@@ -895,15 +930,20 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       prompt,
     };
     // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
-    const sbs = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+    // videoDurationSec 是关键 —— 5s/10s 是后端按台词字数动态决定的，前端只知道
+    // shot.duration 累加值（往往跟实际不一致），剪辑工作台导入时间线如果不持久化
+    // 这个真实时长，就会出现"视频是 10s 但 timeline 段长 5s"的错位（用户截图）。
+    const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     if (sbs[groupIdx]) {
-      sbs[groupIdx] = { ...sbs[groupIdx], videoUrl: result.url, videoTaskId: result.taskId };
+      sbs[groupIdx] = {
+        ...sbs[groupIdx],
+        videoUrl: result.url,
+        videoTaskId: result.taskId,
+        videoDurationSec: result.durationSec,
+      };
     }
-    updateProjectForUser(ctx.projectId, ctx.user.id, {
-      videoTasks,
-      storyboards: sbs,
-    });
-  }
+    return { videoTasks, storyboards: sbs };
+  });
 
   return {
     resultUrl: result.url,
@@ -1080,15 +1120,12 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
   ctx.progress({ stage: 'assembling', percent: 95, hint: '正在保存镜头表…' });
 
   // 写回项目：shots + 重置下游审批/分镜
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
-    updateProjectForUser(ctx.projectId, ctx.user.id, {
-      shots: shotsArr,
-      shotsApproved: false,
-      storyboards: [],
-      currentStep: 3,
-    });
-  }
+  patchProjectForUser(ctx.projectId, ctx.user.id, () => ({
+    shots: shotsArr,
+    shotsApproved: false,
+    storyboards: [],
+    currentStep: 3,
+  }));
 
   return {
     patch: { type: 'shots', value: shotsArr },
@@ -1208,9 +1245,9 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
   ctx.progress({ stage: 'saving', percent: 92, hint: '正在保存…' });
 
   // 写回 storyboards[groupIdx].videoPrompt
-  const fresh = getProjectByIdForUser(ctx.projectId, ctx.user.id);
-  if (fresh) {
-    const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     while (storyboards.length <= groupIdx) storyboards.push({});
     storyboards[groupIdx] = {
       ...storyboards[groupIdx],
@@ -1218,8 +1255,8 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
       narrationsUsed: narrations,
       shotIndices,
     };
-    updateProjectForUser(ctx.projectId, ctx.user.id, { storyboards });
-  }
+    return { storyboards };
+  });
 
   return {
     patch: { type: 'video_prompt', idx: groupIdx, value: cleaned },

@@ -16,3 +16,5 @@ reference-site/local-screenshots/
 reference-site/local-screenshots-final/
 reference-site/phase1-screenshots/
 reference-site/__pycache__/
+.claude/
+.playwright-mcp/

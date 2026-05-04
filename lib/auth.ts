@@ -10,10 +10,13 @@ import { getDb, userToPublic, type UserRow } from './db';
 const SECRET = (() => {
   const env = process.env.JWT_SECRET;
   if (env && env.length >= 32) return new TextEncoder().encode(env);
-  // 开发环境兜底密钥（提示用户在生产环境务必通过 JWT_SECRET 覆盖）
+  // 生产环境：缺密钥或密钥过短 → 直接拒绝启动，避免用兜底密钥给攻击者自助伪造 token
   if (process.env.NODE_ENV === 'production') {
-    console.warn('[auth] JWT_SECRET 未设置（或长度不足 32），使用开发兜底，请在生产环境设置！');
+    throw new Error(
+      '[auth] 生产环境必须设置 JWT_SECRET（≥32 字节）。请在环境变量中设置，然后重启服务。',
+    );
   }
+  console.warn('[auth] JWT_SECRET 未设置或长度不足 32 字节，开发环境使用兜底密钥。生产环境必须覆盖！');
   return new TextEncoder().encode('dev-jwt-secret-please-change-me-32-bytes-long');
 })();
 
@@ -53,6 +56,10 @@ export function readBearer(req: NextRequest | Request): string | null {
   const m = /^Bearer\s+(.+)$/i.exec(h);
   if (m) return m[1].trim();
   // EventSource 不能带自定义 header，前端会把 token 放到 query string ?token=...
+  // 仅在 Accept: text/event-stream（即 SSE 连接）时允许从 query 读取 token，
+  // 其他请求类型不接受 ?token=，避免 token 被日志/Referer 泄漏。
+  const accept = req.headers.get('accept') || '';
+  if (!accept.includes('text/event-stream')) return null;
   try {
     const url = new URL((req as any).url || '');
     const q = url.searchParams.get('token');
@@ -83,9 +90,19 @@ export async function requireUser(req: NextRequest | Request): Promise<UserRow> 
 
 export async function findUserByLogin(usernameOrEmail: string): Promise<UserRow | null> {
   const db = getDb();
+  const key = (usernameOrEmail || '').trim();
+  if (!key) return null;
+  // 根据输入是否含 @ 明确按邮箱或按用户名查，避免 "a" 同时匹配用户名 a 和邮箱 a@... 的歧义
+  const isEmail = key.includes('@');
+  if (isEmail) {
+    const row = db
+      .prepare<{ key: string }, UserRow>('SELECT * FROM users WHERE email = @key COLLATE NOCASE LIMIT 1')
+      .get({ key: key.toLowerCase() });
+    return row ?? null;
+  }
   const row = db
-    .prepare<{ key: string }, UserRow>('SELECT * FROM users WHERE username = @key OR email = @key LIMIT 1')
-    .get({ key: usernameOrEmail });
+    .prepare<{ key: string }, UserRow>('SELECT * FROM users WHERE username = @key LIMIT 1')
+    .get({ key });
   return row ?? null;
 }
 

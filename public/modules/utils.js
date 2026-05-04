@@ -369,4 +369,15 @@ export function consumeStreamStepTags(chunk, state, onStep) {
   return out;
 }
 
+// 显示剧本/画面描述/台词等文本时的防御性清洁器。
+// 历史上 gpt-5.5 / claude-thinking 这类推理模型偶尔会无视 prompt 里
+// "禁止输出 <step>" 的指令，把 <step>铺垫</step> 当段落标记输出。
+// 后端 full-create / consult/confirm 已经剥了一道，但老数据/边缘路径仍可能
+// 穿漏，所以所有显示剧本/镜头描述的位置都再过一次这个函数兜底。
+export function stripStepTags(text) {
+  if (typeof text !== 'string' || !text) return text;
+  if (text.indexOf('<step>') < 0 && text.indexOf('</step>') < 0) return text;
+  return text.replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
+}
+
 export function $(id) { return document.getElementById(id); }

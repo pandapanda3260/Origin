@@ -136,9 +136,11 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     }
     const q = pickQuality(modelName, input.quality);
 
-    // 一次失败就重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
+    // 失败重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
     // 4xx（除 429）与 401/403 视为永久错误，立刻抛出，避免无意义浪费积分。
-    const MAX_ATTEMPTS = 2;
+    // 429 限流：3 次机会，退避 8-15s（限流需要等更久才放行）
+    // 5xx/超时：3 次机会，退避 2-4s（多数是抖动，快重试就能过）
+    const MAX_ATTEMPTS = 3;
     let lastErr: any = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       // 单次调用 240s 超时（gpt-image-* medium + 中转排队，180s 偏紧）
@@ -223,13 +225,31 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}`);
         lastErr = e;
         if (attempt < MAX_ATTEMPTS && transient) {
-          // 退避 2-4s 再试。中转站短暂排队 / 抖动多数能在第 2 次成功。
-          const delay = 2000 + Math.floor(Math.random() * 2000);
+          // 429 限流要等更久（中转站每分钟有总配额，太快重试还会被拒）
+          // 5xx/超时多数是抖动/排队，2-4s 退避通常就能过
+          const isRateLimit = status === 429;
+          const baseDelay = isRateLimit ? 8000 + attempt * 3000 : 2000;
+          const delay = baseDelay + Math.floor(Math.random() * 3000);
+          console.log(`[image-gen] retry attempt=${attempt + 1}/${MAX_ATTEMPTS} after ${delay}ms (status=${status || 'timeout'})`);
           await new Promise((r) => setTimeout(r, delay));
           continue;
         }
-        // 永久错误 / 用尽重试次数 → 抛出最终错误
-        throw new Error('图像生成失败：' + reason);
+        // 永久错误 / 用尽重试次数 → 抛出最终错误（针对常见 status 给人话提示）
+        let friendly: string;
+        if (status === 429) {
+          friendly = `中转站当前限流（API 429），${MAX_ATTEMPTS} 次重试均被拒。请等几分钟再试，或更换图像 API Key`;
+        } else if (status === 401 || status === 403) {
+          friendly = `图像 API Key 无效或无权限（${status}），请到设置里检查/更换 Key`;
+        } else if (status === 402) {
+          friendly = `图像 API 余额不足（402），请到中转站充值后再试`;
+        } else if (aborted) {
+          friendly = `图像生成超时（>240s 未返回），中转站可能在排队，请稍后重试`;
+        } else if (status && status >= 500 && status < 600) {
+          friendly = `中转站服务异常（${status}），${MAX_ATTEMPTS} 次重试均失败，请稍后再试`;
+        } else {
+          friendly = '图像生成失败：' + reason;
+        }
+        throw new Error(friendly);
       } finally {
         clearTimeout(timeoutId);
       }

@@ -8,7 +8,8 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const SP_EXPAND = `你是短视频编剧助理。请把现有剧本扩充得更丰满（多加细节描写、对白和镜头建议），但保持原有五段式结构（铺垫/升温/高潮/回落/余韵）和总时长不变。
-回答必须用中文，不要 markdown 围栏，直接输出新的完整剧本。每段开头插入 <step>步骤名</step>。`;
+回答必须用中文，不要 markdown 围栏，直接输出新的完整剧本。
+每段用"铺垫：""升温：""高潮：""回落：""余韵："这种冒号前缀标记开头，**绝对不要**输出 <step>、<phase> 等任何 XML/HTML 标签，也不要输出 markdown 或方括号注释。`;
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
@@ -40,13 +41,21 @@ export async function POST(req: NextRequest) {
       },
     );
 
+    // 兜底：剥 LLM 可能残留的 <step> / <phase> 标签，再把字面量 "\n" 还原为真换行
+    const cleanScript = buf
+      .replace(/<step>[^<]*<\/step>\s*/gi, '')
+      .replace(/<phase>[^<]*<\/phase>\s*/gi, '')
+      .replace(/\\r\\n|\\n/g, '\n')
+      .replace(/\r\n?/g, '\n')
+      .trim();
+
     if (projectId && proj) {
       updateProjectForUser(projectId, user.id, {
-        scriptDraft: buf,
-        script: buf,
+        scriptDraft: cleanScript,
+        script: cleanScript,
       });
     }
 
-    writer.done({ script: buf, deltaTokens: Math.ceil(buf.length / 2) });
+    writer.done({ script: cleanScript, deltaTokens: Math.ceil(cleanScript.length / 2) });
   });
 }

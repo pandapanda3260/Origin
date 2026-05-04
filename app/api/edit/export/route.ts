@@ -152,29 +152,46 @@ async function _exportPost(req: NextRequest) {
   }
 
   const exportId = randomUUID();
-  const ownerDir = join(EXPORTS_DIR, String(user.id));
-  mkdirSync(ownerDir, { recursive: true });
-  const filename = `${exportId}.mp4`;
-  const fullPath = join(ownerDir, filename);
-
-  db.prepare(
-    `INSERT INTO exports (id, owner_id, project_id, status, progress, filename, edl_json, bgm_id)
-     VALUES (?, ?, ?, 'queued', 0, ?, ?, ?)`,
-  ).run(exportId, user.id, projectId, filename, JSON.stringify({ items, bgmId: bgmId || null }), bgmId || null);
-
-  const refundOnFailure = () => {
-    try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.export, reason: 'edit.export.failed', refId: exportId }); } catch (_) {}
+  const refundOnFailure = (reason: string) => {
+    try {
+      refundCredits({
+        userId: user.id,
+        amount: CREDIT_PRICES.export,
+        reason: `edit.export.failed:${reason}`,
+        refId: exportId,
+      });
+    } catch (refErr) {
+      console.error('[export] refund failed:', exportId, refErr);
+    }
   };
+
+  const ownerDir = join(EXPORTS_DIR, String(user.id));
+  let filename: string;
+  let fullPath: string;
+  try {
+    mkdirSync(ownerDir, { recursive: true });
+    filename = `${exportId}.mp4`;
+    fullPath = join(ownerDir, filename);
+
+    db.prepare(
+      `INSERT INTO exports (id, owner_id, project_id, status, progress, filename, edl_json, bgm_id)
+       VALUES (?, ?, ?, 'queued', 0, ?, ?, ?)`,
+    ).run(exportId, user.id, projectId, filename, JSON.stringify({ items, bgmId: bgmId || null }), bgmId || null);
+  } catch (e: any) {
+    // 同步路径失败（建目录/写表）：一定要退款，否则用户积分直接消失
+    refundOnFailure('sync-setup');
+    return jsonError('导出准备失败：' + (e?.message || String(e)), 500);
+  }
 
   // 异步执行
   setImmediate(async () => {
     try {
       await doExport({ exportId, userId: user.id, items, bgmId, outputPath: fullPath, project: proj });
       const cur = getDb().prepare<{ id: string }, any>('SELECT status FROM exports WHERE id = @id').get({ id: exportId });
-      if (cur?.status === 'failed') refundOnFailure();
+      if (cur?.status === 'failed') refundOnFailure('doExport-set-failed');
     } catch (e) {
       console.error('[export]', exportId, e);
-      refundOnFailure();
+      refundOnFailure('doExport-throw');
     }
   });
 
@@ -196,8 +213,44 @@ function fmtSrtTime(sec: number): string {
 function stripSpeaker(line: string): string {
   return String(line || '')
     .replace(/^\s*[^：:]{1,12}\s*[：:]\s*/, '')
-    .replace(/^["'"'「]+|["'"'」]+$/g, '')
+    .replace(/^["'""'「『]+|["'""'」』]+$/g, '')
     .trim();
+}
+
+/** 把"老板：xxx 帝王蟹：yyy"形式的多句对白拆成每条独立的 text 数组。
+ * stripSpeaker 只能剥头一段，碰到多 speaker 时第二句开始的"角色名:"会留在字幕里
+ *（用户截图：「家人们…" 帝王蟹队长："先别…」），所以这里走 anchor 切。 */
+function splitDialogueLines(raw: string): string[] {
+  if (!raw) return [];
+  const SPEAKER_RE = /([^：:\s「『""''""''『」』]{1,12})[：:]/g;
+  const anchors: Array<{ speaker: string; textStart: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = SPEAKER_RE.exec(raw)) !== null) {
+    anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
+  }
+  if (!anchors.length) {
+    const t = raw
+      .trim()
+      .replace(/^["'""'「『]+/, '')
+      .replace(/["'""'」』]+$/, '')
+      .trim();
+    return t ? [t] : [];
+  }
+  const out: string[] = [];
+  for (let i = 0; i < anchors.length; i++) {
+    const cur = anchors[i];
+    const nextStart =
+      i + 1 < anchors.length
+        ? anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
+        : raw.length;
+    let text = raw.slice(cur.textStart, nextStart).trim();
+    text = text
+      .replace(/^["'""'「『]+/, '')
+      .replace(/["'""'」』]+$/, '')
+      .trim();
+    if (text) out.push(text);
+  }
+  return out;
 }
 
 /** 根据 EDL items 和项目 storyboards/shots 构造 SRT；返回 srt 字符串（空串表示无字幕） */
@@ -205,18 +258,41 @@ function buildSrt(items: { groupIdx: number | null; inSec: number; outSec: numbe
   const sbs: any[] = Array.isArray(project?.storyboards) ? project.storyboards : [];
   const shots: any[] = Array.isArray(project?.shots) ? project.shots : [];
 
-  // 取每段的对白：优先 storyboards[i].shotIndices.map(shots[]) 拼起来，
-  // 没 shotIndices 就拿 shots[groupIdx]。空的就跳过这段。
+  // 取每段的对白：优先从 sb.videoPrompt 抓 `角色：「台词」` —— 这是 AI 真正
+  // "说了什么"的权威源（一段视频可能合并 2-3 个 shot 的台词）。
+  // 抓不到才退回 shots[].dialogue。
   function dialogueForGroup(gIdx: number): string[] {
     const sb = sbs[gIdx];
-    const idxList: number[] = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
     const lines: string[] = [];
-    for (const si of idxList) {
-      const sh = shots[si];
-      if (!sh) continue;
-      const raw = String(sh.dialogue || '').trim();
-      if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-      lines.push(stripSpeaker(raw));
+    const prompt: string = (sb && sb.videoPrompt) || '';
+    if (prompt) {
+      // 引号字符必须用 \u 转义，否则编辑/序列化过程会把中文引号统一成 ASCII 双引号，
+      // 字符类退化为 [""...] 完全失效，永远抓不到 sb.videoPrompt 里的台词。
+      const Q = '\u201C\u201D\u2018\u2019\u0022\u0027\u300C\u300D\u300E\u300F';
+      const DIALOG_RE = new RegExp(
+        '[\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9\\u00B7]{0,11}[\\uFF1A:]\\s*[' + Q + ']([^' + Q + '\\n]{1,80}?)[' + Q + ']',
+        'g'
+      );
+      let m: RegExpExecArray | null;
+      while ((m = DIALOG_RE.exec(prompt)) !== null) {
+        const t = (m[1] || '').trim();
+        const cleaned = t.replace(/[，。,.]/g, '').trim();
+        if (cleaned) lines.push(cleaned);
+      }
+    }
+    if (!lines.length) {
+      const idxList: number[] = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
+      for (const si of idxList) {
+        const sh = shots[si];
+        if (!sh) continue;
+        const raw = String(sh.dialogue || '').trim();
+        if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
+        const pieces = splitDialogueLines(raw);
+        for (const p of pieces) {
+          const cleaned = p.replace(/[，。,.]/g, '').trim();
+          if (cleaned) lines.push(cleaned);
+        }
+      }
     }
     return lines.filter(Boolean);
   }

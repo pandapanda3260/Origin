@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
-  const snap = getBatchSnapshot(params.id);
+  const snap = getBatchSnapshot(params.id, user.id);
   if (!snap) return jsonError('batch 不存在', 404);
   return jsonOk(snap);
 }

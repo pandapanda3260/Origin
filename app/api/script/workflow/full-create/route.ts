@@ -94,7 +94,7 @@ export async function POST(req: NextRequest) {
     } catch (e: any) {
       // LLM 调用失败 → 退积分 + 抛友好错误
       if (charge) {
-        try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 3, kind: 'text', reason: 'script.error', refId: projectId }); } catch (_) {}
+        try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 3, reason: 'script.error', refId: projectId }); } catch (_) {}
       }
       writer.error(`剧本生成失败：${e?.message || String(e)}`);
       return;
@@ -152,7 +152,16 @@ export async function POST(req: NextRequest) {
       };
       // 修改模式不要覆盖 oneSentence —— 原创意要保留
       if (!isRevise) writePayload.oneSentence = finalSentence;
-      updateProjectForUser(projectId, user.id, writePayload);
+      try {
+        updateProjectForUser(projectId, user.id, writePayload);
+      } catch (e: any) {
+        // 最终写库失败时，整个流程相当于白跑了——必须退款
+        if (charge) {
+          try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 3, reason: 'script.persist.error', refId: projectId }); } catch (_) {}
+        }
+        writer.error('保存失败：' + (e?.message || String(e)));
+        return;
+      }
     }
 
     writer.done({

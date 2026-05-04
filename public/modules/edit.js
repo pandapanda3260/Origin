@@ -6,6 +6,9 @@ import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, 
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
 
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 95" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 95 —— 字幕延后 0.3s 切换，每句多 hold 0.3s 等演员说完', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+
 let _ctx = {};
 let project = null;
 
@@ -107,9 +110,14 @@ export function syncEditProject(p) {
       var sb = (project.storyboards && project.storyboards[gi]) || {};
       if (!sb.videoUrl) continue;
       if (sb.importedToEdit !== true) continue;
-      var dur = 0;
       var shots = g.shots || [];
-      shots.forEach(function (shot) { dur += (shot.duration || 4); });
+      // 真实视频时长由后端按台词字数决定（5s 或 10s），sb.videoDurationSec 是
+      // 后端写入的权威值。fallback 到 shots[].duration 累加只是为了兼容老数据
+      // （那种情况会在 AI 剪辑后被纠正成真实值）。
+      var dur = Number(sb.videoDurationSec) || 0;
+      if (!dur) {
+        shots.forEach(function (shot) { dur += (shot.duration || 4); });
+      }
       segs.push({
         groupIdx: g.groupIdx != null ? g.groupIdx : gi,
         videoUrl: sb.videoUrl,
@@ -181,12 +189,39 @@ export function syncEditProject(p) {
   }
 
   function _sumGroupDuration(groupIdx) {
+    // 优先用真实视频时长（后端按台词字数动态决定 5s / 10s 后落到 storyboard）。
+    // 退回 shots[].duration 累加只是兼容老数据 / 视频还没生成时的预估。
+    var sb = (project && Array.isArray(project.storyboards)) ? project.storyboards[groupIdx] : null;
+    if (sb && Number(sb.videoDurationSec) > 0) return Number(sb.videoDurationSec);
     var groups = _ctx.getStoryboardGroups ? _ctx.getStoryboardGroups() : [];
     var g = groups[groupIdx];
     if (!g || !Array.isArray(g.shots) || !g.shots.length) return 5;
     var dur = 0;
     g.shots.forEach(function (s) { dur += (s.duration || 4); });
     return dur || 5;
+  }
+
+  /** 把 _editState.edl.timeline 里"陈旧的 duration / outPoint"修正到当前
+   * sb.videoDurationSec —— 解决"老 timeline 写了 5s 段长但实际视频是 10s"的错位。
+   * 只动 inPoint=0 的段（用户手剪过的不动）。 */
+  function _repairTimelineDurations() {
+    if (!_editState.edl || !Array.isArray(_editState.edl.timeline)) return false;
+    if (!project || !Array.isArray(project.storyboards)) return false;
+    var changed = false;
+    _editState.edl.timeline.forEach(function (item) {
+      if (!item || item.groupIdx == null) return;
+      var sb = project.storyboards[item.groupIdx];
+      var realDur = sb && Number(sb.videoDurationSec) > 0 ? Number(sb.videoDurationSec) : 0;
+      if (!realDur) return;
+      var curDur = Number(item.duration) || 0;
+      if (Math.abs(curDur - realDur) < 0.05) return;
+      if (!item.inPoint || Number(item.inPoint) === 0) {
+        item.duration = realDur;
+        item.outPoint = realDur;
+        changed = true;
+      }
+    });
+    return changed;
   }
 
   function importGroupToTimeline(groupIdx) {
@@ -321,6 +356,10 @@ export function syncEditProject(p) {
     }
     if (project && project.editData && project.editData.edl) {
       _editState.edl = project.editData.edl;
+      // 老 timeline 数据可能用错误的 _sumGroupDuration（按 shots 累加 = 5）写入了
+      // duration / outPoint，但实际视频是 10s。这里用 sb.videoDurationSec 一次性纠正，
+      // 让段长立即变成真实视频时长。
+      _repairTimelineDurations();
       var btnEdl2 = $("btnEditGenEdl");
       if (btnEdl2) btnEdl2.disabled = false;
     }
@@ -345,6 +384,7 @@ export function syncEditProject(p) {
     // 刷新时也要把 BGM 选择器渲出来——之前只在 _analyzeEditSegments / _generateEditEdl
     // 之后才 render，导致用户刷新页面就完全看不到 BGM 区域，反馈"刷新后没看到 bgm"。
     _renderBgmSelector();
+    _renderBgmClearButton();
     _renderTransitionPanel();
     _wireTransitionControls();
 
@@ -430,7 +470,8 @@ export function syncEditProject(p) {
         waveformHtml +
         '<div class="edit-trim-handle edit-trim-left" data-side="left"></div>' +
         '<div class="edit-trim-handle edit-trim-right" data-side="right"></div>' +
-        '<button class="edit-seg-regen-btn" title="重新生成此片段" data-gidx="' + gIdx + '">&#x21bb;</button>';
+        '<button class="edit-seg-regen-btn" title="重新生成此片段" data-gidx="' + gIdx + '">&#x21bb;</button>' +
+        '<button class="edit-seg-remove-btn" title="从剪辑工作台移除此片段" data-gidx="' + gIdx + '">&#x2715;</button>';
 
       /* drag reorder */
       block.setAttribute("draggable", "true");
@@ -464,6 +505,24 @@ export function syncEditProject(p) {
           regenBtn.addEventListener("click", function (ev) {
             ev.stopPropagation();
             _regenSegment(idx);
+          });
+        })(gIdx);
+      }
+
+      /* remove button —— 把此片段从剪辑工作台移除（不删原视频文件） */
+      var removeBtn = block.querySelector(".edit-seg-remove-btn");
+      if (removeBtn) {
+        (function (idx) {
+          removeBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            showConfirm(
+              "移除片段 " + (idx + 1),
+              "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在批量页重新导入）",
+              function () {
+                removeGroupFromTimeline(idx);
+                showToast("已移除片段 " + (idx + 1), "ok");
+              }
+            );
           });
         })(gIdx);
       }
@@ -955,7 +1014,7 @@ export function syncEditProject(p) {
       showToast("片段 " + (groupIdx + 1) + " 正在生成中，请稍候", "warn");
       return;
     }
-    showConfirm("确定重新生成片段 " + (groupIdx + 1) + " 的视频？", function () {
+    showConfirm("重新生成片段 " + (groupIdx + 1), "确定重新生成这个片段的视频？", function () {
       showToast("正在重新生成片段 " + (groupIdx + 1) + "…", "ok");
       var btn = document.querySelector('.edit-seg-regen-btn[data-gidx="' + groupIdx + '"]');
       if (btn) { btn.disabled = true; btn.classList.add("animate-spin"); }
@@ -1088,6 +1147,12 @@ export function syncEditProject(p) {
     _editState._activeVid = "A";
     area.appendChild(_editState._vidA);
     area.appendChild(_editState._vidB);
+    // 两个 vid 都常驻 display:block + position:absolute 叠在一起，用 z-index 切换
+    // 哪个在上面。这样段间 cut 不会触发 display:none → block 的重新 paint 静帧。
+    _editState._vidA.style.display = "block";
+    _editState._vidA.style.zIndex = "2";
+    _editState._vidB.style.display = "block";
+    _editState._vidB.style.zIndex = "1";
 
     // 字幕浮层：底部居中、白字黑边、跟着 globalTime 切换内容
     if (!_editState._subtitleEl) {
@@ -1129,7 +1194,14 @@ export function syncEditProject(p) {
       var url = _segVideoUrl(segs[0], 0);
       if (url) {
         _editState._vidA.src = url;
-        _editState._vidA.currentTime = segs[0].inPoint || 0;
+        try { _editState._vidA.dataset.segIdx = "0"; } catch (_) {}
+        var seg0In = segs[0].inPoint || 0;
+        var seg0Start = seg0In === 0 ? SEEDANCE_INTRO_TRIM_SEC : seg0In;
+        var initSeek = function () { try { _editState._vidA.currentTime = seg0Start; } catch (_e) {} };
+        if (_editState._vidA.readyState >= 1) initSeek();
+        else _editState._vidA.addEventListener('loadedmetadata', function _h() {
+          _editState._vidA.removeEventListener('loadedmetadata', _h); initSeek();
+        });
         _editState._vidA.style.display = "block";
         _editState._vidA.load();
         var placeholder = $("editPreviewPlaceholder");
@@ -1198,6 +1270,11 @@ export function syncEditProject(p) {
     _editState._activeVid = _editState._activeVid === "A" ? "B" : "A";
   }
 
+  // Seedance i2v 视频的前 ~500 ms 几乎是参考图静帧（模型从图片"启动"到真正运动
+  // 需要时间，用户反馈 0.25s 还能看到一点封面；这里加大到 0.5s）。
+  // 5s 视频跳过 0.5s → 实际播 4.5s；10s 视频跳过 0.5s → 实际播 9.5s。
+  // 用户已全局关字幕，所以这 0.5s 损失不会"漏台词"。
+  var SEEDANCE_INTRO_TRIM_SEC = 0.5;
   function _loadSegToVid(vid, segIdx) {
     var segs = _getTimelineSegs();
     var seg = segs[segIdx];
@@ -1207,7 +1284,21 @@ export function syncEditProject(p) {
     if (vid.getAttribute("src") !== url) {
       vid.src = url;
     }
-    vid.currentTime = seg.inPoint || 0;
+    try { vid.dataset.segIdx = String(segIdx); } catch (_) {}
+    var baseIn = seg.inPoint || 0;
+    // 只对"自然 inPoint=0"的片段做 intro 跳过；用户手动剪过的就尊重它。
+    var startAt = baseIn === 0 ? SEEDANCE_INTRO_TRIM_SEC : baseIn;
+    // 如果 metadata 还没就绪，挂一次 loadedmetadata 再 seek，避免在 readyState=0 时
+    // 设置 currentTime 被浏览器忽略（结果还是从 0 帧开始，封面感原样）。
+    var trySeek = function () {
+      try { vid.currentTime = startAt; } catch (_e) {}
+    };
+    if (vid.readyState >= 1 /* HAVE_METADATA */) {
+      trySeek();
+    } else {
+      var once = function () { vid.removeEventListener('loadedmetadata', once); trySeek(); };
+      vid.addEventListener('loadedmetadata', once);
+    }
   }
 
   function _showVid(vid, transType) {
@@ -1226,9 +1317,21 @@ export function syncEditProject(p) {
     }
 
     if (!t || t === "cut") {
-      if (_editState._vidA) { _editState._vidA.style.display = "none"; _editState._vidA.style.opacity = "1"; }
-      if (_editState._vidB) { _editState._vidB.style.display = "none"; _editState._vidB.style.opacity = "1"; }
-      if (vid) vid.style.display = "block";
+      // 关键：cut 切换时**不要**用 display:none/block —— 浏览器在 display 切换瞬间
+      // 会有一个短暂的 paint，把刚 display:block 的 vid 显示成第 0 帧（即使 currentTime
+      // 已经 seek 到 0.5s），用户感知就是"段间夹了一张封面图"。
+      // 改用 z-index + opacity 切换：两个 vid 都常驻 display:block，仅靠 z-index 决定
+      // 哪个在上面，避免重新 layout / paint 静帧。
+      if (_editState._vidA) {
+        _editState._vidA.style.display = "block";
+        _editState._vidA.style.opacity = "1";
+        _editState._vidA.style.zIndex = (vid === _editState._vidA) ? "2" : "1";
+      }
+      if (_editState._vidB) {
+        _editState._vidB.style.display = "block";
+        _editState._vidB.style.opacity = "1";
+        _editState._vidB.style.zIndex = (vid === _editState._vidB) ? "2" : "1";
+      }
       _clearTransOverlay();
       return;
     }
@@ -1241,15 +1344,22 @@ export function syncEditProject(p) {
 
     if (t === "crossfade") {
       var outgoing = _getActiveVid();
-      if (vid) { vid.style.display = "block"; vid.style.opacity = "0"; }
-      if (outgoing && outgoing !== vid) outgoing.style.display = "block";
+      if (vid) { vid.style.display = "block"; vid.style.opacity = "0"; vid.style.zIndex = "2"; }
+      if (outgoing && outgoing !== vid) { outgoing.style.display = "block"; outgoing.style.zIndex = "3"; }
       var start = performance.now();
       function crossfadeTick(now) {
         var p = Math.min((now - start) / dur, 1);
         if (vid) vid.style.opacity = p;
         if (outgoing && outgoing !== vid) outgoing.style.opacity = (1 - p);
         if (p < 1) requestAnimationFrame(crossfadeTick);
-        else { if (outgoing && outgoing !== vid) { outgoing.style.display = "none"; outgoing.style.opacity = "1"; } }
+        else {
+          // crossfade 完成后保持 outgoing display:block + 退到 z-index 1，避免下次
+          // cut 切换时再次触发 display:none → block 的重 paint 闪封面。
+          if (outgoing && outgoing !== vid) {
+            outgoing.style.opacity = "1";
+            outgoing.style.zIndex = "1";
+          }
+        }
       }
       requestAnimationFrame(crossfadeTick);
 
@@ -1364,6 +1474,7 @@ export function syncEditProject(p) {
     if (vid) {
       var srcChanged = vid.getAttribute("src") !== url;
       if (srcChanged) vid.src = url;
+      try { vid.dataset.segIdx = String(segIdx); } catch (_) {}
       if (srcChanged && vid.readyState < 2) {
         vid.addEventListener("loadedmetadata", function onMeta() {
           vid.removeEventListener("loadedmetadata", onMeta);
@@ -1426,9 +1537,23 @@ export function syncEditProject(p) {
     var url = _segVideoUrl(seg, segIdx);
     if (vid) {
       if (vid.getAttribute("src") !== url) vid.src = url;
+      try { vid.dataset.segIdx = String(segIdx); } catch (_) {}
       var localOffset = _editState.globalTime - (_editState.segStartTimes[segIdx] || 0);
-      var targetTime = (seg.inPoint || 0) + localOffset;
-      vid.currentTime = targetTime;
+      var rawIn = seg.inPoint || 0;
+      // 关键修复（第一段开头封面）：当处于段开头 + inPoint=0 时，需要应用
+      // SEEDANCE_INTRO_TRIM_SEC 偏移跳过 i2v 启动静帧。否则用户每次"暂停后再点
+      // 播放"或第一次开播，都会看到第 0 帧封面图。
+      var targetTime = rawIn + localOffset;
+      if (rawIn === 0 && localOffset < 0.05) {
+        targetTime = SEEDANCE_INTRO_TRIM_SEC;
+      }
+      // 如果 vid metadata 还没加载好，同步 set currentTime 会被忽略，
+      // 必须等 loadedmetadata 再 seek，否则播放从第 0 帧开始 → 封面感。
+      var doVidSeek = function () { try { vid.currentTime = targetTime; } catch (_e) {} };
+      if (vid.readyState >= 1) doVidSeek();
+      else vid.addEventListener('loadedmetadata', function _h() {
+        vid.removeEventListener('loadedmetadata', _h); doVidSeek();
+      });
       _showVid(vid);
       _seekThenPlay(vid, targetTime);
     }
@@ -1547,7 +1672,44 @@ export function syncEditProject(p) {
     if (standby.getAttribute("src") !== url) {
       standby.src = url;
     }
-    standby.currentTime = nextSeg.inPoint || 0;
+    try { standby.dataset.segIdx = String(nextIdx); } catch (_) {}
+    // standby 必须 seek 到跳过 Seedance i2v 启动静帧的位置 —— 否则切到 standby
+    // 那一瞬间会闪一下 frame=0 的封面图（i2v 模型从图片"启动"到运动需要 ~0.5s）。
+    var rawIn = nextSeg.inPoint || 0;
+    var nextStart = rawIn === 0 ? SEEDANCE_INTRO_TRIM_SEC : rawIn;
+    var doSeek = function () {
+      try { standby.currentTime = nextStart; } catch (_e) {}
+      // 关键修复（封面闪一下）：很多浏览器在长时间静止 + display 切换的 vid 上
+      // 会先 paint 一帧旧的 frame buffer 才更新到当前 currentTime 的帧。这里做
+      // 一次"warm-up"——seek 完后短暂 muted-play 再 pause，强制浏览器把当前
+      // 帧 decode + paint 到 vid surface，下次切换显示就不会闪历史 frame。
+      var warmup = function () {
+        var prevMuted = standby.muted;
+        standby.muted = true;
+        var p = standby.play();
+        var stopWarm = function () {
+          try { standby.pause(); } catch (_) {}
+          standby.muted = prevMuted;
+          // pause 后再确保 currentTime 还在 trim 后位置（play 推进了一点点）
+          try { standby.currentTime = nextStart; } catch (_) {}
+        };
+        if (p && typeof p.then === 'function') {
+          p.then(function () { setTimeout(stopWarm, 60); }).catch(function () { stopWarm(); });
+        } else {
+          setTimeout(stopWarm, 60);
+        }
+      };
+      if (standby.readyState >= 2 /* HAVE_CURRENT_DATA */) warmup();
+      else {
+        var w2 = function () { standby.removeEventListener('canplay', w2); warmup(); };
+        standby.addEventListener('canplay', w2);
+      }
+    };
+    if (standby.readyState >= 1) doSeek();
+    else {
+      var once = function () { standby.removeEventListener('loadedmetadata', once); doSeek(); };
+      standby.addEventListener('loadedmetadata', once);
+    }
     standby.load();
   }
 
@@ -1577,6 +1739,9 @@ export function syncEditProject(p) {
       var segDur = _segDuration(seg);
       if (localTime > segDur) localTime = segDur;
       _editState.globalTime = (starts[curIdx] || 0) + localTime;
+      // 主循环每帧把 active vid 的 dataset.segIdx 同步到 currentSegIdx，确保字幕
+      // 反查不会因为某次 swap 漏写 dataset 导致一直读到上一段索引。
+      try { vid.dataset.segIdx = String(curIdx); } catch (_) {}
     }
 
     var segEnd = (starts[curIdx] || 0) + _segDuration(seg);
@@ -1597,9 +1762,24 @@ export function syncEditProject(p) {
       var transType = (nextSeg.transitionIn && nextSeg.transitionIn.type) || "cut";
 
       if (standby) {
-        var nextInPt = nextSeg.inPoint || 0;
+        // 切到下一段时跳过 Seedance i2v 启动静帧 —— 这是"段落之间像夹了张封面图"
+        // 的最后一道防线（_loadSegToVid / _prebufferNext / _initDoubleBuffer
+        // 都已加上同样的偏移）。
+        var rawIn = nextSeg.inPoint || 0;
+        var nextInPt = rawIn === 0 ? SEEDANCE_INTRO_TRIM_SEC : rawIn;
         var srcChanged = standby.getAttribute("src") !== nextUrl;
-        if (srcChanged) { standby.src = nextUrl; standby.load(); }
+        if (srcChanged) {
+          standby.src = nextUrl;
+          standby.load();
+          // 关键：src 刚变 + readyState=0，下面同步 set currentTime 会被
+          // 忽略；先等 loadedmetadata 再 seek，否则 doSwap 时 standby 还在
+          // 第 0 帧 → 段间闪一张静帧封面。
+          var _earlySeek = function () {
+            standby.removeEventListener('loadedmetadata', _earlySeek);
+            try { standby.currentTime = nextInPt; } catch (_e) {}
+          };
+          standby.addEventListener('loadedmetadata', _earlySeek);
+        }
 
         // 切换流程修正（v3）：
         //   v1 立刻 _showVid → 黑屏 + 音频先到
@@ -1624,6 +1804,9 @@ export function syncEditProject(p) {
           if (vid) { try { vid.pause(); } catch (_) {} }
           _editState.currentSegIdx = nextIdx;
           _editState.globalTime = _editState.segStartTimes[nextIdx] || 0;
+          // 给 standby vid 打段索引标签，字幕反查时可以严格定位到对应段，
+          // 不会再因为 _editState.currentSegIdx 异步切换中途看到错段。
+          try { standby.dataset.segIdx = String(nextIdx); } catch (_) {}
           _showVid(standby, transType);
           _swapBuffers();
           _seekThenPlay(standby, nextInPt);
@@ -1686,11 +1869,38 @@ export function syncEditProject(p) {
         maybeSwap();
 
         // 兜底：1.5s 后强切——但如果已经 swapped，绝对不再动 currentTime！
-        // 否则就是把已经播了 1.5s 的视频 seek 回起点，制造"第一秒重播"
+        // 否则就是把已经播了 1.5s 的视频 seek 回起点，制造"第一秒重播"。
+        // 关键：如果此时 standby 还没 ready（readyState<1）或者还没 seek 到 intro
+        // trim，强切会让用户看到一帧封面静帧。所以兜底里也分两段——先等 metadata
+        // 再 seek 再 doSwap，保证显示出来已经是 0.5s 之后的运动帧。
         setTimeout(function () {
           if (swapped) return;
-          try { standby.currentTime = nextInPt; } catch (_) {}
-          doSwap();
+          var hardSwap = function () {
+            if (swapped) return;
+            // 等 currentTime 真正落到 nextInPt 才执行 doSwap，避免封面闪一下
+            var atTarget = Math.abs(standby.currentTime - nextInPt) < 0.05;
+            if (atTarget || standby.readyState < 1) { doSwap(); return; }
+            var onSk = function () { standby.removeEventListener('seeked', onSk); doSwap(); };
+            standby.addEventListener('seeked', onSk);
+            try { standby.currentTime = nextInPt; } catch (_) {}
+            // 极端兜底：再过 400ms 还没 seeked 也强切，不能无限拖
+            setTimeout(function () {
+              try { standby.removeEventListener('seeked', onSk); } catch (_) {}
+              doSwap();
+            }, 400);
+          };
+          if (standby.readyState >= 1) {
+            try { standby.currentTime = nextInPt; } catch (_) {}
+            hardSwap();
+          } else {
+            var _wm = function () { standby.removeEventListener('loadedmetadata', _wm); hardSwap(); };
+            standby.addEventListener('loadedmetadata', _wm);
+            // metadata 仍然不来的极端兜底（200ms），按硬切走
+            setTimeout(function () {
+              try { standby.removeEventListener('loadedmetadata', _wm); } catch (_) {}
+              hardSwap();
+            }, 200);
+          }
         }, 1500);
       } else if (vid) {
         try { vid.pause(); } catch (_) {}
@@ -1706,42 +1916,181 @@ export function syncEditProject(p) {
     _editState._rafId = requestAnimationFrame(_editTickLoop);
   }
 
-  /** 当前 globalTime 应该展示的字幕文本（含 speaker 前缀剥除） */
+  /** 把"老板：xxx 帝王蟹：yyy"形式的多句对白拆成 [{speaker, text}, ...]
+   * speaker 仅作元数据（不进字幕），text 是真正显示的台词。
+   * 老的"只剥开头一段 speaker 前缀"实现会把后续每句的 speaker 名留在字幕里
+   * （用户截图：「家人们，今晚复盘。" 帝王蟹队长："先别画饼，手酸。」） */
+  function _splitDialogueLines(raw) {
+    if (!raw) return [];
+    var SPEAKER_RE = /([^：:\s「『""''""''『」』]{1,12})[：:]/g;
+    var anchors = [];
+    var m;
+    while ((m = SPEAKER_RE.exec(raw)) !== null) {
+      anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
+    }
+    if (!anchors.length) {
+      var t = raw.trim().replace(/^["'""'「『]+|["'""'」』]+$/g, '').trim();
+      return t ? [t] : [];
+    }
+    var out = [];
+    for (var i = 0; i < anchors.length; i++) {
+      var cur = anchors[i];
+      var nextStart = i + 1 < anchors.length
+        ? anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
+        : raw.length;
+      var text = raw.slice(cur.textStart, nextStart).trim();
+      text = text
+        .replace(/^["'""'「『]+/, '')
+        .replace(/["'""'」』]+$/, '')
+        .trim();
+      if (text) out.push(text);
+    }
+    return out;
+  }
+
+  /** 当前 globalTime 应该展示的字幕文本（已剥掉所有 speaker 前缀，
+   * 并按用户要求去掉逗号 / 句号—— 字幕里只留干净的台词内容） */
+  function _stripPunctForSubtitle(s) {
+    return String(s || '').replace(/[，。,.]/g, '').trim();
+  }
   function _currentSubtitleText() {
-    var segs = _tickCache.segs;
-    var starts = _tickCache.starts;
-    var idx = _editState.currentSegIdx;
+    var segs = _tickCache.segs || [];
+    var starts = _tickCache.starts || [];
+    // 段索引完全按 globalTime 在时间轴上的位置二分确定，跟 vid / currentSegIdx /
+    // dataset 都解耦。time line 上看到的 playhead 在哪段，字幕就显示哪段——
+    // 这是用户视觉上最一致的行为。
+    var gt = _editState.globalTime || 0;
+    var idx = segs.length - 1;
+    for (var ii = 0; ii < segs.length; ii++) {
+      var dStart = starts[ii] || 0;
+      var dEnd = dStart + _segDuration(segs[ii]);
+      if (gt < dEnd - 0.02) { idx = ii; break; }
+    }
+    if (idx < 0) idx = 0;
     var seg = segs && segs[idx];
     if (!seg || !project) return '';
     var gIdx = seg.groupIdx != null ? seg.groupIdx : idx;
     var sbs = Array.isArray(project.storyboards) ? project.storyboards : [];
     var shots = Array.isArray(project.shots) ? project.shots : [];
     var sb = sbs[gIdx];
-    var shotIdxs = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
     var lines = [];
-    for (var i = 0; i < shotIdxs.length; i++) {
-      var sh = shots[shotIdxs[i]];
-      if (!sh) continue;
-      var raw = String(sh.dialogue || '').trim();
-      if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-      // 剥 "角色名："前缀
-      lines.push(raw.replace(/^\s*[^：:]{1,12}\s*[：:]\s*/, '').replace(/^["'"'「]+|["'"'」]+$/g, '').trim());
+
+    // 字幕台词权威来源切换（关键修复）：
+    // 之前依赖 sb.shotIndices 推导段内 shot，但后端实际生成 videoPrompt 时
+    // 经常一段视频合并了 2-3 个 shot 的台词（shot[1].dialogue + shot[2].dialogue
+    // 一起塞进 sb[1] 的 prompt），用户能在视频里听到全部 5 句台词，但前端只读
+    // shot[gIdx].dialogue 的 2 句字幕，"还是靠限时排队" 等就永远不出现。
+    //
+    // 改成：优先从 sb.videoPrompt 文本里 regex 抓所有 `角色：「台词」` /
+    // `角色："台词"` 形式的引号字符串作为字幕——这是 AI 真正"说了什么"的来源。
+    // 仅当 prompt 抓不到任何台词时才退回 shots[].dialogue。
+    var prompt = (sb && sb.videoPrompt) || '';
+    if (prompt) {
+      // 角色名 1-12 字 + ：/: + 引号包裹的台词。
+      // 引号必须用 \u 转义显式写出，否则字符在保存 / 序列化过程中可能被规范化
+      // 成普通 ASCII 双引号，导致字符类退化、永远匹配不到中文引号 “…” 的台词。
+      // 覆盖：U+201C/D 中文双引号、U+2018/9 中文单引号、U+0022 ASCII 双引号、
+      // U+0027 ASCII 单引号、U+300C/D 「」、U+300E/F 『』。
+      var Q = '\u201C\u201D\u2018\u2019\u0022\u0027\u300C\u300D\u300E\u300F';
+      var DIALOG_RE = new RegExp(
+        '[\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9\\u00B7]{0,11}[\\uFF1A:]\\s*[' + Q + ']([^' + Q + '\\n]{1,80}?)[' + Q + ']',
+        'g'
+      );
+      var dm;
+      while ((dm = DIALOG_RE.exec(prompt)) !== null) {
+        var t = (dm[1] || '').trim();
+        var clean = _stripPunctForSubtitle(t);
+        if (clean) lines.push(clean);
+      }
+    }
+    if (!lines.length) {
+      // fallback：老路径，从 shots[].dialogue 取
+      var shotIdxs = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
+      for (var i = 0; i < shotIdxs.length; i++) {
+        var sh = shots[shotIdxs[i]];
+        if (!sh) continue;
+        var raw = String(sh.dialogue || '').trim();
+        if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
+        var pieces = _splitDialogueLines(raw);
+        for (var j = 0; j < pieces.length; j++) {
+          var c2 = _stripPunctForSubtitle(pieces[j]);
+          if (c2) lines.push(c2);
+        }
+      }
     }
     if (!lines.length) return '';
-    // 把段时长按行数均分；预留头 0.15s + 尾 0.15s
+    // 段内进度严格用 globalTime - segStart，跟段索引判定保持同一时间基准
     var segDur = _segDuration(seg);
-    var segStart = starts[idx] || 0;
-    var localT = _editState.globalTime - segStart;
-    var usable = Math.max(0.5, segDur - 0.3);
-    var each = usable / lines.length;
-    var k = Math.floor((localT - 0.15) / each);
-    if (k < 0 || k >= lines.length) return '';
-    return lines[k];
+    var segStart2 = starts[idx] || 0;
+    var localT = Math.max(0, gt - segStart2);
+    if (localT > segDur) localT = segDur;
+
+    // 字幕节奏 v4 —— 双策略：
+    //
+    // (a) 台词总长 <= 段长：按字符比例分配，留一点尾巴让最后一句保持到段尾。
+    //     minPerLine 保证短句不会一闪而过（段 4-5 这种 2 句词的段也能看清）。
+    //
+    // (b) 台词总长 > 段长（典型如段 3：7 句 ~14s 要塞进 10s）：
+    //     不能再用 minPerLine 兜底——4 字句和 9 字句被一起压缩成同等时长，
+    //     就会出现"短句字幕还在显示，AI 已经说到长句一半"的口型错位。
+    //     此时直接按字符比例分配可用时间（短句快过、长句慢过），
+    //     更贴近 AI 演员"字多说久"的真实节奏。
+    var perChar = 1 / 3.0;       // 0.33s / 字
+    var minPerLine = 1.9;        // 段时间充足时最短 1.9s
+    var TAIL_PAD = 0.2;          // 段尾留 0.2s 收尾
+    var avail = Math.max(0.5, segDur - TAIL_PAD);
+
+    var rawSum = 0;
+    for (var li0 = 0; li0 < lines.length; li0++) {
+      rawSum += Math.max(0.6, lines[li0].length) * perChar;
+    }
+
+    var ends = [];
+    var t = 0;
+    if (rawSum <= avail) {
+      // 策略 (a)：宽裕——用 minPerLine 撑短句，再按比例填到段尾
+      for (var li = 0; li < lines.length; li++) {
+        var d = Math.max(minPerLine, lines[li].length * perChar);
+        t += d;
+        ends.push(t);
+      }
+      if (t > 0 && t < avail) {
+        var pad = avail / t;
+        for (var pi = 0; pi < ends.length; pi++) ends[pi] *= pad;
+      }
+    } else {
+      // 策略 (b)：紧——纯按字符比例分配 avail，不再 minPerLine 兜底
+      var totalChar = 0;
+      for (var ci = 0; ci < lines.length; ci++) {
+        totalChar += Math.max(2, lines[ci].length); // 极短句保底 2 字权重
+      }
+      var t2 = 0;
+      for (var li2 = 0; li2 < lines.length; li2++) {
+        var w = Math.max(2, lines[li2].length);
+        t2 += avail * w / totalChar;
+        ends.push(t2);
+      }
+    }
+    // 字幕"延后量" SUB_LAG：每句字幕比算出来的"段内字符比例"边界**延后** 0.3s
+    // 切换。AI 视频演员普遍比"字数 × perChar"估算的纯字数节奏略慢——开场
+    // 还有动作 cue（账单啪一声、机位移动），演员真正开口比 0s 晚一拍；
+    // 句间也有反应停顿。延后切换 = 每句 hold 多 0.3s 等演员，前几句"字幕
+    // 跑在演员前面"的串台词感会消失。最后一句默认保留到段尾，不受影响。
+    var SUB_LAG = 0.3;
+    var pickedK = lines.length - 1;
+    for (var ki = 0; ki < lines.length - 1; ki++) {
+      if (localT < ends[ki] + SUB_LAG) { pickedK = ki; break; }
+    }
+    return lines[pickedK];
   }
 
   function _updateSubtitleFast() {
     var sub = _editState._subtitleEl;
     if (!sub) return;
+    // 切换中：currentSegIdx 已经指向下一段，但 standby 视频还没真正切到画面前置；
+    // 这时如果照常更新字幕，用户会看到"画面是上一段、字幕是下一段"的串台词。
+    // 切换期间冻结字幕，等画面 swap 完成后下一帧再刷新。
+    if (_editState._swapping) return;
     var text = _currentSubtitleText();
     var span = sub.firstElementChild;
     if (span && span.textContent !== text) span.textContent = text;
@@ -1953,6 +2302,7 @@ export function syncEditProject(p) {
           // E-4.2：BGM 选择 PATCH bgm-select。
           _sendTimelineOp({ op: "bgm-select", trackId: bgmId });
           _renderBgmSelector();
+          _renderBgmClearButton();
           // 立即同步到预览的 BGM player —— 用户点完应当立刻能在工作台听到效果
           _syncBgmPlayback();
           showToast("已选择 BGM，预览即时生效", "ok");
@@ -2031,12 +2381,56 @@ export function syncEditProject(p) {
     }
   }
 
-  /** 绑定"去除全部转场"按钮（只绑一次） */
+  /** 绑定"去除全部转场" + "去除 BGM"按钮（只绑一次） */
   function _wireTransitionControls() {
     var btn = $("btnEditClearTransitions");
-    if (!btn || btn.dataset.wired === "1") return;
-    btn.dataset.wired = "1";
-    btn.addEventListener("click", _clearAllTransitions);
+    if (btn && btn.dataset.wired !== "1") {
+      btn.dataset.wired = "1";
+      btn.addEventListener("click", _clearAllTransitions);
+    }
+    var bgmBtn = $("btnEditClearBgm");
+    if (bgmBtn && bgmBtn.dataset.wired !== "1") {
+      bgmBtn.dataset.wired = "1";
+      bgmBtn.addEventListener("click", _clearBgm);
+    }
+  }
+
+  /** 清空 BGM 选择，停止预览，写盘。可用「撤销」恢复。 */
+  function _clearBgm() {
+    if (!_editState.edl) {
+      showToast("还没有剪辑方案", "warn");
+      return;
+    }
+    var hasBgm = _editState.edl.bgm && _editState.edl.bgm.trackId;
+    if (!hasBgm) { showToast("当前未选 BGM", "ok"); return; }
+
+    _editSaveUndo();
+    _editState.edl.bgm = { trackId: null };
+
+    if (project) {
+      if (!project.editData) project.editData = {};
+      project.editData.edl = _editState.edl; // arch-guard:allow-editdata
+    }
+    // 后端也支持 bgm-select 把 trackId 置 null（清空选择）
+    _sendTimelineOp({ op: "bgm-select", trackId: null });
+
+    // 立即停止预览 audio
+    var bgmAudio = _editState._bgmAudio;
+    if (bgmAudio) {
+      try { bgmAudio.pause(); bgmAudio.removeAttribute("src"); bgmAudio.load(); } catch (_e) {}
+    }
+
+    _renderBgmSelector();
+    _renderBgmClearButton();
+    showToast("已去除 BGM，可用「撤销」恢复", "ok");
+  }
+
+  /** 根据当前 BGM 选择状态启用/禁用「去除 BGM」按钮 */
+  function _renderBgmClearButton() {
+    var btn = $("btnEditClearBgm");
+    if (!btn) return;
+    var hasBgm = !!(_editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId);
+    btn.disabled = !hasBgm;
   }
 
   /** 把 timeline 里所有 transitionIn 改成 cut，写盘 + 重渲染。可用 Undo 恢复。 */
@@ -2212,6 +2606,7 @@ export function syncEditProject(p) {
 
       _renderEditTimeline();
       _renderBgmSelector();
+      _renderBgmClearButton();
       _syncBgmPlayback();
       $("btnEditExport").disabled = false;
       // 把 LLM 给的剪辑思路一起 toast 出来，方便用户看出"AI 怎么剪的"
@@ -2446,12 +2841,20 @@ export function syncEditProject(p) {
     }
 
     var durText = info.duration ? _formatTime(info.duration) : "";
+    // type='clip' 的删除按钮 = 把片段从剪辑工作台移除（不删原视频）
+    // type='upload' 的删除按钮 = 删掉用户上传的素材文件
+    var deleteIconHtml = '';
+    if (info.type === "upload") {
+      deleteIconHtml = '<span class="edit-media-card-delete material-symbols-outlined" data-media-id="' + (info.mediaId || "") + '">close</span>';
+    } else if (info.type === "clip") {
+      deleteIconHtml = '<span class="edit-media-card-delete material-symbols-outlined" data-clip-gidx="' + info.idx + '" title="从剪辑工作台移除">close</span>';
+    }
     card.innerHTML = thumbHtml +
       '<div class="edit-media-card-info">' +
         '<span class="edit-media-card-name">' + escapeHtml(info.name) + '</span>' +
         (durText ? '<span class="edit-media-card-dur">' + durText + '</span>' : '') +
       '</div>' +
-      (info.type === "upload" ? '<span class="edit-media-card-delete material-symbols-outlined" data-media-id="' + (info.mediaId || "") + '">close</span>' : '');
+      deleteIconHtml;
 
     card.addEventListener("dragstart", function (ev) {
       ev.dataTransfer.setData("application/x-edit-media", JSON.stringify({
@@ -2474,7 +2877,18 @@ export function syncEditProject(p) {
     if (delBtn) {
       delBtn.addEventListener("click", function (ev) {
         ev.stopPropagation();
-        _deleteUploadedMedia(info.mediaId, info.idx);
+        if (info.type === "clip") {
+          showConfirm(
+            "移除片段 " + (info.idx + 1),
+            "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在批量页重新导入）",
+            function () {
+              removeGroupFromTimeline(info.idx);
+              showToast("已移除片段 " + (info.idx + 1), "ok");
+            }
+          );
+        } else {
+          _deleteUploadedMedia(info.mediaId, info.idx);
+        }
       });
     }
 

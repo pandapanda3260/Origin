@@ -12,6 +12,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 
@@ -368,7 +369,7 @@ export async function burnSubtitles(opts: {
   }
   const { createCanvas } = canvasMod;
 
-  const tmpDir = join(dirname(opts.outputPath), `_subs_${Date.now()}`);
+  const tmpDir = join(dirname(opts.outputPath), `_subs_${Date.now()}_${randomUUID().slice(0, 8)}`);
   mkdirSync(tmpDir, { recursive: true });
 
   const subPaths: string[] = [];

@@ -123,8 +123,6 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       };
 
       const poll = setInterval(tick, 1500);
-      // 立即推一帧当前状态
-      tick();
 
       function cleanup() {
         clearInterval(poll);
@@ -133,13 +131,20 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       }
 
       const onAbort = () => {
-        clearInterval(poll);
-        clearInterval(heartbeat);
-        closeOnce();
+        cleanup();
       };
       try {
         (req as any).signal?.addEventListener?.('abort', onAbort);
       } catch (_) {}
+
+      // 立即推一帧当前状态；即使首次 tick 抛异常也保证定时器被清理，不然会永远泄漏
+      try {
+        tick();
+      } catch (e) {
+        console.warn('[tasks/stream] initial tick error:', e);
+        try { send('task_failed', { taskId, reason: 'stream init error' }); } catch (_) {}
+        cleanup();
+      }
     },
     cancel() {
       closed = true;

@@ -13,7 +13,15 @@ export async function GET(req: NextRequest) {
   if (!user) return jsonError('unauthorized', 401);
 
   const bal = getBalance(user.id);
-  const plan = getPlan(bal.planCode) || PLANS[0];
+  // 未知 planCode 不要 fallback 成 PLANS[0]（那是 free），会把付费用户错误显示为免费。
+  // 找不到时构造一个"最小可用"的 plan 对象，仍然带上真实的 planCode。
+  const plan = getPlan(bal.planCode) || {
+    code: bal.planCode,
+    title: bal.planCode,
+    monthly_credits: 0,
+    price_cents_monthly: 0,
+    price_cents_yearly: 0,
+  };
 
   // 标记当前套餐
   const plansWithCurrent = PLANS.map((p) => ({ ...p, isCurrent: p.code === bal.planCode }));

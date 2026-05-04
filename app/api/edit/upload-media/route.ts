@@ -12,9 +12,23 @@ export const dynamic = 'force-dynamic';
 const DATA_DIR = join(process.cwd(), 'data');
 const UPLOADS_DIR = join(DATA_DIR, 'uploads');
 
+// 单文件上限：视频 / 音频 200 MB，图片 20 MB
+const MAX_AV_BYTES = 200 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+// 请求体总上限（稍微宽松：给 form 字段留点余量）
+const MAX_REQUEST_BYTES = MAX_AV_BYTES + 1 * 1024 * 1024;
+
+const ALLOWED_MIME_PREFIX = ['video/', 'audio/', 'image/'];
+
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
+
+  // 先看 content-length，阻止超大请求把整个 body 读进内存
+  const contentLength = Number(req.headers.get('content-length') || 0);
+  if (contentLength && contentLength > MAX_REQUEST_BYTES) {
+    return jsonError(`文件过大：请求体 ${Math.round(contentLength / 1024 / 1024)} MB 超过上限 ${Math.round(MAX_REQUEST_BYTES / 1024 / 1024)} MB`, 413);
+  }
 
   try {
     const form = await req.formData();
@@ -22,13 +36,25 @@ export async function POST(req: NextRequest) {
     const projectId = (form.get('projectId') || '').toString() || null;
     if (!file) return jsonError('没有上传文件', 400);
 
+    const mime = (file as any).type || 'application/octet-stream';
+    if (!ALLOWED_MIME_PREFIX.some((p) => mime.startsWith(p))) {
+      return jsonError('不支持的文件类型：' + mime, 415);
+    }
+    const kind = mime.startsWith('video') ? 'video' : mime.startsWith('audio') ? 'audio' : 'image';
+    const perFileLimit = kind === 'image' ? MAX_IMAGE_BYTES : MAX_AV_BYTES;
+    const declaredSize = Number((file as any).size || 0);
+    if (declaredSize && declaredSize > perFileLimit) {
+      return jsonError(`文件过大：${kind} 最大 ${Math.round(perFileLimit / 1024 / 1024)} MB`, 413);
+    }
+
     const buf = Buffer.from(await file.arrayBuffer());
+    if (buf.length > perFileLimit) {
+      return jsonError(`文件过大：${kind} 最大 ${Math.round(perFileLimit / 1024 / 1024)} MB`, 413);
+    }
+
     const id = randomUUID();
     const dir = join(UPLOADS_DIR, String(user.id));
     mkdirSync(dir, { recursive: true });
-
-    const mime = (file as any).type || 'application/octet-stream';
-    const kind = mime.startsWith('video') ? 'video' : mime.startsWith('audio') ? 'audio' : 'image';
     const ext = guessExt(mime);
     const filename = `${id}.${ext}`;
     writeFileSync(join(dir, filename), buf);

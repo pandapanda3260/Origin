@@ -367,23 +367,49 @@ export function getStoryboardGroups() {
     });
   });
 
-  // 用户反馈："视频节奏太慢了 我觉得是分镜图太多了的原因 ... 把在5秒内能完成
-  // 的内容放在一块 但是要保证能演完 比如前三个分镜其实一个分镜就能搞定了"
+  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持 5s / 10s 两档。
+  // 分组后端会按本组台词字数挑档位：≤18 字走 5s，>18 字走 10s。
+  // 10s 视频中文语速上限约 4 字/秒，也就是 **一组台词 ≤ 40 字**才保证念完。
   //
-  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持固定 3/5/10/15s 几档；
-  // 后端已锁死每段 5s。这里前端的分组算法配合：每段尽量打包 MAX_SHOTS_PER_GROUP
-  // 个连续同情绪镜头，让最终分镜数量大幅减少（实测 8 段→约 5-6 段）。
+  // 历史算法 bug：按"每组 ≤ 4 个镜头数"打包 → 4 × 5s = 20s 合成一组，
+  // Seedance 硬砍成 10s 后台词念不完。（用户实测片段 2：19s、230 字台词）
   //
-  // 算法：
-  //   · 严格按情绪段切分（setup / rising / climax / falling / resolution
-  //     之间一定是不同的分镜稿——情绪转折是讲故事节奏的天然边界）
-  //   · 每段最多打包 MAX_SHOTS_PER_GROUP（4）个镜头，让一张分镜稿正好画 2×2
-  //   · 同情绪段 5+ 镜头 → 平均切（3+2 而不是 4+1，避免孤儿镜头）
+  // 新算法：贪心打包，同一情绪段内，逐个镜头加入当前组，满足以下全部条件才加：
+  //   · 加上后总时长 ≤ MAX_GROUP_DURATION_SEC (10s)
+  //   · 加上后台词字数 ≤ MAX_GROUP_DIALOGUE_CHARS (45 字)
+  //   · 组内镜头数 ≤ MAX_SHOTS_PER_GROUP (4，分镜稿 2×2 上限)
+  // 任何一条不满足 → 先 flush 当前组，用当前镜头起新组。
   //
-  // 注意：之前还做过"单镜头台词密集（>50 字）独立成组"的处理——这是错的，
-  // 用户的剧本里多角色对白经常 50+ 字一镜，独立成组反而又把分镜数顶回 8 张。
-  // 现在去掉密集检测：信任模型在 5s 视频里用快剪表现多角色对白。
+  // 45 字的来历：10s 视频中文语速上限约 4.5 字/秒（一般 4 字/秒，快节奏能到
+  // 5 字/秒）。之前用过 40 字偏保守，分镜图会炸到 14 张节奏太碎；45 字
+  // 既给 Seedance 留 10% 余量，又把分镜数压到 10-12 张的可看节奏。
   var MAX_SHOTS_PER_GROUP = 4;
+  var MAX_GROUP_DURATION_SEC = 10;
+  var MAX_GROUP_DIALOGUE_CHARS = 45;
+
+  // 数"实际要念出来的字"：按行处理，每行剥掉"角色名（动作）："前缀，
+  // 剩下的引号内容当台词计数；引号外的动作/旁白不念（不计数）。
+  // 注意：不能用一条大正则吞整段——会跨行把前面的台词也吃掉只留最后一句。
+  function _dialogueCharCount(shot) {
+    var raw = String((shot && shot.dialogue) || '').trim();
+    if (!raw || raw === '——' || raw === '-' || raw === '无') return 0;
+    var lines = raw.split(/\r?\n/);
+    var total = 0;
+    var QUOTED_RE = /[「『""''"'‘’“”]([\s\S]*?)[」』""''"'‘’“”]/g;
+    var PUNCT_RE = /[\s，。！？、…—·,.!?"'()（）「」『』"'‘’“”]/g;
+    lines.forEach(function (line) {
+      // 剥掉开头 "角色名（可选动作）："前缀（上限 20 非冒号字符，避免误伤）
+      var stripped = line.replace(/^\s*[^：:\n]{1,20}[：:]\s*/, '');
+      var quoted = stripped.match(QUOTED_RE);
+      if (quoted && quoted.length) {
+        quoted.forEach(function (q) { total += q.replace(PUNCT_RE, '').length; });
+      } else {
+        // 没引号——可能是纯旁白/独白，整行都当台词念
+        total += stripped.replace(PUNCT_RE, '').length;
+      }
+    });
+    return total;
+  }
 
   // 第一步：按情绪段切成 emotion buckets
   var emoBuckets = [];
@@ -401,31 +427,55 @@ export function getStoryboardGroups() {
   });
   if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
 
-  // 第二步：每个情绪 bucket 内部均匀切成 MAX_SHOTS 张/组
+  // 第二步：每个情绪 bucket 内部贪心打包，受 Seedance 10s / 40 字硬约束
   var groups = [];
   emoBuckets.forEach(function (eb) {
     var items = eb.items;
-    var n = items.length;
-    if (!n) return;
-    // 计算切几组：n=1 → 1, n=2-4 → 1, n=5 → 2 (3+2), n=6 → 2 (3+3),
-    //            n=7 → 2 (4+3), n=8 → 2 (4+4), n=9 → 3 (3+3+3), 以此类推
-    var groupCount = Math.ceil(n / MAX_SHOTS_PER_GROUP);
-    var perGroup = Math.ceil(n / groupCount); // 平均每组数量（向上取整）
-    var k = 0;
-    for (var gi = 0; gi < groupCount; gi++) {
-      var remainingGroups = groupCount - gi;
-      var remainingItems = n - k;
-      // 让最后几组不会太小：用动态平均 ceil(remaining / remainingGroups)
-      var take = Math.min(perGroup, Math.ceil(remainingItems / remainingGroups));
-      var slice = items.slice(k, k + take);
+    if (!items.length) return;
+
+    var curItems = [];
+    var curDur = 0;
+    var curDia = 0;
+    var flush = function () {
+      if (!curItems.length) return;
       groups.push({
         groupIdx: groups.length,
-        shotIndices: slice.map(function (x) { return x.idx; }),
-        shots: slice.map(function (x) { return x.shot; }),
+        shotIndices: curItems.map(function (x) { return x.idx; }),
+        shots: curItems.map(function (x) { return x.shot; }),
         emotion: eb.emotion,
       });
-      k += take;
-    }
+      curItems = [];
+      curDur = 0;
+      curDia = 0;
+    };
+
+    items.forEach(function (item) {
+      var shot = item.shot;
+      var dur = Number(shot.duration || shot.durationSec || 4) || 4;
+      var dia = _dialogueCharCount(shot);
+
+      // 单个镜头自己就超约束：独占一组（上游应该拆，但这里别崩）
+      if (dur > MAX_GROUP_DURATION_SEC || dia > MAX_GROUP_DIALOGUE_CHARS) {
+        flush();
+        curItems = [item];
+        curDur = dur;
+        curDia = dia;
+        flush();
+        return;
+      }
+
+      var wouldExceed =
+        curDur + dur > MAX_GROUP_DURATION_SEC ||
+        curDia + dia > MAX_GROUP_DIALOGUE_CHARS ||
+        curItems.length >= MAX_SHOTS_PER_GROUP;
+
+      if (wouldExceed) flush();
+      curItems.push(item);
+      curDur += dur;
+      curDia += dia;
+    });
+
+    flush();
   });
 
   return groups;

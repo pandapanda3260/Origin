@@ -12,6 +12,13 @@ import { getBackgroundStylizeCount } from './assets.js';
 import { showBillingPaywall } from './billing.js';
 
 let _ctx = {};
+
+// 与 storyboard.js / videoPrompts.js / shots.js 一致的本地桥接：
+// _ctx.safeWriteBack 由 main.js 在 init 时注入；模块内统一通过这个 _safeWriteBack
+// 调用，避免散落的 `_ctx.safeWriteBack &&` 判空逻辑。
+function _safeWriteBack(id, fn, serverVersion) {
+  return _ctx.safeWriteBack ? _ctx.safeWriteBack(id, fn, serverVersion) : false;
+}
 let project = null;
 let settings = null;
 let videoState = null;
@@ -171,6 +178,8 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             if (task.videoUrl && project && Array.isArray(project.storyboards)) {
               if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
               if (!project.storyboards[gIdx].videoUrl) project.storyboards[gIdx].videoUrl = task.videoUrl;
+              var dSec = (result.patch && result.patch.durationSec) || (result.extra && result.extra.durationSec);
+              if (dSec) project.storyboards[gIdx].videoDurationSec = dSec;
             }
           } else if (st.status === "failed" || st.status === "timeout") {
             task.status = "failed"; task.statusCn = st.errorMsg || st.error_msg || "失败";
@@ -246,6 +255,11 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             if (project && t._groupIdx != null && Array.isArray(project.storyboards)) {
               if (!project.storyboards[t._groupIdx]) project.storyboards[t._groupIdx] = {};
               project.storyboards[t._groupIdx].videoUrl = url;
+              // 把后端真实时长（5s / 10s）写到 storyboard，剪辑工作台 timeline
+              // 段长就能用真实视频长度，避免出现"导入是 5s/AI 剪辑后变 10s"
+              var realDur = (extra && extra.durationSec) || 0;
+              if (!realDur && extra && extra.patch && extra.patch.durationSec) realDur = extra.patch.durationSec;
+              if (realDur) project.storyboards[t._groupIdx].videoDurationSec = realDur;
             }
             videoPipeline(t).then(function () { updateBadge(); renderBatchClipList(); });
           } else {
@@ -397,6 +411,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           if (isSucceeded && url && project && Array.isArray(project.storyboards)) {
             if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
             if (!project.storyboards[gIdx].videoUrl) project.storyboards[gIdx].videoUrl = url;
+            if (t.duration_sec) project.storyboards[gIdx].videoDurationSec = Number(t.duration_sec);
           }
 
           var sb = (project.storyboards && project.storyboards[gIdx]) || {};
@@ -424,6 +439,14 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           if (isSucceeded && task.videoUrl) {
             try { videoPipeline(task).then(function () { updateBadge(); renderBatchClipList(); }); }
             catch (_pe) {}
+          }
+
+          // 关键修复：对仍在 running 的视频任务挂 SSE 流，否则刷新后卡片
+          // 永远卡在"生成中"——后端继续跑、最终也写完 video_tasks，但前端不知道，
+          // 用户感觉"刷新后正在生成的视频丢了"。
+          if (!isSucceeded && !isFailed && task.serverTaskId) {
+            try { _attachTaskStream(task, task.serverTaskId); }
+            catch (_se) { console.warn('[VideoReattach] attach stream failed:', _se); }
           }
         });
       }
@@ -602,7 +625,15 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var bWrap = $("batchTaskListWrap");
     if (!bWrap || !task.cardEl) return;
     if (task._killed || (task._projectId && project && task._projectId !== project.id)) return;
-    var mirror = bWrap.querySelector('[data-mirror-id="' + task.localId + '"]');
+    // 优先按 groupIdx 复用 mirror（同一片段重新生成时不应该出现两张卡片）
+    // —— 用户反馈"片段 8 出现 2 次 / 名字都一样分不清"。
+    // groupIdx 缺失（极少见）才退回 localId。
+    var mirror = null;
+    if (task._groupIdx != null) {
+      mirror = bWrap.querySelector('[data-group-idx="' + task._groupIdx + '"]');
+      if (mirror) mirror.dataset.mirrorId = task.localId; // 让后续 localId 查找也能命中
+    }
+    if (!mirror) mirror = bWrap.querySelector('[data-mirror-id="' + task.localId + '"]');
 
     var st = task.status, fail = st === "failed" || st === "timeout";
     var done = st === "done", active = !isTerminal(task);
@@ -678,8 +709,24 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     if (!mirror) {
       mirror = document.createElement("div");
       mirror.dataset.mirrorId = task.localId;
-      if (bWrap.firstChild) bWrap.insertBefore(mirror, bWrap.firstChild);
-      else bWrap.appendChild(mirror);
+      if (task._groupIdx != null) mirror.dataset.groupIdx = String(task._groupIdx);
+      // 按 groupIdx 升序插入（片段 1, 2, 3, ...），用户不再被"乱序排列"困扰
+      var inserted = false;
+      if (task._groupIdx != null) {
+        var siblings = bWrap.children;
+        for (var si = 0; si < siblings.length; si++) {
+          var sib = siblings[si];
+          var sibGi = sib.dataset && sib.dataset.groupIdx != null ? Number(sib.dataset.groupIdx) : NaN;
+          if (Number.isFinite(sibGi) && sibGi > task._groupIdx) {
+            bWrap.insertBefore(mirror, sib);
+            inserted = true;
+            break;
+          }
+        }
+      }
+      if (!inserted) bWrap.appendChild(mirror);
+    } else if (task._groupIdx != null && mirror.dataset.groupIdx == null) {
+      mirror.dataset.groupIdx = String(task._groupIdx);
     }
 
     var existingPlayer = mirror.querySelector('.batch-inline-player');
@@ -995,12 +1042,19 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
 
   /* 把底层错误文本分类成用户看得懂的简短提示 */
   function _friendlyVideoError(errMsg) {
-    var s = ((errMsg == null) ? "" : String(errMsg)).toLowerCase();
-    try { if (s) console.debug('[friendlyVideoError] raw:', s.slice(0, 200)); } catch (_e) {}
+    var raw = ((errMsg == null) ? "" : String(errMsg));
+    var s = raw.toLowerCase();
+    try { if (s) console.debug('[friendlyVideoError] raw:', raw.slice(0, 200)); } catch (_e) {}
     if (!s) return "生成失败，请稍后重试";
-    if (/timeout|timed out|超时/.test(s)) return "等待时间过长，请稍后再试";
+    // 积分不足 —— 直接把后端原文（含具体积分数）透出来，不要再被改成"生成失败"
+    if (/积分不足|insufficient.*credit|余额.*不足|credits?.*insufficient/.test(raw)) {
+      // 只截前 60 字避免 UI 撑炸
+      return raw.length > 60 ? (raw.slice(0, 58) + '…') : raw;
+    }
+    if (/timeout|timed out|超时|排队过久/.test(s)) return "等待时间过长，请稍后再试";
     if (/network|econnreset|enet|fetch|connection/.test(s)) return "网络波动，请稍后再试";
     if (/content|policy|safety|blocked|敏感|违规/.test(s)) return "素材不符合内容规范，请调整后重试";
+    if (/quota|rate.?limit|429/.test(s)) return "通道繁忙，请稍后再试";
     return "生成失败，请稍后重试";
   }
 
@@ -1576,12 +1630,33 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var validCount = 0;
     var totalDurAll = 0;
 
+    // Seedance 只出 5s / 10s：本组台词 ≤18 字用 5s，否则 10s。
+    // 跟 batch-executors.ts 的决策完全一致，这样批量页显示的时长和实际成片一致。
+    function _seedanceDurForBatch(grp) {
+      var QUOTED_RE = /[「『""''"'‘’“”]([\s\S]*?)[」』""''"'‘’“”]/g;
+      var PUNCT_RE = /[\s，。！？、…—·,.!?"'()（）「」『』"'‘’“”]/g;
+      var total = 0;
+      (grp.shots || []).forEach(function (sh) {
+        var raw = String((sh && sh.dialogue) || '').trim();
+        if (!raw || raw === '——' || raw === '-' || raw === '无') return;
+        raw.split(/\r?\n/).forEach(function (line) {
+          var stripped = line.replace(/^\s*[^：:\n]{1,20}[：:]\s*/, '');
+          var quoted = stripped.match(QUOTED_RE);
+          if (quoted && quoted.length) {
+            quoted.forEach(function (q) { total += q.replace(PUNCT_RE, '').length; });
+          } else {
+            total += stripped.replace(PUNCT_RE, '').length;
+          }
+        });
+      });
+      return total > 18 ? 10 : 5;
+    }
+
     groups.forEach(function (group, gIdx) {
       var sb = project.storyboards[gIdx] || {};
       if (!sb.videoPrompt) return;
       validCount++;
-      var totalDur = 0;
-      group.shots.forEach(function (s) { totalDur += (s.duration || 4); });
+      var totalDur = _seedanceDurForBatch(group);
       totalDurAll += totalDur;
 
       var bcThumbSrc = sb.rawUrl || sb.imageUrl || '';

@@ -10,12 +10,10 @@
 import Database from 'better-sqlite3';
 import { hashSync } from 'bcryptjs';
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 const DATA_DIR = join(process.cwd(), 'data');
 const DB_PATH = process.env.DB_PATH || join(DATA_DIR, 'qd.sqlite');
-
-mkdirSync(DATA_DIR, { recursive: true });
 
 declare global {
   // eslint-disable-next-line no-var
@@ -23,6 +21,12 @@ declare global {
 }
 
 function open(): Database.Database {
+  // 在真正打开连接前建目录，避免 Next.js build 时 collect-page-data 阶段
+  // 因为 env 中的 DB_PATH 指向别的机器的绝对路径而直接崩掉整个构建。
+  // 运行时真正打不开 DB 会在下面 new Database() 自己抛。
+  try { mkdirSync(dirname(DB_PATH), { recursive: true }); } catch (_) {}
+  try { mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
@@ -256,11 +260,46 @@ function bootstrap(db: Database.Database) {
       value_json  TEXT NOT NULL DEFAULT '{}',
       updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
+
+    -- 注册邮箱验证码（OTP）
+    CREATE TABLE IF NOT EXISTS otp_codes (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      email        TEXT NOT NULL,
+      code_hash    TEXT NOT NULL,
+      purpose      TEXT NOT NULL DEFAULT 'register',
+      ip           TEXT,
+      used         INTEGER NOT NULL DEFAULT 0,
+      attempts     INTEGER NOT NULL DEFAULT 0,
+      expires_at   TEXT NOT NULL,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_codes(email, purpose, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_otp_ip ON otp_codes(ip, created_at DESC);
   `);
 
   seedDefaultUser(db);
   seedDefaultCredits(db);
   seedDefaultRedeemCodes(db);
+  migrateLedgerBuckets(db);
+}
+
+/**
+ * 迁移：给 credit_ledger 加 buckets_json 字段。
+ * 这个字段用来在 chargeCredits 时存"本次扣款从各桶各扣了多少"（{bonus, topup, subscription}），
+ * 后续 refundCredits 可以按 refId 找回原始桶分布，精准退回原桶。
+ * 不带这个字段时 refund 统一退到 bonus 桶（会把 subscription 额度永久化）。
+ */
+function migrateLedgerBuckets(db: Database.Database) {
+  try {
+    const cols = db.prepare("PRAGMA table_info(credit_ledger)").all() as Array<{ name: string }>;
+    const has = cols.some((c) => c.name === 'buckets_json');
+    if (!has) {
+      db.exec('ALTER TABLE credit_ledger ADD COLUMN buckets_json TEXT');
+      console.log('[db] migrated credit_ledger: added buckets_json');
+    }
+  } catch (e) {
+    console.warn('[db] migrateLedgerBuckets:', e);
+  }
 }
 
 function seedDefaultCredits(db: Database.Database) {
@@ -295,8 +334,9 @@ function seedDefaultRedeemCodes(db: Database.Database) {
     ['QDDEMO-5000', 5000, '示例兑换码 5000 积分'],
     ['QDDEMO-10000', 10000, '示例兑换码 10000 积分'],
   ];
+  // 示例码默认每个码每用户只能用一次（max_uses=1），避免被脚本撸光
   const stmt = db.prepare(
-    `INSERT INTO redeem_codes (code, credits, max_uses, used_count, memo) VALUES (?, ?, 100, 0, ?)`,
+    `INSERT INTO redeem_codes (code, credits, max_uses, used_count, memo) VALUES (?, ?, 1, 0, ?)`,
   );
   for (const [c, n, m] of codes) stmt.run(c, n, m);
   console.log('[db] Seeded redeem codes:', codes.map((c) => c[0]).join(', '));

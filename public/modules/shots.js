@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders } from './utils.js';
+import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from './utils.js';
 import { subscribeBatch } from './backend_stream.js';
 
 let _ctx = {};
@@ -183,7 +183,7 @@ function _renderScriptRefPanel() {
   if (!project || !project.script || !project.shots || !project.shots.length) {
     colWrap.hidden = true; return;
   }
-  var raw = project.script.replace(/\r\n/g, "\n");
+  var raw = stripStepTags(project.script).replace(/\r\n/g, "\n");
   _scriptParas = raw.split(/\n{2,}/).map(function (p) { return p.trim(); }).filter(Boolean);
   if (!_scriptParas.length) {
     _scriptParas = raw.split(/\n/).map(function (p) { return p.trim(); }).filter(Boolean);

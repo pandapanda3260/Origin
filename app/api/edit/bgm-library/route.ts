@@ -170,7 +170,21 @@ async function seedOneTrack(t: SeedTrack, outPath: string) {
 
 async function ensureSeedBgm() {
   if (!existsSync(BGM_DIR)) mkdirSync(BGM_DIR, { recursive: true });
+  // 进程级互斥：多个请求并发进入时只让第一个真正跑 seed，其他 await 同一个 Promise。
+  // 不然会同时 spawn 8 个 ffmpeg × N 请求，CPU 打满且 _meta.json 互相覆盖。
+  const g = globalThis as any;
+  if (g.__qd_bgm_seed_inflight__) return g.__qd_bgm_seed_inflight__;
+  g.__qd_bgm_seed_inflight__ = (async () => {
+    try {
+      await seedBgmImpl();
+    } finally {
+      g.__qd_bgm_seed_inflight__ = null;
+    }
+  })();
+  return g.__qd_bgm_seed_inflight__;
+}
 
+async function seedBgmImpl() {
   const existingFiles = new Set(
     readdirSync(BGM_DIR).filter((f) => /\.(mp3|wav|m4a|aac|ogg)$/i.test(f))
   );

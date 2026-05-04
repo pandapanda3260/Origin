@@ -42,7 +42,12 @@ function ensureEdl(proj: any): Edl {
 function sumGroupDuration(proj: any, groupIdx: number): number {
   const sbs: any[] = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
   const sb = sbs[groupIdx];
-  if (!sb || !Array.isArray(sb.shots) || !sb.shots.length) return 5;
+  if (!sb) return 5;
+  // 关键：优先用真实视频时长（5s/10s 是后端按台词字数动态决定后写入的权威字段）。
+  // 不走这一步会出现"导入剪辑台显示 5s 但实际视频是 10s / 字幕串到下一段"的错位。
+  const real = Number(sb.videoDurationSec);
+  if (real > 0) return real;
+  if (!Array.isArray(sb.shots) || !sb.shots.length) return 5;
   let dur = 0;
   for (const s of sb.shots) dur += Number(s?.duration) || 4;
   return dur || 5;
@@ -66,6 +71,25 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
   const edl = ensureEdl(proj);
   const sbs: any[] = Array.isArray(proj?.storyboards) ? [...proj.storyboards] : [];
   let sbsTouched = false;
+
+  // ⚠️ 一次性 normalize：老 timeline 里可能已经存了用错误 sumGroupDuration 写下的
+  // duration / outPoint（按 shots 累加 = 5），但实际视频是 10s。每次 mutation 前
+  // 用真实视频时长（sb.videoDurationSec）纠正一遍，让陈旧数据自动愈合落盘。
+  // 只动 inPoint=0 的段，避免覆盖用户已手动 trim 的范围。
+  for (const seg of edl.timeline) {
+    if (!seg || seg.groupIdx == null) continue;
+    const sb = sbs[seg.groupIdx];
+    if (!sb) continue;
+    const realDur = Number(sb.videoDurationSec) || 0;
+    if (!realDur) continue;
+    const curDur = Number(seg.duration) || 0;
+    if (Math.abs(curDur - realDur) < 0.05) continue;
+    const inP = Number(seg.inPoint) || 0;
+    if (inP === 0) {
+      seg.duration = realDur;
+      seg.outPoint = realDur;
+    }
+  }
 
   const op = String(body?.op || '');
   switch (op) {
@@ -190,7 +214,30 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
       if (!entry || typeof entry !== 'object') {
         return { edl, storyboards: null, error: '缺 entry' };
       }
-      edl.timeline.push(entry);
+      // 基础 schema 校验：防止前端塞任意大 JSON / 非数值字段
+      const clipId = typeof entry.clipId === 'string' ? entry.clipId.slice(0, 100) : '';
+      const mediaId = typeof entry.mediaId === 'string' ? entry.mediaId.slice(0, 100) : '';
+      if (!clipId && !mediaId && !entry.videoUrl) {
+        return { edl, storyboards: null, error: 'entry 必须带 clipId / mediaId / videoUrl 之一' };
+      }
+      if (Array.isArray(edl.timeline) && edl.timeline.length >= 500) {
+        return { edl, storyboards: null, error: '时间线条目超过上限（500 条）' };
+      }
+      const sanitized: Record<string, any> = {
+        clipId: clipId || undefined,
+        mediaId: mediaId || undefined,
+        videoUrl: typeof entry.videoUrl === 'string' ? entry.videoUrl.slice(0, 2000) : undefined,
+        inPoint: Number.isFinite(Number(entry.inPoint)) ? Number(entry.inPoint) : 0,
+        outPoint: Number.isFinite(Number(entry.outPoint)) ? Number(entry.outPoint) : undefined,
+        duration: Number.isFinite(Number(entry.duration)) ? Number(entry.duration) : undefined,
+        groupIdx: Number.isInteger(Number(entry.groupIdx)) ? Number(entry.groupIdx) : null,
+        transitionIn: entry.transitionIn && typeof entry.transitionIn === 'object'
+          ? { type: String((entry.transitionIn as any).type || 'cut').slice(0, 32) }
+          : (typeof entry.transitionIn === 'string' ? { type: entry.transitionIn.slice(0, 32) } : undefined),
+      };
+      // 去除 undefined 键
+      const cleaned = Object.fromEntries(Object.entries(sanitized).filter(([, v]) => v !== undefined));
+      edl.timeline.push(cleaned);
       break;
     }
     default:

@@ -322,6 +322,9 @@ export async function chatStream(
     return full;
   } finally {
     clearTimeout(streamTimer);
+    // 不论正常结束还是异常，都要释放 reader，避免 HTTP/2 / undici 连接不回池
+    try { await reader.cancel(); } catch (_) {}
+    try { reader.releaseLock(); } catch (_) {}
   }
 }
 

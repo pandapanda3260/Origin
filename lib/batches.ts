@@ -64,9 +64,9 @@ function _concurrencyFor(batchType: string): number {
   // 5 个片段并行 → 总时间约 = 单个片段时间 (1~2 分钟) 而非 5 倍
   if (batchType === 'video_segments' || batchType === 'videos') return 3;
   // 分镜图通常 ≤ 6 张：concurrency 6 会把中转站打到排队 → 后面的请求超时；
-  // 4 是一个相对稳的折中：5-6 张里"4 并行 + 1-2 即时补位"，比 3 体感快很多
-  // 又不会让中转排队太久。
-  if (batchType === 'storyboard_images') return 4;
+  // 3 比 4 慢一点点（5-6 张时差 1-2 张的并行位），但能显著降低中转 429 限流概率。
+  // 中转站每分钟总配额是固定的，并发越高越容易撞限流，4 多次实测会触发 bad_response。
+  if (batchType === 'storyboard_images') return 3;
   // 资产图可能有 10+ 张，concurrency 太高反而触发中转限流
   if (batchType === 'asset_images') return 3;
   return 3;
@@ -148,10 +148,90 @@ export function createBatch(opts: {
   // 后台启动（不 await，立即返回 batchId）
   setImmediate(() => {
     runBatch({ user: opts.user, batchId, batchType: opts.batchType, projectId: opts.projectId, options: opts.options || {} })
-      .catch((e) => console.error('[batch]', batchId, 'fatal:', e));
+      .catch((e) => {
+        console.error('[batch]', batchId, 'fatal:', e);
+        // 致命错误：把 batch 标 failed，退还还没消费的 running task 的预扣，避免永久卡 running
+        try {
+          const tasks = db
+            .prepare<{ bid: string }, any>(
+              "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status IN ('queued','running')",
+            )
+            .all({ bid: batchId });
+          db.prepare(
+            "UPDATE batch_tasks SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE batch_id=? AND status IN ('queued','running')",
+          ).run(`batch fatal: ${String(e?.message || e).slice(0, 500)}`, batchId);
+          db.prepare(
+            "UPDATE batches SET status='failed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+          ).run(batchId);
+          _emit(batchId, 'batch_completed', {
+            batchId, status: 'failed', reason: 'fatal error',
+            failedTaskIds: tasks.map((t: any) => t.id),
+          });
+        } catch (e2) {
+          console.error('[batch]', batchId, 'fatal cleanup also failed:', e2);
+        }
+      });
   });
 
   return { batchId, total };
+}
+
+/**
+ * 启动时调用一次：把上次进程退出时仍处于 queued/running 的 batch 全部标 failed，
+ * 并把它们还在 running 的 task 做一次退款尝试，避免用户积分被永久吞掉。
+ *
+ * 注意：这是一次"兜底清理"，不尝试续跑——续跑需要重建 setImmediate 上下文、
+ * 重新订阅 SSE，比本 app 的范围大得多；标 failed + 退款让用户手动重试更稳。
+ */
+export function reapOrphanBatches() {
+  const db = getDb();
+  try {
+    const orphanBatches = db
+      .prepare<[], any>(
+        "SELECT id, owner_id, batch_type FROM batches WHERE status IN ('queued','running')",
+      )
+      .all();
+    if (!orphanBatches.length) return;
+    console.warn(`[batch] reap: 发现 ${orphanBatches.length} 个孤儿 batch，标记 failed 并退款`);
+    for (const b of orphanBatches) {
+      // 退款还在 running 的 task
+      const runningTasks = db
+        .prepare<{ bid: string }, any>(
+          "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
+        )
+        .all({ bid: b.id });
+      const cost = costForBatchType(b.batch_type);
+      if (cost > 0 && runningTasks.length) {
+        for (const t of runningTasks) {
+          try {
+            refundCredits({
+              userId: b.owner_id,
+              amount: cost,
+              reason: `orphan batch reap:${b.batch_type}`,
+              refId: t.id,
+            });
+          } catch (e) {
+            console.error('[batch] reap refund failed for task', t.id, e);
+          }
+        }
+      }
+      db.prepare(
+        "UPDATE batch_tasks SET status='failed', error_msg='orphaned by server restart', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE batch_id=? AND status IN ('queued','running')",
+      ).run(b.id);
+      db.prepare(
+        "UPDATE batches SET status='failed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+      ).run(b.id);
+    }
+  } catch (e) {
+    console.error('[batch] reap orphan failed:', e);
+  }
+}
+
+function costForBatchType(batchType: string): number {
+  if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
+  if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
+  if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
+  return 0;
 }
 
 /**
@@ -268,7 +348,8 @@ async function runBatch(opts: {
         const msg = e?.message || String(e);
         // 任务失败：把刚预扣的积分退还
         if (cost > 0) {
-          try { refundCredits({ userId: opts.user.id, amount: cost, reason: `refund:${opts.batchType}`, refId: t.id }); } catch (_) {}
+          try { refundCredits({ userId: opts.user.id, amount: cost, reason: `refund:${opts.batchType}`, refId: t.id }); }
+          catch (refundErr) { console.error('[batch] refund failed:', opts.batchId, t.id, refundErr); }
         }
         db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
           .run(msg.slice(0, 1000), t.id);
@@ -288,7 +369,13 @@ async function runBatch(opts: {
     tryNext();
   });
 
-  const finalStatus = failed === 0 ? 'completed' : (succeeded === 0 ? 'failed' : 'completed');
+  const finalStatus = failed === 0
+    ? 'completed'
+    : succeeded === 0
+      ? 'failed'
+      : failed > succeeded
+        ? 'failed'
+        : 'partial';
   db.prepare(`UPDATE batches SET status=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(finalStatus, opts.batchId);
   _emit(opts.batchId, 'batch_completed', {
     batchId: opts.batchId,
@@ -297,6 +384,15 @@ async function runBatch(opts: {
     failed,
     total: succeeded + failed,
   });
+  // 60 秒后回收 EventEmitter，避免 _emitters map 无限膨胀。
+  // 留 60s 是给"stream 路由晚订阅一帧"的用户仍能收到最终事件；超时后即使有订阅也只是静默。
+  setTimeout(() => {
+    const e = _emitters.get(opts.batchId);
+    if (e) {
+      try { e.removeAllListeners(); } catch (_) {}
+      _emitters.delete(opts.batchId);
+    }
+  }, 60_000).unref?.();
 }
 
 /**
@@ -307,9 +403,15 @@ export function emitSnapshot(batchId: string) {
   if (snap) _emit(batchId, 'snapshot', snap);
 }
 
-export function getBatchSnapshot(batchId: string): any | null {
+export function getBatchSnapshot(batchId: string, ownerId?: number): any | null {
   const db = getDb();
-  const batch = db.prepare<{ id: string }, any>('SELECT * FROM batches WHERE id = @id').get({ id: batchId });
+  const batch = ownerId != null
+    ? db
+        .prepare<{ id: string; oid: number }, any>(
+          'SELECT * FROM batches WHERE id = @id AND owner_id = @oid',
+        )
+        .get({ id: batchId, oid: ownerId })
+    : db.prepare<{ id: string }, any>('SELECT * FROM batches WHERE id = @id').get({ id: batchId });
   if (!batch) return null;
   const tasks = db
     .prepare<{ bid: string }, any>('SELECT * FROM batch_tasks WHERE batch_id = @bid ORDER BY seq ASC')
@@ -338,8 +440,14 @@ function safeParse(s: string) {
 }
 
 /**
- * 查询当前用户在某项目下所有"未完成"（queued/running）的批次。
- * 前端刷新后调 /api/batch/active 用来 reattach SSE 订阅，恢复 UI 进度。
+ * 查询当前用户在某项目下"未完成 + 近期已完成"的批次。
+ * 包含两类：
+ *   1) 状态 queued / running 的（永远返回）
+ *   2) 状态 completed / failed 但最近 RECENT_BATCH_WINDOW_MS 内更新过的
+ *      —— 用来让刷新后还能看到刚跑完/失败的 task 卡片，
+ *      而不是因为整个 batch 完成了就从 UI 上彻底消失
+ *
+ * 前端刷新后调 /api/batch/active 用来 reattach SSE 订阅 + 恢复失败卡片。
  */
 export function getActiveBatchesForUser(opts: {
   ownerId: number;
@@ -352,27 +460,37 @@ export function getActiveBatchesForUser(opts: {
   tasks: any[];
 }> {
   const db = getDb();
+  // 30 分钟窗口：足够让用户回来翻看刚跑完的批次状态，又不会无限累积历史
+  const RECENT_BATCH_WINDOW_MS = 30 * 60 * 1000;
+  const recentCutoff = new Date(Date.now() - RECENT_BATCH_WINDOW_MS).toISOString();
+
   let rows: any[];
   if (opts.projectId) {
     rows = db
       .prepare<any[], any>(
         `SELECT id, batch_type, status FROM batches
          WHERE owner_id = ? AND project_id = ?
-           AND status IN ('queued', 'running')
+           AND (
+             status IN ('queued', 'running')
+             OR (status IN ('completed', 'failed', 'partial') AND updated_at > ?)
+           )
          ORDER BY created_at DESC
-         LIMIT 20`,
+         LIMIT 100`,
       )
-      .all(opts.ownerId, opts.projectId);
+      .all(opts.ownerId, opts.projectId, recentCutoff);
   } else {
     rows = db
       .prepare<any[], any>(
         `SELECT id, batch_type, status FROM batches
          WHERE owner_id = ?
-           AND status IN ('queued', 'running')
+           AND (
+             status IN ('queued', 'running')
+             OR (status IN ('completed', 'failed', 'partial') AND updated_at > ?)
+           )
          ORDER BY created_at DESC
-         LIMIT 20`,
+         LIMIT 100`,
       )
-      .all(opts.ownerId);
+      .all(opts.ownerId, recentCutoff);
   }
 
   return rows.map((r: any) => {

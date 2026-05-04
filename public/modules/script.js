@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags } from './utils.js';
 
 var _ctx = {};
 var project = null;
@@ -114,8 +114,9 @@ export function refreshScriptPage() {
 
   if (project.script) {
     resultCard.hidden = false;
-    if (displayText) displayText.textContent = project.script;
-    if (editArea) editArea.value = project.script;
+    var _cleanScript = stripStepTags(project.script);
+    if (displayText) displayText.textContent = _cleanScript;
+    if (editArea) editArea.value = _cleanScript;
     showScriptDisplay();
     if (project.styleBible) {
       bibleCard.hidden = false;
@@ -547,7 +548,12 @@ function _replayScriptConsultHistory() {
   }
   // 只给"最后一条 AI 且 ready"挂按钮——历史中间的 ready 消息就算出过，也早
   // 被后面的追问覆盖了，挂多个按钮反而迷惑。
-  if (lastAiBubble && lastAiReady) {
+  //
+  // 兼容老数据：早期后端写库时没把 readyToDraft 落到每条消息上（只存在
+  // sc.ready 模块级字段）。刷新回来如果 sc.ready=true 且尚未 confirm 过，
+  // 最后一条是 AI 的，就也当 ready 处理，避免"下一步按钮消失"。
+  var consultReadyFallback = !!sc.ready && !sc.confirmedAt && !project.script;
+  if (lastAiBubble && (lastAiReady || consultReadyFallback)) {
     _appendConfirmDraftButton(lastAiBubble);
   }
   box.dataset.consultVersion = tag;

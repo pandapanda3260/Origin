@@ -2,8 +2,13 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <!-- Safari 极其顽固地缓存这个 HTML + import map，导致改 ?v=NN 也没用。
+         强制 no-cache，让浏览器每次都重拉 HTML，import map 拿到的就是最新版本号。-->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>QD INFINITY · 视频Agent</title>
+    <title>ORIGINRISE · 视频Agent</title>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
@@ -120,8 +125,12 @@
 
     <!-- ===== Sidebar ===== -->
     <aside id="sidebar" class="fixed left-0 top-0 h-full w-72 flex flex-col py-8 px-6 bg-[#ffffff]/20 backdrop-blur-xl rounded-r-[3rem] border-r border-[#90A4AE]/10 z-40 shadow-[0px_0px_40px_rgba(11,19,32,0.04)]">
-      <div class="flex flex-col items-center gap-2 mb-4 px-4">
-        <img src="logo.png" alt="QD INFINITY" class="w-36 h-36 object-contain mb-2" />
+      <div class="flex flex-col items-center gap-1 mb-4 px-1">
+        <img src="originrise-logo.png" alt="ORIGINRISE" class="w-36 h-36 object-contain" />
+        <div class="flex flex-col items-center select-none -mt-1">
+          <div class="text-[1.05rem] leading-none font-light tracking-[0.25em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk'] whitespace-nowrap">ORIGINRISE</div>
+          <div class="text-[8px] mt-1.5 font-medium tracking-[0.18em] uppercase text-slate-500 dark:text-slate-400 whitespace-nowrap">Where Imagination Begins</div>
+        </div>
       </div>
 
       <!--
@@ -289,7 +298,7 @@
         <div class="max-w-5xl mx-auto">
           <header class="mb-12">
             <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">项目总览</h1>
-            <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1" id="overviewSub">Overview · 开始你的 AI 视频制作工作流</p>
+            <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1" id="overviewSub">Overview · The Cinema Operating System</p>
           </header>
 
           <div id="overviewEmpty" class="flex flex-col items-center justify-center py-24 text-center">
@@ -496,7 +505,7 @@
                       <div class="px-6 py-4 border-b border-[#CFD8DC]/60 bg-[#ECEFF1]/50">
                         <div class="flex items-center gap-2">
                           <span class="material-symbols-outlined text-primary text-base">movie_creation</span>
-                          <span class="text-[10px] font-black tracking-[0.15em] text-primary uppercase">QD INFINITY · AI</span>
+                          <span class="text-[10px] font-black tracking-[0.15em] text-primary uppercase">ORIGINRISE · AI</span>
                         </div>
                         <h3 class="text-lg font-semibold text-on-background mt-2" id="scriptCardTitle">剧本草稿</h3>
                       </div>
@@ -1199,6 +1208,16 @@
                     <span>去除全部转场</span>
                   </button>
                   <p class="text-[9px] text-white/25 mt-1.5 leading-relaxed">把所有转场改为硬切。可用「撤销」恢复</p>
+                  <button type="button" id="btnEditClearBgm"
+                          class="w-full mt-2 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md
+                                 border border-white/10 hover:border-white/25 hover:bg-white/5
+                                 text-[11px] font-medium text-white/60 hover:text-white/90
+                                 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                          disabled>
+                    <span class="material-symbols-outlined text-sm">music_off</span>
+                    <span>去除 BGM</span>
+                  </button>
+                  <p class="text-[9px] text-white/25 mt-1.5 leading-relaxed">清空 BGM 选择，导出无背景音乐版本</p>
                 </div>
               </div>
             </div>
@@ -1615,29 +1634,29 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=87",
-        "/modules/backend_stream.js": "/modules/backend_stream.js?v=87",
-        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=87",
-        "/modules/edit.js":           "/modules/edit.js?v=87",
-        "/modules/episodes.js":       "/modules/episodes.js?v=87",
-        "/modules/error_hub.js":      "/modules/error_hub.js?v=87",
-        "/modules/project.js":        "/modules/project.js?v=87",
-        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=87",
-        "/modules/script.js":         "/modules/script.js?v=87",
-        "/modules/settings.js":       "/modules/settings.js?v=87",
-        "/modules/shots.js":          "/modules/shots.js?v=87",
-        "/modules/store.js":          "/modules/store.js?v=87",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=87",
-        "/modules/tasks.js":          "/modules/tasks.js?v=87",
-        "/modules/utils.js":          "/modules/utils.js?v=87",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=87",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=87"
+        "/modules/assets.js":         "/modules/assets.js?v=95",
+        "/modules/backend_stream.js": "/modules/backend_stream.js?v=95",
+        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=95",
+        "/modules/edit.js":           "/modules/edit.js?v=95",
+        "/modules/episodes.js":       "/modules/episodes.js?v=95",
+        "/modules/error_hub.js":      "/modules/error_hub.js?v=95",
+        "/modules/project.js":        "/modules/project.js?v=95",
+        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=95",
+        "/modules/script.js":         "/modules/script.js?v=95",
+        "/modules/settings.js":       "/modules/settings.js?v=95",
+        "/modules/shots.js":          "/modules/shots.js?v=95",
+        "/modules/store.js":          "/modules/store.js?v=95",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=95",
+        "/modules/tasks.js":          "/modules/tasks.js?v=95",
+        "/modules/utils.js":          "/modules/utils.js?v=95",
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=95",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=95"
       }
     }
     </script>
-    <script type="module" src="modules/store.js?v=87"></script>
-    <script type="module" src="modules/utils.js?v=87"></script>
-    <script type="module" src="main.js?v=87"></script>
+    <script type="module" src="modules/store.js?v=95"></script>
+    <script type="module" src="modules/utils.js?v=95"></script>
+    <script type="module" src="main.js?v=95"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

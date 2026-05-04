@@ -244,6 +244,29 @@ export function refreshPromptsPage() {
   checkVideoPromptsConfirm();
 }
 
+// Seedance 只出 5s / 10s 两档；后端 batch-executors.ts 按本组台词字数挑：
+// ≤18 字 → 5s，>18 字 → 10s。前端展示时用完全相同的规则算出"实际成片时长"，
+// 这样左边片段条上的 `0:00-0:09` 和右边视频提示词里的 `0-5s / 0-10s` 永远对齐。
+function _seedanceGroupDuration(group) {
+  var QUOTED_RE = /[「『""''"'‘’“”]([\s\S]*?)[」』""''"'‘’“”]/g;
+  var PUNCT_RE = /[\s，。！？、…—·,.!?"'()（）「」『』"'‘’“”]/g;
+  var total = 0;
+  (group.shots || []).forEach(function (sh) {
+    var raw = String((sh && sh.dialogue) || '').trim();
+    if (!raw || raw === '——' || raw === '-' || raw === '无') return;
+    raw.split(/\r?\n/).forEach(function (line) {
+      var stripped = line.replace(/^\s*[^：:\n]{1,20}[：:]\s*/, '');
+      var quoted = stripped.match(QUOTED_RE);
+      if (quoted && quoted.length) {
+        quoted.forEach(function (q) { total += q.replace(PUNCT_RE, '').length; });
+      } else {
+        total += stripped.replace(PUNCT_RE, '').length;
+      }
+    });
+  });
+  return total > 18 ? 10 : 5;
+}
+
 function _renderVpStoryboardFrames() {
   var container = $("vpStoryboardFrames");
   if (!container) return;
@@ -259,12 +282,11 @@ function _renderVpStoryboardFrames() {
     var isActive = gIdx === _vpSelectedGroup;
     var hasDone = !!sb.videoPrompt;
 
-    var totalDur = 0;
-    group.shots.forEach(function (s) { totalDur += (s.duration || 4); });
+    var totalDur = _seedanceGroupDuration(group);
     var durStart = 0;
     for (var gi = 0; gi < gIdx; gi++) {
       var prevGroup = groups[gi];
-      if (prevGroup) prevGroup.shots.forEach(function (ps) { durStart += (ps.duration || 4); });
+      if (prevGroup) durStart += _seedanceGroupDuration(prevGroup);
     }
     var durEnd = durStart + totalDur;
 

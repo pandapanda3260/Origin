@@ -12,12 +12,22 @@ export const dynamic = 'force-dynamic';
 const DATA_DIR = join(process.cwd(), 'data');
 const IMAGES_DIR = join(DATA_DIR, 'images');
 
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;       // 20 MB
+const MAX_REQUEST_BYTES = MAX_IMAGE_BYTES + 1 * 1024 * 1024;
+
+const ALLOWED_MIME_PREFIX = ['image/'];
+
 /**
  * 用户上传一张自定义角色照片做参考图。
  */
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
+
+  const contentLength = Number(req.headers.get('content-length') || 0);
+  if (contentLength && contentLength > MAX_REQUEST_BYTES) {
+    return jsonError(`文件过大：请求体超过上限 ${Math.round(MAX_REQUEST_BYTES / 1024 / 1024)} MB`, 413);
+  }
 
   try {
     const form = await req.formData();
@@ -26,11 +36,24 @@ export async function POST(req: NextRequest) {
     const assetRef = (form.get('assetRef') || '').toString();
 
     if (!file) return jsonError('没有上传文件', 400);
+    const mime = (file as any).type || 'image/jpeg';
+    if (!ALLOWED_MIME_PREFIX.some((p) => mime.startsWith(p))) {
+      return jsonError('仅支持图片文件', 415);
+    }
+    const declaredSize = Number((file as any).size || 0);
+    if (declaredSize && declaredSize > MAX_IMAGE_BYTES) {
+      return jsonError(`图片过大：最大 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB`, 413);
+    }
+
     const buf = Buffer.from(await file.arrayBuffer());
+    if (buf.length > MAX_IMAGE_BYTES) {
+      return jsonError(`图片过大：最大 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB`, 413);
+    }
+
     const id = randomUUID();
     const dir = join(IMAGES_DIR, String(user.id));
     mkdirSync(dir, { recursive: true });
-    const ext = guessExt((file as any).type || '');
+    const ext = guessExt(mime);
     const filename = `${id}.${ext}`;
     writeFileSync(join(dir, filename), buf);
 
@@ -44,7 +67,7 @@ export async function POST(req: NextRequest) {
       projectId || null,
       assetRef || null,
       filename,
-      (file as any).type || 'image/jpeg',
+      mime,
       buf.length,
     );
 

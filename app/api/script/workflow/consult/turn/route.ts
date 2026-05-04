@@ -59,7 +59,11 @@ export async function POST(req: NextRequest) {
         const newMessages = [
           ...(existing.messages || []),
           { role: 'user' as const, content: userMsg },
-          { role: 'assistant' as const, content: buf.trim() },
+          // 把 readyToDraft 落到消息本身，刷新后前端回放能正确判断"是否挂确认按钮"
+          // （否则只能依赖 sc.ready 兜底，多轮后追问可能误判）
+          // 存剥干净的 replyMain 而不是原始 buf——不然历史里会残留 <step>…</step>
+          // 标签（某些推理模型无视 prompt 里"禁止 <step>"的约束），刷新后回放穿帮。
+          { role: 'assistant' as const, content: replyMain, readyToDraft: ready },
         ];
         updateProjectForUser(projectId, user.id, {
           scriptConsult: {

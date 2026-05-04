@@ -6,6 +6,13 @@
  *   - schema 简单（不需要 N 张子表）
  *   - 整个项目读一行就拿到全部，前端 saveProject() 直接整体覆盖
  *   - 后期需要做按字段查询时，再按需拆分
+ *
+ * 并发安全：
+ *   - updateProjectForUser 把读 + 合并 + 写整体放进 db.transaction().immediate()，
+ *     在同一事务内部再读一次最新 data_json 再合并，避免 TOCTOU 丢写。
+ *   - 对于"读全项目 → 在 JS 里改数组某一项 → 写回"的典型模式（batch 执行器常用），
+ *     应使用 patchProjectForUser(id, uid, patcher)：patcher 在事务里拿到最新数据，
+ *     返回 patch 对象；这样多个 batch task 并发时每个都基于最新状态计算。
  */
 import { randomUUID } from 'node:crypto';
 import { getDb, type ProjectRow } from './db';
@@ -105,27 +112,22 @@ export function createProjectForUser(userId: number, payload: any = {}) {
   return getProjectByIdForUser(id, userId)!;
 }
 
-export function updateProjectForUser(id: string, userId: number, patch: any) {
-  const db = getDb();
-  const existing = db
-    .prepare<{ id: string; uid: number }, ProjectRow>(
-      'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
-    )
-    .get({ id, uid: userId });
-  if (!existing) return null;
-
+function applyPatchToRow(existing: ProjectRow, patch: any): {
+  title: string;
+  description: string;
+  coverUrl: string | null;
+  status: string;
+  dataJson: string;
+} {
   let data: any = {};
   try { data = JSON.parse(existing.data_json || '{}'); } catch { data = {}; }
-  // 浅合并：上层每次保存都把整个项目对象传过来
   const newData = { ...data, ...(patch || {}) };
 
-  // name 和 title 同义，任一传入都更新到 title 列
   const title = patch.name ?? patch.title ?? existing.title;
   const description = patch.description ?? existing.description;
   const coverUrl = patch.coverUrl ?? existing.cover_url;
   const status = patch.status ?? existing.status;
 
-  // 把列字段从 data_json 里清掉
   delete newData.id;
   delete newData.name;
   delete newData.title;
@@ -136,14 +138,83 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
   delete newData.updatedAt;
   delete newData.ownerId;
 
-  db.prepare(
-    `UPDATE projects
-     SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     WHERE id = ? AND owner_id = ?`,
-  ).run(title, description, coverUrl, status, JSON.stringify(newData), id, userId);
+  return {
+    title,
+    description,
+    coverUrl,
+    status,
+    dataJson: JSON.stringify(newData),
+  };
+}
 
-  return getProjectByIdForUser(id, userId);
+/**
+ * 用 patch 覆盖/合并指定字段。在事务里重新读最新行再合并，防止 TOCTOU。
+ * 注意：如果 patch 里的某个键是数组（如 storyboards），这里仍然是整体替换，
+ *      和其他并发 writer 的数组修改之间仍然可能冲突——这类场景请用 patchProjectForUser。
+ */
+export function updateProjectForUser(id: string, userId: number, patch: any) {
+  const db = getDb();
+  let hit = false;
+  const txn = db.transaction(() => {
+    const existing = db
+      .prepare<{ id: string; uid: number }, ProjectRow>(
+        'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
+      )
+      .get({ id, uid: userId });
+    if (!existing) return;
+    hit = true;
+    const applied = applyPatchToRow(existing, patch || {});
+    db.prepare(
+      `UPDATE projects
+       SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND owner_id = ?`,
+    ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
+  });
+  txn.immediate();
+  return hit ? getProjectByIdForUser(id, userId) : null;
+}
+
+/**
+ * 读-改-写原子版：在事务内 SELECT 当前行，把解析出的项目对象交给 patcher，
+ * patcher 返回 patch 对象（字段会浅合并到 data_json）。整个过程在 IMMEDIATE
+ * 事务里完成，多个并发 batch task 串行化。
+ *
+ * 使用示例（批量执行器）：
+ *   patchProjectForUser(projectId, userId, (current) => {
+ *     const sbs = Array.isArray(current.storyboards) ? [...current.storyboards] : [];
+ *     while (sbs.length <= groupIdx) sbs.push({});
+ *     sbs[groupIdx] = { ...sbs[groupIdx], imageUrl: url };
+ *     return { storyboards: sbs };
+ *   });
+ */
+export function patchProjectForUser(
+  id: string,
+  userId: number,
+  patcher: (current: any) => any | null | undefined,
+) {
+  const db = getDb();
+  let hit = false;
+  const txn = db.transaction(() => {
+    const existing = db
+      .prepare<{ id: string; uid: number }, ProjectRow>(
+        'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
+      )
+      .get({ id, uid: userId });
+    if (!existing) return;
+    hit = true;
+    const current = rowToPublic(existing);
+    const patch = patcher(current) || {};
+    const applied = applyPatchToRow(existing, patch);
+    db.prepare(
+      `UPDATE projects
+       SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND owner_id = ?`,
+    ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
+  });
+  txn.immediate();
+  return hit ? getProjectByIdForUser(id, userId) : null;
 }
 
 export function deleteProjectForUser(id: string, userId: number) {

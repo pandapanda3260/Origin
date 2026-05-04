@@ -1,5 +1,5 @@
 /**
- * QD INFINITY · AI 可视化分镜工作台 — v2.7-web
+ * ORIGINRISE · AI 可视化分镜工作台 — v2.7-web
  */
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,

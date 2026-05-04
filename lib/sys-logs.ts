@@ -24,8 +24,29 @@ const ring: LogEntry[] = [];
 let installed = false;
 
 export function pushLog(level: LogLevel, message: string) {
-  ring.push({ ts: Date.now(), level, message: message.slice(0, 2000) });
+  const redacted = redactSensitive(message).slice(0, 2000);
+  ring.push({ ts: Date.now(), level, message: redacted });
   if (ring.length > MAX) ring.splice(0, ring.length - MAX);
+}
+
+/**
+ * 敏感字段脱敏：
+ *  - Authorization: Bearer <xxx> → Bearer [REDACTED]
+ *  - ?token=<xxx> / &token=<xxx> → ?token=[REDACTED]
+ *  - password / password_hash 键 → [REDACTED]
+ *  - Long JWT-ish strings（3 段点分隔 base64）→ [REDACTED]
+ *
+ * 目的：admin 能读日志也不能顺路读出其他用户的 token / 密码。
+ */
+function redactSensitive(s: string): string {
+  let out = s;
+  out = out.replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer [REDACTED]');
+  out = out.replace(/([?&])token=[^&\s"']+/gi, '$1token=[REDACTED]');
+  out = out.replace(/\b(password|password_hash|passwordHash)\s*[:=]\s*"[^"]*"/gi, '$1:"[REDACTED]"');
+  out = out.replace(/\b(password|password_hash|passwordHash)\s*[:=]\s*'[^']*'/gi, '$1:\'[REDACTED]\'');
+  // JWT: 三段点分隔 base64（每段 ≥20 字符）
+  out = out.replace(/\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+/g, '[REDACTED_JWT]');
+  return out;
 }
 
 export function readLogs(opts: { level?: 'warning' | 'all'; lines?: number } = {}) {

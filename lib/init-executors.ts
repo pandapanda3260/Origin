@@ -7,7 +7,19 @@
  */
 import './batch-executors';
 import { installConsoleHook } from './sys-logs';
+import { reapOrphanBatches } from './batches';
+import { reapOrphanExports } from './exports-reap';
 
 installConsoleHook();
 
+// 启动时回收上次进程留下的孤儿 batch/export + 退款
+// 用 globalThis 标记避免 HMR 下重复 reap
+const reapKey = '__qd_batches_reaped__';
+if (!(globalThis as any)[reapKey]) {
+  (globalThis as any)[reapKey] = true;
+  try { reapOrphanBatches(); } catch (e) { console.error('[init] reapOrphanBatches:', e); }
+  try { reapOrphanExports(); } catch (e) { console.error('[init] reapOrphanExports:', e); }
+}
+
 export const __EXECUTORS_INITIALIZED__ = true;
+

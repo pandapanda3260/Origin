@@ -129,7 +129,37 @@ export async function POST(req: NextRequest) {
       dedup.push(v);
     }
 
-    if (!dedup.length) {
+    // ⚠️ 用户在剪辑工作台手动删除过的片段，不能再被 AI 剪辑"自动捡回"。
+    // 双重过滤：
+    //   1) 优先用前端传的 segments（用户视角的 timeline 当前状态——最权威）
+    //   2) 退一步用 project.storyboards[gi].importedToEdit（DB 持久化标记）
+    // 用户反馈："一键剪辑会把之前已删除的镜头自动导进来"——根因是这里之前没做任何过滤，
+    // 直接从 video_tasks 读所有 completed，把删过的也带回 EDL。
+    const frontendSegments: any[] = Array.isArray(body?.segments) ? body.segments : [];
+    let allowedGroupIdx: Set<number> | null = null;
+    if (frontendSegments.length > 0) {
+      allowedGroupIdx = new Set(
+        frontendSegments
+          .map((s) => Number(s?.groupIdx))
+          .filter((n) => Number.isInteger(n)),
+      );
+    } else {
+      // 前端没传（旧客户端 / 直接调 API）→ 看 importedToEdit 字段
+      const sbsForFilter: any[] = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+      allowedGroupIdx = new Set();
+      for (let gi = 0; gi < sbsForFilter.length; gi++) {
+        if (sbsForFilter[gi] && sbsForFilter[gi].importedToEdit === true) {
+          allowedGroupIdx.add(gi);
+        }
+      }
+    }
+    const filtered = allowedGroupIdx.size > 0
+      ? dedup.filter((v) => allowedGroupIdx!.has(Number(v.group_idx)))
+      : dedup;
+    // 如果过滤后空了 → 回退到全集（避免用户没勾选时直接报错）
+    const finalVideos = filtered.length > 0 ? filtered : dedup;
+
+    if (!finalVideos.length) {
       writer.error('当前还没有已生成的视频片段，先去批量页生成');
       return;
     }
@@ -151,7 +181,7 @@ export async function POST(req: NextRequest) {
       return lines.join(' / ');
     };
 
-    const clips = dedup.map((v: any) => {
+    const clips = finalVideos.map((v: any) => {
       const gIdx = Number(v.group_idx);
       const dialogue = dialogueForGroup(gIdx);
       return {

@@ -21,7 +21,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   const batchId = params.id;
   if (!batchId) return new Response('bad id', { status: 400 });
 
-  const snapshot = getBatchSnapshot(batchId);
+  const snapshot = getBatchSnapshot(batchId, user.id);
   if (!snapshot) return new Response('not found', { status: 404 });
 
   const encoder = new TextEncoder();
