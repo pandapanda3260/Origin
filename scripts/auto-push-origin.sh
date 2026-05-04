@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+export GIT_SSH_COMMAND="ssh -i /Users/mark/.ssh/id_ed25519_origin_github -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
 branch="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$branch" != "main" ]]; then
   echo "auto-push skipped: current branch is '$branch', expected 'main'." >&2
