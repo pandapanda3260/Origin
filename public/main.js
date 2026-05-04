@@ -1548,27 +1548,78 @@ var _projectEpoch = 0;
   var _profileChatHistory = [];
   var _profileChatSending = false;
   var _globalCreatorProfile = {};
+
+  function _profilePick(p, keys) {
+    p = p || {};
+    for (var i = 0; i < keys.length; i++) {
+      var v = p[keys[i]];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return "";
+  }
+
+  function _normalizeCreatorProfileClient(profile) {
+    var p = profile || {};
+    var camera = _profilePick(p, ["cameraStyle", "cameraPrefs"]);
+    var mood = _profilePick(p, ["moodStyle", "moodTone"]);
+    var updatedAt = _profilePick(p, ["updatedAt", "lastUpdated"]);
+    return Object.assign({}, p, {
+      visualStyle: _profilePick(p, ["visualStyle"]),
+      narrativeStyle: _profilePick(p, ["narrativeStyle"]),
+      cameraStyle: camera,
+      cameraPrefs: camera,
+      moodStyle: mood,
+      moodTone: mood,
+      promptHabits: _profilePick(p, ["promptHabits"]),
+      duration: _profilePick(p, ["duration"]),
+      freeText: _profilePick(p, ["freeText"]),
+      updatedAt: updatedAt,
+      lastUpdated: updatedAt,
+      rawDialog: Array.isArray(p.rawDialog) ? p.rawDialog : [],
+    });
+  }
+
+  function _hasCreatorProfileContent(profile) {
+    var p = _normalizeCreatorProfileClient(profile);
+    return ["visualStyle", "narrativeStyle", "cameraStyle", "moodStyle", "promptHabits", "duration", "freeText"].some(function (key) {
+      return !!(p[key] || "").trim();
+    });
+  }
+
+  function _compactCreatorProfileForApi(profile) {
+    var p = _normalizeCreatorProfileClient(profile);
+    if (!_hasCreatorProfileContent(p)) return null;
+    return {
+      visualStyle: p.visualStyle,
+      narrativeStyle: p.narrativeStyle,
+      cameraStyle: p.cameraStyle,
+      cameraPrefs: p.cameraPrefs,
+      moodStyle: p.moodStyle,
+      moodTone: p.moodTone,
+      promptHabits: p.promptHabits,
+      duration: p.duration,
+      freeText: p.freeText,
+    };
+  }
   
   function getActiveCreatorProfile() {
     if (project && project.creatorProfileOverride) {
-      var ov = project.creatorProfileOverride;
-      var hasContent = Object.keys(ov).some(function (k) { return k !== "lastUpdated" && ov[k]; });
-      if (hasContent) return ov;
+      var ov = _normalizeCreatorProfileClient(project.creatorProfileOverride);
+      if (_hasCreatorProfileContent(ov)) return ov;
     }
-    return _globalCreatorProfile || {};
+    return _normalizeCreatorProfileClient(_globalCreatorProfile || {});
   }
   
   function formatCreatorProfileForApi() {
-    var p = getActiveCreatorProfile();
-    var hasContent = Object.keys(p).some(function (k) { return k !== "lastUpdated" && p[k]; });
-    return hasContent ? p : null;
+    return _compactCreatorProfileForApi(getActiveCreatorProfile());
   }
   
   async function loadCreatorProfile() {
     try {
       var resp = await fetch("/api/profile", { headers: _getAuthHeaders() });
       if (resp.ok) {
-        _globalCreatorProfile = await resp.json();
+        _globalCreatorProfile = _normalizeCreatorProfileClient(await resp.json());
+        _profileChatHistory = Array.isArray(_globalCreatorProfile.rawDialog) ? _globalCreatorProfile.rawDialog.slice() : [];
         _renderProfileCard();
       }
     } catch (e) { console.warn("[Profile] load failed:", e); }
@@ -1577,12 +1628,12 @@ var _projectEpoch = 0;
   function _renderProfileCard() {
     var container = $("profileCardContent");
     if (!container) return;
-    var p = _globalCreatorProfile || {};
+    var p = _normalizeCreatorProfileClient(_globalCreatorProfile || {});
     var fields = [
       { key: "visualStyle", label: "视觉风格", labelEn: "Visual Style" },
       { key: "narrativeStyle", label: "叙事风格", labelEn: "Narrative Tone" },
-      { key: "cameraPrefs", label: "镜头偏好", labelEn: "Camera Prefs" },
-      { key: "moodTone", label: "情绪基调", labelEn: "Mood & Tone" },
+      { key: "cameraStyle", label: "镜头偏好", labelEn: "Camera Prefs" },
+      { key: "moodStyle", label: "情绪基调", labelEn: "Mood & Tone" },
       { key: "promptHabits", label: "提示词习惯", labelEn: "Prompt Habits" },
       { key: "duration", label: "常用时长", labelEn: "Duration" },
       { key: "freeText", label: "其他偏好", labelEn: "Other" },
@@ -1640,8 +1691,8 @@ var _projectEpoch = 0;
       html += '</div>';
     }
 
-    if (p.lastUpdated) {
-      var d = new Date(p.lastUpdated);
+    if (p.updatedAt) {
+      var d = new Date(p.updatedAt);
       html += '<div class="text-[10px] text-[#a5b4bc] pt-4">更新于 ' + d.toLocaleString("zh-CN") + '</div>';
     }
     container.innerHTML = html;
@@ -1744,7 +1795,7 @@ var _projectEpoch = 0;
         _profileChatHistory.push({ role: "assistant", content: reply });
 
         if (resp.profile) {
-          _globalCreatorProfile = resp.profile;
+          _globalCreatorProfile = _normalizeCreatorProfileClient(resp.profile);
           _renderProfileCard();
           // Phase 3-B-10：/api/profile/chat 成功时后端已经把 creatorProfile
           // 落进 user_<uid>.json 了，前端不再 mirror 到 localStorage。
@@ -1770,7 +1821,7 @@ var _projectEpoch = 0;
 
   function _resetProfile() {
     showConfirm("重置创作偏好", "确定要重置所有创作偏好吗？", function () {
-    _globalCreatorProfile = {};
+    _globalCreatorProfile = _normalizeCreatorProfileClient({});
     _profileChatHistory = [];
     // Phase 3-B-10：重置只改内存 + 下方 apiPost("/api/profile", {profile:{}})
     // 就够了，sw_creator_profile 这个 localStorage 镜像已经不再写入。
@@ -1807,8 +1858,8 @@ var _projectEpoch = 0;
       editor.hidden = true;
       return;
     }
-    var ov = project.creatorProfileOverride;
-    var hasContent = Object.keys(ov).some(function (k) { return k !== "lastUpdated" && ov[k]; });
+    var ov = _normalizeCreatorProfileClient(project.creatorProfileOverride);
+    var hasContent = _hasCreatorProfileContent(ov);
     toggle.checked = hasContent;
     editor.hidden = !hasContent;
     if (hasContent) {

@@ -2146,6 +2146,7 @@ async function _uploadCharImage(charIdx, file) {
   formData.append("file", file);
   formData.append("projectId", project.id || "default");
   formData.append("charIdx", String(charIdx));
+  formData.append("assetRef", "characters[" + charIdx + "]");
 
   try {
     var authToken = "";
@@ -2158,6 +2159,32 @@ async function _uploadCharImage(charIdx, file) {
     var data = await resp.json();
     if (data.error) {
       showToast(data.error, "error");
+      return;
+    }
+    if (!data.taskId && data.url) {
+      var ch = project.assets && project.assets.characters && project.assets.characters[charIdx];
+      if (!ch) {
+        showToast("上传成功，但当前角色不存在", "warn");
+        return;
+      }
+      var uploadedUrl = data.url;
+      var displayUrl = data.signedUrl || uploadedUrl;
+      if (typeof _ctx.archiveOldImage === "function") _ctx.archiveOldImage(ch, "character-upload");
+      ch.realPhotoUrl = uploadedUrl;
+      ch.rawUrl = uploadedUrl;
+      ch.imageUrl = uploadedUrl;
+      ch.pencilUrl = uploadedUrl;
+      delete ch._pencilFailed;
+      _ctx.saveProject();
+      updateAssetCardImage("char", charIdx, "done", displayUrl);
+      renderAssets();
+      showToast("角色图上传成功，已保存为当前参考图", "success");
+      var entityType = ((ch.entityType || "human") + "").toLowerCase();
+      if (entityType !== "non-human") {
+        _retryPencilConversion(charIdx).catch(function (e) {
+          console.warn("[CharUpload] stylize after upload failed:", e && e.message);
+        });
+      }
       return;
     }
     if (!data.taskId) {

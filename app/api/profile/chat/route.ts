@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream, chatComplete, parseJsonLoose } from '@/lib/llm';
 import { getJson, setJson } from '@/lib/kv-db';
+import { DEFAULT_CREATOR_PROFILE, normalizeCreatorProfile } from '@/lib/creator-profile';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,10 +28,7 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({} as any));
   const userMsg: string = (body.message || body.text || '').toString();
-  const cur: any = getJson('user_profiles', user.id, {
-    visualStyle: '', narrativeStyle: '', cameraStyle: '', moodStyle: '', promptHabits: '',
-    rawDialog: [], updatedAt: null,
-  });
+  const cur = normalizeCreatorProfile(getJson('user_profiles', user.id, DEFAULT_CREATOR_PROFILE));
   const dialog = Array.isArray(cur.rawDialog) ? cur.rawDialog : [];
 
   return sseResponse(async (writer) => {
@@ -51,10 +49,10 @@ export async function POST(req: NextRequest) {
     buf = stripStepTags(buf).trim();
 
     const newDialog = [...dialog, { role: 'user', content: userMsg }, { role: 'assistant', content: buf.trim() }];
-    let persona = { ...cur };
+    let persona = normalizeCreatorProfile(cur);
 
-    // 每 4 轮自动提炼一次画像
-    if (newDialog.length >= 4 && newDialog.length % 4 === 0) {
+    // 画像为空时立即补提炼；之后降低频率，避免 gpt-5.4-pro 结构化调用频繁阻塞聊天。
+    if (newDialog.length >= 4 && (!hasProfileFields(persona) || newDialog.length % 12 === 0)) {
       try {
         const raw = await chatComplete(
           user,
@@ -68,16 +66,18 @@ export async function POST(req: NextRequest) {
             maxTokens: 700,
             modelRole: 'structured',
             reasoningEffort: 'medium',
-            requestTimeoutMs: 12_000,
+            requestTimeoutMs: 45_000,
           },
         );
         const j = parseJsonLoose(raw);
-        persona = { ...persona, ...j };
-      } catch (_) {}
+        persona = normalizeCreatorProfile({ ...persona, ...j });
+      } catch (e: any) {
+        console.warn('[profile/chat] persona derive failed:', e?.message || String(e));
+      }
     }
 
-    persona.rawDialog = newDialog;
-    persona.updatedAt = new Date().toISOString();
+    const now = new Date().toISOString();
+    persona = normalizeCreatorProfile({ ...persona, rawDialog: newDialog, updatedAt: now, lastUpdated: now });
     setJson('user_profiles', user.id, persona);
 
     writer.done({ reply: buf.trim(), profile: persona, persona });
@@ -86,4 +86,11 @@ export async function POST(req: NextRequest) {
 
 function stripStepTags(text: string): string {
   return String(text || '').replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
+}
+
+function hasProfileFields(profile: any): boolean {
+  const p = normalizeCreatorProfile(profile);
+  return Boolean(
+    p.visualStyle || p.narrativeStyle || p.cameraStyle || p.moodStyle || p.promptHabits || p.duration || p.freeText,
+  );
 }

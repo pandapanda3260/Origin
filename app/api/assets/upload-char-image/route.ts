@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDb } from '@/lib/db';
+import { buildSignedImageUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -71,9 +72,16 @@ export async function POST(req: NextRequest) {
       buf.length,
     );
 
+    const url = `/api/images/file/${id}`;
+    const signed = buildSignedImageUrl(id, user.id);
     return jsonOk({
       ok: true,
-      url: `/api/images/file/${id}`,
+      id,
+      assetId: id,
+      url,
+      signedUrl: signed.url,
+      signedTtl: signed.ttl,
+      signedExpiresAt: signed.expiresAt,
       message: '上传成功',
     });
   } catch (e: any) {
