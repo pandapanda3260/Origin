@@ -21,13 +21,20 @@ declare global {
 }
 
 function open(): Database.Database {
-  // 在真正打开连接前建目录，避免 Next.js build 时 collect-page-data 阶段
-  // 因为 env 中的 DB_PATH 指向别的机器的绝对路径而直接崩掉整个构建。
-  // 运行时真正打不开 DB 会在下面 new Database() 自己抛。
-  try { mkdirSync(dirname(DB_PATH), { recursive: true }); } catch (_) {}
+  // 先尝试 env 指定的 DB_PATH；如果它的父目录不存在且无法创建（典型：.env.local 残留
+  // 了别的机器的绝对路径），自动回落到项目本地 data/qd.sqlite，避免整个 dev server 全 500。
+  let finalPath = DB_PATH;
+  try { mkdirSync(dirname(finalPath), { recursive: true }); }
+  catch (e: any) {
+    if (finalPath !== join(DATA_DIR, 'qd.sqlite')) {
+      console.warn(`[db] DB_PATH "${finalPath}" 目录无法创建（${e?.code || e?.message}），回落到 ${join(DATA_DIR, 'qd.sqlite')}`);
+      finalPath = join(DATA_DIR, 'qd.sqlite');
+    }
+  }
   try { mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+  try { mkdirSync(dirname(finalPath), { recursive: true }); } catch (_) {}
 
-  const db = new Database(DB_PATH);
+  const db = new Database(finalPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   bootstrap(db);
