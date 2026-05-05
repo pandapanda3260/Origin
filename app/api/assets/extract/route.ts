@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
       const characters = await chatCompleteJsonWithRetry(
         user,
         buildAssetCharactersExtractMessages(finalScript, styleBible),
-        { temperature: 0.35, maxTokens: 3500, modelRole: 'structured' },
+        { temperature: 0.35, maxTokens: 6000, modelRole: 'structured' },
         (raw) => {
           const json = parseJsonLoose(raw);
           return ensureArray(json.characters);

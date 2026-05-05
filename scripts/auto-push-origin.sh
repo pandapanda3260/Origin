@@ -4,14 +4,15 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
-export GIT_SSH_COMMAND="ssh -i /Users/mark/.ssh/id_ed25519_origin_github -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -p 443"
+export GIT_SSH_COMMAND="ssh -i /Users/mark/.ssh/id_ed25519_origin_github -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -p 443"
 
 retry() {
   local attempts="$1"
+  local delay="$2"
+  shift
   shift
 
   local n=1
-  local delay=2
   while true; do
     if "$@"; then
       return 0
@@ -28,9 +29,12 @@ retry() {
   done
 }
 
-if ! retry 2 bash -lc 'ssh -i /Users/mark/.ssh/id_ed25519_origin_github -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -p 443 -T git@ssh.github.com 2>&1 | grep -q "successfully authenticated"' ; then
-  echo "auto-push stopped: unable to reach GitHub over SSH on port 443. Check local network access or GitHub SSH availability." >&2
-  exit 4
+if command -v nc >/dev/null 2>&1; then
+  if ! nc -z -G 15 ssh.github.com 443 >/dev/null 2>&1 && ! nc -z -w 15 ssh.github.com 443 >/dev/null 2>&1; then
+    echo "auto-push warning: TCP probe to ssh.github.com:443 failed; continuing so git fetch/push can report the authoritative error." >&2
+  fi
+else
+  echo "auto-push warning: nc not found; skipping TCP probe and letting git fetch/push validate GitHub access." >&2
 fi
 
 branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -46,7 +50,7 @@ if ! git diff --cached --quiet; then
   git commit -m "chore: automated hourly sync $(date '+%Y-%m-%d %H:%M:%S %Z')"
 fi
 
-retry 2 git fetch origin main
+retry 5 5 git fetch origin main
 
 if git rev-parse --verify origin/main >/dev/null 2>&1; then
   if git merge-base --is-ancestor origin/main HEAD; then
@@ -59,4 +63,4 @@ if git rev-parse --verify origin/main >/dev/null 2>&1; then
   fi
 fi
 
-retry 2 git push origin main
+retry 5 5 git push origin main
