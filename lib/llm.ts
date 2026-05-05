@@ -36,6 +36,9 @@ export type LLMOptions = {
   modelRole?: TextModelRole;
   reasoningEffort?: string | null;
   requestTimeoutMs?: number;
+  traceName?: string;
+  traceAttempt?: number;
+  traceMaxAttempts?: number;
   // 覆盖默认模型选择（默认用 settings 里的 text 模型）
   modelOverride?: string;
 };
@@ -143,17 +146,21 @@ async function responsesComplete(
     opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS,
     `LLM 请求超时（>${Math.round((opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS) / 1000)}s 未返回）`,
   );
+  const status = String(json?.status || json?.response?.status || 'unknown');
+  const usage = summarizeResponsesUsage(json);
+  const incompleteDetails = getResponsesIncompleteDetails(json);
   const incompleteReason = getResponsesIncompleteReason(json);
   if (incompleteReason) {
-    const usage = summarizeResponsesUsage(json);
     console.warn(
-      `[llm.responses] incomplete role=${cfg.role || 'unknown'} model=${opts.modelOverride || cfg.model} ` +
+      `[llm.responses] incomplete ${formatResponsesTrace(cfg, opts)} ` +
+      `status=${status} incomplete_details=${formatIncompleteDetails(incompleteDetails)} ` +
       `reason=${incompleteReason} usage=${formatUsageSummary(usage)}`,
     );
     const err: any = new Error(`LLM Responses 输出不完整（reason=${incompleteReason}）：请提高 maxTokens 或降低 reasoningEffort`);
     err.llmStatus = 'incomplete';
     err.incompleteReason = incompleteReason;
     err.usage = usage;
+    err.incompleteDetails = incompleteDetails;
     throw err;
   }
   const content = extractResponsesText(json);
@@ -161,6 +168,10 @@ async function responsesComplete(
     const status = typeof json?.status === 'string' ? `，status=${json.status}` : '';
     throw new Error(`LLM 返回结构异常（缺 Responses output_text${status}）`);
   }
+  console.info(
+    `[llm.responses] complete ${formatResponsesTrace(cfg, opts)} ` +
+    `status=${status} incomplete_details=none usage=${formatUsageSummary(usage)}`,
+  );
   return stripThinkBlocks(content);
 }
 
@@ -183,6 +194,33 @@ function formatUsageSummary(usage: ReturnType<typeof summarizeResponsesUsage> | 
     `total=${usage.totalTokens ?? 'n/a'}`,
     `reasoning=${usage.reasoningTokens ?? 'n/a'}`,
   ].join(',');
+}
+
+function formatResponsesTrace(cfg: ResolvedModelConfig, opts: LLMOptions): string {
+  const attempt = opts.traceAttempt
+    ? ` attempt=${opts.traceAttempt}/${opts.traceMaxAttempts || '?'}`
+    : '';
+  return [
+    `task=${opts.traceName || 'unknown'}`,
+    attempt.trim(),
+    `role=${cfg.role || opts.modelRole || 'unknown'}`,
+    `provider=${cfg.provider}`,
+    `model=${opts.modelOverride || cfg.model}`,
+    `maxTokens=${opts.maxTokens ?? 4096}`,
+  ].filter(Boolean).join(' ');
+}
+
+function getResponsesIncompleteDetails(json: any): any {
+  return json?.incomplete_details || json?.response?.incomplete_details || null;
+}
+
+function formatIncompleteDetails(details: any): string {
+  if (!details) return 'none';
+  try {
+    return JSON.stringify(details);
+  } catch {
+    return String(details);
+  }
 }
 
 /** 从中转站/OpenAI 风格的错误体中抽 message，方便上层显示友好提示 */
@@ -481,7 +519,7 @@ function getResponsesIncompleteReason(json: any): string {
   const status = String(json?.status || json?.response?.status || '').toLowerCase();
   if (status !== 'incomplete') return '';
 
-  const details = json?.incomplete_details || json?.response?.incomplete_details || {};
+  const details = getResponsesIncompleteDetails(json) || {};
   const reason = details?.reason
     || json?.incomplete_reason
     || json?.response?.incomplete_reason
@@ -519,6 +557,9 @@ export async function chatCompleteJsonWithRetry<T = any>(
         ...opts,
         responseFormat: 'json_object',
         modelRole: opts.modelRole || 'structured',
+        traceName: taskName,
+        traceAttempt: attempt,
+        traceMaxAttempts: maxAttempts,
       });
       const parsed = parser(raw);
       console.info(`[${taskName}] attempt ${attempt}/${maxAttempts} succeeded in ${Date.now() - t0}ms (${taskMeta})`);
@@ -529,7 +570,8 @@ export async function chatCompleteJsonWithRetry<T = any>(
       const elapsedMs = Date.now() - t0;
       console.warn(
         `[${taskName}] attempt ${attempt}/${maxAttempts} failed in ${elapsedMs}ms ` +
-        `(reason=${decision.reason}, retryable=${decision.retryable}, ${taskMeta}, usage=${formatUsageSummary(e?.usage)}):`,
+        `(reason=${decision.reason}, retryable=${decision.retryable}, ${taskMeta}, ` +
+        `usage=${formatUsageSummary(e?.usage)}, incomplete_details=${formatIncompleteDetails(e?.incompleteDetails)}):`,
         e?.message,
       );
       if (!decision.retryable) throw e;
