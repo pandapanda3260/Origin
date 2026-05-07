@@ -153,23 +153,68 @@ Use the synthetic fixture for smoke checks:
 npm run prompt-eval:report -- --samples fixtures/prompt-eval/sample.example.jsonl
 ```
 
+Compare legacy and candidate reports:
+
+```bash
+npm run prompt-eval:report -- --baseline legacy-report.json --candidate candidate-report.json
+```
+
 Comparison summary shape:
 
 ```json
 {
-  "winRate": 0,
-  "lossRate": 0,
-  "tieRate": 0,
-  "hardFailureDelta": 0,
-  "leakDelta": 0,
-  "outputCharDelta": 0,
-  "latencyDelta": 0
+  "comparableCases": 0,
+  "orphanCandidates": 0,
+  "orphanCandidateCaseIds": [],
+  "comparison": {
+    "comparableCases": 0,
+    "winRate": 0,
+    "lossRate": 0,
+    "tieRate": 0,
+    "hardFailureDelta": 0,
+    "leakDelta": 0,
+    "outputCharDelta": 0,
+    "outputCharP95Delta": 0,
+    "latencyDelta": 0,
+    "latencyP95Delta": 0
+  },
+  "byModule": {
+    "styleBible": {
+      "comparableCases": 0,
+      "winRate": 0,
+      "lossRate": 0,
+      "tieRate": 0,
+      "hardFailureDelta": 0,
+      "leakDelta": 0,
+      "outputCharDelta": 0,
+      "outputCharP95Delta": 0,
+      "latencyDelta": 0,
+      "latencyP95Delta": 0
+    }
+  }
 }
 ```
+
+`comparison` is global. `byModule` repeats the same metrics per module, so a
+single improved module cannot hide another module regressing. Candidate-only
+cases are reported as `orphanCandidates` and `orphanCandidateCaseIds`; they are
+not counted as comparable cases.
 
 In P0-0, `schemaOk` is a sample/report field, not automatic schema validation.
 P0-2 should add zod or JSON Schema validation for JSON extractor modules before
 claiming automatic schema compliance.
+
+Quality scoring and verdict threshold:
+
+- `jsonOk: true` adds 2; `jsonOk: false` subtracts 4.
+- `schemaOk: true` adds 2; `schemaOk: false` subtracts 4.
+- `requiredFieldCompleteness` adds up to 2 points.
+- High-risk leakage subtracts 5; low-risk leakage subtracts 1.
+- `humanRating.canProceed: true` adds 4; `false` subtracts 4.
+- `humanRating.editAmount` subtracts 0.5 for `minor`, 2 for `major`, and 3 for
+  `rewrite`.
+- Candidate score minus baseline score `>= 1` is a win, `<= -1` is a loss, and
+  anything between is a tie.
 
 Release gate for each P0 candidate:
 
@@ -184,6 +229,10 @@ Release gate for each P0 candidate:
 - Average latency growth is at most 20%; P95 growth is at most 30%.
 - JSON/schema modules must not reduce parse success or schema compliance.
 - High-risk leakage must not increase.
+- Module-specific gates must be checked against `byModule`, not only the global
+  `comparison` block.
+- `orphanCandidates` must be 0 for release-gate runs unless the new sample set
+  has been intentionally expanded and the baseline has been regenerated.
 
 ## Leakage Detection
 
@@ -227,6 +276,10 @@ Precedence:
 ```text
 project override > user override > module default
 ```
+
+The dry-run endpoint `/api/debug/prompt-version` is for internal verification.
+In production it returns 404 unless `PROMPT_DEBUG_TOKEN` is configured and the
+request sends the same value in `x-debug-token`.
 
 If a configured version is unknown, the resolver falls back to the module's
 default version and returns a warning.

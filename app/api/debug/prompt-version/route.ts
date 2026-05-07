@@ -12,7 +12,19 @@ function isPromptModuleId(value: string): value is PromptModuleId {
   return Object.prototype.hasOwnProperty.call(PROMPT_MODULES, value);
 }
 
+function isDebugAccessAllowed(req: NextRequest) {
+  if (process.env.NODE_ENV !== 'production') return true;
+  const expectedToken = process.env.PROMPT_DEBUG_TOKEN;
+  return Boolean(expectedToken && req.headers.get('x-debug-token') === expectedToken);
+}
+
+function hiddenDebugResponse() {
+  return NextResponse.json({ ok: false }, { status: 404 });
+}
+
 export async function GET(req: NextRequest) {
+  if (!isDebugAccessAllowed(req)) return hiddenDebugResponse();
+
   const url = new URL(req.url);
   const moduleId = url.searchParams.get('moduleId') || '';
   const userId = url.searchParams.get('userId');
@@ -40,6 +52,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  if (!isDebugAccessAllowed(req)) return hiddenDebugResponse();
+
   const body = await req.json().catch(() => ({}));
   const moduleId = String(body.moduleId || '');
   if (!isPromptModuleId(moduleId)) {

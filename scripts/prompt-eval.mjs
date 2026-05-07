@@ -308,66 +308,124 @@ function relativeDelta(candidateValue, baselineValue) {
   return Number(((candidateValue - baselineValue) / baselineValue).toFixed(4));
 }
 
+function percentile(values, percentileRank) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((percentileRank / 100) * sorted.length) - 1));
+  return Number(sorted[index].toFixed(4));
+}
+
+function emptyCompareAccumulator() {
+  return {
+    rows: [],
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    hardBase: 0,
+    hardCand: 0,
+    leakBase: 0,
+    leakCand: 0,
+    outputBase: 0,
+    outputCand: 0,
+    outputCharDeltas: [],
+    latencyBase: 0,
+    latencyCand: 0,
+    latencyPairs: 0,
+    latencyDeltas: [],
+  };
+}
+
+function recordComparison(acc, base, cand, verdict, scoreDelta) {
+  if (verdict === 'win') acc.wins += 1;
+  else if (verdict === 'loss') acc.losses += 1;
+  else acc.ties += 1;
+
+  const baseHard = isHardFailure(base);
+  const candHard = isHardFailure(cand);
+  if (baseHard) acc.hardBase += 1;
+  if (candHard) acc.hardCand += 1;
+  if (base.leakScan?.severity === 'high') acc.leakBase += 1;
+  if (cand.leakScan?.severity === 'high') acc.leakCand += 1;
+
+  const baseOutputChars = base.autoMetrics?.outputCharCount || 0;
+  const candOutputChars = cand.autoMetrics?.outputCharCount || 0;
+  acc.outputBase += baseOutputChars;
+  acc.outputCand += candOutputChars;
+  acc.outputCharDeltas.push(relativeDelta(candOutputChars, baseOutputChars));
+
+  if (typeof base.autoMetrics?.latencyMs === 'number' && typeof cand.autoMetrics?.latencyMs === 'number') {
+    acc.latencyBase += base.autoMetrics.latencyMs;
+    acc.latencyCand += cand.autoMetrics.latencyMs;
+    acc.latencyPairs += 1;
+    acc.latencyDeltas.push(relativeDelta(cand.autoMetrics.latencyMs, base.autoMetrics.latencyMs));
+  }
+
+  acc.rows.push({
+    caseId: base.caseId,
+    moduleId: base.moduleId,
+    verdict,
+    scoreDelta: Number(scoreDelta.toFixed(4)),
+  });
+}
+
+function summarizeComparison(acc) {
+  const total = acc.rows.length;
+  return {
+    comparableCases: total,
+    winRate: pct(acc.wins, total),
+    lossRate: pct(acc.losses, total),
+    tieRate: pct(acc.ties, total),
+    hardFailureDelta: pct(acc.hardCand, total) - pct(acc.hardBase, total),
+    leakDelta: pct(acc.leakCand, total) - pct(acc.leakBase, total),
+    outputCharDelta: relativeDelta(acc.outputCand, acc.outputBase),
+    outputCharP95Delta: percentile(acc.outputCharDeltas, 95),
+    latencyDelta: acc.latencyPairs ? relativeDelta(acc.latencyCand / acc.latencyPairs, acc.latencyBase / acc.latencyPairs) : 0,
+    latencyP95Delta: percentile(acc.latencyDeltas, 95),
+  };
+}
+
 function compareReports(baselineReport, candidateReport) {
   const baselineByCase = new Map(baselineReport.results.map((r) => [r.caseId, r]));
   const candidateByCase = new Map(candidateReport.results.map((r) => [r.caseId, r]));
-  const rows = [];
-  let wins = 0;
-  let losses = 0;
-  let ties = 0;
-  let hardBase = 0;
-  let hardCand = 0;
-  let leakBase = 0;
-  let leakCand = 0;
-  let outputBase = 0;
-  let outputCand = 0;
-  let latencyBase = 0;
-  let latencyCand = 0;
-  let latencyPairs = 0;
+  const all = emptyCompareAccumulator();
+  const byModule = new Map();
+  const missingCandidateCaseIds = [];
+  const orphanCandidateCaseIds = candidateReport.results
+    .map((r) => r.caseId)
+    .filter((caseId) => !baselineByCase.has(caseId));
 
   for (const [caseId, base] of baselineByCase.entries()) {
     const cand = candidateByCase.get(caseId);
-    if (!cand) continue;
+    if (!cand) {
+      missingCandidateCaseIds.push(caseId);
+      continue;
+    }
     const baseScore = qualityScore(base);
     const candScore = qualityScore(cand);
     const scoreDelta = candScore - baseScore;
     const verdict = scoreDelta >= 1 ? 'win' : scoreDelta <= -1 ? 'loss' : 'tie';
-    if (verdict === 'win') wins += 1;
-    else if (verdict === 'loss') losses += 1;
-    else ties += 1;
-
-    const baseHard = isHardFailure(base);
-    const candHard = isHardFailure(cand);
-    if (baseHard) hardBase += 1;
-    if (candHard) hardCand += 1;
-    if (base.leakScan?.severity === 'high') leakBase += 1;
-    if (cand.leakScan?.severity === 'high') leakCand += 1;
-    outputBase += base.autoMetrics?.outputCharCount || 0;
-    outputCand += cand.autoMetrics?.outputCharCount || 0;
-    if (typeof base.autoMetrics?.latencyMs === 'number' && typeof cand.autoMetrics?.latencyMs === 'number') {
-      latencyBase += base.autoMetrics.latencyMs;
-      latencyCand += cand.autoMetrics.latencyMs;
-      latencyPairs += 1;
-    }
-    rows.push({ caseId, moduleId: base.moduleId, verdict, scoreDelta: Number(scoreDelta.toFixed(4)) });
+    const moduleId = base.moduleId || cand.moduleId || 'unknown';
+    if (!byModule.has(moduleId)) byModule.set(moduleId, emptyCompareAccumulator());
+    recordComparison(all, base, cand, verdict, scoreDelta);
+    recordComparison(byModule.get(moduleId), base, cand, verdict, scoreDelta);
   }
 
-  const total = rows.length;
   return {
     generatedAt: new Date().toISOString(),
     baselineFiles: baselineReport.files || [],
     candidateFiles: candidateReport.files || [],
-    comparableCases: total,
-    comparison: {
-      winRate: pct(wins, total),
-      lossRate: pct(losses, total),
-      tieRate: pct(ties, total),
-      hardFailureDelta: pct(hardCand, total) - pct(hardBase, total),
-      leakDelta: pct(leakCand, total) - pct(leakBase, total),
-      outputCharDelta: relativeDelta(outputCand, outputBase),
-      latencyDelta: latencyPairs ? relativeDelta(latencyCand / latencyPairs, latencyBase / latencyPairs) : 0,
-    },
-    rows,
+    comparableCases: all.rows.length,
+    missingCandidateCases: missingCandidateCaseIds.length,
+    missingCandidateCaseIds,
+    orphanCandidates: orphanCandidateCaseIds.length,
+    orphanCandidateCaseIds,
+    comparison: summarizeComparison(all),
+    byModule: Object.fromEntries(
+      Array.from(byModule.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([moduleId, acc]) => [moduleId, summarizeComparison(acc)]),
+    ),
+    rows: all.rows,
   };
 }
 

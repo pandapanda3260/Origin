@@ -257,13 +257,16 @@ export type PromptHumanRating = {
 };
 
 export type PromptComparisonSummary = {
+  comparableCases: number;
   winRate: number;
   lossRate: number;
   tieRate: number;
   hardFailureDelta: number;
   leakDelta: number;
   outputCharDelta: number;
+  outputCharP95Delta: number;
   latencyDelta: number;
+  latencyP95Delta: number;
 };
 
 export type PromptEvalResult = {
