@@ -6,7 +6,9 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
-    "lint": "next lint"
+    "lint": "next lint",
+    "prompt-eval:collect": "node scripts/prompt-sample-collect.mjs",
+    "prompt-eval:report": "node scripts/prompt-eval.mjs"
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.100",

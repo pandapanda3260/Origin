@@ -1,0 +1,88 @@
+[
+  {
+    "moduleId": "default",
+    "appliesTo": ["json", "plain-description", "video-prompt"],
+    "highRisk": [
+      "# Role",
+      "# Goal",
+      "# Workflow",
+      "# Rules",
+      "# Output",
+      "# Self Check",
+      "# Failure Handling",
+      "Role:",
+      "Goal:",
+      "Workflow:",
+      "Self Check:",
+      "Failure Handling:",
+      "system prompt",
+      "LangGPT",
+      "按以下步骤",
+      "你是一个",
+      "你是 AI",
+      "不要输出任何 JSON 之外",
+      "严格按照以下格式"
+    ],
+    "lowRisk": [
+      "输出格式",
+      "任务目标",
+      "自检"
+    ],
+    "allowlist": []
+  },
+  {
+    "moduleId": "videoPromptGenerate",
+    "appliesTo": ["video-prompt"],
+    "highRisk": [
+      "http://",
+      "https://",
+      "Image 1",
+      "Image 2",
+      "Image 3",
+      "Image 4",
+      "image_1",
+      "image_2",
+      "image_3",
+      "image_4",
+      "reference image 1",
+      "reference image 2",
+      "reference image 3",
+      "reference image 4",
+      "ref 1",
+      "ref 2",
+      "ref 3",
+      "ref 4",
+      "参考图 1",
+      "参考图 2",
+      "参考图 3",
+      "参考图 4",
+      "参考图片",
+      "参考图像",
+      "对照图"
+    ],
+    "lowRisk": [
+      "参考图",
+      "参考图片编号",
+      "图像编号"
+    ],
+    "allowlist": []
+  },
+  {
+    "moduleId": "scriptFullCreate",
+    "appliesTo": ["script"],
+    "highRisk": [
+      "# Role",
+      "# Goal",
+      "# Workflow",
+      "下面是",
+      "好的",
+      "我将",
+      "按以下步骤"
+    ],
+    "lowRisk": [
+      "说明：",
+      "注："
+    ],
+    "allowlist": []
+  }
+]
