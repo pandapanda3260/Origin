@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { chatComplete, parseJsonLoose } from '@/lib/llm';
+import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 
 export const runtime = 'nodejs';
@@ -17,15 +17,16 @@ export async function POST(req: NextRequest) {
   if (!body.before || !body.after) return jsonOk({ changed: false, items: [] });
 
   try {
-    const raw = await chatComplete(
+    const json = await chatCompleteJsonWithRetry<{ changed: boolean; items: any[] }>(
       user,
       [
         { role: 'system', content: SP_CHECK },
         { role: 'user', content: `对比：\n${JSON.stringify({ before: body.before, after: body.after })}` },
       ],
-      { temperature: 0.2, responseFormat: 'json_object', maxTokens: 500, modelRole: 'structured' },
+      { temperature: 0.2, maxTokens: 500, modelRole: 'structured' },
+      parseJsonLoose,
+      'assets.check-equipment-change',
     );
-    const json = parseJsonLoose<{ changed: boolean; items: any[] }>(raw);
     return jsonOk({ changed: !!json.changed, items: Array.isArray(json.items) ? json.items : [] });
   } catch (e: any) {
     return jsonOk({ changed: false, items: [], _error: e?.message || String(e) });

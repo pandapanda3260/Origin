@@ -90,7 +90,7 @@
   <text class="boxTitle" x="480" y="632">6. video_segments 执行器</text>
   <text class="boxText" x="480" y="660">取本组 videoPrompt + shotIndices</text>
   <text class="boxText" x="480" y="684">解析对白 speaker/text，禁止少字</text>
-  <text class="boxText" x="480" y="708">按台词字数自动选 5s / 10s</text>
+  <text class="boxText" x="480" y="708">按镜头 duration 累加计划时长</text>
   <text class="boxText" x="480" y="732">传场景图 + 角色图 + 分镜图</text>
 
   <path class="originLine" d="M395 677 L455 677"/>
@@ -98,7 +98,7 @@
   <rect class="originBox" x="105" y="815" width="290" height="166" rx="12"/>
   <text class="boxTitle" x="130" y="847">7. 视频模型适配</text>
   <text class="boxText" x="130" y="875">Seedance：合成彩色视觉圣经参考图</text>
-  <text class="boxText" x="130" y="899">Grok：压缩视觉 prompt + 保留台词</text>
+  <text class="boxText" x="130" y="899">Grok：直接提交 videoPrompt</text>
   <text class="boxText" x="130" y="923">Sora：OpenAI 风格提交/轮询/下载</text>
   <text class="boxText" x="130" y="947">fake：ffmpeg 黑场兜底</text>
 

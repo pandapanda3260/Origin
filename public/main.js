@@ -3,7 +3,7 @@
  */
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,
-  getAuthToken, getAuthHeaders, checkAuth } from './modules/utils.js';
+  getAuthToken, getAuthHeaders, checkAuth, fetchAssetSignedUrl } from './modules/utils.js';
 import { appStore } from './modules/store.js';
 import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js';
 import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from './modules/edit.js';
@@ -12,7 +12,7 @@ import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
 import { initTasks, syncTasksProject, _startGlobalTaskCenterPoll,
   _startMaintenanceBannerPoll, _loadGlobalTaskCenter, checkMaintenanceBanner,
   _gtcProgressHtml } from './modules/tasks.js';
-import { initProject, getProject, setProject, loadProject, saveProject,
+import { initProject, getProject, setProject, loadProject, loadProjectData, saveProject,
   _serializeProject, cleanupBlobUrls, _registerServerTask, _updateServerTaskStatus,
   _notifyServerTaskDone,
   _archiveOldImage, _safeWriteBack, _flushServerSave } from './modules/project.js';
@@ -152,6 +152,10 @@ var _projectEpoch = 0;
     },
   };
   var activePage = "overview";
+  var _appBootstrapping = true;
+  var _bootUserNavigated = false;
+  var _bootDeferredPageRefresh = "";
+  var _coreNavigationBound = false;
 
   /* ================================================================
      持久化：设置
@@ -488,6 +492,36 @@ var _projectEpoch = 0;
     } catch (e) {}
   }
 
+  function _invalidateVideoForGroup(gIdx) {
+    var idx = Number(gIdx);
+    if (!Number.isFinite(idx) || idx < 0) return;
+
+    if (project && project.storyboards && project.storyboards[idx]) {
+      delete project.storyboards[idx].videoUrl;
+      delete project.storyboards[idx]._originVideoUrl;
+      delete project.storyboards[idx].videoTaskId;
+      delete project.storyboards[idx].videoCoverUrl;
+      delete project.storyboards[idx].videoStatus;
+      delete project.storyboards[idx].videoMode;
+      delete project.storyboards[idx].videoTaskFinishedAt;
+      delete project.storyboards[idx].videoDurationSec;
+    }
+    if (project && Array.isArray(project.videoTasks) && project.videoTasks.length > idx) {
+      project.videoTasks[idx] = {};
+    }
+    if (videoState && Array.isArray(videoState.tasks)) {
+      videoState.tasks = videoState.tasks.filter(function (t) {
+        if (Number(t && t._groupIdx) !== idx) return true;
+        if (t && t._sseHandle) {
+          try { t._sseHandle.close(); } catch (_e) {}
+          t._sseHandle = null;
+        }
+        if (t) t._killed = true;
+        return false;
+      });
+    }
+  }
+
   /**
    * Phase 5.2：切项目 = await _flushServerSave() → GET 新项目。
    *
@@ -560,10 +594,17 @@ var _projectEpoch = 0;
       list = list.filter(function (p) { return p.id !== projId; });
       saveProjectList(list);
       localStorage.removeItem(_uPrefix + "sw_proj_" + projId);
+      _ovProjectTasks = _ovProjectTasks.filter(function (t) { return t && t.projectId !== projId; });
+      if (_ovTaskState.selectedId === "p:" + projId) _ovTaskState.selectedId = "";
+      _ovProjectTasksLoaded = true;
+      _ovRenderDashboard();
 
       fetch("/api/projects/" + encodeURIComponent(projId), {
         method: "DELETE",
         headers: _getAuthHeaders(),
+      }).then(function (resp) {
+        if (!resp || !resp.ok) console.warn("[ServerDelete] non-2xx:", resp && resp.status);
+        _ovInvalidateProjectTasks(true);
       }).catch(function (e) { console.warn("[ServerDelete] failed:", e); });
 
       if (project && project.id === projId) {
@@ -624,7 +665,7 @@ var _projectEpoch = 0;
       else {
         var el = document.createElement("div");
         el.id = "sw-project-skeleton";
-        el.style.cssText = "position:fixed;inset:0;z-index:9999;display:flex;" +
+        el.style.cssText = "position:fixed;inset:0;z-index:35;display:flex;pointer-events:none;" +
           "align-items:center;justify-content:center;flex-direction:column;gap:14px;" +
           "background:rgba(10,10,12,0.72);backdrop-filter:blur(6px);" +
           "color:#e8e8ea;font-size:14px;font-family:inherit;" +
@@ -798,6 +839,9 @@ var _projectEpoch = 0;
     syncScriptProject(project);
     syncAssetsProject(project);
     addProjectToList(project);
+    _ovProjectTasks = _ovProjectTasks.filter(function (t) { return t && t.projectId !== project.id; });
+    _ovProjectTasks.unshift(_ovProjectTaskFromSummary({ id: project.id, name: project.name, title: project.title, createdAt: project.createdAt, updatedAt: project.updatedAt, status: project.status }, project));
+    _ovInvalidateProjectTasks(true);
     refreshAllPages();
     _renderEpisodeTabs();
     console.log("[Project] Created (server-first):", project.id, project.name, "v=", project.version);
@@ -1024,16 +1068,49 @@ var _projectEpoch = 0;
     }, 200);
   }
 
-  function switchPage(page) {
+  function _refreshPageForActiveRoute(page) {
+    try {
+      if (page === "overview") refreshOverview();
+      if (page === "script") refreshScriptPage();
+      if (page === "assets") refreshAssetsPage();
+      if (page === "shots") refreshShotsPage();
+      if (page === "images") refreshImagesPage();
+      if (page === "prompts") refreshPromptsPage();
+      if (page === "batch") refreshBatchPage();
+      if (page === "edit") refreshEditPage();
+      if (page === "library") refreshLibraryPage();
+      if (page === "admin") refreshAdminPage();
+    } catch (e) {
+      console.error("[SwitchPage] refresh failed:", page, e);
+    }
+  }
+
+  function _resetRouteScroll(pageEl) {
+    try {
+      if (pageEl) pageEl.scrollTop = 0;
+      if (document.documentElement) document.documentElement.scrollTop = 0;
+      if (document.body) document.body.scrollTop = 0;
+      if (window.scrollTo) window.scrollTo(0, 0);
+    } catch (e) {
+      console.warn("[SwitchPage] reset scroll failed:", e);
+    }
+  }
+
+  function switchPage(page, options) {
+    options = options || {};
     // billing 不再是独立 page，而是浮层弹窗，提前 return 不影响当前 activePage
     if (page === "billing") { openBillingModal(); return; }
+    if (PAGES.indexOf(page) === -1) return;
+    if (options.user && _appBootstrapping) _bootUserNavigated = true;
     activePage = page;
+    var activePageEl = null;
     for (var i = 0; i < PAGES.length; i++) {
       var pid = "page" + PAGES[i].charAt(0).toUpperCase() + PAGES[i].slice(1);
       var el = $(pid);
       if (el) {
         var show = PAGES[i] === page;
         if (show) {
+          activePageEl = el;
           el.hidden = false;
           el.classList.remove("page-enter-anim");
           void el.offsetWidth;
@@ -1049,19 +1126,59 @@ var _projectEpoch = 0;
       var nav = $("nav" + PAGES[i].charAt(0).toUpperCase() + PAGES[i].slice(1));
       if (nav) nav.classList.toggle("is-active", PAGES[i] === page);
     }
+    if (!options.preserveScroll) _resetRouteScroll(activePageEl);
     requestAnimationFrame(function () {
+      if (!options.preserveScroll) _resetRouteScroll(activePageEl);
       requestAnimationFrame(updateSidebarNavDot);
     });
-    if (page === "overview") refreshOverview();
-    if (page === "script") refreshScriptPage();
-    if (page === "assets") refreshAssetsPage();
-    if (page === "shots") refreshShotsPage();
-    if (page === "images") refreshImagesPage();
-    if (page === "prompts") refreshPromptsPage();
-    if (page === "batch") refreshBatchPage();
-    if (page === "edit") refreshEditPage();
-    if (page === "library") refreshLibraryPage();
-    if (page === "admin") refreshAdminPage();
+    if (_appBootstrapping && !options.forceRefresh) {
+      _bootDeferredPageRefresh = page;
+      return;
+    }
+    _refreshPageForActiveRoute(page);
+  }
+
+  function _wireCoreNavigationOnce() {
+    if (_coreNavigationBound) return;
+    _coreNavigationBound = true;
+    PAGES.forEach(function (page) {
+      var navId = "nav" + page.charAt(0).toUpperCase() + page.slice(1);
+      var navEl = $(navId);
+      if (navEl) navEl.addEventListener("click", function () { switchPage(page, { user: true }); });
+    });
+
+    var navBillingBtn = $("navBilling");
+    if (navBillingBtn) navBillingBtn.addEventListener("click", function () { openBillingModal(); });
+
+    var billingModalEl = $("billingModal");
+    var billingCloseBtn = $("billingModalClose");
+    if (billingCloseBtn) billingCloseBtn.addEventListener("click", closeBillingModal);
+    if (billingModalEl) {
+      billingModalEl.addEventListener("click", function (ev) {
+        var t = ev && ev.target;
+        if (t && t.getAttribute && t.getAttribute("data-billing-close") === "1") closeBillingModal();
+      });
+    }
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key !== "Escape") return;
+      if (!billingModalEl) return;
+      if (billingModalEl.classList.contains("hidden")) return;
+      closeBillingModal();
+    });
+
+    window.addEventListener("resize", updateSidebarNavDot);
+    var trackHost = $("sidebarNavTrackHost");
+    if (trackHost) trackHost.addEventListener("scroll", updateSidebarNavDot, { passive: true });
+
+    var gtBtn = $("navGlobalTasks");
+    if (gtBtn) gtBtn.addEventListener("click", function () { toggleGlobalTaskPanel(); });
+    var gtClose = $("globalTaskPanelClose");
+    if (gtClose) gtClose.addEventListener("click", function () { toggleGlobalTaskPanel(false); });
+
+    document.addEventListener("click", function (e) {
+      var el = e.target.closest("[data-goto]");
+      if (el) { e.preventDefault(); switchPage(el.dataset.goto, { user: true }); }
+    });
   }
 
   /* ================================================================
@@ -1307,7 +1424,7 @@ var _projectEpoch = 0;
 
 
   /* ================================================================
-     项目总览页
+     任务列表页
      ================================================================ */
   /**
    * Phase 5.9：项目列表改为服务器权威源。
@@ -1401,146 +1518,1492 @@ var _projectEpoch = 0;
    * 让后端 project.json 成为唯一权威源。失败时给用户 toast，避免静默。
    */
   async function _renameProject(pid, newName) {
+    newName = String(newName || "").trim().slice(0, 200);
+    if (!pid || !newName) return false;
     if (project && project.id === pid) {
       project.name = newName;
+      project.title = newName;
       saveProject();
+      var saved = await _flushServerSave();
+      if (!saved || !saved.ok) {
+        showToast("重命名失败：服务器未保存成功", "error");
+        return false;
+      }
     } else {
       try {
         var resp = await fetch("/api/projects/" + encodeURIComponent(pid), {
           headers: _getAuthHeaders(),
         });
-        if (resp.ok) {
-          var p = await resp.json();
-          if (p && p.id) {
-            p.name = newName;
-            var headers = Object.assign({}, _getAuthHeaders());
-            if (typeof p.version === "number") headers["If-Match"] = "v" + p.version;
-            var putResp = await fetch("/api/projects/" + encodeURIComponent(pid), {
-              method: "PUT",
-              headers: headers,
-              body: JSON.stringify(p),
-            });
-            if (putResp.status === 409) {
-              showToast("项目在另一处被修改，请刷新后再重命名", "warn");
-              return;
-            }
-            if (!putResp.ok) {
-              showToast("重命名失败：服务器拒绝（" + putResp.status + "）", "error");
-              return;
-            }
-          }
+        if (!resp.ok) {
+          showToast("重命名失败：项目读取失败（" + resp.status + "）", "error");
+          return false;
+        }
+        var p = await resp.json();
+        if (!p || !p.id) {
+          showToast("重命名失败：项目数据异常", "error");
+          return false;
+        }
+        p.name = newName;
+        p.title = newName;
+        var headers = Object.assign({}, _getAuthHeaders());
+        if (typeof p.version === "number") headers["If-Match"] = "v" + p.version;
+        var putResp = await fetch("/api/projects/" + encodeURIComponent(pid), {
+          method: "PUT",
+          headers: headers,
+          body: JSON.stringify(p),
+        });
+        if (putResp.status === 409) {
+          showToast("项目在另一处被修改，请刷新后再重命名", "warn");
+          return false;
+        }
+        if (!putResp.ok) {
+          showToast("重命名失败：服务器拒绝（" + putResp.status + "）", "error");
+          return false;
         }
       } catch (e) {
         console.warn("[RenameProject] server failed:", e);
         showToast("重命名失败：网络错误", "error");
-        return;
+        return false;
       }
     }
     var list = getProjectList();
     for (var i = 0; i < list.length; i++) {
-      if (list[i].id === pid) { list[i].name = newName; break; }
+      if (list[i].id === pid) { list[i].name = newName; list[i].title = newName; break; }
     }
     localStorage.setItem(_uPrefix + "sw_project_list", JSON.stringify(list));
+    _ovProjectTasks = _ovProjectTasks.map(function (t) {
+      if (!t || t.projectId !== pid) return t;
+      return Object.assign({}, t, { title: newName });
+    });
+    _ovInvalidateProjectTasks(true);
     renderProjectList();
     refreshOverview();
+    return true;
+  }
+
+  var _ovTaskState = {
+    status: "all",
+    query: "",
+    page: 1,
+    pageSize: 10,
+    selectedId: "",
+    sort: "latest",
+    editingTitleId: "",
+  };
+  var _overviewDashboardBound = false;
+  var _ovProjectTasks = [];
+  var _ovProjectTasksLoaded = false;
+  var _ovProjectTasksLoading = false;
+  var _ovProjectTasksDirty = false;
+  var _ovProjectTasksSeq = 0;
+  var _ovProjectTaskNavigating = false;
+  var _ovProjectTaskDeleting = false;
+  var _ovProjectTaskCreating = false;
+  var _ovSearchLastUserInputAt = 0;
+  var _ovSearchLastFocusAt = 0;
+  var _ovSearchComposing = false;
+
+  function _ovSearchValue() {
+    return String(_ovTaskState.query || "");
+  }
+
+  function _ovMarkSearchUserInput() {
+    _ovSearchLastUserInputAt = Date.now();
+  }
+
+  function _ovIsTrustedUserEvent(e) {
+    return !!(e && e.isTrusted);
+  }
+
+  function _ovIsRecentSearchUserInput() {
+    return Date.now() - _ovSearchLastUserInputAt < 1500;
+  }
+
+  function _ovMarkSearchFocus() {
+    _ovSearchLastFocusAt = Date.now();
+  }
+
+  function _ovIsRecentSearchFocus() {
+    return Date.now() - _ovSearchLastFocusAt < 5000;
+  }
+
+  function _ovResetSearchInput(search) {
+    if (!search) search = $("ovTaskSearch");
+    if (!search) return;
+    if (_ovSearchComposing && document.activeElement === search) return;
+    var expected = _ovSearchValue();
+    if (search.value !== expected) search.value = expected;
+  }
+
+  function _ovClearSearchInput(search) {
+    if (!search) search = $("ovTaskSearch");
+    _ovTaskState.query = "";
+    _ovTaskState.page = 1;
+    _ovResetSearchInput(search);
+  }
+
+  function _ovDeferSearchReset(search) {
+    _ovResetSearchInput(search);
+    setTimeout(function () { _ovResetSearchInput(search); }, 0);
+    setTimeout(function () { _ovResetSearchInput(search); }, 120);
+  }
+
+  function _ovGuardSearchAutofill(search) {
+    if (!search) search = $("ovTaskSearch");
+    if (!search) return;
+    if (_ovSearchComposing) return;
+    if (document.activeElement === search || _ovIsRecentSearchUserInput()) return;
+    if (!_ovTaskState.query && search.value) search.value = "";
+  }
+
+  function _ovScheduleSearchAutofillGuard(search) {
+    [0, 80, 250, 700, 1500, 3200].forEach(function (ms) {
+      setTimeout(function () { _ovGuardSearchAutofill(search); }, ms);
+    });
+  }
+
+  function _ovIsCredentialReplacementInput(e) {
+    return e && (
+      e.inputType === "insertReplacementText" ||
+      e.inputType === "insertFromAutoComplete" ||
+      e.inputType === "insertFromSuggestion"
+    );
+  }
+
+  function _ovCredentialSearchCandidates() {
+    var candidates = [];
+    try {
+      var stored = JSON.parse(localStorage.getItem("sw_auth_user") || "{}");
+      if (stored && stored.username) candidates.push(String(stored.username));
+    } catch (_) {}
+    var accountName = $("accountUsername");
+    if (accountName && accountName.textContent) candidates.push(accountName.textContent);
+    var honey = document.querySelector('input[name="username"]');
+    if (honey && honey.value) candidates.push(honey.value);
+    return candidates.map(function (v) { return String(v || "").trim(); }).filter(Boolean);
+  }
+
+  function _ovLooksLikeCredentialSearchValue(value) {
+    var trimmed = String(value || "").trim();
+    if (!trimmed) return false;
+    return _ovCredentialSearchCandidates().some(function (candidate) { return candidate === trimmed; });
+  }
+
+  function _ovHasActiveSearchIntent(search) {
+    if (!search) search = $("ovTaskSearch");
+    return document.activeElement === search && (_ovIsRecentSearchUserInput() || _ovIsRecentSearchFocus());
+  }
+
+  function _ovApplySearchInput(search) {
+    if (!search) search = $("ovTaskSearch");
+    if (!search) return;
+    if (_ovLooksLikeCredentialSearchValue(search.value)) {
+      _ovClearSearchInput(search);
+      _ovRenderDashboard();
+      return;
+    }
+    _ovTaskState.query = search.value || "";
+    _ovTaskState.page = 1;
+    _ovRenderDashboard();
+  }
+
+  function _ovAllowSearchInputEvent(e, search) {
+    if (!e) return false;
+    if (_ovIsCredentialReplacementInput(e)) return false;
+    if (!_ovIsTrustedUserEvent(e) && !_ovHasActiveSearchIntent(search)) return false;
+    if (e.isComposing) return false;
+    return true;
+  }
+
+  function _blockCredentialReplacementInput(input) {
+    if (!input) return;
+    input.addEventListener("beforeinput", function (e) {
+      if (!_ovIsCredentialReplacementInput(e)) return;
+      e.preventDefault();
+      setTimeout(function () { input.value = ""; }, 0);
+    });
+    input.addEventListener("input", function (e) {
+      if (!_ovIsCredentialReplacementInput(e)) return;
+      input.value = "";
+    });
+  }
+
+  function _ovPaginationItems(totalPages, currentPage) {
+    totalPages = Math.max(1, Number(totalPages) || 1);
+    currentPage = Math.max(1, Math.min(totalPages, Number(currentPage) || 1));
+    if (totalPages <= 5) {
+      var all = [];
+      for (var i = 1; i <= totalPages; i++) all.push(i);
+      return all;
+    }
+    var start = Math.max(2, currentPage - 1);
+    var end = Math.min(totalPages - 1, currentPage + 1);
+    if (currentPage <= 3) { start = 2; end = 4; }
+    if (currentPage >= totalPages - 2) { start = totalPages - 3; end = totalPages - 1; }
+    var pages = [1];
+    if (start > 2) pages.push("gap-left");
+    for (var p = start; p <= end; p++) pages.push(p);
+    if (end < totalPages - 1) pages.push("gap-right");
+    pages.push(totalPages);
+    return pages;
+  }
+
+  function _ovPad2(n) {
+    n = Number(n) || 0;
+    return String(n).padStart(2, "0");
+  }
+
+  function _ovFormatDate(ts) {
+    if (!ts) return "--";
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return "--";
+    return d.getFullYear() + "/" + _ovPad2(d.getMonth() + 1) + "/" + _ovPad2(d.getDate()) + " " + _ovPad2(d.getHours()) + ":" + _ovPad2(d.getMinutes());
+  }
+
+  function _ovShortTime(ts) {
+    if (!ts) return "--";
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return "--";
+    return _ovPad2(d.getHours()) + ":" + _ovPad2(d.getMinutes());
+  }
+
+  function _ovFormatDuration(sec) {
+    var n = Number(sec);
+    if (!Number.isFinite(n) || n <= 0) return "--";
+    n = Math.round(n);
+    return _ovPad2(Math.floor(n / 60)) + ":" + _ovPad2(n % 60);
+  }
+
+  function _ovText(v, fallback) {
+    if (v === null || v === undefined) return fallback || "--";
+    var s = String(v).trim();
+    return s ? s : (fallback || "--");
+  }
+
+  function _ovFirst() {
+    for (var i = 0; i < arguments.length; i++) {
+      var v = arguments[i];
+      if (v !== null && v !== undefined && String(v).trim()) return v;
+    }
+    return "";
+  }
+
+  var _OV_INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
+  var _OV_BLANK_THUMB_SRC = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+
+  function _ovImageAssetIdFromUrl(url) {
+    var m = _OV_INTERNAL_IMAGE_RE.exec(String(url || ""));
+    return m ? m[1] : "";
+  }
+
+  function _ovSignedImageUrlStillValid(url) {
+    url = String(url || "").trim();
+    if (!url || url.indexOf("sig=") < 0 || url.indexOf("exp=") < 0) return false;
+    try {
+      var u = new URL(url, window.location.origin);
+      var exp = parseInt(u.searchParams.get("exp") || "0", 10);
+      return Number.isFinite(exp) && exp * 1000 > Date.now() + 15000;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function _ovThumbnailNeedsSigning(url) {
+    return !!_ovImageAssetIdFromUrl(url) && !_ovSignedImageUrlStillValid(url);
+  }
+
+  function _ovOverviewThumbnailDisplayUrl(url) {
+    url = String(url || "").trim();
+    if (!url || !_ovImageAssetIdFromUrl(url)) return url;
+    try {
+      var u = new URL(url, window.location.origin);
+      u.searchParams.set("w", "192");
+      return u.pathname + u.search + u.hash;
+    } catch (_) {
+      return url;
+    }
+  }
+
+  function _ovThumbnailPosterUrl(url) {
+    url = String(url || "").trim();
+    if (!url || _ovThumbnailNeedsSigning(url)) return "";
+    return _ovOverviewThumbnailDisplayUrl(url);
+  }
+
+  function _ovThumbnailImgHtml(url) {
+    url = String(url || "").trim();
+    if (!url) return "";
+    var id = _ovImageAssetIdFromUrl(url);
+    var src = _ovThumbnailNeedsSigning(url) ? _OV_BLANK_THUMB_SRC : _ovOverviewThumbnailDisplayUrl(url);
+    return '<img src="' + escapeHtml(src) + '" alt="" loading="lazy" decoding="async" data-ov-thumb-src="' + escapeHtml(url) + '"' + (id ? ' data-ov-thumb-id="' + escapeHtml(id) + '"' : "") + '>';
+  }
+
+  async function _ovEnsureThumbnailImage(img, force) {
+    if (!img || img.dataset.ovThumbLoading === "1") return;
+    var original = img.getAttribute("data-ov-thumb-src") || img.getAttribute("src") || "";
+    var id = img.getAttribute("data-ov-thumb-id") || _ovImageAssetIdFromUrl(original);
+    if (!id) return;
+    var current = img.getAttribute("src") || "";
+    if (!force && current && current !== _OV_BLANK_THUMB_SRC && _ovSignedImageUrlStillValid(current)) return;
+    img.dataset.ovThumbLoading = "1";
+    try {
+      var signed = await fetchAssetSignedUrl(id, 3600);
+      if (signed && img.isConnected) {
+        img.src = _ovOverviewThumbnailDisplayUrl(signed);
+        img.setAttribute("data-ov-thumb-src", signed);
+      }
+    } finally {
+      if (img.isConnected) delete img.dataset.ovThumbLoading;
+    }
+  }
+
+  function _ovRefreshThumbnailImages(root) {
+    root = root || document;
+    root.querySelectorAll("img[data-ov-thumb-src]").forEach(function (img) {
+      _ovEnsureThumbnailImage(img, false).catch(function (err) {
+        console.warn("[overview] refresh thumbnail failed:", err);
+      });
+    });
+  }
+
+  async function _ovHydrateProjectOverviewThumbnail(proj) {
+    if (!proj || typeof proj !== "object") return proj;
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    var vts = Array.isArray(proj.videoTasks) ? proj.videoTasks : [];
+    for (var i = 0; i < Math.max(sbs.length, vts.length); i++) {
+      var sb = sbs[i] || {};
+      var vt = vts[i] || {};
+      var candidates = [
+        [vt, "coverUrl"], [vt, "videoCoverUrl"],
+        [sb, "videoCoverUrl"], [sb, "coverUrl"], [sb, "rawUrl"], [sb, "imageUrl"],
+      ];
+      for (var j = 0; j < candidates.length; j++) {
+        var obj = candidates[j][0];
+        var key = candidates[j][1];
+        var url = obj && obj[key];
+        if (!url) continue;
+        if (_ovThumbnailNeedsSigning(url)) {
+          var id = _ovImageAssetIdFromUrl(url);
+          var signed = id ? await fetchAssetSignedUrl(id, 3600) : "";
+          if (signed) obj[key] = signed;
+        }
+        return proj;
+      }
+    }
+    return proj;
+  }
+
+  function _ovCurrentModelLabel() {
+    try {
+      var m = settings && settings.models && settings.models.video;
+      return _ovFirst(m && m.label, m && m.model, m && m.adapter);
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function _ovLocalTaskForGroup(gIdx) {
+    if (!videoState || !Array.isArray(videoState.tasks)) return null;
+    var best = null;
+    for (var i = 0; i < videoState.tasks.length; i++) {
+      var t = videoState.tasks[i];
+      if (!t || t._killed) continue;
+      if (project && t._projectId && t._projectId !== project.id) continue;
+      if (Number(t._groupIdx) === Number(gIdx)) {
+        if (!best || Number(t.createdAt || 0) > Number(best.createdAt || 0)) best = t;
+      }
+    }
+    return best;
+  }
+
+	  function _ovStatusFrom(localTask, persisted, sb) {
+	    if ((persisted && persisted.isCurrent === false) || (sb && sb.videoIsCurrent === false)) return "pending";
+	    var raw = _ovFirst(localTask && localTask.status, persisted && persisted.status, sb && sb.videoStatus);
+    raw = String(raw || "").toLowerCase();
+    if (raw === "done" || raw === "completed" || raw === "complete" || raw === "succeeded" || (sb && sb.videoUrl && !raw)) return "done";
+    if (raw === "failed" || raw === "timeout" || raw === "cancelled" || raw === "retry_failed") return "failed";
+    if (raw === "polling" || raw === "running" || raw === "queued" || raw === "submit" || raw === "submitting" || raw === "preparing" || raw === "fetching" || raw === "in_progress") return "running";
+    if (sb && sb.videoUrl) return "done";
+    return "pending";
+  }
+
+  function _ovStatusLabel(task) {
+    if (!task) return "待处理";
+    if (task.status === "loading") return "同步中";
+    if (task.status === "unknown") return "待同步";
+    if (task.status === "running") return "生成中 " + task.progress + "%";
+    if (task.status === "done") return "已完成";
+    if (task.status === "failed") return "失败";
+    return "待处理";
+  }
+
+  function _ovStatusBucket(status) {
+    if (status === "loading" || status === "unknown") return "pending";
+    return status || "pending";
+  }
+
+  function _ovStatusClass(status) {
+    if (status === "running") return "is-running";
+    if (status === "done") return "is-done";
+    if (status === "failed") return "is-failed";
+    return "is-pending";
+  }
+
+  function _ovStatusFilterLabel(status) {
+    var map = { all: "全部", running: "生成中", done: "已完成", failed: "失败", pending: "待处理" };
+    return map[status] || map.all;
+  }
+
+  function _ovSyncToolbarState() {
+    var filter = $("ovTaskFilterBtn");
+    if (filter) {
+      var statusLabel = _ovStatusFilterLabel(_ovTaskState.status);
+      filter.innerHTML = '<span class="material-symbols-outlined">filter_list</span>筛选：' + escapeHtml(statusLabel);
+      filter.title = "当前筛选：" + statusLabel + "。点击切换下一个状态";
+      filter.setAttribute("aria-label", filter.title);
+      filter.classList.toggle("is-active", _ovTaskState.status !== "all");
+    }
+    var sort = $("ovTaskSortBtn");
+    if (sort) {
+      var sortLabel = _ovTaskState.sort === "oldest" ? "最早优先" : "最新优先";
+      sort.innerHTML = '<span class="material-symbols-outlined">sort</span>排序：' + escapeHtml(sortLabel);
+      sort.title = "当前排序：" + sortLabel + "。点击切换排序";
+      sort.setAttribute("aria-label", sort.title);
+      sort.classList.toggle("is-active", _ovTaskState.sort === "oldest");
+    }
+  }
+
+  function _ovProgressFor(localTask, status) {
+    if (status === "done") return 100;
+    if (status === "failed" || status === "pending") return 0;
+    var direct = Number(localTask && (localTask.progress || localTask.percent || localTask.pct));
+    if (Number.isFinite(direct) && direct > 0) return Math.max(1, Math.min(99, Math.round(direct)));
+    var elapsed = localTask && localTask.createdAt ? (Date.now() - Number(localTask.createdAt)) / 1000 : 0;
+    return Math.max(8, Math.min(95, Math.round(elapsed / 90 * 100) || 12));
+  }
+
+  function _ovProjectTaskSummariesFallback() {
+    var list = getProjectList();
+    if (project && project.id && !list.some(function (p) { return p && p.id === project.id; })) {
+      list = [{ id: project.id, name: project.name, title: project.title, createdAt: project.createdAt, updatedAt: project.updatedAt }].concat(list);
+    }
+    return list;
+  }
+
+  function _ovProjectAssetCount(proj) {
+    var assets = proj && proj.assets;
+    if (!assets) return 0;
+    return (assets.characters || []).length + (assets.scenes || []).length + (assets.props || []).length;
+  }
+
+  function _ovProjectSegmentCount(proj, localTasks) {
+    if (!proj) return 0;
+    var storyboards = Array.isArray(proj.storyboards) ? proj.storyboards.length : 0;
+    var videoTasksLen = Array.isArray(proj.videoTasks) ? proj.videoTasks.length : 0;
+    var prompts = Array.isArray(proj.videoPrompts) ? proj.videoPrompts.length : 0;
+    var localMax = 0;
+    (localTasks || []).forEach(function (t) {
+      if (t && t._groupIdx != null) localMax = Math.max(localMax, Number(t._groupIdx) + 1);
+    });
+    return Math.max(storyboards, videoTasksLen, prompts, localMax);
+  }
+
+  function _ovLocalTasksForProject(projectId) {
+    if (!videoState || !Array.isArray(videoState.tasks) || !projectId) return [];
+    return videoState.tasks.filter(function (t) {
+      if (!t || t._killed) return false;
+      if (t._projectId) return t._projectId === projectId;
+      return project && project.id === projectId;
+    });
+  }
+
+  function _ovLocalTaskForProjectGroup(localTasks, gIdx) {
+    var best = null;
+    (localTasks || []).forEach(function (t) {
+      if (!t || Number(t._groupIdx) !== Number(gIdx)) return;
+      if (!best || Number(t.createdAt || 0) > Number(best.createdAt || 0)) best = t;
+    });
+    return best;
+  }
+
+  function _ovProjectMedia(proj) {
+    var media = { videoUrl: "", thumbnail: "" };
+    var sbs = Array.isArray(proj && proj.storyboards) ? proj.storyboards : [];
+    var vts = Array.isArray(proj && proj.videoTasks) ? proj.videoTasks : [];
+    for (var i = 0; i < Math.max(sbs.length, vts.length); i++) {
+      var sb = sbs[i] || {};
+      var vt = vts[i] || {};
+      if (!media.videoUrl) media.videoUrl = _ovFirst(vt.url, vt.videoUrl, vt.protectedUrl, sb.videoUrl, sb._originVideoUrl);
+      if (!media.thumbnail) media.thumbnail = _ovFirst(vt.coverUrl, vt.videoCoverUrl, sb.videoCoverUrl, sb.coverUrl, sb.rawUrl, sb.imageUrl);
+      if (media.videoUrl && media.thumbnail) break;
+    }
+    return media;
+  }
+
+  function _ovProjectPromptSummary(proj) {
+    if (!proj) return "";
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    var firstPrompt = "";
+    for (var i = 0; i < sbs.length; i++) {
+      if (sbs[i] && sbs[i].videoPrompt) { firstPrompt = sbs[i].videoPrompt; break; }
+    }
+    return _ovFirst(proj.oneSentence, proj.description, firstPrompt, proj.scriptDraft, proj.script);
+  }
+
+  function _ovProjectDurationSec(proj) {
+    var total = 0;
+    var seen = false;
+    var sbs = Array.isArray(proj && proj.storyboards) ? proj.storyboards : [];
+    var vts = Array.isArray(proj && proj.videoTasks) ? proj.videoTasks : [];
+    for (var i = 0; i < Math.max(sbs.length, vts.length); i++) {
+      var n = Number(_ovFirst(vts[i] && vts[i].durationSec, vts[i] && vts[i].duration_sec, sbs[i] && sbs[i].videoDurationSec));
+      if (Number.isFinite(n) && n > 0) { total += n; seen = true; }
+    }
+    return seen ? total : 0;
+  }
+
+  function _ovProjectTaskFromSummary(summary, detail, options) {
+    options = options || {};
+    var proj = detail || summary || {};
+    var projectId = _ovFirst(proj.id, summary && summary.id);
+    var localTasks = _ovLocalTasksForProject(projectId);
+    var segmentCount = _ovProjectSegmentCount(proj, localTasks);
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    var vts = Array.isArray(proj.videoTasks) ? proj.videoTasks : [];
+    var counts = { running: 0, done: 0, failed: 0, pending: 0 };
+    var progressTotal = 0;
+
+    for (var i = 0; i < segmentCount; i++) {
+      var localTask = _ovLocalTaskForProjectGroup(localTasks, i);
+      var serverStatus = _ovStatusFrom(null, vts[i] || {}, sbs[i] || {});
+      var status = (serverStatus === "done" || serverStatus === "failed")
+        ? serverStatus
+        : _ovStatusFrom(localTask, vts[i] || {}, sbs[i] || {});
+      if (counts[status] === undefined) status = "pending";
+      counts[status]++;
+      progressTotal += _ovProgressFor(localTask, status);
+    }
+
+    var rawProjectStatus = String(proj.status || summary && summary.status || "").toLowerCase();
+    var taskStatus = "pending";
+    if (options.loading) taskStatus = "loading";
+    else if (counts.running > 0) taskStatus = "running";
+    else if (counts.failed > 0) taskStatus = "failed";
+    else if (segmentCount > 0 && counts.done === segmentCount) taskStatus = "done";
+    else if (rawProjectStatus === "completed" || rawProjectStatus === "done" || rawProjectStatus === "succeeded") taskStatus = "done";
+    else if (rawProjectStatus === "failed" || rawProjectStatus === "error") taskStatus = "failed";
+    else if (options.detailFailed) taskStatus = "unknown";
+
+    var progress = taskStatus === "done" ? 100 : 0;
+    if (taskStatus === "running") {
+      progress = segmentCount ? Math.max(8, Math.min(99, Math.round(progressTotal / segmentCount))) : 8;
+    }
+
+    var media = _ovProjectMedia(proj);
+    var promptText = _ovProjectPromptSummary(proj);
+    var durationSec = _ovProjectDurationSec(proj);
+    var createdAt = _ovFirst(proj.createdAt, summary && summary.createdAt);
+    var updatedAt = _ovFirst(proj.updatedAt, summary && summary.updatedAt, createdAt);
+    var title = _ovFirst(proj.name, proj.title, summary && (summary.name || summary.title), "未命名项目");
+
+    return {
+      id: "p:" + projectId,
+      projectId: projectId,
+      projectData: detail || (project && project.id === projectId ? project : null),
+      title: title,
+      createdAt: createdAt,
+      updatedAt: updatedAt,
+      createdText: _ovFormatDate(createdAt),
+      type: segmentCount ? segmentCount + " 个片段" : "视频项目",
+      segmentCount: segmentCount,
+      segmentCounts: counts,
+      durationSec: durationSec,
+      durationText: _ovFormatDuration(durationSec),
+      assetCount: _ovProjectAssetCount(proj),
+      resolution: "1080 x 1920",
+      model: _ovText(_ovCurrentModelLabel(), "--"),
+      ratio: "9:16",
+      audio: "开启",
+      status: taskStatus,
+      progress: progress,
+      thumbnail: media.thumbnail,
+      videoUrl: media.videoUrl,
+      prompt: promptText || "",
+      promptCount: promptText ? String(promptText).length : 0,
+    };
+  }
+
+  function _ovPrimeProjectTasksFromSummaries(summaries) {
+    summaries = Array.isArray(summaries) ? summaries : [];
+    _ovProjectTasks = summaries.map(function (sp) {
+      var detail = project && project.id === sp.id ? project : null;
+      return _ovProjectTaskFromSummary(sp, detail, { loading: !detail });
+    });
+  }
+
+  async function _ovFetchProjectDataForOverview(projectId) {
+    if (!projectId) return null;
+    if (project && project.id === projectId) return _ovHydrateProjectOverviewThumbnail(project);
+    try {
+      var resp = await fetch("/api/projects/" + encodeURIComponent(projectId), { headers: _getAuthHeaders() });
+      if (!resp.ok) return null;
+      var data = await resp.json();
+      if (data && data.id) await _ovHydrateProjectOverviewThumbnail(data);
+      return data && data.id ? data : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function _ovLoadProjectTasks(force) {
+    if (_ovProjectTasksLoading) {
+      if (force) _ovProjectTasksDirty = true;
+      return;
+    }
+    if (_ovProjectTasksLoaded && !force) return;
+    if (force) _ovProjectTasksDirty = false;
+    _ovProjectTasksLoading = true;
+    var seq = ++_ovProjectTasksSeq;
+    try {
+      var summaries = await getProjectListFromServer();
+      if (!Array.isArray(summaries) || !summaries.length) summaries = _ovProjectTaskSummariesFallback();
+      summaries = summaries.map(function (sp) {
+        return { id: sp.id, name: sp.name || sp.title, title: sp.title || sp.name, createdAt: sp.createdAt, updatedAt: sp.updatedAt, status: sp.status };
+      }).filter(function (sp) { return !!sp.id; });
+      try { saveProjectList(summaries.map(function (sp) { return { id: sp.id, name: sp.name, createdAt: sp.createdAt }; })); } catch (_) {}
+      _ovPrimeProjectTasksFromSummaries(summaries);
+      _ovProjectTasksLoaded = true;
+      if (seq === _ovProjectTasksSeq) _ovRenderDashboard();
+
+      var details = await Promise.all(summaries.map(function (sp) {
+        if (project && project.id === sp.id) return Promise.resolve(project);
+        return _ovFetchProjectDataForOverview(sp.id);
+      }));
+      if (seq !== _ovProjectTasksSeq) return;
+      _ovProjectTasks = summaries.map(function (sp, idx) {
+        return _ovProjectTaskFromSummary(sp, details[idx], { detailFailed: !details[idx] });
+      });
+      _ovProjectTasksLoaded = true;
+      _ovRenderDashboard();
+    } finally {
+      if (seq === _ovProjectTasksSeq) {
+        _ovProjectTasksLoading = false;
+        if (_ovProjectTasksDirty) {
+          _ovProjectTasksDirty = false;
+          _ovLoadProjectTasks(true).catch(function (err) {
+            console.warn("[overview] reload dirty project tasks failed:", err);
+          });
+        }
+      }
+    }
+  }
+
+  function _ovEnsureProjectTasks(force) {
+    _ovLoadProjectTasks(!!force).catch(function (err) {
+      console.warn("[overview] load project tasks failed:", err);
+    });
+  }
+
+  function _ovInvalidateProjectTasks(refetch) {
+    _ovProjectTasksLoaded = false;
+    if (refetch !== false) _ovEnsureProjectTasks(true);
+  }
+
+  function _ovAssetCount(sb, group) {
+    if (sb && Array.isArray(sb._matchedRefs) && sb._matchedRefs.length) return sb._matchedRefs.length;
+    if (group && Array.isArray(group.shots)) {
+      var names = Object.create(null);
+      group.shots.forEach(function (sh) {
+        (sh.characters || []).forEach(function (n) { if (n) names["c:" + n] = 1; });
+        (sh.props || []).forEach(function (n) { if (n) names["p:" + n] = 1; });
+        if (sh.scene) names["s:" + sh.scene] = 1;
+      });
+      return Object.keys(names).length;
+    }
+    var assets = project && project.assets;
+    if (!assets) return 0;
+    return (assets.characters || []).length + (assets.scenes || []).length + (assets.props || []).length;
+  }
+
+  function _ovTaskTitle(gIdx, group, sb, persisted) {
+    var firstShot = group && group.shots && group.shots[0] ? group.shots[0] : {};
+    var visual = _ovFirst(firstShot.title, firstShot.name, firstShot.scene, firstShot.shotType, firstShot.visual, firstShot.description);
+    if (visual && visual.length > 20) visual = visual.slice(0, 20) + "...";
+    return _ovFirst(
+      persisted && (persisted.name || persisted.title),
+      sb && (sb.name || sb.title),
+      project && project.name ? project.name + " - " + (visual || ("片段 " + (gIdx + 1))) : "",
+      "未命名任务"
+    );
+  }
+
+  function _ovTaskType(group, sb) {
+    var firstShot = group && group.shots && group.shots[0] ? group.shots[0] : {};
+    return _ovFirst(sb && sb.taskType, firstShot.sceneType, firstShot.shotType, firstShot.type, "视频生成任务");
+  }
+
+  function _ovTaskCreatedAt(localTask, persisted, sb) {
+    return _ovFirst(
+      localTask && localTask.createdAt,
+      persisted && (persisted.createdAt || persisted.created_at),
+      sb && (sb.videoTaskFinishedAt || sb.updatedAt || sb.createdAt),
+      project && (project.updatedAt || project.createdAt)
+    );
+  }
+
+  function _ovTaskUpdatedAt(localTask, persisted, sb) {
+    return _ovFirst(
+      localTask && (localTask._doneAt || localTask.updatedAt || localTask.createdAt),
+      persisted && (persisted.updatedAt || persisted.updated_at || persisted.createdAt),
+      sb && (sb.videoTaskFinishedAt || sb.updatedAt || sb.createdAt),
+      project && (project.updatedAt || project.createdAt)
+    );
+  }
+
+  function _ovBuildTasks() {
+    if (!_ovProjectTasksLoaded && !_ovProjectTasksLoading) {
+      _ovPrimeProjectTasksFromSummaries(_ovProjectTaskSummariesFallback());
+      _ovEnsureProjectTasks(false);
+    }
+    var tasks = _ovProjectTasks.slice();
+    if (project && project.id) {
+      var currentId = "p:" + project.id;
+      var replaced = false;
+      tasks = tasks.map(function (t) {
+        if (t.id !== currentId) return t;
+        replaced = true;
+        return _ovProjectTaskFromSummary({ id: project.id, name: project.name, title: project.title, createdAt: project.createdAt, updatedAt: project.updatedAt, status: project.status }, project);
+      });
+      if (!replaced) {
+        tasks.unshift(_ovProjectTaskFromSummary({ id: project.id, name: project.name, title: project.title, createdAt: project.createdAt, updatedAt: project.updatedAt, status: project.status }, project));
+      }
+    }
+    return tasks;
+  }
+
+  function _ovCurrentTasks() {
+    var tasks = _ovBuildTasks();
+    var query = String(_ovTaskState.query || "").trim().toLowerCase();
+    if (_ovTaskState.status !== "all") tasks = tasks.filter(function (t) { return _ovStatusBucket(t.status) === _ovTaskState.status; });
+    if (query) {
+      tasks = tasks.filter(function (t) {
+        return [t.title, t.id, t.type, t.model, t.prompt].some(function (v) {
+          return String(v || "").toLowerCase().indexOf(query) >= 0;
+        });
+      });
+    }
+    tasks.sort(function (a, b) {
+      var aKey = _ovTaskState.sort === "oldest" ? a.createdAt : (a.updatedAt || a.createdAt);
+      var bKey = _ovTaskState.sort === "oldest" ? b.createdAt : (b.updatedAt || b.createdAt);
+      var av = new Date(aKey || 0).getTime() || 0;
+      var bv = new Date(bKey || 0).getTime() || 0;
+      return _ovTaskState.sort === "oldest" ? av - bv : bv - av;
+    });
+    return tasks;
+  }
+
+  function _ovAllCounts() {
+    var all = _ovBuildTasks();
+    var c = { all: all.length, running: 0, done: 0, failed: 0, pending: 0 };
+    all.forEach(function (t) {
+      var bucket = _ovStatusBucket(t.status);
+      if (c[bucket] !== undefined) c[bucket]++;
+    });
+    return c;
+  }
+
+  function _ovSetSelected(id, tasks) {
+    tasks = tasks || _ovBuildTasks();
+    if (id && tasks.some(function (t) { return t.id === id; })) { _ovTaskState.selectedId = id; return; }
+    if (_ovTaskState.selectedId && tasks.some(function (t) { return t.id === _ovTaskState.selectedId; })) return;
+    _ovTaskState.selectedId = tasks.length ? tasks[0].id : "";
+  }
+
+  function _ovRenderTabs(counts) {
+    var map = { ovTabAll: counts.all, ovTabRunning: counts.running, ovTabDone: counts.done, ovTabFailed: counts.failed, ovTabPending: counts.pending };
+    Object.keys(map).forEach(function (id) { var el = $(id); if (el) el.textContent = map[id]; });
+    var tabs = $("ovTaskTabs");
+    if (tabs) tabs.querySelectorAll("button[data-ov-status]").forEach(function (btn) { btn.classList.toggle("is-active", btn.dataset.ovStatus === _ovTaskState.status); });
+  }
+
+  function _ovTaskCardHtml(t, selected) {
+    var statusClass = _ovStatusClass(t.status);
+    var thumb = t.thumbnail
+      ? _ovThumbnailImgHtml(t.thumbnail)
+      : '<div class="vtd-thumb-empty"><span class="material-symbols-outlined">movie_filter</span></div>';
+    var retryDisabled = t.projectId ? "" : " disabled";
+    var deleteDisabled = t.projectId ? "" : " disabled";
+    var renameDisabled = t.projectId ? "" : " disabled";
+    var titleText = t.title || "未命名任务";
+    var isEditingTitle = _ovTaskState.editingTitleId === t.id;
+    var titleHtml = isEditingTitle
+      ? '<div class="vtd-title-edit-row is-editing">' +
+          '<input type="text" class="vtd-title-input" data-ov-title-input value="' + escapeHtml(titleText) + '" maxlength="200" autocomplete="off" spellcheck="false" aria-label="任务标题">' +
+          '<button type="button" class="vtd-title-icon-btn" data-ov-action="rename-save" title="保存标题" aria-label="保存标题"><span class="material-symbols-outlined">check</span></button>' +
+          '<button type="button" class="vtd-title-icon-btn" data-ov-action="rename-cancel" title="取消编辑" aria-label="取消编辑"><span class="material-symbols-outlined">close</span></button>' +
+        '</div>'
+      : '<div class="vtd-title-edit-row">' +
+          '<h3>' + escapeHtml(titleText) + '</h3>' +
+          '<button type="button" class="vtd-title-edit-btn" data-ov-action="rename" title="编辑标题" aria-label="编辑标题"' + renameDisabled + '><span class="material-symbols-outlined">edit</span></button>' +
+        '</div>';
+    return '' +
+      '<article class="vtd-task-card' + (selected ? ' is-selected' : '') + '" data-task-id="' + escapeHtml(t.id) + '">' +
+        '<button type="button" class="vtd-select-dot" data-ov-action="select" aria-label="选择任务"></button>' +
+        '<div class="vtd-thumb">' + thumb + '</div>' +
+        '<div class="vtd-task-body">' +
+          '<div class="vtd-task-title-row">' +
+            '<div class="min-w-0">' + titleHtml + '<p>创建时间&nbsp;&nbsp;' + escapeHtml(t.createdText || "--") + '</p></div>' +
+          '</div>' +
+          '<div class="vtd-task-meta">' +
+            '<span><i class="material-symbols-outlined">schedule</i>' + escapeHtml(t.durationText) + '</span>' +
+            '<span><i class="material-symbols-outlined">folder</i>素材 ' + escapeHtml(String(t.assetCount || 0)) + '</span>' +
+            '<span><i class="material-symbols-outlined">crop_portrait</i>' + escapeHtml(t.resolution) + '</span>' +
+            '<span><i class="material-symbols-outlined">memory</i>' + escapeHtml(t.model) + '</span>' +
+            '<span><i class="material-symbols-outlined">aspect_ratio</i>比例 ' + escapeHtml(t.ratio) + '</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="vtd-task-status-actions">' +
+          '<span class="vtd-type-pill">' + escapeHtml(t.type || "视频生成任务") + '</span>' +
+          '<span class="vtd-status ' + statusClass + '">' + escapeHtml(_ovStatusLabel(t)) + '</span>' +
+          '<div class="vtd-icon-actions">' +
+            (t.status === "failed"
+              ? '<button type="button" data-ov-action="retry" title="进入批量页处理失败任务"' + retryDisabled + '><span class="material-symbols-outlined">rule</span></button>'
+              : '') +
+            '<button type="button" data-ov-action="delete" title="删除项目任务"' + deleteDisabled + '><span class="material-symbols-outlined">delete</span></button>' +
+          '</div>' +
+        '</div>' +
+      '</article>';
+  }
+
+  function _ovFindTaskCard(taskId) {
+    var list = $("ovTaskList");
+    if (!list) return null;
+    var cards = list.querySelectorAll(".vtd-task-card");
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].dataset.taskId === taskId) return cards[i];
+    }
+    return null;
+  }
+
+  function _ovFocusTitleEditor(taskId) {
+    setTimeout(function () {
+      var card = _ovFindTaskCard(taskId);
+      var input = card && card.querySelector("[data-ov-title-input]");
+      if (!input) return;
+      input.focus();
+      input.select();
+    }, 30);
+  }
+
+  function _ovStartRenameProjectTask(task) {
+    if (!task || !task.projectId) {
+      showToast("这个任务暂不支持修改标题", "warn");
+      return;
+    }
+    _ovTaskState.editingTitleId = task.id;
+    _ovSelectTask(task.id);
+    _ovRenderDashboard();
+    _ovFocusTitleEditor(task.id);
+  }
+
+  function _ovCancelRenameProjectTask() {
+    _ovTaskState.editingTitleId = "";
+    _ovRenderDashboard();
+  }
+
+  async function _ovSaveRenameProjectTask(task, input) {
+    if (!task || !task.projectId) return;
+    var nextTitle = String((input && input.value) || "").trim();
+    if (!nextTitle) {
+      showToast("标题不能为空", "warn");
+      if (input) input.focus();
+      return;
+    }
+    if (nextTitle === String(task.title || "").trim()) {
+      _ovCancelRenameProjectTask();
+      return;
+    }
+    if (input) input.disabled = true;
+    var ok = await _renameProject(task.projectId, nextTitle);
+    if (!ok) {
+      if (input) {
+        input.disabled = false;
+        input.focus();
+      }
+      return;
+    }
+    _ovTaskState.editingTitleId = "";
+    showToast("标题已更新", "success");
+    _ovRenderDashboard();
+  }
+
+  function _ovRenderTaskList(tasks) {
+    var listEl = $("ovTaskList");
+    if (!listEl) return;
+    var pageSize = Number(_ovTaskState.pageSize) || 10;
+    var totalPages = Math.max(1, Math.ceil(tasks.length / pageSize));
+    if (_ovTaskState.page > totalPages) _ovTaskState.page = totalPages;
+    if (_ovTaskState.page < 1) _ovTaskState.page = 1;
+    var start = (_ovTaskState.page - 1) * pageSize;
+    var pageItems = tasks.slice(start, start + pageSize);
+    if (pageItems.length && !pageItems.some(function (t) { return t.id === _ovTaskState.selectedId; })) {
+      _ovTaskState.selectedId = pageItems[0].id;
+    }
+    if (!pageItems.length) {
+      listEl.innerHTML = '<div class="vtd-empty-state"><span class="material-symbols-outlined">movie</span><strong>暂无任务</strong><p>没有匹配当前筛选条件的视频任务。</p></div>';
+    } else {
+      listEl.innerHTML = pageItems.map(function (t) { return _ovTaskCardHtml(t, t.id === _ovTaskState.selectedId); }).join("");
+    }
+    var totalText = $("ovTaskTotalText");
+    if (totalText) totalText.textContent = "共 " + tasks.length + " 条";
+    var pageNums = $("ovTaskPageNumbers");
+    if (pageNums) {
+      var html = _ovPaginationItems(totalPages, _ovTaskState.page).map(function (item) {
+        if (typeof item !== "number") return '<span aria-hidden="true">...</span>';
+        return '<button type="button" class="' + (item === _ovTaskState.page ? 'is-active' : '') + '" data-ov-page="' + item + '">' + item + '</button>';
+      }).join("");
+      pageNums.innerHTML = html;
+    }
+    var prev = $("ovTaskPrevPage"), next = $("ovTaskNextPage"), size = $("ovTaskPageSize");
+    if (prev) prev.disabled = _ovTaskState.page <= 1;
+    if (next) next.disabled = _ovTaskState.page >= totalPages;
+    if (size) size.value = String(pageSize);
+  }
+
+  function _ovWorkflowData(targetProject) {
+    var proj = targetProject || project;
+    if (!proj) return [];
+    var groups = [];
+    if (proj === project) {
+      try { groups = getStoryboardGroups() || []; } catch (_) { groups = []; }
+    }
+    var assetCount = _ovProjectAssetCount(proj);
+    var sbTotal = Math.max(groups.length, Array.isArray(proj.storyboards) ? proj.storyboards.length : 0, Array.isArray(proj.videoTasks) ? proj.videoTasks.length : 0);
+    var sbDone = proj.storyboards ? proj.storyboards.filter(function (s) { return s && s.imageUrl; }).length : 0;
+    var vpDone = proj.storyboards ? proj.storyboards.filter(function (s) { return s && s.videoPrompt; }).length : 0;
+    var videoDone = 0;
+    if (Array.isArray(proj.storyboards)) videoDone = proj.storyboards.filter(function (s) { return s && s.videoUrl; }).length;
+    if (Array.isArray(proj.videoTasks)) {
+      videoDone = Math.max(videoDone, proj.videoTasks.filter(function (t) { return t && (t.url || t.videoUrl || t.protectedUrl || String(t.status || "").toLowerCase() === "done"); }).length);
+    }
+    return [
+      { label: "脚本生成", value: proj.script ? "已生成" : "未开始", done: !!proj.scriptApproved || !!proj.script },
+      { label: "资产库", value: proj.assetsApproved ? "已确认（" + assetCount + " 项）" : (assetCount ? assetCount + " 项已分析" : "未开始"), done: !!proj.assetsApproved },
+      { label: "镜头设计", value: proj.shots && proj.shots.length ? proj.shots.length + " 个镜头" : "未开始", done: !!proj.shotsApproved },
+      { label: "分镜图生成", value: proj.imagesApproved ? "已确认" : (sbDone ? "分镜板 " + sbDone + "/" + sbTotal : "未开始"), done: !!proj.imagesApproved },
+      { label: "视频提示词", value: proj.videoPromptsApproved ? "已确认" : (vpDone ? vpDone + "/" + sbTotal + " 条" : "未开始"), done: !!proj.videoPromptsApproved },
+      { label: "批量视频生成", value: videoDone ? videoDone + "/" + sbTotal + " 个片段" : (proj.videoPromptsApproved ? "就绪（" + sbTotal + " 个片段）" : "待处理"), done: sbTotal > 0 && videoDone >= sbTotal, ready: !!proj.videoPromptsApproved },
+    ];
+  }
+
+  function _ovRenderDetail(allTasks) {
+    allTasks = allTasks || _ovBuildTasks();
+    var task = allTasks.find(function (t) { return t.id === _ovTaskState.selectedId; }) || allTasks[0] || null;
+    _ovSetSelected(task && task.id, allTasks);
+    var preview = $("ovPreviewWrap"), param = $("ovParamList"), flow = $("ovWorkflowStatus"), summary = $("ovPromptSummary");
+    var dl = $("ovDownloadVideoBtn");
+    if (!task) {
+      if (preview) preview.innerHTML = '<div class="vtd-preview-empty"><span class="material-symbols-outlined">movie_filter</span><p>未选择任务</p></div>';
+      if (param) param.innerHTML = "";
+      if (flow) flow.innerHTML = "";
+      if (summary) summary.textContent = "暂无内容摘要";
+      if (dl) dl.disabled = true;
+      return;
+    }
+    if (preview) {
+      if (task.videoUrl) {
+        preview.innerHTML = '<video src="' + escapeHtml(task.videoUrl) + '" poster="' + escapeHtml(_ovThumbnailPosterUrl(task.thumbnail)) + '" controls playsinline preload="metadata"></video><button type="button" class="vtd-preview-play" data-ov-action="preview-play" title="播放"><span class="material-symbols-outlined">play_arrow</span></button>';
+      } else if (task.thumbnail) {
+        preview.innerHTML = _ovThumbnailImgHtml(task.thumbnail) + '<div class="vtd-preview-unavailable"><span class="material-symbols-outlined">videocam_off</span><p>视频未生成</p></div>';
+      } else {
+        preview.innerHTML = '<div class="vtd-preview-empty"><span class="material-symbols-outlined">movie_filter</span><p>暂无缩略图</p></div>';
+      }
+    }
+    if (param) {
+      var rows = [["片段数", task.segmentCount ? task.segmentCount + " 个" : "--"], ["总时长", task.durationText], ["比例", "9:16 竖版"], ["内容字数", task.promptCount ? task.promptCount + " 字" : "--"]];
+      param.innerHTML = rows.map(function (r) { return '<div class="vtd-param-row"><span>' + escapeHtml(r[0]) + '</span><strong>' + escapeHtml(r[1]) + '</strong></div>'; }).join("");
+    }
+    if (flow) {
+      flow.innerHTML = _ovWorkflowData(task.projectData || (project && project.id === task.projectId ? project : null)).map(function (s, idx) {
+        return '<div class="vtd-workflow-item' + (s.done ? ' is-done' : s.ready ? ' is-ready' : '') + '"><span class="vtd-workflow-num">' + (idx + 1) + '</span><div><strong>' + escapeHtml(s.label) + '</strong><p>' + escapeHtml(s.value) + '</p></div>' + (s.done ? '<span class="material-symbols-outlined">check</span>' : s.ready ? '<em>就绪</em>' : '<em>待处理</em>') + '</div>';
+      }).join("");
+    }
+    if (summary) {
+      var p = String(task.prompt || "").trim();
+      summary.textContent = p ? (p.length > 120 ? p.slice(0, 120) + "..." : p) : "暂无内容摘要";
+    }
+    if (dl) { dl.disabled = !task.videoUrl; dl.dataset.taskId = task.id; }
+  }
+
+  function _ovRenderStats(counts) {
+    var grid = $("ovStatsGrid");
+    if (!grid) return;
+    var items = [
+      { key: "all", icon: "grid_view", label: "全部任务", value: counts.all },
+      { key: "running", icon: "timelapse", label: "生成中", value: counts.running },
+      { key: "done", icon: "task_alt", label: "已完成", value: counts.done },
+      { key: "failed", icon: "error", label: "失败", value: counts.failed },
+      { key: "pending", icon: "pending_actions", label: "待处理", value: counts.pending },
+    ];
+    grid.innerHTML = items.map(function (it) {
+      var active = _ovTaskState.status === it.key;
+      return '<button type="button" class="vtd-stat-card is-' + it.key + (active ? ' is-active' : '') + '" data-ov-stat-filter="' + it.key + '" aria-pressed="' + (active ? 'true' : 'false') + '"><span class="material-symbols-outlined">' + it.icon + '</span><strong>' + it.value + '</strong><p>' + it.label + '</p></button>';
+    }).join("");
+  }
+
+  function _ovRenderTrend(tasks) {
+    var el = $("ovTrendChart");
+    if (!el) return;
+    var days = [], now = new Date();
+    for (var i = 6; i >= 0; i--) {
+      var d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+      days.push({ d: d, key: d.toISOString().slice(0, 10), label: (d.getMonth() + 1) + "/" + d.getDate(), count: 0 });
+    }
+    tasks.forEach(function (t) {
+      var d = t.createdAt ? new Date(t.createdAt) : null;
+      if (!d || isNaN(d.getTime())) return;
+      var key = d.toISOString().slice(0, 10);
+      var hit = days.find(function (x) { return x.key === key; });
+      if (hit) hit.count++;
+    });
+    var max = Math.max.apply(null, days.map(function (d) { return d.count; }));
+    if (!max) {
+      el.innerHTML = '<div class="vtd-empty-state compact"><span class="material-symbols-outlined">show_chart</span><p>暂无最近 7 天生成数据</p></div>';
+      return;
+    }
+    var width = 560, height = 170, padX = 32, padY = 22;
+    var points = days.map(function (d, idx) {
+      var x = padX + idx * ((width - padX * 2) / 6);
+      var y = height - padY - (d.count / max) * (height - padY * 2);
+      return { x: x, y: y, d: d };
+    });
+    var poly = points.map(function (p) { return p.x + "," + p.y; }).join(" ");
+    el.innerHTML = '<svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="近 7 天生成趋势"><g class="vtd-trend-grid"><line x1="28" y1="24" x2="' + (width - 24) + '" y2="24"></line><line x1="28" y1="82" x2="' + (width - 24) + '" y2="82"></line><line x1="28" y1="140" x2="' + (width - 24) + '" y2="140"></line></g><polyline points="' + poly + '" fill="none" stroke="#4b6695" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>' + points.map(function (p) { return '<circle cx="' + p.x + '" cy="' + p.y + '" r="4.5"></circle>'; }).join("") + points.map(function (p) { return '<text x="' + p.x + '" y="162" text-anchor="middle">' + escapeHtml(p.d.label) + '</text>'; }).join("") + '</svg>';
+  }
+
+  function _ovRenderActivity(tasks) {
+    var el = $("ovActivityList");
+    if (!el) return;
+    var items = tasks.slice().sort(function (a, b) { return (new Date(b.updatedAt || b.createdAt || 0).getTime() || 0) - (new Date(a.updatedAt || a.createdAt || 0).getTime() || 0); }).slice(0, 3);
+    if (!items.length) {
+      el.innerHTML = '<div class="vtd-empty-state compact"><span class="material-symbols-outlined">notifications</span><p>暂无最近动态</p></div>';
+      return;
+    }
+    el.innerHTML = items.map(function (t) {
+      var icon = t.status === "done" ? "check" : t.status === "failed" ? "priority_high" : t.status === "running" ? "sync" : "schedule";
+      return '<button type="button" class="vtd-activity-item" data-task-id="' + escapeHtml(t.id) + '"><span class="vtd-activity-dot ' + _ovStatusClass(t.status) + '"><i class="material-symbols-outlined">' + icon + '</i></span><span><strong>' + escapeHtml(t.title) + '</strong><em>' + escapeHtml(_ovStatusLabel(t)) + ' · ' + escapeHtml(_ovShortTime(t.updatedAt || t.createdAt)) + '</em></span><i class="material-symbols-outlined">chevron_right</i></button>';
+    }).join("");
+  }
+
+  function _ovRenderDashboard() {
+    _ovResetSearchInput();
+    var allTasks = _ovBuildTasks();
+    var filtered = _ovCurrentTasks();
+    _ovSetSelected(_ovTaskState.selectedId, filtered.length ? filtered : allTasks);
+    var counts = _ovAllCounts();
+    _ovRenderTabs(counts);
+    _ovSyncToolbarState();
+    _ovRenderTaskList(filtered);
+    _ovRenderDetail(allTasks);
+    _ovRenderStats(counts);
+    _ovRenderTrend(allTasks);
+    _ovRenderActivity(allTasks);
+    _ovRefreshThumbnailImages($("overviewContent") || document);
   }
 
   function refreshOverview() {
     var empty = $("overviewEmpty");
     var content = $("overviewContent");
-    if (!project) {
+    var hasKnownTasks = _ovProjectTasks.length || getProjectList().length;
+    if (!project && !hasKnownTasks) {
       empty.hidden = false;
       if (content) content.hidden = true;
       return;
     }
+    _ovEnsureProjectTasks(false);
     empty.hidden = true;
     content.hidden = false;
     var projNameEl = $("ovProjName");
-    projNameEl.textContent = project.name || "未命名项目";
-    projNameEl.title = "点击修改项目名称";
-
-    var sbTotal = project.shots ? getStoryboardGroups().length : 0;
-    var sbDone = project.storyboards ? project.storyboards.filter(function (s) { return s && s.imageUrl; }).length : 0;
-    var promptCount = project.shots ? project.shots.filter(function (s) { return s.imagePromptGenerated; }).length : 0;
-    var imgTotal = project.shots ? project.shots.length : 0;
-    var imgLabel = "未开始";
-    if (project.imagesApproved) imgLabel = "已确认";
-    else if (sbDone > 0) imgLabel = "分镜板 " + sbDone + "/" + sbTotal;
-    else if (promptCount > 0) imgLabel = "生成 " + promptCount + "/" + imgTotal;
-    var vpTotal = sbTotal;
-    var vpDone = project.storyboards ? project.storyboards.filter(function (s) { return s && s.videoPrompt; }).length : 0;
-    var vpLabel = "未开始";
-    if (project.videoPromptsApproved) vpLabel = "已确认";
-    else if (vpDone > 0) vpLabel = vpDone + "/" + vpTotal + " 条";
-    var assetCount = project.assets ? (project.assets.characters || []).length + (project.assets.scenes || []).length + (project.assets.props || []).length : 0;
-    var assetLabel = "未开始";
-    if (project.assetsApproved) assetLabel = "已确认 (" + assetCount + " 项)";
-    else if (assetCount > 0) assetLabel = assetCount + " 项已分析";
-
-    var batchLabel = "未开始";
-    if (project.videoPromptsApproved) batchLabel = "就绪（" + vpTotal + " 个片段）";
-
-    var stepData = [
-      { approved: project.scriptApproved, label: project.script ? "已生成" : "未开始" },
-      { approved: !!project.assetsApproved, label: assetLabel },
-      { approved: project.shotsApproved, label: project.shots && project.shots.length ? project.shots.length + " 个镜头" : "未开始" },
-      { approved: !!project.imagesApproved, label: imgLabel },
-      { approved: !!project.videoPromptsApproved, label: vpLabel },
-      { approved: false, label: batchLabel },
-    ];
-
-    for (var i = 0; i < 6; i++) {
-      var el = $("ovStep" + (i + 1));
-      var st = $("ovStatus" + (i + 1));
-      if (!el || !st) continue;
-      st.textContent = stepData[i].label;
-      el.classList.remove("is-done", "is-current");
-      if (stepData[i].approved) el.classList.add("is-done");
-      else if (i + 1 === project.currentStep) el.classList.add("is-current");
+    if (projNameEl) {
+      var total = _ovProjectTasks.length || getProjectList().length || (project ? 1 : 0);
+      projNameEl.textContent = total ? "全部项目 · " + total + " 个" : "全部项目";
+      projNameEl.title = "按项目聚合的视频任务列表";
     }
+    _ovRenderDashboard();
+  }
+
+  function _ovTaskById(id) {
+    var tasks = _ovBuildTasks();
+    for (var i = 0; i < tasks.length; i++) {
+      if (tasks[i].id === id) return tasks[i];
+    }
+    return null;
+  }
+
+  function _ovSelectTask(id) {
+    _ovTaskState.selectedId = id || "";
+    _ovRenderDashboard();
+  }
+
+  function _ovDefaultProjectTaskName() {
+    var d = new Date();
+    var mm = String(d.getMinutes());
+    if (mm.length < 2) mm = "0" + mm;
+    return "项目 " + (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours() + ":" + mm;
+  }
+
+  async function _ovCreateProjectTask(btn) {
+    if (_ovProjectTaskCreating) return;
+    _ovProjectTaskCreating = true;
+    if (btn) btn.disabled = true;
+    try {
+      var ok = await createNewProject(_ovDefaultProjectTaskName());
+      if (ok !== false) {
+        refreshOverview();
+        switchPage("script");
+      }
+    } catch (e) {
+      console.error("[OverviewNewTask]", e);
+      showToast("新建任务失败", "error");
+    } finally {
+      _ovProjectTaskCreating = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function _ovOpenVideo(task) {
+    if (!task || !task.videoUrl) {
+      showToast("视频尚未生成", "warn");
+      return;
+    }
+    try {
+      window.open(task.videoUrl, "_blank", "noopener,noreferrer");
+    } catch (_) {
+      showToast("浏览器阻止了新窗口，请允许弹窗后重试", "warn");
+    }
+  }
+
+  async function _ovRetryTask(task) {
+    if (!task || !task.projectId || _ovProjectTaskNavigating) return;
+    _ovProjectTaskNavigating = true;
+    try {
+      if (!project || project.id !== task.projectId) {
+        await switchToProject(task.projectId);
+      }
+      if (!project || project.id !== task.projectId) {
+        showToast("无法打开该项目，请刷新后重试", "error");
+        return;
+      }
+      switchPage("batch");
+    } catch (e) {
+      showToast((e && e.message) || "打开失败任务处理页失败", "error");
+    } finally {
+      _ovProjectTaskNavigating = false;
+    }
+  }
+
+  async function _ovDeleteProjectTask(task) {
+    if (!task || !task.projectId || _ovProjectTaskDeleting) return;
+    var title = task.title || "未命名任务";
+    var ok = await showConfirm(
+      "删除项目任务",
+      "确定删除「" + title + "」？\n这会删除该项目任务及其关联素材、生成视频、上传素材、导出文件和批量记录，操作不可恢复。",
+      "删除",
+      "取消"
+    );
+    if (!ok) return;
+
+    var projectId = task.projectId;
+    var previousTasks = _ovProjectTasks.slice();
+    _ovProjectTaskDeleting = true;
+    try {
+      _ovProjectTasks = _ovProjectTasks.filter(function (item) { return item && item.projectId !== projectId; });
+      if (_ovTaskState.selectedId === task.id) _ovTaskState.selectedId = "";
+      _ovProjectTasksLoaded = true;
+      _ovRenderDashboard();
+
+      var resp = await fetch("/api/projects/" + encodeURIComponent(projectId), {
+        method: "DELETE",
+        headers: _getAuthHeaders(),
+      });
+      if (!resp || !resp.ok) {
+        var msg = "删除失败";
+        try {
+          var body = await resp.json();
+          msg = body && (body.error || body.message) ? (body.error || body.message) : msg;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+
+      var list = getProjectList().filter(function (p) { return p && p.id !== projectId; });
+      saveProjectList(list);
+      localStorage.removeItem(_uPrefix + "sw_proj_" + projectId);
+
+      if (project && project.id === projectId) {
+        if (list.length > 0) {
+          await switchToProject(list[0].id);
+        } else {
+          project = null;
+          syncEditProject(null);
+          syncTasksProject(null);
+          syncVideoTasksProject(null);
+          syncVideoPromptsProject(null);
+          syncShotsProject(null);
+          syncStoryboardProject(null);
+          syncScriptProject(null);
+          syncAssetsProject(null);
+          localStorage.removeItem(STORAGE_PROJECT);
+          refreshOverview();
+        }
+      }
+
+      _ovInvalidateProjectTasks(true);
+      renderProjectList();
+      refreshOverview();
+      showToast("已删除视频任务", "success");
+    } catch (e) {
+      _ovProjectTasks = previousTasks;
+      _ovProjectTasksLoaded = true;
+      _ovRenderDashboard();
+      _ovInvalidateProjectTasks(true);
+      showToast((e && e.message) || "删除视频任务失败", "error");
+    } finally {
+      _ovProjectTaskDeleting = false;
+    }
+  }
+
+  function _wireOverviewDashboardOnce() {
+    if (_overviewDashboardBound) return;
+    _overviewDashboardBound = true;
+
+    var tabs = $("ovTaskTabs");
+    if (tabs) tabs.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-ov-status]");
+      if (!btn) return;
+      _ovTaskState.status = btn.dataset.ovStatus || "all";
+      _ovTaskState.page = 1;
+      _ovRenderDashboard();
+    });
+
+    var search = $("ovTaskSearch");
+    if (search) {
+      _ovClearSearchInput(search);
+      _ovScheduleSearchAutofillGuard(search);
+      search.addEventListener("beforeinput", function (e) {
+        if (_ovIsCredentialReplacementInput(e) || (!_ovIsTrustedUserEvent(e) && !_ovHasActiveSearchIntent(search))) {
+          e.preventDefault();
+          _ovDeferSearchReset(search);
+          return;
+        }
+        _ovMarkSearchUserInput();
+      }, true);
+      search.addEventListener("pointerdown", function (e) { if (_ovIsTrustedUserEvent(e)) _ovMarkSearchFocus(); }, true);
+      search.addEventListener("click", function () { _ovMarkSearchFocus(); }, true);
+      search.addEventListener("keydown", function (e) { if (_ovIsTrustedUserEvent(e)) _ovMarkSearchUserInput(); }, true);
+      search.addEventListener("paste", function (e) { if (_ovIsTrustedUserEvent(e)) _ovMarkSearchUserInput(); }, true);
+      search.addEventListener("drop", function (e) { if (_ovIsTrustedUserEvent(e)) _ovMarkSearchUserInput(); }, true);
+      search.addEventListener("compositionstart", function (e) {
+        if (_ovIsTrustedUserEvent(e) || _ovHasActiveSearchIntent(search)) {
+          _ovMarkSearchUserInput();
+          _ovSearchComposing = true;
+        }
+      }, true);
+      search.addEventListener("focus", function () {
+        _ovMarkSearchFocus();
+        if (!_ovTaskState.query && !_ovIsRecentSearchUserInput()) {
+          _ovClearSearchInput(search);
+          _ovRenderDashboard();
+        } else {
+          _ovResetSearchInput(search);
+        }
+      });
+      search.addEventListener("blur", function () {
+        _ovSearchComposing = false;
+      });
+      search.addEventListener("change", function () { _ovResetSearchInput(search); });
+      search.addEventListener("input", function (e) {
+        if (!_ovAllowSearchInputEvent(e, search)) {
+          _ovDeferSearchReset(search);
+          return;
+        }
+        _ovMarkSearchUserInput();
+        _ovApplySearchInput(search);
+      });
+      search.addEventListener("compositionend", function (e) {
+        _ovSearchComposing = false;
+        if (!_ovIsTrustedUserEvent(e) && !_ovHasActiveSearchIntent(search)) {
+          _ovDeferSearchReset(search);
+          return;
+        }
+        _ovMarkSearchUserInput();
+        _ovApplySearchInput(search);
+      });
+    }
+
+    var filter = $("ovTaskFilterBtn");
+    if (filter) filter.addEventListener("click", function () {
+      var order = ["all", "running", "done", "failed", "pending"];
+      var next = order[(order.indexOf(_ovTaskState.status) + 1) % order.length];
+      _ovTaskState.status = next;
+      _ovTaskState.page = 1;
+      _ovRenderDashboard();
+    });
+
+    var sort = $("ovTaskSortBtn");
+    if (sort) sort.addEventListener("click", function () {
+      _ovTaskState.sort = _ovTaskState.sort === "latest" ? "oldest" : "latest";
+      _ovRenderDashboard();
+    });
+
+    var stats = $("ovStatsGrid");
+    if (stats) stats.addEventListener("click", function (e) {
+      var card = e.target.closest("[data-ov-stat-filter]");
+      if (!card || !stats.contains(card)) return;
+      _ovTaskState.status = card.dataset.ovStatFilter || "all";
+      _ovTaskState.page = 1;
+      _ovRenderDashboard();
+    });
+
+    var newTask = $("ovNewTaskBtn");
+    if (newTask) newTask.addEventListener("click", function () {
+      _ovCreateProjectTask(newTask);
+    });
+
+    var list = $("ovTaskList");
+    if (list) list.addEventListener("click", function (e) {
+      if (e.target.closest("[data-ov-title-input]")) return;
+      var card = e.target.closest(".vtd-task-card");
+      if (!card) return;
+      var id = card.dataset.taskId;
+      var actionBtn = e.target.closest("[data-ov-action]");
+      var action = actionBtn ? actionBtn.dataset.ovAction : "select";
+      var task = _ovTaskById(id);
+      if (!task) return;
+      if (action === "rename") {
+        e.preventDefault();
+        _ovStartRenameProjectTask(task);
+        return;
+      }
+      if (action === "rename-save") {
+        e.preventDefault();
+        _ovSaveRenameProjectTask(task, card.querySelector("[data-ov-title-input]"));
+        return;
+      }
+      if (action === "rename-cancel") {
+        e.preventDefault();
+        _ovCancelRenameProjectTask();
+        return;
+      }
+      if (action === "download") {
+        e.preventDefault();
+        _ovOpenVideo(task);
+        return;
+      }
+      if (action === "retry") {
+        e.preventDefault();
+        _ovRetryTask(task);
+        return;
+      }
+      if (action === "delete") {
+        e.preventDefault();
+        _ovDeleteProjectTask(task);
+        return;
+      }
+      if (action === "details") {
+        e.preventDefault();
+        _ovSelectTask(id);
+        var panel = document.querySelector(".vtd-detail-panel");
+        if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "nearest", inline: "nearest" });
+        return;
+      }
+      _ovSelectTask(id);
+      if (action === "play" && task.videoUrl) {
+        setTimeout(function () {
+          var video = $("ovPreviewWrap") && $("ovPreviewWrap").querySelector("video");
+          if (video) video.play().catch(function () {});
+        }, 40);
+      }
+    });
+    if (list) list.addEventListener("keydown", function (e) {
+      var input = e.target.closest("[data-ov-title-input]");
+      if (!input || e.isComposing) return;
+      var card = input.closest(".vtd-task-card");
+      var task = card && _ovTaskById(card.dataset.taskId);
+      if (!task) return;
+      if (e.key === "Enter") {
+        e.preventDefault();
+        _ovSaveRenameProjectTask(task, input);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        _ovCancelRenameProjectTask();
+      }
+    });
+
+    var pageNums = $("ovTaskPageNumbers");
+    if (pageNums) pageNums.addEventListener("click", function (e) {
+      var btn = e.target.closest("button[data-ov-page]");
+      if (!btn) return;
+      _ovTaskState.page = Number(btn.dataset.ovPage) || 1;
+      _ovRenderDashboard();
+    });
+    var prev = $("ovTaskPrevPage");
+    if (prev) prev.addEventListener("click", function () {
+      _ovTaskState.page = Math.max(1, _ovTaskState.page - 1);
+      _ovRenderDashboard();
+    });
+    var next = $("ovTaskNextPage");
+    if (next) next.addEventListener("click", function () {
+      _ovTaskState.page = _ovTaskState.page + 1;
+      _ovRenderDashboard();
+    });
+    var pageSize = $("ovTaskPageSize");
+    if (pageSize) pageSize.addEventListener("change", function () {
+      _ovTaskState.pageSize = Number(pageSize.value) || 10;
+      _ovTaskState.page = 1;
+      _ovRenderDashboard();
+    });
+
+    var activity = $("ovActivityList");
+    if (activity) activity.addEventListener("click", function (e) {
+      var item = e.target.closest("[data-task-id]");
+      if (item) {
+        _ovTaskState.status = "all";
+        _ovTaskState.page = 1;
+        _ovSelectTask(item.dataset.taskId);
+      }
+    });
+
+    var dl = $("ovDownloadVideoBtn");
+    if (dl) dl.addEventListener("click", function () {
+      _ovOpenVideo(_ovTaskById(dl.dataset.taskId));
+    });
+
+    var preview = $("ovPreviewWrap");
+    document.addEventListener("error", function (e) {
+      var img = e.target && e.target.closest && e.target.closest("img[data-ov-thumb-src]");
+      if (!img) return;
+      _ovEnsureThumbnailImage(img, true).catch(function (err) {
+        console.warn("[overview] retry thumbnail failed:", err);
+      });
+    }, true);
+    if (preview) preview.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-ov-action='preview-play']");
+      if (!btn) return;
+      var video = preview.querySelector("video");
+      if (video) {
+        btn.hidden = true;
+        video.play().catch(function () { btn.hidden = false; });
+      }
+    });
   }
 
   /* ── 项目名 inline 编辑 ── */
   var _projNameEditBound = false;
   function _bindProjNameEdit() {
-    if (_projNameEditBound) return;
     var el = $("ovProjName");
     if (!el) return;
     _projNameEditBound = true;
-    el.style.cursor = "pointer";
-    el.addEventListener("click", function () {
-      if (!project) return;
-      var current = project.name || "未命名项目";
-      var input = document.createElement("input");
-      input.type = "text";
-      input.value = current;
-      input.className = "text-2xl font-thin tracking-tighter bg-transparent border-b-2 border-primary/50 text-on-background outline-none w-full";
-      input.style.padding = "2px 0";
-      el.replaceWith(input);
-      input.focus();
-      input.select();
-      function commit() {
-        var val = input.value.trim();
-        if (val && val !== current) {
-          _renameProject(project.id, val);
-        }
-        var newEl = $("ovProjName");
-        if (!newEl) {
-          newEl = document.createElement("h2");
-          newEl.id = "ovProjName";
-          newEl.className = el.className;
-          input.replaceWith(newEl);
-        }
-        _projNameEditBound = false;
-        refreshOverview();
-        _bindProjNameEdit();
-      }
-      input.addEventListener("blur", commit);
-      input.addEventListener("keydown", function (ev) {
-        if (ev.key === "Enter") { ev.preventDefault(); input.blur(); }
-        if (ev.key === "Escape") { input.value = current; input.blur(); }
-      });
-    });
+    el.style.cursor = "default";
   }
   /* ================================================================
      CREATOR PROFILE — chat-based preference collection
@@ -1969,6 +3432,118 @@ var _projectEpoch = 0;
   var _agentHistory = [];
   var _agentRefs = [];
   var _agentBusy = false;
+  var _agentFabSuppressClick = false;
+  var AGENT_FAB_POS_KEY = _uPrefix + "sw_agent_fab_pos_v1";
+
+  function _agentFabBounds(fab) {
+    var margin = 12;
+    var size = fab && fab.offsetWidth ? fab.offsetWidth : 52;
+    return {
+      minX: margin,
+      minY: margin,
+      maxX: Math.max(margin, window.innerWidth - size - margin),
+      maxY: Math.max(margin, window.innerHeight - size - margin),
+    };
+  }
+
+  function _clampAgentFabPos(fab, pos) {
+    var bounds = _agentFabBounds(fab);
+    return {
+      x: Math.min(bounds.maxX, Math.max(bounds.minX, pos.x)),
+      y: Math.min(bounds.maxY, Math.max(bounds.minY, pos.y)),
+    };
+  }
+
+  function _applyAgentFabPos(fab, pos) {
+    if (!fab || !pos) return;
+    var next = _clampAgentFabPos(fab, pos);
+    fab.style.left = next.x + "px";
+    fab.style.top = next.y + "px";
+    fab.style.right = "auto";
+    fab.style.bottom = "auto";
+  }
+
+  function _readAgentFabPos() {
+    try {
+      var raw = localStorage.getItem(AGENT_FAB_POS_KEY);
+      if (!raw) return null;
+      var pos = JSON.parse(raw);
+      if (!pos || typeof pos.x !== "number" || typeof pos.y !== "number") return null;
+      return pos;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function _saveAgentFabPos(fab) {
+    if (!fab) return;
+    var rect = fab.getBoundingClientRect();
+    var pos = _clampAgentFabPos(fab, { x: rect.left, y: rect.top });
+    _applyAgentFabPos(fab, pos);
+    try { localStorage.setItem(AGENT_FAB_POS_KEY, JSON.stringify(pos)); } catch (_) {}
+  }
+
+  function _wireAgentFabDrag(fab) {
+    if (!fab || fab.dataset.dragBound === "1") return;
+    fab.dataset.dragBound = "1";
+
+    var saved = _readAgentFabPos();
+    if (saved) _applyAgentFabPos(fab, saved);
+
+    var drag = null;
+
+    function finishDrag(e) {
+      if (!drag) return;
+      try { fab.releasePointerCapture(drag.pointerId); } catch (_) {}
+      fab.classList.remove("is-dragging");
+      if (drag.moved) {
+        _saveAgentFabPos(fab);
+        _agentFabSuppressClick = true;
+        setTimeout(function () { _agentFabSuppressClick = false; }, 180);
+        if (e) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }
+      drag = null;
+    }
+
+    fab.addEventListener("pointerdown", function (e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      var rect = fab.getBoundingClientRect();
+      drag = {
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        left: rect.left,
+        top: rect.top,
+        moved: false,
+      };
+      fab.classList.add("is-dragging");
+      try { fab.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+
+    fab.addEventListener("pointermove", function (e) {
+      if (!drag || e.pointerId !== drag.pointerId) return;
+      var dx = e.clientX - drag.startX;
+      var dy = e.clientY - drag.startY;
+      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
+      drag.moved = true;
+      _applyAgentFabPos(fab, { x: drag.left + dx, y: drag.top + dy });
+      e.preventDefault();
+    });
+
+    fab.addEventListener("pointerup", finishDrag);
+    fab.addEventListener("pointercancel", finishDrag);
+
+    window.addEventListener("resize", function () {
+      var current = _readAgentFabPos();
+      if (current) {
+        _applyAgentFabPos(fab, current);
+        _saveAgentFabPos(fab);
+      }
+    });
+  }
 
   function toggleAgentPanel(forceState) {
     var panel = $("agentPanel");
@@ -2706,7 +4281,17 @@ var _projectEpoch = 0;
 
   function _wireAgentEvents() {
     var agentBtn = $("navAgent");
-    if (agentBtn) agentBtn.addEventListener("click", function () { toggleAgentPanel(); });
+    if (agentBtn) {
+      _wireAgentFabDrag(agentBtn);
+      agentBtn.addEventListener("click", function (e) {
+        if (_agentFabSuppressClick) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        toggleAgentPanel();
+      });
+    }
 
     var closeBtn = $("agentCloseBtn");
     if (closeBtn) closeBtn.addEventListener("click", function () { toggleAgentPanel(false); });
@@ -2832,6 +4417,7 @@ var _projectEpoch = 0;
       window.location.href = "/?auth=1";
       return;
     }
+    _wireCoreNavigationOnce();
     initSettings({
       settings,
       STORAGE_MODELS,
@@ -2863,6 +4449,7 @@ var _projectEpoch = 0;
       STATUS_COPY,
       VIDEO_ADAPTERS,
       saveProject: () => saveProject(),
+      flushServerSave: () => _flushServerSave(),
       registerServerTask: (taskId, taskType, targetType, targetIdx, extra) => _registerServerTask(taskId, taskType, targetType, targetIdx, extra),
       notifyServerTaskDone: (taskId) => _notifyServerTaskDone(taskId),
       archiveOldImage: (item, source) => _archiveOldImage(item, source),
@@ -2874,10 +4461,31 @@ var _projectEpoch = 0;
       vpFetchAndCache: (sb) => vpFetchAndCache(sb),
       vpGetCache: (sb) => vpGetCache(sb),
       switchPage: (p) => switchPage(p),
-      diagnoseApiError: (msg) => _diagnoseApiError(msg),
-      sleep: (ms) => sleep(ms),
-      refreshOverview: () => refreshOverview(),
-    });
+	      diagnoseApiError: (msg) => _diagnoseApiError(msg),
+	      sleep: (ms) => sleep(ms),
+	      refreshOverview: () => refreshOverview(),
+	      reloadProjectFromServer: async () => {
+	        if (!project || !project.id) return false;
+	        try {
+	          var p = await loadProjectData(project.id);
+	          if (!p || !p.id || p.id !== project.id) return false;
+	          project = p;
+	          syncEditProject(project);
+	          syncTasksProject(project);
+	          syncVideoTasksProject(project);
+	          syncVideoPromptsProject(project);
+	          syncShotsProject(project);
+	          syncStoryboardProject(project);
+	          syncScriptProject(project);
+	          syncAssetsProject(project);
+	          syncEpisodesProject(project);
+	          return true;
+	        } catch (e) {
+	          console.warn("[reloadProjectFromServer] failed:", e);
+	          return false;
+	        }
+	      },
+	    });
     initProject({
       getProject: () => project,
       setProject: (p) => { project = p; },
@@ -2946,12 +4554,48 @@ var _projectEpoch = 0;
       getStoryboardGroups: () => getStoryboardGroups(),
       isStale: (key) => _isStale(key),
       clearStale: (key) => _clearStale(key),
-      checkAndSuggest: (stage) => _checkAndSuggest(stage),
-      switchPage: (p) => switchPage(p),
-      formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
-      sleep: (ms) => sleep(ms),
-      diagnoseApiError: (msg) => _diagnoseApiError(msg),
-    });
+	      checkAndSuggest: (stage) => _checkAndSuggest(stage),
+	      switchPage: (p) => switchPage(p),
+	      formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
+	      sleep: (ms) => sleep(ms),
+	      diagnoseApiError: (msg) => _diagnoseApiError(msg),
+	      invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
+	      applyProjectFromServer: (p) => {
+	        if (!p || !p.id || (project && p.id !== project.id)) return false;
+	        project = p;
+	        syncEditProject(project);
+	        syncTasksProject(project);
+	        syncVideoTasksProject(project);
+	        syncVideoPromptsProject(project);
+	        syncShotsProject(project);
+	        syncStoryboardProject(project);
+	        syncScriptProject(project);
+	        syncAssetsProject(project);
+	        syncEpisodesProject(project);
+	        return true;
+	      },
+	      reloadProjectFromServer: async () => {
+	        if (!project || !project.id) return false;
+	        try {
+	          var p = await loadProjectData(project.id);
+	          if (!p || !p.id || p.id !== project.id) return false;
+	          project = p;
+	          syncEditProject(project);
+	          syncTasksProject(project);
+	          syncVideoTasksProject(project);
+	          syncVideoPromptsProject(project);
+	          syncShotsProject(project);
+	          syncStoryboardProject(project);
+	          syncScriptProject(project);
+	          syncAssetsProject(project);
+	          syncEpisodesProject(project);
+	          return true;
+	        } catch (e) {
+	          console.warn("[reloadProjectFromServer] failed:", e);
+	          return false;
+	        }
+	      },
+	    });
     syncVideoPromptsProject(project);
     initShots({
       getProject: () => project,
@@ -2983,6 +4627,7 @@ var _projectEpoch = 0;
       setHistoryAsCurrent: (item, hi) => _setHistoryAsCurrent(item, hi),
       emotionBadgeHtml: (emotion, intensity) => emotionBadgeHtml(emotion, intensity),
       sleep: (ms) => sleep(ms),
+      invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
     });
     syncStoryboardProject(project);
     initScript({
@@ -3003,9 +4648,11 @@ var _projectEpoch = 0;
     });
     syncScriptProject(project);
     syncAssetsProject(project);
-    initAssets({
-      getProject: () => project,
-      saveProject: () => saveProject(),
+	    initAssets({
+	      getProject: () => project,
+	      getVideoState: () => videoState,
+	      saveProject: () => saveProject(),
+      flushServerSave: () => _flushServerSave(),
       safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
@@ -3033,9 +4680,7 @@ var _projectEpoch = 0;
       reloadProjectFromServer: async () => {
         if (!project || !project.id) return false;
         try {
-          var resp = await fetch("/api/projects/" + encodeURIComponent(project.id), { headers: _getAuthHeaders() });
-          if (!resp.ok) return false;
-          var p = await resp.json();
+          var p = await loadProjectData(project.id);
           if (!p || !p.id || p.id !== project.id) return false;
           project = p;
           syncEditProject(project);
@@ -3088,50 +4733,7 @@ var _projectEpoch = 0;
       if (project) { saveProject(); }
     });
 
-    /* Navigation — sidebar */
-    PAGES.forEach(function (page) {
-      var navId = "nav" + page.charAt(0).toUpperCase() + page.slice(1);
-      var navEl = $(navId);
-      if (navEl) navEl.addEventListener("click", function () { switchPage(page); });
-    });
-
-    /* 积分卡片 → 打开 billing modal（billing 不在 PAGES 里，所以 PAGES.forEach 不会处理它，
-       这里显式绑一次）。 */
-    var _navBillingBtn = $("navBilling");
-    if (_navBillingBtn) _navBillingBtn.addEventListener("click", function () { openBillingModal(); });
-
-    /* Billing modal 三路关闭：右上 × / 点遮罩 / 按 ESC
-       绑定一次即可，modal 在 static/index.html 顶层，不随页面切换销毁。 */
-    var _billingModalEl = $("billingModal");
-    var _billingCloseBtn = $("billingModalClose");
-    if (_billingCloseBtn) _billingCloseBtn.addEventListener("click", closeBillingModal);
-    if (_billingModalEl) {
-      _billingModalEl.addEventListener("click", function (ev) {
-        var t = ev && ev.target;
-        if (t && t.getAttribute && t.getAttribute("data-billing-close") === "1") closeBillingModal();
-      });
-    }
-    document.addEventListener("keydown", function (ev) {
-      if (ev.key !== "Escape") return;
-      if (!_billingModalEl) return;
-      if (_billingModalEl.classList.contains("hidden")) return;
-      closeBillingModal();
-    });
-
-    window.addEventListener("resize", updateSidebarNavDot);
-    var trackHost = $("sidebarNavTrackHost");
-    if (trackHost) trackHost.addEventListener("scroll", updateSidebarNavDot, { passive: true });
-
-    var _gtBtn = $("navGlobalTasks");
-    if (_gtBtn) _gtBtn.addEventListener("click", function () { toggleGlobalTaskPanel(); });
-    var _gtClose = $("globalTaskPanelClose");
-    if (_gtClose) _gtClose.addEventListener("click", function () { toggleGlobalTaskPanel(false); });
-
-    /* Navigation — data-goto links anywhere */
-    document.addEventListener("click", function (e) {
-      var el = e.target.closest("[data-goto]");
-      if (el) { e.preventDefault(); switchPage(el.dataset.goto); }
-    });
+    _wireCoreNavigationOnce();
 
     /* Project overview — all guarded with try/catch to prevent breaking event chain */
     try {
@@ -3173,19 +4775,7 @@ var _projectEpoch = 0;
         try { _openTemplateImportModal(); } catch (e) { console.error("[FromTemplate2]", e); }
       });
 
-      var _btnShowList = $("btnShowProjectList");
-      if (_btnShowList) _btnShowList.addEventListener("click", function () {
-        try {
-          var sec = $("projectListSection");
-          if (sec) { sec.hidden = !sec.hidden; if (!sec.hidden) renderProjectList(); }
-        } catch (e) { console.error("[ShowList]", e); }
-      });
-
-      var _btnCloseList = $("btnCloseProjectList");
-      if (_btnCloseList) _btnCloseList.addEventListener("click", function () {
-        var sec = $("projectListSection");
-        if (sec) sec.hidden = true;
-      });
+      _wireOverviewDashboardOnce();
 
       var _plistWrap = $("projectListWrap");
       if (_plistWrap) _plistWrap.addEventListener("click", handleProjectListAction);
@@ -3219,6 +4809,19 @@ var _projectEpoch = 0;
       var lastIdea = (project && project.idea) || "";
       if (lastIdea) { $("ideaInput").value = lastIdea; }
       generateScript(lastIdea);
+    });
+    var scriptHeaderRegen = $("btnScriptHeaderRegen");
+    if (scriptHeaderRegen) scriptHeaderRegen.addEventListener("click", function () {
+      var regen = $("btnRegenScript");
+      if (regen) regen.click();
+    });
+    var scriptHistoryBtn = $("btnScriptHistory");
+    if (scriptHistoryBtn) scriptHistoryBtn.addEventListener("click", function () {
+      showToast("历史版本入口已保留，版本管理功能待接入", "info");
+    });
+    var scriptSettingsBtn = $("btnScriptSettings");
+    if (scriptSettingsBtn) scriptSettingsBtn.addEventListener("click", function () {
+      showToast("剧本设置入口已保留，配置功能待接入", "info");
     });
     $("btnRegenBible").addEventListener("click", function () {
       chatAddMsg("status", "正在重新提取风格圣经…");
@@ -3307,43 +4910,6 @@ var _projectEpoch = 0;
     var imgGrid = $("imageGrid");
     if (imgGrid) imgGrid.addEventListener("click", handleImageAction);
 
-    if (imgGrid) {
-      var _wheelTarget = 0;
-      var _wheelAnimating = false;
-      imgGrid.addEventListener("wheel", function (e) {
-        if (Math.abs(e.deltaY) < 2) return;
-        e.preventDefault();
-        _wheelTarget += e.deltaY * 2.5;
-        if (!_wheelAnimating) {
-          _wheelAnimating = true;
-          (function smoothScroll() {
-            if (Math.abs(_wheelTarget) < 0.5) { _wheelTarget = 0; _wheelAnimating = false; return; }
-            var step = _wheelTarget * 0.15;
-            imgGrid.scrollLeft += step;
-            _wheelTarget -= step;
-            requestAnimationFrame(smoothScroll);
-          })();
-        }
-      }, { passive: false });
-
-      var _dragStartX = 0, _dragScrollLeft = 0, _dragging = false;
-      imgGrid.addEventListener("mousedown", function (e) {
-        _dragging = true; _dragStartX = e.pageX; _dragScrollLeft = imgGrid.scrollLeft;
-        imgGrid.style.scrollSnapType = "none";
-      });
-      imgGrid.addEventListener("mousemove", function (e) {
-        if (!_dragging) return;
-        imgGrid.scrollLeft = _dragScrollLeft - (e.pageX - _dragStartX);
-      });
-      function _endDrag() {
-        if (!_dragging) return;
-        _dragging = false;
-        imgGrid.style.scrollSnapType = "";
-      }
-      imgGrid.addEventListener("mouseup", _endDrag);
-      imgGrid.addEventListener("mouseleave", _endDrag);
-    }
-
     var _sbPrev = $("sbNavPrev");
     var _sbNext = $("sbNavNext");
     if (_sbPrev) _sbPrev.addEventListener("click", function () { scrollToCard(getSbCurrentIdx() - 1); });
@@ -3386,12 +4952,15 @@ var _projectEpoch = 0;
       if (val) refineVideoPrompt(val);
     });
     var vpRefineInput = $("vpRefineInput");
-    if (vpRefineInput) vpRefineInput.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") {
-        var val = e.target.value.trim();
-        if (val) refineVideoPrompt(val);
-      }
-    });
+    if (vpRefineInput) {
+      _blockCredentialReplacementInput(vpRefineInput);
+      vpRefineInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") {
+          var val = e.target.value.trim();
+          if (val) refineVideoPrompt(val);
+        }
+      });
+    }
 
     /* Batch generation page */
     $("btnStartBatch").addEventListener("click", startBatchGeneration);
@@ -3409,7 +4978,12 @@ var _projectEpoch = 0;
     _wireAgentEvents();
 
     /* Initial page */
-    switchPage("overview");
+    var bootTargetPage = _bootUserNavigated
+      ? (_bootDeferredPageRefresh || activePage || "overview")
+      : "overview";
+    _appBootstrapping = false;
+    _bootDeferredPageRefresh = "";
+    switchPage(bootTargetPage, { forceRefresh: true });
   }
 
   if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", init); }

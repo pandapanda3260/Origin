@@ -10,6 +10,12 @@
  */
 
 import type { ChatMessage } from './llm';
+import {
+  buildReferenceManifestPromptBlock,
+  cleanDialogueCharCountFromText,
+  plannedDurationFromShots,
+  type ReferenceManifestItem,
+} from './video-reference-manifest';
 
 const COMMON_RULES = `你是 QD INFINITY 的 AI 创作引擎，专门服务于"AI 短视频自动生产"工作流。
 回答必须使用中文（专有名词可保留英文）。
@@ -22,9 +28,6 @@ const COMMON_RULES = `你是 QD INFINITY 的 AI 创作引擎，专门服务于"A
   "Now I should…"、"Preparing format…"
 - **绝对禁止**自言自语的中文开场，例如 "好的，让我想一下"、"我先理一下结构"
 - 把所有思考保留在内部，最终给用户的内容必须是干净的成品`;
-
-const COMMON_RULES_WITH_STEPS = `${COMMON_RULES}
-若用户没有给特定 JSON 格式，则在每段开头插入 <step>步骤名</step> 形式的进度标记，便于前端展示。`;
 
 /* =====================================================
    1) 剧本顾问对话（多轮）
@@ -486,130 +489,6 @@ export function buildRetagMessages(scriptText: string, totalDurationSec?: number
   ];
 }
 
-/* =====================================================
-   5) 资产抽取
-   ===================================================== */
-export const SP_ASSETS_EXTRACT = `${COMMON_RULES}
-
-【任务】从剧本中识别所有需要做参考图的角色、场景、道具，并为**每个资产**生成图像生成 prompt。
-
-【输出严格 JSON】（字段名必须完全照搬）
-{
-  "characters": [
-    {
-      "id": "c1",
-      "name": "角色名（如：老周）",
-      "role": "在故事中的身份角色（如：主导者、对手、旁观员工、客人）",
-      "identity": "一句话身份定位（如：海鲜自助餐厅老板、拟人化海鲜员工）",
-      "entityType": "human 或 non-human（拟人化海鲜/机甲/动物/异形等填 non-human）",
-      "appearance": "外貌描述（年龄、性别、身形、面部、发型、肤色等，60-120 字）",
-      "clothing": "服装描述（上衣/下装/配饰/材质/颜色，30-80 字）",
-      "equipment": "随身物品（手里拿什么、佩戴什么），无则填空字符串",
-      "temperament": "气质标签，**用中文逗号分隔的多个词**（如：干练，威严，克制幽默，管理者气场，接地气）",
-      "actionTraits": "动作特征，**用中文逗号分隔的多个词**（如：爱扶额，皱眉，手插腰）",
-      "tags": ["主角","男","50岁"],
-      "imagePrompt": "英文 60-120 词，只描述主体（人/生物的外貌+服装+姿态），不写风格/光线/背景，由后台统一加"
-    }
-  ],
-  "environments": [
-    {
-      "id": "e1",
-      "name": "场景名（如：海鲜店主厅）",
-      "location": "上一级地理位置（如：当代城市海鲜自助餐厅内、东京小巷深处、太空舱内）。1 行内",
-      "description": "100 字以内的场景描述（光线、色温、构图、时间段、气氛）",
-      "timeSetting": "拍摄时段，**2-4 字中文**：清晨 / 白天 / 黄昏 / 夜晚 / 深夜 / 凌晨；如果剧本有具体时间（21:30）也可写在此",
-      "weather": "天气，**2-4 字中文**：晴 / 多云 / 雨 / 雪 / 雾 / 室内（室内戏写"室内"即可）",
-      "lighting": "灯光，**2-6 字中文**：自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
-      "atmosphere": "氛围/情绪关键词，**用中文逗号「，」分隔 3-6 个词**，例如：明亮，整洁，诙谐，热闹，职场感，舞台感",
-      "isMain": true,
-      "baseSceneRef": null,
-      "tags": ["室内","海鲜店","打烊"],
-      "imagePrompt": "英文 60-120 词，描述空间布局+物品陈设。不写风格、白底、光线（后台会加）"
-    },
-    {
-      "id": "e2",
-      "name": "副场景名（如：海鲜店后厨角落）",
-      "location": "（同主场景所在地理位置）",
-      "description": "副场景描述（与主场景同空间但不同区域，如角落、走廊、厨房等）",
-      "timeSetting": "（一般和主场景一致）",
-      "weather": "（一般和主场景一致）",
-      "lighting": "（可与主场景略有区别，如后厨更冷白）",
-      "atmosphere": "副场景氛围，**用中文逗号「，」分隔 3-6 个词**",
-      "isMain": false,
-      "baseSceneRef": "e1",
-      "tags": ["室内","海鲜店","后厨"],
-      "imagePrompt": "英文 60-120 词，描述这个具体角落的布局/陈设"
-    }
-  ],
-  "props": [
-    {
-      "id": "p1",
-      "name": "道具名",
-      "propType": "类别（手持物/服装/家具/标志物）",
-      "function": "在剧本里的作用（线索/情感寄托/工具）",
-      "ownership": "关联哪位角色 id（如 c1，公共道具填 null）",
-      "features": "外观/材质/颜色",
-      "imagePrompt": "英文 40-80 词，描述材质+颜色+形状+磨损"
-    }
-  ]
-}
-
-【字段填写要点 - 重要】
-  · entityType：**必填**，判断标准：
-    - human：现实中的真人（哪怕是虚构角色，只要外形是人）
-    - non-human：拟人化的动物/海鲜/机甲/异形/AI 生物（如"虾盾""蟹盾""帝王蟹""锅老板"等）
-  · role + identity：合起来要能让人秒懂这个角色在故事里是干嘛的，对应原网站卡片
-    上"老周 / 主导者 · 海鲜自助餐厅老板"那一行小字。**两者都不能空**。
-  · appearance + clothing + equipment 三个字段会被前端拼起来当详细介绍展示
-    （类似"中年中国男性，东亚面孔... | 黑色 T 恤，深色防水围裙 | 手里拿着记账板"），
-    所以三段要清晰互不重复。equipment 可以为空字符串。
-  · temperament 和 actionTraits 必须是**用中文逗号「，」分隔的多个标签**，
-    前端会按逗号拆成多个胶囊小标签展示。每个字段建议 3-6 个词。
-  · 非人角色（entityType=non-human）：appearance 写它本身的形态（蟹腿、甲壳、
-    钳子、触手等），不要硬画成人；clothing 可以填空字符串或微小拟人配件
-    （工牌/肩带等）；imagePrompt 用英文写出"crab"/"shrimp"/"creature"等真实物种名。
-
-【场景规则】
-  · 第一个"主场景"放 isMain=true，baseSceneRef=null
-  · **必须**至少生成 1-2 个**副场景**（isMain=false，baseSceneRef 指向主场景 id）
-  · 副场景定义：和主场景在同一个空间但不同区域/角度，比如：
-    - 主场景=海鲜店主厅 → 副场景=海鲜店后厨、收银台角落
-    - 主场景=咖啡馆 → 副场景=咖啡馆吧台、窗边座位
-  · 副场景要保持和主场景**视觉一致**（光线、色调、材质语言一致）
-  · **每个场景**都必须填齐 location / timeSetting / weather / lighting / atmosphere 五个元数据
-    字段（不要留空字符串、不要省略）。这些字段会显示在场景卡上，并喂给图像生成 prompt
-    让出图能反映出对应的时段/天气/氛围。
-  · atmosphere 字段必须是 3-6 个**中文**逗号分隔标签，前端会拆成胶囊标签展示——
-    示例："明亮，整洁，诙谐，热闹，职场感，舞台感"。绝不要写成英文（"warm, cozy" 是错的）。
-
-【数量】
-  · 3-6 个角色、2-4 个场景（**至少 1 主 1 副**）、3-6 个道具
-
-【imagePrompt 写作要求】
-  · 全英文（图像模型对英文理解更准）
-  · 只描述"主体本身"——长什么样、穿什么、什么形态、什么动作
-  · **不要**写画面风格 / 背景颜色 / 光线 / 布局 / "三视图"——后台会强制统一加
-  · 真人示例："a middle-aged Chinese man in his 50s, weathered face with friendly smile, short salt-and-pepper hair, wearing a dark waterproof apron over a black t-shirt, holding a wooden clipboard"
-  · 非人示例（蟹盾）："a giant anthropomorphic king crab, massive red-orange spiny carapace, thick crab legs, large pincers, alert expression, wearing only a small employee name tag clipped to its shell, no human body parts"
-  · 场景示例："interior of a small Chinese seafood restaurant after closing, fish tanks along the wall, wooden tables and stacked chairs, weathered tile floor"
-  · 道具示例："a worn wooden clipboard with handwritten notes pinned under the metal clip, slightly scratched surface"
-  · ❌ 不要出现："cinematic", "illustration style", "anime", "cartoon", "warm lighting", "studio backdrop", "white background"
-
-【绝对禁止】
-  · 任何资产的 imagePrompt 字段为空字符串
-  · 把拟人化的非人角色（蟹/虾/AI 生物）的 entityType 误写成 human
-  · 只生成主场景而不生成副场景
-  · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要解释）`;
-
-export function buildAssetsExtractMessages(scriptText: string, styleBible?: any): ChatMessage[] {
-  const parts = [`剧本：\n${scriptText}`];
-  if (styleBible) parts.push(`风格圣经：${JSON.stringify(styleBible)}`);
-  return [
-    { role: 'system', content: SP_ASSETS_EXTRACT },
-    { role: 'user', content: parts.join('\n\n') },
-  ];
-}
-
 const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
 
 【任务】只从剧本中识别需要做参考图的角色，不要输出场景和道具。
@@ -645,7 +524,10 @@ const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
 
 const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
 
-【任务】只从剧本中识别需要做参考图的场景/环境，不要输出角色和道具。
+【任务】只从剧本中识别本集需要做参考图的核心场景/环境，不要输出角色和道具。
+
+场景参考图只是给后续视频提供整体空间、色调、光照、材质的辅助锚点；镜头级构图由首帧/尾帧负责。
+如果剧本出现多个重要物理空间，要分别输出；如果只是同一物理空间的不同角度/不同镜头，不要拆成多个场景。
 
 【输出严格 JSON】
 {
@@ -657,21 +539,22 @@ const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
       "description": "100 字以内的场景描述",
       "timeSetting": "清晨 / 白天 / 黄昏 / 夜晚 / 深夜 / 凌晨",
       "weather": "晴 / 多云 / 雨 / 雪 / 雾 / 室内",
-      "lighting": "自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
-      "atmosphere": "中文逗号分隔 3-6 个氛围词",
-      "isMain": true,
-      "baseSceneRef": null,
-      "tags": ["室内","主场景"],
-      "imagePrompt": "英文 35-70 词，描述空间布局和陈设，不写风格/白底/光线"
+	      "lighting": "自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
+	      "atmosphere": "中文逗号分隔 3-6 个氛围词",
+	      "isMain": true,
+	      "tags": ["室内"],
+	      "imagePrompt": "英文 35-70 词，描述空间布局和陈设，不写风格/白底/光线"
     }
   ]
 }
 
-【数量】2-3 个场景，至少 1 个主场景和 1 个副场景。
+【数量】输出 1-6 个核心场景。
 
 【重点】
-  · 第一个主场景 isMain=true，baseSceneRef=null。
-  · 副场景 isMain=false，baseSceneRef 指向主场景 id。
+  · 整个 environments 列表中必须恰好有 1 个 isMain=true，其余必须是 false。
+  · 主场景选择出场最多、最能代表全片视觉风格、对连续性最关键的那个场景。
+  · 不要输出角落变体、同一地点的其它区域。
+  · 不要为了单个镜头/过场/临时背景创建场景；只有真实影响镜头连续性的物理空间才输出。
   · 每个场景必须填齐 location / timeSetting / weather / lighting / atmosphere。
   · atmosphere 必须中文逗号分隔。
   · imagePrompt 必须英文且不能为空。
@@ -744,10 +627,11 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
   · 同一场景同一情绪段（setup/rising/climax/falling/resolution 不变）下，能合并成一个连续镜头的就合并
   · 每个 duration 默认 3-5 秒（合并镜头可到 5-6 秒）
 
-⚠️【硬约束 - 单镜头台词字数 ≤ 35 字】
-  · 下游视频模型 (Seedance) 单段最长 10 秒，中文语速 4 字/秒 = 单段最多念 40 字
-  · 因此**单个镜头的 dialogue 字段，去掉"说话人："标签和动作描述后，实际台词不能超过 35 字**（留 5 字余量）
-  · 台词超过 35 字必须拆成多个相邻镜头，每个镜头承载一段台词——典型场景如"多角色争吵 / 长段独白 / 连续三句以上的对白"
+⚠️【硬约束 - duration 是导演计划时长】
+  · 每个镜头的 duration 就是后续视频提示词和剪辑工作台使用的计划秒数，不是装饰字段
+  · 中文正常语速约 4 字/秒，快节奏不要超过 4.5 字/秒；台词多时优先增加 duration 或拆镜，禁止靠后续"压缩"来解决
+  · 单个镜头的 dialogue 字段，去掉"说话人："标签和动作描述后，实际要念出的字数应匹配该镜头 duration
+  · 长台词必须拆成多个相邻镜头，每个镜头承载一段台词——典型场景如"多角色争吵 / 长段独白 / 连续三句以上的对白"
   · 拆分时让每个镜头承载 1-2 个完整语义单元（一问一答、一个完整句子），不要断在半句话
   · 多角色对白 > 2 句时**不要**用"群像反应中景"把所有对白塞进一个镜头——应该每 1-2 句切一镜
   · 示范：
@@ -768,9 +652,9 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
       ③ 反应镜头（有人听别人说话时）——静止才能让神态说话
       ④ 同一场景同机位的第二个/第三个镜头——第一个运镜建立过了，后续继续运会累
 
-⚠️【关键约束 - 相邻同情绪镜头运镜必须兼容（前后会被合成 1 个视频）】
-  · 后端会把 **2 个相邻同情绪且时长 ≤10 秒的镜头合并成 1 个 Seedance 10 秒视频**
-  · 这意味着相邻 2 个同情绪镜头的 camera 必须能当 "1 个连续镜头" 拍——要么完全相同，
+⚠️【关键约束 - 相邻同情绪镜头运镜必须兼容（可能进入同一视频片段）】
+  · 后续会把相邻同情绪镜头按计划时长组合成视频片段，片段时长 = 组内镜头 duration 之和
+  · 这意味着相邻同情绪镜头的 camera 必须能顺滑连续——要么完全相同，
     要么同方向相邻档位（固定镜头 ↔ 缓慢推进 ↔ 轻微推近 是兼容的；固定镜头 ↔ 甩镜头 不兼容）
   · 硬性规则：相邻**同情绪**镜头，camera 字段要么**完全一致**，要么都在下面的同一组里：
       A 组（静/微动）： 固定镜头, 缓慢推进, 轻微推近
@@ -791,6 +675,8 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
   "shots": [
     {
       "idx": 1,
+      "sceneId": "e1",
+      "sceneName": "场景名",
       "duration": 3,
       "shotType": "大全景",
       "camera": "缓慢推进",
@@ -836,7 +722,7 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
   · 有台词就**逐字复制剧本原文**，包括说话人，例如："老周："来，复盘。先说好的。""
   · 没台词写 ——
   · 不要改写或总结台词
-  · **单镜头实际要念出的字数 ≤ 35 字（不含"说话人："前缀和动作描述）**——多了必须拆成多个镜头
+  · **台词字数必须匹配本镜头 duration（约 4 字/秒，最高 4.5 字/秒）**——多了就增加 duration 或拆成多个镜头
 
 ▸ keyInfo（关键信息）：**简短主题词**，2-6 个汉字，给制片速读用
   · 好例子："打烊环境"、"老周出场"、"军容压阵"、"嘴硬反驳"、"摊主收尾"、"翻页耍宝"
@@ -852,16 +738,22 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 
 ▸ characters：本镜头**实际入画**的角色名（中文短名数组）；空场景写 []
 
-【整体规则】
+▸ sceneId / sceneName：本镜头发生在哪个已抽取场景里
+  · 如果资产里提供了场景列表，sceneId 必须从资产场景的 id 中选择，sceneName 必须和该场景 name 一致
+  · 不要编造资产列表里不存在的新场景；同一个物理空间的不同角度仍然使用同一个 sceneId
+  · 如果全片只有一个场景，所有镜头都填这个场景
+  · 如果资产里没有场景，sceneId / sceneName 可以填空字符串
+
+	【整体规则】
   · idx 从 1 连续递增不跳号
   · 每个 duration 在 3-6 秒（铺垫 3-4 秒，主戏 4-5 秒，过渡 2-3 秒）
   · **镜头总数灵活，6-14 个都可以**，目标总时长**只是参考值**——如果剧本台词密集，拆成 12-14 个镜头也没问题（反而比少镜头挤爆台词更好）
   · 关键剧情节点（开场环境、人物登场、冲突爆发、转折、收尾）各自一个独立镜头即可，不要为同一节点拆多个反应镜头
-  · **台词密集段必须多切镜头**：单镜头台词 > 35 字时继续用这个规则 "塞不下就拆一镜"，直到每镜都 ≤ 35 字
+  · **台词密集段必须多切镜头或增加 duration**：不要把超过计划时长可承载的台词塞进一个短镜头
   · **camera 字段单镜头只能写一种核心运镜**——禁止"缓慢推进+轻微环绕"、"先推近再拉远"这种叠加；不同镜头之间运镜手法可以丰富多样
 
 【自检 - 输出前请逐条对照】
-  · **每个镜头的 dialogue 字段去掉"说话人："标签和（动作描述）后，实际台词 ≤ 35 字？**超过必须拆成多镜
+  · **每个镜头的 dialogue 字段去掉"说话人："标签和（动作描述）后，是否匹配 duration 可承载语速？**超过必须加时长或拆镜
   · 镜头总数 6-14 个都合理（只要每镜台词都在 35 字内）
   · **"固定镜头" 占比 ≥ 40%？** 数一下，不够就把"鸡肋运镜"（可有可无的 轻微推近 / 缓慢推进）改成 固定镜头
   · **相邻同情绪镜头 camera 是否在同一组？** 按 A/B/C/D 分组对一遍：
@@ -889,7 +781,7 @@ export function buildShotsMessages(opts: {
   // 用户如果说 60 秒，但剧本实际需要 80 秒才能把台词念完，按剧本来，不要砍。
   if (opts.totalDurationSec) {
     parts.push(
-      `参考总时长：约 ${opts.totalDurationSec} 秒（仅作节奏参考；若剧本台词密集，宁可多切几个镜头把总长拉到 ${Math.round(opts.totalDurationSec * 1.3)} 秒左右，也不要挤台词——下游 Seedance 单段 10s 里念不完会被砍半）`,
+      `参考总时长：约 ${opts.totalDurationSec} 秒（仅作节奏参考；若剧本台词密集，宁可多切几个镜头或适当拉长总长到 ${Math.round(opts.totalDurationSec * 1.3)} 秒左右，也不要挤台词或期待后续压缩）`,
     );
   }
   return [
@@ -914,7 +806,7 @@ export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
 ═══════════════════════════════════════════
 
 运镜系统
-以客观观察视角做平稳缓推，从门框前景建立打烊后营业区纵深，再在同一180度轴线内自然推到老周的管理者中景，不快切，靠空间收束完成出场转场。两个镜头之间不切换，靠相机本身做物理位移，保持时间空间连贯。
+第一镜沿门框前景做平稳缓推建立打烊后营业区纵深，第二镜在同一 180 度轴线内切到老周的管理者中近景。每个时间段只执行对应镜头表里的一个核心运镜动作，切点干净，节奏按计划时间轴推进。
 
 角色
 老周，中年中国男性、短黑发、身形结实匀称，真人皮肤毛孔可见，穿黑色T恤和深色防水围裙，画面状态：站立训话前准备状态。
@@ -922,21 +814,19 @@ export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
 场景
 奔海海鲜自助餐厅营业区，夜晚打烊后仍灯火通明的现实风格海鲜自助餐厅，长条金属自助台与不锈钢台面被擦得锃亮整洁，空气里残留海水气息与烤黄油暖反光，前景带半开木门虚焦边缘造纵深。
 
-0-5s
+0-3s
 ⟦内景中景·35mm缓慢推近⟧
-镜头从半开木门虚焦边缘后方朝奔海海鲜自助餐厅营业区平稳缓推 1 秒建立空间，再在 180 度轴线内自然推到老周的管理者中景。老周面朝镜头稳稳压住画面，右手捏着记账板贴在胸前，肩背收紧站定不晃，先抬下巴清了清嗓子，沉声开口："来，复盘。"语气克制带憨笑感，黑色 T 恤与深色防水围裙在冷白顶灯下利落克制，不锈钢自助台从他身两侧向后退开。
+镜头从半开木门虚焦边缘后方朝奔海海鲜自助餐厅营业区平稳缓推，先交代冷白顶灯、不锈钢自助台和收拾到一半的餐具。老周站在纵深尽头，右手捏着记账板贴在胸前，肩背收紧，抬下巴清了清嗓子。
 
-——以上是短台词（5 字）走 0-5s 档位的示范。下面是同一场景**长台词**走 **0-10s** 档位的另一种示范——若本组台词总字数 > 18 字，必须用这种结构（时间段标题写成 0-10s）：
-
-0-10s
-⟦内景中景·50mm缓慢推近⟧
-镜头从老周右后方平稳缓推 2 秒到他面前的中景，老周面朝镜头压住画面，右手翻开记账板，沉声开口："注意团队氛围。"扇贝财务稳稳压着摊开的账单，迷你金属眼镜夹在贝壳鼻梁上，语气冷硬地补："今天被自助的，不是海鲜。"帝王蟹队长在旁边抬起巨钳，红橙色甲壳刺影投到白板上，眼神上扬地警觉又不满地追问："那是谁？！"龙虾主管、三文鱼客服和生蚝实习生在后方同时吸气，投影幕冷光切在众人脸上，暖黄灯忽明忽暗，会议落幕被账单逼到失控边缘。
+3-7s
+⟦内景中近景·50mm固定镜头⟧
+切到老周面前的中近景，机位固定不晃，他稳稳压住画面，右手翻开记账板，沉声开口："来，复盘。"扇贝财务在旁边压着摊开的账单，迷你金属眼镜夹在贝壳鼻梁上，只做冷硬反应不抢话。帝王蟹队长抬起巨钳，红橙色甲壳刺影投到白板上，后排几名员工同时屏住呼吸。
 
 基调
 社交网络/华尔街之狼式冷峻都市商业摄影，结合当代海鲜自助餐厅拟人喜剧写实语境，洁净硬光、玻璃金属反射、冷白色温、Stainless Silver与Butter Gold为主，live-action realistic cinematic，真人实景电影感，电影胶片颗粒感、自然镜头光学、真实景深。
 
 约束
-禁止插画/动漫/卡通；角色全部按真人写实呈现；老周外貌全片严格一致；可见真实皮肤毛孔与细微眉眼不对称；真实布料重力褶皱与餐饮空间物理反射；不要出现六宫格线条，不要魔幻化空间，不要把海鲜员工直接出镜成人类替代物。
+禁止插画/动漫/卡通；角色全部按真人写实呈现；老周外貌全片严格一致；可见真实皮肤毛孔与细微眉眼不对称；真实布料重力褶皱与餐饮空间物理反射；不要魔幻化空间，不要把海鲜员工直接出镜成人类替代物。
 
 音障
 无BGM；仅保留顶灯轻微电流声、远处排风机低鸣、清洁后残留水声轻微回响、老周清嗓声、纸页翻动声、空场自然混响。
@@ -947,17 +837,17 @@ export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
 
 【你输出时要做到】
   1. 段落标题就是"运镜系统 / 角色 / 场景 / 时间段 / 基调 / 约束 / 音障"这 7 类，独立成行，前后不加任何符号（不用 #、[]、**）
-  2. ⚠️【硬约束 - 视频时长只有 5 秒或 10 秒】实际成片由后端按本组台词字数决定档位（≤18 字用 5 秒，>18 字用 10 秒）。
-     **时间段只输出 1 段：要么 0-5s、要么 0-10s**，把本组所有 shot 内容融合成 1 个连贯镜头描述。
-     ✗ 禁止输出"0-4s / 4-9s / 9-14s"这种按 shot.duration 累加的多时间段
-     ✓ 短台词用 0-5s（紧凑节奏），长台词用 0-10s（保证一字不漏）
+  2. ⚠️【硬约束 - 时间轴来自镜头表】用户消息会给出"计划时间轴"。
+     **时间段标题必须逐段匹配计划时间轴**，例如 0-3s / 3-7s / 7-11s；禁止自行改成 5 秒或 10 秒档位。
+     · 如果本组只有 1 个 shot，就输出 1 个时间段；如果本组有多个 shot，就按 shot 顺序输出多个时间段
+     · 不要为了凑时长合并、压缩、删减动作；模型实际成片略长略短由剪辑阶段处理
   3. ⚠️【硬约束 - 台词必须逐字完整保留，一个字都不能少】
      · 把本组所有 shot.dialogue 按出场顺序**逐字**写进时间段的画面描述里，**禁止概括/省略/改写**
      · 用"角色 X 沉声开口：'……'，紧接着 角色 Y 抢话：'……'"这种自然对话承接形式
      · 多句对白要明确每句由谁说，让 Seedance 给对应角色生成口型 + 配音
-     · 如果原始台词是 50 字、视频时长是 10 秒，那就让角色用偏快语速一字不落讲完——禁止 LLM 自作主张说"……" / "（省略）" / "等等"等模糊表述
+     · 如果某段台词偏密，也必须一字不落讲完；禁止 LLM 自作主张说"……" / "（省略）" / "等等"等模糊表述
   4. 时间段格式：第一行 ⟦景别·焦距·运镜⟧ 视觉标签，第二行起是中文画面段（包含动作 + 台词 + 神态 + 光线，连贯叙述）
-  5. **绝对不要在 prompt 里出现"参考图1"、"参考图2"、"（参考图X）"这种字样**——直接用角色名（老周）、场景名（奔海海鲜自助餐厅）、道具名（记账板）即可
+  5. 如果用户消息提供了 Image N 参考图清单，只能用 "Image 1" / "Image 2" 这种英文编号引用；不要写"参考图1"、"参考图2"、"（参考图X）"这种中文编号
   6. 总字数 500-900 字，**不要写英文 shot 1: / camera: / characters: / aspect ratio: 这类键值对**
   7. 直接以"运镜系统"四个字开头，不要写"以下是..."不要写 markdown 围栏
 
@@ -973,14 +863,14 @@ export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
     ✓ 可以用更专业的词汇展开（轴线 / 180度轴线 / 平移跟拍 / 平稳缓推 / 升降 / 横摇 / 物理位移 / 单机位连贯 / 跟焦 / 拉焦 / 浅景深 / 收束纵深 等），把 shot.camera 这一个核心运镜词**润色**成完整的电影术语描述
     ✓ 可以加焦段（24mm/35mm/50mm/85mm）、机位高度、轴线方向、起幅终幅这些细节
     ✗ **但运镜的"核心方向"不能跟 shot.camera 矛盾**——shot.camera 写"缓慢推进"，你不能改写成"快速拉远"或"环绕"；shot.camera 写"固定镜头"，你不能改成"跟随移动"
-    ✗ **每个时间段（每个镜头）只能有一个核心运镜动作**——禁止"先推进然后环绕再拉远"这种叠加运镜，一个 5 秒镜头就一个动作
+    ✗ **每个时间段（每个镜头）只能有一个核心运镜动作**——禁止"先推进然后环绕再拉远"这种叠加运镜
   · 同理景别（shotType）：可以润色（如"中景"→"中景偏中近，齐胸构图"），但不能把"中景"改成"大特写"或"大全景"
 
 【输出前自检】
   ✗ 运镜系统段第一句以"以 XX 视角"开头 → 是错的，重写为具体轴线/焦段/位移
   ✗ 运镜系统段出现"轻松""幽默""温暖""治愈""活泼""营造""氛围""突出 XX 情感" → 是错的，把感性形容删掉，只留机位 / 轴线 / 焦段 / 物理位移
   ✗ 出现"shot 1:" / "shot 2:" / "camera:" / "characters:" / "[CAMERA]" / "[STYLE]" → 是错的，重写
-  ✗ 出现"参考图1" / "参考图2" / "（参考图N）" → 是错的，重写
+  ✗ 出现"参考图1" / "参考图2" / "（参考图N）" → 是错的，改成 Image 1 / Image 2 或直接用角色/场景/道具名
   ✗ ⟦…⟧ 视觉标签里的运镜方向跟本组对应 shot.camera **方向相反**（推↔拉、静↔动、跟↔甩） → 必须改回与 shot.camera 同向
   ✗ 一个时间段（一个镜头）的描述里出现"先 X 再 Y"、"先 X 然后 Y"、"X+Y"这种叠加运镜 → 是错的，删掉次要动作只留主动作
   ✗ 整段是英文 → 是错的，重写
@@ -991,6 +881,7 @@ export function buildVideoPromptMessages(opts: {
   styleBible: any;
   assets: any;
   narrations?: any[];
+  referenceManifest?: ReferenceManifestItem[];
   groupIdx?: number;
   totalGroups?: number;
 }): ChatMessage[] {
@@ -1009,12 +900,12 @@ export function buildVideoPromptMessages(opts: {
   });
   const sceneLines = scenes.map((s: any, i: number) => {
     const name = s.name || `场景${i + 1}`;
-    const desc = s.description || s.detail || '';
+    const desc = s.effectiveVisualDescription?.effectiveText || s.description || s.detail || '';
     return `- ${name}${desc ? '：' + desc : ''}`;
   });
   const propLines = props.map((p: any, i: number) => {
     const name = p.name || `道具${i + 1}`;
-    const desc = p.description || p.detail || '';
+    const desc = p.effectiveVisualDescription?.effectiveText || p.description || p.features || p.detail || '';
     return `- ${name}${desc ? '：' + desc : ''}`;
   });
 
@@ -1024,10 +915,13 @@ export function buildVideoPromptMessages(opts: {
   if (propLines.length) assetSections.push('【道具】\n' + propLines.join('\n'));
   if (assetSections.length) {
     parts.push(
-      '资产清单（在 prompt 中**直接用名字**引用，禁止使用"参考图X"这种编号）：\n\n' +
+      '资产清单（角色/场景/道具真实名称；涉及下方参考图时优先使用 Image N 编号）：\n\n' +
         assetSections.join('\n\n'),
     );
   }
+
+  const referenceBlock = buildReferenceManifestPromptBlock(opts.referenceManifest || []);
+  if (referenceBlock) parts.push(referenceBlock);
 
   // 2) 本组镜头（精简字段，避免上下文太长）
   const slimShots = (opts.shots || []).map((s: any, i: number) => ({
@@ -1045,50 +939,53 @@ export function buildVideoPromptMessages(opts: {
   // 把 camera/shotType 单独拎出来给 LLM 一份清晰的"运镜方向锚点"提示。
   // 用词可以更专业（轴线/焦段/平稳缓推 等），但每个镜头的核心方向必须忠于这里给的 camera。
   const cameraList = slimShots.map((s: any) => `镜头${s.idx}:${s.camera || '固定镜头'}/${s.shotType || '中景'}`).join('；');
-  // 统计本组所有 dialogue 的总字数 + 推断后端会用 5s 还是 10s 视频
+  // 统计本组所有 dialogue 的总字数，并把 shot.duration 展开成权威计划时间轴。
   const allDialogues = slimShots
     .map((s: any) => String(s.dialogue || '').trim())
     .filter((d: string) => d && d !== '——' && d !== '-' && d !== '无');
-  const totalDialogueChars = allDialogues.join('').replace(/[\s「『""''，。！？]/g, '').length;
-  // 与 batch-executors.ts video_segments 里的 FIVE_SEC_DIALOGUE_BUDGET 保持一致
-  const expectedDuration = totalDialogueChars > 18 ? 10 : 5;
-  const expectedTimeRange = expectedDuration === 10 ? '0-10s' : '0-5s';
-  // 当本组有多个 shot 时，它们会被合并成 1 个 Seedance 视频（整组就一个连续镜头）。
-  // LLM 不能"先运镜 A 再运镜 B"，必须从所有 shot.camera 里挑一个"主导运镜"融合进输出。
-  // 挑选规则：
-  //   · 如果 > 50% 的 shot 是 "固定镜头" → 主导用 "固定镜头"
-  //   · 其它情况用 shots[0].camera（第一个镜头的 camera）
-  const cameraCounts: Record<string, number> = {};
-  slimShots.forEach((s: any) => {
-    const c = (s.camera || '固定镜头').trim();
-    cameraCounts[c] = (cameraCounts[c] || 0) + 1;
+  const totalDialogueChars = allDialogues.reduce((sum: number, text: string) => sum + cleanDialogueCharCountFromText(text), 0);
+  const plannedDurationSec = plannedDurationFromShots(slimShots);
+  const fmtSec = (n: number) => {
+    const rounded = Math.round(n * 10) / 10;
+    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1).replace(/\.0$/, '');
+  };
+  let cursor = 0;
+  const timelineLines = slimShots.map((s: any) => {
+    const dur = Math.max(0.5, Number(s.duration) || 4);
+    const start = cursor;
+    const end = cursor + dur;
+    cursor = end;
+    const dialogueChars = cleanDialogueCharCountFromText(s.dialogue || '');
+    return [
+      `镜头${s.idx}: ${fmtSec(start)}-${fmtSec(end)}s`,
+      `duration=${fmtSec(dur)}s`,
+      `景别=${s.shotType || '中景'}`,
+      `运镜=${s.camera || '固定镜头'}`,
+      s.keyInfo ? `主题=${s.keyInfo}` : '',
+      dialogueChars ? `台词=${dialogueChars}字` : '无台词',
+    ].filter(Boolean).join('；');
   });
-  const staticRatio = (cameraCounts['固定镜头'] || 0) / slimShots.length;
-  const dominantCamera = staticRatio > 0.5 ? '固定镜头' : (slimShots[0].camera || '固定镜头');
+  const charsPerSec = plannedDurationSec > 0 ? totalDialogueChars / plannedDurationSec : 0;
   parts.push(
     `本组镜头（共 ${slimShots.length} 个）：\n${JSON.stringify(slimShots, null, 2)}\n\n` +
       `⚠️ 本组每个镜头的核心运镜方向 / 景别：\n` +
       cameraList +
       `\n\n` +
-      (slimShots.length > 1
-        ? `⚠️【本组 ${slimShots.length} 个镜头会被合成 1 个 Seedance 连续视频，整段只能有 1 个运镜动作】\n` +
-          `  · 主导运镜（全组共用）：**${dominantCamera}**（这是按"静态占比多 → 用固定，否则用第一镜"算出来的）\n` +
-          `  · 运镜系统段 + ⟦…⟧ 视觉标签必须统一按这个 **${dominantCamera}** 来写，\n` +
-          `    **绝对不要**写成"前 5 秒缓慢推进，后 5 秒跟随"这种分段运镜\n` +
-          `  · 如果本组镜头的 camera 字段互相不同，当作"艺术上同一个镜头的不同瞬间"——用 ${dominantCamera} 这一个运镜连续拍下来，依靠**景别微调 / 焦段变化 / 演员调度**来承载其它 shot 的意图\n` +
-          `\n`
+      `⚠️ 本组计划时间轴（权威，来自 shot.duration）：\n` +
+      timelineLines.join('\n') +
+      `\n` +
+      `  · 片段计划总时长 = ${fmtSec(plannedDurationSec)}s\n` +
+      `  · 生成请求时长以后端计划时长为准；如供应商有最小时长，只做最小时长适配，不按台词字数改成 5s/10s 档位\n` +
+      `  · 你的时间段标题必须逐段匹配上面时间轴，禁止自行合并成单段或改写成 0-5s / 0-10s\n` +
+      (totalDialogueChars
+        ? `  · 本组台词总字数 = ${totalDialogueChars} 字，约 ${charsPerSec.toFixed(1)} 字/秒；不要删字，不要用省略号压缩\n`
         : ``) +
-      `⚠️ 视频时长档位（后端按台词字数自动决策）：\n` +
-      `  · 本组台词总字数 = ${totalDialogueChars} 字\n` +
-      `  · 后端会生成 **${expectedDuration} 秒** 视频 → 你的"时间段"段落标题必须写成 **${expectedTimeRange}**\n` +
-      `  · 不管上面给了几个 shot，时间段就这一段（${expectedTimeRange}），把所有镜头内容融合成连贯描述\n` +
       `\n` +
       (allDialogues.length
         ? `⚠️【台词必须逐字完整保留，一个字都不能少】本组台词清单：\n` +
           allDialogues.map((d, i) => `   ${i + 1}) ${d}`).join('\n') +
-          `\n   要求：把上面所有台词按出场顺序**逐字**写进 ${expectedTimeRange} 段的画面描述里，` +
+          `\n   要求：把上面所有台词按出场顺序**逐字**写进对应镜头的时间段画面描述里，` +
           `用"X 角色开口：'……'，紧接 Y 角色：'……'"形式自然承接。` +
-          `${expectedDuration === 10 ? '10 秒视频，中文每秒 4 字，完全够念完。' : '5 秒视频，台词紧凑念完即可。'}` +
           `禁止概括 / 省略 / 改写 / 用"……"代替原文。`
         : `本组无台词，纯画面叙事`),
   );
@@ -1130,9 +1027,12 @@ export const SP_VIDEO_PROMPT_REFINE = `${COMMON_RULES}
 
 【任务】根据用户的"修改意图"对现有视频提示词做微调。
 【约束】
-  · 严禁修改时间轴、运镜、角色 ID、参考图编号
+  · 保持原有中文结构化视频提示词格式，段落标题仍使用"运镜系统 / 角色 / 场景 / 计划时间段（如 0-3s / 3-7s） / 基调 / 约束 / 音障"
+  · 严禁修改时间轴、运镜、角色 ID、角色身份、参考图编号
+  · 严禁改写、删减或新增原有台词；如果用户只要求视觉调整，台词必须逐字保留
+  · 严禁改动角色外貌、服装、物种、声音等主档设定；如果用户要求改角色设定，只能保留原 prompt 并指出该修改应回到资产/角色设定环节处理
   · 只能在用户指定的方面调整（如把镜头放慢、加雾气、改色调）
-  · 输出依然是与原版同样结构的英文提示词，纯文本
+  · 输出依然是与原版同样结构的中文视频提示词，纯文本
   · 不要解释，不要 markdown，直接输出新的 prompt`;
 
 export function buildRefineMessages(currentPrompt: string, instruction: string): ChatMessage[] {

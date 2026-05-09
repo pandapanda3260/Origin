@@ -14,7 +14,7 @@
  * 决定要不要置 `_pendingRerender`。
  */
 
-import { $, escapeHtml } from './utils.js';
+import { $, escapeHtml, hydrateProtectedImageElements } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Asset card (角色/场景/道具)
@@ -174,14 +174,46 @@ export function renderVpCard(gIdx, status, payload) {
 // ---------------------------------------------------------------------------
 
 /**
- * 就地更新卡片内所有 <img src> 和 [data-img]。如果卡片还没渲染出 <img>
- * （只有占位符 placeholder），返回 false 让调用方触发 full re-render。
+ * 就地更新卡片内所有 <img src> 和 [data-img]。如果分镜卡片还只有
+ * placeholder，先原地替换成 <img>，避免首次出图时整块 grid 重建。
  */
 function _updateCardImageInPlace(card, imgUrl) {
   var imgs = card.querySelectorAll("img");
   var zoomEls = card.querySelectorAll("[data-img]");
-  if (!imgs.length) return false;
-  for (var i = 0; i < imgs.length; i++) imgs[i].src = imgUrl;
-  for (var j = 0; j < zoomEls.length; j++) zoomEls[j].dataset.img = imgUrl;
+
+  if (!imgs.length) {
+    var sbPlaceholder = card.querySelector(".sb-sheet-placeholder");
+    if (sbPlaceholder) {
+      var img = document.createElement("img");
+      img.className = "w-full h-full object-cover scale-105 group-hover:scale-100 transition-transform duration-1000 ease-out cursor-pointer";
+      img.dataset.action = "lightbox";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.src = imgUrl;
+      sbPlaceholder.replaceWith(img);
+      imgs = [img];
+    } else {
+      var assetPlaceholder = card.querySelector(".asset-card-placeholder");
+      if (!assetPlaceholder) return false;
+      var assetImg = document.createElement("img");
+      assetImg.className = assetPlaceholder.dataset.imgClass || "w-full h-full object-cover";
+      assetImg.loading = "lazy";
+      assetImg.decoding = "async";
+      assetImg.src = imgUrl;
+      assetPlaceholder.replaceWith(assetImg);
+      imgs = [assetImg];
+    }
+  }
+
+  for (var i = 0; i < imgs.length; i++) {
+    imgs[i].loading = imgs[i].loading || "lazy";
+    imgs[i].decoding = "async";
+    imgs[i].src = imgUrl;
+    hydrateProtectedImageElements(imgs[i]);
+  }
+  for (var j = 0; j < zoomEls.length; j++) {
+    zoomEls[j].dataset.img = imgUrl;
+    hydrateProtectedImageElements(zoomEls[j]);
+  }
   return true;
 }

@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
+import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,7 +41,8 @@ export async function GET(req: NextRequest) {
     const gi = Number(r.group_idx);
     if (seen.has(gi)) continue;
     seen.add(gi);
-    const resultUrl = r.filename ? `/api/videos/file/${r.id}` : '';
+    const protectedUrl = r.filename ? `/api/videos/file/${r.id}` : '';
+    const resultUrl = r.filename ? buildSignedVideoUrl(r.id, user.id).url : '';
     tasks.push({
       task_id: r.id,
       task_type: 'video',
@@ -50,6 +52,7 @@ export async function GET(req: NextRequest) {
       progress: r.progress,
       duration_sec: r.duration_sec,
       result_url: resultUrl,
+      protected_url: protectedUrl,
       cover_url: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : '',
       error_msg: r.error_msg || '',
       prompt: r.prompt || '',
@@ -66,6 +69,7 @@ export async function GET(req: NextRequest) {
     progress: t.progress,
     durationSec: t.duration_sec,
     url: t.result_url || null,
+    protectedUrl: t.protected_url || null,
     coverUrl: t.cover_url || null,
     createdAt: t.created_at,
     updatedAt: t.updated_at,

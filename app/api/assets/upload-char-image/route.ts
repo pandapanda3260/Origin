@@ -5,7 +5,9 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDb } from '@/lib/db';
+import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
+import { mutateCharacterLock } from '@/lib/character-consistency';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -17,6 +19,28 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;       // 20 MB
 const MAX_REQUEST_BYTES = MAX_IMAGE_BYTES + 1 * 1024 * 1024;
 
 const ALLOWED_MIME_PREFIX = ['image/'];
+
+function parseCharacterIndex(form: FormData, assetRef: string): number {
+  const direct = form.get('charIdx') ?? form.get('idx') ?? form.get('characterIndex');
+  if (direct !== null && direct !== '') {
+    const n = Number(String(direct));
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  const m = /characters\[(\d+)\]/.exec(assetRef);
+  return m ? Number(m[1]) : -1;
+}
+
+function withUploadedReference(character: any, url: string) {
+  const next = {
+    ...(character || {}),
+    realPhotoUrl: url,
+    rawUrl: url,
+    imageUrl: url,
+    pencilUrl: url,
+  };
+  delete next._pencilFailed;
+  return next;
+}
 
 /**
  * 用户上传一张自定义角色照片做参考图。
@@ -35,6 +59,7 @@ export async function POST(req: NextRequest) {
     const file = form.get('file') as File | null;
     const projectId = (form.get('projectId') || '').toString();
     const assetRef = (form.get('assetRef') || '').toString();
+    const charIdx = parseCharacterIndex(form, assetRef);
 
     if (!file) return jsonError('没有上传文件', 400);
     const mime = (file as any).type || 'image/jpeg';
@@ -74,6 +99,36 @@ export async function POST(req: NextRequest) {
 
     const url = `/api/images/file/${id}`;
     const signed = buildSignedImageUrl(id, user.id);
+    if (projectId && charIdx >= 0) {
+      patchProjectForUser(projectId, user.id, (fresh) => {
+        if (!fresh) return null;
+        const assets = { ...((fresh as any).assets || {}) };
+        const chars = Array.isArray(assets.characters) ? [...assets.characters] : [];
+        const top = Array.isArray((fresh as any).characters) ? [...(fresh as any).characters] : [];
+        const currentChar = chars[charIdx] || top[charIdx];
+        if (!currentChar) return null;
+
+        chars[charIdx] = withUploadedReference(currentChar, url);
+        top[charIdx] = withUploadedReference(top[charIdx] || chars[charIdx], url);
+        assets.characters = chars;
+
+        const patch: any = { assets, characters: top.length ? top : chars };
+        const nextChar = chars[charIdx] || top[charIdx];
+        const mutation = mutateCharacterLock(
+          { ...(fresh as any), ...patch },
+          nextChar.characterId || nextChar.id || nextChar.name || `characters[${charIdx}]`,
+          {
+            referenceLock: {
+              sheetUrl: url,
+              sourceImageId: id,
+              referenceStatus: 'ready',
+            },
+          },
+          { source: 'user_upload' },
+        );
+        return { ...patch, consistency: mutation.project.consistency };
+      });
+    }
     return jsonOk({
       ok: true,
       id,

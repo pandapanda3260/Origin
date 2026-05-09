@@ -8,6 +8,26 @@ import { verifySignedImageUrl } from '@/lib/signed-asset-url';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+function parseThumbWidth(req: NextRequest): number {
+  const raw = new URL(req.url).searchParams.get('w');
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(48, Math.min(512, Math.round(n)));
+}
+
+async function resizeImage(buffer: Buffer, width: number): Promise<Buffer | null> {
+  if (!width) return null;
+  const canvasMod: any = await import('@napi-rs/canvas').catch(() => null);
+  if (!canvasMod?.createCanvas || !canvasMod?.loadImage) return null;
+  const image = await canvasMod.loadImage(buffer);
+  if (!image?.width || !image?.height || image.width <= width) return null;
+  const height = Math.max(1, Math.round(image.height * (width / image.width)));
+  const canvas = canvasMod.createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, 0, 0, width, height);
+  return canvas.toBuffer('image/png') as Buffer;
+}
+
 /**
  * 提供生成图文件的下载/预览。
  *
@@ -45,12 +65,23 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });
 
   const stat = statSync(fullPath);
-  const buf = readFileSync(fullPath);
+  const source = readFileSync(fullPath);
+  let buf = source;
+  let contentType = row.mime || 'image/png';
+  try {
+    const resized = await resizeImage(source, parseThumbWidth(req));
+    if (resized) {
+      buf = resized;
+      contentType = 'image/png';
+    }
+  } catch (e) {
+    console.warn('[images/file] thumbnail resize failed:', e);
+  }
   return new Response(buf, {
     status: 200,
     headers: {
-      'Content-Type': row.mime || 'image/png',
-      'Content-Length': String(stat.size),
+      'Content-Type': contentType,
+      'Content-Length': String(buf.length || stat.size),
       'Cache-Control': 'private, max-age=31536000, immutable',
     },
   });

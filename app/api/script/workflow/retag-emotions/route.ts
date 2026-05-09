@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { chatComplete, parseJsonLoose } from '@/lib/llm';
+import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { buildRetagMessages } from '@/lib/prompts';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
@@ -23,12 +23,13 @@ export async function POST(req: NextRequest) {
 
   let emotions: any[] = [];
   try {
-    const raw = await chatComplete(
+    const json = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
       user,
       buildRetagMessages(finalScript, durationSec || (proj as any)?.scriptTargetDurationSec),
-      { temperature: 0.4, responseFormat: 'json_object', maxTokens: 800, modelRole: 'structured' },
+      { temperature: 0.4, maxTokens: 800, modelRole: 'structured' },
+      parseJsonLoose,
+      'retag.emotions',
     );
-    const json = parseJsonLoose<{ emotions: any[] }>(raw);
     emotions = Array.isArray(json?.emotions) ? json.emotions : [];
   } catch (e: any) {
     return jsonError('情绪标签生成失败：' + (e?.message || String(e)), 502);

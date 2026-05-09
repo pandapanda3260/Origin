@@ -8,11 +8,297 @@
  */
 
 import { registerExecutor, aliasExecutor, type BatchExecCtx } from './batches';
-import { generateImage, resolveLocalImagePath } from './image-gen';
-import { generateVideo } from './video-gen';
-import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from './llm';
+import { resolveLocalImagePath } from './image-gen';
+import { generateImageWithModerationRecovery } from './safe-image-gen';
+import { generateVideo, VideoGenerationError, classifyVideoFailureStage, type VideoReferenceImage } from './video-gen';
+import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose, resolveLLMConfig } from './llm';
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
 import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
+import { isIndependentMultiImageModeEnabled, isMultiRefVideoModeEnabled } from './feature-flags';
+import {
+  buildVideoPromptAttemptMessages,
+  videoPromptTemperatureForAttempt,
+  VIDEO_PROMPT_MAX_ATTEMPTS,
+} from './video-prompt-attempts';
+import {
+  applyCharacterPanelResult,
+  existingPanelVersion,
+  inferEntityTypeFromCharacter,
+  splitCharacterPanels,
+  type SplitCharacterPanelsResult,
+} from './character-panels';
+import type { CharacterReferencePanel } from './panel-selection';
+import {
+  ensureProjectConsistency,
+  mutateCharacterLock,
+  renderCharacterLockRosterLine,
+  type CharacterLock,
+} from './character-consistency';
+import { buildVideoReferenceManifest } from './reference-matcher';
+import {
+  enforceHardVisualConstraints,
+  enforceNoFillLightConstraint,
+  hasFillLightPositiveMention,
+  hasNoFillLightConstraint,
+  sanitizeFillLightPositiveMentions,
+  sanitizePromptObject,
+} from './content-sanitize';
+import {
+  cleanDialogueCharCount,
+  evaluateDialogueBudget,
+  hashString,
+  plannedDurationFromShots,
+  resolveGenerationDurationSec,
+  type DialoguePolicy,
+  type DroppedReference,
+  type ReferenceManifestItem,
+  type VideoGenerationPlan,
+  type VideoReferenceRole,
+} from './video-reference-manifest';
+import {
+  assertVideoPromptReadyForGroups,
+  markStoryboardVideoOutdated,
+  markVideoTaskOutdated,
+  type VideoPromptFailureStage,
+} from './video-prompt-state';
+import { buildSeedancePromptParts } from './video-prompt-runtime';
+import { validateCharacterConsistencyForGroup } from './character-consistency-gate';
+import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl } from './visual-reference-state';
+import { pickSceneForShots } from './scene-selection';
+import { buildFrameImageGenerationPlan, summarizePlanForAudit } from './frame-image-plan';
+import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
+
+function isPlanReferenceRole(role: string): role is VideoReferenceRole {
+  return role === 'first_frame' || role === 'scene' || role === 'character' || role === 'prop';
+}
+
+function findCharacterLock(project: any, character: any): CharacterLock | null {
+  const withConsistency = ensureProjectConsistency(project || {}, { source: 'migration' });
+  const locks: CharacterLock[] = Array.isArray(withConsistency.consistency?.characters) ? withConsistency.consistency.characters : [];
+  const ids = new Set(
+    [
+      character?.characterId,
+      character?.id,
+      character?.name,
+      character?.role,
+    ].filter(Boolean).map((v) => String(v)),
+  );
+  return locks.find((lock) => (
+    ids.has(lock.characterId) ||
+    (lock.sourceAssetId && ids.has(lock.sourceAssetId)) ||
+    ids.has(lock.canonicalName) ||
+    lock.aliases.some((alias) => ids.has(alias))
+  )) || null;
+}
+
+function referenceDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem, 'useFor' | 'immutable' | 'promptHint'> {
+  if (role === 'first_frame') {
+    return {
+      useFor: ['锁定第 0 帧开场构图', '光照', '主体位置', '画面比例', '色调基准'],
+      immutable: ['构图', '光照方向', '主体站位', '画面比例'],
+      promptHint: '角色身份由 character reference 锁定，场景细节由 scene reference 锁定。',
+    };
+  }
+  if (role === 'scene') {
+    return {
+      useFor: ['锁定环境布局', '空间结构', '材质', '氛围'],
+      immutable: ['场景类型', '道路/地形结构', '主色调', '主要空间关系'],
+    };
+  }
+  if (role === 'character') {
+    return {
+      useFor: ['锁定角色脸部', '体型', '服装', '物种特征'],
+      immutable: ['脸型', '毛发/发色', '服装颜色', '身体类型'],
+    };
+  }
+  return {
+    useFor: ['锁定道具材质', '颜色', '尺度', '识别特征'],
+    immutable: ['核心形状', '主色', '材质', '用途'],
+  };
+}
+
+function collectRuntimeHardConstraints(prompt: string): Array<{ id: string; text: string; source: 'runtime' }> {
+  const lines = String(prompt || '').match(/HARD USER NEGATIVE CONSTRAINT:[^\n]+/g) || [];
+  return lines.map((text, idx) => ({
+    id: `runtime_hard_${idx + 1}`,
+    text,
+    source: 'runtime' as const,
+  }));
+}
+
+function compactManifestSignature(refs: any[]): string {
+  if (!Array.isArray(refs)) return '';
+  return refs
+    .map((ref: any) => [
+      ref?.imageNo,
+      ref?.role,
+      ref?.url,
+      ref?.label,
+      ref?.assetName,
+      ref?.panelInfo?.panel,
+      ref?.panelInfo?.intent,
+    ].map((v) => String(v || '')).join('|'))
+    .join('\n');
+}
+
+function manifestsDiffer(a: any[], b: any[]): boolean {
+  return compactManifestSignature(a) !== compactManifestSignature(b);
+}
+
+function dedupeDroppedReferences(refs: any[]): DroppedReference[] {
+  const out: DroppedReference[] = [];
+  const seen = new Set<string>();
+  for (const ref of refs || []) {
+    if (!ref || !ref.role) continue;
+    const role = String(ref.role);
+    if (role !== 'scene' && role !== 'character' && role !== 'prop') continue;
+    const assetName = String(ref.assetName || ref.label || '').trim();
+    const key = `${role}|${assetName.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      role: role as DroppedReference['role'],
+      assetName: assetName || undefined,
+      reason: ref.reason || 'image_budget_exceeded',
+    });
+  }
+  return out;
+}
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function errorWithFailureStage(message: string, failureStage: VideoPromptFailureStage): Error & { failureStage: VideoPromptFailureStage } {
+  const err = new Error(message) as Error & { failureStage: VideoPromptFailureStage };
+  err.failureStage = failureStage;
+  return err;
+}
+
+function isTransientNetworkError(err: any): boolean {
+  const msg = String(err?.message || err || '');
+  return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function planReferencesFromManifest(refs: ReferenceManifestItem[]): ReferenceManifestItem[] {
+  return refs
+    .filter((ref) => isPlanReferenceRole(ref.role))
+    .map((ref, idx) => {
+      const role = ref.role as VideoReferenceRole;
+      const defaults = referenceDefaults(role);
+      return {
+        ...ref,
+        imageNo: idx + 1,
+        role,
+        label: ref.label || `${role} reference`,
+        useFor: Array.isArray(ref.useFor) && ref.useFor.length ? ref.useFor : defaults.useFor,
+        immutable: Array.isArray(ref.immutable) && ref.immutable.length ? ref.immutable : defaults.immutable,
+        promptHint: ref.promptHint || defaults.promptHint,
+      };
+    });
+}
+
+function planReferencesFromAuditRefs(refs: any[]): ReferenceManifestItem[] {
+  return (refs || [])
+    .filter((ref) => isPlanReferenceRole(ref.role))
+    .map((ref, idx) => {
+      const role = ref.role as VideoReferenceRole;
+      const defaults = referenceDefaults(role);
+      return {
+        imageNo: idx + 1,
+        role,
+        assetId: ref.assetId,
+        assetName: ref.assetName,
+        label: ref.label || `${role} reference`,
+        url: ref.sourceUrl || ref.path,
+        localPath: ref.path,
+        useFor: defaults.useFor,
+        immutable: defaults.immutable,
+        promptHint: ref.promptHint || defaults.promptHint,
+      };
+    });
+}
+
+function buildVideoPlanSnapshot(opts: {
+  projectId: string;
+  groupIdx: number;
+  groupShotIndices: number[];
+  videoPromptSource: VideoGenerationPlan['promptAudit']['sourcePrompt']['source'];
+  sanitizedFor: string[];
+  finalPrompt: { preview: string; hash: string; length: number };
+  dialoguePolicy: DialoguePolicy;
+  dialoguePolicyNotes?: string;
+  references: ReferenceManifestItem[];
+  droppedReferences: DroppedReference[];
+  prompt: string;
+  userRatio: string;
+  durationSec: number;
+  plannedDurationSec?: number;
+  videoWarnings: any[];
+  dialogueChars: number;
+  status: 'submitting' | 'completed' | 'failed';
+  modelSnapshot?: VideoGenerationPlan['modelSnapshot'];
+  failureStage?: VideoPromptFailureStage;
+  errorMsg?: string;
+}): VideoGenerationPlan {
+  return {
+    version: 'video_plan_v1',
+    projectId: opts.projectId,
+    groupIdx: opts.groupIdx,
+    shotIndices: opts.groupShotIndices,
+    promptAudit: {
+      sourcePrompt: {
+        source: opts.videoPromptSource,
+        sanitizedFor: opts.sanitizedFor,
+      },
+      finalPrompt: opts.finalPrompt,
+      dialoguePolicy: opts.dialoguePolicy,
+      dialoguePolicyNotes: opts.dialoguePolicyNotes,
+    },
+    references: opts.references,
+    droppedReferences: dedupeDroppedReferences(opts.droppedReferences),
+    constraints: {
+      hard: [
+        ...collectRuntimeHardConstraints(opts.prompt),
+        ...opts.sanitizedFor.map((id) => ({
+          id,
+          text: id === 'fill_light_positive'
+            ? 'Prompt sanitized positive fill-light mentions before video generation.'
+            : 'Prompt enforced no-fill-light hard constraint before video generation.',
+          source: 'sanitizer' as const,
+        })),
+      ],
+      negative: [],
+    },
+    params: {
+      ratio: opts.userRatio,
+      durationSec: opts.durationSec,
+      plannedDurationSec: opts.plannedDurationSec,
+      subtitles: 'none',
+      audioMode: 'seedance_dialogue_audio',
+    },
+    audit: {
+      status: opts.status,
+      referenceCount: opts.references.length,
+      dialogueChars: opts.dialogueChars,
+      warnings: opts.videoWarnings.map((warning: any) => warning?.message || String(warning)).filter(Boolean),
+      failureStage: opts.failureStage,
+      errorMsg: opts.errorMsg,
+    },
+    modelSnapshot: opts.modelSnapshot,
+  };
+}
 
 /* ============================================================
    helper：根据 target.{type, idx} 找到对应资产 + 构造提示词
@@ -21,7 +307,7 @@ import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 /**
  * 把 styleBible 转成一段固定的英文 "STYLE BIBLE LOCK"——同一个项目下的
  * **每一张场景图**都拼上完全相同的这段，从 prompt 层面强行让所有场景共享
- * 同一套色调 / 灯光 / 风格关键字，避免主场景偏暖黄、副场景跑去冷白这种割裂。
+ * 同一套色调 / 灯光 / 风格关键字，避免场景参考图和后续镜头参考割裂。
  *
  * 注意：这段会作为权威约束放在 prompt 末尾，覆盖前面 imagePrompt 里可能写
  * 出来的局部冲突。如果 styleBible 缺失就返回空串，不强加约束。
@@ -52,71 +338,11 @@ function buildSceneStyleLock(styleBible: any): string {
     parts.push(`World rules: ${wr}`);
   }
   if (!parts.length) return '';
-  return [
+  return sanitizeFillLightPositiveMentions([
     '=== PROJECT STYLE BIBLE LOCK (every scene image in this project MUST share this exact look) ===',
     ...parts,
     'CRITICAL: do NOT introduce colors, lighting temperatures, or material styles outside the project palette above. All scenes in this project must look like they came from the same DP and the same color grading session.',
-  ].join('\n');
-}
-
-/**
- * 副场景跑前等主场景图就绪，并返回主场景 PNG 在磁盘上的绝对路径——给
- * `/v1/images/edits` 当参考图用。最长 timeoutMs 还没就绪就返回 null，
- * 调用方应 fallback 到纯文本 prompt（文本 lock 至少能保色调一致）。
- *
- * 实现思路：每 1.5s 重读 project，从 project.environments / assets.scenes
- * 里找主场景的 imageUrl（形如 `/api/images/file/<uuid>`），然后用
- * `resolveLocalImagePath` 反查到磁盘 PNG。
- */
-async function waitForMainSceneReference(
-  projectId: string,
-  ownerId: number,
-  baseSceneRef: string,
-  timeoutMs: number,
-  onWait?: (msg: string) => void,
-): Promise<string | null> {
-  const start = Date.now();
-  let logged = false;
-  while (Date.now() - start < timeoutMs) {
-    const fresh = getProjectByIdForUser(projectId, ownerId);
-    if (fresh) {
-      const main = findSceneByRef(fresh, baseSceneRef);
-      const url = main?.imageUrl || main?.rawUrl;
-      if (url) {
-        const path = resolveLocalImagePath(url, ownerId);
-        if (path) return path;
-      }
-    }
-    if (!logged) {
-      onWait?.(`等待主场景 ${baseSceneRef} 就绪…`);
-      logged = true;
-    }
-    await new Promise((r) => setTimeout(r, 1500));
-  }
-  return null;
-}
-
-/**
- * 副场景找它绑定的主场景。baseSceneRef 是 LLM 在 SP_ASSETS_EXTRACT 阶段塞的
- * id（如 "e1"），主场景候选既可能在 project.environments 也可能在
- * project.assets.scenes 下，两个数组都看一眼。
- */
-function findSceneByRef(project: any, ref: string): any | null {
-  if (!ref) return null;
-  const candidates: any[] = [];
-  if (Array.isArray(project?.environments)) candidates.push(...project.environments);
-  if (Array.isArray(project?.assets?.scenes)) candidates.push(...project.assets.scenes);
-  for (const s of candidates) {
-    if (!s) continue;
-    if (s.id === ref) return s;
-    // 兜底：有些项目用 name 或 isMain 标识主场景
-    if (ref === 'main' && s.isMain) return s;
-  }
-  // 再兜一次：直接拿第一个 isMain=true 的
-  for (const s of candidates) {
-    if (s && s.isMain) return s;
-  }
-  return null;
+  ].join('\n'));
 }
 
 function resolveAssetTarget(project: any, target: any) {
@@ -141,13 +367,13 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
     const traits = [asset.temperament, asset.actionTraits, ...(asset.tags || [])]
       .filter(Boolean)
       .join(', ');
-    return [
+    return sanitizeFillLightPositiveMentions([
       `Subject: ${asset.name || 'unnamed character'}.`,
       asset.detail || asset.intro || '',
       traits && `Traits: ${traits}.`,
       asset.appearance && `Appearance: ${asset.appearance}.`,
       asset.clothing && `Clothing: ${asset.clothing}.`,
-    ].filter(Boolean).join('\n');
+    ].filter(Boolean).join('\n'));
   }
   if (type === 'scene') {
     const parts: string[] = [`Subject: ${asset.name || 'unnamed scene'}.`];
@@ -158,13 +384,13 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
     if (asset.lighting) parts.push(`Lighting: ${asset.lighting}.`);
     if (asset.atmosphere) parts.push(`Atmosphere: ${asset.atmosphere}.`);
     if (Array.isArray(asset.elements) && asset.elements.length) parts.push(`Key elements: ${asset.elements.join(', ')}.`);
-    return parts.filter(Boolean).join('\n');
+    return sanitizeFillLightPositiveMentions(parts.filter(Boolean).join('\n'));
   }
-  return [
+  return sanitizeFillLightPositiveMentions([
     `Subject: ${asset.name || 'unnamed prop'}.`,
     asset.features && `Appearance: ${asset.features}.`,
     asset.propType && `Type: ${asset.propType}.`,
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n'));
 }
 
 /* ============================================================
@@ -178,11 +404,12 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   if (!item) throw new Error(`找不到 ${cat}[${idx}]`);
 
   ctx.progress({ stage: 'building_prompt' });
-  let prompt = item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible);
+  const reusablePrompt = sanitizeFillLightPositiveMentions(item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible));
+  let prompt = reusablePrompt;
 
   // 场景元数据注入：原网站效果之所以好看，是因为它把"时段/天气/灯光/氛围/位置"
   // 这些场景级参数也喂进了图像 prompt（不光显示在卡上）。我们的 LLM 现在会抽
-  // 这些字段（参考 SP_ASSETS_EXTRACT），这里在出图前拼一段"SCENE METADATA"
+  // 这些字段（参考资产场景抽取规则），这里在出图前拼一段"SCENE METADATA"
   // 段落让图像模型必须 reflect 出来。即便 imagePrompt 已经写过部分氛围，
   // 这段也作为权威约束追加到末尾。
   if (type === 'scene') {
@@ -198,48 +425,31 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     }
 
     // ----- 项目级色调锁定 -----
-    // 用户反馈："主场景和各个分场景的色调要统一，不能一个黄一个白"。
-    // 之前每个场景独立生成 → 灯光/白平衡/色温由模型自己定 → 同一个项目下
-    // 主场景偏暖黄、副场景偏冷白。这里从 styleBible 抽出 color palette /
-    // visualStyle / mood / era，每张场景图都带**完全相同**的 lock 段落，
-    // 强制整个项目共享一套色调；副场景再额外锁定到主场景的 name + description，
-    // 让图像模型把它当成"同一地点的另一角度"，不能跑偏。
+    // 场景资产现在只生成一张主环境参考图；这里从 styleBible 抽出 color
+    // palette / visualStyle / mood / era，让这张图稳定承载全片环境质感。
     const styleLock = buildSceneStyleLock((proj as any).styleBible);
     if (styleLock) {
       prompt = `${prompt}\n\n${styleLock}`;
     }
-    if (item.baseSceneRef) {
-      const mainScene = findSceneByRef(proj, item.baseSceneRef);
-      if (mainScene) {
-        const mainHints: string[] = [];
-        mainHints.push(`This is a SUB-AREA / DIFFERENT ANGLE of the main scene "${mainScene.name || ''}" — it is the SAME physical location, just a different corner / camera angle.`);
-        if (mainScene.description) mainHints.push(`Main scene description (must share the SAME architecture, materials, fixtures, props): ${mainScene.description}`);
-        if (mainScene.timeSetting) mainHints.push(`Main scene time of day: ${mainScene.timeSetting}.`);
-        if (mainScene.lighting) mainHints.push(`Main scene lighting: ${mainScene.lighting}.`);
-        if (mainScene.atmosphere) mainHints.push(`Main scene atmosphere keywords: ${mainScene.atmosphere}.`);
-        if (Array.isArray(mainScene.elements) && mainScene.elements.length) {
-          mainHints.push(`Main scene key elements (some of these should remain visible): ${mainScene.elements.join(', ')}.`);
-        }
-        mainHints.push('CRITICAL — same-location consistency:');
-        mainHints.push('  · Same wall paint, same floor material, same ceiling type, same window/door style.');
-        mainHints.push('  · Same furniture pieces and same equipment style as visible in the main scene.');
-        mainHints.push('  · Same lighting fixtures and same color temperature / white balance / contrast / grading.');
-        mainHints.push('  · Same era, same construction style, same level of cleanliness/wear.');
-        mainHints.push('If the main scene is a stainless-steel commercial back-kitchen at night with warm tungsten lights, the sub-scene MUST also look like a different corner of THAT SAME kitchen — NOT a clean classroom, NOT a different building, NOT a different time of day.');
-        prompt = `${prompt}\n\n=== MAIN-SCENE LOCK (sub-scenes must match the main scene's look) ===\n${mainHints.join('\n')}`;
-      }
-    }
   }
 
-  // 角色元数据注入：气质/动作特征也影响表演气场（皱眉/手插腰），让 reference
-  // 图能体现出来。equipment 同样写进去，避免漏画手里的物件。
+  // 角色元数据注入：把用户当前编辑过的外貌/服装/道具放到末尾作为权威覆盖，
+  // 避免旧 imagePrompt 或重写 LLM 把这些细节弱化。气质/动作特征也影响表演
+  // 气场（皱眉/手插腰），同样要求图像模型反映出来。
   if (type === 'char') {
-    const charMeta: string[] = [];
-    if (item.equipment) charMeta.push(`Holding / wearing: ${item.equipment}.`);
-    if (item.temperament) charMeta.push(`Temperament keywords (must show in face/posture): ${item.temperament}.`);
-    if (item.actionTraits) charMeta.push(`Signature gestures (pose hints for the front view): ${item.actionTraits}.`);
-    if (charMeta.length) {
-      prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image) ===\n${charMeta.join('\n')}`;
+    const lock = findCharacterLock(proj as any, item);
+    if (lock) {
+      prompt = `${prompt}\n\n=== CHARACTER CONSISTENCY LOCK (authoritative, must match exactly) ===\n${renderCharacterLockRosterLine(lock, 'en')}`;
+    } else {
+      const charMeta: string[] = [];
+      if (item.appearance) charMeta.push(`Current appearance (authoritative override): ${item.appearance}.`);
+      if (item.clothing) charMeta.push(`Current clothing (authoritative override): ${item.clothing}.`);
+      if (item.equipment) charMeta.push(`Holding / wearing: ${item.equipment}.`);
+      if (item.temperament) charMeta.push(`Temperament keywords (must show in face/posture): ${item.temperament}.`);
+      if (item.actionTraits) charMeta.push(`Signature gestures (pose hints for the front view): ${item.actionTraits}.`);
+      if (charMeta.length) {
+        prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image, override conflicting hints above) ===\n${charMeta.join('\n')}`;
+      }
     }
   }
 
@@ -250,37 +460,13 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   //   - 场景：1536×1024 establishing shot
   //   - 道具：1024×1024 白底 product shot
   const entityType: 'human' | 'non-human' =
-    type === 'char' && (item.entityType === 'non-human') ? 'non-human' : 'human';
+    type === 'char' ? inferEntityTypeFromCharacter(item) : 'human';
 
-  // ----- 副场景的参考图（image-to-image）-----
-  // 用户反馈："分场景得参考主场景来生成 不止是色调 环境什么的也是"。
-  // 文本描述对模型来说太弱了——主场景是工业不锈钢后厨，副场景照样画成
-  // 干净小教室。这里走 gpt-image-* 的 /v1/images/edits 端点，把已经生成
-  // 出来的主场景 PNG 当视觉锚点喂进去，让模型用同一套材质 / 灯光 / 色温
-  // 画"同一地点的另一角度"。
-  //
-  // 时序：主场景 + 多个副场景同时被批量生成，副场景可能比主场景早开跑。
-  // 这里用最长 90s 的轮询等主场景图就绪；超时就 fallback 到无参考图，
-  // 至少有文本 lock 兜底。
-  let referenceImagePath: string | undefined;
-  if (type === 'scene' && item.baseSceneRef) {
-    referenceImagePath = await waitForMainSceneReference(
-      ctx.projectId,
-      ctx.user.id,
-      item.baseSceneRef,
-      90_000,
-      (msg) => ctx.progress({ stage: 'waiting_main_scene', msg }),
-    ) || undefined;
-    if (referenceImagePath) {
-      console.log(`[asset_images] sub-scene scenes[${idx}] using main scene as reference image: ${referenceImagePath}`);
-      // 给 prompt 再加一行明确指令，告诉模型那张参考图是同一个地点
-      prompt = `${prompt}\n\n=== REFERENCE IMAGE NOTE ===\nThe attached reference image IS the main scene of this same physical location. Generate a DIFFERENT camera angle / sub-area of THAT SAME location — keep all materials, fixtures, lighting, color temperature, and overall photographic look IDENTICAL to the reference. Do NOT change the building, the room style, the time of day, or the color grading.`;
-    } else {
-      console.warn(`[asset_images] sub-scene scenes[${idx}]: main scene image not ready in 90s, falling back to text-only`);
-    }
-  }
+  const referenceImagePath: string | undefined = undefined;
 
-  const result = await generateImage(ctx.user, {
+  prompt = sanitizeFillLightPositiveMentions(prompt);
+
+  const result = await generateImageWithModerationRecovery(ctx.user, {
     prompt,
     size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : '1024x1024',
     style: 'natural',
@@ -288,11 +474,28 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     entityType: type === 'char' ? entityType : undefined,
     projectId: ctx.projectId,
     assetRef: `${cat}[${idx}]`,
-    // 角色 4 宫格（头部特写 + 三视图）和场景 6 宫格细节多，低画质会糊掉脸
-    // 和场景纹理；prop 单图保持 low 既快又够用。
+    // 角色参考图和场景主环境图细节多，低画质会糊掉脸和场景纹理；
+    // prop 单图保持 low 既快又够用。
     quality: type === 'prop' ? 'low' : 'medium',
     referenceImagePath,
   });
+
+  let panelResult: SplitCharacterPanelsResult | null = null;
+  if (type === 'char') {
+    ctx.progress({ stage: 'splitting_character_panels' });
+    panelResult = await splitCharacterPanels({
+      user: ctx.user,
+      projectId: ctx.projectId,
+      assetRef: `${cat}[${idx}]`,
+      sourceImageUrl: result.url,
+      entityType,
+      prompt: result.submittedPrompt,
+      version: existingPanelVersion(item) + 1,
+    });
+    if (!panelResult.ok) {
+      console.warn(`[asset_images] character panel split failed for ${cat}[${idx}]: ${panelResult.error}`);
+    }
+  }
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
   // 注意：写入 imageUrl + rawUrl 两个字段，因为前端不同卡片读不同字段（兼容历史）
@@ -304,26 +507,67 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     const charExtra = type === 'char'
       ? { realPhotoUrl: result.url, pencilUrl: result.url, skippedStylize: true }
       : {};
-    assets[cat][idx] = {
+    let nextAsset = {
       ...assets[cat][idx],
       imageUrl: result.url,
       rawUrl: result.url,
-      imagePrompt: prompt,
+      imagePrompt: reusablePrompt,
+      submittedImagePrompt: result.submittedPrompt,
+      imageSafetyAudit: result.safetyAudit,
+      effectiveVisualDescription: result.visualAnchorDescription,
+      reference: {
+        ...assets[cat][idx].reference,
+        currentUrl: result.url,
+        lastKnownGoodUrl: result.url,
+        status: 'ready',
+        updatedAt: new Date().toISOString(),
+      },
       imageGeneratedAt: new Date().toISOString(),
       ...charExtra,
     };
+    if (type === 'char' && panelResult) nextAsset = applyCharacterPanelResult(nextAsset, panelResult);
+    assets[cat][idx] = nextAsset;
     // 顶层 characters/environments/props 也同步（前端两种结构都读）
     const topKey = cat === 'characters' ? 'characters' : cat === 'scenes' ? 'environments' : 'props';
     const top = (fresh as any)[topKey] || [];
     if (!top[idx]) top[idx] = {};
-    top[idx] = {
+    let nextTop = {
       ...top[idx],
       imageUrl: result.url,
       rawUrl: result.url,
-      imagePrompt: prompt,
+      imagePrompt: reusablePrompt,
+      submittedImagePrompt: result.submittedPrompt,
+      imageSafetyAudit: result.safetyAudit,
+      effectiveVisualDescription: result.visualAnchorDescription,
       ...charExtra,
     };
-    return { assets, [topKey]: top };
+    if (type === 'char' && panelResult) nextTop = applyCharacterPanelResult(nextTop, panelResult);
+    top[idx] = nextTop;
+    const patch: any = { assets, [topKey]: top };
+    if (type === 'char') {
+      const panels = nextAsset.panels || {};
+      const mutation = mutateCharacterLock(
+        { ...(fresh as any), ...patch },
+        nextAsset.characterId || nextAsset.id || nextAsset.name || `characters[${idx}]`,
+        {
+          referenceLock: {
+            sheetUrl: panels.sheetUrl || result.url,
+            headshotUrl: panels.headshotUrl,
+            frontUrl: panels.frontUrl,
+            sideUrl: panels.sideUrl,
+            backUrl: panels.backUrl,
+            sourceImageId: panels.sourceImageId || result.id,
+            referenceStatus: panelResult && !panelResult.ok ? 'degraded' : 'ready',
+            qualityScore: panelResult?.ok ? panelResult.panels.confidence : undefined,
+          },
+        },
+        { source: 'asset_image' },
+      );
+      patch.consistency = mutation.project.consistency;
+      patch.assets = mutation.project.assets;
+      patch[topKey] = mutation.project[topKey];
+    }
+    return patch;
   });
 
   // task_completed 事件 payload：前端 onTaskCompleted 读 extra.rawUrl / extra.pencilUrl
@@ -331,7 +575,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   // 刷新页面才显示——这里补上。
   return {
     resultUrl: result.url,
-    patch: { type: 'asset_image', cat, idx, value: result.url, imageUrl: result.url, imagePrompt: prompt },
+    patch: { type: 'asset_image', cat, idx, value: result.url, imageUrl: result.url, imagePrompt: reusablePrompt },
     extra: {
       type,
       idx,
@@ -341,6 +585,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       mode: result.mode,
       width: result.width,
       height: result.height,
+      panels: panelResult?.ok ? panelResult.panels : undefined,
+      panelsError: panelResult && !panelResult.ok ? panelResult.error : undefined,
+      imageSafetyAudit: result.safetyAudit,
     },
   };
 });
@@ -380,13 +627,13 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'building_prompt' });
   const styleBible = (proj as any).styleBible || {};
-  const styleHint = [
+  const styleHint = joinPromptValues([
     styleBible.vision || styleBible.visualStyle,
     styleBible.colorPalette,
     styleBible.cameraStyle,
     styleBible.mood || styleBible.tone,
     styleBible.lighting,
-  ].filter(Boolean).join('; ');
+  ]);
 
   // 兼容新老字段
   const shotType = shot.shotType || shot.framing || '';
@@ -427,7 +674,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     }
   }
 
-  const userMsg = [
+  const userMsg = sanitizeFillLightPositiveMentions([
     `镜头序号：${shot.idx ?? idx + 1}`,
     shotType && `景别：${shotType}`,
     camera && `运镜：${camera}`,
@@ -437,7 +684,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     charContext && `本镜头角色（必须保留外观/服装一致性）：${charContext}`,
     nonHumanMentions.length && `画面中提及的其它非人/拟人角色（绝对不能画成真人）：${nonHumanMentions.join(' | ')}`,
     styleHint && `整体视觉风格：${styleHint}`,
-  ].filter(Boolean).join('\n');
+  ].filter(Boolean).join('\n'));
 
   ctx.progress({ stage: 'calling_llm' });
   const prompt = await chatComplete(
@@ -448,7 +695,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     ],
     { temperature: 0.5, maxTokens: 600, modelRole: 'structured' },
   );
-  const cleaned = prompt.trim().replace(/^["'`]+|["'`]+$/g, '');
+  const cleaned = sanitizeFillLightPositiveMentions(prompt.trim().replace(/^["'`]+|["'`]+$/g, ''));
   if (!cleaned) throw new Error('AI 没有返回提示词');
 
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
@@ -493,6 +740,144 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'building_prompt' });
 
+  if (isMultiRefVideoModeEnabled()) {
+    // P0: 用结构化的 FrameImageGenerationPlan 统一组织首帧输入。
+    //   - prompt / 参考图清单 / 资产锁 / 模型能力快照都通过 plan 产出;
+    //   - 为保持零行为变更, multiRefImageCap 仍强制为 1 (只传一张参考图),
+    //     P3 升级多图时再把 cap 交给 provider 能力决定。
+    const imgCfg = resolveLLMConfig(ctx.user, 'image');
+    const plan = buildFrameImageGenerationPlan({
+      project: proj,
+      groupIdx,
+      shotIndices,
+      ownerId: ctx.user.id,
+      frameType: 'first_frame',
+      modelSnapshot: {
+        provider: imgCfg.provider,
+        model: imgCfg.model,
+        baseUrl: imgCfg.baseUrl,
+        quality: imgCfg.imageQuality || 'medium',
+        multiRefImageCap: 1,
+      },
+    });
+    const basePrompt = plan.finalPrompt;
+    const imageRef = plan.referenceManifest.find((r) => r.delivery === 'image');
+    const referenceImagePath = imageRef?.localPath;
+    const planSummary = summarizePlanForAudit(plan);
+
+    ctx.progress({
+      stage: 'calling_image_api',
+      shotCount: groupShots.length,
+      mode: 'first_frame',
+      hint: '调用图像 API 生成彩色视频首帧…',
+    });
+    const result = await generateImageWithModerationRecovery(ctx.user, {
+      prompt: basePrompt,
+      size: '1536x1024',
+      style: 'photographic',
+      kind: 'storyboard',
+      projectId: ctx.projectId,
+      assetRef: `storyboards[${groupIdx}].firstFrame`,
+      quality: 'medium',
+      referenceImagePath,
+    });
+
+    // P1: storyboards[g].frames.first 作为新的结构化对外容器, 与旧的 firstFrameUrl /
+    // firstFramePrompt / firstFrameMode / firstFrameSafetyAudit / firstFramePlanSummary
+    // 并行输出, 方便 P2 尾帧以同一形状落到 frames.tail。旧字段保留做兼容。
+    const frameFirst = {
+      url: result.url,
+      prompt: result.submittedPrompt,
+      originalPrompt: basePrompt,
+      mode: 'structured_v1' as const,
+      status: 'ready' as const,
+      planSummary,
+      safetyAudit: result.safetyAudit,
+      visualAnchorDescription: result.visualAnchorDescription,
+      generatedAt: nowIso(),
+    };
+
+    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+      if (!fresh) return null;
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      while (storyboards.length <= groupIdx) storyboards.push({});
+      const prev = storyboards[groupIdx] || {};
+      const {
+        videoUrl: _oldVideoUrl,
+        videoTaskId: _oldVideoTaskId,
+        videoDurationSec: _oldVideoDurationSec,
+        videoCoverUrl: _oldVideoCoverUrl,
+        videoStatus: _oldVideoStatus,
+        videoMode: _oldVideoMode,
+        videoTaskFinishedAt: _oldVideoTaskFinishedAt,
+        ...prevWithoutVideo
+      } = prev;
+      storyboards[groupIdx] = {
+        ...prevWithoutVideo,
+        url: result.url,
+        imageUrl: result.url,
+        rawUrl: result.url,
+        firstFrameUrl: result.url,
+        firstFrame: {
+          ...markFirstFrameReady(prev, result.url, result.url),
+          safetyAudit: result.safetyAudit,
+          visualAnchorDescription: result.visualAnchorDescription,
+        },
+        firstFramePrompt: result.submittedPrompt,
+        firstFrameMode: 'structured_v1',
+        firstFrameLastError: undefined,
+        firstFrameFailedAt: undefined,
+        debugSketchUrl: prev.debugSketchUrl || prev.pencilUrl,
+        imagePrompt: result.submittedPrompt,
+        originalFirstFramePrompt: basePrompt,
+        firstFrameSafetyAudit: result.safetyAudit,
+        effectiveVisualDescription: result.visualAnchorDescription,
+        idx: groupIdx,
+        shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
+        shotIndices,
+        firstFramePlanSummary: planSummary,
+        frames: { ...(prev.frames || {}), first: frameFirst },
+      };
+      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+      if (videoTasks.length > groupIdx) videoTasks[groupIdx] = {};
+      return { storyboards, videoTasks };
+    });
+
+    return {
+      resultUrl: result.url,
+      patch: {
+        type: 'storyboard_image',
+        idx: groupIdx,
+        url: result.url,
+        imageUrl: result.url,
+        rawUrl: result.url,
+        firstFrameUrl: result.url,
+        firstFrameMode: 'structured_v1',
+        shotIndices,
+        imagePrompt: result.submittedPrompt,
+        firstFrameSafetyAudit: result.safetyAudit,
+        firstFramePlanSummary: planSummary,
+        frames: { first: frameFirst },
+      },
+      extra: {
+        mode: result.mode,
+        groupIdx,
+        url: result.url,
+        rawUrl: result.url,
+        imageUrl: result.url,
+        firstFrameUrl: result.url,
+        firstFrameMode: 'structured_v1',
+        shotIndices,
+        imagePrompt: result.submittedPrompt,
+        originalImagePrompt: basePrompt,
+        imageSafetyAudit: result.safetyAudit,
+        firstFramePlanSummary: planSummary,
+        frames: { first: frameFirst },
+        invalidateVideo: true,
+      },
+    };
+  }
+
   // 单组 prompt 长度上限（中转站对超长 prompt 不稳定，1200 字符是安全线）
   const MAX_PROMPT_CHARS = 1200;
   // 把组内所有镜头压成精简描述：每段最多 350 字符
@@ -501,8 +886,8 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const idx = shotIndices[i] + 1;
     const _shotType = sh.shotType || sh.framing || '';
     const _camera = sh.camera || sh.movement || '';
-    const englishPrompt = (sh.imagePrompt || '').trim();
-    const _visual = sh.visual || sh.description || sh.desc || '';
+    const englishPrompt = sanitizeFillLightPositiveMentions((sh.imagePrompt || '').trim());
+    const _visual = sanitizeFillLightPositiveMentions(sh.visual || sh.description || sh.desc || '');
     const body = englishPrompt || _visual;
     const head = `Frame ${idx}` + (_shotType ? ` (${_shotType}${_camera ? ', ' + _camera : ''})` : '');
     return `${head}: ${truncate(body, 350)}`;
@@ -526,7 +911,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   } else {
     sheetIntro = `A storyboard sheet with ${n} sequential panels showing different beats of the same scene. `;
   }
-  let basePrompt = sheetIntro + promptSections.join(' | ');
+  let basePrompt = sanitizeFillLightPositiveMentions(sheetIntro + promptSections.join(' | '));
   if (basePrompt.length > MAX_PROMPT_CHARS) {
     basePrompt = basePrompt.slice(0, MAX_PROMPT_CHARS) + '…';
   }
@@ -547,17 +932,17 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const projChars: any[] = ((proj as any).assets?.characters || []) as any[];
     const nonHumanSpeciesUsed = new Set<string>();
     for (const sh of groupShots) {
-      const text = [
+      const text = sanitizeFillLightPositiveMentions([
         sh.imagePrompt || '',
         sh.visual || sh.description || sh.desc || '',
         Array.isArray(sh.characters) ? sh.characters.join(' ') : '',
-      ].join(' ');
+      ].join(' '));
       for (const c of projChars) {
         if (c?.entityType !== 'non-human') continue;
         const nm = c.name || c.role;
         if (!nm) continue;
         if (text.includes(nm)) {
-          const appearance = (c.appearance || c.description || '').slice(0, 120);
+          const appearance = sanitizeFillLightPositiveMentions(c.appearance || c.description || '').slice(0, 120);
           nonHumanSpeciesUsed.add(`${nm} (${appearance || 'anthropomorphic creature, keep species body'})`);
         }
       }
@@ -583,12 +968,14 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     }
   } catch {}
 
+  basePrompt = sanitizeFillLightPositiveMentions(basePrompt);
+
   ctx.progress({
     stage: 'calling_image_api',
     shotCount: groupShots.length,
     hint: `调用图像 API 中（gpt-image-1 单张约 30-60 秒）…`,
   });
-  const result = await generateImage(ctx.user, {
+  const result = await generateImageWithModerationRecovery(ctx.user, {
     prompt: basePrompt,
     size: '1536x1024', // 16:9 多格分镜
     style: 'pencil', // 手稿风格
@@ -604,24 +991,217 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     while (storyboards.length <= groupIdx) storyboards.push({});
+    const prev = storyboards[groupIdx] || {};
+    const prevFirstFrame = normalizeFirstFrameState(prev);
+    const at = new Date().toISOString();
     storyboards[groupIdx] = {
-      ...storyboards[groupIdx],
+      ...prev,
       url: result.url,
       imageUrl: result.url,
       rawUrl: result.url,
       pencilUrl: result.url,
-      imagePrompt: basePrompt,
+      firstFrameUrl: result.url,
+      firstFrameMode: 'legacy_pencil',
+      firstFrame: {
+        currentUrl: result.url,
+        rawUrl: result.url,
+        status: 'legacy_sketch_only',
+        source: 'generated',
+        lastKnownGoodUrl: result.url,
+        lastError: undefined,
+        history: [
+          { url: result.url, at, source: 'generated' as const },
+          ...prevFirstFrame.history.filter((item) => item.url !== result.url),
+        ].slice(0, 20),
+        safetyAudit: result.safetyAudit,
+        visualAnchorDescription: result.visualAnchorDescription,
+      },
+      imagePrompt: result.submittedPrompt,
+      originalImagePrompt: basePrompt,
+      imageSafetyAudit: result.safetyAudit,
+      effectiveVisualDescription: result.visualAnchorDescription,
+      firstFrameLastError: undefined,
+      firstFrameFailedAt: undefined,
       idx: groupIdx,
       shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
       shotIndices,
     };
-    return { storyboards };
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+    if (videoTasks.length > groupIdx) videoTasks[groupIdx] = {};
+    return { storyboards, videoTasks };
   });
 
   return {
     resultUrl: result.url,
-    patch: { type: 'storyboard_image', idx: groupIdx, url: result.url, pencilUrl: result.url, imageUrl: result.url, rawUrl: result.url },
-    extra: { mode: result.mode, groupIdx, url: result.url, rawUrl: result.url, imageUrl: result.url },
+    patch: {
+      type: 'storyboard_image',
+      idx: groupIdx,
+      url: result.url,
+      pencilUrl: result.url,
+      imageUrl: result.url,
+      rawUrl: result.url,
+      firstFrameUrl: result.url,
+      firstFrameMode: 'legacy_pencil',
+      firstFrameStatus: 'legacy_sketch_only',
+    },
+    extra: {
+      mode: result.mode,
+      groupIdx,
+      url: result.url,
+      rawUrl: result.url,
+      imageUrl: result.url,
+      firstFrameUrl: result.url,
+      firstFrameMode: 'legacy_pencil',
+      firstFrameStatus: 'legacy_sketch_only',
+      imagePrompt: result.submittedPrompt,
+      imageSafetyAudit: result.safetyAudit,
+      invalidateVideo: true,
+    },
+  };
+});
+
+/* ============================================================
+   3.5 tail_frame_images executor —— 给每个分镜组生成彩色视频尾帧
+   ============================================================ */
+registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
+  const proj = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  if (!proj) throw new Error('项目不存在');
+
+  const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? 0;
+  const shots = (proj as any).shots || [];
+
+  let shotIndices: number[] =
+    Array.isArray(ctx.target.shotIndices) && ctx.target.shotIndices.length
+      ? ctx.target.shotIndices.filter((i: any) => typeof i === 'number')
+      : [groupIdx];
+  shotIndices = shotIndices.filter((i) => i >= 0 && i < shots.length);
+  if (!shotIndices.length) {
+    throw new Error(`分组 #${groupIdx} 没有对应的镜头数据`);
+  }
+
+  // Preflight: 本片段首帧必须已就绪。尾帧必须用首帧做连续性锚点。
+  const storyboards = (proj as any).storyboards || [];
+  const sb = storyboards[groupIdx] || {};
+  const firstFrameUrl: string | undefined =
+    sb.firstFrameUrl || sb.frames?.first?.url || sb.firstFrame?.currentUrl;
+  if (!firstFrameUrl) {
+    throw new Error(
+      `片段 ${groupIdx + 1} 首帧未就绪, 无法生成尾帧。请先在首帧阶段生成并确认首帧图后再生成尾帧。`,
+    );
+  }
+
+  // 首帧图的本地路径; 无法解析时降级为 text_only 锚 (plan 会标 droppedReason='unresolvable')。
+  const selfFirstFrameLocal = resolveLocalImagePath(firstFrameUrl, ctx.user.id) || undefined;
+  if (!selfFirstFrameLocal) {
+    console.warn(
+      `[tail_frame_images] group ${groupIdx}: firstFrameUrl 无法解析到本地, 尾帧将降级为文字锚: ${firstFrameUrl}`,
+    );
+  }
+
+  ctx.progress({ stage: 'building_prompt' });
+
+  const imgCfg = resolveLLMConfig(ctx.user, 'image');
+  const plan = buildFrameImageGenerationPlan({
+    project: proj,
+    groupIdx,
+    shotIndices,
+    ownerId: ctx.user.id,
+    frameType: 'tail_frame',
+    modelSnapshot: {
+      provider: imgCfg.provider,
+      model: imgCfg.model,
+      baseUrl: imgCfg.baseUrl,
+      quality: imgCfg.imageQuality || 'medium',
+      multiRefImageCap: 1,
+    },
+    selfFirstFrame: {
+      remoteUrl: firstFrameUrl,
+      localPath: selfFirstFrameLocal,
+    },
+  });
+
+  const basePrompt = plan.finalPrompt;
+  const imageRef = plan.referenceManifest.find((r) => r.delivery === 'image');
+  const referenceImagePath = imageRef?.localPath;
+  const planSummary = summarizePlanForAudit(plan);
+
+  ctx.progress({
+    stage: 'calling_image_api',
+    shotCount: shotIndices.length,
+    mode: 'tail_frame',
+    hint: '调用图像 API 生成彩色视频尾帧…',
+  });
+
+  const result = await generateImageWithModerationRecovery(ctx.user, {
+    prompt: basePrompt,
+    size: '1536x1024',
+    style: 'photographic',
+    kind: 'storyboard',
+    projectId: ctx.projectId,
+    assetRef: `storyboards[${groupIdx}].tailFrame`,
+    quality: 'medium',
+    referenceImagePath,
+  });
+
+  const frameTail = {
+    url: result.url,
+    prompt: result.submittedPrompt,
+    originalPrompt: basePrompt,
+    mode: 'structured_v1' as const,
+    status: 'ready' as const,
+    planSummary,
+    safetyAudit: result.safetyAudit,
+    visualAnchorDescription: result.visualAnchorDescription,
+    generatedAt: nowIso(),
+  };
+
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+    while (sbs.length <= groupIdx) sbs.push({});
+    const prev = sbs[groupIdx] || {};
+    sbs[groupIdx] = {
+      ...prev,
+      tailFrameUrl: result.url,
+      tailFramePrompt: result.submittedPrompt,
+      originalTailFramePrompt: basePrompt,
+      tailFrameMode: 'structured_v1',
+      tailFrameSafetyAudit: result.safetyAudit,
+      tailFramePlanSummary: planSummary,
+      tailFrameLastError: undefined,
+      tailFrameFailedAt: undefined,
+      frames: { ...(prev.frames || {}), tail: frameTail },
+    };
+    return { storyboards: sbs };
+  });
+
+  return {
+    resultUrl: result.url,
+    patch: {
+      type: 'tail_frame_image',
+      idx: groupIdx,
+      url: result.url,
+      tailFrameUrl: result.url,
+      tailFrameMode: 'structured_v1',
+      shotIndices,
+      tailFramePrompt: result.submittedPrompt,
+      tailFrameSafetyAudit: result.safetyAudit,
+      tailFramePlanSummary: planSummary,
+      frames: { tail: frameTail },
+    },
+    extra: {
+      mode: result.mode,
+      groupIdx,
+      url: result.url,
+      tailFrameUrl: result.url,
+      tailFrameMode: 'structured_v1',
+      shotIndices,
+      tailFramePrompt: result.submittedPrompt,
+      originalTailFramePrompt: basePrompt,
+      tailFrameSafetyAudit: result.safetyAudit,
+      tailFramePlanSummary: planSummary,
+      frames: { tail: frameTail },
+    },
   };
 });
 
@@ -636,13 +1216,32 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const storyboards = (proj as any).storyboards || [];
   const sb = storyboards[groupIdx];
   if (!sb) throw new Error(`找不到 storyboards[${groupIdx}]`);
+	  const promptReadiness = assertVideoPromptReadyForGroups(proj as any, [groupIdx]);
+	  if (!promptReadiness.ok) {
+	    const blocked = promptReadiness.blocked[0];
+	    throw errorWithFailureStage(
+	      `片段 ${groupIdx + 1} 视频提示词未就绪（${blocked?.reason || 'not_ready'}），` +
+	        `已阻止视频生成。请先重新生成并确认该片段的视频提示词。`,
+	      'preflight_video_prompt_not_ready',
+	    );
+	  }
 
   // 提示词来源优先：sb.videoPrompt（视频提示词页生成的）→ shot.imagePrompt → shot.visual
   const shots = (proj as any).shots || [];
   const shot = shots[groupIdx] || {};
   const _shotVisual = shot.visual || shot.description || shot.desc || '';
-  const prompt =
-    sb.videoPrompt || shot.imagePrompt || _shotVisual || `Video segment for shot ${groupIdx + 1}`;
+  let videoPromptSource: VideoGenerationPlan['promptAudit']['sourcePrompt']['source'] = sb.videoPrompt
+    ? 'storyboard.videoPrompt'
+    : (sb.firstFramePrompt || sb.imagePrompt || shot.imagePrompt)
+      ? 'shot.imagePrompt'
+      : 'shot.visual';
+  let prompt =
+    sb.videoPrompt ||
+    sb.firstFramePrompt ||
+    sb.imagePrompt ||
+    shot.imagePrompt ||
+    _shotVisual ||
+    `Video segment for shot ${groupIdx + 1}`;
 
   // 收集本组所有 shot（按情绪段切分后的真实镜头索引）。
   // 优先级：
@@ -669,14 +1268,42 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       `group ${groupIdx} 分组索引丢失且缺 videoPrompt，请回到"视频提示词"页重新生成后再来这一步`,
     );
   }
+	  if (!sb.videoPrompt) {
+	    const firstGroupShot = shots[groupShotIndices[0]] || shot || {};
+	    const firstGroupVisual = firstGroupShot.visual || firstGroupShot.description || firstGroupShot.desc || '';
+	    videoPromptSource = (sb.firstFramePrompt || sb.imagePrompt || firstGroupShot.videoPrompt || firstGroupShot.imagePrompt)
+	      ? 'shot.imagePrompt'
+	      : 'shot.visual';
+	    prompt =
+      sb.firstFramePrompt ||
+      sb.imagePrompt ||
+      firstGroupShot.videoPrompt ||
+      firstGroupShot.imagePrompt ||
+	      firstGroupVisual ||
+	      prompt;
+	  }
+	  const sanitizedFor: string[] = [];
+	  const promptBeforeSanitize = prompt;
+		  prompt = sanitizeFillLightPositiveMentions(prompt);
+	  if (prompt !== promptBeforeSanitize) sanitizedFor.push('fill_light_positive');
 
-  let totalGroupDur = 0;
-  for (const si of groupShotIndices) {
-    const sh = shots[si];
-    if (!sh) continue;
-    totalGroupDur += Number(sh.duration || sh.durationSec || 4);
-  }
-  // 注意：durationSec 在 dialoguePairs 构建完成后再决策（因为要按台词字数选 5s / 10s）
+  const groupShotsForPlan = groupShotIndices.map((si) => shots[si]).filter(Boolean);
+  const plannedDurationSec = plannedDurationFromShots(groupShotsForPlan);
+  const videoCfg = resolveLLMConfig(ctx.user, 'video');
+  const videoCfgIsGrok = /^grok-video/i.test(videoCfg.model || '');
+  const videoCfgIsVolcano =
+    /volces\.com|volcengine|ark\.cn-/i.test(videoCfg.baseUrl || '') ||
+    /seedance|doubao/i.test(videoCfg.model || '');
+
+  // durationSec 是给视频模型的请求时长：源头来自镜头表计划时长，只做模型固定时长/
+  // 供应商最小时长适配，不再按台词字数压到 5s / 10s 档位。
+  const durationSec = resolveGenerationDurationSec({
+    plannedDurationSec,
+    model: videoCfg.model,
+    baseUrl: videoCfg.baseUrl,
+    minDurationSec: videoCfg.minDurationSec,
+  });
+
   // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给视频模型
   // —— 视频提示词页 LLM 经常把对话遗漏/改写，这里直接从源头数据拿。
   //
@@ -731,27 +1358,24 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     const parsed = parseDialogue(raw);
     for (const p of parsed) dialoguePairs.push(p);
   }
-  // 注意：用户明确要求"台词一个字都不能少"，这里**不做任何截断**。
-  // 如果一组台词太长 5 秒念不完，下面会把视频时长拉到 10 秒（Seedance 支持的另一档）。
-
-  // ===== 动态视频时长（5s / 10s）=====
-  // 用户的两条核心约束：
-  //   (a) "加快视频节奏 不要每段都 5 秒"  → 短台词的片段用 5s
-  //   (b) "台词一个字都不能少"             → 长台词的片段必须用 10s（5s 念不完）
-  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持 5s / 10s 两档。
-  // 决策依据：本组**台词总字数**——中文一般每秒念 4 字，5 秒念 20 字封顶；
-  //   ≤ 18 字  → 5s 视频（节奏快、台词从容）
-  //   > 18 字  → 10s 视频（保证一字不少）
-  let dialogueCharSum = 0;
-  for (const dp of dialoguePairs) {
-    dialogueCharSum += (dp.text || '').replace(/[\s「『""''，。！？]/g, '').length;
-  }
-  const FIVE_SEC_DIALOGUE_BUDGET = 18;
-  const durationSec: number = dialogueCharSum > FIVE_SEC_DIALOGUE_BUDGET ? 10 : 5;
+  // 注意：用户明确要求"台词一个字都不能少"，这里不做任何截断/改写/压缩。
+  // 台词字数只用于质量提醒，不再反向决定视频时长。
+  const dialogueCharSum = cleanDialogueCharCount(dialoguePairs);
+  const dialogueBudget = evaluateDialogueBudget(dialogueCharSum, plannedDurationSec);
+  const dialogueWarning = dialogueBudget.level === 'soft_warning'
+    ? {
+        key: 'dialogue_budget_warning',
+        level: 'warn',
+        message: dialogueBudget.message || `本组台词 ${dialogueCharSum} 字，可能语速偏快。`,
+        dialogueChars: dialogueCharSum,
+        durationSec,
+      }
+    : null;
+  const videoWarnings: any[] = [dialogueWarning].filter(Boolean);
   console.log(
-    `[video_segments] group ${groupIdx} 台词 ${dialogueCharSum} 字 → ` +
-      `用 ${durationSec}s 视频（${dialoguePairs.length} 句台词）` +
-      (totalGroupDur > durationSec ? `；镜头总时长 ${totalGroupDur}s 超出，Seedance 会自适应` : ''),
+    `[video_segments] group ${groupIdx} 计划 ${plannedDurationSec}s，台词 ${dialogueCharSum} 字 → ` +
+      `请求 ${durationSec}s 视频（${dialoguePairs.length} 句台词）` +
+      (dialogueWarning ? `；${dialogueWarning.message}` : ''),
   );
 
   // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
@@ -767,44 +1391,47 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   //   3) **彩色角色图 (characterReferencePaths[])**：定角色外形、服装、物种
   // video-gen 会把三者合成成一张"视觉圣经参考图"再送 Seedance。
 
-  // ① 分镜草图本地路径
+  // ① 视频主参考图本地路径
+  // 新模式：firstFrameUrl 是彩色视频首帧，作为 i2v 主参考。
+  // 旧模式/旧项目：继续使用原 storyboard 黑白草图，保证可回退。
+  const multiRefMode = isMultiRefVideoModeEnabled();
+  const independentMultiImageMode = multiRefMode && isIndependentMultiImageModeEnabled();
+  const resolvedFirstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
+  const hasFirstFrame = !!resolvedFirstFrameUrl;
+  console.log(
+    `[video_segments] group ${groupIdx} flags: ` +
+      `multiRef=${multiRefMode} independentMultiImage=${independentMultiImageMode} ` +
+      `hasFirstFrame=${hasFirstFrame} envIndependent=${String(process.env.ORIGIN_INDEPENDENT_MULTI_IMAGE_MODE || '') || 'default'}`,
+	  );
+	  if (independentMultiImageMode && !hasFirstFrame) {
+	    throw errorWithFailureStage(
+	      `片段 ${groupIdx + 1} 缺少彩色首帧 firstFrameUrl，已阻止视频生成。` +
+	        `请先在分镜/首帧环节重新生成该片段，再生成视频。`,
+	      'preflight_missing_first_frame',
+	    );
+	  }
   let referenceImagePath: string | undefined;
-  const sbImageUrl: string = sb.rawUrl || sb.url || sb.imageUrl || '';
+  const sbImageUrl: string = hasFirstFrame
+    ? resolvedFirstFrameUrl
+    : (sb.rawUrl || sb.url || sb.imageUrl || '');
   const sbMatch = /\/api\/images\/file\/([0-9a-f-]{36})/.exec(sbImageUrl);
   if (sbMatch) {
     referenceImagePath = `${process.cwd()}/data/images/${ctx.user.id}/${sbMatch[1]}.png`;
   }
-
-  // ② 彩色场景图：从 proj.assets.scenes / proj.environments 里挑
-  //    匹配优先级：
-  //      a. 镜头 visual / location 文本里命中场景 name → 用该场景
-  //      b. 命不中 → 用第一张有 imageUrl 的（多数项目就一个主场景）
-  let sceneReferencePath: string | undefined;
-  const allScenes: any[] = [
-    ...((proj as any).assets?.scenes || []),
-    ...((proj as any).environments || []),
-  ];
-  const scenesWithImg = allScenes.filter((s) => s && (s.imageUrl || s.rawUrl));
-  if (scenesWithImg.length) {
-    const allText = groupShotIndices
-      .map((i) => {
-        const sh = shots[i];
-        return [sh?.visual, sh?.location, sh?.scene].filter(Boolean).join(' ');
-      })
-      .join(' ');
-    let chosen = scenesWithImg.find(
-      (s) => s.name && allText.includes(s.name),
-    );
-    // 没命中 → 优先用 isMain，再不行用第一张
-    if (!chosen) chosen = scenesWithImg.find((s) => s.isMain) || scenesWithImg[0];
-    const scenePath = resolveLocalImagePath(
-      chosen.imageUrl || chosen.rawUrl,
-      ctx.user.id,
-    );
-    if (scenePath) sceneReferencePath = scenePath;
+	  const referenceImageRole: 'first_frame' | 'storyboard_sketch' = multiRefMode && hasFirstFrame ? 'first_frame' : 'storyboard_sketch';
+  let storyboardReferencePath: string | undefined;
+  if (referenceImageRole === 'first_frame') {
+    const sketchUrl = sb.debugSketchUrl || sb.pencilUrl || '';
+    const sketchMatch = /\/api\/images\/file\/([0-9a-f-]{36})/.exec(sketchUrl);
+    if (sketchMatch) {
+      storyboardReferencePath = `${process.cwd()}/data/images/${ctx.user.id}/${sketchMatch[1]}.png`;
+    }
   }
 
-  // ③ 彩色角色图：本组所有 shot.characters 名字去 assets.characters / characters 里查
+  let sceneReferencePath: string | undefined;
+  let sceneReferenceLabel = '';
+  let sceneReferenceHint = '';
+
   const allChars: any[] = [
     ...((proj as any).assets?.characters || []),
     ...((proj as any).characters || []),
@@ -818,38 +1445,114 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       }
     }
   }
-  const characterReferencePaths: string[] = [];
-  for (const name of charNames) {
-    const ch = allChars.find(
-      (c) => c && (c.name === name || c.role === name),
-    );
-    const url = ch?.imageUrl || ch?.rawUrl;
-    if (url) {
-      const p = resolveLocalImagePath(url, ctx.user.id);
-      if (p) characterReferencePaths.push(p);
-    }
-    // 最多带 4 张角色图（合成时底部缩略图条只有 4 格）
-    if (characterReferencePaths.length >= 4) break;
+  let characterReferencePaths: string[] = [];
+  let characterReferencePanels: CharacterReferencePanel[] = [];
+  let propReferencePaths: string[] = [];
+
+  const referenceImages: VideoReferenceImage[] = [];
+  const addReferenceImage = (ref: VideoReferenceImage) => {
+    if (!independentMultiImageMode || !ref.path) return;
+    if (referenceImages.some((item) => item.path === ref.path)) return;
+    if (referenceImages.length >= 4) return;
+    referenceImages.push(ref);
+  };
+
+  const canonicalRefs = buildVideoReferenceManifest({
+    project: proj,
+    assets: (proj as any).assets || {},
+    shots,
+    groupShotIndices,
+    groupIdx,
+    ownerId: ctx.user.id,
+    storyboardImageUrl: sbImageUrl || null,
+  });
+  const persistedManifest = Array.isArray(sb.videoReferenceManifest) ? sb.videoReferenceManifest : [];
+  const manifestChanged = persistedManifest.length > 0 && manifestsDiffer(persistedManifest, canonicalRefs.manifest);
+  if (persistedManifest.length === 0 && canonicalRefs.manifest.length > 0) {
+    videoWarnings.push({
+      key: 'reference_manifest_rebuilt_in_executor',
+      level: 'info',
+      message: '该片段无视频提示词阶段持久化的参考图清单，已按当前项目资产重建 canonical manifest。',
+    });
+  }
+  if (manifestChanged) {
+    console.warn(`[video_segments] group ${groupIdx} reference manifest changed between video prompt and video generation`);
+    videoWarnings.push({
+      key: 'manifest_changed_between_prompt_and_video',
+      level: 'warn',
+      message: '视频提示词阶段看到的参考图清单与本次视频生成实际参考图不同，已使用最新首帧/资产重新生成 canonical manifest。',
+    });
   }
 
-  // ===== 角色声音 roster（跨片段保持声音一致） =====
-  // 用户反馈："角色的声音前后不一致"——每条视频独立生成 → Seedance 给同一个
-  // 角色随机分配音色。修法：把整张项目的角色清单（含外形 + 推测音色）作为
-  // 显式锁附在 prompt 里，让模型基于固定描述给同一个名字配同一个声音。
-  const voiceRosterLines: string[] = [];
-  for (const ch of allChars) {
-    if (!ch || !(ch.name || ch.role)) continue;
-    const nm = ch.name || ch.role;
-    if (!charNames.has(nm) && voiceRosterLines.length >= 6) continue;
-    const isNonHuman = ch.entityType === 'non-human';
-    const traits = [ch.appearance, ch.clothing, ch.temperament]
-      .filter(Boolean)
-      .join('，')
-      .slice(0, 80);
-    voiceRosterLines.push(
-      `- ${nm}${isNonHuman ? '【拟人化非人角色】' : ''}：${traits || '外形见对应彩色资产图'}`,
+  const firstFrameItem = canonicalRefs.manifest.find((ref) => ref.role === 'first_frame' && ref.localPath);
+  if (firstFrameItem?.localPath) referenceImagePath = firstFrameItem.localPath;
+  const sceneItem = canonicalRefs.manifest.find((ref) => ref.role === 'scene' && ref.localPath);
+  sceneReferencePath = sceneItem?.localPath || undefined;
+  sceneReferenceLabel = sceneItem?.assetName || sceneItem?.label || sceneReferenceLabel;
+  sceneReferenceHint = sceneItem?.promptHint || sceneReferenceHint;
+  characterReferencePaths = canonicalRefs.manifest
+    .filter((ref) => ref.role === 'character' && ref.localPath)
+    .map((ref) => ref.localPath as string);
+  characterReferencePanels = canonicalRefs.manifest
+    .filter((ref) => ref.role === 'character' && ref.localPath && ref.panelInfo)
+    .map((ref: any) => ({
+      characterName: ref.assetName || ref.label,
+      panel: ref.panelInfo.panel,
+      path: ref.localPath,
+      intent: ref.panelInfo.intent,
+      priority: Number(ref.score || ref.priority || 0),
+      reason: ref.matchReason || `manifest:${ref.panelInfo.panel}`,
+    }));
+  propReferencePaths = canonicalRefs.manifest
+    .filter((ref) => ref.role === 'prop' && ref.localPath)
+    .map((ref) => ref.localPath as string);
+
+  referenceImages.length = 0;
+  for (const ref of canonicalRefs.manifest) {
+    if (!ref.localPath) continue;
+    addReferenceImage({
+      role: ref.role,
+      path: ref.localPath,
+      sourceUrl: ref.url,
+      assetId: ref.assetId,
+      assetName: ref.assetName,
+      label: ref.label,
+      promptHint: ref.promptHint,
+      priority: ref.priority || ref.score,
+    });
+  }
+
+  const segmentGate = validateCharacterConsistencyForGroup(proj as any, {
+    groupIdx,
+    shotIndices: groupShotIndices,
+    target: 'videoSegment',
+  });
+  if (!segmentGate.allowed) {
+    throw errorWithFailureStage(
+      `片段 ${groupIdx + 1} 角色一致性未通过：${segmentGate.blockers.map((b) => b.message).join('；')}`,
+      'preflight_video_prompt_not_ready',
     );
   }
+
+  // ===== 角色一致性主档（跨片段保持形象、表演和声音一致） =====
+  const characterLockContextText = [
+    prompt,
+    ...groupShotIndices.map((si) => {
+      const sh = shots[si] || {};
+      return [
+        sh.characters,
+        sh.speaker,
+        sh.visual,
+        sh.description,
+        sh.desc,
+        sh.dialogue,
+        sh.scriptRef,
+        sh.keyInfo,
+      ].flat().filter(Boolean).join(' ');
+    }),
+  ].join('\n');
+  const characterLockRoster = buildCharacterLockRoster(proj as any, charNames, 'zh', characterLockContextText);
+  const characterLockBlockHash = characterLockRoster ? hashString(characterLockRoster) : undefined;
 
   // ===== 前后片段衔接信息（避免镜头硬切 / 角色姿态突变） =====
   // 用户反馈："有些镜头前后连不上 因为每条是独立生成的"——这里把上一组终幅
@@ -860,7 +1563,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     if (!sh) return '';
     const st = sh.shotType ? `【${sh.shotType}】` : '';
     const cm = sh.camera ? `【${sh.camera}】` : '';
-    const v = String(sh.visual || sh.description || '').slice(0, 120);
+	    const v = sanitizeFillLightPositiveMentions(String(sh.visual || sh.description || '')).slice(0, 120);
     return `${st}${cm}${v}`.trim();
   };
   const _firstShotIdxOf = (gi: number): number | null => {
@@ -887,61 +1590,316 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     const nextFirstIdx = _firstShotIdxOf(groupIdx + 1);
     if (nextFirstIdx != null) nextHeadSummary = _summarizeShot(shots[nextFirstIdx]);
   }
+  let projectConstraintText = '';
+  try {
+    projectConstraintText = JSON.stringify({
+      assets: (proj as any).assets || {},
+      characters: (proj as any).characters || [],
+      environments: (proj as any).environments || [],
+      styleBible: (proj as any).styleBible || {},
+    }).slice(0, 18000);
+  } catch {}
+  const beforeConstraintPrompt = prompt;
+  prompt = enforceHardVisualConstraints(
+    prompt,
+    [
+      beforeConstraintPrompt,
+      projectConstraintText,
+      ...groupShotIndices.map((si) => {
+        const sh = shots[si];
+        return [
+          sh?.visual,
+          sh?.description,
+          sh?.desc,
+          sh?.dialogue,
+          sh?.scriptRef,
+          sh?.keyInfo,
+          sh?.location,
+          sh?.scene,
+        ].filter(Boolean).join(' ');
+      }),
+    ].join('\n'),
+  );
+	  if (prompt !== beforeConstraintPrompt) {
+	    sanitizedFor.push('no_fill_light_constraint_enforced');
+	    console.log(`[video_segments] group ${groupIdx} applied hard constraint: no fill lights`);
+	  }
 
   console.log(
     `[video_segments] group ${groupIdx} refs: scene=${!!sceneReferencePath} ` +
-      `chars=${characterReferencePaths.length} sb=${!!referenceImagePath} ` +
+      `panels=${characterReferencePanels.length} chars=${characterReferencePaths.length} sb=${!!referenceImagePath} ` +
+      `props=${propReferencePaths.length} refRole=${referenceImageRole} ` +
+      `independentRefs=${referenceImages.length} ` +
       `dialoguePairs=${dialoguePairs.length} prev=${!!prevTailSummary} next=${!!nextHeadSummary}`,
   );
 
-  ctx.progress({ stage: 'submitting', durationSec });
+		  const firstVideoWarning = dialogueWarning;
+		  if (firstVideoWarning) {
+		    ctx.progress({
+		      stage: 'quality_warning',
+		      durationSec,
+		      plannedDurationSec,
+		      warning: firstVideoWarning,
+		      videoWarnings,
+		      hint: firstVideoWarning.message,
+		    });
+		  }
 
-  const result = await generateVideo(
-    ctx.user,
-    {
-      prompt,
-      ratio: userRatio,
-      durationSec,
-      projectId: ctx.projectId,
-      groupIdx,
-      dialoguePairs,
-      voiceRoster: voiceRosterLines.join('\n') || undefined,
-      prevTailSummary: prevTailSummary || undefined,
-      nextHeadSummary: nextHeadSummary || undefined,
-      referenceImagePath,
-      sceneReferencePath,
-      characterReferencePaths,
+  const videoInput = {
+    prompt,
+    ratio: userRatio,
+    durationSec,
+    projectId: ctx.projectId,
+    groupIdx,
+	    dialoguePairs,
+	    characterLockRoster: characterLockRoster || undefined,
+    prevTailSummary: prevTailSummary || undefined,
+    nextHeadSummary: nextHeadSummary || undefined,
+    referenceImagePath,
+    referenceImageRole,
+    storyboardReferencePath,
+    sceneReferencePath,
+    characterReferencePaths,
+    characterReferencePanels,
+    propReferencePaths,
+    referenceImages: independentMultiImageMode ? referenceImages : undefined,
+  };
+	  const plannedFinalPrompt = videoCfgIsVolcano
+    ? buildSeedancePromptParts(videoInput).finalPrompt
+    : prompt;
+  let videoPlan: VideoGenerationPlan = buildVideoPlanSnapshot({
+    projectId: ctx.projectId,
+    groupIdx,
+    groupShotIndices,
+    videoPromptSource,
+    sanitizedFor,
+    finalPrompt: {
+      preview: plannedFinalPrompt.slice(0, 500),
+      hash: hashString(plannedFinalPrompt),
+      length: plannedFinalPrompt.length,
     },
-    (pct, hint) => ctx.progress({ stage: 'gen', pct, hint }),
-  );
+    dialoguePolicy: 'budget_check_only',
+    references: planReferencesFromManifest(canonicalRefs.manifest),
+    droppedReferences: [
+      ...(Array.isArray(sb.videoReferenceDropped) ? sb.videoReferenceDropped : []),
+      ...canonicalRefs.droppedReferences,
+    ],
+    prompt,
+	    userRatio,
+	    durationSec,
+	    plannedDurationSec,
+	    videoWarnings,
+    dialogueChars: cleanDialogueCharCount(dialoguePairs),
+    status: 'submitting',
+    modelSnapshot: {
+      modelRole: 'video',
+      provider: videoCfg.provider || (videoCfgIsGrok ? 'grok' : videoCfgIsVolcano ? 'seedance' : videoCfg.mode),
+      model: videoCfg.model,
+      filledAfterCall: false,
+    },
+  });
 
-  // 写回 project.videoTasks 数组（前端 batch 页读这里）
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
     while (videoTasks.length <= groupIdx) videoTasks.push({});
-    videoTasks[groupIdx] = {
-      groupIdx,
-      taskId: result.taskId,
-      status: 'completed',
-      url: result.url,
-      coverUrl: result.coverUrl,
-      durationSec: result.durationSec,
-      prompt,
-    };
+	    videoTasks[groupIdx] = {
+	      ...(videoTasks[groupIdx] || {}),
+	      groupIdx,
+		      status: 'submitting',
+		      prompt,
+		      durationSec,
+		      plannedDurationSec,
+		      warnings: videoWarnings,
+	      videoPlan,
+	      consistency: {
+	        ...((videoTasks[groupIdx] || {}).consistency || {}),
+	        videoSegment: {
+	          ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
+	          characterLockBlockHash,
+	          characterUsages: segmentGate.characterUsages,
+	          score: segmentGate.score,
+	          level: segmentGate.level,
+	          warnings: segmentGate.warnings,
+	        },
+	      },
+	      isCurrent: true,
+	    };
+    return { videoTasks };
+  });
+
+	  ctx.progress({ stage: 'submitting', durationSec, plannedDurationSec, videoWarnings });
+
+		  let result;
+		  try {
+		    result = await generateVideo(
+		      ctx.user,
+		      videoInput,
+		      (pct, hint) => ctx.progress({ stage: 'gen', pct, hint }),
+		    );
+		  } catch (e: any) {
+		    const vgErr = e instanceof VideoGenerationError ? e : null;
+		    const failureStage: VideoPromptFailureStage = vgErr?.failureStage || classifyVideoFailureStage(e);
+		    const failureAudit = vgErr?.videoAudit;
+		    const errMsg = e?.message || String(e);
+		    const failureReferences = failureAudit?.referenceImages?.length
+		      ? planReferencesFromAuditRefs(failureAudit.referenceImages)
+		      : videoPlan.references;
+		    videoPlan = buildVideoPlanSnapshot({
+		      projectId: ctx.projectId,
+		      groupIdx,
+		      groupShotIndices,
+		      videoPromptSource,
+		      sanitizedFor,
+		      finalPrompt: {
+		        preview: failureAudit?.finalPromptPreview || videoPlan.promptAudit.finalPrompt.preview,
+		        hash: failureAudit?.finalPromptHash || videoPlan.promptAudit.finalPrompt.hash,
+		        length: failureAudit?.finalPromptLength || videoPlan.promptAudit.finalPrompt.length,
+		      },
+		      dialoguePolicy: failureAudit?.dialoguePolicy || 'budget_check_only',
+		      dialoguePolicyNotes: failureAudit?.dialoguePolicyNotes,
+		      references: failureReferences,
+		      droppedReferences: videoPlan.droppedReferences,
+		      prompt,
+			      userRatio,
+			      durationSec,
+			      plannedDurationSec,
+			      videoWarnings: [
+		        ...videoWarnings,
+		        ...(failureAudit?.fallbackReason ? [{ message: `reference fallback: ${failureAudit.fallbackReason}` }] : []),
+		      ],
+		      dialogueChars: cleanDialogueCharCount(dialoguePairs),
+		      status: 'failed',
+		      failureStage,
+		      errorMsg: errMsg.slice(0, 500),
+		      modelSnapshot: {
+		        modelRole: 'video',
+		        provider: failureAudit?.provider || videoPlan.modelSnapshot?.provider,
+		        model: failureAudit?.model || videoPlan.modelSnapshot?.model,
+		        providerTaskId: failureAudit?.providerTaskId,
+		        filledAfterCall: !!failureAudit,
+		      },
+		    });
+		    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+		      if (!fresh) return null;
+		      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+		      while (videoTasks.length <= groupIdx) videoTasks.push({});
+		      videoTasks[groupIdx] = {
+		        ...(videoTasks[groupIdx] || {}),
+		        groupIdx,
+		        taskId: vgErr?.taskId || videoTasks[groupIdx]?.taskId,
+			        status: 'failed',
+			        errorMsg: errMsg.slice(0, 500),
+			        durationSec,
+			        plannedDurationSec,
+			        prompt,
+		        warnings: videoWarnings,
+		        videoPlan,
+		        isCurrent: true,
+		      };
+		      return { videoTasks };
+		    });
+		    throw e;
+		  }
+
+		  const dialoguePolicy: DialoguePolicy = result.videoAudit?.dialoguePolicy || 'budget_check_only';
+		  const actualAuditRefs = result.videoAudit?.referenceImages || [];
+		  const sentPaths = new Set(actualAuditRefs.map((ref) => ref.path).filter(Boolean));
+		  const planReferences: ReferenceManifestItem[] = actualAuditRefs.length
+		    ? planReferencesFromAuditRefs(actualAuditRefs)
+		    : planReferencesFromManifest(canonicalRefs.manifest);
+		  videoPlan = buildVideoPlanSnapshot({
+		    projectId: ctx.projectId,
+		    groupIdx,
+		    groupShotIndices,
+		    videoPromptSource,
+		    sanitizedFor,
+		    finalPrompt: {
+		      preview: result.videoAudit?.finalPromptPreview || plannedFinalPrompt.slice(0, 500),
+		      hash: result.videoAudit?.finalPromptHash || hashString(plannedFinalPrompt),
+		      length: result.videoAudit?.finalPromptLength || plannedFinalPrompt.length,
+		    },
+		    dialoguePolicy,
+		    dialoguePolicyNotes: result.videoAudit?.dialoguePolicyNotes,
+		    references: planReferences,
+		    droppedReferences: [
+		      ...(Array.isArray(sb.videoReferenceDropped) ? sb.videoReferenceDropped : []),
+		      ...canonicalRefs.droppedReferences,
+		      ...referenceImages
+		        .filter((ref) => isPlanReferenceRole(ref.role) && ref.role !== 'first_frame' && ref.path && !sentPaths.has(ref.path))
+		        .map((ref) => ({
+		          role: ref.role as Exclude<VideoReferenceRole, 'first_frame'>,
+		          assetName: ref.assetName || ref.label,
+		          reason: 'filtered_constraint' as const,
+		        })),
+		    ],
+			    prompt,
+			    userRatio,
+			    durationSec: result.durationSec,
+			    plannedDurationSec,
+			    videoWarnings: [
+		      ...videoWarnings,
+		      ...(result.videoAudit?.fallbackReason ? [{ message: `reference fallback: ${result.videoAudit.fallbackReason}` }] : []),
+		    ],
+		    dialogueChars: cleanDialogueCharCount(dialoguePairs),
+		    status: 'completed',
+		    modelSnapshot: result.videoAudit
+		      ? {
+		          modelRole: 'video',
+		          provider: result.videoAudit.provider,
+		          model: result.videoAudit.model,
+		          providerTaskId: result.videoAudit.providerTaskId,
+		          filledAfterCall: true,
+		        }
+		      : videoPlan.modelSnapshot,
+		  });
+
+	  // 写回 project.videoTasks 数组（前端 batch 页读这里）
+	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+    while (videoTasks.length <= groupIdx) videoTasks.push({});
+		    videoTasks[groupIdx] = {
+		      groupIdx,
+		      taskId: result.taskId,
+		      status: 'completed',
+		      url: result.protectedUrl,
+		      coverUrl: result.coverUrl,
+				      durationSec: result.durationSec,
+				      plannedDurationSec,
+				      prompt,
+			      warnings: videoWarnings,
+			      videoPlan,
+		      consistency: {
+		        ...((videoTasks[groupIdx] || {}).consistency || {}),
+		        videoSegment: {
+		          ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
+		          characterLockBlockHash,
+		          characterUsages: segmentGate.characterUsages,
+		          score: segmentGate.score,
+		          level: segmentGate.level,
+		          warnings: segmentGate.warnings,
+		        },
+		      },
+		      isCurrent: true,
+			    };
     // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
-    // videoDurationSec 是关键 —— 5s/10s 是后端按台词字数动态决定的，前端只知道
-    // shot.duration 累加值（往往跟实际不一致），剪辑工作台导入时间线如果不持久化
-    // 这个真实时长，就会出现"视频是 10s 但 timeline 段长 5s"的错位（用户截图）。
+	    // videoDurationSec 是真实生成文件时长；plannedDurationSec 是镜头表计划时长。
+	    // 剪辑工作台优先用真实文件时长，避免生成结果比计划略长时出现时间线错位。
     const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    if (sbs[groupIdx]) {
-      sbs[groupIdx] = {
-        ...sbs[groupIdx],
-        videoUrl: result.url,
-        videoTaskId: result.taskId,
-        videoDurationSec: result.durationSec,
-      };
-    }
+	    if (sbs[groupIdx]) {
+	      sbs[groupIdx] = {
+	        ...sbs[groupIdx],
+	        videoUrl: result.protectedUrl,
+	        videoTaskId: result.taskId,
+		        videoDurationSec: result.durationSec,
+		        plannedDurationSec,
+		        videoWarnings,
+	        videoIsCurrent: true,
+	        videoInvalidatedAt: undefined,
+	        videoInvalidatedReason: undefined,
+	      };
+	    }
     return { videoTasks, storyboards: sbs };
   });
 
@@ -952,10 +1910,18 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       groupIdx,
       url: result.url,
       coverUrl: result.coverUrl,
-      durationSec: result.durationSec,
-      taskId: result.taskId,
+	      durationSec: result.durationSec,
+	      plannedDurationSec,
+	      taskId: result.taskId,
     },
-    extra: { mode: result.mode, durationSec: result.durationSec },
+    extra: {
+      mode: result.mode,
+      groupIdx,
+	      durationSec: result.durationSec,
+	      plannedDurationSec,
+	      protectedUrl: result.protectedUrl,
+      videoWarnings,
+    },
   };
 });
 
@@ -1072,6 +2038,7 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
     return '';
   };
 
+  const sceneSelectionAssets = slimAssets || assets || {};
   shotsArr = shotsArr.map((sh, i) => {
     const dur = Number(sh.duration ?? sh.durationSec ?? 4);
     const visual = cleanStr(sh.visual, sh.description, sh.desc);
@@ -1091,9 +2058,35 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
     const rawShotType = cleanStr(sh.shotType, sh.framing) || '中景';
     const rawCamera = cleanStr(sh.camera, sh.movement) || '固定镜头';
     const rawEmotion = cleanStr(sh.emotion);
+    const pickedScene = pickSceneForShots({
+      assets: sceneSelectionAssets,
+      shots: [sh],
+      text: [
+        sh.sceneId,
+        sh.sceneName,
+        sh.scene,
+        sh.location,
+        visual,
+        sh.description,
+        sh.desc,
+        sh.scriptRef,
+      ].filter(Boolean).join(' '),
+    });
+    const sceneId = cleanStr(pickedScene.scene?.id, pickedScene.scene?.sceneId, sh.sceneId);
+    const sceneName = cleanStr(
+      pickedScene.scene?.name,
+      pickedScene.scene?.sceneName,
+      pickedScene.scene?.location,
+      sh.sceneName,
+      sh.scene,
+      sh.location,
+    );
 
     return {
       idx: typeof sh.idx === 'number' && sh.idx > 0 ? sh.idx : i + 1,
+      sceneId,
+      sceneName,
+      scene: sceneName,
       duration: Math.max(2, Math.min(12, Number.isFinite(dur) ? dur : 4)),
       shotType: upgradeShotType(rawShotType),
       camera: upgradeCamera(rawCamera),
@@ -1153,24 +2146,58 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     ? ctx.target.shotIndices.filter((i: any) => typeof i === 'number')
     : [];
   shotIndices = shotIndices.filter((i) => i >= 0 && i < shots.length);
-  if (!shotIndices.length) {
-    // fallback：把 groupIdx 当镜头索引（兼容老调用）
-    if (groupIdx < shots.length) shotIndices = [groupIdx];
-    else throw new Error(`分组 #${groupIdx} 没有对应的镜头`);
-  }
+		  if (!shotIndices.length) {
+		    // fallback：把 groupIdx 当镜头索引（兼容老调用）
+		    if (groupIdx < shots.length) shotIndices = [groupIdx];
+		    else throw new Error(`分组 #${groupIdx} 没有对应的镜头`);
+		  }
+		  const promptGate = validateCharacterConsistencyForGroup(proj as any, {
+		    groupIdx,
+		    shotIndices,
+		    target: 'videoPrompt',
+		  });
+		  if (!promptGate.allowed) {
+		    throw new Error(
+		      `片段 ${groupIdx + 1} 角色一致性未通过：${promptGate.blockers.map((b) => b.message).join('；')}`,
+		    );
+		  }
+		  const promptRunId = ctx.batchId;
+	  const promptStartedAt = nowIso();
+	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+	    if (!fresh) return null;
+	    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+	    while (storyboards.length <= groupIdx) storyboards.push({});
+	    const prev = storyboards[groupIdx] || {};
+	    storyboards[groupIdx] = {
+	      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
+	      videoPromptStatus: 'generating',
+	      videoPromptRunId: promptRunId,
+	      videoPromptStartedAt: promptStartedAt,
+	      videoPromptLastError: undefined,
+	      videoPromptFailedAt: undefined,
+	    };
+	    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', promptStartedAt);
+	    }
+	    return { storyboards, videoTasks };
+	  });
 
-  const groupShots = shotIndices.map((i) => shots[i]);
-  const styleBible = (proj as any).styleBible || {};
-  const assets = (proj as any).assets || {};
-  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
+		  const groupShots = shotIndices.map((i) => shots[i]);
+	  const promptGroupShots = sanitizePromptObject(groupShots);
+	  const styleBible = (proj as any).styleBible || {};
+	  const assets = (proj as any).assets || {};
+	  const promptStyleBible = sanitizePromptObject(styleBible);
+	  const promptAssets = sanitizePromptObject(assets);
+	  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
 
   ctx.progress({ stage: 'preparing', percent: 10, hint: '准备镜头与资产上下文…' });
 
-  const messages = buildVideoPromptMessages({
-    shots: groupShots,
-    styleBible,
-    assets,
-    narrations,
+	  const messages = buildVideoPromptMessages({
+	    shots: promptGroupShots,
+	    styleBible: promptStyleBible,
+	    assets: promptAssets,
+	    narrations,
     groupIdx,
     totalGroups,
   });
@@ -1199,48 +2226,85 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
       .replace(/[ \t]+/g, ' ')
       .replace(/[ \t]*([，。；：])[ \t]*/g, '$1');
 
-  let prompt = '';
-  let attempt = 0;
-  const MAX_ATTEMPTS = 2;
+	  let prompt = '';
+	  let attempt = 0;
+	  const NETWORK_MAX_ATTEMPTS = envInt('VIDEO_PROMPT_NETWORK_MAX_ATTEMPTS', 4, 1, 8);
+	  const MAX_ATTEMPTS = Math.max(VIDEO_PROMPT_MAX_ATTEMPTS, NETWORK_MAX_ATTEMPTS);
+	  const RETRY_DEADLINE_MS = envInt('VIDEO_PROMPT_RETRY_DEADLINE_MS', 90_000, 10_000, 600_000);
+	  const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
 
-  while (attempt < MAX_ATTEMPTS) {
-    attempt++;
-    try {
-      // 第二次重试时压低 temperature 并在 user message 末尾追加强提示
-      const retryMessages = attempt === 1
-        ? messages
-        : [
-            ...messages.slice(0, -1),
-            {
-              ...messages[messages.length - 1],
-              content:
-                messages[messages.length - 1].content +
-                '\n\n⚠️ 上一次输出错了，必须严格按"运镜系统/角色/场景/0-Xs/.../基调/约束/音障"中文段落输出，**绝对不要写 shot 1: / [CAMERA] / camera: / characters: 这种英文键值对**。重写一遍。',
-            },
-          ];
-      const temp = attempt === 1 ? 0.55 : 0.3;
+	  while (attempt < MAX_ATTEMPTS) {
+	    attempt++;
+	    try {
+	      const remaining = retryDeadlineAt - Date.now();
+	      if (remaining <= 0) {
+	        throw new Error('retry_deadline_exceeded：视频提示词网络/模型重试超过总预算');
+	      }
+	      // 第二次重试时压低 temperature 并在 user message 末尾追加强提示
+	      const retryMessages = buildVideoPromptAttemptMessages(messages, attempt);
+	      const temp = videoPromptTemperatureForAttempt(attempt);
       prompt = await chatComplete(
         ctx.user,
         retryMessages,
-        { temperature: temp, maxTokens: 2200, modelRole: 'structured' },
-      );
-      if (!looksLikeOldFormat(prompt)) break;
-      console.warn(`[video_prompts] attempt ${attempt} produced old format, retrying…`);
-    } catch (e: any) {
-      if (attempt >= MAX_ATTEMPTS) {
-        throw new Error('视频提示词生成失败：' + (e?.message || String(e)));
-      }
-    }
-  }
+        {
+          temperature: temp,
+          modelRole: 'structured',
+	          traceName: 'video-prompts',
+	          traceAttempt: attempt,
+	          traceMaxAttempts: MAX_ATTEMPTS,
+	          requestTimeoutMs: Math.min(remaining, 600_000),
+	        },
+	      );
+	      if (!looksLikeOldFormat(prompt)) break;
+	      console.warn(`[video_prompts] attempt ${attempt} produced old format, retrying…`);
+	    } catch (e: any) {
+	      const isNetwork = isTransientNetworkError(e);
+	      const maxAttemptsForThisError = isNetwork ? NETWORK_MAX_ATTEMPTS : VIDEO_PROMPT_MAX_ATTEMPTS;
+	      if (attempt >= maxAttemptsForThisError) {
+	        throw new Error('视频提示词生成失败：' + (e?.message || String(e)));
+	      }
+	      const delay = isNetwork
+	        ? Math.min(60_000, 10_000 * Math.pow(2, attempt - 1))
+	        : 1500 * attempt;
+	      if (Date.now() + delay > retryDeadlineAt) {
+	        throw new Error('视频提示词生成失败：retry_deadline_exceeded；最后错误：' + (e?.message || String(e)));
+	      }
+	      console.warn(
+	        `[video_prompts] attempt ${attempt}/${maxAttemptsForThisError} failed, ` +
+	          `retrying in ${Math.round(delay / 1000)}s: ${e?.message || String(e)}`,
+	      );
+	      await sleep(delay);
+	    }
+	  }
 
   let cleaned = prompt.trim().replace(/^["'`]+|["'`]+$/g, '');
   if (!cleaned) throw new Error('AI 没有返回提示词');
-  // 即使 LLM 漏写了"参考图X"，最后再做一次纯文本清洗（不破坏其他内容）
-  cleaned = stripRefMarkers(cleaned);
+	  // 即使 LLM 漏写了"参考图X"，最后再做一次纯文本清洗（不破坏其他内容）
+	  cleaned = stripRefMarkers(cleaned);
+	  cleaned = sanitizeFillLightPositiveMentions(cleaned);
   if (looksLikeOldFormat(cleaned)) {
     // 两次都失败：抛错让前端显示"重试"按钮，比保存一份乱码好
     throw new Error('AI 输出格式不符（旧英文格式或仍含参考图编号），请点击重新生成（已自动重试 2 次仍失败）');
   }
+  let assetConstraintText = '';
+  try {
+    assetConstraintText = JSON.stringify({ assets, styleBible }).slice(0, 14000);
+  } catch {}
+  cleaned = enforceHardVisualConstraints(
+    cleaned,
+    [
+      prompt,
+      assetConstraintText,
+      ...groupShots.map((sh: any) => [
+        sh?.visual,
+        sh?.description,
+        sh?.desc,
+        sh?.dialogue,
+        sh?.scriptRef,
+        sh?.keyInfo,
+      ].filter(Boolean).join(' ')),
+    ].join('\n'),
+  );
 
   ctx.progress({ stage: 'saving', percent: 92, hint: '正在保存…' });
 
@@ -1249,22 +2313,51 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     while (storyboards.length <= groupIdx) storyboards.push({});
-    storyboards[groupIdx] = {
-      ...storyboards[groupIdx],
-      videoPrompt: cleaned,
-      narrationsUsed: narrations,
-      shotIndices,
-    };
-    return { storyboards };
-  });
+	    const prev = storyboards[groupIdx] || {};
+	    if (prev.videoPromptRunId && prev.videoPromptRunId !== promptRunId) {
+	      console.warn(
+	        `[video_prompts] ignored stale write project=${ctx.projectId} group=${groupIdx} ` +
+	          `run=${promptRunId} currentRun=${prev.videoPromptRunId}`,
+	      );
+	      return null;
+	    }
+		    storyboards[groupIdx] = {
+		      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration'),
+		      videoPrompt: cleaned,
+		      videoPromptStatus: 'ready',
+		      videoPromptRunId: promptRunId,
+		      videoPromptUpdatedAt: nowIso(),
+		      videoPromptLastError: undefined,
+		      videoPromptFailedAt: undefined,
+		      narrationsUsed: narrations,
+		      shotIndices,
+		      consistency: {
+		        ...(prev.consistency || {}),
+		        videoPrompt: {
+		          characterUsages: promptGate.characterUsages,
+		          score: promptGate.score,
+		          level: promptGate.level,
+		          warnings: promptGate.warnings,
+		        },
+		      },
+		    };
+	    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
+	    }
+	    return { storyboards, videoTasks };
+	  });
 
   return {
     patch: { type: 'video_prompt', idx: groupIdx, value: cleaned },
     extra: {
       groupIdx,
-      videoPrompt: cleaned,
-      narrationsUsed: narrations,
-      shotIndices,
+	      videoPrompt: cleaned,
+	      videoPromptStatus: 'ready',
+	      videoPromptRunId: promptRunId,
+	      narrationsUsed: narrations,
+	      shotIndices,
+	      invalidateVideo: true,
     },
   };
 });

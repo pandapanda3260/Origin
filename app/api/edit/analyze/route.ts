@@ -117,13 +117,14 @@ export async function POST(req: NextRequest) {
     let raw = '';
     try {
       writer.step('正在分析叙事结构…');
+      const analyzeMaxTokens = Math.min(12_000, Math.max(4_000, segmentsCtx.length * 800));
       await chatStream(
         user,
         [
           { role: 'system', content: SP_EDIT_ANALYZE },
           { role: 'user', content: JSON.stringify(ctx) },
         ],
-        { temperature: 0.5, responseFormat: 'json_object', maxTokens: 1500, modelRole: 'structured' },
+        { temperature: 0.5, responseFormat: 'json_object', maxTokens: analyzeMaxTokens, modelRole: 'structured', reasoningEffort: 'none' },
         (delta) => { raw += delta; writer.chunk(delta); },
       );
     } catch (e: any) {

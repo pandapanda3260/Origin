@@ -16,13 +16,21 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     .get({ id: params.id, uid: user.id });
   if (!row) return jsonError('导出任务不存在', 404);
 
+  const status = String(row.status || '');
+  const url = status === 'completed' ? `/api/edit/export-file/${row.id}` : null;
+  const errorMsg = row.error_msg || '';
+
   return jsonOk({
     taskId: row.id,
-    status: row.status,
+    status,
     progress: row.progress,
-    url: row.status === 'completed' ? `/api/edit/export-file/${row.id}` : null,
-    errorMsg: row.error_msg,
+    url,
+    errorMsg,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    done: status === 'completed' || status === 'failed',
+    downloadUrl: url,
+    error: status === 'failed' ? errorMsg || '导出失败' : '',
+    restarted: status === 'failed' && errorMsg === 'orphaned by server restart',
   });
 }

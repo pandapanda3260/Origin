@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { verifySignedVideoUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -17,16 +18,26 @@ function toWebStream(nodeStream: NodeJS.ReadableStream): ReadableStream<Uint8Arr
  * 避免把整个 mp4 一次性读进内存。
  */
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const user = await getCurrentUser(req);
-  if (!user) return new Response('unauthorized', { status: 401 });
-
   const id = params.id;
   if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) return new Response('bad id', { status: 400 });
 
   const db = getDb();
   const row = db.prepare<{ id: string }, any>('SELECT * FROM video_tasks WHERE id = @id').get({ id });
   if (!row || !row.filename) return new Response('not found', { status: 404 });
-  if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+
+  const user = await getCurrentUser(req);
+  if (user) {
+    if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+  } else {
+    const url = new URL(req.url);
+    const signedOk = verifySignedVideoUrl({
+      videoId: id,
+      ownerId: Number(row.owner_id),
+      exp: url.searchParams.get('exp'),
+      sig: url.searchParams.get('sig'),
+    });
+    if (!signedOk) return new Response('unauthorized', { status: 401 });
+  }
 
   const fullPath = join(process.cwd(), 'data', 'videos', String(row.owner_id), row.filename);
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });

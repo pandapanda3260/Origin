@@ -15,7 +15,6 @@ Variable settings include:
 - `apiKey`
 - `reasoningEffort`
 - `timeout`
-- `maxTokens`
 - `quality`
 - `tier`
 
@@ -26,6 +25,8 @@ Business routes should usually choose a task role, for example:
 ```
 
 The concrete model configuration should be resolved by `lib/model-routing.ts` from `.env.local` or the external env file.
+
+`maxTokens` is handled differently from provider/model settings: business code may pass it as a task's desired output budget, but the unified LLM budget layer is the final authority. The budget layer clamps it against the resolved model's `contextWindow`, `maxOutputTokens`, estimated input tokens, reasoning reserve, and safety margin.
 
 ## Why
 
@@ -69,6 +70,29 @@ TEXT_API_BASE="https://api.openai.com/v1"
 TEXT_API_ENDPOINT="/responses"
 TEXT_MODEL="gpt-5.5"
 TEXT_REASONING_EFFORT="xhigh"
+TEXT_CONTEXT_WINDOW="400000"
+TEXT_MAX_OUTPUT_TOKENS="32768"
+```
+
+Emergency and tuning switches:
+
+```env
+# Set to 0 to bypass budget enforcement and return to legacy maxTokens behavior.
+LLM_BUDGET_ENFORCE="1"
+
+# Set to 1 to log budget decisions without enforcing clamps.
+LLM_BUDGET_LOG_ONLY="0"
+
+# Optional global fallback overrides.
+LLM_CONTEXT_WINDOW="128000"
+LLM_MAX_OUTPUT_TOKENS="8192"
+LLM_REASONING_RESERVE_TOKENS="3000"
+
+# Optional long JSON timeout override, in milliseconds.
+LLM_JSON_REQUEST_TIMEOUT_MS="900000"
+
+# Optional task-specific timeout override, generated from traceName.
+SHOTS_GENERATE_REQUEST_TIMEOUT_MS="900000"
 ```
 
 ## Allowed Exceptions
@@ -84,7 +108,7 @@ Hardcoding is allowed only for:
 
 Business routes may set task-intrinsic values:
 
-- `maxTokens`
+- `maxTokens` as a desired output budget; it must still pass through the centralized budget clamp
 - `responseFormat` / schema shape
 - prompt builders
 - `modelRole`

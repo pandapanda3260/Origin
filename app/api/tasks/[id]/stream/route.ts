@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { getDb } from '@/lib/db';
+import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -101,10 +102,12 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
                   resultUrl: `/api/edit/export-file/${row.id}`,
                 });
               } else {
+                const protectedUrl = row.filename ? `/api/videos/file/${row.id}` : '';
                 send('task_completed', {
                   taskId,
                   progress: 100,
-                  resultUrl: row.filename ? `/api/videos/file/${row.id}` : '',
+                  resultUrl: row.filename ? buildSignedVideoUrl(row.id, user.id).url : '',
+                  extra: { protectedUrl },
                 });
               }
               cleanup();

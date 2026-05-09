@@ -12,6 +12,7 @@ import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
 import { sinicizeColorPalette } from '@/lib/style-bible';
+import { sanitizePromptObject } from '@/lib/content-sanitize';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -121,7 +122,7 @@ export async function POST(req: NextRequest) {
         'styleBible',
       );
       // 兜底：把 LLM 偷懒输出的英文色名翻成中文，避免前端展示 "TEAL · AMBER · CREAM" 这种
-      styleBible = sinicizeColorPalette(styleBible);
+      styleBible = sanitizePromptObject(sinicizeColorPalette(styleBible));
       styleBibleStatus = 'ready';
       styleBibleGeneratedAt = new Date().toISOString();
     } catch (e: any) {

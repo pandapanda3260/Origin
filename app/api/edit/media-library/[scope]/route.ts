@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
+import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,12 +41,14 @@ export async function GET(req: NextRequest, { params }: { params: { scope: strin
       .all({ uid: user.id });
   }
   for (const v of videoRows) {
+    const protectedUrl = `/api/videos/file/${v.id}`;
     items.push({
       mediaId: v.id,
       kind: 'video',
       source: 'generated',
       title: `片段 ${v.group_idx ?? ''}`,
-      url: `/api/videos/file/${v.id}`,
+      url: buildSignedVideoUrl(v.id, user.id).url,
+      protectedUrl,
       coverUrl: v.cover_image_id ? `/api/images/file/${v.cover_image_id}` : null,
       durationSec: v.duration_sec,
       createdAt: v.created_at,

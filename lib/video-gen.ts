@@ -13,7 +13,7 @@
  *   保证前端 <video> 能正常播放并展示进度条 / 封面。
  */
 
-import { mkdirSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
@@ -21,6 +21,17 @@ import { getDb } from './db';
 import type { UserRow } from './db';
 import { makeBlackVideo, extractCover } from './ffmpeg';
 import { generateImage } from './image-gen';
+import { buildSignedVideoUrl } from './signed-asset-url';
+import { patchProjectForUser } from './projects-db';
+import type { CharacterReferencePanel } from './panel-selection';
+import { fetchViaProxy } from './proxy-fetch';
+import {
+  buildSeedancePromptParts,
+  type VideoReferenceImage,
+} from './video-prompt-runtime';
+import { hashString, resolveGenerationDurationSec } from './video-reference-manifest';
+import type { DialoguePolicy } from './video-reference-manifest';
+import type { VideoPromptFailureStage } from './video-prompt-state';
 
 export type VideoGenInput = {
   prompt: string;
@@ -42,8 +53,12 @@ export type VideoGenInput = {
    */
   dialoguePairs?: Array<{ speaker: string; text: string }>;
   /**
-   * 项目角色声音 roster（多行字符串，每行 "- 名字: 描述"），
-   * 跨片段保持同一个名字 → 同一个声音/形象。
+   * 项目角色一致性主档 roster（多行字符串）。Seedance 路径会渲染成中文
+   * characterLockBlock，包含 visual + performance + voice。
+   */
+  characterLockRoster?: string;
+  /**
+   * 旧字段，仅作向后兼容。新调用方应传 characterLockRoster。
    */
   voiceRoster?: string;
   /** 上一组的最后一镜简述，给模型用于"承接上一镜终幅"。 */
@@ -53,10 +68,14 @@ export type VideoGenInput = {
   /** 用于 fake 模式做封面的素材描述 */
   coverHint?: string;
   /**
-   * 分镜草图本地路径（黑白铅笔风），仅作为构图/分格参考。
-   * 之前是单一 i2v 主参考，导致最终视频也是黑白调；现在降级为辅助。
+   * 视频主参考图本地路径。
+   * 新多参模式下是彩色首帧；旧模式下可能仍是黑白分镜草图。
    */
   referenceImagePath?: string;
+  /** 标记 referenceImagePath 的语义，避免把彩色首帧误当成黑白草图解释。 */
+  referenceImageRole?: 'first_frame' | 'storyboard_sketch';
+  /** 可选黑白草图路径：新模式只把它当构图调试/辅助，不再作为主参考。 */
+  storyboardReferencePath?: string;
   /**
    * **彩色场景资产图**本地路径——前面"资产"步骤生成的彩色场景图。
    * Seedance 适配会拿这张图当 i2v 主参考，保证视频环境/光照/色彩跟资产一致，
@@ -68,7 +87,22 @@ export type VideoGenInput = {
    * 会拼接到合成参考图底部缩略图条，给 Seedance 稳定角色外观/服装。
    */
   characterReferencePaths?: string[];
+  /**
+   * 按当前镜头语义挑出的角色 panel。本字段优先于 characterReferencePaths：
+   * 近景用 headshot，侧身用 side，背影用 back，全身动作用 front/side/back。
+   */
+  characterReferencePanels?: CharacterReferencePanel[];
+  /** 本片段出现的道具参考图。会和角色参考一起放进视觉参考合成图。 */
+  propReferencePaths?: string[];
+  /**
+   * 独立多图参考列表。开启 ORIGIN_INDEPENDENT_MULTI_IMAGE_MODE 后，
+   * Seedance 适配会按顺序把这些图片作为独立 image_url(reference_image) 传入，
+   * 并在 prompt 中生成 Image N 的角色/场景/道具绑定说明。
+   */
+  referenceImages?: VideoReferenceImage[];
 };
+
+export type { VideoReferenceImage };
 
 /**
  * 把"彩色场景图（主） + 彩色角色图（缩略图条） + 黑白分镜草图（小角标）"
@@ -86,6 +120,8 @@ export type VideoGenInput = {
 async function buildColorReferenceComposite(opts: {
   scenePath?: string;
   characterPaths?: string[];
+  characterPanels?: CharacterReferencePanel[];
+  propPaths?: string[];
   storyboardPath?: string;
 }): Promise<Buffer | null> {
   const fs = await import('node:fs');
@@ -98,8 +134,12 @@ async function buildColorReferenceComposite(opts: {
 
   const validScene = opts.scenePath && fs.existsSync(opts.scenePath) ? opts.scenePath : null;
   const validChars = (opts.characterPaths || []).filter((p) => p && fs.existsSync(p));
+  const validPanels = (opts.characterPanels || [])
+    .filter((panel) => panel?.path && fs.existsSync(panel.path))
+    .slice(0, 4);
+  const validProps = (opts.propPaths || []).filter((p) => p && fs.existsSync(p)).slice(0, 4);
   const validSb = opts.storyboardPath && fs.existsSync(opts.storyboardPath) ? opts.storyboardPath : null;
-  if (!validScene && !validChars.length && !validSb) return null;
+  if (!validScene && !validChars.length && !validPanels.length && !validProps.length && !validSb) return null;
 
   // 输出尺寸：固定 1280x720（16:9 主流横版），脚本里 ratio 用 9:16 时
   // Seedance 会自己 letterbox，但 i2v 参考图比例不影响输出比例
@@ -112,22 +152,23 @@ async function buildColorReferenceComposite(opts: {
   ctx.fillStyle = '#1a1a1a';
   ctx.fillRect(0, 0, W, H);
 
-  // 1) 主背景 = 场景图，铺满画布
-  if (validScene) {
+  // 1) 主背景：优先用彩色场景图作环境/色调参考。
+  const mainBg = validScene;
+  if (mainBg) {
     try {
-      const sceneImg = await loadImage(validScene);
+      const sceneImg = await loadImage(mainBg);
       // cover 模式：等比缩放到完全覆盖 1280x720，多余裁掉
       const ratio = Math.max(W / sceneImg.width, H / sceneImg.height);
       const dw = sceneImg.width * ratio;
       const dh = sceneImg.height * ratio;
       ctx.drawImage(sceneImg, (W - dw) / 2, (H - dh) / 2, dw, dh);
     } catch (e: any) {
-      console.warn('[color-ref] scene draw failed:', e?.message || e);
+      console.warn('[color-ref] main background draw failed:', e?.message || e);
     }
-  } else if (validChars.length) {
+  } else if (validPanels.length || validChars.length || validProps.length) {
     // 没场景图时角色图占主位（cover 第一张）
     try {
-      const c0 = await loadImage(validChars[0]);
+      const c0 = await loadImage(validPanels[0]?.path || validChars[0] || validProps[0]);
       const ratio = Math.max(W / c0.width, H / c0.height);
       const dw = c0.width * ratio;
       const dh = c0.height * ratio;
@@ -135,21 +176,28 @@ async function buildColorReferenceComposite(opts: {
     } catch (_) {}
   }
 
-  // 2) 底部一条角色缩略图条（高 130px，半透明黑底 + 角色彩图）
+  // 2) 底部一条角色缩略图条：
+  //    - 新 panel 路径：180px，高度 156px 内容区，让竖版 headshot/front/side/back
+  //      比旧 130px 条获得更大有效像素面积。
+  //    - 旧路径 fallback：仍接受整张角色图，只是布局代码共用。
   //    注意：场景图存在 + 角色图存在时才贴；角色图独占主位时跳过
-  if (validScene && validChars.length) {
-    const stripH = 130;
+  const characterThumbs = validPanels.length
+    ? validPanels.map((panel) => panel.path)
+    : validChars.slice(0, 4);
+  const referenceThumbs = [...characterThumbs, ...validProps].slice(0, 6);
+  if (mainBg && referenceThumbs.length) {
+    const stripH = validPanels.length ? 180 : 130;
     const stripY = H - stripH;
     ctx.fillStyle = 'rgba(0,0,0,0.45)';
     ctx.fillRect(0, stripY, W, stripH);
 
-    const maxThumbs = Math.min(validChars.length, 4);
+    const maxThumbs = Math.min(referenceThumbs.length, 6);
     const thumbGap = 12;
     const thumbW = Math.floor((W - thumbGap * (maxThumbs + 1)) / maxThumbs);
     const thumbH = stripH - thumbGap * 2;
     for (let i = 0; i < maxThumbs; i++) {
       try {
-        const cImg = await loadImage(validChars[i]);
+        const cImg = await loadImage(referenceThumbs[i]);
         const ratio = Math.min(thumbW / cImg.width, thumbH / cImg.height);
         const dw = cImg.width * ratio;
         const dh = cImg.height * ratio;
@@ -293,66 +341,6 @@ export function sanitizeForSeedance(rawPrompt: string): string {
   return t;
 }
 
-/**
- * 把"视频提示词页"生成的长结构化中文 prompt（含"运镜系统/角色/场景/0-Ns/基调/约束/音障"）
- * 压缩成 grok-video 友好的简洁单段描述。
- *
- * grok-video 对长 prompt 控制力差，>500 字基本只会抓最显著的关键词（如"叹气"），
- * 忽略大部分场景/角色细节。压缩后只保留视觉相关段落、限到 ~250 字以内。
- */
-export function compressForGrokVideo(rawPrompt: string, maxChars = 320): string {
-  if (!rawPrompt) return '';
-  const txt = rawPrompt.replace(/\r/g, '');
-  // 把整段按"段落标题/时间标签"切成 K→V
-  const SECTION_HEADERS = ['运镜系统', '角色', '场景', '基调', '约束', '音障'];
-  const TIME_RE = /^\s*\d+(?:\.\d+)?\s*[-–~～至到]\s*\d+(?:\.\d+)?\s*s?\s*$/;
-  const lines = txt.split(/\n+/);
-  const sections: Array<{ key: string; body: string }> = [];
-  let currentKey: string | null = null;
-  let buf: string[] = [];
-  const flush = () => {
-    if (currentKey && buf.length) {
-      sections.push({ key: currentKey, body: buf.join(' ').trim() });
-    }
-    buf = [];
-  };
-  for (const raw of lines) {
-    const t = raw.trim();
-    if (!t) continue;
-    if (SECTION_HEADERS.includes(t) || TIME_RE.test(t)) {
-      flush();
-      currentKey = t;
-    } else if (currentKey) {
-      buf.push(t);
-    }
-  }
-  flush();
-
-  // 抽出关键段
-  const get = (k: string) => sections.find(s => s.key === k)?.body || '';
-  const scene = get('场景');
-  const character = get('角色');
-  const camera = get('运镜系统');
-  const timeline = sections.find(s => TIME_RE.test(s.key))?.body || '';
-
-  // 拼接顺序：镜头运镜 → 场景 → 角色外形 → 时间轴动作（去掉⟦⟧装饰）
-  const cleanTimeline = timeline.replace(/[⟦⟧【】「」]/g, ' ').replace(/\s+/g, ' ').trim();
-  const parts = [camera, scene, character, cleanTimeline].filter(Boolean);
-  let combined = parts.join('。').replace(/[。；][。；]+/g, '。');
-  combined = combined.replace(/[⟦⟧【】]/g, '').replace(/\s+/g, ' ').trim();
-
-  // 完全没切到段：直接截断原文
-  if (!combined) combined = txt.replace(/\s+/g, ' ').slice(0, maxChars);
-
-  if (combined.length > maxChars) {
-    // 在 maxChars 附近找一个标点截断，避免半句话+省略号让模型迷糊
-    const cut = combined.slice(0, maxChars);
-    const lastPunct = Math.max(cut.lastIndexOf('。'), cut.lastIndexOf('；'), cut.lastIndexOf('，'));
-    combined = lastPunct > maxChars * 0.6 ? cut.slice(0, lastPunct + 1) : cut;
-  }
-  return combined;
-}
-
 /** 把 ratio 字符串规范成统一格式 + size 映射 */
 function normalizeRatio(ratio?: string): { ratio: string; size: '1080x1920' | '1920x1080' | '1024x1024' } {
   const r = (ratio || '').trim();
@@ -370,10 +358,127 @@ export type VideoGenResult = {
   taskId: string;
   status: 'completed' | 'failed';
   url: string;
+  protectedUrl: string;
   coverUrl: string | null;
   durationSec: number;
   mode: 'real' | 'fake';
+  videoAudit?: {
+    provider: string;
+    model?: string;
+    providerTaskId?: string;
+    finalPromptPreview: string;
+    finalPromptHash: string;
+    finalPromptLength: number;
+    referenceImages: Array<Pick<VideoReferenceImage, 'role' | 'path' | 'label' | 'sourceUrl' | 'assetId' | 'assetName' | 'promptHint'>>;
+    dialoguePolicy?: DialoguePolicy;
+    dialoguePolicyNotes?: string;
+    fallbackReason?: string;
+  };
 };
+
+export class VideoGenerationError extends Error {
+  taskId?: string;
+  videoAudit?: VideoGenResult['videoAudit'];
+  failureStage: VideoPromptFailureStage;
+
+  constructor(message: string, opts: {
+    taskId?: string;
+    videoAudit?: VideoGenResult['videoAudit'];
+    failureStage?: VideoPromptFailureStage;
+    cause?: any;
+  } = {}) {
+    super(message);
+    this.name = 'VideoGenerationError';
+    this.taskId = opts.taskId;
+    this.videoAudit = opts.videoAudit;
+    this.failureStage = opts.failureStage || classifyVideoFailureStage(opts.cause || message);
+    if (opts.cause) (this as any).cause = opts.cause;
+  }
+}
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function retryAfterMs(raw: string | null): number | null {
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const time = Date.parse(raw);
+  if (!Number.isFinite(time)) return null;
+  return Math.max(0, time - Date.now());
+}
+
+function jitter(ms: number): number {
+  return ms + Math.floor(Math.random() * 1000);
+}
+
+function networkErrorMessage(err: any): string {
+  return String(err?.message || err || '');
+}
+
+function isTransientNetworkError(err: any): boolean {
+  const msg = networkErrorMessage(err);
+  return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+}
+
+export function classifyVideoFailureStage(err: any): VideoPromptFailureStage {
+  const status = Number(err?.status || err?.statusCode);
+  const msg = networkErrorMessage(err);
+  if (status === 429 || /rate.?limit|HTTP 429|429/i.test(msg)) return 'submit_rate_limited';
+  if (status === 401 || status === 403 || /unauthorized|forbidden|invalid api key|HTTP 401|HTTP 403/i.test(msg)) return 'submit_auth';
+  if (status >= 500) return 'submit_network';
+  if (isTransientNetworkError(err) || /retry_deadline_exceeded/i.test(msg)) return 'submit_network';
+  if ((status >= 400 && status < 500) || /rejected|policy|审核|不符合|sensitive|filter|risk/i.test(msg)) {
+    return 'submit_upstream_reject';
+  }
+  if (/poll|状态|超时|timeout|排队过久/i.test(msg)) return 'post_submit_poll';
+  if (/download|下载/i.test(msg)) return 'download';
+  return 'unknown';
+}
+
+class Semaphore {
+  private active = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limit) {
+      await new Promise<void>((resolve) => this.queue.push(resolve));
+    }
+    this.active++;
+    try {
+      return await fn();
+    } finally {
+      this.active--;
+      const next = this.queue.shift();
+      if (next) next();
+    }
+  }
+}
+
+let _submitSemaphoreLimit = 0;
+let _submitSemaphore: Semaphore | null = null;
+
+function videoSubmitSemaphore(): Semaphore {
+  const limit = envInt('VIDEO_SUBMIT_CONCURRENCY', 2, 1, 3);
+  if (!_submitSemaphore || _submitSemaphoreLimit !== limit) {
+    _submitSemaphoreLimit = limit;
+    _submitSemaphore = new Semaphore(limit);
+  }
+  return _submitSemaphore;
+}
+
+async function withVideoSubmitSlot<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  return videoSubmitSemaphore().run(async () => {
+    console.log(`[video-gen] submit slot acquired label=${label} concurrency=${_submitSemaphoreLimit}`);
+    return fn();
+  });
+}
 
 const DATA_DIR = join(process.cwd(), 'data');
 const VIDEOS_DIR = join(DATA_DIR, 'videos');
@@ -400,17 +505,13 @@ export async function generateVideo(
   const cfgIsGrok = /^grok-video/i.test(cfg.model || '');
   const isVolcano = /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl) || /seedance|doubao/i.test(cfg.model);
   const isGrok = cfgIsGrok;
-  // grok 模型时长策略：
-  //   grok-video-3-10s → 固定 10 秒
-  //   grok-video-3-Ns  → 固定 N 秒
-  //   grok-video-3     → 默认 5 秒（中转站默认）
-  const grokFixedDur = cfgIsGrok
-    ? (/-(\d+)s$/i.test(cfg.model) ? Number(RegExp.$1) : 5)
-    : null;
-  const rawDur = grokFixedDur ?? input.durationSec ?? (isVolcano ? (cfg.minDurationSec || 5) : 4);
-  const dur = isVolcano && !grokFixedDur
-    ? Math.max(rawDur, cfg.minDurationSec || 5)
-    : rawDur;
+  // 生成请求时长来自镜头表计划时长；仅在模型自身固定时长或供应商最小时长时做适配。
+  const dur = resolveGenerationDurationSec({
+    plannedDurationSec: input.durationSec,
+    model: cfg.model,
+    baseUrl: cfg.baseUrl,
+    minDurationSec: cfg.minDurationSec,
+  });
   // ratio 优先；没传 ratio 时尊重 size，否则按 size 反推
   const sizeArgPresent = !!input.size;
   const { ratio: aspectRatio, size: sizeFromRatio } = normalizeRatio(
@@ -420,6 +521,7 @@ export async function generateVideo(
   console.log(`[video-gen] resolved ratio=${aspectRatio} size=${size} dur=${dur}s model=${cfg.model}`);
 
   let mode: 'real' | 'fake' = 'real';
+  let videoAudit: VideoGenResult['videoAudit'] | undefined;
 
   // 入库登记
   const db = getDb();
@@ -451,34 +553,17 @@ export async function generateVideo(
     //       GET  {base}/video/query?id={id}（兜底，含 video_url）
     // 失败时直接抛错（**不 fallback 黑场视频**），上层 batch executor 会把这条任务标 failed
     try {
-      // grok-video 对长 prompt 理解力差，压缩后只保留视觉关键信息（视觉部分留 240 字）
-      const compressedVisual = compressForGrokVideo(input.prompt, 240);
-      // 拼上必须严格演绎的台词（如有）。这一段不计入压缩预算，确保不被截断。
-      // 优先用 dialoguePairs 拼成 "说话人:'台词'" 的紧凑格式（让 grok 知道
-      // 谁说什么、避免把"老板"这种角色名也念出来）；没有 pairs 才退回到
-      // 老的 input.dialogue 字符串。
-      let finalPrompt = compressedVisual || input.prompt.slice(0, 240);
-      let dialogueText = '';
-      if (Array.isArray(input.dialoguePairs) && input.dialoguePairs.length > 0) {
-        dialogueText = input.dialoguePairs
-          .filter((p) => p && p.text)
-          .map((p) => {
-            const tx = p.text.replace(/\s+/g, ' ').slice(0, 100);
-            return p.speaker
-              ? `由 ${p.speaker} 开口说："${tx}"（"${p.speaker}"是说话人标记不要念出）`
-              : `旁白："${tx}"`;
-          })
-          .join('；');
-      } else if (input.dialogue && input.dialogue.trim()) {
-        dialogueText = input.dialogue.trim().replace(/\s+/g, ' ').slice(0, 220);
-      }
-      if (dialogueText) {
-        finalPrompt =
-          finalPrompt +
-          `。【角色对白】必须严格、完整、清晰地按以下原文演绎并配音，不得自由发挥、不得即兴增删字句：${dialogueText}`;
-      }
-      console.log(`[video-gen][grok] prompt: visual=${compressedVisual.length}c dialogue=${dialogueText.length}c total=${finalPrompt.length}c`);
-      console.log(`[video-gen][grok] final prompt = ${finalPrompt.slice(0, 600)}…`);
+      const finalPrompt = input.prompt;
+      videoAudit = {
+        provider: 'grok',
+        model: cfg.model,
+        finalPromptPreview: finalPrompt.slice(0, 500),
+        finalPromptHash: hashString(finalPrompt),
+        finalPromptLength: finalPrompt.length,
+        referenceImages: [],
+        dialoguePolicy: 'budget_check_only',
+      };
+      console.log(`[video-gen][grok] final prompt length=${finalPrompt.length}`);
 
       // 关键：grok-video-3 提交参数兼容
       //   - grok-video-3-Ns（带数字后缀）：模型已锁时长，传 duration 是冗余但 OK
@@ -494,20 +579,21 @@ export async function generateVideo(
       console.log(`[video-gen][grok] submit body keys = ${Object.keys(submitBody).join(',')}`);
       onProgress?.(5, `提交 Grok 视频任务（${cfg.model}, ${dur}s, ${aspectRatio}）…`);
 
-      const submit: any = await retryFetch(
-        `${cfg.baseUrl}/video/create`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-          body: JSON.stringify(submitBody),
-        },
-        '[grok submit]',
-      );
+	      const submit: any = await withVideoSubmitSlot('[grok submit]', () => retryFetch(
+	        `${cfg.baseUrl}/video/create`,
+	        {
+	          method: 'POST',
+	          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+	          body: JSON.stringify(submitBody),
+	        },
+	        '[grok submit]',
+	      ));
     console.log('[video-gen][grok] submit response:', JSON.stringify(submit).slice(0, 400));
-    const remoteId = submit.id || submit.task_id;
-    if (!remoteId) throw new Error('Grok API 返回缺 id：' + JSON.stringify(submit).slice(0, 200));
-    console.log('[video-gen][grok] remoteId =', remoteId);
-    db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+	    const remoteId = submit.id || submit.task_id;
+	    if (!remoteId) throw new Error('Grok API 返回缺 id：' + JSON.stringify(submit).slice(0, 200));
+	    console.log('[video-gen][grok] remoteId =', remoteId);
+	    db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+	    if (videoAudit) videoAudit.providerTaskId = remoteId;
 
     const isTerminalStatus = (s: string) =>
       /^(succeeded|success|completed|complete|finished|done|ok|ready)$/i.test(s);
@@ -577,7 +663,12 @@ export async function generateVideo(
            updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
       ).run(msg.slice(0, 1000), taskId);
       // 往上抛 → batch executor 会把对应 batch_task 标 failed，前端能"重试"
-      throw new Error('Grok 视频生成失败：' + msg.slice(0, 200));
+	      throw new VideoGenerationError('Grok 视频生成失败：' + msg.slice(0, 200), {
+	        taskId,
+	        videoAudit,
+	        failureStage: classifyVideoFailureStage(e),
+	        cause: e,
+	      });
     }
   } else if (isVolcano) {
     // ---- 火山引擎 Seedance 适配 ----
@@ -595,65 +686,6 @@ export async function generateVideo(
       //      → 修法：参考图前加"风格强制覆盖"指令，告诉 Seedance 参考图只用作
       //        构图/角色/镜头参考，最终视频必须全彩电影级。
 
-      // 结构化台词：每条 { speaker, text }——分离说话人与台词内容，避免
-      // Seedance 把"老板："这种角色名前缀当成台词的一部分念出来。
-      // 同时给 Seedance 一个明确的"指定说话人"元信息（同一名字跨片段
-      // 应该对应同一种音色——配合后面的 voiceRoster 锁住）。
-      const dialogPairs = Array.isArray(input.dialoguePairs)
-        ? input.dialoguePairs.filter((p) => p && p.text)
-        : [];
-
-      let dialogueBlock = '';
-      if (dialogPairs.length > 0) {
-        const lines = dialogPairs
-          .map((p, i) => {
-            const cleanText = p.text.replace(/\s+/g, ' ').slice(0, 200);
-            const sp = p.speaker
-              ? `说话人: ${p.speaker}（必须由该角色开口配音，唇形要对得上）`
-              : `说话人: 旁白`;
-            return `  [${i + 1}] ${sp}\n      台词内容: "${cleanText}"`;
-          })
-          .join('\n');
-        dialogueBlock =
-          `【本片段台词 - 必须严格按原文配音、按列表顺序、由指定说话人开口】\n` +
-          lines +
-          `\n` +
-          `严格规则：\n` +
-          `  · "说话人:" 后面的角色名是元信息，**绝对不准念出来**（不要把"老板"、"帝王蟹队长"等角色名当成台词的一部分朗读）\n` +
-          `  · 只有"台词内容:"引号里的字才是真正要念的台词\n` +
-          `  · 每句台词的发声角色必须严格匹配上面"说话人:"指定的那个名字，` +
-          `其它角色只做反应/听不发声\n` +
-          `  · 提示词里任何「」/""/''/⟦⟧ 包裹的、不在上面列表里的句子都禁止念出\n\n`;
-      } else {
-        dialogueBlock =
-          `【本片段无台词】\n` +
-          `角色保持沉默，禁止从画面描述中提取任何"" /「」/⟦⟧ 内的对白朗读出来，` +
-          `即便提示词里有引号包住的句子也不要念，只保留环境音 / 动作音 / 背景音。\n\n`;
-      }
-
-      // 角色声音 roster：保证跨片段同一角色声音一致
-      const voiceBlock = input.voiceRoster
-        ? `【角色声音/形象锁 - 跨片段必须一致】\n${input.voiceRoster}\n` +
-          `（同一个角色名在不同片段必须使用同一种音色 / 性别 / 年龄段，` +
-          `拟人化非人角色要用带物种特征的语气，例如帝王蟹是低沉粗哑男声、` +
-          `生蚝实习生是怯怯轻细的青年声）\n\n`
-        : '';
-
-      // 前后镜头衔接信息：避免硬切 / 角色姿态突变
-      const continuityBlock =
-        input.prevTailSummary || input.nextHeadSummary
-          ? `【前后片段衔接 - 避免硬切】\n` +
-            (input.prevTailSummary
-              ? `· 上一片段结束在：${input.prevTailSummary.slice(0, 200)}\n` +
-                `  → 本片段第一帧的角色站位、视线方向、灯光要与之自然承接\n`
-              : '') +
-            (input.nextHeadSummary
-              ? `· 下一片段开始时：${input.nextHeadSummary.slice(0, 200)}\n` +
-                `  → 本片段最后一帧要为下一镜留出过渡空间（不要镜头突然推到死/拉到底）\n`
-              : '') +
-            `\n`
-          : '';
-
       // 用户反馈关键架构问题："前面有场景彩色图和人物角色彩色图，不能单一参考
       // 分镜图去生成"——之前只把黑白分镜草图当 i2v 主参考，等于让 Seedance
       // 基于黑白调凭空想象彩色画面，前面"资产"步骤生成的彩色场景/角色图完全
@@ -665,86 +697,108 @@ export async function generateVideo(
       //   · 主色调来自彩色场景图 → 不再黑白
       //   · 角色外形来自彩色角色三视图 → 跨片段一致
       //   · 镜头构图/景别来自分镜草图小角标 → 不丢前期分镜工作
-      const hasColorRefs =
-        !!input.sceneReferencePath ||
-        (Array.isArray(input.characterReferencePaths) && input.characterReferencePaths.length > 0);
-      const hasAnyRef = hasColorRefs || !!input.referenceImagePath;
-
-      let styleOverrideBlock = '';
-      if (hasColorRefs) {
-        styleOverrideBlock =
-          `【风格强制覆盖 - 视觉圣经参考图说明】\n` +
-          `已附上一张合成参考图，包含三块信息：\n` +
-          `  ① 主背景（顶部铺满）= 彩色场景资产图，定义环境、光照、色调、材质\n` +
-          `  ② 底部缩略图条 = 本片段出场角色的彩色资产三视图，定义角色外形/服装/物种（拟人化角色必须保留物种特征）\n` +
-          `  ③ 右上小角标 = 黑白铅笔分镜草图，仅用于参考镜头构图/景别/角色站位（不要复制黑白色调）\n` +
-          `最终视频必须满足：\n` +
-          `  · 全彩电影级真人画质（live-action cinematic full color, professional cinematography）\n` +
-          `  · 色调/光照/材质完全跟随彩色场景图，禁止保留分镜草图的黑白灰阶 / 铅笔肌理 / 草稿质感\n` +
-          `  · 每个角色严格匹配底部对应的彩色资产图（人物形象、衣着、物种）；非人/拟人角色绝对不能画成真人\n` +
-          `  · 镜头构图/景别遵循右上角标的草图，但成片是真人电影质感\n\n`;
-      } else if (input.referenceImagePath) {
-        // 没拿到彩色资产时回退到旧路径：分镜草图 + 强制覆盖
-        styleOverrideBlock =
-          `【风格强制覆盖】\n` +
-          `参考图为黑白铅笔分镜草图（pre-production storyboard sketch），` +
-          `仅用于构图、角色站位、镜头视角、动作走位的参考。\n` +
-          `最终视频必须满足：\n` +
-          `  · 全彩电影级真人画质（live-action cinematic full color, professional cinematography）\n` +
-          `  · 严禁保留参考图的铅笔线条 / 素描肌理 / 黑白灰阶 / 网格纹理 / 草稿质感\n` +
-          `  · 角色皮肤、服装颜色、环境光照、道具材质均按真实场景渲染\n\n`;
-      }
-
-      // 【开场动态指令】Seedance i2v 默认从参考图微动 → 前 0.3s 几乎是静帧，
-      // 用户在剪辑工作台拼接多段视频时，每段开头那一瞬间静帧看起来像
-      // "中间夹了一张封面图"，破坏了片段间的连贯感。强制要求开场就有
-      // 明显运动（角色微动作 / 镜头位移 / 光线呼吸），让首帧不再静态。
-      const motionOpeningBlock =
-        `【开场动态强制】\n` +
-        `视频第 0 帧就必须是动态画面，禁止前 0.3 秒呈现"参考图静帧定格"效果。\n` +
-        `  · 镜头从第 1 帧就要按【运镜系统】描述的方向开始物理位移（推/拉/横移/跟随等）\n` +
-        `  · 角色从第 1 帧就要有微动作（呼吸起伏 / 眨眼 / 手部小动作 / 嘴唇微动），不能像照片一样定格\n` +
-        `  · 多个视频拼成成片时，每段开头的那一瞬间必须无缝接得上"在动"，不能让人感觉切到一张静态封面\n\n`;
-
-      const promptCore =
-        `${dialogueBlock}` +
-        `${voiceBlock}` +
-        `${continuityBlock}` +
-        `${motionOpeningBlock}` +
-        `${styleOverrideBlock}` +
-        `${input.prompt}`;
+      const seedancePrompt = buildSeedancePromptParts({
+        ...input,
+        ratio: aspectRatio,
+        durationSec: dur,
+      });
+      const independentReferenceImages = seedancePrompt.independentReferenceImages;
+      const hasIndependentImageRefs = seedancePrompt.hasIndependentImageRefs;
+      const hasFirstFrameRef = seedancePrompt.hasFirstFrameRef;
+      const hasColorRefs = seedancePrompt.hasColorRefs;
+      const hasAnyRef = seedancePrompt.hasAnyRef;
+      videoAudit = {
+        provider: 'seedance',
+        model: cfg.model,
+        finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
+        finalPromptHash: hashString(seedancePrompt.finalPrompt),
+        finalPromptLength: seedancePrompt.finalPrompt.length,
+        referenceImages: [],
+        dialoguePolicy: 'budget_check_only',
+      };
 
       const content: any[] = [
-        { type: 'text', text: `${promptCore}\n--ratio ${aspectRatio} --duration ${dur}` },
+        { type: 'text', text: seedancePrompt.finalPrompt },
       ];
 
-      if (hasAnyRef) {
+      if (hasIndependentImageRefs) {
+        try {
+          for (const ref of independentReferenceImages) {
+            content.push({
+              type: 'image_url',
+              image_url: { url: imagePathToDataUrl(ref.path) },
+              role: 'reference_image',
+            });
+          }
+          videoAudit = {
+            provider: 'seedance',
+            model: cfg.model,
+            finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
+            finalPromptHash: hashString(seedancePrompt.finalPrompt),
+            finalPromptLength: seedancePrompt.finalPrompt.length,
+            dialoguePolicy: 'budget_check_only',
+            referenceImages: independentReferenceImages.map((ref) => ({
+              role: ref.role,
+              path: ref.path,
+              label: ref.label,
+              sourceUrl: ref.sourceUrl,
+              assetId: ref.assetId,
+              assetName: ref.assetName,
+              promptHint: ref.promptHint,
+            })),
+          };
+          console.log(
+            `[video-gen][seedance] attached independent reference images ` +
+              `(${independentReferenceImages.map((ref, i) => `Image${i + 1}:${ref.role}:${ref.label}`).join(' | ')})`,
+          );
+          console.log(
+            `[metric][seedance][multi-image] attempted groupIdx=${input.groupIdx ?? -1} ` +
+              `images=${independentReferenceImages.length} ` +
+              `roles=${independentReferenceImages.map((ref) => ref.role).join(',')}`,
+          );
+        } catch (refErr: any) {
+          console.warn(
+            '[video-gen][seedance] independent reference image build failed, falling back to text-only:',
+            refErr?.message || refErr,
+          );
+        }
+      } else if (hasAnyRef) {
         try {
           let refBuf: Buffer | null = null;
-          if (hasColorRefs) {
+          if (hasFirstFrameRef && input.referenceImagePath) {
+            refBuf = readFileSync(input.referenceImagePath);
+            console.log(
+              `[video-gen][seedance] attached first-frame reference directly ` +
+                `(props=${input.propReferencePaths?.length || 0}, panels=${input.characterReferencePanels?.length || 0})`,
+            );
+          } else if (hasColorRefs) {
             // 走新路径：合成"彩色场景 + 彩色角色 + 黑白草图角标"
             const composite = await buildColorReferenceComposite({
               scenePath: input.sceneReferencePath,
               characterPaths: input.characterReferencePaths,
+              characterPanels: input.characterReferencePanels,
+              propPaths: input.propReferencePaths,
               storyboardPath: input.referenceImagePath,
             });
             if (composite) {
               refBuf = await applyFaceSafetyMask(composite);
               console.log(
                 `[video-gen][seedance] built color reference composite ` +
-                  `(scene=${!!input.sceneReferencePath}, chars=${input.characterReferencePaths?.length || 0}, ` +
-                  `sb=${!!input.referenceImagePath})`,
+                  `(scene=${!!input.sceneReferencePath}, panels=${input.characterReferencePanels?.length || 0}, ` +
+                  `chars=${input.characterReferencePaths?.length || 0}, ` +
+                  `props=${input.propReferencePaths?.length || 0}, firstFrame=${hasFirstFrameRef}, ` +
+                  `sb=${!!(hasFirstFrameRef ? input.storyboardReferencePath : input.referenceImagePath)})`,
               );
             }
           }
           // 兜底：合成失败 / 没彩色资产 → 用旧的纯分镜草图路径
-          if (!refBuf && input.referenceImagePath) {
+          if (!refBuf && !hasFirstFrameRef && input.referenceImagePath) {
             refBuf = await applyFaceSafetyMask(input.referenceImagePath);
           }
 
           if (refBuf) {
             const dataUrl = `data:image/png;base64,${refBuf.toString('base64')}`;
-            content.push({ type: 'image_url', image_url: { url: dataUrl } });
+            content.push({ type: 'image_url', image_url: { url: dataUrl }, role: 'reference_image' });
             console.log(`[video-gen][seedance] attached i2v ref image (${refBuf.length} bytes)`);
           }
         } catch (refErr: any) {
@@ -755,22 +809,81 @@ export async function generateVideo(
         }
       }
 
-      const submit: any = await retryFetch(
-        `${cfg.baseUrl}/contents/generations/tasks`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-          body: JSON.stringify({
-            model: cfg.model || 'doubao-seedance-2-0-260128',
-            content,
-          }),
-        },
-        '[seedance submit]',
-      );
+      let submit: any;
+      try {
+	        submit = await withVideoSubmitSlot('[seedance submit]', () => retryFetch(
+	          `${cfg.baseUrl}/contents/generations/tasks`,
+	          {
+	            method: 'POST',
+	            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+	            body: JSON.stringify({
+	              model: cfg.model || 'doubao-seedance-2-0-260128',
+	              content,
+	            }),
+	          },
+	          '[seedance submit]',
+	        ));
+      } catch (submitErr: any) {
+        if (hasIndependentImageRefs && hasFirstFrameRef && input.referenceImagePath && isInputImageSensitiveError(submitErr)) {
+          console.warn(
+            '[video-gen][seedance] independent refs rejected by input-image safety; retrying with first-frame only:',
+            submitErr?.message || submitErr,
+          );
+          console.log(
+            `[metric][seedance][multi-image] fallback groupIdx=${input.groupIdx ?? -1} ` +
+              `reason=sensitive images=${independentReferenceImages.length}`,
+          );
+              const fallbackPrompt = buildSeedancePromptParts({
+                ...input,
+                ratio: aspectRatio,
+                durationSec: dur,
+                referenceImages: undefined,
+                referenceImageRole: 'first_frame',
+              });
+              videoAudit = {
+                provider: 'seedance',
+                model: cfg.model,
+                finalPromptPreview: fallbackPrompt.finalPrompt.slice(0, 500),
+                finalPromptHash: hashString(fallbackPrompt.finalPrompt),
+                finalPromptLength: fallbackPrompt.finalPrompt.length,
+                dialoguePolicy: 'budget_check_only',
+                referenceImages: [{
+                  role: 'first_frame',
+                  path: input.referenceImagePath,
+                  label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
+                  promptHint: 'Fallback after independent reference images were rejected.',
+                }],
+                fallbackReason: 'independent_refs_rejected_by_input_image_safety',
+              };
+              const fallbackContent: any[] = [
+                { type: 'text', text: fallbackPrompt.finalPrompt },
+            {
+              type: 'image_url',
+              image_url: { url: imagePathToDataUrl(input.referenceImagePath) },
+              role: 'reference_image',
+            },
+          ];
+	          submit = await withVideoSubmitSlot('[seedance submit first-frame fallback]', () => retryFetch(
+	            `${cfg.baseUrl}/contents/generations/tasks`,
+	            {
+	              method: 'POST',
+	              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+	              body: JSON.stringify({
+	                model: cfg.model || 'doubao-seedance-2-0-260128',
+	                content: fallbackContent,
+	              }),
+	            },
+	            '[seedance submit first-frame fallback]',
+	          ));
+        } else {
+          throw submitErr;
+        }
+      }
       const remoteId = submit.id;
       if (!remoteId) throw new Error('Seedance API 返回缺 id');
       console.log(`[video-gen][seedance] task created id=${remoteId}`);
       db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+      if (videoAudit) videoAudit.providerTaskId = remoteId;
 
       // 用户反馈：10 分钟有时撞到 Seedance 排队/慢推理导致"等待时间过长"误报失败。
       // 加长到 15 分钟兜住高峰期排队，并把超时文案带上重试建议。
@@ -839,30 +952,46 @@ export async function generateVideo(
         `UPDATE video_tasks SET status='failed', error_msg=?,
            updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
       ).run(friendly.slice(0, 1000), taskId);
-      throw new Error(friendly.slice(0, 400));
+	      throw new VideoGenerationError(friendly.slice(0, 400), {
+	        taskId,
+	        videoAudit,
+	        failureStage: classifyVideoFailureStage(e),
+	        cause: e,
+	      });
     }
   } else {
     // ---- OpenAI Sora 适配 ----
     try {
       onProgress?.(5, '提交 Sora 任务…');
-      const submitResp = await fetch(`${cfg.baseUrl}/videos`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-        body: JSON.stringify({
-          model: cfg.model || 'sora-2',
-          prompt: input.prompt,
-          size,
-          seconds: String(dur),
-        }),
-      });
-      if (!submitResp.ok) {
-        const t = await submitResp.text();
-        throw new Error(`Video submit ${submitResp.status}: ${t.slice(0, 400)}`);
-      }
-      const submit: any = await submitResp.json();
+      const finalPrompt = input.prompt;
+      const soraModel = cfg.model || 'sora-2';
+      videoAudit = {
+        provider: 'sora',
+        model: soraModel,
+        finalPromptPreview: finalPrompt.slice(0, 500),
+        finalPromptHash: hashString(finalPrompt),
+        finalPromptLength: finalPrompt.length,
+        referenceImages: [],
+        dialoguePolicy: 'budget_check_only',
+      };
+	      const submit: any = await withVideoSubmitSlot('[sora submit]', () => retryFetch(
+	        `${cfg.baseUrl}/videos`,
+	        {
+	          method: 'POST',
+	          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+	          body: JSON.stringify({
+	            model: soraModel,
+	            prompt: finalPrompt,
+	            size,
+	            seconds: String(dur),
+	          }),
+	        },
+	        '[sora submit]',
+	      ));
       const remoteId = submit.id;
       if (!remoteId) throw new Error('Video API 返回缺 id');
       db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+      if (videoAudit) videoAudit.providerTaskId = remoteId;
 
       const deadline = Date.now() + 6 * 60 * 1000;
       let status = submit.status || 'queued';
@@ -870,7 +999,7 @@ export async function generateVideo(
       while (status !== 'completed' && status !== 'failed') {
         if (Date.now() > deadline) throw new Error('视频生成超时（6 分钟）');
         await sleep(5000);
-        const r = await fetch(`${cfg.baseUrl}/videos/${remoteId}`, {
+        const r = await fetchViaProxy(`${cfg.baseUrl}/videos/${remoteId}`, {
           headers: { Authorization: `Bearer ${cfg.apiKey}` },
         });
         if (!r.ok) {
@@ -886,7 +1015,7 @@ export async function generateVideo(
       if (status === 'failed') throw new Error('远端视频任务 failed');
 
       onProgress?.(90, '下载视频…');
-      const dl = await fetch(`${cfg.baseUrl}/videos/${remoteId}/content`, {
+      const dl = await fetchViaProxy(`${cfg.baseUrl}/videos/${remoteId}/content`, {
         headers: { Authorization: `Bearer ${cfg.apiKey}` },
       });
       if (!dl.ok) throw new Error(`下载 ${dl.status}`);
@@ -936,47 +1065,98 @@ export async function generateVideo(
 
   onProgress?.(100, '完成');
 
+  const protectedUrl = `/api/videos/file/${taskId}`;
+
   return {
     taskId,
     status: 'completed',
-    url: `/api/videos/file/${taskId}`,
-    coverUrl,
-    durationSec: dur,
-    mode,
-  };
+    url: buildSignedVideoUrl(taskId, user.id).url,
+    protectedUrl,
+      coverUrl,
+      durationSec: dur,
+      mode,
+      videoAudit,
+    };
 }
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function imagePathToDataUrl(imagePath: string): string {
+  const ext = imagePath.split('.').pop()?.toLowerCase() || 'png';
+  const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : 'image/png';
+  return `data:${mime};base64,${readFileSync(imagePath).toString('base64')}`;
+}
+
+function isInputImageSensitiveError(err: any): boolean {
+  const msg = String(err?.message || err || '');
+  return /InputImageSensitiveContentDetected|PrivacyInformation|real person|真人|隐私/i.test(msg);
+}
+
 /**
- * 带重试的 fetch + JSON 解析（Volcano 偶尔抖一下，重试 3 次）。
+ * 带重试的 fetch + JSON 解析。submit 阶段使用更长退避和 overall deadline，
+ * poll 阶段保留较短重试，避免一次网络抖动直接打断长任务。
  */
 async function retryFetch(url: string, init: any, label: string, retries = 3): Promise<any> {
+  const isSubmit = /submit|video\/create|generations\/tasks(?!\/)/i.test(label) || /\/video\/create$|\/contents\/generations\/tasks$|\/videos$/.test(url);
+  const maxAttempts = isSubmit ? envInt('VIDEO_SUBMIT_MAX_ATTEMPTS', 5, 1, 8) : retries;
+  const deadlineMs = isSubmit
+    ? envInt('VIDEO_SUBMIT_RETRY_DEADLINE_MS', 120_000, 10_000, 600_000)
+    : envInt('VIDEO_FETCH_RETRY_DEADLINE_MS', 60_000, 5_000, 300_000);
+  const deadlineAt = Date.now() + deadlineMs;
   let lastErr: any;
-  for (let i = 0; i < retries; i++) {
+
+  for (let i = 0; i < maxAttempts; i++) {
     try {
-      const resp = await fetch(url, init);
+      const resp = await fetchViaProxy(url, init);
       if (!resp.ok) {
         const t = await resp.text();
-        if (resp.status >= 500 && i < retries - 1) {
-          console.warn(`${label} status=${resp.status}, retrying...`);
-          await sleep(2000 * (i + 1));
-          continue;
-        }
-        throw new Error(`${label} HTTP ${resp.status}: ${t.slice(0, 300)}`);
+        const err: any = new Error(`${label} HTTP ${resp.status}: ${t.slice(0, 300)}`);
+        err.status = resp.status;
+        err.retryAfterMs = retryAfterMs(resp.headers.get('retry-after'));
+        throw err;
       }
       return await resp.json();
     } catch (e: any) {
       lastErr = e;
+      const status = Number(e?.status || e?.statusCode);
       const msg = e?.message || String(e);
-      if (i < retries - 1) {
-        console.warn(`${label} attempt ${i + 1}/${retries} failed: ${msg}, retrying...`);
-        await sleep(2000 * (i + 1));
+      const retryable =
+        status === 429 ||
+        (status >= 500 && status < 600) ||
+        (!status && isTransientNetworkError(e));
+      const attemptsLeft = i < maxAttempts - 1;
+      if (retryable && attemptsLeft) {
+        const retryAfter = typeof e?.retryAfterMs === 'number' ? e.retryAfterMs : null;
+        const baseDelay = status === 429
+          ? envInt('VIDEO_SUBMIT_429_RETRY_BASE_MS', 20_000, 1_000, 300_000)
+          : isSubmit
+            ? envInt('VIDEO_SUBMIT_NETWORK_RETRY_BASE_MS', 10_000, 1_000, 120_000)
+            : 2_000;
+        const capDelay = isSubmit
+          ? envInt('VIDEO_SUBMIT_RETRY_MAX_MS', 90_000, 1_000, 300_000)
+          : 12_000;
+        const computedDelay = Math.min(capDelay, retryAfter != null ? retryAfter : baseDelay * Math.pow(2, i));
+        const delay = jitter(computedDelay);
+        if (Date.now() + delay > deadlineAt) {
+          const finalErr: any = new Error(
+            `${label} retry_deadline_exceeded after ${i + 1}/${maxAttempts}: ${msg}`,
+          );
+          finalErr.status = status;
+          finalErr.failureStage = classifyVideoFailureStage(e);
+          throw finalErr;
+        }
+        console.warn(
+          `${label} attempt ${i + 1}/${maxAttempts} failed: ${msg}; retrying in ${Math.round(delay / 1000)}s`,
+        );
+        await sleep(delay);
         continue;
       }
-      throw new Error(`${label} 失败（${retries} 次重试后）: ${msg}`);
+      const finalErr: any = new Error(`${label} 失败（${i + 1} 次尝试后）: ${msg}`);
+      finalErr.status = status;
+      finalErr.failureStage = classifyVideoFailureStage(e);
+      throw finalErr;
     }
   }
   throw lastErr;
@@ -989,7 +1169,7 @@ async function retryDownload(url: string, retries = 3): Promise<Buffer> {
   let lastErr: any;
   for (let i = 0; i < retries; i++) {
     try {
-      const dl = await fetch(url);
+      const dl = await fetchViaProxy(url);
       if (!dl.ok) throw new Error(`下载 HTTP ${dl.status}`);
       return Buffer.from(await dl.arrayBuffer());
     } catch (e: any) {
@@ -1015,4 +1195,223 @@ export function getVideoTaskMeta(id: string, ownerId: number) {
     ...row,
     fullPath: join(VIDEOS_DIR, String(row.owner_id), row.filename || ''),
   };
+}
+
+const recoveringVideoTasks = new Set<string>();
+
+export function recoverRunningVideoTasks(limit = 12) {
+  const db = getDb();
+  const rows = db
+    .prepare<[], any>(
+      `SELECT *
+       FROM video_tasks
+       WHERE status IN ('queued','running')
+       ORDER BY created_at ASC
+       LIMIT ${Math.max(1, Math.min(limit, 50))}`,
+    )
+    .all();
+
+  if (!rows.length) return 0;
+
+  let started = 0;
+  for (const row of rows) {
+    const taskId = String(row.id || '');
+    if (!taskId || recoveringVideoTasks.has(taskId)) continue;
+
+    if (!row.provider_task) {
+      const createdAt = Date.parse(row.created_at || '');
+      const stale = Number.isFinite(createdAt) && Date.now() - createdAt > 2 * 60 * 1000;
+      if (stale) {
+        db.prepare(
+          `UPDATE video_tasks
+           SET status='failed',
+               error_msg='orphaned by server restart before remote submit',
+               updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id=? AND status IN ('queued','running') AND (provider_task IS NULL OR provider_task='')`,
+        ).run(taskId);
+      }
+      continue;
+    }
+
+    const user = db.prepare<{ id: number }, UserRow>('SELECT * FROM users WHERE id = @id').get({ id: Number(row.owner_id) });
+    if (!user) continue;
+
+    recoveringVideoTasks.add(taskId);
+    started++;
+    void recoverOneRunningVideoTask(user, row)
+      .catch((e) => {
+        console.warn('[video-recover] failed:', taskId, e?.message || e);
+      })
+      .finally(() => {
+        recoveringVideoTasks.delete(taskId);
+      });
+  }
+
+  if (started) console.warn(`[video-recover] started ${started} in-flight video recovery task(s)`);
+  return started;
+}
+
+async function recoverOneRunningVideoTask(user: UserRow, row: any) {
+  const cfg = resolveLLMConfig(user, 'video');
+  const taskId = String(row.id || '');
+  const remoteId = String(row.provider_task || '');
+  const providerName = String(row.provider || cfg.model || '').toLowerCase();
+  const isSeedance =
+    /seedance|doubao/i.test(providerName) ||
+    /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl);
+
+  if (!isSeedance) {
+    console.warn(`[video-recover] skip unsupported provider task=${taskId} provider=${row.provider || cfg.model || 'unknown'}`);
+    return;
+  }
+
+  console.warn(`[video-recover] resuming Seedance task local=${taskId} remote=${remoteId}`);
+  const deadline = Date.now() + 15 * 60 * 1000;
+  let pollCount = 0;
+
+  while (true) {
+    const j: any = await retryFetch(
+      `${cfg.baseUrl}/contents/generations/tasks/${remoteId}`,
+      { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
+      `[video-recover seedance poll #${pollCount + 1}]`,
+    );
+    pollCount++;
+
+    const status = String(j.status || '').toLowerCase();
+    const videoUrl = j?.content?.video_url || j?.video_url || '';
+    const progress = status === 'queued'
+      ? 20
+      : status === 'running' || status === 'in_progress'
+        ? Math.min(70, 30 + pollCount * 3)
+        : status === 'succeeded'
+          ? 90
+          : Number(row.progress || 0);
+
+    dbUpdateVideoProgress(taskId, progress);
+
+    if (status === 'succeeded') {
+      if (!videoUrl) throw new Error('Seedance 恢复成功但没返回 video_url');
+      await finalizeRecoveredVideoTask(user, row, videoUrl);
+      console.warn(`[video-recover] recovered Seedance task local=${taskId} remote=${remoteId}`);
+      return;
+    }
+
+    if (status === 'failed' || status === 'cancelled') {
+      const reason =
+        j?.error?.message ||
+        j?.error?.code ||
+        j?.fail_reason ||
+        j?.failReason ||
+        j?.message ||
+        `Seedance 远端状态：${status}`;
+      markVideoTaskFailed(taskId, String(reason).slice(0, 1000));
+      return;
+    }
+
+    if (Date.now() > deadline) {
+      console.warn(`[video-recover] remote still running after recovery window local=${taskId} remote=${remoteId}`);
+      return;
+    }
+
+    await sleep(6000);
+  }
+}
+
+function dbUpdateVideoProgress(taskId: string, progress: number) {
+  const db = getDb();
+  db.prepare(
+    `UPDATE video_tasks
+     SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id=? AND status IN ('queued','running')`,
+  ).run(progress, taskId);
+}
+
+function markVideoTaskFailed(taskId: string, message: string) {
+  const db = getDb();
+  db.prepare(
+    `UPDATE video_tasks
+     SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id=? AND status IN ('queued','running')`,
+  ).run(message, taskId);
+}
+
+async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: string) {
+  const db = getDb();
+  const taskId = String(row.id);
+  const ownerDir = join(VIDEOS_DIR, String(user.id));
+  mkdirSync(ownerDir, { recursive: true });
+  const filename = row.filename || `${taskId}.mp4`;
+  const fullPath = join(ownerDir, filename);
+
+  const buf = await retryDownload(videoUrl);
+  writeFileSync(fullPath, buf);
+
+  let coverImageId = row.cover_image_id || null;
+  let coverUrl = coverImageId ? `/api/images/file/${coverImageId}` : null;
+  if (!coverImageId) {
+    try {
+      const coverPath = join(ownerDir, `${taskId}.cover.png`);
+      await extractCover({ videoPath: fullPath, outputPath: coverPath });
+      coverImageId = randomUUID();
+      const stat = statSync(coverPath);
+      db.prepare(
+        `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
+         VALUES (?, ?, ?, 'other', ?, ?, 'image/png', ?, 1080, 1920, ?, 'video-cover')`,
+      ).run(
+        coverImageId,
+        user.id,
+        row.project_id || null,
+        `video-cover/${taskId}`,
+        `${taskId}.cover.png`,
+        stat.size,
+        String(row.prompt || '').slice(0, 200),
+      );
+      coverUrl = `/api/images/file/${coverImageId}`;
+    } catch (e: any) {
+      console.warn('[video-recover] extract cover failed:', e?.message || e);
+    }
+  }
+
+  db.prepare(
+    `UPDATE video_tasks
+     SET status='completed',
+         progress=100,
+         filename=?,
+         cover_image_id=?,
+         error_msg=NULL,
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id=?`,
+  ).run(filename, coverImageId, taskId);
+
+  if (row.project_id && row.group_idx != null) {
+    const groupIdx = Number(row.group_idx);
+    const protectedUrl = `/api/videos/file/${taskId}`;
+    const durationSec = Number(row.duration_sec) || undefined;
+    patchProjectForUser(String(row.project_id), user.id, (fresh) => {
+      if (!fresh) return null;
+      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+      while (videoTasks.length <= groupIdx) videoTasks.push({});
+      videoTasks[groupIdx] = {
+        ...(videoTasks[groupIdx] || {}),
+        groupIdx,
+        taskId,
+        status: 'completed',
+        url: protectedUrl,
+        coverUrl,
+        durationSec,
+        prompt: row.prompt || '',
+      };
+
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      if (storyboards[groupIdx]) {
+        storyboards[groupIdx] = {
+          ...storyboards[groupIdx],
+          videoUrl: protectedUrl,
+          videoTaskId: taskId,
+          videoDurationSec: durationSec || storyboards[groupIdx].videoDurationSec,
+        };
+      }
+      return { videoTasks, storyboards };
+    });
+  }
 }

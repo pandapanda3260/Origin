@@ -1,0 +1,71 @@
+{
+  "sexual": [
+    {
+      "slot": "exposure_costume_state",
+      "pattern": "(袒胸|半敞|露出身体|赤裸上身|裸露上身)",
+      "replacement": "衣袍松垮但完整覆盖身体",
+      "type": "phrase_replace",
+      "reason": "avoid accidental nudity interpretation while preserving loose costume design"
+    },
+    {
+      "slot": "surface_residue",
+      "pattern": "(棒尖|棍端|刀刃|衣角|地面|石阶|树枝|金属表面|道具表面).{0,12}(挂着|沾着|缠着|残留|勾着).{0,8}(一缕|几根)?(黑毛|毛发)",
+      "replacement": "$1有一缕深色布料纤维残留",
+      "type": "phrase_replace",
+      "reason": "avoid ambiguous body-hair phrasing while preserving a dark residue detail"
+    },
+    {
+      "slot": "surface_residue",
+      "pattern": "(black fur|dark hair|fur)\\s+(snagged|caught|stuck)\\s+(on|near)\\s+(one end|the tip|the blade|the edge)",
+      "replacement": "dark fabric fibers caught near the tip",
+      "type": "phrase_replace",
+      "reason": "avoid ambiguous body-hair phrasing while preserving a dark residue detail"
+    }
+  ],
+  "violence": [
+    {
+      "slot": "injury_body_state",
+      "pattern": "(被打晕的小妖[^。；\\n]*|软塌塌倒在[^。；\\n]*|倒在雾后)",
+      "replacement": "远处雾后留下模糊的战后轮廓与散落道具",
+      "type": "clause_replace",
+      "reason": "preserve battle aftermath without depicting an injured body"
+    },
+    {
+      "slot": "battle_trace",
+      "pattern": "(血迹|伤口|流血|blood stains?|wounds?|bleeding)",
+      "replacement": "深色污痕、烟尘与战后磨损",
+      "type": "phrase_replace",
+      "reason": "preserve post-battle texture without explicit injury detail"
+    }
+  ],
+  "unknown": [
+    {
+      "slot": "injury_body_state",
+      "pattern": "(被打晕的小妖[^。；\\n]*|软塌塌倒在[^。；\\n]*|倒在雾后)",
+      "replacement": "远处雾后留下模糊的战后轮廓与散落道具",
+      "type": "clause_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    },
+    {
+      "slot": "exposure_costume_state",
+      "pattern": "(袒胸|半敞|露出身体|赤裸上身|裸露上身)",
+      "replacement": "衣袍松垮但完整覆盖身体",
+      "type": "phrase_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    },
+    {
+      "slot": "surface_residue",
+      "pattern": "(棒尖|棍端|刀刃|衣角|地面|石阶|树枝|金属表面|道具表面).{0,12}(挂着|沾着|缠着|残留|勾着).{0,8}(一缕|几根)?(黑毛|毛发)",
+      "replacement": "$1有一缕深色布料纤维残留",
+      "type": "phrase_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    },
+    {
+      "slot": "surface_residue",
+      "pattern": "(black fur|dark hair|fur)\\s+(snagged|caught|stuck)\\s+(on|near)\\s+(one end|the tip|the blade|the edge)",
+      "replacement": "dark fabric fibers caught near the tip",
+      "type": "phrase_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    }
+  ]
+}

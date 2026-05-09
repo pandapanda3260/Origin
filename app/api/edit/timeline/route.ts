@@ -43,8 +43,8 @@ function sumGroupDuration(proj: any, groupIdx: number): number {
   const sbs: any[] = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
   const sb = sbs[groupIdx];
   if (!sb) return 5;
-  // 关键：优先用真实视频时长（5s/10s 是后端按台词字数动态决定后写入的权威字段）。
-  // 不走这一步会出现"导入剪辑台显示 5s 但实际视频是 10s / 字幕串到下一段"的错位。
+  // 关键：优先用真实生成文件时长；镜头表 duration 只是计划时长。
+  // 不走这一步会出现"计划时长和实际视频文件不一致"导致字幕串到下一段的错位。
   const real = Number(sb.videoDurationSec);
   if (real > 0) return real;
   if (!Array.isArray(sb.shots) || !sb.shots.length) return 5;
@@ -55,10 +55,13 @@ function sumGroupDuration(proj: any, groupIdx: number): number {
 
 function computeReadiness(proj: any) {
   const sbs: any[] = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
+  const videoTasks: any[] = Array.isArray(proj?.videoTasks) ? proj.videoTasks : [];
   const totalCount = sbs.length;
   let readyCount = 0;
-  for (const sb of sbs) {
-    if (sb && typeof sb.videoUrl === 'string' && sb.videoUrl.trim()) readyCount++;
+  for (let i = 0; i < sbs.length; i++) {
+    const sb = sbs[i];
+    const vt = videoTasks[i];
+    if (sb && typeof sb.videoUrl === 'string' && sb.videoUrl.trim() && sb.videoIsCurrent !== false && vt?.isCurrent !== false) readyCount++;
   }
   return {
     totalCount,
@@ -98,9 +101,10 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
       if (!Number.isInteger(idx) || idx < 0 || idx >= sbs.length) {
         return { edl, storyboards: null, error: '非法 groupIdx' };
       }
-      const sb = sbs[idx] || {};
-      if (!sb.videoUrl) {
-        return { edl, storyboards: null, error: '该片段还没有视频，无法导入' };
+	      const sb = sbs[idx] || {};
+	      const vt = Array.isArray(proj?.videoTasks) ? proj.videoTasks[idx] : null;
+	      if (!sb.videoUrl || sb.videoIsCurrent === false || vt?.isCurrent === false) {
+	        return { edl, storyboards: null, error: '该片段还没有视频，无法导入' };
       }
       sbs[idx] = { ...sb, importedToEdit: true };
       sbsTouched = true;

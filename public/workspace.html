@@ -12,7 +12,7 @@
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=59" />
+    <link rel="stylesheet" href="styles.css?v=87" />
     <script>
       tailwind.config = {
         theme: {
@@ -98,10 +98,10 @@
       }
     </style>
   </head>
-  <body class="bg-background text-on-background min-h-screen selection:bg-primary/20" style="padding-top:32px">
+  <body class="bg-background text-on-background min-h-screen selection:bg-primary/20" style="padding-top:var(--top-announcement-height);min-height:calc(100vh - var(--top-announcement-height))">
 
     <!-- ===== Scrolling Announcement Banner ===== -->
-    <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:32px;display:flex;align-items:center;">
+    <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:var(--top-announcement-height);display:flex;align-items:center;">
       <div id="announceTrack" style="display:inline-block;white-space:nowrap;animation:bannerScroll 72s linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;"></div>
     </div>
     <style>
@@ -318,286 +318,310 @@
     <div class="vignette-overlay"></div>
     <main class="main-area ml-72 min-h-screen relative z-10">
 
-      <!-- ══════ 1. 项目总览 ══════ -->
-      <div class="page-scroll p-12" id="pageOverview">
-        <div class="max-w-5xl mx-auto">
-          <header class="mb-12">
-            <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">项目总览</h1>
-            <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1" id="overviewSub">Overview · The Cinema Operating System</p>
-          </header>
+      <!-- ══════ 1. 任务列表 ══════ -->
+      <div class="page-scroll video-task-page" id="pageOverview">
+        <div id="overviewEmpty" class="video-task-empty">
+          <div class="video-task-empty-icon">
+            <span class="material-symbols-outlined">movie</span>
+          </div>
+          <p class="video-task-empty-title">暂无视频任务</p>
+          <p class="video-task-empty-desc">创建一个项目后，即可在这里查看视频生成任务。</p>
+          <div class="video-task-empty-actions">
+            <button type="button" id="btnNewProject" class="vtd-primary-btn">
+              <span class="material-symbols-outlined">add</span>
+              开始新项目
+            </button>
+            <button type="button" id="btnFromTemplate" class="vtd-ghost-btn">
+              <span class="material-symbols-outlined">auto_awesome</span>
+              从模板创建
+            </button>
+          </div>
+        </div>
 
-          <div id="overviewEmpty" class="flex flex-col items-center justify-center py-24 text-center">
-            <div class="text-5xl mb-4 text-primary/30">✦</div>
-            <p class="text-on-surface-variant font-medium">暂无项目</p>
-            <p class="text-outline text-xs mt-1">还没有项目</p>
-            <div class="flex gap-3 mt-6">
-              <button type="button" id="btnNewProject" class="px-8 py-3 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all">
-                开始新项目
+        <div id="overviewContent" class="video-task-dashboard" hidden>
+          <section class="vtd-header">
+            <div class="vtd-header-copy">
+              <p class="vtd-kicker" id="ovProjName"></p>
+              <h1>视频任务列表</h1>
+              <p>管理和查看您的视频生成任务，支持预览、下载、重试及批量操作。</p>
+            </div>
+            <div class="vtd-header-actions">
+              <input type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;">
+              <label class="vtd-search" for="ovTaskSearch">
+                <span class="material-symbols-outlined">search</span>
+                <input type="search" id="ovTaskSearch" name="task_search" value="" aria-label="搜索视频任务" placeholder="搜索任务名称 / ID / 关键词" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" inputmode="search" data-form-type="other" data-lpignore="true" data-1p-ignore="true">
+              </label>
+              <button type="button" class="vtd-toolbar-btn" id="ovTaskFilterBtn">
+                <span class="material-symbols-outlined">filter_list</span>
+                筛选
               </button>
-              <button type="button" id="btnFromTemplate" class="px-8 py-3 bg-surface-container-lowest border border-outline-variant/15 text-on-surface-variant rounded-full font-bold text-sm tracking-wide hover:bg-surface-container-high transition-all flex items-center gap-2">
-                <span class="material-symbols-outlined text-base">auto_awesome</span>从模板创建
+              <button type="button" class="vtd-toolbar-btn" id="ovTaskSortBtn">
+                <span class="material-symbols-outlined">sort</span>
+                排序
+              </button>
+              <button type="button" id="ovNewTaskBtn" class="vtd-primary-btn">
+                <span class="material-symbols-outlined">add</span>
+                新建任务
+              </button>
+              <button type="button" id="btnFromTemplate2" class="vtd-ghost-btn vtd-template-btn">
+                <span class="material-symbols-outlined">auto_awesome</span>
+                从模板创建
               </button>
             </div>
-          </div>
+          </section>
 
-          <div id="overviewContent" hidden>
-            <section class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mb-6">
-              <div class="flex items-center justify-between">
-                <span class="text-xl font-bold tracking-tight text-on-background" id="ovProjName"></span>
-                <div class="flex gap-3">
-                  <button type="button" id="btnResetProject" class="px-5 py-2 text-xs font-bold text-on-surface-variant bg-surface-container rounded-full hover:bg-surface-container-high transition-colors">新建项目</button>
-                  <button type="button" id="btnFromTemplate2" class="px-5 py-2 text-xs font-bold text-on-surface-variant bg-surface-container rounded-full hover:bg-surface-container-high transition-colors flex items-center gap-1.5">
-                    <span class="material-symbols-outlined text-xs">auto_awesome</span>从模板创建
+          <section class="vtd-work-grid">
+            <div class="vtd-panel vtd-list-panel">
+              <div class="vtd-tabs" id="ovTaskTabs">
+                <button type="button" class="is-active" data-ov-status="all">全部任务 <span id="ovTabAll">0</span></button>
+                <button type="button" data-ov-status="running">生成中 <span id="ovTabRunning">0</span></button>
+                <button type="button" data-ov-status="done">已完成 <span id="ovTabDone">0</span></button>
+                <button type="button" data-ov-status="failed">失败 <span id="ovTabFailed">0</span></button>
+                <button type="button" data-ov-status="pending">待处理 <span id="ovTabPending">0</span></button>
+              </div>
+              <div class="vtd-task-list" id="ovTaskList"></div>
+              <div class="vtd-pagination">
+                <div class="vtd-page-buttons">
+                  <button type="button" id="ovTaskPrevPage" aria-label="上一页">
+                    <span class="material-symbols-outlined">chevron_left</span>
                   </button>
-                  <button type="button" id="btnShowProjectList" class="px-5 py-2 text-xs font-bold text-on-surface-variant bg-surface-container rounded-full hover:bg-surface-container-high transition-colors">项目列表</button>
+                  <div id="ovTaskPageNumbers" class="vtd-page-numbers"></div>
+                  <button type="button" id="ovTaskNextPage" aria-label="下一页">
+                    <span class="material-symbols-outlined">chevron_right</span>
+                  </button>
+                </div>
+                <div class="vtd-page-meta">
+                  <span id="ovTaskTotalText">共 0 条</span>
+                  <label>
+                    <select id="ovTaskPageSize">
+                      <option value="5">5 条/页</option>
+                      <option value="10" selected>10 条/页</option>
+                      <option value="20">20 条/页</option>
+                    </select>
+                  </label>
                 </div>
               </div>
-            </section>
+            </div>
 
-            <!-- Phase 5.9：默认展开，让用户登录进来一眼就能看到自己所有项目。
-                 以前默认 hidden 导致用户点了"项目列表"按钮才能看，不少人以为
-                 "账号里一个项目都没有"——服务器明明有 10 个。 -->
-            <section id="projectListSection" class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mb-6">
-              <div class="flex items-center justify-between mb-4">
-                <strong class="text-sm font-bold">项目列表</strong>
-                <button type="button" id="btnCloseProjectList" class="px-4 py-1.5 text-xs font-bold text-on-surface-variant bg-surface-container rounded-full hover:bg-surface-container-high transition-colors">收起</button>
+            <aside class="vtd-panel vtd-detail-panel">
+              <div class="vtd-detail-head">
+                <h2>任务预览与详情</h2>
+                <button type="button" id="ovDownloadVideoBtn" class="vtd-mini-btn">
+                  <span class="material-symbols-outlined">open_in_new</span>
+                  打开视频
+                </button>
               </div>
-              <div id="projectListWrap" class="max-h-[200px] overflow-y-auto"></div>
-            </section>
-
-            <section class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm space-y-3">
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="1" id="ovStep1">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">1</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">剧本生成</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus1">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="script">前往</button>
-              </div>
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="2" id="ovStep2">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">2</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">资产库</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus2">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="assets">前往</button>
-              </div>
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="3" id="ovStep3">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">3</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">镜头设计</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus3">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="shots">前往</button>
-              </div>
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="4" id="ovStep4">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">4</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">分镜图生成</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus4">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="images">前往</button>
-              </div>
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="5" id="ovStep5">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">5</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">视频提示词</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus5">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="prompts">前往</button>
-              </div>
-              <div class="ov-step flex items-center gap-4 p-4 rounded-xl hover:bg-surface-container-low transition-colors" data-step="6" id="ovStep6">
-                <div class="w-10 h-10 rounded-full bg-primary text-on-primary flex items-center justify-center font-bold text-sm shrink-0">6</div>
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-bold text-on-surface">批量视频生成</div>
-                  <div class="text-xs text-on-surface-variant" id="ovStatus6">未开始</div>
-                </div>
-                <button type="button" class="px-5 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="batch">前往</button>
-              </div>
-            </section>
-
-            <section id="projectProfileSection" class="glow-border-wrap rounded-[28px] mt-6">
-              <span class="glow-edge-light"></span>
-              <div class="glow-border-inner p-8">
-              <div class="flex items-center justify-between mb-4">
-                <div class="flex items-center gap-3">
-                  <div class="w-9 h-9 rounded-lg bg-[#5a5e6a]/10 flex items-center justify-center">
-                    <span class="material-symbols-outlined text-[#5a5e6a] text-base" style="font-variation-settings:'FILL' 1">genetics</span>
+              <div class="vtd-detail-main">
+                <div class="vtd-phone-preview" id="ovPreviewWrap"></div>
+                <div class="vtd-detail-stack">
+                  <div class="vtd-param-card">
+                    <h3>视频参数</h3>
+                    <div id="ovParamList" class="vtd-param-list"></div>
                   </div>
-                  <strong class="text-sm font-bold text-[#26353b]">本项目创作偏好</strong>
+                  <div class="vtd-status-card">
+                    <h3>当前状态</h3>
+                    <div id="ovWorkflowStatus" class="vtd-workflow-list"></div>
+                  </div>
                 </div>
-                <label class="relative inline-flex items-center cursor-pointer">
-                  <input type="checkbox" id="toggleProjectProfile" class="sr-only peer">
-                  <div class="w-9 h-5 bg-[#a5b4bc]/20 peer-focus:ring-0 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#5a5e6a]"></div>
-                  <span class="ml-2 text-xs text-[#526168] font-medium">启用项目级覆盖</span>
-                </label>
               </div>
-              <p class="text-xs text-[#526168] mb-4">启用后，此项目将使用自定义偏好覆盖全局设置。关闭则使用全局偏好。</p>
-              <div id="projectProfileEditor" class="space-y-3" hidden>
+              <div class="vtd-prompt-card">
                 <div>
-                  <label class="text-[10px] font-bold tracking-[0.15em] text-[#5a5e6a] uppercase">视觉风格</label>
-                  <input type="text" id="ppVisualStyle" class="w-full mt-1 px-4 py-2.5 bg-white/60 backdrop-blur-md border border-[#a5b4bc]/15 rounded-xl text-sm text-[#26353b] placeholder:text-[#a5b4bc] focus:ring-1 focus:ring-[#5a5e6a]/20 focus:border-[#5a5e6a]/20" placeholder="如：赛博朋克/暗色调/霓虹色彩">
+                  <h3>内容摘要</h3>
+                  <p id="ovPromptSummary">暂无内容摘要</p>
                 </div>
-                <div>
-                  <label class="text-[10px] font-bold tracking-[0.15em] text-[#5a5e6a] uppercase">叙事风格</label>
-                  <input type="text" id="ppNarrativeStyle" class="w-full mt-1 px-4 py-2.5 bg-white/60 backdrop-blur-md border border-[#a5b4bc]/15 rounded-xl text-sm text-[#26353b] placeholder:text-[#a5b4bc] focus:ring-1 focus:ring-[#5a5e6a]/20 focus:border-[#5a5e6a]/20" placeholder="如：快节奏/反转多/对白简短有力">
-                </div>
-                <div>
-                  <label class="text-[10px] font-bold tracking-[0.15em] text-[#5a5e6a] uppercase">镜头偏好</label>
-                  <input type="text" id="ppCameraPrefs" class="w-full mt-1 px-4 py-2.5 bg-white/60 backdrop-blur-md border border-[#a5b4bc]/15 rounded-xl text-sm text-[#26353b] placeholder:text-[#a5b4bc] focus:ring-1 focus:ring-[#5a5e6a]/20 focus:border-[#5a5e6a]/20" placeholder="如：偏好特写+手持/多用快切">
-                </div>
-                <div>
-                  <label class="text-[10px] font-bold tracking-[0.15em] text-[#5a5e6a] uppercase">情绪基调</label>
-                  <input type="text" id="ppMoodTone" class="w-full mt-1 px-4 py-2.5 bg-white/60 backdrop-blur-md border border-[#a5b4bc]/15 rounded-xl text-sm text-[#26353b] placeholder:text-[#a5b4bc] focus:ring-1 focus:ring-[#5a5e6a]/20 focus:border-[#5a5e6a]/20" placeholder="如：压抑/紧张/偶尔温情">
-                </div>
-                <div>
-                  <label class="text-[10px] font-bold tracking-[0.15em] text-[#5a5e6a] uppercase">提示词习惯</label>
-                  <input type="text" id="ppPromptHabits" class="w-full mt-1 px-4 py-2.5 bg-white/60 backdrop-blur-md border border-[#a5b4bc]/15 rounded-xl text-sm text-[#26353b] placeholder:text-[#a5b4bc] focus:ring-1 focus:ring-[#5a5e6a]/20 focus:border-[#5a5e6a]/20" placeholder="如：喜欢用体积光/雨景/颗粒感">
-                </div>
-                <button type="button" id="btnSaveProjectProfile" class="px-7 py-3 bg-[#5a5e6a] text-white rounded-xl text-xs font-bold tracking-[0.1em] uppercase hover:opacity-90 transition-all mt-2 shadow-[0_0_40px_rgba(90,94,106,0.06)]">保存项目偏好</button>
               </div>
+            </aside>
+          </section>
+
+          <section class="vtd-bottom-grid">
+            <div class="vtd-panel vtd-overview-card">
+              <div class="vtd-section-head">
+                <h2>任务概览</h2>
+                <span id="ovStatsDate">今天</span>
               </div>
-            </section>
-          </div>
+              <div class="vtd-stat-grid" id="ovStatsGrid"></div>
+            </div>
+            <div class="vtd-panel vtd-trend-card">
+              <div class="vtd-section-head">
+                <h2>生成趋势</h2>
+                <span>近 7 天</span>
+              </div>
+              <div id="ovTrendChart" class="vtd-trend-chart"></div>
+            </div>
+            <div class="vtd-panel vtd-activity-card">
+              <div class="vtd-section-head">
+                <h2>最近动态</h2>
+              </div>
+              <div id="ovActivityList" class="vtd-activity-list"></div>
+            </div>
+          </section>
         </div>
       </div>
 
       <!-- ══════ 2. 剧本生成 ══════ -->
-      <div class="page-scroll !p-0 !overflow-hidden relative" id="pageScript" hidden>
-        <div class="flex h-screen">
-
-          <!-- Script Library Panel (collapsible, glass sidebar) -->
-          <aside id="scriptLibPanel" class="script-lib-panel script-lib--collapsed">
-            <div class="script-lib-collapsed-strip" id="scriptLibToggle">
-              <span class="material-symbols-outlined" style="font-size:18px;font-variation-settings:'FILL' 1">auto_stories</span>
-              <span style="font-size:11px;font-weight:700;color:#26353b;letter-spacing:0.15em">剧本库</span>
-              <span style="font-size:7px;font-weight:600;letter-spacing:0.08em;color:rgba(82,97,104,0.35);text-transform:uppercase">Scripts</span>
-              <span class="script-lib-badge" id="scriptLibBadge" hidden>0</span>
+      <div class="page-scroll script-page-scroll" id="pageScript" hidden>
+        <div class="script-dashboard-shell">
+          <header class="script-dashboard-header">
+            <div class="script-title-block">
+              <div class="script-title-row">
+                <h1>剧本创作</h1>
+                <span>SCRIPT PHASE · 迭代创作</span>
+              </div>
             </div>
-            <div class="script-lib-expanded">
-              <div class="script-lib-header">
-                <div class="flex items-center justify-between w-full">
+            <div class="script-header-actions">
+              <!-- TODO: 历史版本与设置入口保留给后续版本管理/页面配置功能接入。 -->
+              <button type="button" id="btnScriptHistory" class="script-toolbar-btn">
+                <span class="material-symbols-outlined">history</span>
+                <span>历史版本</span>
+              </button>
+              <button type="button" id="btnScriptSettings" class="script-toolbar-btn">
+                <span class="material-symbols-outlined">settings</span>
+                <span>设置</span>
+              </button>
+              <button type="button" id="btnScriptHeaderRegen" class="script-toolbar-btn script-toolbar-btn--primary">
+                <span class="material-symbols-outlined">auto_awesome</span>
+                <span>重新生成</span>
+              </button>
+            </div>
+          </header>
+
+          <section class="script-dashboard-grid">
+            <aside id="scriptLibPanel" class="script-lib-panel script-library-panel script-lib--expanded">
+              <div class="script-lib-collapsed-strip" id="scriptLibToggle" hidden>
+                <span class="material-symbols-outlined">auto_stories</span>
+                <span>剧本库</span>
+                <span class="script-lib-badge" id="scriptLibCollapsedBadge" hidden>0</span>
+              </div>
+              <div class="script-lib-expanded script-panel-inner">
+                <div class="script-panel-heading">
                   <div>
-                    <span class="text-base font-bold tracking-wide text-[#26353b]">剧本库</span>
-                    <p class="text-[9px] font-bold tracking-[0.18em] text-[#526168]/50 uppercase mt-0.5">Script Library</p>
+                    <h2>剧本库</h2>
+                    <p>SCRIPT LIBRARY</p>
                   </div>
-                  <button type="button" id="scriptLibClose" class="w-7 h-7 rounded-full hover:bg-black/5 flex items-center justify-center transition-all active:scale-90">
-                    <span class="material-symbols-outlined text-[#a5b4bc]" style="font-size:18px">chevron_left</span>
+                  <span class="script-count-pill" id="scriptLibBadge" hidden>0</span>
+                </div>
+                <div class="script-library-actions">
+                  <button type="button" id="btnNewScript" class="script-action-btn script-action-btn--primary">
+                    <span class="material-symbols-outlined">add</span>
+                    <span>新建</span>
                   </button>
+                  <button type="button" id="btnUploadScript" class="script-action-btn">
+                    <span class="material-symbols-outlined">upload_file</span>
+                    <span>上传</span>
+                  </button>
+                  <input type="file" id="scriptFileInput" accept=".txt,.docx,.doc" hidden />
                 </div>
+                <div class="script-library-subbar">
+                  <span>全部文档</span>
+                  <span class="material-symbols-outlined">sort</span>
+                </div>
+                <div class="script-lib-list script-library-list" id="scriptLibList"></div>
               </div>
-              <div class="script-lib-actions" style="display:flex;gap:6px;">
-                <button type="button" id="btnNewScript" class="script-lib-upload-btn" style="background:#0B1320;color:#fff;flex:1;">
-                  <span class="material-symbols-outlined" style="font-size:16px">add</span>
-                  <span>新建</span>
-                </button>
-                <button type="button" id="btnUploadScript" class="script-lib-upload-btn" style="flex:1;">
-                  <span class="material-symbols-outlined" style="font-size:16px">upload_file</span>
-                  <span>上传</span>
-                </button>
-                <input type="file" id="scriptFileInput" accept=".txt,.docx,.doc" hidden />
+            </aside>
+
+            <section class="script-workbench-panel script-panel">
+              <div class="script-panel-heading">
+                <div>
+                  <h2>剧本工作台</h2>
+                  <p>SCRIPT WORKBENCH</p>
+                </div>
+                <span class="script-workbench-status">草稿编辑</span>
               </div>
-              <div class="script-lib-subtitle">收录文档</div>
-              <div class="script-lib-list" id="scriptLibList"></div>
-            </div>
-          </aside>
 
-          <!-- Left: iMessage-style Chat -->
-          <section class="flex-1 flex flex-col relative min-w-0">
-            <!-- Top header -->
-            <div class="shrink-0 px-12 pt-8 pb-4 border-b border-outline-variant/5 bg-background/80 backdrop-blur-xl z-10">
-              <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">剧本创作</h1>
-              <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Script Phase · 迭代创作</p>
-            </div>
-
-            <!-- Chat messages — scrollable, fills all space -->
-            <div class="flex-1 overflow-y-auto elegant-scroll" id="chatMessages">
-              <div class="max-w-2xl mx-auto px-12 pt-8 pb-44 space-y-6">
-                <div id="chatWelcome" class="flex flex-col items-center justify-center py-24 text-center">
-                  <div class="w-16 h-16 rounded-2xl bg-primary/5 flex items-center justify-center mb-6">
-                    <span class="material-symbols-outlined text-primary text-2xl" style="font-variation-settings:'FILL' 1">auto_awesome</span>
+              <div class="script-workbench-scroll elegant-scroll" id="chatMessages">
+                <div id="chatWelcome" class="script-welcome-card">
+                  <div class="script-welcome-icon">
+                    <span class="material-symbols-outlined">auto_awesome</span>
                   </div>
-                  <p class="text-on-surface-variant text-sm leading-relaxed">输入你的一句话创意<br/>我来为你编写完整短视频剧本</p>
+                  <h3>暂无剧本草稿</h3>
+                  <p>输入一句创意，AI 会先帮你梳理需求，再生成可继续迭代的短视频剧本。</p>
                 </div>
 
-                <!-- Script result card (appears in chat flow) -->
-                <div id="scriptResultCard" class="chat-msg chat-msg--ai" hidden>
-                  <div class="chat-avatar w-8 h-8 rounded-full bg-secondary-container/30 flex items-center justify-center shrink-0">
-                    <span class="material-symbols-outlined text-primary text-sm" style="font-variation-settings:'FILL' 1">auto_awesome</span>
+                <div id="scriptResultCard" class="chat-msg chat-msg--ai script-result-card" hidden>
+                  <div class="chat-avatar">
+                    <span class="material-symbols-outlined">auto_awesome</span>
                   </div>
-                  <div class="flex-1 min-w-0">
-                    <div class="script-card bg-white rounded-2xl border border-[#CFD8DC] shadow-sm overflow-hidden">
-                      <div class="px-6 py-4 border-b border-[#CFD8DC]/60 bg-[#ECEFF1]/50">
-                        <div class="flex items-center gap-2">
-                          <span class="material-symbols-outlined text-primary text-base">movie_creation</span>
-                          <span class="text-[10px] font-black tracking-[0.15em] text-primary uppercase">ORIGINRISE · AI</span>
+                  <div class="script-result-content">
+                    <div class="script-card script-draft-card">
+                      <div class="script-draft-head">
+                        <div>
+                          <div class="script-draft-brand">
+                            <span class="material-symbols-outlined">movie_creation</span>
+                            <span>ORIGINRISE · AI</span>
+                          </div>
+                          <h3 id="scriptCardTitle">剧本草稿</h3>
                         </div>
-                        <h3 class="text-lg font-semibold text-on-background mt-2" id="scriptCardTitle">剧本草稿</h3>
+                        <div class="script-draft-meta">
+                          <span>草稿 · 未确认</span>
+                          <small>版本 1.0 · 刚刚</small>
+                        </div>
                       </div>
-                      <div class="px-6 py-5 relative">
-                        <div id="scriptBodyWrap" class="flex gap-0">
-                          <div id="scriptTextCol" class="flex-1 min-w-0">
-                            <p id="scriptStreamStep" class="text-[10px] font-bold text-primary/80 tracking-wide mb-2 hidden"></p>
-                            <div id="scriptDisplayText" class="text-sm text-on-surface leading-[1.9] whitespace-pre-wrap cursor-pointer hover:bg-[#ECEFF1]/50 rounded-lg transition-colors -mx-2 px-2 py-1" title="点击编辑"></div>
-                            <textarea id="scriptOutput" rows="10" class="hidden w-full bg-[#ECEFF1]/50 border border-[#CFD8DC]/60 rounded-xl p-4 text-sm text-on-surface leading-[1.9] focus:ring-1 focus:ring-primary/30 resize-y mt-2"></textarea>
+                      <div class="script-draft-body">
+                        <div id="scriptBodyWrap" class="script-body-wrap">
+                          <div id="scriptTextCol" class="script-text-col">
+                            <p id="scriptStreamStep" class="script-stream-step hidden"></p>
+                            <div id="scriptDisplayText" class="script-display-text" title="点击编辑"></div>
+                            <textarea id="scriptOutput" rows="10" class="script-output hidden"></textarea>
                           </div>
                           <div id="emotionRuler" class="emotion-ruler" hidden></div>
-                          <button type="button" id="btnRetagEmotions" class="absolute top-3 right-4 px-3 py-1 text-[10px] font-bold tracking-[0.1em] text-on-surface-variant border border-[#CFD8DC] rounded-full hover:bg-[#ECEFF1] transition-colors uppercase" hidden>重新分析情绪</button>
+                          <button type="button" id="btnRetagEmotions" class="script-retag-btn" hidden>重新分析情绪</button>
                         </div>
                       </div>
-                      <div class="px-6 py-4 border-t border-[#CFD8DC]/60 flex items-center gap-3">
-                        <button type="button" id="btnEditScript" class="px-5 py-2 text-[10px] font-bold tracking-[0.1em] text-primary border border-primary/20 rounded-full hover:bg-primary/5 transition-colors uppercase">编辑剧本</button>
-                        <button type="button" id="btnRegenScript" class="px-5 py-2 text-[10px] font-bold tracking-[0.1em] text-on-surface-variant border border-[#CFD8DC] rounded-full hover:bg-[#ECEFF1] transition-colors uppercase">重新生成</button>
-                        <button type="button" id="btnExpandScript" class="px-5 py-2 text-[10px] font-bold tracking-[0.1em] text-on-surface-variant border border-[#CFD8DC] rounded-full hover:bg-[#ECEFF1] transition-colors uppercase flex items-center gap-1">
-                          <span class="material-symbols-outlined text-xs">add_circle</span>扩充剧本
-                        </button>
-                      </div>
-                    </div>
-                    <!-- Confirm button below script card -->
-                    <div id="scriptConfirmArea" class="mt-4" hidden>
-                      <button type="button" id="btnConfirmScript" class="w-full py-3.5 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center justify-center gap-2">
-                        <span>确认剧本，进入资产库</span>
-                        <span class="material-symbols-outlined text-base">arrow_forward</span>
-                      </button>
                     </div>
                   </div>
                 </div>
               </div>
-            </div>
 
-            <!-- Fixed input bar at bottom -->
-            <div class="absolute bottom-0 left-0 right-0 z-20 pointer-events-none" style="right: var(--bible-width, 0px)">
-              <div class="bg-gradient-to-t from-background via-background/95 to-transparent pt-12 pb-6 px-12 pointer-events-auto">
-                <div class="max-w-2xl mx-auto">
-                  <div id="scriptInputWrap" class="glow-border-wrap rounded-[28px]">
-                    <span class="glow-edge-light"></span>
-                    <div class="glow-border-inner p-2 flex-row !flex items-center">
-                      <textarea id="ideaInput" rows="1" class="flex-1 bg-transparent border-none focus:ring-0 px-6 py-2 text-sm placeholder:text-white/35 text-white/90 resize-none leading-relaxed" placeholder="聊聊你想拍什么，AI 先陪你把需求聊清楚…"></textarea>
-                      <button type="button" id="btnGenScript" class="w-11 h-11 rounded-full bg-white text-[#0B1320] flex items-center justify-center hover:scale-95 active:scale-90 transition-transform duration-200 shrink-0 shadow-md" title="发送">
-                        <span class="material-symbols-outlined" style="font-size:18px">north</span>
-                      </button>
-                    </div>
-                  </div>
-                  <div id="scriptExampleChips" class="flex flex-wrap gap-2 mt-3 justify-center max-w-2xl mx-auto">
-                    <button type="button" class="script-chip px-3 py-1.5 rounded-full text-[10px] font-semibold bg-white/10 text-white/80 hover:bg-white/20 border border-white/10 transition-colors" data-idea="30秒美妆产品种草短视频，清新自然风格">30秒美妆种草</button>
-                    <button type="button" class="script-chip px-3 py-1.5 rounded-full text-[10px] font-semibold bg-white/10 text-white/80 hover:bg-white/20 border border-white/10 transition-colors" data-idea="1分钟悬疑短剧第一集，都市夜景开场">悬疑短剧开篇</button>
-                    <button type="button" class="script-chip px-3 py-1.5 rounded-full text-[10px] font-semibold bg-white/10 text-white/80 hover:bg-white/20 border border-white/10 transition-colors" data-idea="产品开箱测评，轻松幽默口播，竖屏9:16">竖屏开箱测评</button>
-                  </div>
+              <div class="script-workbench-footer">
+                <div class="script-draft-actions">
+                  <button type="button" id="btnEditScript" class="script-mini-btn">
+                    <span class="material-symbols-outlined">edit</span>
+                    <span>编辑剧本</span>
+                  </button>
+                  <button type="button" id="btnRegenScript" class="script-mini-btn">
+                    <span class="material-symbols-outlined">refresh</span>
+                    <span>重新生成</span>
+                  </button>
+                  <button type="button" id="btnExpandScript" class="script-mini-btn">
+                    <span class="material-symbols-outlined">add_circle</span>
+                    <span>扩充剧本</span>
+                  </button>
+                </div>
+                <div id="scriptConfirmArea" class="script-confirm-area" hidden>
+                  <button type="button" id="btnConfirmScript" class="script-confirm-btn">
+                    <span>确认剧本，进入资产库</span>
+                    <span class="material-symbols-outlined">arrow_forward</span>
+                  </button>
+                </div>
+                <div id="scriptInputWrap" class="script-command-box">
+                  <textarea id="ideaInput" rows="1" class="script-command-input" placeholder="输入修改指令，例如：让开头更紧凑，增加一段打斗，换个结局..."></textarea>
+                  <button type="button" id="btnGenScript" class="script-send-btn" title="发送">
+                    <span class="material-symbols-outlined">north</span>
+                  </button>
+                </div>
+                <div id="scriptExampleChips" class="script-quick-chips">
+                  <button type="button" class="script-chip" data-idea="把当前剧本压缩成30秒版本，节奏更紧凑，保留核心反转">30秒紧凑精简</button>
+                  <button type="button" class="script-chip" data-idea="加强悬疑氛围，增加不安的环境细节和镜头铺垫">悬疑氛围加强</button>
+                  <button type="button" class="script-chip" data-idea="把开场改成更轻松的喜剧节奏，人物对白更有反差">喜剧开场重写</button>
+                  <button type="button" class="script-chip" data-idea="在结尾增加一次反转，让观众重新理解前面的伏笔">增加反转结尾</button>
                 </div>
               </div>
-            </div>
+            </section>
+
+            <aside id="styleBibleCard" class="script-style-panel script-panel" hidden>
+              <div class="script-panel-heading">
+                <div>
+                  <h2>风格圣经</h2>
+                  <p>STYLE BIBLE</p>
+                </div>
+                <button type="button" id="btnRegenBible" class="script-soft-btn">
+                  <span class="material-symbols-outlined">auto_awesome</span>
+                  <span>重新生成</span>
+                </button>
+              </div>
+              <div id="styleBiblePreview" class="script-style-preview elegant-scroll"></div>
+            </aside>
           </section>
-
-          <!-- Right: Style Bible sidebar -->
-          <aside id="styleBibleCard" class="w-[380px] shrink-0 bg-[#ECEFF1] border-l border-[#CFD8DC] flex flex-col overflow-hidden" hidden>
-            <div class="px-8 pt-8 pb-4 shrink-0 border-b border-[#CFD8DC]/60">
-              <div class="flex items-center justify-between">
-                <h4 class="text-[11px] font-black tracking-[0.2em] text-primary uppercase">风格圣经</h4>
-                <button type="button" id="btnRegenBible" class="px-4 py-1.5 text-[10px] font-bold text-on-surface-variant bg-surface-container rounded-full hover:bg-surface-container-high transition-colors">重新生成</button>
-              </div>
-            </div>
-            <div id="styleBiblePreview" class="flex-1 overflow-y-auto elegant-scroll px-8 py-6 space-y-8"></div>
-          </aside>
         </div>
       </div>
 
@@ -793,7 +817,7 @@
         <div class="px-12 pt-10 pb-4 flex items-end justify-between shrink-0">
           <div>
             <h1 class="text-4xl font-extralight tracking-tighter text-on-background opacity-90">Storyboard Gallery</h1>
-            <p class="text-on-surface-variant font-medium text-sm tracking-wide mt-1" id="imagesHint">AI 自动生成提示词并绘制分镜板</p>
+            <p class="text-on-surface-variant font-medium text-sm tracking-wide mt-1" id="imagesHint">基于镜头与资产自动绘制分镜板</p>
           </div>
           <div class="flex items-center gap-3" id="imagesActionBar" hidden>
             <button type="button" id="btnGenAllImages" class="px-6 py-3 bg-primary text-on-primary rounded-xl text-[11px] font-bold tracking-widest uppercase flex items-center gap-2 hover:opacity-90 transition-all shadow-lg active:scale-95">
@@ -897,7 +921,7 @@
               <div class="mt-8 mb-2">
                 <div class="bg-white/40 backdrop-blur-[40px] border border-outline-variant/20 rounded-full px-8 py-4 flex items-center gap-4 shadow-2xl">
                   <span class="material-symbols-outlined text-primary">auto_awesome</span>
-                  <input type="text" id="vpRefineInput" class="flex-grow bg-transparent border-none focus:ring-0 text-sm placeholder:text-outline/60 text-on-surface font-medium" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" />
+                  <input type="text" id="vpRefineInput" name="video_prompt_refine_instruction" class="flex-grow bg-transparent border-none focus:ring-0 text-sm placeholder:text-outline/60 text-on-surface font-medium" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" data-form-type="other" data-lpignore="true" data-1p-ignore="true" />
                   <button type="button" id="vpBtnRefine" class="bg-on-background text-background w-10 h-10 rounded-full flex items-center justify-center hover:scale-110 transition-transform active:scale-95">
                     <span class="material-symbols-outlined text-sm">arrow_upward</span>
                   </button>
@@ -1601,7 +1625,7 @@
     </main>
 
     <!-- ===== Agent FAB (右下角悬浮按钮) ===== -->
-    <button type="button" id="navAgent" class="agent-fab" title="AI 视频助手">
+    <button type="button" id="navAgent" class="agent-fab" title="AI 视频助手（可拖动）" aria-label="AI 视频助手（可拖动）">
       <span class="material-symbols-outlined agent-fab-icon" style="font-variation-settings:'FILL' 0">auto_awesome</span>
       <span class="agent-fab-pulse"></span>
     </button>
@@ -1659,29 +1683,29 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=100",
+        "/modules/assets.js":         "/modules/assets.js?v=102",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
-        "/modules/edit.js":           "/modules/edit.js?v=100",
+        "/modules/edit.js":           "/modules/edit.js?v=101",
         "/modules/episodes.js":       "/modules/episodes.js?v=100",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/project.js":        "/modules/project.js?v=100",
         "/modules/render_hooks.js":   "/modules/render_hooks.js?v=100",
-        "/modules/script.js":         "/modules/script.js?v=100",
+        "/modules/script.js":         "/modules/script.js?v=103",
         "/modules/settings.js":       "/modules/settings.js?v=100",
         "/modules/shots.js":          "/modules/shots.js?v=100",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=100",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=101",
         "/modules/tasks.js":          "/modules/tasks.js?v=100",
         "/modules/utils.js":          "/modules/utils.js?v=100",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=100",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=100"
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=101",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=106"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=100"></script>
-    <script type="module" src="main.js?v=100"></script>
+    <script type="module" src="main.js?v=126"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

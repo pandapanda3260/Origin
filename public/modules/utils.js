@@ -160,7 +160,9 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
 // 这里仅保留注释占位，勿复活。
 
 const _assetUrlCache = new Map();
+const _videoUrlCache = new Map();
 const _INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
+const _INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
 const _protectedImageBlobCache = new Map();
 
 export async function fetchAssetSignedUrl(assetId, ttl) {
@@ -195,6 +197,55 @@ export async function fetchAssetSignedUrl(assetId, ttl) {
   var ttlSec = Math.max(60, Math.min(parseInt((data && data.ttl) || ttl, 10) || 3600, 7 * 24 * 3600));
   if (url) _assetUrlCache.set(assetId, { url: url, expiresAt: now + Math.max(30000, (ttlSec - 30) * 1000) });
   return url;
+}
+
+function _signedUrlStillValid(url) {
+  url = String(url || '').trim();
+  if (!url || url.indexOf('sig=') < 0 || url.indexOf('exp=') < 0) return false;
+  try {
+    var u = new URL(url, window.location.origin);
+    var exp = parseInt(u.searchParams.get('exp') || '0', 10);
+    return Number.isFinite(exp) && exp * 1000 > Date.now() + 5000;
+  } catch (_e) {
+    return false;
+  }
+}
+
+export async function fetchVideoSignedUrl(videoUrl, ttl) {
+  videoUrl = String(videoUrl || '').trim();
+  ttl = ttl || 3600;
+  if (!videoUrl) return '';
+  var m = _INTERNAL_VIDEO_RE.exec(videoUrl);
+  if (!m) return videoUrl;
+  if (_signedUrlStillValid(videoUrl)) return videoUrl;
+
+  var videoId = m[1];
+  var now = Date.now();
+  var cached = _videoUrlCache.get(videoId);
+  if (cached && cached.url && cached.expiresAt > now + 5000) return cached.url;
+
+  var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  if (ctl) {
+    timer = setTimeout(function () { try { ctl.abort(); } catch (_) {} }, 8000);
+  }
+  var data = null;
+  try {
+    var resp = await fetch(
+      '/api/videos/' + encodeURIComponent(videoId) + '/url?ttl=' + encodeURIComponent(String(ttl)),
+      { headers: getAuthHeaders(), signal: ctl ? ctl.signal : undefined },
+    );
+    checkAuth(resp);
+    data = await _safeJson(resp);
+  } catch (_e) {
+    return videoUrl;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  var url = data && data.url ? data.url : '';
+  var ttlSec = Math.max(60, Math.min(parseInt((data && data.ttl) || ttl, 10) || 3600, 7 * 24 * 3600));
+  if (url) _videoUrlCache.set(videoId, { url: url, expiresAt: now + Math.max(30000, (ttlSec - 30) * 1000) });
+  return url || videoUrl;
 }
 
 async function _applyResolvedUrl(obj, assetKey, urlKeys) {
@@ -232,6 +283,38 @@ async function _applySignedUrlForStoredImage(obj, urlKeys) {
   }));
 }
 
+async function _applySignedUrlForStoredVideo(obj, urlKeys) {
+  if (!obj || !urlKeys || !urlKeys.length) return;
+  await Promise.all(urlKeys.map(async function (key) {
+    var current = obj[key] || '';
+    var originKey = '_origin' + key.charAt(0).toUpperCase() + key.slice(1);
+    var origin = obj[originKey] || current;
+    if (!origin) return;
+    var m = _INTERNAL_VIDEO_RE.exec(origin);
+    if (!m) return;
+
+    var cleanOrigin = '/api/videos/file/' + m[1];
+    if (typeof obj[originKey] === 'undefined' && current && current.indexOf('?') >= 0) {
+      obj[originKey] = cleanOrigin;
+    }
+    var url = await fetchVideoSignedUrl(cleanOrigin);
+    if (!url || url === origin) return;
+    if (typeof obj[originKey] === 'undefined') {
+      obj[originKey] = current && current.indexOf('?') >= 0 ? cleanOrigin : current;
+    }
+    obj[key] = url;
+  }));
+}
+
+function _hydrateEditVideoUrls(editData, jobs) {
+  if (!editData || !jobs) return;
+  var edl = editData.edl || {};
+  (edl.timeline || []).forEach(function (item) {
+    if (!item) return;
+    jobs.push(_applySignedUrlForStoredVideo(item, ['videoUrl']));
+  });
+}
+
 function _hydrateAssetCollection(assets, jobs) {
   if (!assets || !jobs) return;
   (assets.characters || []).forEach(function (ch) {
@@ -260,6 +343,7 @@ export async function hydrateProjectAssetUrls(project) {
     jobs.push(_applyResolvedUrl(sb, 'imageAssetId', ['imageUrl', 'rawUrl']));
     jobs.push(_applyResolvedUrl(sb, 'videoAssetId', ['videoUrl']));
     jobs.push(_applySignedUrlForStoredImage(sb, ['imageUrl', 'rawUrl', 'pencilUrl']));
+    jobs.push(_applySignedUrlForStoredVideo(sb, ['videoUrl']));
   });
 
   _hydrateAssetCollection(project.assets || {}, jobs);
@@ -274,8 +358,10 @@ export async function hydrateProjectAssetUrls(project) {
     (ep.storyboards || []).forEach(function (sb) {
       if (!sb) return;
       jobs.push(_applySignedUrlForStoredImage(sb, ['imageUrl', 'rawUrl', 'pencilUrl']));
+      jobs.push(_applySignedUrlForStoredVideo(sb, ['videoUrl']));
     });
   });
+  _hydrateEditVideoUrls(project.editData || {}, jobs);
   (project.videoTasks || []).forEach(function (task) {
     if (!task) return;
     jobs.push(_applySignedUrlForStoredImage(task, ['coverUrl']));

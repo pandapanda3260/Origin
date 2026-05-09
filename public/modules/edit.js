@@ -2,7 +2,7 @@
  * Edit workbench module — extracted from main.js (stage 2 refactor).
  * Call initEdit(ctx) once at startup, then syncEditProject(p) whenever project changes.
  */
-import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl } from './utils.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
 
@@ -49,6 +49,7 @@ async function _resyncEditDataFromServer() {
     var ed = latest.editData || {};
     if (!project.editData) project.editData = {};
     if (ed.edl) {
+      await _hydrateEdlVideoUrls(ed.edl);
       project.editData.edl = ed.edl; // arch-guard:allow-editdata 强同步回灌
       _editState.edl = ed.edl;
     }
@@ -101,19 +102,71 @@ export function syncEditProject(p) {
     _undoPtr: -1,
   };
 
+  var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
+
+  function _protectedVideoUrlFrom(url) {
+    url = String(url || '').trim();
+    if (!url) return '';
+    var m = _PROTECTED_VIDEO_RE.exec(url);
+    return m ? '/api/videos/file/' + m[1] : '';
+  }
+
+  function _segPersistedVideoUrl(seg) {
+    if (!seg) return '';
+    return seg._originVideoUrl || seg.protectedUrl || _protectedVideoUrlFrom(seg.videoUrl) || seg.videoUrl || '';
+  }
+
+  async function _hydrateVideoEntryUrl(entry) {
+    if (!entry) return;
+    var origin = _segPersistedVideoUrl(entry);
+    if (!_protectedVideoUrlFrom(origin)) return;
+    try {
+      var runtimeUrl = await fetchVideoSignedUrl(origin);
+      if (runtimeUrl && runtimeUrl !== origin) {
+        if (typeof entry._originVideoUrl === 'undefined') entry._originVideoUrl = origin;
+        entry.protectedUrl = origin;
+        entry.videoUrl = runtimeUrl;
+      }
+    } catch (_e) {}
+  }
+
+  async function _hydrateEdlVideoUrls(edl) {
+    if (!edl || !Array.isArray(edl.timeline)) return edl;
+    await Promise.all(edl.timeline.map(function (entry) {
+      return _hydrateVideoEntryUrl(entry);
+    }));
+    return edl;
+  }
+
+  function _entryForPersistence(entry) {
+    var out = Object.assign({}, entry || {});
+    out.videoUrl = _segPersistedVideoUrl(entry);
+    delete out._originVideoUrl;
+    delete out.protectedUrl;
+    return out;
+  }
+
+  function _edlForPersistence(edl) {
+    if (!edl || typeof edl !== 'object') return edl;
+    var out = Object.assign({}, edl);
+    out.timeline = Array.isArray(edl.timeline) ? edl.timeline.map(_entryForPersistence) : [];
+    return out;
+  }
+
   function _getEditSegments() {
     if (!project || !project.storyboards) return [];
     var groups = _ctx.getStoryboardGroups ? _ctx.getStoryboardGroups() : [];
     var segs = [];
     for (var gi = 0; gi < groups.length; gi++) {
-      var g = groups[gi];
-      var sb = (project.storyboards && project.storyboards[gi]) || {};
-      if (!sb.videoUrl) continue;
-      if (sb.importedToEdit !== true) continue;
+	      var g = groups[gi];
+	      var sb = (project.storyboards && project.storyboards[gi]) || {};
+	      if (!sb.videoUrl) continue;
+	      var vt = Array.isArray(project.videoTasks) ? project.videoTasks[gi] : null;
+	      if (sb.videoIsCurrent === false || (vt && vt.isCurrent === false)) continue;
+	      if (sb.importedToEdit !== true) continue;
       var shots = g.shots || [];
-      // 真实视频时长由后端按台词字数决定（5s 或 10s），sb.videoDurationSec 是
-      // 后端写入的权威值。fallback 到 shots[].duration 累加只是为了兼容老数据
-      // （那种情况会在 AI 剪辑后被纠正成真实值）。
+      // sb.videoDurationSec 是真实生成文件时长；fallback 到 shots[].duration 累加
+      // 只是为了兼容老数据或尚未生成视频的预估。
       var dur = Number(sb.videoDurationSec) || 0;
       if (!dur) {
         shots.forEach(function (shot) { dur += (shot.duration || 4); });
@@ -121,6 +174,8 @@ export function syncEditProject(p) {
       segs.push({
         groupIdx: g.groupIdx != null ? g.groupIdx : gi,
         videoUrl: sb.videoUrl,
+        protectedUrl: _segPersistedVideoUrl(sb),
+        _originVideoUrl: _segPersistedVideoUrl(sb),
         thumbnailUrl: sb.imageUrl || sb.rawUrl || "",
         shotIndices: g.shotIndices || [],
         duration: dur || 5,
@@ -144,7 +199,7 @@ export function syncEditProject(p) {
   function _sendTimelineOp(body, onError) {
     if (!project || !project.id) return Promise.resolve(null);
     var payload = Object.assign({ projectId: project.id }, body || {});
-    return apiPost("/api/edit/timeline", payload).then(function (resp) {
+    return apiPost("/api/edit/timeline", payload).then(async function (resp) {
       if (!resp || !resp.ok) {
         var msg = (resp && resp.error) || "保存失败";
         if (onError) try { onError(msg); } catch (_e) {}
@@ -161,6 +216,7 @@ export function syncEditProject(p) {
         _ctx.bumpProjectVersion(resp.serverVersion);
       }
       if (resp.edl && project) {
+        await _hydrateEdlVideoUrls(resp.edl);
         _editState.edl = resp.edl;
         if (!project.editData) project.editData = {};
         project.editData.edl = resp.edl; // arch-guard:allow-editdata 内存镜像（后端已权威落盘）
@@ -189,8 +245,8 @@ export function syncEditProject(p) {
   }
 
   function _sumGroupDuration(groupIdx) {
-    // 优先用真实视频时长（后端按台词字数动态决定 5s / 10s 后落到 storyboard）。
-    // 退回 shots[].duration 累加只是兼容老数据 / 视频还没生成时的预估。
+    // 优先用真实视频时长；退回 shots[].duration 累加只是兼容老数据 /
+    // 视频还没生成时的预估。
     var sb = (project && Array.isArray(project.storyboards)) ? project.storyboards[groupIdx] : null;
     if (sb && Number(sb.videoDurationSec) > 0) return Number(sb.videoDurationSec);
     var groups = _ctx.getStoryboardGroups ? _ctx.getStoryboardGroups() : [];
@@ -244,6 +300,8 @@ export function syncEditProject(p) {
         _editState.edl.timeline.push({
           groupIdx: groupIdx,
           videoUrl: sb.videoUrl,
+          protectedUrl: _segPersistedVideoUrl(sb),
+          _originVideoUrl: _segPersistedVideoUrl(sb),
           inPoint: 0,
           outPoint: dur,
           duration: dur,
@@ -966,7 +1024,7 @@ export function syncEditProject(p) {
     }
     // E-4.2：undo 用"整包 set-edl"op 推到后端——实现简单、后端无需理解具体差异，
     // 也避免了只改单字段时后端校验失败导致栈错位。
-    _sendTimelineOp({ op: "set-edl", edl: snap });
+    _sendTimelineOp({ op: "set-edl", edl: _edlForPersistence(snap) });
     _buildSegStartTimes();
     _renderEditTimeline();
     _updatePlayhead();
@@ -982,7 +1040,7 @@ export function syncEditProject(p) {
       if (!project.editData) project.editData = {};
       project.editData.edl = snap; // arch-guard:allow-editdata redo 内存镜像
     }
-    _sendTimelineOp({ op: "set-edl", edl: snap });
+    _sendTimelineOp({ op: "set-edl", edl: _edlForPersistence(snap) });
     _buildSegStartTimes();
     _renderEditTimeline();
     _updatePlayhead();
@@ -1035,13 +1093,28 @@ export function syncEditProject(p) {
             var newUrl = data && data.resultUrl;
             if (newUrl && project) {
               var sbs = project.storyboards || [];
-              if (sbs[groupIdx]) sbs[groupIdx].videoUrl = newUrl;
+              if (sbs[groupIdx]) {
+                sbs[groupIdx].videoUrl = newUrl;
+                sbs[groupIdx]._originVideoUrl = newUrl;
+              }
               var segs = _editState.edl ? _editState.edl.timeline : _editState.segments;
-              segs.forEach(function (s) {
-                if (s.groupIdx === groupIdx) s.videoUrl = newUrl;
+              fetchVideoSignedUrl(newUrl).then(function (runtimeUrl) {
+                segs.forEach(function (s) {
+                  if (s.groupIdx === groupIdx) {
+                    s.videoUrl = runtimeUrl || newUrl;
+                    s.protectedUrl = newUrl;
+                    s._originVideoUrl = newUrl;
+                  }
+                });
+                _renderEditTimeline();
+                _previewEditSegment(groupIdx);
+              }).catch(function () {
+                segs.forEach(function (s) {
+                  if (s.groupIdx === groupIdx) s.videoUrl = newUrl;
+                });
+                _renderEditTimeline();
+                _previewEditSegment(groupIdx);
               });
-              _renderEditTimeline();
-              _previewEditSegment(groupIdx);
             }
             showToast("片段 " + (groupIdx + 1) + " 重新生成完成！", "ok");
           },
@@ -2460,7 +2533,7 @@ export function syncEditProject(p) {
       if (!project.editData) project.editData = {};
       project.editData.edl = _editState.edl; // arch-guard:allow-editdata
     }
-    _sendTimelineOp({ op: "set-edl", edl: _editState.edl });
+    _sendTimelineOp({ op: "set-edl", edl: _edlForPersistence(_editState.edl) });
 
     _buildSegStartTimes();
     _renderEditTimeline();
@@ -2559,27 +2632,9 @@ export function syncEditProject(p) {
     _editActionEnd("btnEditAnalyze", "editCardAnalyze", "AI 分析");
   }
 
-  async function _generateEditEdl() {
-    if (!_editState.segmentTags) {
-      showToast("请先进行 AI 分析", "error");
-      return;
-    }
-    if (!_editActionStart("btnEditGenEdl", "editCardGenEdl", "#c084fc", "正在生成剪辑方案…", "Generating")) return;
-
-    try {
-      var _edlChars = 0;
-      var resp = await apiPostStream("/api/edit/generate-edl", {
-        projectId: (project && project.id) || "",
-        segmentTags: _editState.segmentTags,
-        segments: _editState.segments.map(function (s) {
-          return { groupIdx: s.groupIdx, videoUrl: s.videoUrl, duration: s.duration };
-        }),
-      }, function (chunk) {
-        _edlChars += chunk.length;
-        var pct = Math.min(90, 10 + Math.floor(_edlChars / 40));
-        _editActionProgress("editCardGenEdl", "生成进度 " + pct + "%");
-      });
-
+  async function _applyGeneratedEdlResponse(resp) {
+    if (!resp || !resp.result) return false;
+      await _hydrateEdlVideoUrls(resp.result);
       _editState.edl = resp.result;
       // E-3.3：同 _analyzeEditSegments，EDL 已由 /generate-edl SSE done 前落盘，
       // 前端只推 version + 更新展示态，不再 saveProject。
@@ -2616,6 +2671,126 @@ export function syncEditProject(p) {
       if (dur > 0) msg += "（共 " + dur.toFixed(1) + "s）";
       if (narr) msg += "：" + narr;
       showToast(msg, "ok");
+      return true;
+  }
+
+  function _currentEditSegmentsForEdl() {
+    return _editState.segments.map(function (s) {
+      return { groupIdx: s.groupIdx, videoUrl: _segPersistedVideoUrl(s), duration: s.duration };
+    });
+  }
+
+  async function _generateEditEdlLegacy() {
+    var _edlChars = 0;
+    return apiPostStream("/api/edit/generate-edl", {
+      projectId: (project && project.id) || "",
+      segmentTags: _editState.segmentTags,
+      segments: _currentEditSegmentsForEdl(),
+    }, function (chunk) {
+      _edlChars += chunk.length;
+      var pct = Math.min(90, 10 + Math.floor(_edlChars / 40));
+      _editActionProgress("editCardGenEdl", "生成进度 " + pct + "%");
+    });
+  }
+
+  function _edlDraftConfirmMessage(resp) {
+    var draft = (resp && (resp.draftResult || resp.result)) || {};
+    var dur = Number(draft.duration) || 0;
+    var narr = String(draft.narrative || "").trim();
+    var warnings = Array.isArray(resp && resp.qcWarnings) ? resp.qcWarnings : [];
+    var msg = "AI 已生成剪辑草稿，确认后才会写入当前时间线。";
+    if (dur > 0) msg += "\n预计时长：" + dur.toFixed(1) + "s";
+    if (warnings.length) msg += "\n质检提醒：" + warnings.length + " 条";
+    if (narr) msg += "\n剪辑思路：" + narr;
+    return msg;
+  }
+
+  async function _resumeEditEdlGraph(threadId, action) {
+    return apiPostStream("/api/edit/generate-edl-graph", {
+      threadId: threadId,
+      action: action,
+    }, null, function (evt) {
+      if (evt && evt.type === "phase" && evt.name === "commit_edl") {
+        _editActionProgress("editCardGenEdl", "正在应用剪辑草稿…");
+      }
+    });
+  }
+
+  async function _generateEditEdlGraph() {
+    var _edlChars = 0;
+    var approvalEvent = null;
+    var resp = await apiPostStream("/api/edit/generate-edl-graph", {
+      projectId: (project && project.id) || "",
+      segmentTags: _editState.segmentTags,
+      segments: _currentEditSegmentsForEdl(),
+    }, function (chunk) {
+      _edlChars += chunk.length;
+      var pct = Math.min(90, 10 + Math.floor(_edlChars / 40));
+      _editActionProgress("editCardGenEdl", "生成进度 " + pct + "%");
+    }, function (evt) {
+      if (evt && evt.type === "needs_approval") approvalEvent = evt;
+    });
+
+    if (!resp.needsApproval && resp.result && resp.serverVersion != null) return resp;
+
+    var pending = approvalEvent || resp;
+    var threadId = pending && pending.threadId;
+    if (!threadId) throw new Error("EDL 草稿缺少 threadId，无法确认");
+
+    var ok = await showConfirm(
+      "确认 AI 剪辑草稿",
+      _edlDraftConfirmMessage(pending),
+      "应用到时间线",
+      "放弃草稿"
+    );
+    if (!ok) {
+      await _resumeEditEdlGraph(threadId, "reject").catch(function () {});
+      showToast("已放弃 AI 剪辑草稿", "ok");
+      return null;
+    }
+
+    var conflictEvent = null;
+    var finalResp = await apiPostStream("/api/edit/generate-edl-graph", {
+      threadId: threadId,
+      action: "approve",
+    }, null, function (evt) {
+      if (evt && evt.type === "phase" && evt.name === "commit_edl") {
+        _editActionProgress("editCardGenEdl", "正在应用剪辑草稿…");
+      }
+      if (evt && evt.type === "needs_approval") conflictEvent = evt;
+    });
+
+    if (finalResp.needsApproval || (conflictEvent && conflictEvent.approvalType === "edl_version_conflict")) {
+      var rerun = await showConfirm(
+        "时间线已变化",
+        "你确认草稿前，剪辑时间线已经被修改。为避免覆盖手工编辑，当前草稿不会写入。\n是否基于当前时间线重新生成？",
+        "重新生成",
+        "放弃草稿"
+      );
+      await _resumeEditEdlGraph(threadId, rerun ? "rerun" : "discard").catch(function () {});
+      if (rerun) {
+        showToast("请重新点击 AI 剪辑生成当前时间线的新草稿", "error");
+      } else {
+        showToast("已放弃冲突的 AI 剪辑草稿", "ok");
+      }
+      return null;
+    }
+
+    return finalResp;
+  }
+
+  async function _generateEditEdl() {
+    if (!_editState.segmentTags) {
+      showToast("请先进行 AI 分析", "error");
+      return;
+    }
+    if (!_editActionStart("btnEditGenEdl", "editCardGenEdl", "#c084fc", "正在生成剪辑方案…", "Generating")) return;
+
+    try {
+      var useLegacy = false;
+      try { useLegacy = localStorage.getItem("origin_legacy_edl") === "1"; } catch (_e) {}
+      var resp = useLegacy ? await _generateEditEdlLegacy() : await _generateEditEdlGraph();
+      if (resp) await _applyGeneratedEdlResponse(resp);
     } catch (e) {
       showToast("AI 剪辑失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
     }
@@ -2691,19 +2866,24 @@ export function syncEditProject(p) {
         // SSE 异常断开：兜底拉一次 HTTP 状态确认结果，避免按钮卡死。
         apiGet("/api/edit/export-status/" + taskId).then(function (status) {
           if (!status) return;
-          if (status.done) {
-            if (status.downloadUrl) {
+          var isCompleted = status.done || status.status === "completed";
+          var isFailed = status.status === "failed" || status.status === "cancelled" || status.status === "timeout";
+          var downloadUrl = status.downloadUrl || status.url || "";
+          var errorMsg = status.error || status.errorMsg || "";
+          var restarted = status.restarted || errorMsg === "orphaned by server restart";
+          if (isCompleted || isFailed) {
+            if (isCompleted && downloadUrl) {
               if (project) {
                 if (!project.editData) project.editData = {};
-                project.editData.exportUrl = status.downloadUrl; // arch-guard:allow-editdata HTTP 兜底内存镜像
+                project.editData.exportUrl = downloadUrl; // arch-guard:allow-editdata HTTP 兜底内存镜像
                 project.editData.exportTaskId = taskId;
               }
-              _downloadExportFile(status.downloadUrl);
+              _downloadExportFile(downloadUrl);
               showToast("成片导出完成，正在下载！", "ok");
-            } else if (status.restarted) {
+            } else if (restarted) {
               showToast("服务刚刚重启了，这次导出中断了，点「导出成片」重试一次就好", "warn");
-            } else if (status.error) {
-              showToast("导出失败: " + _diagnoseApiError(status.error), "error");
+            } else if (isFailed || errorMsg) {
+              showToast("导出失败: " + _diagnoseApiError(errorMsg || "导出失败"), "error");
             }
             _editActionEnd("btnEditExport", "editCardExport", "导出成片");
           }
@@ -2722,11 +2902,11 @@ export function syncEditProject(p) {
     }
     if (!_editActionStart("btnEditExport", "editCardExport", "#34d399", "正在导出成片…", "Exporting")) return;
 
-    var exportEdl = _editState.edl || {
+    var exportEdl = _editState.edl ? _edlForPersistence(_editState.edl) : {
       timeline: segs.map(function (s) {
         return {
           groupIdx: s.groupIdx,
-          videoUrl: s.videoUrl,
+          videoUrl: _segPersistedVideoUrl(s),
           inPoint: s.inPoint || 0,
           outPoint: s.outPoint || s.duration || 0,
           duration: s.duration || 0,
@@ -2739,7 +2919,7 @@ export function syncEditProject(p) {
         projectId: (project && project.id) || "",
         edl: exportEdl,
         segments: segs.map(function (s) {
-          return { groupIdx: s.groupIdx, videoUrl: s.videoUrl, duration: s.duration };
+          return { groupIdx: s.groupIdx, videoUrl: _segPersistedVideoUrl(s), duration: s.duration };
         }),
       });
 
@@ -2802,6 +2982,7 @@ export function syncEditProject(p) {
           name: "片段 " + ((seg.groupIdx != null ? seg.groupIdx : i) + 1),
           thumbUrl: seg.thumbnailUrl || "",
           videoUrl: seg.videoUrl || "",
+          protectedUrl: _segPersistedVideoUrl(seg),
           duration: seg.duration || 5,
         });
         list.appendChild(card);
@@ -2818,6 +2999,7 @@ export function syncEditProject(p) {
           name: m.name || "素材 " + (i + 1),
           thumbUrl: m.thumbnailUrl || "",
           videoUrl: m.url || "",
+          protectedUrl: m.protectedUrl || m.url || "",
           duration: m.duration || 0,
           mediaId: m.id,
         });
@@ -2861,7 +3043,9 @@ export function syncEditProject(p) {
         type: info.type,
         idx: info.idx,
         videoUrl: info.videoUrl,
+        protectedUrl: info.protectedUrl || info.videoUrl,
         duration: info.duration,
+        mediaId: info.mediaId,
         name: info.name,
       }));
       ev.dataTransfer.effectAllowed = "copy";
@@ -2928,7 +3112,7 @@ export function syncEditProject(p) {
           });
           if (!resp.ok) throw new Error("上传失败");
           var data = await resp.json();
-          _uploadedMedia.push(data);
+          _uploadedMedia.push(_normalizeMediaLibraryItem(data));
           showToast("素材已上传: " + (data.name || files[i].name), "ok");
         } catch (e) {
           showToast("上传失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
@@ -2945,11 +3129,27 @@ export function syncEditProject(p) {
   async function _loadUploadedMedia() {
     if (!project) return;
     try {
-      var resp = await apiGet("/api/edit/media-library/" + project.id);
-      _uploadedMedia = resp.media || [];
+      var resp = await apiGet("/api/edit/media-library/project?projectId=" + encodeURIComponent(project.id));
+      _uploadedMedia = (resp.items || resp.media || [])
+        .filter(function (item) { return !item.source || item.source === "uploaded"; })
+        .map(_normalizeMediaLibraryItem);
     } catch (e) {
       _uploadedMedia = [];
     }
+  }
+
+  function _normalizeMediaLibraryItem(item) {
+    item = item || {};
+    return {
+      id: item.mediaId || item.id || "",
+      name: item.title || item.name || item.filename || "",
+      url: item.url || "",
+      protectedUrl: item.protectedUrl || item.url || "",
+      thumbnailUrl: item.thumbnailUrl || item.coverUrl || "",
+      duration: Number(item.durationSec || item.duration || 0) || 0,
+      kind: item.kind || "",
+      source: item.source || "uploaded",
+    };
   }
 
   async function _deleteUploadedMedia(mediaId, idx) {
@@ -3007,18 +3207,21 @@ export function syncEditProject(p) {
     var newEntry = {
       groupIdx: info.type === "clip" ? info.idx : 900 + (_editState.edl.timeline.length),
       videoUrl: info.videoUrl,
+      protectedUrl: info.protectedUrl || _protectedVideoUrlFrom(info.videoUrl) || info.videoUrl,
+      _originVideoUrl: info.protectedUrl || _protectedVideoUrlFrom(info.videoUrl) || info.videoUrl,
       inPoint: 0,
       outPoint: info.duration || 5,
       duration: info.duration || 5,
       transitionIn: { type: "cut", duration: 0 },
       _isExternalMedia: info.type === "upload",
       _mediaName: info.name,
+      mediaId: info.mediaId || "",
     };
     _editState.edl.timeline.push(newEntry);
 
     // E-4.2：add-media PATCH /api/edit/timeline。后端把 entry 追加进 timeline
     // 并返回权威 edl；前端乐观更新一份即时渲染。
-    _sendTimelineOp({ op: "add-media", entry: newEntry });
+    _sendTimelineOp({ op: "add-media", entry: _entryForPersistence(newEntry) });
 
     _buildSegStartTimes();
     _renderEditTimeline();

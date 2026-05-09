@@ -1,5 +1,5 @@
 import { $, escapeHtml, showToast, apiPost, apiPostStream, apiGet,
-  consumeStreamStepTags, ApiError } from './utils.js';
+  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js';
 import { attachDiagnostic } from './diagnostic.js';
 import { renderStoryboardCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
@@ -13,6 +13,8 @@ var _promptsConverting = false;
 var IMG_PARALLEL = 3;
 var MAX_SHOTS_PER_GROUP = 5;
 var _sbCurrentIdx = 0;
+var _sbProgrammaticScrolling = false;
+var _sbScrollSettleTimer = null;
 
 export function initStoryboard(ctx) {
   _ctx = ctx || {};
@@ -67,27 +69,31 @@ function _reattachImagesBatch(b) {
   if (!project.storyboards) project.storyboards = [];
 
   tasks.forEach(function (t) {
-    var gIdx = t.target_idx != null ? t.target_idx : ((t.extra && t.extra.groupIdx) != null ? t.extra.groupIdx : null);
+    var extra = _snapshotTaskExtra(t);
+    var target = _snapshotTaskTarget(t);
+    var gIdx = _firstTaskNumber([target.groupIdx, extra.groupIdx, t.target_idx, t.seq]);
     if (gIdx == null) return;
     var isDone = t.status === "succeeded" || t.status === "done" || t.status === "completed";
     var isFailed = t.status === "failed" || t.status === "timeout";
-    var url = t.result_url || (t.extra && t.extra.rawUrl) || "";
+    var url = _snapshotTaskImageUrl(t);
 
     if (isDone && url) {
       if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-      if (!project.storyboards[gIdx].imageUrl) {
-        project.storyboards[gIdx].imageUrl = url;
-        project.storyboards[gIdx].rawUrl = url;
+      var displayUrl = url;
+      if (project.storyboards[gIdx].imageUrl) {
+        displayUrl = project.storyboards[gIdx].rawUrl || project.storyboards[gIdx].imageUrl;
+      } else {
+        _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
       }
-      updateStoryboardCard(gIdx, "done", url);
+      updateStoryboardCard(gIdx, "done", displayUrl);
     } else if (isFailed) {
-      updateStoryboardCard(gIdx, "error", null, (t.error_msg || "生成失败").toString().slice(0, 120));
+      updateStoryboardCard(gIdx, "error", null, _snapshotTaskError(t, 120));
     } else {
       updateStoryboardCard(gIdx, "loading", null, "生成中…");
     }
   });
 
-  var isComplete = snap.status === "completed" || snap.status === "done";
+  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
   if (isComplete) {
     _imagesGenerating = false;
     checkImagesConfirm();
@@ -154,12 +160,7 @@ function _reattachImagesBatch(b) {
         if (!proj.storyboards) proj.storyboards = [];
         var existing = proj.storyboards[groupIdx] || {};
         _archiveOldImage(existing, "storyboard");
-        existing.imageUrl = rawUrl;
-        existing.rawUrl = rawUrl;
-        if (extra.assetId) existing.imageAssetId = extra.assetId;
-        if (extra.fetchStatus) existing.fetchStatus = extra.fetchStatus;
-        if (Array.isArray(extra.shotIndices)) existing.shotIndices = extra.shotIndices;
-        if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+        _applyStoryboardImageFields(existing, rawUrl, extra, null);
         proj.storyboards[groupIdx] = existing;
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
       }, data && data.serverVersion);
@@ -176,12 +177,15 @@ function _reattachImagesBatch(b) {
       _renderEtaR();
     },
     onBatchCompleted: function () {
-      _imagesGenerating = false;
-      if (btn) btn.disabled = false;
-      _stopTickR();
-      _clearEtaR();
-      renderImageGrid();
-      checkImagesConfirm();
+      (async function () {
+        _imagesGenerating = false;
+        if (btn) btn.disabled = false;
+        _stopTickR();
+        _clearEtaR();
+        await _reloadProjectFromServerForStoryboard(originId);
+        renderImageGrid();
+        checkImagesConfirm();
+      })();
     },
     onClose: function () {
       _imagesGenerating = false;
@@ -202,26 +206,32 @@ function _reattachPromptsBatch(b) {
     "total:", snap.total, "succeeded:", snap.succeeded);
 
   tasks.forEach(function (t) {
-    var shotIdx = t.target_idx != null ? t.target_idx : ((t.extra && t.extra.shotIdx) != null ? t.extra.shotIdx : null);
+    var extra = _snapshotTaskExtra(t);
+    var target = _snapshotTaskTarget(t);
+    var shotIdx = _firstTaskNumber([target.shotIdx, target.idx, extra.shotIdx, t.target_idx, t.seq]);
     if (shotIdx == null) return;
     var isDone = t.status === "succeeded" || t.status === "done" || t.status === "completed";
     var isFailed = t.status === "failed" || t.status === "timeout";
 
     if (isDone) {
-      var prompt = (t.extra && t.extra.imagePrompt) || "";
+      var prompt = _snapshotTaskPrompt(t);
       if (prompt && project.shots && project.shots[shotIdx]) {
-        project.shots[shotIdx].imagePrompt = prompt;
-        project.shots[shotIdx].imagePromptGenerated = true;
+        if (!project.shots[shotIdx].imagePrompt) {
+          project.shots[shotIdx].imagePrompt = prompt;
+          project.shots[shotIdx].imagePromptGenerated = true;
+        } else {
+          prompt = project.shots[shotIdx].imagePrompt;
+        }
       }
       updatePromptCard(shotIdx, "done", prompt);
     } else if (isFailed) {
-      updatePromptCard(shotIdx, "error", null, (t.error_msg || "生成失败").toString().slice(0, 100));
+      updatePromptCard(shotIdx, "error", null, _snapshotTaskError(t, 100));
     } else {
       updatePromptCard(shotIdx, "loading");
     }
   });
 
-  var isComplete = snap.status === "completed" || snap.status === "done";
+  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
   if (isComplete) {
     _promptsConverting = false;
     checkConvertConfirm();
@@ -273,6 +283,53 @@ function _reattachPromptsBatch(b) {
   });
 }
 
+function _snapshotTaskTarget(t) {
+  return (t && t.target) || {};
+}
+
+function _snapshotTaskResult(t) {
+  return (t && t.result) || {};
+}
+
+function _snapshotTaskExtra(t) {
+  var result = _snapshotTaskResult(t);
+  return result.extra || (t && t.extra) || {};
+}
+
+function _snapshotTaskPatch(t) {
+  var result = _snapshotTaskResult(t);
+  return result.patch || (t && t.patch) || {};
+}
+
+function _firstTaskNumber(values) {
+  for (var i = 0; i < values.length; i++) {
+    var raw = values[i];
+    if (raw === null || raw === undefined || raw === '') continue;
+    var n = (typeof raw === 'number') ? raw : parseInt(raw, 10);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function _snapshotTaskImageUrl(t) {
+  var result = _snapshotTaskResult(t);
+  var extra = _snapshotTaskExtra(t);
+  var patch = _snapshotTaskPatch(t);
+  return extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || result.resultUrl || t.resultUrl || t.result_url || "";
+}
+
+function _snapshotTaskPrompt(t) {
+  var result = _snapshotTaskResult(t);
+  var extra = _snapshotTaskExtra(t);
+  var patch = _snapshotTaskPatch(t);
+  return extra.imagePrompt || patch.imagePrompt || patch.value || result.imagePrompt || result.resultText || "";
+}
+
+function _snapshotTaskError(t, limit) {
+  limit = limit || 120;
+  return ((t && (t.errorMsg || t.error_msg)) || "生成失败").toString().slice(0, limit);
+}
+
 function _syncRefs() {
   project = _ctx.getProject ? _ctx.getProject() : project;
 }
@@ -292,6 +349,70 @@ function _openHistoryPopover(btn, item, onApply) { if (_ctx.openHistoryPopover) 
 function _setHistoryAsCurrent(item, hi) { return _ctx.setHistoryAsCurrent ? _ctx.setHistoryAsCurrent(item, hi) : false; }
 function emotionBadgeHtml(emotion, intensity) { return _ctx.emotionBadgeHtml ? _ctx.emotionBadgeHtml(emotion, intensity) : ''; }
 function sleep(ms) { return _ctx.sleep ? _ctx.sleep(ms) : new Promise(function (r) { setTimeout(r, ms); }); }
+
+async function _reloadProjectFromServerForStoryboard(originId) {
+  if (!_ctx.reloadProjectFromServer) return false;
+  try {
+    var ok = await _ctx.reloadProjectFromServer();
+    _syncRefs();
+    return !!ok && (!originId || (project && project.id === originId));
+  } catch (e) {
+    console.warn("[Storyboard] reloadProjectFromServer failed:", e);
+    return false;
+  }
+}
+
+function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndices) {
+  extra = extra || {};
+  var shouldInvalidateVideo = !!(extra.invalidateVideo || extra.firstFrameUrl || extra.firstFrameMode || extra.imagePrompt);
+  var groupIdx = (typeof extra.groupIdx === "number") ? extra.groupIdx : ((typeof existing.idx === "number") ? existing.idx : null);
+  if (shouldInvalidateVideo) {
+    delete existing.videoUrl;
+    delete existing._originVideoUrl;
+    delete existing.videoTaskId;
+    delete existing.videoCoverUrl;
+    delete existing.videoStatus;
+    delete existing.videoMode;
+    delete existing.videoTaskFinishedAt;
+    delete existing.videoDurationSec;
+    if (_ctx.invalidateVideoForGroup && groupIdx !== null) _ctx.invalidateVideoForGroup(groupIdx);
+  }
+  existing.url = rawUrl;
+  existing.imageUrl = rawUrl;
+  existing.rawUrl = rawUrl;
+  if (extra.firstFrameUrl || extra.firstFrameMode) {
+    existing.firstFrameUrl = extra.firstFrameUrl || rawUrl;
+    existing.firstFrameMode = extra.firstFrameMode || "multi_ref_v1";
+    existing.firstFrame = {
+      currentUrl: existing.firstFrameUrl,
+      rawUrl: rawUrl,
+      status: extra.firstFrameStatus || "ready",
+      source: "generated",
+      lastKnownGoodUrl: existing.firstFrameUrl,
+      history: [{
+        url: existing.firstFrameUrl,
+        at: new Date().toISOString(),
+        source: "generated"
+      }].concat((existing.firstFrame && Array.isArray(existing.firstFrame.history)) ? existing.firstFrame.history.filter(function (item) {
+        return item && item.url && item.url !== existing.firstFrameUrl;
+      }) : []).slice(0, 20)
+    };
+    delete existing.firstFrameLastError;
+    delete existing.firstFrameFailedAt;
+  }
+  if (extra.firstFramePrompt) existing.firstFramePrompt = extra.firstFramePrompt;
+  if (extra.imagePrompt) {
+    existing.imagePrompt = extra.imagePrompt;
+    if (extra.firstFrameMode && !existing.firstFramePrompt) existing.firstFramePrompt = extra.imagePrompt;
+  }
+  if (extra.debugSketchUrl) existing.debugSketchUrl = extra.debugSketchUrl;
+  if (extra.assetId) existing.imageAssetId = extra.assetId;
+  if (extra.fetchStatus) existing.fetchStatus = extra.fetchStatus;
+  if (Array.isArray(extra.shotIndices)) existing.shotIndices = extra.shotIndices;
+  else if (Array.isArray(fallbackShotIndices)) existing.shotIndices = fallbackShotIndices;
+  if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+  return existing;
+}
 
 /* ================================================================
    Storyboard groups
@@ -367,49 +488,11 @@ export function getStoryboardGroups() {
     });
   });
 
-  // Seedance 2.0 (doubao-seedance-2-0-260128) 只支持 5s / 10s 两档。
-  // 分组后端会按本组台词字数挑档位：≤18 字走 5s，>18 字走 10s。
-  // 10s 视频中文语速上限约 4 字/秒，也就是 **一组台词 ≤ 40 字**才保证念完。
-  //
-  // 历史算法 bug：按"每组 ≤ 4 个镜头数"打包 → 4 × 5s = 20s 合成一组，
-  // Seedance 硬砍成 10s 后台词念不完。（用户实测片段 2：19s、230 字台词）
-  //
-  // 新算法：贪心打包，同一情绪段内，逐个镜头加入当前组，满足以下全部条件才加：
-  //   · 加上后总时长 ≤ MAX_GROUP_DURATION_SEC (10s)
-  //   · 加上后台词字数 ≤ MAX_GROUP_DIALOGUE_CHARS (45 字)
-  //   · 组内镜头数 ≤ MAX_SHOTS_PER_GROUP (4，分镜稿 2×2 上限)
-  // 任何一条不满足 → 先 flush 当前组，用当前镜头起新组。
-  //
-  // 45 字的来历：10s 视频中文语速上限约 4.5 字/秒（一般 4 字/秒，快节奏能到
-  // 5 字/秒）。之前用过 40 字偏保守，分镜图会炸到 14 张节奏太碎；45 字
-  // 既给 Seedance 留 10% 余量，又把分镜数压到 10-12 张的可看节奏。
+  // 视频片段分组只看导演计划：同一情绪段内尽量合并，但保持片段可控。
+  // 片段计划时长 = 组内 shot.duration 之和；台词字数只在视频生成前做质量提醒，
+  // 不再反向决定 5s/10s 档位，也不在这里触发隐藏拆分。
   var MAX_SHOTS_PER_GROUP = 4;
   var MAX_GROUP_DURATION_SEC = 10;
-  var MAX_GROUP_DIALOGUE_CHARS = 45;
-
-  // 数"实际要念出来的字"：按行处理，每行剥掉"角色名（动作）："前缀，
-  // 剩下的引号内容当台词计数；引号外的动作/旁白不念（不计数）。
-  // 注意：不能用一条大正则吞整段——会跨行把前面的台词也吃掉只留最后一句。
-  function _dialogueCharCount(shot) {
-    var raw = String((shot && shot.dialogue) || '').trim();
-    if (!raw || raw === '——' || raw === '-' || raw === '无') return 0;
-    var lines = raw.split(/\r?\n/);
-    var total = 0;
-    var QUOTED_RE = /[「『""''"'‘’“”]([\s\S]*?)[」』""''"'‘’“”]/g;
-    var PUNCT_RE = /[\s，。！？、…—·,.!?"'()（）「」『』"'‘’“”]/g;
-    lines.forEach(function (line) {
-      // 剥掉开头 "角色名（可选动作）："前缀（上限 20 非冒号字符，避免误伤）
-      var stripped = line.replace(/^\s*[^：:\n]{1,20}[：:]\s*/, '');
-      var quoted = stripped.match(QUOTED_RE);
-      if (quoted && quoted.length) {
-        quoted.forEach(function (q) { total += q.replace(PUNCT_RE, '').length; });
-      } else {
-        // 没引号——可能是纯旁白/独白，整行都当台词念
-        total += stripped.replace(PUNCT_RE, '').length;
-      }
-    });
-    return total;
-  }
 
   // 第一步：按情绪段切成 emotion buckets
   var emoBuckets = [];
@@ -427,7 +510,7 @@ export function getStoryboardGroups() {
   });
   if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
 
-  // 第二步：每个情绪 bucket 内部贪心打包，受 Seedance 10s / 40 字硬约束
+  // 第二步：每个情绪 bucket 内部贪心打包，受计划时长和分镜格数约束
   var groups = [];
   emoBuckets.forEach(function (eb) {
     var items = eb.items;
@@ -435,7 +518,6 @@ export function getStoryboardGroups() {
 
     var curItems = [];
     var curDur = 0;
-    var curDia = 0;
     var flush = function () {
       if (!curItems.length) return;
       groups.push({
@@ -446,33 +528,28 @@ export function getStoryboardGroups() {
       });
       curItems = [];
       curDur = 0;
-      curDia = 0;
     };
 
     items.forEach(function (item) {
       var shot = item.shot;
       var dur = Number(shot.duration || shot.durationSec || 4) || 4;
-      var dia = _dialogueCharCount(shot);
 
-      // 单个镜头自己就超约束：独占一组（上游应该拆，但这里别崩）
-      if (dur > MAX_GROUP_DURATION_SEC || dia > MAX_GROUP_DIALOGUE_CHARS) {
+      // 单个镜头自己就超出建议片段时长：独占一组，尊重镜头表计划。
+      if (dur > MAX_GROUP_DURATION_SEC) {
         flush();
         curItems = [item];
         curDur = dur;
-        curDia = dia;
         flush();
         return;
       }
 
       var wouldExceed =
         curDur + dur > MAX_GROUP_DURATION_SEC ||
-        curDia + dia > MAX_GROUP_DIALOGUE_CHARS ||
         curItems.length >= MAX_SHOTS_PER_GROUP;
 
       if (wouldExceed) flush();
       curItems.push(item);
       curDur += dur;
-      curDia += dia;
     });
 
     flush();
@@ -536,7 +613,7 @@ export function renderPromptPreviewList() {
         statusHtml +
       '</div>' +
       '<div class="prompt-preview-desc">' + escapeHtml((shot.visual || "").slice(0, 80) || "无描述") + '</div>' +
-      '<div class="prompt-preview-prompt">' + escapeHtml(shot.imagePrompt || "") + '</div>' +
+      '<div class="prompt-preview-prompt">' + (shot.imagePrompt ? '画面指令已准备' : '') + '</div>' +
       '<div class="prompt-preview-actions">' +
         '<button type="button" class="btn btn-secondary btn-sm" data-action="regen-convert">重新生成</button>' +
         '<button type="button" class="btn btn-secondary btn-sm" data-action="edit-convert">手动编辑</button>' +
@@ -561,7 +638,7 @@ export function updatePromptCard(idx, status, promptText, errMsg) {
     card.classList.add("is-done");
     card.classList.remove("is-err");
     if (statusEl) { statusEl.className = "prompt-preview-status ok"; statusEl.innerHTML = "&#10003; 已生成"; }
-    if (promptEl) promptEl.textContent = promptText || "";
+    if (promptEl) promptEl.textContent = promptText ? "画面指令已准备" : "";
   } else if (status === "error") {
     card.classList.add("is-err");
     card.classList.remove("is-done");
@@ -738,7 +815,7 @@ export async function convertAllPrompts() {
 export function confirmPrompts() {
   if (!project || !project.shots) return;
   var missing = project.shots.filter(function (s) { return !s.imagePromptGenerated || !s.imagePrompt; });
-  if (missing.length) { showToast("还有 " + missing.length + " 条提示词未生成", "warn"); return; }
+  if (missing.length) { showToast("还有 " + missing.length + " 条画面指令未准备好", "warn"); return; }
   var stepGenerate = $("imgStepGenerate");
   if (stepGenerate) stepGenerate.hidden = false;
   var stepConvert = $("imgStepConvert");
@@ -761,6 +838,8 @@ export function renderImageGrid() {
   _syncRefs();
   var grid = $("imageGrid");
   if (!grid || !project || !project.shots) return;
+  var prevScrollLeft = grid.scrollLeft || 0;
+  var prevIdx = _sbCurrentIdx || 0;
   grid.innerHTML = "";
   if (!project.storyboards) project.storyboards = [];
   var groups = getStoryboardGroups();
@@ -796,9 +875,9 @@ export function renderImageGrid() {
       return (st + v).trim();
     }).filter(function (v) { return v; }).join(' ');
 
-    var fullPromptDisplay = visualText || promptText || '';
-    var hasFullPrompt = !!String(fullPromptDisplay).trim();
-    var promptSummaryLine = hasFullPrompt ? _sbPromptShort(fullPromptDisplay, 120) : "";
+    var shotBriefText = visualText || '';
+    var hasShotBrief = !!String(shotBriefText).trim();
+    var shotBriefSummary = hasShotBrief ? _sbPromptShort(shotBriefText, 120) : "";
 
     var card = document.createElement("div");
     card.className = "sb-sheet flex-none w-[75vw] md:w-[65vw] lg:w-[60vw] h-full snap-center-custom flex flex-col";
@@ -840,7 +919,7 @@ export function renderImageGrid() {
           '</div>' +
           '<div class="flex-1 bg-white rounded-3xl overflow-hidden border border-outline-variant/10 shadow-inner relative group-hover:shadow-xl transition-shadow duration-500 min-h-0">' +
             (hasImg
-              ? '<img class="w-full h-full object-cover scale-105 group-hover:scale-100 transition-transform duration-1000 ease-out cursor-pointer" data-action="lightbox" src="' + escapeHtml(imgSrc) + '" />'
+              ? '<img class="w-full h-full object-cover scale-105 group-hover:scale-100 transition-transform duration-1000 ease-out cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgSrc) + '" />'
               : '<div class="sb-sheet-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/20">' +
                   '<span class="material-symbols-outlined text-7xl mb-3">brush</span>' +
                   '<span class="text-xs font-bold uppercase tracking-[0.3em]">待生成</span>' +
@@ -851,17 +930,14 @@ export function renderImageGrid() {
               '<span class="text-[12px] font-black uppercase tracking-widest text-primary">' + escapeHtml(shotLabel) + '</span>' +
               '<div class="h-px flex-1 bg-outline-variant/20"></div>' +
             '</div>' +
-            (hasFullPrompt
-              ? '<details class="sb-prompt-details mb-4 max-w-full">' +
-                  '<summary class="text-[11px] leading-relaxed text-on-surface-variant/70 font-medium cursor-pointer list-none [&::-webkit-details-marker]:hidden flex items-start gap-1 select-none">' +
-                    '<span class="material-symbols-outlined text-[14px] shrink-0 text-primary/70">expand_more</span>' +
-                    '<span class="font-mono line-clamp-2">' + escapeHtml(promptSummaryLine) + '</span>' +
-                  '</summary>' +
-                  '<div class="mt-2 text-[11px] leading-relaxed text-on-surface-variant/85 font-mono whitespace-pre-wrap break-words max-h-52 overflow-y-auto rounded-2xl bg-surface-container-lowest/40 p-3 border border-outline-variant/10">' +
-                    escapeHtml(fullPromptDisplay) +
+            (hasShotBrief
+              ? '<div class="mb-4 max-w-full rounded-2xl bg-white/35 border border-outline-variant/10 px-3 py-2">' +
+                  '<div class="flex items-start gap-2 text-[11px] leading-relaxed text-on-surface-variant/70 font-medium">' +
+                    '<span class="text-[10px] font-black tracking-widest uppercase text-primary/55 shrink-0 leading-relaxed">画面描述</span>' +
+                    '<span class="line-clamp-2">' + escapeHtml(shotBriefSummary) + '</span>' +
                   '</div>' +
-                '</details>'
-              : '<p class="text-[11px] leading-relaxed text-on-surface-variant/60 font-medium mb-4 font-mono">待生成</p>') +
+                '</div>'
+              : '<p class="text-[11px] leading-relaxed text-on-surface-variant/60 font-medium mb-4">待生成画面描述</p>') +
             '<div class="flex items-center gap-2 flex-wrap">' +
               '<button type="button" class="w-9 h-9 rounded-full bg-surface-container-lowest/70 flex items-center justify-center hover:bg-white transition-colors" data-action="ref-agent-sb" title="引用到 AI 助手"><span class="material-symbols-outlined text-sm text-on-surface-variant">alternate_email</span></button>' +
               '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-primary text-on-primary rounded-full text-[10px] font-bold tracking-widest uppercase hover:opacity-90 transition-all active:scale-95 shadow-md" data-action="regen-sb">' +
@@ -869,11 +945,11 @@ export function renderImageGrid() {
               '</button>' +
               _historyBtnHtml(sb, "sb") +
               '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-white/60 hover:bg-white/90 text-on-surface-variant rounded-full text-[10px] font-bold tracking-widest uppercase transition-all active:scale-95 border border-outline-variant/20" data-action="regen-sb-prompt">' +
-                '<span class="material-symbols-outlined text-sm">auto_fix_high</span>重写提示词' +
+                '<span class="material-symbols-outlined text-sm">auto_fix_high</span>重写画面指令' +
               '</button>' +
               (promptText
                 ? '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-white/60 hover:bg-white/90 text-on-surface-variant rounded-full text-[10px] font-bold tracking-widest uppercase transition-all active:scale-95 border border-outline-variant/20 sb-toggle-prompt">' +
-                    '<span class="material-symbols-outlined text-sm">edit_note</span>编辑提示词' +
+                    '<span class="material-symbols-outlined text-sm">edit_note</span>编辑画面指令' +
                   '</button>'
                 : '') +
               (hasImg
@@ -933,33 +1009,114 @@ export function renderImageGrid() {
   });
 
   _initGalleryDrag(grid);
+  hydrateProtectedImageElements(grid);
+  _sbCurrentIdx = groups.length ? Math.min(prevIdx, groups.length - 1) : 0;
   _updateNavDots(groups.length);
-  _sbCurrentIdx = 0;
+  if (prevScrollLeft > 0) {
+    requestAnimationFrame(function () {
+      var maxScrollLeft = Math.max(0, grid.scrollWidth - grid.clientWidth);
+      grid.scrollLeft = Math.min(prevScrollLeft, maxScrollLeft);
+      _syncNavFromScroll(grid);
+    });
+  }
 }
 
 function _initGalleryDrag(container) {
-  var isDown = false, startX, scrollLeft, hasDragged = false;
-  container.addEventListener("mousedown", function (e) {
-    if (e.target.closest("button, textarea, select, a, details, summary, input")) return;
-    isDown = true;
-    hasDragged = false;
-    container.classList.add("active");
-    startX = e.pageX - container.offsetLeft;
-    scrollLeft = container.scrollLeft;
-  });
-  container.addEventListener("mouseleave", function () { isDown = false; container.classList.remove("active"); });
-  container.addEventListener("mouseup", function () {
-    isDown = false;
-    container.classList.remove("active");
-    if (hasDragged) _syncNavFromScroll(container);
-  });
-  container.addEventListener("mousemove", function (e) {
-    if (!isDown) return;
+  if (!container || container.dataset.dragInited === "1") return;
+  container.dataset.dragInited = "1";
+  var pointerState = null;
+  var suppressClick = false;
+  var wheelLocked = false;
+  var wheelUnlockTimer = null;
+
+  container.style.touchAction = "pan-y";
+  container.style.overscrollBehaviorX = "contain";
+  container.style.scrollSnapType = "none";
+
+  function _gestureThreshold() {
+    return Math.max(48, Math.min(120, container.clientWidth * 0.12));
+  }
+
+  function _pageByDelta(delta) {
+    if (!delta) return;
+    var cards = container.querySelectorAll(".sb-sheet");
+    if (!cards.length) return;
+    var nextIdx = _sbCurrentIdx + (delta > 0 ? 1 : -1);
+    nextIdx = Math.max(0, Math.min(cards.length - 1, nextIdx));
+    scrollToCard(nextIdx);
+  }
+
+  container.addEventListener("wheel", function (e) {
+    var delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (Math.abs(delta) < 24) return;
     e.preventDefault();
-    hasDragged = true;
-    var x = e.pageX - container.offsetLeft;
-    container.scrollLeft = scrollLeft - (x - startX) * 1.5;
+    if (!wheelLocked) {
+      wheelLocked = true;
+      _pageByDelta(delta);
+    }
+    if (wheelUnlockTimer) clearTimeout(wheelUnlockTimer);
+    wheelUnlockTimer = setTimeout(function () {
+      wheelLocked = false;
+      wheelUnlockTimer = null;
+    }, 720);
+  }, { passive: false });
+
+  container.addEventListener("click", function (e) {
+    if (!suppressClick) return;
+    e.preventDefault();
+    e.stopPropagation();
+    suppressClick = false;
+  }, true);
+
+  container.addEventListener("pointerdown", function (e) {
+    if (e.target.closest("button, textarea, select, a, details, summary, input")) return;
+    pointerState = {
+      id: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      moved: false,
+    };
+    container.classList.add("active");
+    try { container.setPointerCapture(e.pointerId); } catch (_e) {}
   });
+
+  container.addEventListener("pointermove", function (e) {
+    if (!pointerState || e.pointerId !== pointerState.id) return;
+    pointerState.lastX = e.clientX;
+    pointerState.lastY = e.clientY;
+    var dx = pointerState.lastX - pointerState.startX;
+    var dy = pointerState.lastY - pointerState.startY;
+    if (!pointerState.moved && Math.hypot(dx, dy) < 6) return;
+    if (Math.abs(dx) > Math.abs(dy)) {
+      pointerState.moved = true;
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  function _endPointer(e) {
+    if (!pointerState || (e && e.pointerId !== pointerState.id)) return;
+    var state = pointerState;
+    pointerState = null;
+    container.classList.remove("active");
+    try { container.releasePointerCapture(state.id); } catch (_e) {}
+
+    var dx = state.lastX - state.startX;
+    var dy = state.lastY - state.startY;
+    if (state.moved) {
+      suppressClick = true;
+      setTimeout(function () { suppressClick = false; }, 180);
+      if (Math.abs(dx) >= _gestureThreshold() && Math.abs(dx) > Math.abs(dy)) {
+        _pageByDelta(dx < 0 ? 1 : -1);
+      } else {
+        scrollToCard(_sbCurrentIdx);
+      }
+    }
+  }
+
+  container.addEventListener("pointerup", _endPointer);
+  container.addEventListener("pointercancel", _endPointer);
   container.addEventListener("scroll", _debounce(function () {
     _syncNavFromScroll(container);
   }, 120));
@@ -988,6 +1145,7 @@ function _updateNavDots(count) {
 }
 
 function _syncNavFromScroll(container) {
+  if (_sbProgrammaticScrolling) return;
   var cards = container.querySelectorAll(".sb-sheet");
   if (!cards.length) return;
   var containerRect = container.getBoundingClientRect();
@@ -1011,9 +1169,48 @@ export function scrollToCard(idx) {
   if (!grid) return;
   var cards = grid.querySelectorAll(".sb-sheet");
   if (idx < 0 || idx >= cards.length) return;
-  cards[idx].scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+
+  var card = cards[idx];
+  var gridRect = grid.getBoundingClientRect();
+  var cardRect = card.getBoundingClientRect();
+  var targetLeft = grid.scrollLeft + (cardRect.left - gridRect.left) - (grid.clientWidth - cardRect.width) / 2;
+  var maxLeft = Math.max(0, grid.scrollWidth - grid.clientWidth);
+  targetLeft = Math.max(0, Math.min(maxLeft, targetLeft));
+
+  if (_sbScrollSettleTimer) {
+    clearTimeout(_sbScrollSettleTimer);
+    _sbScrollSettleTimer = null;
+  }
+  _sbProgrammaticScrolling = true;
+  grid.style.scrollSnapType = "none";
+  try {
+    grid.scrollTo({ left: targetLeft, behavior: "smooth" });
+  } catch (_e) {
+    grid.scrollLeft = targetLeft;
+  }
   _sbCurrentIdx = idx;
   _updateNavDots(cards.length);
+  _waitForScrollSettle(grid, targetLeft);
+}
+
+function _waitForScrollSettle(grid, targetLeft) {
+  var lastLeft = grid.scrollLeft;
+  var stableFrames = 0;
+  function tick() {
+    var currentLeft = grid.scrollLeft;
+    var nearTarget = Math.abs(currentLeft - targetLeft) < 1;
+    var stable = Math.abs(currentLeft - lastLeft) < 0.5;
+    stableFrames = (nearTarget || stable) ? stableFrames + 1 : 0;
+    lastLeft = currentLeft;
+    if (stableFrames >= 2) {
+      _sbProgrammaticScrolling = false;
+      _sbScrollSettleTimer = null;
+      _syncNavFromScroll(grid);
+      return;
+    }
+    _sbScrollSettleTimer = setTimeout(tick, 80);
+  }
+  _sbScrollSettleTimer = setTimeout(tick, 80);
 }
 
 export function updateStoryboardCard(gIdx, status, imgUrl, errMsg) {
@@ -1063,7 +1260,7 @@ export async function generateStoryboardSheet(gIdx) {
     return;
   }
 
-  updateStoryboardCard(gIdx, "loading", null, "生成素描电影分镜…");
+  updateStoryboardCard(gIdx, "loading", null, "生成视频首帧…");
 
   var startResp;
   try {
@@ -1106,13 +1303,31 @@ export async function generateStoryboardSheet(gIdx) {
       if (settled) return;
       var elapsed = Math.floor((Date.now() - etaStart) / 1000);
       var remain = Math.max(5, initialEtaSec - elapsed);
-      try { updateStoryboardCard(gIdx, "loading", null, "生成分镜中…约剩 " + remain + " 秒"); } catch (_e) {}
+      try { updateStoryboardCard(gIdx, "loading", null, "生成首帧中…约剩 " + remain + " 秒"); } catch (_e) {}
     }
     function _stopEta() { if (etaTimer) { clearInterval(etaTimer); etaTimer = null; } }
     _updateEta();
     etaTimer = setInterval(_updateEta, 1000);
     function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
     function finish() { if (!settled) { settled = true; _stopPoll(); _stopEta(); resolve(); } }
+    var finishingFromServer = null;
+
+    function _finishAfterServerSync() {
+      if (finishingFromServer) return finishingFromServer;
+      finishingFromServer = (async function () {
+        await _reloadProjectFromServerForStoryboard(originId);
+        var latest = project && project.storyboards && project.storyboards[gIdx];
+        var latestUrl = latest && (latest.rawUrl || latest.imageUrl || latest.url);
+        if (latestUrl) {
+          _gotResult = true;
+          updateStoryboardCard(gIdx, "done", latestUrl);
+        } else if (!_gotResult) {
+          updateStoryboardCard(gIdx, "error", null, "生成完成但未拿到图片，请重试");
+        }
+        finish();
+      })();
+      return finishingFromServer;
+    }
 
     function _applyResult(rawUrl, extra) {
       if (!rawUrl || _gotResult) return;
@@ -1121,12 +1336,7 @@ export async function generateStoryboardSheet(gIdx) {
         if (!proj.storyboards) proj.storyboards = [];
         var existing = proj.storyboards[gIdx] || {};
         _archiveOldImage(existing, "storyboard");
-        existing.imageUrl = rawUrl;
-        existing.rawUrl = rawUrl;
-        if (extra && extra.assetId) existing.imageAssetId = extra.assetId;
-        if (extra && extra.fetchStatus) existing.fetchStatus = extra.fetchStatus;
-        existing.shotIndices = (extra && extra.shotIndices) || group.shotIndices;
-        if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+        _applyStoryboardImageFields(existing, rawUrl, extra, group.shotIndices);
         proj.storyboards[gIdx] = existing;
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + gIdx];
       });
@@ -1154,8 +1364,9 @@ export async function generateStoryboardSheet(gIdx) {
             _gotResult = true;
           }
         });
-        if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled') {
-          finish();
+        if (snap.status === 'completed' || snap.status === 'failed' ||
+            snap.status === 'cancelled' || snap.status === 'partial') {
+          await _finishAfterServerSync();
         }
       } catch (e) {
         console.warn('[StoryboardImg-single] poll failed:', (e && e.message) || e);
@@ -1176,7 +1387,9 @@ export async function generateStoryboardSheet(gIdx) {
         showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgInner), "error");
         _gotResult = true;
       },
-      onBatchCompleted: finish,
+      onBatchCompleted: function () {
+        _finishAfterServerSync();
+      },
       onClose: function () {
         // SSE 断了不立即 finish，让 polling 跑到 batch 真完成
       },
@@ -1212,27 +1425,15 @@ export async function generateAllImages() {
   var originId = project.id;
   var groups = getStoryboardGroups();
 
-  // Step 1：串行把每个组的 shot prompt 补齐（convertSinglePrompt 还没批量化，
-  // 这一步仍然是前端串行调用）
-  if (hint) hint.textContent = "生成提示词中…";
+  // Step 1：多参首帧模式直接由后端基于 visual + 资产上下文组装首帧 prompt。
+  // 这里不再预生成旧的黑白铅笔 storyboard prompt，避免浪费 token，也避免
+  // 后续视频兜底时被黑白/手绘语义污染。
+  if (hint) hint.textContent = "准备生成视频首帧…";
   for (var gi = 0; gi < groups.length; gi++) {
-    var g0 = groups[gi];
-    var ready = g0.shots.every(function (s) { return s.imagePromptGenerated && s.imagePrompt; });
-    if (!ready) updateStoryboardCard(gi, "loading", null, "生成提示词中…");
-  }
-  try {
-    for (var gj = 0; gj < groups.length; gj++) {
-      await _autoConvertGroupPrompts(groups[gj]);
-    }
-  } catch (e) {
-    if (hint) hint.textContent = "提示词生成失败：" + ((e && e.message) || e);
-    showToast("提示词生成失败：" + _diagnoseApiError(((e && e.message) || e).toString()), "error");
-    _imagesGenerating = false;
-    if (btn) btn.disabled = false;
-    return;
+    updateStoryboardCard(gi, "loading", null, "准备首帧…");
   }
 
-  // 提示词补齐后重新取最新 project（_autoConvertGroupPrompts 内部有 saveProject）
+  // 重新取最新 project，避免进入批处理前拿到旧分组状态。
   _syncRefs();
   groups = getStoryboardGroups();
 
@@ -1382,18 +1583,12 @@ export async function generateAllImages() {
     var imageAssetId = (extra && extra.assetId) || '';
     var shotIndices = (extra && Array.isArray(extra.shotIndices)) ? extra.shotIndices : null;
 
-    var isCurrent = _safeWriteBack(originId, function (proj) {
+      var isCurrent = _safeWriteBack(originId, function (proj) {
       if (!proj.storyboards) proj.storyboards = [];
       var existing = proj.storyboards[groupIdx] || {};
       _archiveOldImage(existing, "storyboard");
-      existing.imageUrl = rawUrl;
-      existing.rawUrl = rawUrl;
-      if (imageAssetId) {
-        existing.imageAssetId = imageAssetId;
-        existing.fetchStatus = 'done';
-      }
-      if (shotIndices) existing.shotIndices = shotIndices;
-      if (existing.realPhotoUrl) delete existing.realPhotoUrl;
+      _applyStoryboardImageFields(existing, rawUrl, extra, shotIndices);
+      if (imageAssetId && !existing.fetchStatus) existing.fetchStatus = 'done';
       proj.storyboards[groupIdx] = existing;
       if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
     });
@@ -1402,11 +1597,38 @@ export async function generateAllImages() {
     _renderEta();
   }
 
+  function _clearFailedStoryboardLocally(groupIdx, errMsg) {
+    if (typeof groupIdx !== 'number' || !project) return;
+    var msg = (errMsg || '生成失败').toString().slice(0, 500);
+    _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      var sb = proj.storyboards[groupIdx] || {};
+      // Keep this optimistic client mirror aligned with lib/visual-reference-state.ts markFirstFrameFailed.
+      // The next server snapshot remains authoritative; this only prevents the UI from flashing a missing reference.
+      var fallbackUrl = (sb.firstFrame && (sb.firstFrame.currentUrl || sb.firstFrame.lastKnownGoodUrl)) || sb.firstFrameUrl || sb.url || sb.imageUrl || sb.rawUrl || "";
+      sb.firstFrameLastError = msg;
+      sb.firstFrameFailedAt = new Date().toISOString();
+      sb.firstFrame = Object.assign({}, sb.firstFrame || {}, {
+        currentUrl: fallbackUrl || undefined,
+        status: fallbackUrl ? "degraded" : "failed",
+        source: fallbackUrl ? "last_known_good" : ((sb.firstFrame && sb.firstFrame.source) || "generated"),
+        lastKnownGoodUrl: fallbackUrl || ((sb.firstFrame && sb.firstFrame.lastKnownGoodUrl) || undefined),
+        lastError: {
+          message: msg,
+          failedAt: sb.firstFrameFailedAt
+        },
+        history: (sb.firstFrame && Array.isArray(sb.firstFrame.history)) ? sb.firstFrame.history : []
+      });
+      proj.storyboards[groupIdx] = sb;
+    });
+  }
+
   function _applyTaskFailed(groupIdx, errMsg) {
     if (typeof groupIdx !== 'number') return;
     if (_seenFailed[groupIdx] || _seenDone[groupIdx]) return;
     _seenFailed[groupIdx] = true;
     failCount++;
+    _clearFailedStoryboardLocally(groupIdx, errMsg);
     updateStoryboardCard(groupIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
     _renderEta();
@@ -1420,6 +1642,20 @@ export async function generateAllImages() {
   var pollTimer = null;
   var pollSettled = false;
   function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  var finishingFromServer = null;
+
+  function _finishAfterServerSync() {
+    if (finished) return Promise.resolve();
+    if (finishingFromServer) return finishingFromServer;
+    finishingFromServer = (async function () {
+      pollSettled = true;
+      _stopPoll();
+      await _reloadProjectFromServerForStoryboard(originId);
+      renderImageGrid();
+      finish();
+    })();
+    return finishingFromServer;
+  }
 
   async function _pollOnce() {
     if (pollSettled) return;
@@ -1442,12 +1678,10 @@ export async function generateAllImages() {
           _applyTaskFailed(gIdx2, t.errorMsg);
         }
       });
-      if (snap.status === 'completed' || snap.status === 'failed' || snap.status === 'cancelled') {
+      if (snap.status === 'completed' || snap.status === 'failed' ||
+          snap.status === 'cancelled' || snap.status === 'partial') {
         console.log('[StoryboardImg] poll detected batch finished status=' + snap.status);
-        pollSettled = true;
-        _stopPoll();
-        renderImageGrid();
-        finish();
+        await _finishAfterServerSync();
       }
     } catch (e) {
       console.warn('[StoryboardImg] poll failed:', (e && e.message) || e);
@@ -1481,10 +1715,7 @@ export async function generateAllImages() {
       _applyTaskFailed(groupIdx, data.errorMsg);
     },
     onBatchCompleted: function () {
-      pollSettled = true;
-      _stopPoll();
-      renderImageGrid();
-      finish();
+      _finishAfterServerSync();
     },
     onClose: function () {
       // SSE 断开（非正常结束）：保留 polling，让它跑完所有 task
@@ -1562,7 +1793,7 @@ export function handleImageAction(e) {
       project.shots[sIdx].imagePromptGenerated = false;
     });
     saveProject();
-    updateStoryboardCard(gIdx, "loading", null, "重新生成提示词…");
+    updateStoryboardCard(gIdx, "loading", null, "重写画面指令…");
     _autoConvertGroupPrompts(group).then(function () {
       updateStoryboardCard(gIdx, "loading", null, "重新生成分镜图…");
       return generateStoryboardSheet(gIdx);
@@ -1604,7 +1835,7 @@ export function handleConvertAction(e) {
   } else if (action === "edit-convert") {
     if (!project || !project.shots[idx]) return;
     var current = project.shots[idx].imagePrompt || "";
-    var newPrompt = prompt("手动编辑图片提示词 (English):", current);
+    var newPrompt = prompt("手动编辑画面生成指令 (English):", current);
     if (newPrompt !== null && newPrompt.trim()) {
       project.shots[idx].imagePrompt = newPrompt.trim();
       project.shots[idx].imagePromptGenerated = true;

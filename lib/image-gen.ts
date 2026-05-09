@@ -1,20 +1,22 @@
 /**
- * 统一 图像生成调用层（OpenAI 兼容协议）
+ * 统一图像生成调用层
  *
  * 支持的模型/服务：
  *   - OpenAI 官方：gpt-image-1, dall-e-3
  *   - 任何 OpenAI 兼容中转：使用 settings.models.image.{baseUrl,apiKey,model}
+ *   - 火山方舟 Seedream：使用 IMAGE_PROVIDER=volcengine_seedream
  *
  * 与文本 LLM 用相同的"settings → env → fake"三级回落。
  * 输出：把生成图保存到 data/images/<userId>/<imageId>.png，并把元数据写进 images 表。
  */
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
 import { getDb } from './db';
 import type { UserRow } from './db';
+import { fetchViaProxy } from './proxy-fetch';
 
 export type ImageGenInput = {
   prompt: string;
@@ -29,14 +31,14 @@ export type ImageGenInput = {
   entityType?: 'human' | 'non-human';
   projectId?: string;
   assetRef?: string; // e.g. 'characters[0]' / 'storyboards[2]'
+  correlationId?: string;
   /**
    * 可选：参考图 PNG 在磁盘上的绝对路径。一旦提供，调用方式从
-   * `/v1/images/generations` 切到 `/v1/images/edits`（multipart），把这张
-   * 图作为视觉锚点喂给 gpt-image-1 / gpt-image-2，让生成图保留参考图的
-   * 材质 / 色调 / 建筑结构 / 物件风格。当前主要用途：
-   *   - 副场景以主场景为参考，做"同一地点不同角度"
-   *   - 镜头分镜以场景图为参考，保证场景一致
-   * 如果文件不存在或读取失败，会自动 fallback 到 generations 路径。
+	 * `/v1/images/generations` 切到 `/v1/images/edits`（multipart），把这张
+	 * 图作为视觉锚点喂给 gpt-image-1 / gpt-image-2，让生成图保留参考图的
+	 * 材质 / 色调 / 建筑结构 / 物件风格。当前主要用途：
+	 *   - 镜头分镜以场景图为参考，保证场景一致
+	 * 如果文件不存在或读取失败，会自动 fallback 到 generations 路径。
    */
   referenceImagePath?: string;
 };
@@ -53,6 +55,31 @@ export type ImageGenResult = {
 const DATA_DIR = join(process.cwd(), 'data');
 const IMAGES_DIR = join(DATA_DIR, 'images');
 mkdirSync(IMAGES_DIR, { recursive: true });
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function retryAfterMs(raw: string | null): number | null {
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const time = Date.parse(raw);
+  if (!Number.isFinite(time)) return null;
+  return Math.max(0, time - Date.now());
+}
+
+function jitter(ms: number): number {
+  return ms + Math.floor(Math.random() * 5000);
+}
+
+function isTransientNetworkError(err: any): boolean {
+  const msg = String(err?.message || err || '');
+  return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+}
 
 /**
  * 主入口：生成 + 保存 + 落 DB
@@ -75,37 +102,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   //   - character/scene/prop 强制锁定为"白底 + 写实摄影"
   //     LLM 写出来的 imagePrompt 五花八门，这里兜底加一段 hard rule，
   //     保证最终风格统一（参考原网站效果）
-  const finalPrompt = (() => {
-    if (input.style === 'pencil') {
-      // 手稿风格锁定：参考原站效果——干净线稿 + 中灰阴影 + 工业制图般的
-      // 严谨度（不是糙笔速写）。关键词侧重：
-      //   · "ink + pencil hybrid" → 主线条干净像针管笔，阴影才用铅笔渐变
-      //   · "tonal washes + cross-hatching" → 既有大面积灰调也有交叉影线
-      //   · "industrial production storyboard" → 行业级专业感而非草稿
-      //   · "characters fully rendered, faces detailed" → 人物面部不能模糊
-      //   · "consistent line weight" → 多格之间风格统一
-      const PENCIL_PREFIX = [
-        'Professional film pre-production storyboard frame, drawn in the style of a senior storyboard artist working for a feature animation studio.',
-        'Medium: ink-and-pencil hybrid on smooth bristol paper — clean confident ink-pen outlines for figures and architecture, soft graphite tonal shading for volumes, cross-hatching for shadows, light tonal wash for atmosphere.',
-        'Strictly monochrome (true black + warm-grey graphite tones + paper white). Absolutely NO color, NO digital painting look.',
-        'High level of finish: faces and hands are fully rendered with anatomy, not vague smudges; clothing folds visible; perspective lines accurate; environment rendered with depth via hatching not blank space.',
-        'Composition: cinematic framing, clear silhouette / staging, characters readable at small sizes.',
-        '',
-      ].join('\n');
-      const PENCIL_SUFFIX = [
-        '',
-        '=== STYLE LOCK (do not deviate) ===',
-        'Style: black-and-white pencil + ink storyboard sheet, professional pre-production grade, hand-drawn on white paper, visible graphite tone and crosshatch shading. Like classic Pixar / Studio Ghibli / Spielberg-era industrial storyboards.',
-        'Line work: confident ink outlines for figures + architectural lines, no scratchy nervous lines, no doodle look.',
-        'Shading: soft graphite gradients + crosshatching for shadows, leave paper white for highlights.',
-        'STRICTLY NOT allowed: photorealistic photo, 3D render, watercolor, anime / manga style, cartoon / chibi, comic book ink (heavy black fills), vector illustration, painted, colored, flat color, gradient color, blueprint, schematic.',
-        'STRICTLY NOT allowed: any visible text / captions / panel labels / signatures / watermarks / page borders.',
-        'STRICTLY NOT allowed: rough scratchy "napkin doodle" look — this MUST look like a finished pre-production deliverable.',
-      ].join('\n');
-      return `${PENCIL_PREFIX}\n${input.prompt}\n${PENCIL_SUFFIX}`;
-    }
-    return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
-  })();
+  const finalPrompt = composeFinalImagePrompt(input);
 
   // 解析尺寸
   const [w, h] = parseSize(input.size || '1024x1024');
@@ -139,18 +136,49 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
 
     // 失败重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
     // 4xx（除 429）与 401/403 视为永久错误，立刻抛出，避免无意义浪费积分。
-    // 429 限流：3 次机会，退避 8-15s（限流需要等更久才放行）
-    // 5xx/超时：3 次机会，退避 2-4s（多数是抖动，快重试就能过）
-    const MAX_ATTEMPTS = 3;
+    // 429 限流通常需要等下一个配额窗口，使用更长退避并尊重 Retry-After。
+    const TRANSIENT_MAX_ATTEMPTS = envInt('IMAGE_GEN_TRANSIENT_MAX_ATTEMPTS', 3, 1, 6);
+    const NETWORK_MAX_ATTEMPTS = envInt('IMAGE_GEN_NETWORK_MAX_ATTEMPTS', 5, 1, 8);
+    const RATE_LIMIT_MAX_ATTEMPTS = envInt('IMAGE_GEN_429_MAX_ATTEMPTS', 5, 1, 8);
+    const RATE_LIMIT_BASE_DELAY_MS = envInt('IMAGE_GEN_429_RETRY_BASE_MS', 20_000, 1_000, 300_000);
+    const RATE_LIMIT_MAX_DELAY_MS = envInt('IMAGE_GEN_429_RETRY_MAX_MS', 120_000, 1_000, 600_000);
+    const NETWORK_BASE_DELAY_MS = envInt('IMAGE_GEN_NETWORK_RETRY_BASE_MS', 10_000, 1_000, 120_000);
+    const NETWORK_MAX_DELAY_MS = envInt('IMAGE_GEN_NETWORK_RETRY_MAX_MS', 90_000, 1_000, 300_000);
+    const RETRY_DEADLINE_MS = envInt('IMAGE_GEN_RETRY_DEADLINE_MS', 120_000, 10_000, 600_000);
+    const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
+    const MAX_ATTEMPTS = Math.max(TRANSIENT_MAX_ATTEMPTS, RATE_LIMIT_MAX_ATTEMPTS, NETWORK_MAX_ATTEMPTS);
     let lastErr: any = null;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       // 单次调用超时由平台 env 控制；未配置时保留原来的 240s。
+      const remainingBudget = retryDeadlineAt - Date.now();
+      if (remainingBudget <= 0) {
+        throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
+      }
+      const attemptTimeoutMs = Math.max(1000, Math.min(requestTimeoutMs, remainingBudget));
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
+      const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
       const tA = Date.now();
       try {
         let resp: Response;
-        if (useEdit) {
+        if (cfg.provider === 'volcengine_seedream') {
+          const body = buildSeedreamImageBody(cfg, modelName, finalPrompt, input);
+          if (input.referenceImagePath && existsSync(input.referenceImagePath)) {
+            body.image = imagePathToDataUrl(input.referenceImagePath);
+          }
+          console.log(
+            `[image-gen][seedream] start attempt=${attempt} model=${modelName} ` +
+              `size=${body.size || '-'} kind=${input.kind} ref=${body.image ? 'yes' : 'no'}`,
+          );
+          resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${cfg.apiKey}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } else if (useEdit) {
           console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit ref=${input.referenceImagePath}`);
           const fd = new FormData();
           fd.append('model', modelName);
@@ -160,7 +188,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           if (q) fd.append('quality', q);
           const refBuf = readFileSync(input.referenceImagePath!);
           fd.append('image', new Blob([refBuf], { type: 'image/png' }), 'reference.png');
-          resp = await fetch(`${cfg.baseUrl}${cfg.imageEditEndpoint || '/images/edits'}`, {
+          resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageEditEndpoint || '/images/edits'}`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${cfg.apiKey}` },
             body: fd as any,
@@ -175,7 +203,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           };
           if (q) body.quality = q;
           console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind} mode=generate`);
-          resp = await fetch(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
+          resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -187,13 +215,23 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         }
         if (!resp.ok) {
           const text = await resp.text().catch(() => '');
-          const err: any = new Error(`Image API ${resp.status}: ${text.slice(0, 400)}`);
+          const err: any = new Error(`Image API ${resp.status}: ${text.slice(0, 1000)}`);
           err.status = resp.status;
+          err.retryAfterMs = retryAfterMs(resp.headers.get('retry-after'));
           throw err;
         }
         const json: any = await resp.json();
         const item = json?.data?.[0];
         if (!item) throw new Error('图像 API 返回结构异常');
+        if (item.error) {
+          const code = item.error.code ? `${item.error.code}: ` : '';
+          throw new Error(`图像 API 单图失败：${code}${item.error.message || JSON.stringify(item.error).slice(0, 200)}`);
+        }
+        if (typeof item.size === 'string') {
+          const [actualW, actualH] = parseSize(item.size);
+          width = actualW;
+          height = actualH;
+        }
 
         let buf: Buffer;
         if (item.b64_json) {
@@ -202,7 +240,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           const dlController = new AbortController();
           const dlTimer = setTimeout(() => dlController.abort(), 60_000);
           try {
-            const r = await fetch(item.url, { signal: dlController.signal });
+            const r = await fetchViaProxy(item.url, { signal: dlController.signal });
             if (!r.ok) throw new Error(`下载图片失败 ${r.status}`);
             buf = Buffer.from(await r.arrayBuffer());
           } finally {
@@ -210,6 +248,12 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           }
         } else {
           throw new Error('图像 API 没返回 b64_json 也没返回 url');
+        }
+        const normalized = await normalizeGeneratedImageBuffer(buf, cfg);
+        buf = normalized.buffer;
+        if (normalized.width && normalized.height) {
+          width = normalized.width;
+          height = normalized.height;
         }
         writeFileSync(fullPath, buf);
         bytes = buf.length;
@@ -221,32 +265,50 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         const elapsed = Date.now() - tA;
         const aborted = e?.name === 'AbortError';
         const status = e?.status as number | undefined;
-        const transient = aborted || status === 429 || (status !== undefined && status >= 500 && status < 600);
-        const reason = aborted ? `请求超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）` : (e?.message || String(e));
+        const networkTransient = !status && isTransientNetworkError(e);
+        const transient = aborted || networkTransient || status === 429 || (status !== undefined && status >= 500 && status < 600);
+        const reason = aborted ? `请求超时（>${Math.round(attemptTimeoutMs / 1000)}s 未返回）` : (e?.message || String(e));
         console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}`);
         lastErr = e;
-        if (attempt < MAX_ATTEMPTS && transient) {
-          // 429 限流要等更久（中转站每分钟有总配额，太快重试还会被拒）
-          // 5xx/超时多数是抖动/排队，2-4s 退避通常就能过
+        if (transient) {
           const isRateLimit = status === 429;
-          const baseDelay = isRateLimit ? 8000 + attempt * 3000 : 2000;
-          const delay = baseDelay + Math.floor(Math.random() * 3000);
-          console.log(`[image-gen] retry attempt=${attempt + 1}/${MAX_ATTEMPTS} after ${delay}ms (status=${status || 'timeout'})`);
-          await new Promise((r) => setTimeout(r, delay));
-          continue;
+          const isNetwork = networkTransient || aborted;
+          const maxAttemptsForThisError = isRateLimit ? RATE_LIMIT_MAX_ATTEMPTS : isNetwork ? NETWORK_MAX_ATTEMPTS : TRANSIENT_MAX_ATTEMPTS;
+          if (attempt >= maxAttemptsForThisError) {
+            // 用尽该类错误的重试额度，走下面的人话错误。
+          } else {
+            const retryAfter = typeof e?.retryAfterMs === 'number' ? e.retryAfterMs : null;
+            const rateLimitDelay = Math.min(
+              RATE_LIMIT_MAX_DELAY_MS,
+              retryAfter != null ? retryAfter : RATE_LIMIT_BASE_DELAY_MS * Math.pow(2, attempt - 1),
+            );
+            const networkDelay = Math.min(NETWORK_MAX_DELAY_MS, NETWORK_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+            const delay = isRateLimit ? jitter(rateLimitDelay) : isNetwork ? jitter(networkDelay) : jitter(2000 + (attempt - 1) * 1000);
+            if (Date.now() + delay > retryDeadlineAt) {
+              throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算；最后错误：' + reason);
+            }
+            console.log(
+              `[image-gen] retry attempt=${attempt + 1}/${maxAttemptsForThisError} ` +
+                `after ${delay}ms (status=${status || (isNetwork ? 'network' : 'timeout')})`,
+            );
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
         }
         // 永久错误 / 用尽重试次数 → 抛出最终错误（针对常见 status 给人话提示）
         let friendly: string;
         if (status === 429) {
-          friendly = `中转站当前限流（API 429），${MAX_ATTEMPTS} 次重试均被拒。请等几分钟再试，或更换图像 API Key`;
+          friendly = `中转站当前限流（API 429），${RATE_LIMIT_MAX_ATTEMPTS} 次重试均被拒。请等几分钟再试，或更换图像 API Key`;
         } else if (status === 401 || status === 403) {
           friendly = `图像 API Key 无效或无权限（${status}），请到设置里检查/更换 Key`;
         } else if (status === 402) {
           friendly = `图像 API 余额不足（402），请到中转站充值后再试`;
         } else if (aborted) {
-          friendly = `图像生成超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回），中转站可能在排队，请稍后重试`;
+          friendly = `图像生成超时（>${Math.round(attemptTimeoutMs / 1000)}s 未返回），中转站可能在排队，请稍后重试`;
+        } else if (!status && isTransientNetworkError(e)) {
+          friendly = `图像生成网络连接失败，${NETWORK_MAX_ATTEMPTS} 次重试均失败，请稍后再试：${reason}`;
         } else if (status && status >= 500 && status < 600) {
-          friendly = `中转站服务异常（${status}），${MAX_ATTEMPTS} 次重试均失败，请稍后再试`;
+          friendly = `中转站服务异常（${status}），${TRANSIENT_MAX_ATTEMPTS} 次重试均失败，请稍后再试`;
         } else {
           friendly = '图像生成失败：' + reason;
         }
@@ -262,8 +324,8 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   // 落 DB
   const db = getDb();
   db.prepare(
-    `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
-     VALUES (?, ?, ?, ?, ?, ?, 'image/png', ?, ?, ?, ?, ?)`,
+    `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style, correlation_id)
+     VALUES (?, ?, ?, ?, ?, ?, 'image/png', ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     user.id,
@@ -276,6 +338,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     height,
     finalPrompt.slice(0, 4000),
     input.style || null,
+    input.correlationId || null,
   );
 
   return {
@@ -289,9 +352,126 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
 }
 
 function parseSize(s: string): [number, number] {
-  const m = /^(\d+)x(\d+)$/.exec(s);
+  const m = /^(\d+)x(\d+)$/i.exec(String(s || '').replace(/[×X]/g, 'x'));
   if (m) return [Number(m[1]), Number(m[2])];
   return [1024, 1024];
+}
+
+type ImageRuntimeConfig = ReturnType<typeof resolveLLMConfig>;
+
+function buildSeedreamImageBody(
+  cfg: ImageRuntimeConfig,
+  modelName: string,
+  prompt: string,
+  input: ImageGenInput,
+): Record<string, any> {
+  const body: Record<string, any> = {
+    model: modelName || 'doubao-seedream-4-5-251128',
+    prompt,
+    size: resolveSeedreamSize(cfg.imageSize, input.size),
+    response_format: normalizeSeedreamResponseFormat(cfg.imageResponseFormat),
+    watermark: cfg.imageWatermark ?? false,
+    sequential_image_generation: normalizeSeedreamSequentialMode(cfg.seedreamSequentialImageGeneration),
+  };
+
+  const optimizeMode = normalizeSeedreamOptimizeMode(cfg.seedreamOptimizePromptMode);
+  if (optimizeMode) {
+    body.optimize_prompt_options = { mode: optimizeMode };
+  }
+
+  return body;
+}
+
+function resolveSeedreamSize(configured: string | undefined, requested: ImageGenInput['size']): string {
+  const cfg = (configured || '4K').trim();
+  if (/^\d+x\d+$/i.test(cfg)) return cfg;
+
+  const tier = cfg.toUpperCase() === '2K' ? '2K' : '4K';
+  const requestedSize = String(requested || '1024x1024').toLowerCase();
+  const table: Record<'2K' | '4K', Record<string, string>> = {
+    '2K': {
+      '1024x1024': '2048x2048',
+      '512x512': '2048x2048',
+      '1536x1024': '2496x1664',
+      '768x512': '2496x1664',
+      '1024x1536': '1664x2496',
+      '512x768': '1664x2496',
+    },
+    '4K': {
+      '1024x1024': '4096x4096',
+      '512x512': '4096x4096',
+      '1536x1024': '4992x3328',
+      '768x512': '4992x3328',
+      '1024x1536': '3328x4992',
+      '512x768': '3328x4992',
+    },
+  };
+  return table[tier][requestedSize] || tier;
+}
+
+function normalizeSeedreamResponseFormat(value: string | undefined): 'url' | 'b64_json' {
+  return value === 'url' ? 'url' : 'b64_json';
+}
+
+function normalizeSeedreamSequentialMode(value: string | undefined): 'auto' | 'disabled' {
+  return value === 'auto' ? 'auto' : 'disabled';
+}
+
+function normalizeSeedreamOptimizeMode(value: string | undefined): 'standard' | undefined {
+  return value === 'standard' || !value ? 'standard' : undefined;
+}
+
+function imagePathToDataUrl(imagePath: string): string {
+  const ext = extname(imagePath).toLowerCase().replace(/^\./, '');
+  const mime =
+    ext === 'jpg' || ext === 'jpeg'
+      ? 'image/jpeg'
+      : ext === 'webp'
+        ? 'image/webp'
+        : ext === 'bmp'
+          ? 'image/bmp'
+          : ext === 'gif'
+            ? 'image/gif'
+            : ext === 'tif' || ext === 'tiff'
+              ? 'image/tiff'
+              : 'image/png';
+  return `data:${mime};base64,${readFileSync(imagePath).toString('base64')}`;
+}
+
+async function normalizeGeneratedImageBuffer(
+  buffer: Buffer,
+  cfg: ImageRuntimeConfig,
+): Promise<{ buffer: Buffer; width?: number; height?: number }> {
+  if (cfg.provider !== 'volcengine_seedream' || isPngBuffer(buffer)) return { buffer };
+
+  const canvasMod: any = await import('@napi-rs/canvas').catch(() => null);
+  if (!canvasMod?.createCanvas || !canvasMod?.loadImage) {
+    throw new Error('Seedream 返回的图片需要转成 PNG，但 @napi-rs/canvas 不可用');
+  }
+
+  const image = await canvasMod.loadImage(buffer);
+  const canvas = canvasMod.createCanvas(image.width, image.height);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, 0, 0);
+  return {
+    buffer: canvas.toBuffer('image/png') as Buffer,
+    width: image.width,
+    height: image.height,
+  };
+}
+
+function isPngBuffer(buffer: Buffer): boolean {
+  return (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  );
 }
 
 /**
@@ -351,27 +531,22 @@ function forceStyleSuffix(
     ].join('\n');
   }
   if (kind === 'scene') {
-    // 场景：六宫格多角度参考图（2 行 × 3 列），每格一个不同角度。
-    // 用户反馈："原网站是六宫格图 各个角度的场景图"——把单张 establishing shot
-    // 升级成 6-panel reference sheet，便于后续分镜覆盖更多视角。
+    // 场景：单张主环境参考图。
+    // 视频阶段已有首帧/尾帧负责镜头级构图；场景资产只负责稳定空间、
+    // 色调、光照、材质，不再生成多格 sheet，避免视频模型误读分屏。
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
-      'Style: photorealistic photography, cinematic establishing shots, sharp focus, high detail, professional location photography.',
-      'Layout: ONE canvas split into SIX panels arranged in a 2-row × 3-column grid (top row 3 panels, bottom row 3 panels), evenly sized cells, thin black gaps (~4px) between panels, white outer border.',
-      'Each of the SIX panels shows the SAME ONE LOCATION from a DIFFERENT camera angle / focal length, so they read as a complete location reference sheet:',
-      '  · Top-Left: WIDE establishing shot, eye-level, full overview of the space.',
-      '  · Top-Middle: HIGH-ANGLE / overhead-ish wide shot revealing the floor plan / layout.',
-      '  · Top-Right: LOW-ANGLE wide shot looking up, emphasizing height / ceiling / vertical features.',
-      '  · Bottom-Left: MEDIUM shot of one signature corner / area, eye-level (e.g. counter, workstation, entry).',
-      '  · Bottom-Middle: MEDIUM shot of a different corner / area from the opposite direction.',
-      '  · Bottom-Right: CLOSE-UP / detail shot of a key prop / texture / surface that defines the location\'s mood (e.g. wood grain, neon sign, equipment, food display).',
-      'CRITICAL: ALL SIX panels must show the SAME LOCATION — same architecture, same lighting mood, same color palette, same era/style. They are reference photos of one place from different angles, NOT six different rooms.',
-      'No people / no human figures in any panel.',
-      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
-      'STRICTLY NOT allowed: any text, watermark, logo, panel labels, captions.',
-      'STRICTLY NOT allowed: rendering this as a single image instead of a 6-panel grid — if there are not 6 visible panels, the image is REJECTED.',
-    ].join('\n');
-  }
+      'Style: photorealistic location photography, cinematic but natural establishing shot, sharp focus, high detail, professional production reference quality.',
+      'Layout: ONE single continuous image of ONE location. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+      'Composition: wide establishing view at eye level or slightly high angle, clearly showing the main spatial layout, entrances/exits, floor, walls, ceiling, key furniture/equipment, and signature materials.',
+      'Purpose: this image is a stable environment reference for video generation — prioritize readable space, lighting, color palette, material texture, and production design over dramatic camera tricks.',
+	      'CRITICAL: the image must depict one coherent physical space, not multiple rooms, not multiple angles, not a montage.',
+	      'No people / no human figures.',
+	      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+	      'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
+	      'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
+	    ].join('\n');
+	  }
   if (kind === 'prop') {
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
@@ -384,6 +559,33 @@ function forceStyleSuffix(
   }
   // storyboard / other: 不加额外约束
   return '';
+}
+
+export function composeFinalImagePrompt(
+  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType'>,
+): string {
+  if (input.style === 'pencil') {
+    const PENCIL_PREFIX = [
+      'Professional film pre-production storyboard frame, drawn in the style of a senior storyboard artist working for a feature animation studio.',
+      'Medium: ink-and-pencil hybrid on smooth bristol paper — clean confident ink-pen outlines for figures and architecture, soft graphite tonal shading for volumes, cross-hatching for shadows, light tonal wash for atmosphere.',
+      'Strictly monochrome (true black + warm-grey graphite tones + paper white). Absolutely NO color, NO digital painting look.',
+      'High level of finish: faces and hands are fully rendered with anatomy, not vague smudges; clothing folds visible; perspective lines accurate; environment rendered with depth via hatching not blank space.',
+      'Composition: cinematic framing, clear silhouette / staging, characters readable at small sizes.',
+      '',
+    ].join('\n');
+    const PENCIL_SUFFIX = [
+      '',
+      '=== STYLE LOCK (do not deviate) ===',
+      'Style: black-and-white pencil + ink storyboard sheet, professional pre-production grade, hand-drawn on white paper, visible graphite tone and crosshatch shading. Like classic Pixar / Studio Ghibli / Spielberg-era industrial storyboards.',
+      'Line work: confident ink outlines for figures + architectural lines, no scratchy nervous lines, no doodle look.',
+      'Shading: soft graphite gradients + crosshatching for shadows, leave paper white for highlights.',
+      'STRICTLY NOT allowed: photorealistic photo, 3D render, watercolor, anime / manga style, cartoon / chibi, comic book ink (heavy black fills), vector illustration, painted, colored, flat color, gradient color, blueprint, schematic.',
+      'STRICTLY NOT allowed: any visible text / captions / panel labels / signatures / watermarks / page borders.',
+      'STRICTLY NOT allowed: rough scratchy "napkin doodle" look — this MUST look like a finished pre-production deliverable.',
+    ].join('\n');
+    return `${PENCIL_PREFIX}\n${input.prompt}\n${PENCIL_SUFFIX}`;
+  }
+  return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
 }
 
 /**
@@ -441,8 +643,8 @@ export function getImageMeta(id: string, ownerId: number) {
 
 /**
  * 把项目里存的 imageUrl（形如 `/api/images/file/<uuid>`）反查回磁盘绝对路径。
- * 用于副场景拿主场景的 PNG 当参考图。如果 url 不是这种内部格式 / 找不到对应
- * 行 / 文件不存在，返回 null，调用方应自动 fallback 到无参考图的纯文本 prompt。
+ * 用于后续生成链路把内部图片作为参考图。如果 url 不是这种内部格式 / 找不到
+ * 对应行 / 文件不存在，返回 null，调用方应自动 fallback 到无参考图的纯文本 prompt。
  */
 export function resolveLocalImagePath(
   imageUrl: string | undefined | null,

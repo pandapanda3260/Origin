@@ -8,6 +8,8 @@ import {
   buildAssetScenesExtractMessages,
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { sanitizePromptObject } from '@/lib/content-sanitize';
+import { mutateCharacterLock } from '@/lib/character-consistency';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,7 +29,8 @@ export async function POST(req: NextRequest) {
   const proj = projectId ? getProjectByIdForUser(projectId, user.id) : null;
   const finalScript = scriptText || (proj as any)?.scriptDraft || (proj as any)?.script || '';
   const bodyStyleBible = normalizeStyleBible(body.styleBible);
-  const styleBible = (proj as any)?.styleBible || bodyStyleBible || null;
+  const rawStyleBible = (proj as any)?.styleBible || bodyStyleBible || null;
+  const styleBible = sanitizePromptObject(rawStyleBible);
   const styleBibleSource = (proj as any)?.styleBible ? 'project' : (bodyStyleBible ? 'request' : 'none');
 
   return sseResponse(async (writer) => {
@@ -116,36 +119,48 @@ export async function POST(req: NextRequest) {
         imagePrompt: c.imagePrompt || buildCharacterPrompt(c, styleBible),
       };
     });
+    let mainAssigned = false;
+    const usedSceneIds = new Set<string>();
+    parsed.environments = ensureArray(parsed.environments).map((e: any, idx: number) => {
+      let isMain = !!e?.isMain;
+      if (isMain && mainAssigned) isMain = false;
+      if (isMain) mainAssigned = true;
+      const baseId = String(e?.id || e?.sceneId || `e${idx + 1}`).trim() || `e${idx + 1}`;
+      let id = baseId;
+      let suffix = 2;
+      while (usedSceneIds.has(id)) {
+        id = `${baseId}_${suffix}`;
+        suffix++;
+      }
+      usedSceneIds.add(id);
+      return {
+        ...e,
+        id,
+        isMain,
+        tags: Array.isArray(e?.tags) ? [...e.tags] : [],
+        imagePrompt: e.imagePrompt || buildScenePrompt(e, styleBible),
+      };
+    });
+    if (parsed.environments.length && !parsed.environments.some((e: any) => e.isMain)) {
+      parsed.environments[0].isMain = true;
+    }
+    const mainIdx = parsed.environments.findIndex((e: any) => e.isMain);
+    if (mainIdx > 0) {
+      const [mainEnv] = parsed.environments.splice(mainIdx, 1);
+      parsed.environments.unshift(mainEnv);
+    }
     parsed.environments = parsed.environments.map((e: any) => ({
       ...e,
-      imagePrompt: e.imagePrompt || buildScenePrompt(e, styleBible),
+      tags: e.isMain
+        ? Array.from(new Set([...(e.tags || []), '主场景']))
+        : (e.tags || []).filter((t: string) => t !== '主场景'),
     }));
     parsed.props = parsed.props.map((p: any) => ({
       ...p,
       imagePrompt: p.imagePrompt || buildPropPrompt(p, styleBible),
     }));
 
-    // 兜底：如果只有主场景没副场景，自动补一个副场景（基于主场景衍生）
-    const mainScene = parsed.environments.find((e: any) => e.isMain);
-    const hasSubScene = parsed.environments.some((e: any) => !e.isMain && e.baseSceneRef);
-    if (mainScene && !hasSubScene) {
-      parsed.environments.push({
-        id: (mainScene.id || 'e1') + '_sub',
-        name: mainScene.name + ' · 副景',
-        description: '由主场景衍生的次要区域，与主场景共享色调、光线、材质语言',
-        isMain: false,
-        baseSceneRef: mainScene.id,
-        tags: [...(mainScene.tags || []), '副景'],
-        imagePrompt: buildScenePrompt(
-          {
-            ...mainScene,
-            name: mainScene.name + ' corner',
-            description: 'a different angle/corner of the main scene, same lighting and color palette',
-          },
-          styleBible,
-        ),
-      });
-    }
+    parsed = sanitizePromptObject(parsed);
 
     writer.step('已识别角色 ' + parsed.characters.length + ' 个');
     writer.step('已识别场景 ' + parsed.environments.length + ' 个');
@@ -159,12 +174,54 @@ export async function POST(req: NextRequest) {
     };
 
     if (projectId && proj) {
+      let consistencyProject: any = {
+        ...(proj as any),
+        characters: parsed.characters,
+        environments: parsed.environments,
+        props: parsed.props,
+        assets,
+      };
+      parsed.characters = parsed.characters.map((character: any, index: number) => {
+        const characterId = String(character.characterId || character.id || `c${index + 1}`);
+        const result = mutateCharacterLock(
+          consistencyProject,
+          characterId,
+          {
+            sourceAssetId: character.id || characterId,
+            canonicalName: character.name || character.role || characterId,
+            aliases: [character.name, character.role].filter(Boolean),
+            identityLock: {
+              role: character.role || '',
+              identity: character.identity || '',
+              entityType: character.entityType === 'non-human' ? 'non-human' : 'human',
+              species: character.species,
+              gender: character.gender,
+              ageBand: character.ageBand || character.age,
+            },
+            visualLock: {
+              appearance: character.appearance || '',
+              clothing: character.clothing || '',
+              equipment: character.equipment || '',
+              canonicalPrompt: character.imagePrompt || '',
+            },
+            performanceLock: {
+              temperament: character.temperament || '',
+              actionTraits: character.actionTraits || '',
+            },
+          },
+          { source: 'asset_extract' },
+        );
+        consistencyProject = result.project;
+        return { ...character, characterId: result.character.characterId };
+      });
+      assets.characters = parsed.characters;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
       updateProjectForUser(projectId, user.id, {
         characters: parsed.characters,
         environments: parsed.environments,
         props: parsed.props,
         assets,
+        consistency: consistencyProject.consistency,
         assetsApproved: false,
         currentStep: 2,
       });

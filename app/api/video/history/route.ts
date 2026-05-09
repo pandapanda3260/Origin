@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
+import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -25,17 +26,21 @@ export async function GET(req: NextRequest) {
     )
     .all({ uid: user.id, lim: limit });
 
-  const items = rows.map((r: any) => ({
-    taskId: r.id,
-    projectId: r.project_id,
-    groupIdx: r.group_idx,
-    prompt: r.prompt,
-    status: r.status,
-    durationSec: r.duration_sec,
-    url: `/api/videos/file/${r.id}`,
-    coverUrl: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : null,
-    createdAt: r.created_at,
-  }));
+  const items = rows.map((r: any) => {
+    const protectedUrl = `/api/videos/file/${r.id}`;
+    return {
+      taskId: r.id,
+      projectId: r.project_id,
+      groupIdx: r.group_idx,
+      prompt: r.prompt,
+      status: r.status,
+      durationSec: r.duration_sec,
+      url: buildSignedVideoUrl(r.id, user.id).url,
+      protectedUrl,
+      coverUrl: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : null,
+      createdAt: r.created_at,
+    };
+  });
 
   return jsonOk({ items, total: items.length, scope });
 }

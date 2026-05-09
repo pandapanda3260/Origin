@@ -15,7 +15,10 @@
  *     返回 patch 对象；这样多个 batch task 并发时每个都基于最新状态计算。
  */
 import { randomUUID } from 'node:crypto';
+import { existsSync, unlinkSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 import { getDb, type ProjectRow } from './db';
+import { listScriptLibraryItems } from './script-library-db';
 
 const EMPTY_DATA = {
   oneSentence: '',
@@ -66,6 +69,7 @@ function preserveExistingAssetUrls(existing: any, next: any) {
 function rowToPublic(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
+  const scriptLibrary = listScriptLibraryItems(r.owner_id, r.id);
   return {
     id: r.id,
     ownerId: r.owner_id,
@@ -79,6 +83,7 @@ function rowToPublic(r: ProjectRow) {
     updatedAt: r.updated_at,
     ...EMPTY_DATA,
     ...data,
+    ...(scriptLibrary.length ? { scriptLibrary } : {}),
   };
 }
 
@@ -258,6 +263,97 @@ export function patchProjectForUser(
 
 export function deleteProjectForUser(id: string, userId: number) {
   const db = getDb();
-  const info = db.prepare('DELETE FROM projects WHERE id = ? AND owner_id = ?').run(id, userId);
-  return info.changes > 0;
+  const existing = db
+    .prepare<{ id: string; uid: number }, { id: string }>(
+      'SELECT id FROM projects WHERE id = @id AND owner_id = @uid',
+    )
+    .get({ id, uid: userId });
+  if (!existing) return false;
+
+  const imageRows = db
+    .prepare<{ uid: number; pid: string }, any>(
+      `SELECT filename, style, asset_ref FROM images WHERE owner_id = @uid AND project_id = @pid`,
+    )
+    .all({ uid: userId, pid: id });
+  const videoRows = db
+    .prepare<{ uid: number; pid: string }, any>(
+      `SELECT id, filename FROM video_tasks WHERE owner_id = @uid AND project_id = @pid`,
+    )
+    .all({ uid: userId, pid: id });
+  const uploadRows = db
+    .prepare<{ uid: number; pid: string }, any>(
+      `SELECT filename FROM uploads WHERE owner_id = @uid AND project_id = @pid`,
+    )
+    .all({ uid: userId, pid: id });
+  const exportRows = db
+    .prepare<{ uid: number; pid: string }, any>(
+      `SELECT id, filename FROM exports WHERE owner_id = @uid AND project_id = @pid`,
+    )
+    .all({ uid: userId, pid: id });
+
+  let deleted = false;
+  const txn = db.transaction(() => {
+    db.prepare(
+      `DELETE FROM batch_tasks
+       WHERE batch_id IN (SELECT id FROM batches WHERE owner_id = ? AND project_id = ?)`,
+    ).run(userId, id);
+    db.prepare('DELETE FROM batches WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM continuity_cache WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM script_library_items WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM images WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM video_tasks WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM uploads WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM exports WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    const info = db.prepare('DELETE FROM projects WHERE id = ? AND owner_id = ?').run(id, userId);
+    deleted = info.changes > 0;
+  });
+  txn.immediate();
+  if (!deleted) return false;
+
+  const files = new Set<string>();
+  const addFile = (bucket: string, filename: any) => {
+    const name = String(filename || '').trim();
+    if (!name) return;
+    files.add(`${bucket}\u0000${name}`);
+  };
+
+  for (const row of imageRows) {
+    const isVideoCover = row?.style === 'video-cover' || String(row?.asset_ref || '').startsWith('video-cover/');
+    addFile(isVideoCover ? 'videos' : 'images', row?.filename);
+  }
+  for (const row of videoRows) {
+    addFile('videos', row?.filename);
+    addFile('videos', row?.id ? `${row.id}.cover.png` : '');
+  }
+  for (const row of uploadRows) addFile('uploads', row?.filename);
+  for (const row of exportRows) {
+    addFile('exports', row?.filename);
+    if (row?.id) {
+      addFile('exports', `${row.id}.concat.mp4`);
+      addFile('exports', `${row.id}.subbed.mp4`);
+      addFile('exports', `${row.id}.sfx.mp4`);
+      addFile('exports', `${row.id}.srt`);
+    }
+  }
+
+  for (const key of files) {
+    const [bucket, filename] = key.split('\u0000');
+    unlinkProjectDataFile(bucket, userId, filename);
+  }
+
+  return true;
+}
+
+function unlinkProjectDataFile(bucket: string, userId: number, filename: string) {
+  const base = resolve(process.cwd(), 'data', bucket, String(userId));
+  const target = resolve(base, filename);
+  if (target === base || !target.startsWith(base + sep)) {
+    console.warn('[ProjectDelete] Skip unsafe file path:', bucket, filename);
+    return;
+  }
+  try {
+    if (existsSync(target)) unlinkSync(target);
+  } catch (e) {
+    console.warn('[ProjectDelete] Failed to remove file:', target, e);
+  }
 }

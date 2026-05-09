@@ -108,10 +108,30 @@ function bootstrap(db: Database.Database) {
       height       INTEGER,
       prompt       TEXT NOT NULL DEFAULT '',
       style        TEXT,
+      correlation_id TEXT,
       created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_images_owner_project ON images(owner_id, project_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS image_generation_audits (
+      correlation_id TEXT PRIMARY KEY,
+      owner_id       INTEGER NOT NULL,
+      project_id     TEXT,
+      asset_ref      TEXT,
+      kind           TEXT,
+      generated_image_id TEXT,
+      moderation_recovered INTEGER NOT NULL DEFAULT 0,
+      original_prompt TEXT NOT NULL DEFAULT '',
+      final_submitted_prompt TEXT NOT NULL DEFAULT '',
+      final_composed_prompt TEXT NOT NULL DEFAULT '',
+      attempts_json  TEXT NOT NULL DEFAULT '[]',
+      safety_violations_json TEXT NOT NULL DEFAULT '[]',
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_image_generation_audits_owner_project ON image_generation_audits(owner_id, project_id, created_at DESC);
 
     -- 阶段三：批量任务
     CREATE TABLE IF NOT EXISTS batches (
@@ -124,11 +144,28 @@ function bootstrap(db: Database.Database) {
       succeeded     INTEGER NOT NULL DEFAULT 0,
       failed        INTEGER NOT NULL DEFAULT 0,
       options_json  TEXT NOT NULL DEFAULT '{}',
+      runner_id     TEXT,
+      runner_heartbeat_at TEXT,
       created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_batches_owner ON batches(owner_id, created_at DESC);
+
+    -- 相邻镜头连续性检查缓存：按输入 hash 缓存每一对镜头的检查结果，避免重复 LLM 调用
+    CREATE TABLE IF NOT EXISTS continuity_cache (
+      id            TEXT PRIMARY KEY,
+      owner_id      INTEGER NOT NULL,
+      project_id    TEXT NOT NULL DEFAULT '',
+      pair_key      TEXT NOT NULL,
+      input_hash    TEXT NOT NULL,
+      result_json   TEXT NOT NULL DEFAULT '{}',
+      created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(owner_id, project_id, pair_key, input_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_continuity_cache_owner_project ON continuity_cache(owner_id, project_id, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS batch_tasks (
       id            TEXT PRIMARY KEY,
@@ -199,6 +236,44 @@ function bootstrap(db: Database.Database) {
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_uploads_owner_project ON uploads(owner_id, project_id, created_at DESC);
+
+    -- 用户世界观模板：风格圣经 + 角色/场景/道具等可复用设定
+    CREATE TABLE IF NOT EXISTS world_templates (
+      id                TEXT NOT NULL,
+      owner_id          INTEGER NOT NULL,
+      name              TEXT NOT NULL,
+      source_project_id TEXT,
+      cover_image_id    TEXT,
+      schema_version    INTEGER NOT NULL DEFAULT 1,
+      source            TEXT NOT NULL DEFAULT 'user',
+      data_json         TEXT NOT NULL DEFAULT '{}',
+      created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (owner_id, id),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (cover_image_id) REFERENCES images(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_world_templates_owner ON world_templates(owner_id, updated_at DESC);
+
+    -- 用户项目剧本库：上传/生成/归档剧本的可复用记录
+    CREATE TABLE IF NOT EXISTS script_library_items (
+      id             TEXT NOT NULL,
+      owner_id       INTEGER NOT NULL,
+      project_id     TEXT NOT NULL,
+      name           TEXT NOT NULL,
+      content        TEXT NOT NULL,
+      content_hash   TEXT NOT NULL,
+      source         TEXT NOT NULL DEFAULT 'generated',
+      schema_version INTEGER NOT NULL DEFAULT 1,
+      meta_json      TEXT NOT NULL DEFAULT '{}',
+      created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (owner_id, id),
+      UNIQUE (owner_id, project_id, content_hash),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_script_library_project ON script_library_items(owner_id, project_id, updated_at DESC);
 
     -- 阶段五：用户积分余额（按用户单行）
     CREATE TABLE IF NOT EXISTS user_credits (
@@ -288,6 +363,8 @@ function bootstrap(db: Database.Database) {
   seedDefaultCredits(db);
   seedDefaultRedeemCodes(db);
   migrateLedgerBuckets(db);
+  migrateBatchLeaseColumns(db);
+  migrateImageAuditColumns(db);
 }
 
 /**
@@ -306,6 +383,48 @@ function migrateLedgerBuckets(db: Database.Database) {
     }
   } catch (e) {
     console.warn('[db] migrateLedgerBuckets:', e);
+  }
+}
+
+/**
+ * 迁移：给 batches 加执行租约字段。
+ * runner_id 标记当前执行进程；runner_heartbeat_at 是 orphan reap 的权威依据。
+ * 旧库缺字段时补列，新库则由 CREATE TABLE 直接创建。
+ */
+function migrateBatchLeaseColumns(db: Database.Database) {
+  try {
+    const cols = db.prepare("PRAGMA table_info(batches)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    if (!names.has('runner_id')) {
+      db.exec('ALTER TABLE batches ADD COLUMN runner_id TEXT');
+      console.log('[db] migrated batches: added runner_id');
+    }
+    if (!names.has('runner_heartbeat_at')) {
+      db.exec('ALTER TABLE batches ADD COLUMN runner_heartbeat_at TEXT');
+      console.log('[db] migrated batches: added runner_heartbeat_at');
+    }
+  } catch (e) {
+    console.warn('[db] migrateBatchLeaseColumns:', e);
+  }
+}
+
+function migrateImageAuditColumns(db: Database.Database) {
+  try {
+    const cols = db.prepare("PRAGMA table_info(images)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    if (!names.has('correlation_id')) {
+      db.exec('ALTER TABLE images ADD COLUMN correlation_id TEXT');
+      console.log('[db] migrated images: added correlation_id');
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_images_correlation ON images(correlation_id)');
+    const auditCols = db.prepare("PRAGMA table_info(image_generation_audits)").all() as Array<{ name: string }>;
+    const auditNames = new Set(auditCols.map((c) => c.name));
+    if (!auditNames.has('final_composed_prompt')) {
+      db.exec("ALTER TABLE image_generation_audits ADD COLUMN final_composed_prompt TEXT NOT NULL DEFAULT ''");
+      console.log('[db] migrated image_generation_audits: added final_composed_prompt');
+    }
+  } catch (e) {
+    console.warn('[db] migrateImageAuditColumns:', e);
   }
 }
 

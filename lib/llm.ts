@@ -10,9 +10,6 @@
  *   - 失败时抛带 friendly message 的 Error，路由层会序列化成前端能展示的中文
  */
 
-import { request as httpRequest } from 'node:http';
-import { request as httpsRequest } from 'node:https';
-import { connect as tlsConnect } from 'node:tls';
 import type { UserRow } from './db';
 import {
   resolveSlotModelConfig,
@@ -20,6 +17,7 @@ import {
   type ResolvedModelConfig,
   type TextModelRole,
 } from './model-routing';
+import { postJsonStreamRequest, postJsonWithProxySupport } from './proxy-fetch';
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -65,6 +63,73 @@ export function resolveLLMConfig(
 // 给到 3 分钟兜底就够覆盖常见慢模型；如果中转站真挂了也不会无限等。
 const LLM_REQUEST_TIMEOUT_MS = 180_000;
 
+type TaskOutputPolicy = {
+  baseMaxTokens: number;
+  retryMaxTokens?: number;
+  timeoutMs?: number;
+  retryTimeoutMs?: number;
+  allowOutputIncompleteRetry?: boolean;
+};
+
+const TASK_OUTPUT_POLICIES: Record<string, TaskOutputPolicy> = {
+  'shots-generate': {
+    baseMaxTokens: 28_000,
+    retryMaxTokens: 32_768,
+    timeoutMs: 900_000,
+    retryTimeoutMs: 900_000,
+    allowOutputIncompleteRetry: true,
+  },
+  'video-prompts': {
+    baseMaxTokens: 8_000,
+    retryMaxTokens: 12_000,
+    timeoutMs: 600_000,
+    retryTimeoutMs: 600_000,
+    allowOutputIncompleteRetry: true,
+  },
+  assetsCharacters: {
+    baseMaxTokens: 24_000,
+    retryMaxTokens: 32_768,
+    timeoutMs: 900_000,
+    retryTimeoutMs: 900_000,
+    allowOutputIncompleteRetry: true,
+  },
+  assetsScenes: {
+    baseMaxTokens: 16_000,
+    retryMaxTokens: 24_000,
+    timeoutMs: 600_000,
+    retryTimeoutMs: 600_000,
+    allowOutputIncompleteRetry: true,
+  },
+  assetsProps: {
+    baseMaxTokens: 12_000,
+    retryMaxTokens: 20_000,
+    timeoutMs: 420_000,
+    retryTimeoutMs: 600_000,
+    allowOutputIncompleteRetry: true,
+  },
+  styleBible: {
+    baseMaxTokens: 16_000,
+    retryMaxTokens: 24_000,
+    timeoutMs: 600_000,
+    retryTimeoutMs: 600_000,
+    allowOutputIncompleteRetry: true,
+  },
+  emotions: {
+    baseMaxTokens: 8_000,
+    retryMaxTokens: 12_000,
+    timeoutMs: 420_000,
+    retryTimeoutMs: 420_000,
+    allowOutputIncompleteRetry: true,
+  },
+  'retag.emotions': {
+    baseMaxTokens: 8_000,
+    retryMaxTokens: 12_000,
+    timeoutMs: 420_000,
+    retryTimeoutMs: 420_000,
+    allowOutputIncompleteRetry: true,
+  },
+};
+
 export async function chatComplete(
   user: UserRow | null,
   messages: ChatMessage[],
@@ -74,7 +139,41 @@ export async function chatComplete(
   if (cfg.mode === 'fake') {
     return fakeReply(messages, opts);
   }
+  const initialOpts = applyTaskRequestTimeout(opts);
+  const budgetedOpts = applyTokenBudget(cfg, messages, initialOpts, 'complete');
 
+  try {
+    return await chatCompleteOnce(cfg, messages, budgetedOpts);
+  } catch (e: any) {
+    const policy = resolveTaskOutputPolicy(opts.traceName);
+    const decision = classifyJsonRetryError(e);
+    const canRetryOutputIncomplete =
+      opts.responseFormat !== 'json_object' &&
+      !!policy?.allowOutputIncompleteRetry &&
+      decision.reason === 'output_incomplete';
+    if (!canRetryOutputIncomplete) throw e;
+
+    const nextTraceAttempt = Math.max((opts.traceAttempt || 1) + 1, 2);
+    const retryMaxTokens = resolveRetryMaxTokens(opts.traceName || '', budgetedOpts.maxTokens ?? opts.maxTokens ?? 4096);
+    console.warn(
+      `[${opts.traceName || 'chatComplete'}] retrying output_incomplete with maxTokens ` +
+      `${budgetedOpts.maxTokens ?? opts.maxTokens ?? 4096} -> ${retryMaxTokens}`,
+    );
+    const retryOpts = applyTaskRequestTimeout({
+      ...opts,
+      maxTokens: retryMaxTokens,
+      traceAttempt: nextTraceAttempt,
+    });
+    const retryBudgetedOpts = applyTokenBudget(cfg, messages, retryOpts, 'complete');
+    return chatCompleteOnce(cfg, messages, retryBudgetedOpts);
+  }
+}
+
+async function chatCompleteOnce(
+  cfg: ResolvedModelConfig,
+  messages: ChatMessage[],
+  opts: LLMOptions,
+): Promise<string> {
   if (cfg.provider === 'zerail_messages') {
     return claudeMessagesComplete(cfg, messages, opts);
   }
@@ -109,7 +208,12 @@ async function openAIChatComplete(
     timeoutMs,
     `LLM 请求超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
   );
-  const content = json?.choices?.[0]?.message?.content;
+  const choice = json?.choices?.[0];
+  const finishReason = String(choice?.finish_reason || '');
+  if (finishReason === 'length') {
+    throw outputIncompleteError('length', opts, json?.usage || null, { finish_reason: finishReason });
+  }
+  const content = choice?.message?.content;
   if (typeof content !== 'string') throw new Error('LLM 返回结构异常（缺 message.content）');
   // 推理模型把 <think>...</think> 当 content 流出来，整段过滤后返回干净文本
   return stripThinkBlocks(content);
@@ -128,6 +232,10 @@ async function claudeMessagesComplete(
     opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS,
     `LLM 请求超时（>${Math.round((opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS) / 1000)}s 未返回）`,
   );
+  const stopReason = String(json?.stop_reason || json?.message?.stop_reason || '').toLowerCase();
+  if (stopReason === 'max_tokens') {
+    throw outputIncompleteError('max_tokens', opts, json?.usage || null, { stop_reason: stopReason });
+  }
   const content = extractClaudeText(json);
   if (!content) throw new Error('LLM 返回结构异常（缺 Claude content text）');
   return stripThinkBlocks(content);
@@ -156,12 +264,7 @@ async function responsesComplete(
       `status=${status} incomplete_details=${formatIncompleteDetails(incompleteDetails)} ` +
       `reason=${incompleteReason} usage=${formatUsageSummary(usage)}`,
     );
-    const err: any = new Error(`LLM Responses 输出不完整（reason=${incompleteReason}）：请提高 maxTokens 或降低 reasoningEffort`);
-    err.llmStatus = 'incomplete';
-    err.incompleteReason = incompleteReason;
-    err.usage = usage;
-    err.incompleteDetails = incompleteDetails;
-    throw err;
+    throw outputIncompleteError(incompleteReason, opts, usage, incompleteDetails);
   }
   const content = extractResponsesText(json);
   if (!content) {
@@ -210,6 +313,16 @@ function formatResponsesTrace(cfg: ResolvedModelConfig, opts: LLMOptions): strin
   ].filter(Boolean).join(' ');
 }
 
+function outputIncompleteError(reason: string, opts: LLMOptions, usage?: any, details?: any): Error {
+  const err: any = new Error(`LLM 输出不完整（reason=${reason}）：请提高 maxTokens 或降低 reasoningEffort`);
+  err.llmStatus = 'incomplete';
+  err.incompleteReason = reason;
+  err.usage = usage;
+  err.incompleteDetails = details;
+  err.maxTokens = opts.maxTokens ?? 4096;
+  return err;
+}
+
 function getResponsesIncompleteDetails(json: any): any {
   return json?.incomplete_details || json?.response?.incomplete_details || null;
 }
@@ -240,6 +353,220 @@ function selectTextRole(opts: LLMOptions): TextModelRole {
   return 'brain';
 }
 
+type TokenBudgetMode = 'complete' | 'stream';
+
+type TokenBudgetDecision = {
+  requestedMaxTokens: number;
+  policyMaxTokens: number;
+  effectiveMaxTokens: number;
+  estimatedInputTokens: number;
+  contextWindow: number;
+  maxOutputTokens: number;
+  reasoningReserve: number;
+  safetyMargin: number;
+  availableOutput: number;
+  clamped: boolean;
+  raisedByPolicy: boolean;
+  taskPolicyName: string;
+  bypassed: boolean;
+  logOnly: boolean;
+};
+
+function applyTokenBudget(
+  cfg: ResolvedModelConfig,
+  messages: ChatMessage[],
+  opts: LLMOptions,
+  mode: TokenBudgetMode,
+): LLMOptions {
+  const requestedMaxTokens = opts.maxTokens ?? 4096;
+  const taskPolicy = resolveTaskOutputPolicy(opts.traceName);
+  const policyMaxTokens = resolvePolicyMaxTokens(taskPolicy, opts.traceAttempt);
+  const desiredMaxTokens = Math.max(requestedMaxTokens, policyMaxTokens);
+  const estimatedInputTokens = estimateMessagesTokens(messages);
+  const reasoningReserve = resolveReasoningReserve(cfg, opts);
+  const safetyMargin = positiveEnvInt('LLM_BUDGET_SAFETY_MARGIN') || 512;
+  const availableOutput = Math.floor(cfg.contextWindow - estimatedInputTokens - reasoningReserve - safetyMargin);
+  const logOnly = envFlag('LLM_BUDGET_LOG_ONLY');
+  const enforce = process.env.LLM_BUDGET_ENFORCE !== '0' && !logOnly;
+  const bypassed = !enforce;
+
+  let effectiveMaxTokens = requestedMaxTokens;
+  let clamped = false;
+  let raisedByPolicy = false;
+  if (enforce) {
+    if (availableOutput < 512) {
+      logTokenBudget(cfg, opts, mode, {
+        requestedMaxTokens,
+        policyMaxTokens,
+        effectiveMaxTokens: requestedMaxTokens,
+        estimatedInputTokens,
+        contextWindow: cfg.contextWindow,
+        maxOutputTokens: cfg.maxOutputTokens,
+        reasoningReserve,
+        safetyMargin,
+        availableOutput,
+        clamped: false,
+        raisedByPolicy: false,
+        taskPolicyName: taskPolicy ? opts.traceName || 'unknown' : '',
+        bypassed: false,
+        logOnly: false,
+      });
+      throw new Error(
+        `输入过长：估算 ${estimatedInputTokens} tokens，模型上下文 ${cfg.contextWindow}，` +
+        `剩余输出预算 ${availableOutput} < 512，请缩短文本或分片处理`,
+      );
+    }
+    effectiveMaxTokens = Math.min(desiredMaxTokens, cfg.maxOutputTokens, availableOutput);
+    clamped = effectiveMaxTokens !== desiredMaxTokens;
+    raisedByPolicy = effectiveMaxTokens > requestedMaxTokens;
+  }
+
+  logTokenBudget(cfg, opts, mode, {
+    requestedMaxTokens,
+    policyMaxTokens,
+    effectiveMaxTokens,
+    estimatedInputTokens,
+    contextWindow: cfg.contextWindow,
+    maxOutputTokens: cfg.maxOutputTokens,
+    reasoningReserve,
+    safetyMargin,
+    availableOutput,
+    clamped,
+    raisedByPolicy,
+    taskPolicyName: taskPolicy ? opts.traceName || 'unknown' : '',
+    bypassed,
+    logOnly,
+  });
+
+  if (!enforce) return opts;
+  return { ...opts, maxTokens: effectiveMaxTokens };
+}
+
+function applyTaskRequestTimeout(opts: LLMOptions): LLMOptions {
+  if (opts.requestTimeoutMs && opts.requestTimeoutMs > 0) return opts;
+  const timeoutMs = resolvePolicyTimeoutMs(resolveTaskOutputPolicy(opts.traceName), opts.traceAttempt);
+  if (!timeoutMs) return opts;
+  return { ...opts, requestTimeoutMs: timeoutMs };
+}
+
+function resolveTaskOutputPolicy(taskName?: string): TaskOutputPolicy | null {
+  const normalized = normalizeTaskName(taskName);
+  if (!normalized) return null;
+  return TASK_OUTPUT_POLICIES[normalized] || null;
+}
+
+function resolvePolicyMaxTokens(policy: TaskOutputPolicy | null, traceAttempt?: number): number {
+  if (!policy) return 0;
+  if ((traceAttempt || 1) > 1 && policy.retryMaxTokens) return policy.retryMaxTokens;
+  return policy.baseMaxTokens;
+}
+
+function resolvePolicyTimeoutMs(policy: TaskOutputPolicy | null, traceAttempt?: number): number {
+  if (!policy) return 0;
+  if ((traceAttempt || 1) > 1 && policy.retryTimeoutMs) return policy.retryTimeoutMs;
+  return policy.timeoutMs || 0;
+}
+
+function normalizeTaskName(taskName?: string): string {
+  const value = String(taskName || '').trim();
+  if (!value) return '';
+  const aliases: Record<string, string> = {
+    video_prompts: 'video-prompts',
+    videoPrompt: 'video-prompts',
+    videoPrompts: 'video-prompts',
+    'shots.generate': 'shots-generate',
+  };
+  return aliases[value] || value;
+}
+
+function estimateMessagesTokens(messages: ChatMessage[]): number {
+  const contentTokens = messages.reduce((sum, msg) => {
+    return sum + estimateTextTokens(msg.role) + estimateTextTokens(msg.name || '') + estimateTextTokens(msg.content || '');
+  }, 0);
+  return Math.ceil(contentTokens + messages.length * 8 + 32);
+}
+
+function estimateTextTokens(text: string): number {
+  const value = String(text || '');
+  if (!value) return 0;
+  const chinese = (value.match(/[\u4e00-\u9fff]/g) || []).length;
+  const nonAscii = (value.match(/[^\x00-\x7f]/g) || []).length - chinese;
+  const ascii = Math.max(0, value.length - chinese - nonAscii);
+  return Math.ceil(chinese * 1.5 + Math.max(0, nonAscii) + ascii / 3);
+}
+
+function resolveReasoningReserve(cfg: ResolvedModelConfig, opts: LLMOptions): number {
+  const override = reasoningReserveEnv(cfg.role || opts.modelRole);
+  if (override) return override;
+
+  const effort = String(opts.reasoningEffort === null ? 'none' : (opts.reasoningEffort || cfg.reasoningEffort || '')).toLowerCase();
+  if (effort === 'xhigh' || effort === 'extra_high') return 12_000;
+  if (effort === 'high') return 6_000;
+  if (effort === 'medium') return 3_000;
+  if (effort === 'low') return 1_500;
+  if (effort === 'minimal' || effort === 'none' || effort === 'off') return 1_000;
+  if (cfg.role === 'styleBible' || cfg.role === 'profileDerive') return 3_000;
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') return 2_000;
+  return 1_000;
+}
+
+function reasoningReserveEnv(role?: TextModelRole): number | undefined {
+  const names: string[] = [];
+  if (role === 'styleBible') names.push('STYLE_BIBLE_REASONING_RESERVE_TOKENS');
+  else if (role === 'profileDerive') names.push('PROFILE_DERIVE_REASONING_RESERVE_TOKENS');
+  else if (role === 'structured') names.push('STRUCTURED_REASONING_RESERVE_TOKENS');
+  else if (role === 'brain') names.push('BRAIN_REASONING_RESERVE_TOKENS', 'CLAUDE_REASONING_RESERVE_TOKENS');
+  names.push('TEXT_REASONING_RESERVE_TOKENS', 'LLM_REASONING_RESERVE_TOKENS');
+  for (const name of Array.from(new Set(names))) {
+    const value = positiveEnvInt(name);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function logTokenBudget(
+  cfg: ResolvedModelConfig,
+  opts: LLMOptions,
+  mode: TokenBudgetMode,
+  budget: TokenBudgetDecision,
+) {
+  const fields = [
+    `mode=${mode}`,
+    `task=${opts.traceName || 'unknown'}`,
+    `role=${cfg.role || opts.modelRole || 'unknown'}`,
+    `provider=${cfg.provider}`,
+    `model=${opts.modelOverride || cfg.model}`,
+    `estimatedInput=${budget.estimatedInputTokens}`,
+    `requestedMax=${budget.requestedMaxTokens}`,
+    `policy=${budget.taskPolicyName || 'none'}`,
+    `policyMax=${budget.policyMaxTokens}`,
+    `effectiveMax=${budget.effectiveMaxTokens}`,
+    `availableOutput=${budget.availableOutput}`,
+    `contextWindow=${budget.contextWindow}`,
+    `maxOutput=${budget.maxOutputTokens}`,
+    `reasoningReserve=${budget.reasoningReserve}`,
+    `safetyMargin=${budget.safetyMargin}`,
+    `clamped=${budget.clamped}`,
+    `raisedByPolicy=${budget.raisedByPolicy}`,
+    `bypassed=${budget.bypassed}`,
+    `logOnly=${budget.logOnly}`,
+  ];
+  const line = `[llm.budget] ${fields.join(' ')}`;
+  if (budget.clamped || budget.availableOutput < 512) console.warn(line);
+  else console.info(line);
+}
+
+function envFlag(name: string): boolean {
+  const value = String(process.env[name] || '').trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
+function positiveEnvInt(name: string): number | undefined {
+  const n = Number(String(process.env[name] || '').trim());
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.round(n);
+}
+
 async function postJsonWithTimeout(
   url: string,
   apiKey: string,
@@ -247,160 +574,7 @@ async function postJsonWithTimeout(
   timeoutMs: number,
   timeoutMessage: string,
 ): Promise<any> {
-  const proxyUrl = getProxyUrlForRequest(url);
-  if (proxyUrl) {
-    return postJsonViaHttpProxy(url, proxyUrl, apiKey, body, timeoutMs, timeoutMessage);
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } catch (e: any) {
-    if (e?.name === 'AbortError') throw new Error(timeoutMessage);
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
-    throw new Error(`LLM ${resp.status}: ${friendly}`);
-  }
-
-  const json: any = await resp.json();
-  if (json?.error) {
-    const friendly = (typeof json.error === 'string' ? json.error : json.error?.message) || JSON.stringify(json.error).slice(0, 400);
-    throw new Error(`LLM 错误: ${friendly}`);
-  }
-  return json;
-}
-
-function getProxyUrlForRequest(url: string): string {
-  const proxyUrl = (process.env.OPENAI_API_PROXY || '').trim();
-  if (!proxyUrl) return '';
-
-  try {
-    const target = new URL(url);
-    if (target.protocol !== 'https:' || target.hostname !== 'api.openai.com') return '';
-    return proxyUrl;
-  } catch {
-    return '';
-  }
-}
-
-function postJsonViaHttpProxy(
-  url: string,
-  proxyUrl: string,
-  apiKey: string,
-  body: any,
-  timeoutMs: number,
-  timeoutMessage: string,
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const target = new URL(url);
-    const proxy = new URL(proxyUrl);
-    const targetPort = Number(target.port || 443);
-    const proxyPort = Number(proxy.port || (proxy.protocol === 'https:' ? 443 : 80));
-    const payload = JSON.stringify(body);
-    const proxyRequest = proxy.protocol === 'https:' ? httpsRequest : httpRequest;
-
-    let settled = false;
-    let connectReq: ReturnType<typeof httpRequest> | null = null;
-    let apiReq: ReturnType<typeof httpsRequest> | null = null;
-    let rawSocket: any = null;
-    let secureSocket: any = null;
-
-    const timer = setTimeout(() => {
-      try { connectReq?.destroy(); } catch (_) {}
-      try { apiReq?.destroy(); } catch (_) {}
-      try { rawSocket?.destroy(); } catch (_) {}
-      try { secureSocket?.destroy(); } catch (_) {}
-      done(new Error(timeoutMessage));
-    }, timeoutMs);
-
-    function done(err: any, value?: any) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (err) reject(err);
-      else resolve(value);
-    }
-
-    connectReq = proxyRequest({
-      hostname: proxy.hostname,
-      port: proxyPort,
-      method: 'CONNECT',
-      path: `${target.hostname}:${targetPort}`,
-      headers: { Host: `${target.hostname}:${targetPort}` },
-    });
-
-    connectReq.on('connect', (connectRes, socket) => {
-      rawSocket = socket;
-      if (connectRes.statusCode !== 200) {
-        try { socket.destroy(); } catch (_) {}
-        done(new Error(`OpenAI 代理 CONNECT 失败（HTTP ${connectRes.statusCode || 'unknown'}）`));
-        return;
-      }
-
-      secureSocket = tlsConnect({ socket, servername: target.hostname });
-      secureSocket.once('secureConnect', () => {
-        apiReq = httpsRequest({
-          hostname: target.hostname,
-          port: targetPort,
-          method: 'POST',
-          path: `${target.pathname}${target.search}`,
-          headers: {
-            Host: target.host,
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Length': Buffer.byteLength(payload),
-          },
-          createConnection: () => secureSocket,
-        }, (resp) => {
-          const chunks: Buffer[] = [];
-          resp.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-          resp.on('end', () => {
-            const text = Buffer.concat(chunks).toString('utf8');
-            if (!resp.statusCode || resp.statusCode < 200 || resp.statusCode >= 300) {
-              const friendly = extractApiErrorMessage(text) || text.slice(0, 500);
-              done(new Error(`LLM ${resp.statusCode || 'unknown'}: ${friendly}`));
-              return;
-            }
-
-            let json: any = null;
-            try {
-              json = JSON.parse(text);
-            } catch (e: any) {
-              done(new Error(`LLM 返回 JSON 解析失败：${e?.message || String(e)}`));
-              return;
-            }
-            if (json?.error) {
-              const friendly = (typeof json.error === 'string' ? json.error : json.error?.message) || JSON.stringify(json.error).slice(0, 400);
-              done(new Error(`LLM 错误: ${friendly}`));
-              return;
-            }
-            done(null, json);
-          });
-        });
-        apiReq.on('error', done);
-        apiReq.end(payload);
-      });
-      secureSocket.on('error', done);
-    });
-    connectReq.on('error', done);
-    connectReq.end();
-  });
+  return postJsonWithProxySupport(url, apiKey, body, timeoutMs, timeoutMessage);
 }
 
 function buildClaudeMessagesBody(
@@ -544,17 +718,22 @@ export async function chatCompleteJsonWithRetry<T = any>(
   const role = opts.modelRole || 'structured';
   const cfg = resolveTextModelConfig(user, role);
   const model = opts.modelOverride || cfg.model;
-  const reasoningEffort = opts.reasoningEffort === null
-    ? 'off'
-    : (opts.reasoningEffort || cfg.reasoningEffort || 'default');
-  const taskMeta = `role=${role},provider=${cfg.provider},model=${model},maxTokens=${opts.maxTokens ?? 4096},reasoning=${reasoningEffort}`;
   let lastErr: any = null;
+  let currentMaxTokens = resolveTaskMaxTokens(taskName, opts.maxTokens, 1);
+  let outputIncompleteRetried = false;
   for (let i = 0; i < maxAttempts; i++) {
     const attempt = i + 1;
     const t0 = Date.now();
+    const reasoningEffort = opts.reasoningEffort === null
+      ? 'off'
+      : (opts.reasoningEffort || cfg.reasoningEffort || 'default');
+    const requestTimeoutMs = resolveJsonRequestTimeoutMs(taskName, currentMaxTokens, reasoningEffort, opts.requestTimeoutMs, attempt);
+    const taskMeta = `role=${role},provider=${cfg.provider},model=${model},maxTokens=${currentMaxTokens},reasoning=${reasoningEffort},timeoutMs=${requestTimeoutMs}`;
     try {
       const raw = await chatComplete(user, messages, {
         ...opts,
+        maxTokens: currentMaxTokens,
+        requestTimeoutMs,
         responseFormat: 'json_object',
         modelRole: opts.modelRole || 'structured',
         traceName: taskName,
@@ -576,6 +755,18 @@ export async function chatCompleteJsonWithRetry<T = any>(
       );
       if (!decision.retryable) throw e;
       if (i < maxAttempts - 1) {
+        if (decision.reason === 'output_incomplete') {
+          if (outputIncompleteRetried) throw e;
+          outputIncompleteRetried = true;
+          const nextMaxTokens = resolveRetryMaxTokens(taskName, currentMaxTokens);
+          console.warn(
+            `[${taskName}] retrying output_incomplete with maxTokens ${currentMaxTokens} -> ${nextMaxTokens}, ` +
+            `reasoning=${reasoningEffort}`,
+          );
+          currentMaxTokens = nextMaxTokens;
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
         // 指数退避：1秒、2秒
         await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
       }
@@ -584,22 +775,64 @@ export async function chatCompleteJsonWithRetry<T = any>(
   throw lastErr || new Error(`${taskName} 调用失败（已重试 ${maxAttempts} 次）`);
 }
 
+function resolveJsonRequestTimeoutMs(
+  taskName: string,
+  maxTokens: number,
+  reasoningEffort: string,
+  explicitTimeoutMs?: number,
+  traceAttempt?: number,
+): number {
+  if (explicitTimeoutMs && explicitTimeoutMs > 0) return explicitTimeoutMs;
+
+  const normalized = normalizeTaskName(taskName);
+  const taskOverride = positiveEnvInt(`${normalized.replace(/[^A-Za-z0-9]+/g, '_').toUpperCase()}_REQUEST_TIMEOUT_MS`);
+  if (taskOverride) return taskOverride;
+
+  const envOverride = positiveEnvInt('LLM_JSON_REQUEST_TIMEOUT_MS');
+  if (envOverride) return envOverride;
+
+  const policy = resolveTaskOutputPolicy(normalized);
+  const policyTimeoutMs = resolvePolicyTimeoutMs(policy, traceAttempt);
+  if (policyTimeoutMs) return policyTimeoutMs;
+
+  const effort = reasoningEffort.toLowerCase();
+  let timeoutMs = LLM_REQUEST_TIMEOUT_MS;
+
+  if (maxTokens >= 28_000) timeoutMs = 900_000;
+  else if (maxTokens >= 20_000) timeoutMs = 600_000;
+  else if (maxTokens >= 12_000) timeoutMs = 420_000;
+
+  if (effort === 'xhigh' || effort === 'extra_high') timeoutMs = Math.max(timeoutMs, 900_000);
+  else if (effort === 'high') timeoutMs = Math.max(timeoutMs, 600_000);
+
+  return timeoutMs;
+}
+
+function resolveTaskMaxTokens(taskName: string, requestedMaxTokens: number | undefined, traceAttempt?: number): number {
+  const policy = resolveTaskOutputPolicy(taskName);
+  return Math.max(requestedMaxTokens ?? 4096, resolvePolicyMaxTokens(policy, traceAttempt));
+}
+
+function resolveRetryMaxTokens(taskName: string, currentMaxTokens: number): number {
+  const policyRetryMaxTokens = resolvePolicyMaxTokens(resolveTaskOutputPolicy(taskName), 2);
+  if (policyRetryMaxTokens) return Math.max(currentMaxTokens, policyRetryMaxTokens);
+  return Math.ceil(currentMaxTokens * 2);
+}
+
 function classifyJsonRetryError(e: any): { retryable: boolean; reason: string } {
   const message = String(e?.message || e || '');
   const lower = message.toLowerCase();
 
-  if (
-    lower.includes('responses 输出不完整') ||
-    lower.includes('status=incomplete') ||
-    lower.includes('reason=max_output_tokens') ||
-    lower.includes('max_output_tokens') ||
-    lower.includes('context_length') ||
-    lower.includes('maximum context')
-  ) {
-    return { retryable: false, reason: 'output_incomplete' };
+  if (String(e?.llmStatus || '').toLowerCase() === 'incomplete') {
+    const reason = String(e?.incompleteReason || '').toLowerCase();
+    if (reason.includes('max_output_tokens') || reason.includes('max_tokens') || reason === 'length') {
+      return { retryable: true, reason: 'output_incomplete' };
+    }
+    return { retryable: false, reason: `incomplete_${reason || 'unknown'}` };
   }
-  if (message.includes('请求超时') || lower.includes('timeout') || lower.includes('abort')) {
-    return { retryable: false, reason: 'timeout' };
+
+  if (lower.includes('context_length') || lower.includes('maximum context')) {
+    return { retryable: false, reason: 'input_context' };
   }
 
   const httpStatus = message.match(/^LLM\s+(\d{3})/i)?.[1];
@@ -609,6 +842,20 @@ function classifyJsonRetryError(e: any): { retryable: boolean; reason: string } 
       retryable: status === 429 || status >= 500,
       reason: `http_${status}`,
     };
+  }
+
+  if (
+    lower.includes('responses 输出不完整') ||
+    lower.includes('status=incomplete') ||
+    lower.includes('reason=max_output_tokens') ||
+    lower.includes('max_output_tokens') ||
+    lower.includes('stop_reason=max_tokens') ||
+    lower.includes('reason=max_tokens')
+  ) {
+    return { retryable: true, reason: 'output_incomplete' };
+  }
+  if (message.includes('请求超时') || lower.includes('timeout') || lower.includes('abort')) {
+    return { retryable: false, reason: 'timeout' };
   }
 
   if (
@@ -655,14 +902,15 @@ export async function chatStream(
     }
     return text;
   }
+  const budgetedOpts = applyTokenBudget(cfg, messages, opts, 'stream');
 
   if (cfg.provider === 'zerail_messages') {
-    return claudeMessagesStream(cfg, messages, opts, onChunk);
+    return claudeMessagesStream(cfg, messages, budgetedOpts, onChunk);
   }
   if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
-    return responsesStream(cfg, messages, opts, onChunk);
+    return responsesStream(cfg, messages, budgetedOpts, onChunk);
   }
-  return openAIChatStream(cfg, messages, opts, onChunk);
+  return openAIChatStream(cfg, messages, budgetedOpts, onChunk);
 }
 
 async function openAIChatStream(
@@ -689,15 +937,12 @@ async function openAIChatStream(
   const streamTimer = setTimeout(() => streamController.abort(), 180_000);
   let resp: Response;
   try {
-    resp = await fetch(`${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${cfg.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: streamController.signal,
-    });
+    resp = await postJsonStreamRequest(
+      `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
+      cfg.apiKey,
+      body,
+      streamController.signal,
+    );
   } catch (e: any) {
     clearTimeout(streamTimer);
     if (e?.name === 'AbortError') {
@@ -820,15 +1065,7 @@ async function streamJsonEvents(
   const streamTimer = setTimeout(() => streamController.abort(), 180_000);
   let resp: Response;
   try {
-    resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: streamController.signal,
-    });
+    resp = await postJsonStreamRequest(url, apiKey, body, streamController.signal);
   } catch (e: any) {
     clearTimeout(streamTimer);
     if (e?.name === 'AbortError') {
@@ -869,6 +1106,11 @@ async function streamJsonEvents(
         }
         try {
           const evt: any = JSON.parse(payload);
+          if (evt?.type === 'response.incomplete' || evt?.response?.status === 'incomplete') {
+            const details = evt?.response?.incomplete_details || evt?.incomplete_details || {};
+            const reason = details?.reason ? `输出未完成：${details.reason}` : '输出未完成';
+            throw new Error(`LLM 流错误: ${reason}`);
+          }
           if (evt?.error || evt?.type === 'error' || evt?.type === 'response.failed') {
             const err = evt?.error || evt?.response?.error || evt;
             const m = (typeof err === 'string' ? err : err?.message) || JSON.stringify(err).slice(0, 300);

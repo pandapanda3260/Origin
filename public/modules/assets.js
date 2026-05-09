@@ -21,6 +21,35 @@ var _assetGenStatus = {};
 var _pendingAssetRerender = false;
 var _libActiveProject = null;
 var _libActiveTab = "all";
+var ASSET_ENTRANCE_ANIM_MS = 1400;
+var _assetEntranceClearTimer = null;
+
+function _getVideoTasksForLibrary() {
+  var state = _ctx.getVideoState ? _ctx.getVideoState() : null;
+  return state && Array.isArray(state.tasks) ? state.tasks : [];
+}
+
+function _assetContentEl() {
+  return $("assetsContent");
+}
+
+function _clearAssetEntranceAnimation() {
+  if (_assetEntranceClearTimer) {
+    clearTimeout(_assetEntranceClearTimer);
+    _assetEntranceClearTimer = null;
+  }
+  var contentEl = _assetContentEl();
+  if (contentEl) contentEl.classList.remove("asset-cards-entrance");
+}
+
+function _scheduleAssetEntranceAnimationClear() {
+  if (_assetEntranceClearTimer) clearTimeout(_assetEntranceClearTimer);
+  _assetEntranceClearTimer = setTimeout(function () {
+    _assetEntranceClearTimer = null;
+    var contentEl = _assetContentEl();
+    if (contentEl) contentEl.classList.remove("asset-cards-entrance");
+  }, ASSET_ENTRANCE_ANIM_MS);
+}
 
 // 后台转绘任务托管：一键生成"资产阶段"完成后，Step2 彩铅转绘继续
 // 在后台跑，用户可以立刻进入编辑/剧本/分镜，不用盯着进度条 4 分钟。
@@ -160,8 +189,9 @@ export async function extractAssets() {
         contentEl.classList.remove("asset-cards-entrance");
         void contentEl.offsetWidth;
         contentEl.classList.add("asset-cards-entrance");
+        _scheduleAssetEntranceAnimationClear();
       }
-      renderAssets();
+      renderAssets({ animateEntrance: true, preserveScroll: false });
       _showAssetActions();
     }
   } catch (e) {
@@ -197,7 +227,13 @@ export async function _showAssetActions() {
   }
 }
 
-export function renderAssets() {
+export function renderAssets(options) {
+  options = options || {};
+  if (!options.animateEntrance) _clearAssetEntranceAnimation();
+  var pageEl = $("pageAssets");
+  var preserveScroll = options.preserveScroll !== false && pageEl && !pageEl.hidden;
+  var prevScrollTop = preserveScroll ? pageEl.scrollTop : 0;
+  var prevScrollLeft = preserveScroll ? pageEl.scrollLeft : 0;
   if (!project || !project.assets) return;
   _cleanupStaleGenStatus();
   renderAssetGrid("assetCharGrid", project.assets.characters, "char", "&#128100;");
@@ -208,6 +244,13 @@ export function renderAssets() {
   $("assetPropCount").textContent = project.assets.props.length;
 
   _injectAssetStaleBadges();
+  if (preserveScroll) {
+    requestAnimationFrame(function () {
+      if (!pageEl || pageEl.hidden) return;
+      pageEl.scrollTop = prevScrollTop;
+      pageEl.scrollLeft = prevScrollLeft;
+    });
+  }
 }
 
 function _injectAssetStaleBadges() {
@@ -384,12 +427,6 @@ function _renderSceneCards(container, items) {
       if (item.timeSetting) metaHtml += '<div class="flex items-center gap-1.5 text-xs font-semibold text-white/70"><span class="material-symbols-outlined text-sm">schedule</span>' + escapeHtml(item.timeSetting) + '</div>';
       if (item.atmosphere) metaHtml += '<div class="flex items-center gap-1.5 text-xs font-semibold text-white/70"><span class="material-symbols-outlined text-sm">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</div>';
 
-      var variantBadgeHero = '';
-      if (item.baseSceneRef) {
-        variantBadgeHero = '<span class="bg-amber-500/80 backdrop-blur px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">变体 ← ' + escapeHtml(item.baseSceneRef) + '</span>';
-        if (item.stateChangeAt) variantBadgeHero += '<span class="bg-white/15 backdrop-blur px-2 py-0.5 rounded text-[9px] font-semibold cursor-pointer" data-action="edit-state-change-at" title="点击编辑转变时机">' + escapeHtml(item.stateChangeAt) + '</span>';
-      }
-
       card.innerHTML =
         '<div class="relative min-h-[320px] rounded-lg overflow-hidden">' +
           imgHtml +
@@ -397,7 +434,7 @@ function _renderSceneCards(container, items) {
           '<div class="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>' +
           '<div class="absolute bottom-8 left-8 text-white">' +
             '<div class="flex items-center gap-2 mb-2">' +
-              (item.baseSceneRef ? variantBadgeHero : '<span class="bg-primary/80 backdrop-blur px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>') +
+              '<span class="bg-primary/80 backdrop-blur px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>' +
               (item.location ? '<span class="text-xs font-medium opacity-70">' + escapeHtml(item.location) + '</span>' : '') +
             '</div>' +
             '<h4 class="text-3xl font-light tracking-tight">' + escapeHtml(item.name) + '</h4>' +
@@ -422,22 +459,12 @@ function _renderSceneCards(container, items) {
       if (item.timeSetting) metaTags += '<div class="flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</div>';
       if (item.atmosphere) metaTags += '<div class="flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</div>';
 
-      var variantLabel = '';
-      if (item.baseSceneRef) {
-        variantLabel = '<div class="flex items-center gap-1.5 mb-1 flex-wrap">' +
-          '<span class="bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded text-[9px] font-bold">变体</span>' +
-          '<span class="text-[9px] text-on-surface-variant/50">← ' + escapeHtml(item.baseSceneRef) + '</span>' +
-          (item.stateChangeAt ? '<span class="text-[9px] text-amber-400/70 cursor-pointer hover:underline" data-action="edit-state-change-at" title="点击编辑转变时机">' + escapeHtml(item.stateChangeAt) + '</span>' : '') +
-        '</div>';
-      }
-
       card.innerHTML =
         '<div class="w-1/3 h-full overflow-hidden rounded-lg relative cursor-pointer" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '">' +
           imgBlock +
           '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
         '</div>' +
         '<div class="w-2/3 p-5 flex flex-col justify-center">' +
-          variantLabel +
           '<span class="text-[9px] font-bold text-primary tracking-[0.15em] uppercase mb-1">' + (item.location || '场景') + '</span>' +
           '<h4 class="text-lg font-bold tracking-tight text-on-background">' + escapeHtml(item.name) + '</h4>' +
           (item.description ? '<p class="text-[11px] text-on-surface-variant/60 mt-1.5 line-clamp-2 leading-relaxed">' + escapeHtml(item.description.slice(0, 100)) + '</p>' : '') +
@@ -457,14 +484,14 @@ function _renderSceneCards(container, items) {
 function _renderPropCards(container, items) {
   items.forEach(function (item, idx) {
     var card = document.createElement("div");
-    card.className = "asset-card group relative bg-surface-container-low rounded-xl p-5 flex flex-col justify-between border border-transparent hover:border-outline-variant/20 transition-all min-h-[180px]";
+    card.className = "asset-card group relative bg-surface-container-low rounded-xl p-5 flex flex-col justify-between border border-transparent hover:border-outline-variant/20 transition-all min-h-[220px]";
     card.dataset.type = "prop";
     card.dataset.idx = idx;
 
     var imgSrc = item.rawUrl || item.imageUrl || '';
     var thumbHtml = imgSrc
-      ? '<div class="w-10 h-10 rounded-lg overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover" /></div>'
-      : '<div class="w-10 h-10 rounded-lg bg-surface-container flex items-center justify-center border border-outline-variant/10"><span class="material-symbols-outlined text-on-surface-variant/20">handyman</span></div>';
+      ? '<div class="asset-prop-thumb rounded-2xl overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all shrink-0" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover" /></div>'
+      : '<div class="asset-prop-thumb rounded-2xl bg-surface-container flex items-center justify-center border border-outline-variant/10 shrink-0"><span class="material-symbols-outlined text-on-surface-variant/20 text-3xl">handyman</span></div>';
 
     var typeLabel = item.propType || '道具';
 
@@ -632,11 +659,55 @@ export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
 
 function _rerenderAssetGrid(type) {
   if (!project || !project.assets) return;
+  _clearAssetEntranceAnimation();
+  var pageEl = $("pageAssets");
+  var preserveScroll = pageEl && !pageEl.hidden;
+  var prevScrollTop = preserveScroll ? pageEl.scrollTop : 0;
+  var prevScrollLeft = preserveScroll ? pageEl.scrollLeft : 0;
   var gridId = type === "char" ? "assetCharGrid" : type === "scene" ? "assetSceneGrid" : "assetPropGrid";
   var items = type === "char" ? project.assets.characters : type === "scene" ? project.assets.scenes : project.assets.props;
   var icon = type === "char" ? "&#128100;" : type === "scene" ? "&#127968;" : "&#128295;";
   renderAssetGrid(gridId, items, type, icon);
   _injectAssetStaleBadges();
+  if (preserveScroll) {
+    requestAnimationFrame(function () {
+      if (!pageEl || pageEl.hidden) return;
+      pageEl.scrollTop = prevScrollTop;
+      pageEl.scrollLeft = prevScrollLeft;
+    });
+  }
+}
+
+function _assetItemFor(type, idx) {
+  if (!project || !project.assets) return null;
+  var list = type === "char" ? project.assets.characters
+    : type === "scene" ? project.assets.scenes
+    : project.assets.props;
+  return list && list[idx] ? list[idx] : null;
+}
+
+function _assetDisplayUrl(type, item) {
+  if (!item) return "";
+  if (type === "char") {
+    return item.imageUrl || item.pencilUrl || item.realPhotoUrl || item.rawUrl || "";
+  }
+  return item.imageUrl || item.rawUrl || "";
+}
+
+function _syncGeneratedAssetCardsFromProject() {
+  var keys = Object.keys(_assetGenStatus);
+  var updated = false;
+  keys.forEach(function (key) {
+    var parts = key.split("_");
+    var type = parts[0];
+    var idx = parseInt(parts[1], 10);
+    if (!type || isNaN(idx)) return;
+    var url = _assetDisplayUrl(type, _assetItemFor(type, idx));
+    if (!url) return;
+    updateAssetCardImage(type, idx, "done", url);
+    updated = true;
+  });
+  return updated;
 }
 
 export async function _rebuildAssetImagePrompt(type, item) {
@@ -689,8 +760,6 @@ export async function _rebuildAssetImagePrompt(type, item) {
  *   - char：executor 内部 Step1（真人图）+ Step2（彩铅）一条龙，`apply_patch_and_save`
  *     把 realPhotoUrl + pencilUrl 一次落盘；刷新页面回来就有图
  *   - scene / prop：单 URL 写 imageUrl
- *   - scene + baseSceneRef（变体）：executor 内部 poll 等 base scene 就绪，
- *     然后 stylize_worker.run_img2img 做派生
  *
  * 不再自管 `_pendingImageTasks` / `registerServerTask` —— 后端 batch_runner
  * 是权威源，前端只挂 SSE 看进度 + 乐观渲染 UI。
@@ -704,22 +773,30 @@ export async function generateSingleAssetImage(type, idx) {
   var item = list && list[idx];
   if (!item) return;
 
-  updateAssetCardImage(type, idx, "loading");
+  updateAssetCardImage(type, idx, "loading", null, "正在同步最新提示词…");
 
-  // 变体场景预检：若 baseSceneRef 对应的主 scene 还没图，就提示用户先生成，
-  // 避免 executor 里白等 6 分钟。
-  if (type === "scene" && item.baseSceneRef) {
-    var baseScene = (project.assets.scenes || []).find(function (s) {
-      return s.name === item.baseSceneRef;
-    });
-      var baseImgUrl = baseScene && (baseScene.imageUrl || baseScene.rawUrl);
-      if (!baseImgUrl) {
-        updateAssetCardImage(type, idx, "error");
-        showToast("请先生成基础场景「" + item.baseSceneRef + "」的参考图", "warn");
-        return;
-      }
-      updateAssetCardImage(type, idx, "loading", null, "基于基础场景图生成变体…");
+  var rebuiltPrompt = await _rebuildAssetImagePrompt(type, item);
+  if (rebuiltPrompt) {
+    item.imagePrompt = rebuiltPrompt;
+    var topKey = type === "char" ? "characters" : type === "scene" ? "environments" : "props";
+    if (project[topKey] && project[topKey][idx]) {
+      project[topKey][idx].imagePrompt = rebuiltPrompt;
+    }
+  } else if (item.imagePrompt) {
+    item.imagePrompt = "";
+    var fallbackTopKey = type === "char" ? "characters" : type === "scene" ? "environments" : "props";
+    if (project[fallbackTopKey] && project[fallbackTopKey][idx]) {
+      project[fallbackTopKey][idx].imagePrompt = "";
+    }
   }
+
+  if (_ctx.flushServerSave) {
+    await _ctx.flushServerSave();
+  } else if (_ctx.saveProject) {
+    await _ctx.saveProject();
+  }
+
+  updateAssetCardImage(type, idx, "loading");
 
   var batchTarget = { type: type, idx: idx };
   var totalTasks = 1;
@@ -851,7 +928,7 @@ function _updateStylizeBadge() {
 
 export async function generateAllAssetImages() {
   // Phase 3-B-4 / 3-B-6 / 3-B-7 / 3-B-8：全部资产（角色一条龙 Step1+Step2、
-  // 场景、道具、**变体场景**）都进同一个后端 batch。**单卡重试**也走相同
+  // 场景、道具）都进同一个后端 batch。**单卡重试**也走相同
   // executor —— `generateSingleAssetImage` 直接发单元素 batch，完全不再碰
   // `/api/images/submit` / `_pollStylizeTask` / `_pendingImageTasks`。
   // 前端只负责：
@@ -867,14 +944,14 @@ export async function generateAllAssetImages() {
 
   var originId = project.id;
 
-  // Phase 3-B-7：扫描 project.assets，变体场景和主资产统一排进一个队列。
+  // Phase 3-B-7：扫描 project.assets，把需要生成的主资产统一排进一个队列。
   var allTargets = [];
   ["characters", "scenes", "props"].forEach(function (cat) {
     var type = cat === "characters" ? "char" : cat === "scenes" ? "scene" : "prop";
     (project.assets[cat] || []).forEach(function (item, idx) {
-      var needsGen = !item.imageUrl && (item.imagePrompt || (type === "scene" && item.baseSceneRef));
+      var needsGen = !item.imageUrl && item.imagePrompt;
       if (!needsGen) return;
-      allTargets.push({ type: type, idx: idx, isVariant: !!(type === "scene" && item.baseSceneRef) });
+      allTargets.push({ type: type, idx: idx });
     });
   });
 
@@ -886,30 +963,12 @@ export async function generateAllAssetImages() {
     return;
   }
 
-  // 为所有 target 先置 loading 占位——变体场景用不同文案提示"等 base 就绪"。
+  // 为所有 target 先置 loading 占位。
   allTargets.forEach(function (t) {
-    if (t.isVariant) {
-      updateAssetCardImage(t.type, t.idx, "loading", null, "等待基础场景就绪…");
-      } else {
-      updateAssetCardImage(t.type, t.idx, "loading");
-    }
+    updateAssetCardImage(t.type, t.idx, "loading");
   });
 
-  // 排序：副场景必须排在它对应的主场景**之后**，否则 batch_runner 并发跑时
-  // 副场景的 executor 会一直 polling 等主场景 PNG 生成出来，可能撑爆 90s
-  // 超时 → 强制 fallback 到无参考图模式，色调和环境就脱钩了。
-  // 简单做法：所有非场景资产保持原顺序，scenes 内部把 isVariant=false
-  // 的全部排到 isVariant=true 之前。
-  allTargets.sort(function (a, b) {
-    if (a.type !== "scene" || b.type !== "scene") return 0;
-    if (a.isVariant === b.isVariant) return 0;
-    return a.isVariant ? 1 : -1;
-  });
-
-  // executor 端不需要 isVariant，这是前端 UI hint，发 batch 前剥掉。
-  var batchTargets = allTargets.map(function (t) { return { type: t.type, idx: t.idx }; });
-
-  var batchResult = await _runAssetImageBatch(originId, batchTargets, hint, totalTasks);
+  var batchResult = await _runAssetImageBatch(originId, allTargets, hint, totalTasks);
   // batchResult: { done, failed }
 
   _assetImagesGenerating = false;
@@ -960,8 +1019,8 @@ export async function generateAllAssetImages() {
  * 乐观更新，权威落盘已由 batch_runner 侧 `apply_patch_and_save` 写进
  * project.json——用户刷新 reload 出来的项目就是"有图"的权威版。
  *
- * Phase 3-B-7：变体场景也进同一个 batch（executor 内部 poll 等 base scene
- * 就绪），前端不再额外跑 Phase 2 串行流；subscribe 回调抽成
+ * Phase 3-B-7：场景图走同一个 batch，前端不再额外跑 Phase 2 串行流；
+ * subscribe 回调抽成
  * `_attachAssetImageBatch` 以便"刷新后重连活跃 batch"复用。
  */
 function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
@@ -1103,10 +1162,15 @@ function _attachAssetImageBatch(opts) {
       _refreshHint();
 
       var succeededNow = (typeof snap.succeeded === "number") ? snap.succeeded : 0;
-      var statusTerminal = (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled");
+      var statusTerminal = (
+        snap.status === "completed" ||
+        snap.status === "failed" ||
+        snap.status === "cancelled" ||
+        snap.status === "partial"
+      );
 
       // 中途增量刷新：只要新增完成的任务 ≥ 1 张，就 reload 一次 project 把
-      // DB 里已落盘的图同步到内存，再重渲三个 grid 让卡片立刻显图。
+      // DB 里已落盘的图同步到内存，再优先只同步完成卡片，避免整页重建闪屏。
       // 这一段独立于"终态分支"——避免必须等所有 15 张全完成才看到前 9 张。
       if (succeededNow > lastPolledSucceeded && lastPolledSucceeded >= 0 && !statusTerminal) {
         console.log("[AssetImg] poll detected new succeeded " + lastPolledSucceeded + " → " + succeededNow + " — incremental reload");
@@ -1114,7 +1178,9 @@ function _attachAssetImageBatch(opts) {
           if (_ctx.reloadProjectFromServer) {
             var ok = await _ctx.reloadProjectFromServer();
             if (ok) {
-              try { renderAssets(); } catch (e2) { console.warn("[AssetImg] renderAssets (incremental) failed:", e2); }
+              try {
+                if (!_syncGeneratedAssetCardsFromProject()) renderAssets();
+              } catch (e2) { console.warn("[AssetImg] incremental card sync failed:", e2); }
             }
           }
         } catch (e) { console.warn("[AssetImg] incremental reload failed:", e); }
@@ -1174,13 +1240,15 @@ function _attachAssetImageBatch(opts) {
       console.log("[AssetImg] task_completed seq=" + data.targetSeq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
       if (!type || typeof idx !== "number" || !url) {
         // SSE 帧缺信息：图已落盘但 UI 收不到必要字段。改成主动从 server 拉一次
-        // project，让 renderAssets() 按权威数据补图——而不是默默吞掉等用户 F5。
+        // project，让当前还在 loading 的卡片按权威数据补图——而不是默默吞掉等用户 F5。
         console.warn("[AssetImg] task_completed missing target/url — pulling project from server to recover", data);
         doneCount++;
         if (_ctx.reloadProjectFromServer) {
           _ctx.reloadProjectFromServer().then(function (ok) {
             if (ok) {
-              try { renderAssets(); } catch (e) { console.warn("[AssetImg] renderAssets after recovery failed:", e); }
+              try {
+                if (!_syncGeneratedAssetCardsFromProject()) renderAssets();
+              } catch (e) { console.warn("[AssetImg] renderAssets after recovery failed:", e); }
             }
           }).catch(function (e) { console.warn("[AssetImg] recovery reload failed:", e); });
         }
@@ -1261,8 +1329,11 @@ function _attachAssetImageBatch(opts) {
       finish({ done: doneCount, failed: failCount });
     },
     onClose: function () {
-      finish({ done: doneCount, failed: failCount });
-      },
+      if (pollTimer) {
+        console.warn("[AssetImg] SSE closed; polling fallback remains active");
+        _refreshHint();
+      }
+    },
     });
   }
 
@@ -1731,16 +1802,6 @@ export function handleAssetAction(e) {
         _autoSyncUpstream(type, idx);
       };
     }
-  } else if (action === "edit-state-change-at") {
-    if (type !== "scene" || !item.baseSceneRef) return;
-    var curVal = item.stateChangeAt || '';
-    var newVal = prompt("编辑转变时机（如：枪战引发火灾后）", curVal);
-    if (newVal !== null && newVal.trim() !== curVal) {
-      item.stateChangeAt = newVal.trim();
-      _ctx.saveProject();
-      renderAssetsUI();
-      showToast("转变时机已更新", "ok");
-    }
   } else if (action === "edit-char-mode") {
     if (type !== "char") return;
     var curVia = item.via || '';
@@ -1868,10 +1929,6 @@ function _showCharMenu(anchor, type, idx) {
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-xl" data-menu="upload-char-img">' +
       '<span class="material-symbols-outlined text-lg text-[#2E7D32]">upload</span>上传角色图' +
     '</button>' +
-    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
-    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-menu="reuse-char">' +
-      '<span class="material-symbols-outlined text-lg text-[#5B6ABF]">person_search</span>复用素材库角色' +
-    '</button>' +
     (_hasPencilIssue ? '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e65100] hover:bg-orange-50 transition-colors" data-menu="retry-pencil">' +
       '<span class="material-symbols-outlined text-lg">brush</span>' + _retryLabel +
@@ -1889,8 +1946,6 @@ function _showCharMenu(anchor, type, idx) {
     _dismissCharMenu();
     if (act === "upload-char-img") {
       _triggerCharImageUpload(idx);
-    } else if (act === "reuse-char") {
-      _openCharLibraryModal(idx);
     } else if (act === "retry-pencil") {
       _retryPencilConversion(idx);
     } else if (act === "delete-char") {
@@ -2003,110 +2058,6 @@ export async function _retryPencilConversion(idx) {
     updateAssetCardImage("char", idx, "done", item.realPhotoUrl);
   }
   _updateStylizeBadge();
-}
-
-/* ── 收集所有项目的角色 ── */
-async function _collectAllLibraryCharacters() {
-  var result = [];
-  var projList = _ctx.getProjectList();
-  if (project && !projList.some(function (p) { return p.id === project.id; })) {
-    projList.unshift({ id: project.id, name: project.name });
-  }
-  for (var i = 0; i < projList.length; i++) {
-    var meta = projList[i];
-    var proj = (project && meta.id === project.id) ? project : await loadProjectData(meta.id);
-    if (!proj || !proj.assets || !proj.assets.characters) continue;
-    proj.assets.characters.forEach(function (ch) {
-      if (!ch.name) return;
-      result.push({
-        projectId: proj.id,
-        projectName: proj.name || "未命名项目",
-        char: ch
-      });
-    });
-  }
-  return result;
-}
-
-/* ── 角色复用弹窗 ── */
-async function _openCharLibraryModal(targetIdx) {
-  _closeCharLibraryModal();
-  var allChars = await _collectAllLibraryCharacters();
-  if (!allChars.length) {
-    showToast("素材库中没有可复用的角色", "warn");
-    return;
-  }
-
-  var overlay = document.createElement("div");
-  overlay.id = "charLibraryModal";
-  overlay.className = "fixed inset-0 z-[9998] flex items-center justify-center bg-black/60 backdrop-blur-sm";
-  overlay.style.animation = "fadeIn .2s ease";
-
-  var gridHtml = "";
-  allChars.forEach(function (entry, i) {
-    var ch = entry.char;
-    var imgSrc = ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-    var roleText = ch.role || "";
-    if (ch.identity) roleText += (roleText ? " · " : "") + ch.identity;
-    var descParts = [];
-    if (ch.appearance) descParts.push(ch.appearance);
-    if (ch.clothing) descParts.push(ch.clothing);
-    var desc = descParts.join(" | ").slice(0, 80);
-
-    gridHtml +=
-      '<div class="group cursor-pointer bg-surface-container-low rounded-xl overflow-hidden border-2 border-transparent hover:border-primary/50 transition-all duration-200" data-reuse-idx="' + i + '">' +
-        '<div class="aspect-square overflow-hidden bg-surface-container">' +
-          (imgSrc
-            ? '<img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover object-[left_top] group-hover:scale-105 transition-transform duration-500" />'
-            : '<div class="w-full h-full flex items-center justify-center"><span class="material-symbols-outlined text-4xl text-on-surface-variant/15">person</span></div>') +
-        '</div>' +
-        '<div class="p-3">' +
-          '<h4 class="text-sm font-bold text-on-background truncate">' + escapeHtml(ch.name) + '</h4>' +
-          (roleText ? '<p class="text-[10px] text-on-surface-variant/70 mt-0.5 truncate">' + escapeHtml(roleText) + '</p>' : '') +
-          (desc ? '<p class="text-[10px] text-on-surface-variant/50 mt-1 line-clamp-2 leading-relaxed">' + escapeHtml(desc) + '</p>' : '') +
-          '<p class="text-[9px] text-primary/60 mt-1.5 truncate font-medium">' + escapeHtml(entry.projectName) + '</p>' +
-        '</div>' +
-      '</div>';
-  });
-
-  overlay.innerHTML =
-    '<div class="bg-surface rounded-2xl shadow-2xl w-[90vw] max-w-3xl max-h-[80vh] flex flex-col overflow-hidden border border-outline-variant/10" onclick="event.stopPropagation()">' +
-      '<div class="flex items-center justify-between px-6 py-4 border-b border-outline-variant/10">' +
-        '<div>' +
-          '<h3 class="text-lg font-bold text-on-background">复用素材库角色</h3>' +
-          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个角色的外观设计复用到当前角色（仅替换外观和图片，名字保持不变）</p>' +
-        '</div>' +
-        '<button class="w-9 h-9 rounded-full hover:bg-surface-container flex items-center justify-center transition-colors" id="btnCloseCharLib">' +
-          '<span class="material-symbols-outlined text-on-surface-variant">close</span>' +
-        '</button>' +
-      '</div>' +
-      '<div class="flex-1 overflow-y-auto p-6">' +
-        '<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">' + gridHtml + '</div>' +
-      '</div>' +
-    '</div>';
-
-  overlay.addEventListener("click", function (ev) {
-    if (ev.target === overlay) _closeCharLibraryModal();
-  });
-
-  overlay.querySelector("#btnCloseCharLib").addEventListener("click", _closeCharLibraryModal);
-
-  overlay.querySelectorAll("[data-reuse-idx]").forEach(function (card) {
-    card.addEventListener("click", function () {
-      var reuseIdx = parseInt(card.dataset.reuseIdx, 10);
-      var source = allChars[reuseIdx];
-      if (!source) return;
-      _reuseCharacter(targetIdx, source.char);
-      _closeCharLibraryModal();
-    });
-  });
-
-  document.body.appendChild(overlay);
-}
-
-function _closeCharLibraryModal() {
-  var m = document.getElementById("charLibraryModal");
-  if (m) m.remove();
 }
 
 var _charUploadStreams = {};
@@ -2235,38 +2186,6 @@ async function _uploadCharImage(charIdx, file) {
   }
 }
 
-function _reuseCharacter(targetIdx, sourceChar) {
-  if (!project || !project.assets || !project.assets.characters) return;
-  var target = project.assets.characters[targetIdx];
-  if (!target) return;
-
-  var targetName = target.name || "未命名";
-  var sourceName = sourceChar.name || "未命名";
-  showToast("正在复用「" + sourceName + "」到「" + targetName + "」，AI 读图更新描述中...", "info");
-
-  apiPost("/api/assets/reuse-and-read", {
-    projectId: project.id || "default",
-    targetIdx: targetIdx,
-    sourceChar: sourceChar,
-  }).then(function (resp) {
-    if (resp.error) {
-      showToast("复用失败：" + resp.error, "error");
-      return;
-    }
-    if (resp.character && project.assets && project.assets.characters[targetIdx]) {
-      project.assets.characters[targetIdx] = Object.assign(
-        project.assets.characters[targetIdx],
-        resp.character,
-      );
-      project.assets.characters[targetIdx].name = targetName;
-    }
-    renderAssets();
-    showToast("已将「" + sourceName + "」的外观复用到「" + targetName + "」，描述已自动更新", "success");
-  }).catch(function (e) {
-    showToast("复用失败：" + (e.message || e), "error");
-  });
-}
-
 export function _openLightbox(imgUrl) {
   var existing = document.getElementById("assetLightbox");
   if (existing) existing.remove();
@@ -2388,30 +2307,165 @@ function runConcurrent(tasks, opts) {
    为什么保留内存镜像：
      - 模板选择框等 UI 要求同步读取；改成 async 全链条要改太多 UI 点。
      - 后端本身就是轻量 JSON，第一屏加载一次足够；之后 CRUD 走 REST。
-     - `_saveWorldTemplates(list)` 这个旧导出仅保留作向后兼容，现在只
-       刷内存不写 localStorage（实际 CRUD 请用 append/delete 两个新 API）。
 */
 
 var _worldTemplatesMem = null;      // null = 尚未 prime，[] = prime 过但空
 var _worldTemplatesPrimed = false;
+var _worldTemplatesPrimePromise = null;
+
+function _worldTemplatesStorageKey() {
+  return (_ctx.uPrefix || "") + "sw_world_templates";
+}
+
+function _worldTemplatesMigratedKey() {
+  return (_ctx.uPrefix || "") + "sw_world_templates_migrated_v1";
+}
+
+function _isSafeWorldTemplateId(id) {
+  var value = String(id || "").trim();
+  return !!(value && value.length <= 100 && /^[A-Za-z0-9_.:-]+$/.test(value));
+}
+
+function _stableWorldTemplateValue(value) {
+  if (Array.isArray(value)) return value.map(_stableWorldTemplateValue);
+  if (!value || typeof value !== "object") return value;
+  var out = {};
+  Object.keys(value).sort().forEach(function (key) {
+    var v = _stableWorldTemplateValue(value[key]);
+    if (typeof v !== "undefined") out[key] = v;
+  });
+  return out;
+}
+
+function _worldTemplateMigrationFingerprint(tpl) {
+  var root = Object.assign({}, tpl || {});
+  [
+    "id",
+    "createdAt",
+    "updatedAt",
+    "created_at",
+    "updated_at",
+    "source",
+    "legacyId",
+    "migrationKey",
+    "schemaVersion",
+    "schema_version",
+  ].forEach(function (key) { delete root[key]; });
+  return _hashWorldTemplateString(JSON.stringify(_stableWorldTemplateValue(root)));
+}
+
+function _hashWorldTemplateString(text) {
+  var h = 2166136261;
+  text = String(text || "");
+  for (var i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function _legacyWorldTemplateStableId(tpl) {
+  return "tpl_legacy_" + _worldTemplateMigrationFingerprint(tpl);
+}
 
 export function _getWorldTemplates() {
   return Array.isArray(_worldTemplatesMem) ? _worldTemplatesMem : [];
 }
 
-/**
- * 向后兼容的"整体覆盖"接口；新代码请用 `_appendWorldTemplate` /
- * `_deleteWorldTemplateRemote`。本函数只刷内存 + 发一次 PUT 同步到后端，
- * 不再写 localStorage。
- */
-export function _saveWorldTemplates(list) {
-  if (!Array.isArray(list)) return;
-  _worldTemplatesMem = list.slice();
-  fetch("/api/world-templates", {
-    method: "PUT",
-    headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
-    body: JSON.stringify({ templates: list }),
-  }).catch(function (e) { console.warn("[WorldTemplates] PUT failed:", e); });
+async function _loadWorldTemplateDetail(tpl) {
+  if (!tpl || !tpl.id) return tpl;
+  if (!tpl.summaryOnly && (Array.isArray(tpl.characters) || tpl.styleBible || tpl.loadedAt)) return tpl;
+  var resp = await fetch("/api/world-templates/" + encodeURIComponent(tpl.id), {
+    headers: _getAuthHeaders(),
+  });
+  var data = await _parseWorldTemplateResponse(resp);
+  var full = data.template || tpl;
+  if (Array.isArray(_worldTemplatesMem)) {
+    _worldTemplatesMem = _worldTemplatesMem.map(function (item) {
+      return item && item.id === full.id ? full : item;
+    });
+  }
+  return full;
+}
+
+function _parseWorldTemplateResponse(resp) {
+  return resp.json().catch(function () { return {}; }).then(function (data) {
+    if (!resp.ok) {
+      throw new Error(data.detail || data.error || ("世界观模板接口失败：" + resp.status));
+    }
+    return data || {};
+  });
+}
+
+async function _migrateLegacyWorldTemplatesIfNeeded(serverTemplates) {
+  var migratedKey = _worldTemplatesMigratedKey();
+  var storageKey = _worldTemplatesStorageKey();
+  try {
+    if (localStorage.getItem(migratedKey) === "1") return serverTemplates || [];
+  } catch (_) { return serverTemplates || []; }
+
+  var legacy = [];
+  try {
+    var raw = localStorage.getItem(_worldTemplatesStorageKey());
+    legacy = raw ? JSON.parse(raw) : [];
+  } catch (_) {
+    legacy = [];
+  }
+  if (!Array.isArray(legacy) || legacy.length === 0) {
+    try { localStorage.setItem(migratedKey, "1"); } catch (_) {}
+    return serverTemplates || [];
+  }
+
+  var existingIds = {};
+  var existingFingerprints = {};
+  (serverTemplates || []).forEach(function (tpl) { if (tpl && tpl.id) existingIds[tpl.id] = true; });
+  (serverTemplates || []).forEach(function (tpl) {
+    if (!tpl || typeof tpl !== "object") return;
+    if (tpl.migrationKey) existingFingerprints[tpl.migrationKey] = true;
+    existingFingerprints[_worldTemplateMigrationFingerprint(tpl)] = true;
+  });
+  var migrated = [];
+  var pending = legacy.slice();
+  function persistPending() {
+    try { localStorage.setItem(storageKey, JSON.stringify(pending)); } catch (_) {}
+  }
+  for (var i = 0; i < pending.length;) {
+    var tpl = pending[i];
+    if (!tpl || typeof tpl !== "object") {
+      pending.splice(i, 1);
+      persistPending();
+      continue;
+    }
+    var migrationKey = _worldTemplateMigrationFingerprint(tpl);
+    var stableId = _isSafeWorldTemplateId(tpl.id) ? String(tpl.id).trim() : _legacyWorldTemplateStableId(tpl);
+    if (existingIds[stableId] || existingFingerprints[migrationKey]) {
+      pending.splice(i, 1);
+      persistPending();
+      continue;
+    }
+    var payload = Object.assign({}, tpl, {
+      id: stableId,
+      source: "localStorage_migration",
+      legacyId: tpl.id || "",
+      migrationKey: migrationKey,
+    });
+    var resp = await fetch("/api/world-templates", {
+      method: "POST",
+      headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
+      body: JSON.stringify({ template: payload }),
+    });
+    var data = await _parseWorldTemplateResponse(resp);
+    if (data.template) {
+      migrated.push(data.template);
+      existingIds[data.template.id] = true;
+      existingFingerprints[migrationKey] = true;
+    }
+    pending.splice(i, 1);
+    persistPending();
+  }
+  try { localStorage.setItem(migratedKey, "1"); } catch (_) {}
+  try { localStorage.setItem(storageKey, "[]"); } catch (_) {}
+  return migrated.concat(serverTemplates || []);
 }
 
 /**
@@ -2419,41 +2473,62 @@ export function _saveWorldTemplates(list) {
  * 不阻塞首屏——用户触发"导入模板"时若还没 prime 完，UI 会提示"加载中"。
  */
 export async function _primeWorldTemplates() {
-  try {
-    var resp = await fetch("/api/world-templates", { headers: _getAuthHeaders() });
-    if (!resp.ok) {
+  if (_worldTemplatesPrimePromise) return _worldTemplatesPrimePromise;
+  _worldTemplatesPrimePromise = (async function () {
+    try {
+      var resp = await fetch("/api/world-templates", { headers: _getAuthHeaders() });
+      if (!resp.ok) {
+        _worldTemplatesMem = _worldTemplatesMem || [];
+        _worldTemplatesPrimed = true;
+        return;
+      }
+      var data = await resp.json();
+      var list = Array.isArray(data.templates) ? data.templates : (Array.isArray(data.items) ? data.items : []);
+      _worldTemplatesMem = await _migrateLegacyWorldTemplatesIfNeeded(list);
+      _worldTemplatesPrimed = true;
+    } catch (e) {
+      console.warn("[WorldTemplates] prime failed:", e);
       _worldTemplatesMem = _worldTemplatesMem || [];
-      return;
+      _worldTemplatesPrimed = true;
+    } finally {
+      _worldTemplatesPrimePromise = null;
     }
-    var data = await resp.json();
-    _worldTemplatesMem = Array.isArray(data.templates) ? data.templates : [];
-    _worldTemplatesPrimed = true;
-  } catch (e) {
-    console.warn("[WorldTemplates] prime failed:", e);
-    _worldTemplatesMem = _worldTemplatesMem || [];
-  }
+  })();
+  return _worldTemplatesPrimePromise;
 }
 
 /** 追加一条模板：本地 unshift + 后端 POST。返回 Promise 便于 UI 等落盘。 */
 function _appendWorldTemplate(tpl) {
-  if (!_worldTemplatesMem) _worldTemplatesMem = [];
-  _worldTemplatesMem.unshift(tpl);
   return fetch("/api/world-templates", {
     method: "POST",
     headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
     body: JSON.stringify({ template: tpl }),
-  }).catch(function (e) { console.warn("[WorldTemplates] POST failed:", e); });
+  }).then(_parseWorldTemplateResponse).then(function (data) {
+    var saved = data.template || tpl;
+    if (!_worldTemplatesMem) _worldTemplatesMem = [];
+    _worldTemplatesMem = _worldTemplatesMem.filter(function (t) { return t.id !== saved.id; });
+    _worldTemplatesMem.unshift(saved);
+    return saved;
+  }).catch(function (e) {
+    console.warn("[WorldTemplates] POST failed:", e);
+    throw e;
+  });
 }
 
 /** 删除一条：本地 filter + 后端 DELETE。 */
 function _deleteWorldTemplateRemote(tplId) {
+  var prev = _getWorldTemplates().slice();
   if (Array.isArray(_worldTemplatesMem)) {
     _worldTemplatesMem = _worldTemplatesMem.filter(function (t) { return t.id !== tplId; });
   }
   return fetch("/api/world-templates/" + encodeURIComponent(tplId), {
     method: "DELETE",
     headers: _getAuthHeaders(),
-  }).catch(function (e) { console.warn("[WorldTemplates] DELETE failed:", e); });
+  }).then(_parseWorldTemplateResponse).catch(function (e) {
+    _worldTemplatesMem = prev;
+    console.warn("[WorldTemplates] DELETE failed:", e);
+    throw e;
+  });
 }
 
 export function saveAsWorldTemplate() {
@@ -2532,24 +2607,28 @@ function _openSaveTemplateDialog() {
   input.select();
 
   overlay.querySelector("#saveTplCancel").addEventListener("click", function () { overlay.remove(); });
-  overlay.querySelector("#saveTplConfirm").addEventListener("click", function () {
+  overlay.querySelector("#saveTplConfirm").addEventListener("click", async function () {
     var name = input.value.trim();
     if (!name) { input.focus(); return; }
-    _doSaveWorldTemplate(name);
-    overlay.remove();
+    try {
+      await _doSaveWorldTemplate(name);
+      overlay.remove();
+    } catch (_) {}
   });
 
-  input.addEventListener("keydown", function (ev) {
+  input.addEventListener("keydown", async function (ev) {
     if (ev.key === "Enter") {
       var name = input.value.trim();
       if (!name) return;
-      _doSaveWorldTemplate(name);
-      overlay.remove();
+      try {
+        await _doSaveWorldTemplate(name);
+        overlay.remove();
+      } catch (_) {}
     }
   });
 }
 
-function _doSaveWorldTemplate(name) {
+async function _doSaveWorldTemplate(name) {
   var chars = [];
   if (project.assets && project.assets.characters) {
     chars = project.assets.characters.map(function (ch) {
@@ -2569,12 +2648,19 @@ function _doSaveWorldTemplate(name) {
     id: "tpl_" + Date.now(),
     name: name,
     createdAt: Date.now(),
+    sourceProjectId: project.id || "",
+    coverImageUrl: (chars[0] && (chars[0].realPhotoUrl || chars[0].rawUrl || chars[0].imageUrl || chars[0].pencilUrl)) || "",
     styleBible: project.styleBible || null,
     characters: chars
   };
 
-  _appendWorldTemplate(tpl);
-  showToast("世界观模板「" + name + "」已保存", "success");
+  try {
+    await _appendWorldTemplate(tpl);
+    showToast("世界观模板「" + name + "」已保存", "success");
+  } catch (e) {
+    showToast("保存世界观模板失败：" + ((e && e.message) || e), "error");
+    throw e;
+  }
 }
 
 export function _applyWorldTemplate(tpl) {
@@ -2618,13 +2704,25 @@ export function _applyWorldTemplate(tpl) {
   _ctx.switchPage("assets");
 }
 
-function _deleteWorldTemplate(tplId) {
-  _deleteWorldTemplateRemote(tplId);
+async function _deleteWorldTemplate(tplId) {
+  try {
+    await _deleteWorldTemplateRemote(tplId);
+    showToast("世界观模板已删除", "ok");
+  } catch (e) {
+    showToast("删除世界观模板失败：" + ((e && e.message) || e), "error");
+    throw e;
+  }
 }
 
 export function _openTemplateImportModal() {
   var existing = document.getElementById("tplImportModal");
   if (existing) existing.remove();
+
+  if (!_worldTemplatesPrimed) {
+    showToast("正在加载世界观模板…", "info");
+    _primeWorldTemplates().then(function () { _openTemplateImportModal(); });
+    return;
+  }
 
   var templates = _getWorldTemplates();
   if (!templates.length) {
@@ -2639,15 +2737,18 @@ export function _openTemplateImportModal() {
 
   var gridHtml = "";
   templates.forEach(function (tpl, i) {
-    var charCount = (tpl.characters || []).length;
+    var charCount = typeof tpl.characterCount === "number" ? tpl.characterCount : (tpl.characters || []).length;
     var charImgs = "";
-    (tpl.characters || []).slice(0, 3).forEach(function (ch) {
-      var src = ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-      if (src) {
-        charImgs += '<img src="' + escapeHtml(src) + '" class="w-8 h-8 rounded-full object-cover border-2 border-white -ml-2 first:ml-0" />';
-      }
+    var previewUrls = Array.isArray(tpl.characterPreviewUrls) ? tpl.characterPreviewUrls : [];
+    if (!previewUrls.length) {
+      previewUrls = (tpl.characters || []).slice(0, 3).map(function (ch) {
+        return ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
+      }).filter(Boolean);
+    }
+    previewUrls.slice(0, 3).forEach(function (src) {
+      charImgs += '<img src="' + escapeHtml(src) + '" class="w-8 h-8 rounded-full object-cover border-2 border-white -ml-2 first:ml-0" />';
     });
-    var styleSummary = tpl.styleBible ? "包含风格圣经" : "无风格圣经";
+    var styleSummary = (tpl.hasStyleBible || tpl.styleBible) ? "包含风格圣经" : "无风格圣经";
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
 
     gridHtml +=
@@ -2702,9 +2803,14 @@ export function _openTemplateImportModal() {
       showConfirm(
         "导入模板",
         "将替换风格圣经并追加角色到资产库，已有镜头表和分镜将被清空，确定继续？",
-        function () {
-          _applyWorldTemplate(tpl);
-          overlay.remove();
+        async function () {
+          try {
+            var full = await _loadWorldTemplateDetail(tpl);
+            _applyWorldTemplate(full);
+            overlay.remove();
+          } catch (e) {
+            showToast("加载世界观模板失败：" + ((e && e.message) || e), "error");
+          }
         }
       );
     });
@@ -2730,6 +2836,38 @@ export function _openTemplateImportModal() {
 export function _collectLibraryAssets(proj) {
   var assets = [];
   if (!proj) return assets;
+
+  function _joinPublicDesc(parts) {
+    return parts.map(function (v) { return (v || "").toString().trim(); })
+      .filter(Boolean)
+      .join(" · ")
+      .slice(0, 160);
+  }
+
+  function _assetPublicDesc(item, cat) {
+    if (!item) return "";
+    if (item.description) return item.description;
+    if (cat === "characters") {
+      return _joinPublicDesc([item.role || item.identity, item.appearance, item.clothing, item.equipment, item.temperament]);
+    }
+    if (cat === "scenes") {
+      return _joinPublicDesc([item.location, item.timeSetting, item.atmosphere, item.weather, item.lighting]);
+    }
+    return _joinPublicDesc([item.propType, item.material, item.features, item.function, item.ownership]);
+  }
+
+  function _shotSummaryForStoryboard(sb, idx) {
+    var indices = sb && Array.isArray(sb.shotIndices) ? sb.shotIndices : [idx];
+    var parts = [];
+    indices.forEach(function (si) {
+      var shot = proj.shots && proj.shots[si];
+      if (!shot) return;
+      var st = shot.shotType ? "【" + shot.shotType + "】" : "";
+      var v = shot.visual || shot.description || shot.dialogue || "";
+      if (v) parts.push((st + v).trim());
+    });
+    return _joinPublicDesc([sb && sb.visual, parts.join(" ")]);
+  }
 
   // Helper: dump an item.imageHistory array into the library view. Each
   // historical snapshot surfaces as its own card with a "历史 vN" suffix
@@ -2775,7 +2913,7 @@ export function _collectLibraryAssets(proj) {
             category: label,
             name: item.name || "未命名",
             url: item.realPhotoUrl || item.rawUrl || item.imageUrl,
-            description: item.description || item.imagePrompt || "",
+            description: _assetPublicDesc(item, cat),
             createdAt: proj.createdAt || 0
           });
         }
@@ -2789,48 +2927,53 @@ export function _collectLibraryAssets(proj) {
             createdAt: proj.createdAt || 0
           });
         }
-        _expandHistory(item, item.name || "未命名", label, item.description || "");
+        _expandHistory(item, item.name || "未命名", label, _assetPublicDesc(item, cat));
       });
     });
   }
   if (proj.storyboards && proj.storyboards.length) {
     proj.storyboards.forEach(function (sb, i) {
       if (sb && sb.imageUrl) {
+        var sbDesc = _shotSummaryForStoryboard(sb, i);
         assets.push({
           type: "image",
           category: "分镜",
           name: "分镜 #" + (i + 1),
           url: sb.rawUrl || sb.imageUrl,
-          description: sb.visual || sb.imagePrompt || "",
+          description: sbDesc,
           createdAt: proj.createdAt || 0
         });
       }
       if (sb && sb.videoUrl) {
+        var clipDesc = _shotSummaryForStoryboard(sb, i);
         assets.push({
           type: "video",
           category: "视频片段",
           name: "片段 #" + (i + 1),
           url: sb.videoUrl,
-          description: sb.visual || sb.videoPrompt || "",
+          description: clipDesc,
           createdAt: proj.createdAt || 0
         });
       }
-      _expandHistory(sb, "分镜 #" + (i + 1), "分镜", sb && (sb.visual || sb.imagePrompt) || "");
+      _expandHistory(sb, "分镜 #" + (i + 1), "分镜", _shotSummaryForStoryboard(sb, i));
     });
   }
   if (project && proj.id === project.id) {
-    videoState.tasks.forEach(function (t) {
+    _getVideoTasksForLibrary().forEach(function (t) {
       if (!(t.videoUrl || t.blobUrl)) return;
       var dominated = proj.storyboards && proj.storyboards.some(function (sb) {
         return sb && sb.videoUrl && sb.videoUrl === t.videoUrl;
       });
       if (dominated) return;
+      var taskGroupIdx = t._groupIdx != null ? Number(t._groupIdx) : null;
+      var taskName = Number.isFinite(taskGroupIdx) ? "片段 #" + (taskGroupIdx + 1) : "视频任务";
+      var taskDesc = Number.isFinite(taskGroupIdx) ? _shotSummaryForStoryboard((proj.storyboards || [])[taskGroupIdx], taskGroupIdx) : "生成视频任务";
       assets.push({
         type: "video",
         category: "生成视频",
-        name: t.prompt || "视频任务",
+        name: taskName,
         url: t.blobUrl || t.videoUrl,
-        description: t.prompt || "",
+        description: taskDesc,
         createdAt: t.createdAt || 0
       });
     });
@@ -2860,24 +3003,9 @@ export async function refreshLibraryPage() {
     tabsWrap.innerHTML = html;
   }
 
-  var targetProj = (_libActiveProject === (project && project.id)) ? project : await loadProjectData(_libActiveProject);
-  var allAssets = _collectLibraryAssets(targetProj);
-
-  var images = allAssets.filter(function (a) { return a.type === "image"; });
-  var videos = allAssets.filter(function (a) { return a.type === "video"; });
-
   var templates = _getWorldTemplates();
-
-  var countAll = document.querySelector(".lib-count-all");
-  var countImg = document.querySelector(".lib-count-image");
-  var countVid = document.querySelector(".lib-count-video");
   var countTpl = document.querySelector(".lib-count-template");
-  if (countAll) countAll.textContent = String(allAssets.length);
-  if (countImg) countImg.textContent = String(images.length);
-  if (countVid) countVid.textContent = String(videos.length);
   if (countTpl) countTpl.textContent = String(templates.length);
-
-  var filtered = _libActiveTab === "image" ? images : _libActiveTab === "video" ? videos : allAssets;
 
   var tabs = document.querySelectorAll(".lib-tab");
   tabs.forEach(function (t) {
@@ -2921,6 +3049,21 @@ export async function refreshLibraryPage() {
     }
     return;
   }
+
+  var targetProj = (_libActiveProject === (project && project.id)) ? project : await loadProjectData(_libActiveProject);
+  var allAssets = _collectLibraryAssets(targetProj);
+
+  var images = allAssets.filter(function (a) { return a.type === "image"; });
+  var videos = allAssets.filter(function (a) { return a.type === "video"; });
+
+  var countAll = document.querySelector(".lib-count-all");
+  var countImg = document.querySelector(".lib-count-image");
+  var countVid = document.querySelector(".lib-count-video");
+  if (countAll) countAll.textContent = String(allAssets.length);
+  if (countImg) countImg.textContent = String(images.length);
+  if (countVid) countVid.textContent = String(videos.length);
+
+  var filtered = _libActiveTab === "image" ? images : _libActiveTab === "video" ? videos : allAssets;
   if (grid) grid.hidden = false;
   if (tplGrid) tplGrid.hidden = true;
   if (!grid) return;
@@ -2998,16 +3141,19 @@ function _renderLibraryTemplates(container, templates) {
 
   var html = "";
   templates.forEach(function (tpl, i) {
-    var charCount = (tpl.characters || []).length;
+    var charCount = typeof tpl.characterCount === "number" ? tpl.characterCount : (tpl.characters || []).length;
     var charImgs = "";
-    (tpl.characters || []).slice(0, 4).forEach(function (ch) {
-      var src = ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-      if (src) {
-        charImgs += '<img src="' + escapeHtml(src) + '" class="w-9 h-9 rounded-full object-cover border-2 border-white -ml-2 first:ml-0 shadow-sm" />';
-      }
+    var previewUrls = Array.isArray(tpl.characterPreviewUrls) ? tpl.characterPreviewUrls : [];
+    if (!previewUrls.length) {
+      previewUrls = (tpl.characters || []).slice(0, 4).map(function (ch) {
+        return ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
+      }).filter(Boolean);
+    }
+    previewUrls.slice(0, 4).forEach(function (src) {
+      charImgs += '<img src="' + escapeHtml(src) + '" class="w-9 h-9 rounded-full object-cover border-2 border-white -ml-2 first:ml-0 shadow-sm" />';
     });
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
-    var hasStyleBible = tpl.styleBible ? "有" : "无";
+    var hasStyleBible = (tpl.hasStyleBible || tpl.styleBible) ? "有" : "无";
 
     html +=
       '<div class="group bg-white/60 rounded-xl p-6 border border-[#CFD8DC] shadow-sm hover:shadow-xl transition-all duration-300">' +
@@ -3042,21 +3188,28 @@ function _renderLibraryTemplates(container, templates) {
   container.innerHTML = html;
 
   container.querySelectorAll("[data-tpl-lib-del]").forEach(function (btn) {
-    btn.addEventListener("click", function (ev) {
+    btn.addEventListener("click", async function (ev) {
       ev.stopPropagation();
       if (!confirm("确定删除这个模板？")) return;
-      _deleteWorldTemplate(btn.dataset.tplLibDel);
-      refreshLibraryPage();
+      try {
+        await _deleteWorldTemplate(btn.dataset.tplLibDel);
+        refreshLibraryPage();
+      } catch (_) {}
     });
   });
 
   container.querySelectorAll("[data-tpl-lib-apply]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
+    btn.addEventListener("click", async function () {
       var idx = parseInt(btn.dataset.tplLibApply, 10);
       var tpl = templates[idx];
       if (!tpl) return;
       if (!confirm("导入模板将替换风格圣经并追加角色到资产库，已有的镜头表和分镜将被清空，确定继续？")) return;
-      _applyWorldTemplate(tpl);
+      try {
+        var full = await _loadWorldTemplateDetail(tpl);
+        _applyWorldTemplate(full);
+      } catch (e) {
+        showToast("加载世界观模板失败：" + ((e && e.message) || e), "error");
+      }
     });
   });
 }

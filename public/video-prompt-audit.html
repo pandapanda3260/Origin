@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>多参生视频提示词审阅 | ORIGINRISE</title>
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,300..700,0..1,0" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #0b1624;
+      --muted: #667789;
+      --line: #dce3e9;
+      --paper: #f6f8fa;
+      --panel: #ffffff;
+      --panel-soft: #eef3f6;
+      --accent: #f2c94c;
+      --accent-ink: #1f2937;
+      --danger: #b42318;
+      --blue: #2563eb;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 24px 24px, rgba(43, 57, 70, .16) 1.5px, transparent 1.5px) 0 0 / 28px 28px,
+        linear-gradient(180deg, #f8fafb 0%, #edf2f5 100%);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 64px;
+      padding: 12px 28px;
+      color: #f8fafc;
+      background: #0b1624;
+      border-bottom: 5px solid var(--accent);
+      box-shadow: 0 8px 22px rgba(11, 22, 36, .18);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+    .brand-icon,
+    .back {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      flex: 0 0 auto;
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: 999px;
+      color: #f8fafc;
+      background: rgba(255,255,255,.08);
+      text-decoration: none;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 900;
+      line-height: 1.2;
+    }
+    .brand p {
+      margin: 2px 0 0;
+      color: #aeb9c5;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 28px auto 56px;
+    }
+    .panel {
+      background: rgba(255,255,255,.92);
+      border: 1px solid rgba(160, 174, 188, .32);
+      border-radius: 8px;
+      box-shadow: 0 16px 40px rgba(11, 22, 36, .08);
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: 1.25fr .75fr;
+      gap: 18px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .summary h2 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.15;
+      font-weight: 950;
+    }
+    .summary p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .meta {
+      min-height: 58px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+    }
+    .meta b {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .meta span {
+      display: block;
+      overflow-wrap: anywhere;
+      font-size: 13px;
+      font-weight: 850;
+      line-height: 1.35;
+    }
+    .section {
+      margin-top: 16px;
+      padding: 22px 24px;
+    }
+    .section-title {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 14px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .section-title h3 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 950;
+    }
+    .section-title p {
+      max-width: 720px;
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      line-height: 1.65;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      color: var(--accent-ink);
+      background: #fff2b8;
+      border: 1px solid #f1d982;
+      font-size: 11px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .stack { display: grid; gap: 12px; }
+    .block {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fbfcfd;
+    }
+    .block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--panel-soft);
+      border-bottom: 1px solid var(--line);
+    }
+    .block-head strong {
+      font-size: 12px;
+      font-weight: 950;
+    }
+    .block-head span {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      padding: 14px;
+      max-height: 560px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: #172033;
+      background: #ffffff;
+      font: 12px/1.72 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    .role-system { color: var(--danger); }
+    .role-user { color: var(--blue); }
+    .empty {
+      padding: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      background: #fff;
+    }
+    .status {
+      padding: 28px;
+      color: var(--muted);
+      font-weight: 800;
+      text-align: center;
+    }
+    .error {
+      color: var(--danger);
+      border-color: rgba(180,35,24,.25);
+      background: #fff8f7;
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media (max-width: 880px) {
+      .topbar { padding: 10px 16px; }
+      main { width: min(100vw - 20px, 1180px); margin-top: 18px; }
+      .summary, .two-col { grid-template-columns: 1fr; }
+      .summary, .section { padding: 18px; }
+      .summary h2 { font-size: 23px; }
+      .meta-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a class="back" href="/workspace" title="返回工作台">
+        <span class="material-symbols-outlined">arrow_back</span>
+      </a>
+      <div class="brand-icon">
+        <span class="material-symbols-outlined">article</span>
+      </div>
+      <div>
+        <h1>多参生视频提示词审阅</h1>
+        <p>READ ONLY · PROMPT AUDIT</p>
+      </div>
+    </div>
+    <span class="pill">只读页面</span>
+  </header>
+
+  <main>
+    <div id="loading" class="panel status">正在读取提示词和系统规则...</div>
+    <div id="error" class="panel status error" hidden></div>
+    <div id="content" hidden>
+      <section class="panel summary">
+        <div>
+          <h2 id="pageTitle">片段提示词审阅</h2>
+          <p id="pageDesc">这里展示该视频片段在提示词生成阶段、视频模型提交阶段使用到的所有可审阅文本和规则。</p>
+        </div>
+        <div class="meta-grid" id="summaryMeta"></div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-title">
+          <div>
+            <h3>视频提示词生成阶段</h3>
+            <p id="promptGenerationDesc"></p>
+          </div>
+          <span class="pill" id="modelRolePill">MODEL ROLE</span>
+        </div>
+        <div class="stack" id="promptGeneration"></div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-title">
+          <div>
+            <h3>保存的视频提示词</h3>
+            <p>这是文本大模型生成并写入当前 storyboard 片段的 videoPrompt，后续视频生成会优先使用它。</p>
+          </div>
+        </div>
+        <div class="stack" id="storedPrompt"></div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-title">
+          <div>
+            <h3>视频生成提交阶段</h3>
+            <p>这里展示后端在真正提交给视频模型前追加的对白、声音、衔接、参考图和负向约束规则，以及最终提交体预览。</p>
+          </div>
+          <span class="pill" id="providerPill">PROVIDER</span>
+        </div>
+        <div class="stack" id="videoSubmission"></div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-title">
+          <div>
+            <h3>负向/禁止规则</h3>
+            <p>当前视频链路没有独立 negative prompt 字段时，禁止项会以内嵌规则块进入最终 prompt；这里单独抽出来方便核对。</p>
+          </div>
+        </div>
+        <div class="stack" id="negativeRules"></div>
+      </section>
+
+      <section class="panel section">
+        <div class="section-title">
+          <div>
+            <h3>镜头与参考素材</h3>
+            <p>用于生成该片段提示词的镜头、台词、角色和参考素材匹配结果。</p>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="stack" id="shotData"></div>
+          <div class="stack" id="referenceData"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    function $(id) { return document.getElementById(id); }
+
+    function authHeaders() {
+      var token = '';
+      try { token = localStorage.getItem('sw_auth_token') || ''; } catch (_e) {}
+      return token ? { Authorization: 'Bearer ' + token } : {};
+    }
+
+    function setText(id, value) {
+      var el = $(id);
+      if (el) el.textContent = value == null ? '' : String(value);
+    }
+
+    function jsonText(value) {
+      return JSON.stringify(value == null ? null : value, null, 2);
+    }
+
+    function addMeta(root, label, value) {
+      var item = document.createElement('div');
+      item.className = 'meta';
+      var b = document.createElement('b');
+      b.textContent = label;
+      var span = document.createElement('span');
+      span.textContent = value == null || value === '' ? '未提供' : String(value);
+      item.appendChild(b);
+      item.appendChild(span);
+      root.appendChild(item);
+    }
+
+    function addBlock(root, title, content, meta, roleClass) {
+      var block = document.createElement('article');
+      block.className = 'block';
+      var head = document.createElement('div');
+      head.className = 'block-head';
+      var strong = document.createElement('strong');
+      strong.textContent = title;
+      if (roleClass) strong.className = roleClass;
+      var small = document.createElement('span');
+      small.textContent = meta || '';
+      head.appendChild(strong);
+      head.appendChild(small);
+      var pre = document.createElement('pre');
+      pre.textContent = content == null || content === '' ? '（空）' : String(content);
+      block.appendChild(head);
+      block.appendChild(pre);
+      root.appendChild(block);
+    }
+
+    function addEmpty(root, text) {
+      var div = document.createElement('div');
+      div.className = 'empty';
+      div.textContent = text;
+      root.appendChild(div);
+    }
+
+    function render(audit) {
+      var group = audit.group || {};
+      var project = audit.project || {};
+      var opts = audit.options || {};
+      var gen = audit.promptGeneration || {};
+      var sub = audit.videoSubmission || {};
+      var resolved = sub.resolved || {};
+      var provider = sub.provider || {};
+      var textProvider = gen.provider || {};
+
+      setText('pageTitle', (project.title || '未命名项目') + ' · ' + (group.label || '片段'));
+      setText('pageDesc', '生成时间：' + (audit.generatedAt || '') + '。本页只展示提示词、系统规则、负向规则和提交体预览，不会写回项目。');
+      setText('promptGenerationDesc', gen.description || '');
+      setText('modelRolePill', gen.modelRole || 'MODEL ROLE');
+      setText('providerPill', sub.providerMode ? String(sub.providerMode).toUpperCase() : 'PROVIDER');
+
+      var meta = $('summaryMeta');
+      meta.innerHTML = '';
+      addMeta(meta, '项目 ID', project.id || '');
+      addMeta(meta, '片段', (group.groupIdx != null ? group.groupIdx + 1 : '') + ' / shots ' + (group.shotIndices || []).join(', '));
+      addMeta(meta, '前端选择', [opts.requestedVideoModel, opts.ratio, opts.quality].filter(Boolean).join(' · '));
+      addMeta(meta, '文本模型', [textProvider.provider, textProvider.model, textProvider.role].filter(Boolean).join(' · '));
+      addMeta(meta, '视频模型', [provider.provider, provider.model].filter(Boolean).join(' · '));
+      addMeta(meta, '时长/比例', [resolved.durationSec ? resolved.durationSec + 's' : '', resolved.aspectRatio, resolved.size].filter(Boolean).join(' · '));
+      addMeta(meta, '音频/水印', '音频 ' + (opts.genAudio === false ? '关闭' : '开启') + ' · 水印 ' + (opts.watermark ? '开启' : '关闭'));
+
+      var genRoot = $('promptGeneration');
+      genRoot.innerHTML = '';
+      addBlock(genRoot, '重试策略', jsonText(gen.retryPolicy || {}), 'batch-executors.ts');
+      (gen.messages || []).forEach(function (msg, i) {
+        var role = msg && msg.role ? String(msg.role) : 'message';
+        addBlock(
+          genRoot,
+          (i + 1) + '. ' + role,
+          msg && msg.content != null ? msg.content : jsonText(msg),
+          'buildVideoPromptMessages',
+          role === 'system' ? 'role-system' : (role === 'user' ? 'role-user' : '')
+        );
+      });
+      (gen.attempts || []).forEach(function (attempt) {
+        (attempt.messages || []).forEach(function (msg, i) {
+          var role = msg && msg.role ? String(msg.role) : 'message';
+          addBlock(
+            genRoot,
+            '实际调用 Attempt ' + attempt.attempt + ' · ' + role,
+            msg && msg.content != null ? msg.content : jsonText(msg),
+            'temperature=' + attempt.temperature + (i === attempt.messages.length - 1 && attempt.appendedRule ? ' · retry rule appended' : ''),
+            role === 'system' ? 'role-system' : (role === 'user' ? 'role-user' : '')
+          );
+        });
+      });
+      if (!(gen.messages || []).length) addEmpty(genRoot, '没有找到提示词生成阶段 messages。');
+
+      var storedRoot = $('storedPrompt');
+      storedRoot.innerHTML = '';
+      addBlock(storedRoot, 'storyboards[groupIdx].videoPrompt', audit.storedVideoPrompt || '', 'stored');
+
+      var submitRoot = $('videoSubmission');
+      submitRoot.innerHTML = '';
+      addBlock(submitRoot, '视频源提示词', sub.sourcePrompt || '', 'source prompt');
+      (sub.blocks || []).forEach(function (block) {
+        addBlock(submitRoot, block.title || block.id || '后端规则块', block.content || '', block.id || '');
+      });
+      addBlock(submitRoot, '最终提交给视频模型的 prompt', sub.finalPrompt || '', 'final prompt');
+      addBlock(submitRoot, '提交体预览', jsonText(sub.submitBodyPreview || {}), 'request body');
+      addBlock(submitRoot, '对白解析', jsonText({
+        dialoguePairs: sub.dialoguePairs || [],
+        dialogueCharSum: sub.dialogueCharSum || 0
+      }), 'dialogue');
+
+      var negRoot = $('negativeRules');
+      negRoot.innerHTML = '';
+      (sub.negativeNotes || []).forEach(function (block) {
+        addBlock(negRoot, block.title || block.id || '负向规则说明', block.content || '', block.id || '');
+      });
+      var negativeBlocks = (sub.blocks || []).filter(function (block) {
+        var text = [block.title, block.content].join('\n');
+        return /禁止|严禁|约束|negative|风格强制覆盖/i.test(text);
+      });
+      negativeBlocks.forEach(function (block) {
+        addBlock(negRoot, block.title || block.id || '内嵌禁止规则', block.content || '', block.id || '');
+      });
+      if (!(sub.negativeNotes || []).length && !negativeBlocks.length) addEmpty(negRoot, '没有单独抽取到负向规则。');
+
+      var shotRoot = $('shotData');
+      shotRoot.innerHTML = '';
+      addBlock(shotRoot, '镜头数据', jsonText(group.shots || []), 'project.shots');
+
+      var refRoot = $('referenceData');
+      refRoot.innerHTML = '';
+      addBlock(refRoot, '参考素材匹配', jsonText(sub.references || {}), 'references');
+      addBlock(refRoot, '模型与解析配置', jsonText({
+        providerMode: sub.providerMode,
+        provider: sub.provider,
+        resolved: sub.resolved,
+        options: audit.options
+      }), 'backend config');
+    }
+
+    async function boot() {
+      var loading = $('loading');
+      var error = $('error');
+      var content = $('content');
+      var params = new URLSearchParams(location.search);
+      if (!params.get('projectId')) {
+        loading.hidden = true;
+        error.hidden = false;
+        error.textContent = '缺 projectId，无法读取提示词审计信息。';
+        return;
+      }
+      try {
+        var resp = await fetch('/api/video-prompt/audit?' + params.toString(), {
+          headers: authHeaders(),
+          cache: 'no-store'
+        });
+        if (resp.status === 401) {
+          location.href = '/?auth=1';
+          return;
+        }
+        var data = await resp.json().catch(function () { return {}; });
+        if (!resp.ok) throw new Error(data.detail || data.error || ('请求失败：' + resp.status));
+        render(data.audit || data);
+        loading.hidden = true;
+        content.hidden = false;
+      } catch (e) {
+        loading.hidden = true;
+        error.hidden = false;
+        error.textContent = e && e.message ? e.message : String(e);
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>

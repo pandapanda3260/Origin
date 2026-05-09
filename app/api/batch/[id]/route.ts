@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getBatchSnapshot } from '@/lib/batches';
+import '@/lib/init-executors';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

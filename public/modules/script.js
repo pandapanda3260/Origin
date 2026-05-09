@@ -99,6 +99,17 @@ function _scrollChatToBottom() {
   if (box) { setTimeout(function() { box.scrollTop = box.scrollHeight; }, 60); }
 }
 
+function _scriptMessageContainer() {
+  var box = $("chatMessages");
+  return box ? (box.querySelector(".max-w-2xl") || box) : null;
+}
+
+function _moveScriptResultToEnd() {
+  var resultCard = $("scriptResultCard");
+  var wrap = _scriptMessageContainer();
+  if (resultCard && wrap && resultCard.parentNode === wrap) wrap.appendChild(resultCard);
+}
+
 function _showScriptConfirmArea() {
   var confirmArea = $("scriptConfirmArea");
   if (!confirmArea) return;
@@ -148,7 +159,13 @@ export function refreshScriptPage() {
     _scrollChatToBottom();
   } else {
     resultCard.hidden = true;
-    bibleCard.hidden = true;
+    if (bibleCard) {
+      bibleCard.hidden = false;
+      renderStyleBibleEmpty(
+        "等待剧本生成",
+        "生成或上传剧本后，系统会自动提取视觉风格、色彩、氛围与角色设定。"
+      );
+    }
     _hideScriptConfirmArea();
     if (displayText) displayText.textContent = "";
     if (editArea) editArea.value = "";
@@ -226,17 +243,20 @@ function _applyStyleBibleResponse(proj, resp) {
 }
 
 function renderStyleBibleFailure(message) {
+  renderStyleBibleEmpty("风格圣经暂不可用", message || "风格圣经尚未提取或提取失败", true);
+}
+
+function renderStyleBibleEmpty(title, message, allowRetry) {
   var el = $("styleBiblePreview");
   if (!el) return;
-  var detail = escapeHtml(message || "风格圣经尚未提取或提取失败");
+  var heading = escapeHtml(title || "风格圣经暂不可用");
+  var detail = escapeHtml(message || "生成剧本后将自动整理风格信息");
   el.innerHTML =
-    '<div class="flex flex-col items-center justify-center h-full text-center gap-4 py-12">' +
-    '<span class="material-symbols-outlined text-5xl text-[#CFD8DC]">error_outline</span>' +
-    '<div>' +
-    '<p class="text-sm font-bold text-[#2C3E50]">风格圣经提取失败</p>' +
-    '<p class="text-xs text-[#90A4AE] mt-2 leading-relaxed max-w-[260px]">' + detail + '</p>' +
-    '</div>' +
-    '<button type="button" onclick="document.getElementById(\'btnRegenBible\').click()" class="px-6 py-2 text-xs font-bold tracking-wider uppercase bg-[#2C3E50] text-white rounded-xl hover:bg-[#0B1320] transition-colors">重新生成风格圣经</button>' +
+    '<div class="script-style-empty">' +
+    '<span class="material-symbols-outlined">auto_stories</span>' +
+    '<h3>' + heading + '</h3>' +
+    '<p>' + detail + '</p>' +
+    (allowRetry ? '<button type="button" onclick="document.getElementById(\'btnRegenBible\').click()" class="script-soft-btn">重新生成</button>' : '') +
     '</div>';
 }
 
@@ -248,6 +268,38 @@ function _sbEditHtml(fieldKey, label, value, extra) {
     placeholder +
     '<span class="sb-edit-icon material-symbols-outlined">edit</span>' +
     '</div>';
+}
+
+function _sbModuleHead(icon, title, en, editable) {
+  return '<div class="script-style-module-head">' +
+    '<div class="script-style-module-title">' +
+      '<span class="material-symbols-outlined">' + icon + '</span>' +
+      '<span class="script-style-title-cn">' + title + '</span>' +
+      '<span class="script-style-title-en">' + en + '</span>' +
+    '</div>' +
+    (editable ? '<span class="script-style-edit-chip">可编辑</span>' : '') +
+  '</div>';
+}
+
+function _sbShort(text, fallback, maxLen) {
+  var s = String(text || fallback || "").trim();
+  if (!s) return "";
+  maxLen = maxLen || 48;
+  return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+}
+
+function _sbCharacterDesc(c) {
+  if (!c) return "";
+  return _sbShort(c.desc || c.description || c.role || c.appearance || c.clothing || "", "角色设定待完善", 42);
+}
+
+function _sbAvatarHtml(c) {
+  var src = c && (c.avatarUrl || c.imageUrl || c.referenceImageUrl || c.url || c.src);
+  var name = String((c && c.name) || "角").trim() || "角";
+  if (src) {
+    return '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(name) + '" />';
+  }
+  return escapeHtml(name.charAt(0));
 }
 
 export function renderStyleBible(sb) {
@@ -263,56 +315,54 @@ export function renderStyleBible(sb) {
     html += '<div class="upstream-stale-banner"><span class="material-symbols-outlined">warning</span>剧本已修改，风格圣经可能与剧本不一致，建议重新提取</div>';
   }
 
-  html += '<div class="sb-section">' +
-    '<p class="sb-label">视觉风格 Visual Style <span class="sb-field-hint">（可编辑）</span></p>' +
-    '<h3 class="text-xl font-light text-[#2C3E50] italic leading-snug mb-2">' + _sbEditHtml('visualStyle', '视觉风格', sb.visualStyle || '') + '</h3>' +
-    '<p class="text-xs text-[#90A4AE] leading-relaxed">' + _sbEditHtml('visualStyleDesc', '视觉风格描述', sb.visualStyleDesc || '', 'sb-editable-sm') + '</p>' +
+  html += '<div class="sb-section script-style-card">' +
+    _sbModuleHead('visibility', '视觉风格', 'VISUAL STYLE', true) +
+    _sbEditHtml('visualStyle', '视觉风格', sb.visualStyle || '', 'script-style-main') +
+    _sbEditHtml('visualStyleDesc', '视觉风格描述', sb.visualStyleDesc || '', 'script-style-desc sb-editable-sm') +
     '</div>';
 
-  if (sb.colorPalette) {
-    html += '<div class="sb-section"><p class="sb-label">色彩调板 Color Palette</p>';
-    if (Array.isArray(sb.colorPalette) && sb.colorPalette.length) {
-      html += '<div class="bg-white rounded-2xl p-5 border border-[#CFD8DC] shadow-sm"><div class="flex h-14 rounded-full overflow-hidden shadow-inner">';
-      sb.colorPalette.forEach(function (c) {
-        html += '<div class="flex-1 h-full" style="background:' + escapeHtml(c.hex || '#888') + '"></div>';
-      });
-      html += '</div><div class="flex mt-3">';
-      sb.colorPalette.forEach(function (c) {
-        html += '<div class="flex-1 text-center"><span class="text-[9px] font-bold text-[#90A4AE] uppercase tracking-[0.12em]">' + escapeHtml(c.name) + '</span></div>';
-      });
-      html += '</div></div>';
-    } else {
-      html += '<p class="text-sm text-[#2C3E50]">' + escapeHtml(sb.colorPalette) + '</p>';
-    }
+  html += '<div class="sb-section script-style-card">' +
+    _sbModuleHead('palette', '色彩调板', 'COLOR PALETTE', true);
+  if (Array.isArray(sb.colorPalette) && sb.colorPalette.length) {
+    html += '<div class="script-color-swatches">';
+    sb.colorPalette.slice(0, 5).forEach(function (c) {
+      var hex = (c && c.hex) || '#CFD8DC';
+      var name = (c && c.name) || hex;
+      html += '<div class="script-color-item"><div class="script-color-block" style="background:' + escapeHtml(hex) + '"></div><span class="script-color-name">' + escapeHtml(name) + '</span></div>';
+    });
     html += '</div>';
+  } else {
+    html += '<p class="script-style-muted">' + escapeHtml(String(sb.colorPalette || '色彩调板待补充')) + '</p>';
   }
+  html += '</div>';
 
-  html += '<div class="sb-section"><p class="sb-label">时代与氛围 Era &amp; Atmosphere <span class="sb-field-hint">（可编辑）</span></p>' +
-    _sbEditHtml('era', '时代与氛围', sb.era || '') +
+  html += '<div class="sb-section script-style-card">' +
+    _sbModuleHead('routine', '时代与氛围', 'ERA & ATMOSPHERE', true) +
+    _sbEditHtml('era', '时代与氛围', sb.era || '', 'script-style-desc') +
     '</div>';
 
-  html += '<div class="sb-section"><p class="sb-label">情绪基调 Mood <span class="sb-field-hint">（可编辑）</span></p>' +
-    '<p class="text-sm text-[#2C3E50] leading-relaxed">' + _sbEditHtml('mood', '情绪基调', sb.mood || '') + '</p>' +
+  html += '<div class="sb-section script-style-card">' +
+    _sbModuleHead('water_drop', '情绪基调', 'MOOD', true) +
+    _sbEditHtml('mood', '情绪基调', sb.mood || '', 'script-style-desc') +
     '</div>';
 
-  html += '<div class="sb-section"><p class="sb-label">镜头风格 Camera Style <span class="sb-field-hint">（可编辑）</span></p>' +
-    '<p class="text-sm text-[#2C3E50] leading-relaxed">' + _sbEditHtml('cameraStyle', '镜头风格', sb.cameraStyle || '') + '</p>' +
-    '</div>';
-
-  html += '<div class="sb-section"><p class="sb-label">世界观规则 World Rules <span class="sb-field-hint">（可编辑）</span></p>' +
-    '<p class="text-sm text-[#2C3E50] leading-relaxed">' + _sbEditHtml('worldRules', '世界观规则', sb.worldRules || '') + '</p>' +
-    '</div>';
-
-  if (sb.characters && sb.characters.length) {
-    html += '<div class="sb-section border-t border-[#CFD8DC] pt-6"><p class="sb-label">Characters</p><div class="space-y-3">';
-    sb.characters.forEach(function (c) {
-      html += '<div class="bg-white rounded-xl p-4 border border-[#CFD8DC] shadow-sm">' +
-        '<div class="text-sm font-bold text-[#0B1320]">' + escapeHtml(c.name) + '</div>' +
-        '<p class="text-xs text-[#90A4AE] mt-1 leading-relaxed">' + escapeHtml((c.appearance || '') + (c.clothing ? ' · ' + c.clothing : '')) + '</p>' +
+  html += '<div class="sb-section script-style-card">' +
+    _sbModuleHead('groups', '主要角色', 'CHARACTERS', true);
+  if (Array.isArray(sb.characters) && sb.characters.length) {
+    html += '<div class="script-characters">';
+    sb.characters.slice(0, 5).forEach(function (c) {
+      var name = _sbShort(c && c.name, "未命名", 10);
+      html += '<div class="script-character">' +
+        '<div class="script-character-avatar">' + _sbAvatarHtml(c) + '</div>' +
+        '<div class="script-character-name">' + escapeHtml(name) + '</div>' +
+        '<div class="script-character-desc">' + escapeHtml(_sbCharacterDesc(c)) + '</div>' +
       '</div>';
     });
-    html += '</div></div>';
+    html += '</div>';
+  } else {
+    html += '<p class="script-style-muted">主要角色待补充</p>';
   }
+  html += '</div>';
 
   el.innerHTML = html;
   var sections = el.querySelectorAll(".sb-section");
@@ -470,8 +520,7 @@ async function _consultConfirm() {
   var resultCard = $("scriptResultCard");
   if (resultCard) {
     resultCard.hidden = false;
-    var _chatInner = document.querySelector("#chatMessages .max-w-2xl");
-    if (_chatInner && resultCard.parentNode === _chatInner) _chatInner.appendChild(resultCard);
+    _moveScriptResultToEnd();
   }
   if (displayText) { displayText.textContent = ""; displayText.style.pointerEvents = "none"; displayText.classList.add("streaming-wave"); }
   if (editArea) editArea.value = "";
@@ -679,10 +728,7 @@ export async function generateScript(idea) {
   var expandBtn = $("btnExpandScript");
   var resultCard = $("scriptResultCard");
   resultCard.hidden = false;
-  var _chatInner = document.querySelector("#chatMessages .max-w-2xl");
-  if (_chatInner && resultCard.parentNode === _chatInner) {
-    _chatInner.appendChild(resultCard);
-  }
+  _moveScriptResultToEnd();
   if (displayText) { displayText.textContent = ""; displayText.style.pointerEvents = "none"; displayText.classList.add("streaming-wave"); }
   if (editArea) editArea.value = "";
   if (editBtn) editBtn.hidden = true;
@@ -953,17 +999,24 @@ export async function addToScriptLibrary(name, content, source) {
 export function renderScriptLibrary() {
   var list = $("scriptLibList");
   var badge = $("scriptLibBadge");
+  var collapsedBadge = $("scriptLibCollapsedBadge");
   if (!list) return;
   var items = (project && project.scriptLibrary) || [];
   if (badge) {
     badge.textContent = items.length;
     badge.hidden = items.length === 0;
   }
+  if (collapsedBadge) {
+    collapsedBadge.textContent = items.length;
+    collapsedBadge.hidden = items.length === 0;
+  }
   if (!items.length) {
     list.innerHTML =
       '<div class="flex flex-col items-center justify-center py-16 text-center">' +
-      '<span class="material-symbols-outlined text-3xl" style="color:rgba(165,180,188,0.3);font-variation-settings:\'FILL\' 1">auto_stories</span>' +
-      '<p class="text-[10px] mt-3 leading-relaxed" style="color:rgba(82,97,104,0.35)">上传或生成剧本后<br/>将在此显示</p>' +
+      '<span class="material-symbols-outlined text-4xl" style="color:rgba(165,180,188,0.42);font-variation-settings:\'FILL\' 0">folder_open</span>' +
+      '<p class="text-[12px] font-bold mt-4 text-[#526168]">暂无剧本文档</p>' +
+      '<p class="text-[11px] mt-2 leading-relaxed" style="color:rgba(82,97,104,0.56)">创建或上传剧本，开启你的创作之旅</p>' +
+      '<button type="button" class="script-lib-empty-create" onclick="document.getElementById(\'btnNewScript\').click()"><span class="material-symbols-outlined" style="font-size:15px">add</span><span>新建剧本</span></button>' +
       '</div>';
     return;
   }
@@ -1473,10 +1526,7 @@ export async function reviseScript(instruction) {
   var editBtn = $("btnEditScript");
   var expandBtn = $("btnExpandScript");
   var _reviseCard = $("scriptResultCard");
-  var _reviseInner = document.querySelector("#chatMessages .max-w-2xl");
-  if (_reviseInner && _reviseCard && _reviseCard.parentNode === _reviseInner) {
-    _reviseInner.appendChild(_reviseCard);
-  }
+  if (_reviseCard) _moveScriptResultToEnd();
   if (displayText) { displayText.textContent = ""; displayText.style.pointerEvents = "none"; displayText.classList.add("streaming-wave"); }
   if (editBtn) editBtn.hidden = true;
   if (expandBtn) expandBtn.hidden = true;

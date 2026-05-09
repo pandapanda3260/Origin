@@ -4,13 +4,14 @@ import { loadExternalEnv } from './env';
 import { MOCK_USER_SETTINGS } from '@/mocks/settings';
 
 export type ModelSlot = 'text' | 'image' | 'video' | 'storyboard';
-export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDerive' | 'legacy';
+export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDerive' | 'continuity' | 'legacy';
 export type ProviderKind =
   | 'openai_chat'
   | 'openai_responses'
   | 'zerail_messages'
   | 'zerail_responses'
   | 'zerail_images'
+  | 'volcengine_seedream'
   | 'seedance'
   | 'fake';
 
@@ -20,6 +21,8 @@ export type ResolvedModelConfig = {
   baseUrl: string;
   apiKey: string;
   model: string;
+  contextWindow: number;
+  maxOutputTokens: number;
   mode: 'real' | 'fake';
   source: ModelConfigSource;
   provider: ProviderKind;
@@ -30,6 +33,11 @@ export type ResolvedModelConfig = {
   imageGenerationEndpoint?: string;
   imageEditEndpoint?: string;
   imageQuality?: string;
+  imageSize?: string;
+  imageResponseFormat?: string;
+  imageWatermark?: boolean;
+  seedreamSequentialImageGeneration?: string;
+  seedreamOptimizePromptMode?: string;
   timeoutMs?: number;
   minDurationSec?: number;
 };
@@ -56,7 +64,7 @@ export function resolveTextModelConfig(
     }
   }
 
-  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive') {
+  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive' || role === 'continuity') {
     const prefix = roleEnvPrefix(role);
     const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('OPENAI_API_KEY');
     if (key) {
@@ -70,7 +78,7 @@ export function resolveTextModelConfig(
         endpoint: prefixedEnv(prefix, 'API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses',
         role,
         source: 'env',
-        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || env('TEXT_REASONING_EFFORT') || undefined,
+        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
       });
     }
   }
@@ -95,17 +103,26 @@ export function resolveSlotModelConfig(
   if (slot === 'text') return resolveTextModelConfig(user, 'brain');
 
   if (slot === 'image') {
-    const key = env('IMAGE_API_KEY');
+    const provider = inferProvider(env('IMAGE_PROVIDER'), 'image');
+    const isSeedream = provider === 'volcengine_seedream';
+    const key = isSeedream
+      ? env('IMAGE_SEEDREAM_API_KEY') || env('VIDEO_API_KEY') || env('IMAGE_API_KEY')
+      : env('IMAGE_API_KEY');
     if (key) {
       return real({
-        baseUrl: env('IMAGE_API_BASE') || 'https://gateway.zerail.com/v1',
+        baseUrl: env('IMAGE_API_BASE') || (isSeedream ? 'https://ark.cn-beijing.volces.com/api/v3' : 'https://gateway.zerail.com/v1'),
         apiKey: key,
-        model: env('IMAGE_MODEL') || env('MODEL_IMAGE_PRIMARY') || 'gpt-image-2',
-        provider: 'zerail_images',
+        model: env('IMAGE_MODEL') || env('MODEL_IMAGE_PRIMARY') || (isSeedream ? 'doubao-seedream-4-5-251128' : 'gpt-image-2'),
+        provider,
         endpoint: env('IMAGE_GENERATIONS_ENDPOINT') || '/images/generations',
         imageGenerationEndpoint: env('IMAGE_GENERATIONS_ENDPOINT') || '/images/generations',
         imageEditEndpoint: env('IMAGE_EDITS_ENDPOINT') || '/images/edits',
         imageQuality: env('IMAGE_QUALITY') || undefined,
+        imageSize: env('IMAGE_SEEDREAM_SIZE') || undefined,
+        imageResponseFormat: env('IMAGE_SEEDREAM_RESPONSE_FORMAT') || undefined,
+        imageWatermark: envBool('IMAGE_SEEDREAM_WATERMARK'),
+        seedreamSequentialImageGeneration: env('IMAGE_SEEDREAM_SEQUENTIAL_IMAGE_GENERATION') || undefined,
+        seedreamOptimizePromptMode: env('IMAGE_SEEDREAM_OPTIMIZE_PROMPT_MODE') || undefined,
         timeoutMs: secondsToMs(env('IMAGE_TIMEOUT_SECONDS')),
         source: 'env',
       });
@@ -147,6 +164,7 @@ export function getModelRoutingStatus(user: UserRow | null) {
     structured: redactConfig(resolveTextModelConfig(user, 'structured')),
     styleBible: redactConfig(resolveTextModelConfig(user, 'styleBible')),
     profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
+    continuity: redactConfig(resolveTextModelConfig(user, 'continuity')),
     image: redactConfig(resolveSlotModelConfig(user, 'image')),
     video: redactConfig(resolveSlotModelConfig(user, 'video')),
     env: {
@@ -199,9 +217,14 @@ function readUserSlotConfig(user: UserRow | null, slot: ModelSlot): ResolvedMode
   }
 }
 
-function real(input: Omit<ResolvedModelConfig, 'mode'>): ResolvedModelConfig {
+type RealModelInput = Omit<ResolvedModelConfig, 'mode' | 'contextWindow' | 'maxOutputTokens'> &
+  Partial<Pick<ResolvedModelConfig, 'contextWindow' | 'maxOutputTokens'>>;
+
+function real(input: RealModelInput): ResolvedModelConfig {
+  const capacity = resolveModelCapacity(input);
   return {
     ...input,
+    ...capacity,
     baseUrl: normalizeBaseUrl(input.baseUrl),
     endpoint: input.endpoint ? normalizeEndpoint(input.endpoint) : input.endpoint,
     imageGenerationEndpoint: input.imageGenerationEndpoint
@@ -213,10 +236,13 @@ function real(input: Omit<ResolvedModelConfig, 'mode'>): ResolvedModelConfig {
 }
 
 function fake(slot: ModelSlot, role: TextModelRole): ResolvedModelConfig {
+  const model = defaultModel(slot);
+  const capacity = fallbackCapacityForModel(model);
   return {
     baseUrl: 'https://api.openai.com/v1',
     apiKey: '',
-    model: defaultModel(slot),
+    model,
+    ...capacity,
     mode: 'fake',
     source: 'fallback',
     provider: 'fake',
@@ -233,6 +259,7 @@ function redactConfig(cfg: ResolvedModelConfig) {
 
 function inferProvider(provider: string, slot: ModelSlot): ProviderKind {
   const p = provider.toLowerCase();
+  if (p.includes('seedream') || p.includes('volcengine')) return 'volcengine_seedream';
   if (p.includes('seedance')) return 'seedance';
   if (p.includes('image')) return 'zerail_images';
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
@@ -256,6 +283,56 @@ function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind
   return baseUrl.toLowerCase().includes('api.openai.com') ? 'openai_responses' : 'zerail_responses';
 }
 
+function resolveModelCapacity(input: RealModelInput): Pick<ResolvedModelConfig, 'contextWindow' | 'maxOutputTokens'> {
+  const fallback = fallbackCapacityForModel(input.model);
+  return {
+    contextWindow: input.contextWindow || capacityEnvInt(input, 'CONTEXT_WINDOW') || fallback.contextWindow,
+    maxOutputTokens: input.maxOutputTokens || capacityEnvInt(input, 'MAX_OUTPUT_TOKENS') || fallback.maxOutputTokens,
+  };
+}
+
+function capacityEnvInt(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX_OUTPUT_TOKENS'): number | undefined {
+  for (const name of capacityEnvNames(input, suffix)) {
+    const value = positiveInt(env(name));
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX_OUTPUT_TOKENS'): string[] {
+  const names: string[] = [];
+  const role = input.role;
+  const provider = input.provider;
+
+  if (role === 'styleBible') names.push(`STYLE_BIBLE_${suffix}`);
+  else if (role === 'profileDerive') names.push(`PROFILE_DERIVE_${suffix}`);
+  else if (role === 'continuity') names.push(`CONTINUITY_${suffix}`);
+  else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
+  else if (role === 'brain') names.push(`BRAIN_${suffix}`, `CLAUDE_${suffix}`);
+
+  if (provider === 'zerail_messages') names.push(`CLAUDE_${suffix}`);
+  if (provider === 'openai_chat' || provider === 'openai_responses' || provider === 'zerail_responses') {
+    names.push(`TEXT_${suffix}`, `OPENAI_${suffix}`);
+  }
+  if (provider === 'zerail_images') names.push(`IMAGE_${suffix}`);
+  if (provider === 'volcengine_seedream') names.push(`IMAGE_${suffix}`);
+  if (provider === 'seedance') names.push(`VIDEO_${suffix}`);
+
+  names.push(`LLM_${suffix}`);
+  return Array.from(new Set(names));
+}
+
+function fallbackCapacityForModel(model: string): Pick<ResolvedModelConfig, 'contextWindow' | 'maxOutputTokens'> {
+  const m = (model || '').toLowerCase();
+  if (m.includes('gpt-5.5')) return { contextWindow: 400_000, maxOutputTokens: 32_768 };
+  if (m.includes('gpt-5')) return { contextWindow: 400_000, maxOutputTokens: 32_768 };
+  if (m.includes('claude')) return { contextWindow: 200_000, maxOutputTokens: 32_000 };
+  if (m.includes('gpt-4o')) return { contextWindow: 128_000, maxOutputTokens: 16_384 };
+  if (m.includes('o1') || m.includes('o3') || m.includes('o4')) return { contextWindow: 128_000, maxOutputTokens: 32_768 };
+  if (m.includes('gemini')) return { contextWindow: 1_000_000, maxOutputTokens: 32_768 };
+  return { contextWindow: 128_000, maxOutputTokens: 8_192 };
+}
+
 function env(name: string): string {
   return (process.env[name] || '').trim();
 }
@@ -263,6 +340,7 @@ function env(name: string): string {
 function roleEnvPrefix(role: TextModelRole): string {
   if (role === 'styleBible') return 'STYLE_BIBLE';
   if (role === 'profileDerive') return 'PROFILE_DERIVE';
+  if (role === 'continuity') return 'CONTINUITY';
   return '';
 }
 
@@ -288,4 +366,12 @@ function positiveInt(value: string): number | undefined {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return undefined;
   return Math.round(n);
+}
+
+function envBool(name: string): boolean | undefined {
+  const value = env(name).toLowerCase();
+  if (!value) return undefined;
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  return undefined;
 }

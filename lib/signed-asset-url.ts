@@ -15,9 +15,19 @@ function signPayload(imageId: string, ownerId: number, exp: number): string {
   return `asset-url-v1:${imageId}:${ownerId}:${exp}`;
 }
 
+function signVideoPayload(videoId: string, ownerId: number, exp: number): string {
+  return `video-url-v1:${videoId}:${ownerId}:${exp}`;
+}
+
 function digest(imageId: string, ownerId: number, exp: number): string {
   return createHmac('sha256', getSecret())
     .update(signPayload(imageId, ownerId, exp))
+    .digest('base64url');
+}
+
+function videoDigest(videoId: string, ownerId: number, exp: number): string {
+  return createHmac('sha256', getSecret())
+    .update(signVideoPayload(videoId, ownerId, exp))
     .digest('base64url');
 }
 
@@ -38,6 +48,17 @@ export function buildSignedImageUrl(imageId: string, ownerId: number, ttlSeconds
   };
 }
 
+export function buildSignedVideoUrl(videoId: string, ownerId: number, ttlSeconds = DEFAULT_TTL_SECONDS) {
+  const ttl = normalizeAssetUrlTtl(ttlSeconds);
+  const exp = Math.floor(Date.now() / 1000) + ttl;
+  const sig = videoDigest(videoId, ownerId, exp);
+  return {
+    url: `/api/videos/file/${encodeURIComponent(videoId)}?exp=${exp}&sig=${encodeURIComponent(sig)}`,
+    ttl,
+    expiresAt: exp,
+  };
+}
+
 export function verifySignedImageUrl(opts: {
   imageId: string;
   ownerId: number;
@@ -50,6 +71,28 @@ export function verifySignedImageUrl(opts: {
   if (!opts.sig) return false;
 
   const expected = digest(opts.imageId, opts.ownerId, exp);
+  const a = Buffer.from(opts.sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+export function verifySignedVideoUrl(opts: {
+  videoId: string;
+  ownerId: number;
+  exp: string | null;
+  sig: string | null;
+}) {
+  const exp = Number(opts.exp || 0);
+  if (!Number.isFinite(exp) || exp <= 0) return false;
+  if (exp < Math.floor(Date.now() / 1000)) return false;
+  if (!opts.sig) return false;
+
+  const expected = videoDigest(opts.videoId, opts.ownerId, exp);
   const a = Buffer.from(opts.sig);
   const b = Buffer.from(expected);
   if (a.length !== b.length) return false;

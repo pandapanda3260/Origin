@@ -408,7 +408,7 @@ export async function generateShots(opts) {
           }
         } catch (e) { console.warn("[Shots] reload after poll failed:", e); }
         finish();
-      } else if (snap.status === "failed" || snap.status === "cancelled") {
+      } else if (snap.status === "failed" || snap.status === "cancelled" || snap.status === "partial") {
         var taskErr = "";
         if (Array.isArray(snap.tasks)) {
           var f = snap.tasks.find(function (t) { return t.status === "failed"; });
@@ -521,7 +521,9 @@ export async function generateShots(opts) {
       showToast("镜头设计失败: " + _diagnoseApiError(errText), "error");
     },
     onBatchCompleted: function () { finish(); },
-    onClose: function () { finish(); },
+    onClose: function () {
+      if (pollTimer) console.warn("[Shots] SSE closed; polling fallback remains active");
+    },
   });
 }
 

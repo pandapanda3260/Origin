@@ -5,7 +5,7 @@
  * composition root and injects project/settings/videoState plus cross-domain
  * callbacks through initVideoTasks(ctx).
  */
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements } from './utils.js';
 import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from './edit.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { getBackgroundStylizeCount } from './assets.js';
@@ -28,6 +28,7 @@ let MAX_TASKS_TOTAL = 20;
 let STATUS_COPY = {};
 let VIDEO_ADAPTERS = {};
 let _projectEpoch = 0;
+var _videoInFlightGroups = new Set();
 
 export function initVideoTasks(ctx) {
   _ctx = ctx || {};
@@ -51,6 +52,7 @@ function _syncVideoRefs() {
 }
 
 function saveProject() { if (_ctx.saveProject) return _ctx.saveProject(); }
+function _flushServerSave() { return _ctx.flushServerSave ? _ctx.flushServerSave() : saveProject(); }
 function _registerServerTask() { if (_ctx.registerServerTask) return _ctx.registerServerTask.apply(null, arguments); }
 function _notifyServerTaskDone() { if (_ctx.notifyServerTaskDone) return _ctx.notifyServerTaskDone.apply(null, arguments); }
 function _archiveOldImage() { if (_ctx.archiveOldImage) return _ctx.archiveOldImage.apply(null, arguments); }
@@ -65,6 +67,21 @@ function switchPage(page) { if (_ctx.switchPage) return _ctx.switchPage(page); }
 function _diagnoseApiError(msg) { return _ctx.diagnoseApiError ? _ctx.diagnoseApiError(msg) : msg; }
 function sleep(ms) { return _ctx.sleep ? _ctx.sleep(ms) : new Promise(function (r) { setTimeout(r, ms); }); }
 function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOverview(); }
+async function _reloadProjectFromServerForVideoBatch(hintEl) {
+  if (!_ctx.reloadProjectFromServer) return false;
+  try {
+    if (hintEl) hintEl.textContent = "正在同步最新提示词状态…";
+    var ok = await _ctx.reloadProjectFromServer();
+    _syncVideoRefs();
+    return !!ok;
+  } catch (e) {
+    console.warn("[VideoBatch] reloadProjectFromServer failed:", e);
+    _syncVideoRefs();
+    return false;
+  } finally {
+    if (hintEl) hintEl.textContent = "";
+  }
+}
 
   /* ================================================================
      视频生成（保留 v1.8 全部功能）
@@ -90,19 +107,290 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       status: "submit", statusCn: "提交中", statusEn: "提交中",
       videoUrl: "", localPath: "", blobUrl: "", previewOk: false,
       autoImport: !!autoImport, createdAt: Date.now(),
+      warnings: [],
       cardEl: null, videoEl: null,
       _badge: null, _busyWrap: null, _busyText: null, _videoWrap: null,
-      _playOverlay: null, _videoLoading: null, _failedWrap: null, _failedText: null, _actions: null,
+      _playOverlay: null, _videoLoading: null, _failedWrap: null, _failedText: null, _warningText: null, _actions: null,
     };
   }
 
   function isTerminal(t) { return t.status === "done" || t.status === "failed" || t.status === "timeout"; }
-  function activeTaskCount() {
-    _syncVideoRefs();
-    if (!videoState || !Array.isArray(videoState.tasks)) return 0;
-    var n = 0;
-    for (var i = 0; i < videoState.tasks.length; i++) { if (!isTerminal(videoState.tasks[i])) n++; }
-    return n;
+  function _taskDisplayName(task) {
+    if (task && task._groupIdx != null && Number.isFinite(Number(task._groupIdx))) {
+      return "片段 " + (Number(task._groupIdx) + 1);
+    }
+    var raw = (task && task.prompt || "").trim();
+    var m = raw.match(/^片段\s*(\d+)/);
+    if (m) return "片段 " + m[1];
+    return "视频任务";
+  }
+  function _taskDisplayMeta(task) {
+    return (task && task._groupIdx != null) ? "基于片段设置生成" : "自定义视频生成任务";
+  }
+	  function activeTaskCount() {
+	    _syncVideoRefs();
+	    if (!videoState || !Array.isArray(videoState.tasks)) return 0;
+	    var n = 0;
+	    for (var i = 0; i < videoState.tasks.length; i++) { if (!isTerminal(videoState.tasks[i])) n++; }
+	    return n;
+	  }
+
+	  function _videoPromptReadinessForGroup(gIdx) {
+	    var sb = project && project.storyboards && project.storyboards[gIdx];
+	    if (!sb || !sb.videoPrompt) return { canStart: false, reason: "missing_video_prompt", status: "missing" };
+	    if (!sb.videoPromptStatus) return { canStart: true, reason: "legacy_ready", status: "ready" };
+	    if (sb.videoPromptStatus !== "ready") {
+	      return {
+	        canStart: false,
+	        reason: sb.videoPromptStatus === "generating" ? "video_prompt_generating" : "video_prompt_failed",
+	        status: sb.videoPromptStatus,
+	        lastError: sb.videoPromptLastError || "",
+	      };
+	    }
+	    return { canStart: true, reason: "ready", status: "ready" };
+	  }
+
+	  function _videoPromptNotReadyMessage(gIdx, readiness) {
+	    var reason = readiness && readiness.reason;
+	    var label = "片段 " + (gIdx + 1);
+	    if (reason === "video_prompt_generating") {
+	      return label + " 的视频提示词还未就绪（状态：生成中）。请等待完成；如果长时间没有变化，请回到「视频提示词」页处理。";
+	    }
+	    if (reason === "video_prompt_failed") {
+	      var err = String((readiness && readiness.lastError) || "").trim();
+	      if (/角色一致性|needs_review|species|locked|非人角色/.test(err)) {
+	        return label + " 的视频提示词未就绪：角色一致性未通过。请回到「视频提示词」页确认角色后继续生成。";
+	      }
+	      if (err) return label + " 的视频提示词上轮生成失败：" + err.slice(0, 80) + "。请回到「视频提示词」页重新生成。";
+	      return label + " 的视频提示词上轮生成失败，请回到「视频提示词」页重新生成。";
+	    }
+	    return "片段 " + (gIdx + 1) + " 缺少可用视频提示词，请先去「视频提示词」页生成";
+	  }
+
+	  function _getVideoSegmentPreflightPayload(source) {
+	    var payload = source && source.payload ? source.payload : source;
+	    if (!payload || !payload.preflight) return null;
+	    if (payload.code === "video_segment_preflight_failed" || payload.code === "video_segment_preflight_warning") return payload;
+	    return null;
+	  }
+
+	  function _formatVideoSegmentPreflightMessage(payload) {
+	    var preflight = (payload && payload.preflight) || {};
+	    var blocked = Array.isArray(preflight.blocked) ? preflight.blocked : [];
+	    var warnings = Array.isArray(preflight.warnings) ? preflight.warnings : [];
+	    var lines = [];
+	    if (blocked.length) {
+	      lines.push("以下片段暂不能开始视频生成：");
+	      blocked.slice(0, 8).forEach(function (item) {
+	        var seg = "片段 " + (Number(item.groupIdx) + 1);
+	        var reasons = [];
+	        (item.blockers || []).forEach(function (b) {
+	          if (b && b.message) reasons.push(b.message);
+	          else if (b && b.code) reasons.push(b.code);
+	        });
+	        if (!reasons.length && item.reason) reasons.push(item.reason);
+	        lines.push(seg + "：" + (reasons.join("；") || "生成前检查未通过"));
+	      });
+	      if (blocked.length > 8) lines.push("还有 " + (blocked.length - 8) + " 个片段需要处理。");
+	    }
+	    if (warnings.length) {
+	      lines.push(blocked.length ? "\n同时有以下警告：" : "以下片段可以继续，但建议先确认：");
+	      warnings.slice(0, 8).forEach(function (item) {
+	        var seg = "片段 " + (Number(item.groupIdx) + 1);
+	        lines.push(seg + "：" + (item.message || item.reason || "存在非阻断警告"));
+	      });
+	      if (warnings.length > 8) lines.push("还有 " + (warnings.length - 8) + " 个警告。");
+	    }
+	    return lines.join("\n") || (payload && (payload.detail || payload.error)) || "视频生成前检查未通过";
+	  }
+
+	  function _videoSegmentPreflightActions(payload) {
+	    var preflight = (payload && payload.preflight) || {};
+	    var actions = [];
+	    function add(list) {
+	      (list || []).forEach(function (item) {
+	        (item.nextActions || []).forEach(function (action) {
+	          if (actions.indexOf(action) < 0) actions.push(action);
+	        });
+	      });
+	    }
+	    add(preflight.blocked);
+	    add(preflight.warnings);
+	    return actions;
+	  }
+
+	  function _targetPageForVideoSegmentPreflight(payload) {
+	    var actions = _videoSegmentPreflightActions(payload);
+	    if (actions.indexOf("regenerate_video_prompt") >= 0 || actions.indexOf("wait_video_prompt") >= 0) return "prompts";
+	    if (
+	      actions.indexOf("confirm_character_lock") >= 0 ||
+	      actions.indexOf("fill_species") >= 0 ||
+	      actions.indexOf("regenerate_prop_reference") >= 0 ||
+	      actions.indexOf("regenerate_character_reference") >= 0 ||
+	      actions.indexOf("regenerate_scene_reference") >= 0
+	    ) return "assets";
+	    if (actions.indexOf("regenerate_first_frame") >= 0) return "images";
+	    return "batch";
+	  }
+
+	  async function _postVideoBatchStartWithPreflightHandling(requestBody) {
+	    var body = JSON.parse(JSON.stringify(requestBody || {}));
+	    for (var attempt = 0; attempt < 2; attempt++) {
+	      try {
+	        return { resp: await apiPost("/api/batch/start", body) };
+	      } catch (e) {
+	        var payload = _getVideoSegmentPreflightPayload(e);
+	        if (!payload) throw e;
+	        var preflight = payload.preflight || {};
+	        var msg = _formatVideoSegmentPreflightMessage(payload);
+	        if (preflight.allowed === true && Array.isArray(preflight.warnings) && preflight.warnings.length) {
+	          var proceed = await showConfirm(
+	            "首帧参考已降级",
+	            msg + "\n\n可以使用旧参考图继续，也可以先回到分镜图页重新生成最新首帧。",
+	            "使用旧参考图继续",
+	            "重新生成最新首帧",
+	          );
+	          if (proceed) {
+	            body.options = Object.assign({}, body.options || {}, { ackPreflightWarnings: true });
+	            continue;
+	          }
+	          switchPage("images");
+	          return { aborted: true, payload: payload };
+	        }
+	        var go = await showConfirm(
+	          "视频生成前检查未通过",
+	          msg,
+	          "去处理",
+	          "稍后处理",
+	        );
+	        if (go) switchPage(_targetPageForVideoSegmentPreflight(payload));
+	        return { aborted: true, payload: payload };
+	      }
+	    }
+	    return { aborted: true };
+	  }
+
+	  function _showVideoSegmentPreflightWarnings(resp) {
+	    var payload = _getVideoSegmentPreflightPayload(resp);
+	    var warnings = payload && payload.preflight && Array.isArray(payload.preflight.warnings)
+	      ? payload.preflight.warnings
+	      : [];
+	    if (!warnings.length) return;
+	    showToast("视频将使用旧参考图继续；可稍后回到分镜图页重生成最新首帧", "warn");
+	  }
+
+	  function _hasCurrentVideoForGroup(gIdx) {
+	    var sb = project && project.storyboards && project.storyboards[gIdx];
+	    if (!sb || !sb.videoUrl) return false;
+	    var vt = Array.isArray(project.videoTasks) ? project.videoTasks[gIdx] : null;
+	    if (sb.videoIsCurrent === false) return false;
+	    if (vt && vt.isCurrent === false) return false;
+	    return true;
+	  }
+
+	  function _videoWarningKey(w) {
+	    return (w && (w.key || w.message)) ? String(w.key || w.message) : '';
+	  }
+	  function _isObsoleteVideoWarning(w) {
+	    var key = _videoWarningKey(w);
+	    var msg = String((w && w.message) || w || '');
+	    return key === 'duration_over_budget' || /视频档位|压缩动作\/台词/.test(msg);
+	  }
+	  function _normalizeVideoWarnings(data) {
+	    if (!data) return [];
+	    if (Array.isArray(data.videoWarnings)) return data.videoWarnings.filter(function (w) { return w && !_isObsoleteVideoWarning(w); });
+	    if (Array.isArray(data.warnings)) return data.warnings.filter(function (w) { return w && !_isObsoleteVideoWarning(w); });
+	    if (data.warning) return _isObsoleteVideoWarning(data.warning) ? [] : [data.warning];
+	    if (data.stage === 'duration_warning' && (data.hint || data.message)) {
+	      return [];
+	    }
+    return [];
+  }
+  function _mergeVideoWarnings(task, data, notify) {
+    if (!task) return;
+    var warnings = Array.isArray(data) ? data : _normalizeVideoWarnings(data);
+    if (!warnings.length) return;
+    task.warnings = Array.isArray(task.warnings) ? task.warnings : [];
+    task._shownWarnings = task._shownWarnings || Object.create(null);
+	    warnings.forEach(function (w) {
+	      if (!w) return;
+	      var normalized = (typeof w === 'string') ? { key: w, level: 'warn', message: w } : w;
+	      if (_isObsoleteVideoWarning(normalized)) return;
+	      var key = _videoWarningKey(normalized);
+	      if (!key) return;
+      var exists = task.warnings.some(function (old) { return _videoWarningKey(old) === key; });
+      if (!exists) task.warnings.push(normalized);
+      if (notify && !task._shownWarnings[key]) {
+        task._shownWarnings[key] = true;
+        showToast(normalized.message || key, 'warn');
+      }
+    });
+  }
+  function _projectVideoWarnings(gIdx) {
+	    if (!project || gIdx == null) return [];
+	    var vt = Array.isArray(project.videoTasks) ? project.videoTasks[gIdx] : null;
+	    if (vt && Array.isArray(vt.warnings)) return vt.warnings.filter(function (w) { return !_isObsoleteVideoWarning(w); });
+	    var sb = Array.isArray(project.storyboards) ? project.storyboards[gIdx] : null;
+	    if (sb && Array.isArray(sb.videoWarnings)) return sb.videoWarnings.filter(function (w) { return !_isObsoleteVideoWarning(w); });
+	    return [];
+	  }
+  function _applyVideoTaskProgress(task, data) {
+    if (!task) return;
+    if (task.status !== "polling") {
+      task.status = "polling";
+      task.statusCn = "生成中";
+    }
+    _mergeVideoWarnings(task, data, true);
+    updateTaskCard(task);
+  }
+
+  function _normalizeGroupIdx(gIdx) {
+    var n = Number(gIdx);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+  }
+
+  function _isVideoGroupInFlight(gIdx) {
+    var n = _normalizeGroupIdx(gIdx);
+    return n != null && _videoInFlightGroups.has(n);
+  }
+
+  function _lockVideoGroup(gIdx) {
+    var n = _normalizeGroupIdx(gIdx);
+    if (n == null) return false;
+    if (_videoInFlightGroups.has(n)) return false;
+    _videoInFlightGroups.add(n);
+    return true;
+  }
+
+  function _unlockVideoGroup(gIdx) {
+    var n = _normalizeGroupIdx(gIdx);
+    if (n != null) _videoInFlightGroups.delete(n);
+  }
+
+  function _lockVideoGroups(indices) {
+    var locked = [];
+    var skipped = [];
+    var seen = Object.create(null);
+    (indices || []).forEach(function (gIdx) {
+      var n = _normalizeGroupIdx(gIdx);
+      if (n == null || seen[n]) return;
+      seen[n] = true;
+      if (_videoInFlightGroups.has(n)) skipped.push(n);
+      else { _videoInFlightGroups.add(n); locked.push(n); }
+    });
+    return { locked: locked, skipped: skipped };
+  }
+
+  function _unlockVideoGroups(indices) {
+    (indices || []).forEach(function (gIdx) { _unlockVideoGroup(gIdx); });
+  }
+
+  function _inFlightMessage(indices) {
+    var arr = (indices || []).map(function (n) { return Number(n) + 1; }).filter(function (n) { return Number.isFinite(n); });
+    if (!arr.length) return "已有视频任务正在生成";
+    return arr.length === 1
+      ? "片段 " + arr[0] + " 正在生成中，请等待完成"
+      : "片段 " + arr.join("、") + " 正在生成中，已跳过重复提交";
   }
 
 
@@ -163,21 +451,24 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           batchSeenGroups[gIdx] = true;
           coveredGroups[gIdx] = true;
 
-          var sb = (project.storyboards && project.storyboards[gIdx]) || {};
-          var task = createVideoTaskObj("片段" + (gIdx + 1) + ": " + (sb.videoPrompt || "").slice(0, 80), false);
+          var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
           task._groupIdx = gIdx;
           task._projectId = project.id;
           task.serverTaskId = st.taskId || st.task_id || "";
 
           var result = st.result || {};
+          _mergeVideoWarnings(task, (result.extra && result.extra.videoWarnings) || _projectVideoWarnings(gIdx), false);
           var resultUrl = result.resultUrl || result.url || (result.patch && result.patch.url) || "";
+          var protectedUrl = result.protectedUrl || result.protected_url || (result.extra && result.extra.protectedUrl) || _protectedVideoUrlFrom(resultUrl);
 
           if (st.status === "done" || st.status === "completed" || st.status === "succeeded") {
             task.status = "done"; task.statusCn = "完成";
             task.videoUrl = resultUrl;
+            task.protectedUrl = protectedUrl;
             if (task.videoUrl && project && Array.isArray(project.storyboards)) {
               if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
               if (!project.storyboards[gIdx].videoUrl) project.storyboards[gIdx].videoUrl = task.videoUrl;
+              if (protectedUrl) project.storyboards[gIdx]._originVideoUrl = protectedUrl;
               var dSec = (result.patch && result.patch.durationSec) || (result.extra && result.extra.durationSec);
               if (dSec) project.storyboards[gIdx].videoDurationSec = dSec;
             }
@@ -245,21 +536,32 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             if (extra && typeof extra.readyForEdit === "boolean") {
               project.storyboards[eIdx].readyForEdit = extra.readyForEdit;
             }
+            if (extra && Array.isArray(extra.videoWarnings)) {
+              project.storyboards[eIdx].videoWarnings = extra.videoWarnings;
+            }
           }
           if (project && extra && extra.editReadiness && typeof extra.editReadiness === "object") {
             if (!project.editData) project.editData = {};
             project.editData.readiness = extra.editReadiness;
           }
           if (url) {
+            _mergeVideoWarnings(t, extra, false);
+            var protectedUrl = (extra && extra.protectedUrl) || _protectedVideoUrlFrom(url);
             t.videoUrl = url;
+            t.protectedUrl = protectedUrl;
             if (project && t._groupIdx != null && Array.isArray(project.storyboards)) {
-              if (!project.storyboards[t._groupIdx]) project.storyboards[t._groupIdx] = {};
-              project.storyboards[t._groupIdx].videoUrl = url;
-              // 把后端真实时长（5s / 10s）写到 storyboard，剪辑工作台 timeline
-              // 段长就能用真实视频长度，避免出现"导入是 5s/AI 剪辑后变 10s"
+	          if (!project.storyboards[t._groupIdx]) project.storyboards[t._groupIdx] = {};
+	          project.storyboards[t._groupIdx].videoUrl = url;
+	          project.storyboards[t._groupIdx].videoIsCurrent = true;
+	          delete project.storyboards[t._groupIdx].videoInvalidatedAt;
+	          delete project.storyboards[t._groupIdx].videoInvalidatedReason;
+	          if (protectedUrl) project.storyboards[t._groupIdx]._originVideoUrl = protectedUrl;
+              // 把后端真实生成文件时长写到 storyboard，剪辑工作台 timeline
+              // 段长就能用真实视频长度，避免计划时长和文件时长错位。
               var realDur = (extra && extra.durationSec) || 0;
               if (!realDur && extra && extra.patch && extra.patch.durationSec) realDur = extra.patch.durationSec;
               if (realDur) project.storyboards[t._groupIdx].videoDurationSec = realDur;
+              if (extra && Array.isArray(extra.videoWarnings)) project.storyboards[t._groupIdx].videoWarnings = extra.videoWarnings;
             }
             videoPipeline(t).then(function () { updateBadge(); renderBatchClipList(); });
           } else {
@@ -315,7 +617,8 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
               });
             }
             if (snap.status === "succeeded" || snap.status === "failed" ||
-                snap.status === "completed" || snap.status === "cancelled") {
+                snap.status === "completed" || snap.status === "cancelled" ||
+                snap.status === "partial") {
               _stopReatPoll();
               if (btn) btn.disabled = false;
               if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
@@ -368,7 +671,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           onTaskProgress: function (data) {
             var t = findTaskByServerId(data.taskId);
             if (!t) return;
-            if (t.status !== "polling") { t.status = "polling"; t.statusCn = "生成中"; updateTaskCard(t); }
+            _applyVideoTaskProgress(t, data);
           },
           onTaskCompleted: function (data) {
             applyCompleted(data.taskId, data.resultUrl || data.videoUrl || "", data.extra || {});
@@ -383,9 +686,8 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
               (totalFail ? "（失败 " + totalFail + "）" : "");
           },
           onClose: function () {
-            _stopReatPoll();
             _batchHandle = null;
-            if (btn) btn.disabled = false;
+            if (_reatPoll && hint) hint.textContent = "实时连接断开，继续轮询后端结果…";
           },
         });
       });
@@ -407,22 +709,25 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           var isSucceeded = t.status === "succeeded" || t.status === "done" || t.status === "completed";
           var isFailed = t.status === "failed" || t.status === "timeout";
           var url = t.result_url || "";
+          var protectedUrl = t.protected_url || _protectedVideoUrlFrom(url);
 
           if (isSucceeded && url && project && Array.isArray(project.storyboards)) {
             if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
             if (!project.storyboards[gIdx].videoUrl) project.storyboards[gIdx].videoUrl = url;
+            if (protectedUrl) project.storyboards[gIdx]._originVideoUrl = protectedUrl;
             if (t.duration_sec) project.storyboards[gIdx].videoDurationSec = Number(t.duration_sec);
           }
 
-          var sb = (project.storyboards && project.storyboards[gIdx]) || {};
-          var task = createVideoTaskObj("片段" + (gIdx + 1) + ": " + (sb.videoPrompt || "").slice(0, 80), false);
+          var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
           task.serverTaskId = t.task_id || "";
           task._groupIdx = gIdx;
           task._projectId = project.id;
+          _mergeVideoWarnings(task, _projectVideoWarnings(gIdx), false);
 
           if (isSucceeded) {
             task.status = "done"; task.statusCn = "已完成";
             task.videoUrl = url;
+            task.protectedUrl = protectedUrl;
           } else if (isFailed) {
             task.status = "failed"; task.statusCn = t.error_msg || "生成失败";
           } else {
@@ -470,10 +775,12 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var tType = t.target_type;
     var tIdx = t.target_idx || 0;
     var url = t.result_url;
+    var protectedUrl = t.protected_url || _protectedVideoUrlFrom(url);
     if (t.task_type === "video") {
       if (!project.storyboards) project.storyboards = [];
       if (!project.storyboards[tIdx]) project.storyboards[tIdx] = {};
       if (url && !project.storyboards[tIdx].videoUrl) project.storyboards[tIdx].videoUrl = url;
+      if (protectedUrl) project.storyboards[tIdx]._originVideoUrl = protectedUrl;
       if (t.asset_id) project.storyboards[tIdx].videoAssetId = t.asset_id;
       if (t.fetch_status) project.storyboards[tIdx].fetchStatus = t.fetch_status;
       project.storyboards[tIdx].videoTaskId = t.task_id;
@@ -670,8 +977,10 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       iconHtml = '<div class="w-10 h-10 rounded-full bg-surface-container-low flex items-center justify-center"><span class="material-symbols-outlined text-on-surface-variant/40 animate-pulse">hourglass_top</span></div>';
     }
 
-    var promptSnippet = escapeHtml((task.prompt || '').slice(0, 60));
-    var timeStr = formatTime(task.createdAt);
+	    var taskMeta = escapeHtml(_taskDisplayMeta(task));
+	    var timeStr = formatTime(task.createdAt);
+	    var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
+	    var warningText = firstWarning ? escapeHtml(firstWarning.message || firstWarning.key || String(firstWarning)) : '';
 
     var playBtnHtml = '';
     if (done && (task.videoUrl || task.blobUrl)) {
@@ -689,8 +998,13 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         '</button>';
     }
 
+    var regenBtnHtml = '';
     var importBtnHtml = '';
     if (done && task._groupIdx != null && (task.videoUrl || task.blobUrl)) {
+      regenBtnHtml =
+        '<button type="button" class="mirror-regen-btn px-3 py-1.5 rounded-full text-[10px] font-bold bg-surface-container-highest/40 text-on-surface-variant hover:opacity-90 transition-all active:scale-95" style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" data-action="retry" data-task-id="' + task.localId + '" title="重新生成">' +
+          '<span class="material-symbols-outlined" style="font-size:13px;line-height:1">refresh</span>重新生成' +
+        '</button>';
       var _imported = false;
       try { _imported = isGroupImported(task._groupIdx); } catch (_e) {}
       if (_imported) {
@@ -738,14 +1052,16 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       '<div class="flex items-center justify-between p-4">' +
         '<div class="flex items-center gap-5">' +
           iconHtml +
-          '<div>' +
-            '<h5 class="text-sm font-bold">' + (task._groupIdx !== undefined ? '片段 ' + (task._groupIdx + 1) : '视频任务') + '</h5>' +
-            '<p class="text-[10px] font-medium text-on-surface-variant/60 max-w-xs truncate">' + promptSnippet + '</p>' +
-            (fail && task.statusCn ? '<p class="text-[10px] text-error/70 max-w-xs truncate mt-0.5">' + escapeHtml(task.statusCn) + '</p>' : '') +
-          '</div>' +
+	          '<div>' +
+	            '<h5 class="text-sm font-bold">' + escapeHtml(_taskDisplayName(task)) + '</h5>' +
+	            '<p class="text-[10px] font-medium text-on-surface-variant/60 max-w-xs truncate">' + taskMeta + '</p>' +
+	            (warningText ? '<p class="text-[10px] text-amber-700 max-w-xs truncate mt-0.5">' + warningText + '</p>' : '') +
+	            (fail && task.statusCn ? '<p class="text-[10px] text-error/70 max-w-xs truncate mt-0.5">' + escapeHtml(task.statusCn) + '</p>' : '') +
+	          '</div>' +
         '</div>' +
         '<div class="flex items-center gap-3">' +
           playBtnHtml +
+          regenBtnHtml +
           importBtnHtml +
           failBtnsHtml +
           '<span class="px-3 py-1 ' + statusClass + ' text-[10px] font-bold rounded-full" style="white-space:nowrap;display:inline-flex;align-items:center;gap:3px">' + statusLabel + '</span>' +
@@ -813,7 +1129,35 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var bWrap = $("batchTaskListWrap");
     if (!bWrap || bWrap._playerBound) return;
     bWrap._playerBound = true;
+
+    function closeInlinePlayer(player, ev) {
+      if (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      if (!player) return;
+      var v = player.querySelector("video");
+      if (v) {
+        try { v.pause(); } catch (_) {}
+        var src = v.currentSrc || v.src || "";
+        if (src.indexOf("blob:") === 0) {
+          try { URL.revokeObjectURL(src); } catch (_) {}
+        }
+      }
+      var blobUrl = player.dataset && player.dataset.blobUrl;
+      if (blobUrl) {
+        try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+      }
+      player.remove();
+    }
+
     bWrap.addEventListener("click", function (e) {
+      var closeBtn = e.target.closest(".batch-close-player");
+      if (closeBtn && bWrap.contains(closeBtn)) {
+        closeInlinePlayer(closeBtn.closest(".batch-inline-player"), e);
+        return;
+      }
+
       var actionBtn = e.target.closest("[data-action]");
       if (actionBtn) {
         var act = actionBtn.dataset.action;
@@ -863,31 +1207,78 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
 
       var playerDiv = document.createElement("div");
       playerDiv.className = "batch-inline-player p-4 pt-0";
-      playerDiv.innerHTML =
-        '<div class="relative rounded-lg overflow-hidden bg-black aspect-video">' +
-          '<video src="' + escapeHtml(videoUrl) + '" class="w-full h-full" controls autoplay playsinline preload="auto"></video>' +
-          '<button type="button" class="batch-close-player absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 text-white flex items-center justify-center hover:bg-black/80 transition-colors z-10">' +
-            '<span class="material-symbols-outlined text-sm">close</span>' +
-          '</button>' +
-        '</div>';
       mirror.appendChild(playerDiv);
+      var blobUrlToRevoke = "";
 
-      var video = playerDiv.querySelector("video");
-      video.addEventListener("error", function () {
+      function closePlayer(ev) {
+        closeInlinePlayer(playerDiv, ev);
+        if (blobUrlToRevoke) {
+          try { URL.revokeObjectURL(blobUrlToRevoke); } catch (_) {}
+          blobUrlToRevoke = "";
+        }
+      }
+
+      function renderFallback() {
         playerDiv.innerHTML =
-          '<div class="p-4 text-center text-xs text-on-surface-variant">' +
+          '<div class="relative p-4 text-center text-xs text-on-surface-variant">' +
+            '<button type="button" class="batch-close-player absolute top-2 right-2 w-7 h-7 rounded-full bg-black/10 text-on-surface flex items-center justify-center hover:bg-black/20 transition-colors">' +
+              '<span class="material-symbols-outlined text-sm">close</span>' +
+            '</button>' +
             '<p>暂时无法在此处播放，' +
             '<a href="' + escapeHtml(videoUrl) + '" target="_blank" class="text-primary underline">点击新窗口播放</a></p>' +
           '</div>';
-      });
+        var c = playerDiv.querySelector(".batch-close-player");
+        if (c) c.addEventListener("click", closePlayer);
+      }
 
-      var closeBtn = playerDiv.querySelector(".batch-close-player");
-      closeBtn.addEventListener("click", function (ev) {
-        ev.stopPropagation();
-        var v = playerDiv.querySelector("video");
-        if (v) v.pause();
-        playerDiv.remove();
-      });
+      function renderLoading() {
+        playerDiv.innerHTML =
+          '<div class="relative rounded-lg overflow-hidden bg-black aspect-video flex items-center justify-center text-white/70 text-xs">' +
+            '<span>正在准备预览…</span>' +
+            '<button type="button" class="batch-close-player absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 text-white flex items-center justify-center hover:bg-black/80 transition-colors z-10">' +
+              '<span class="material-symbols-outlined text-sm">close</span>' +
+            '</button>' +
+          '</div>';
+        var c = playerDiv.querySelector(".batch-close-player");
+        if (c) c.addEventListener("click", closePlayer);
+      }
+
+      function renderVideo(src, allowFetchFallback) {
+        playerDiv.innerHTML =
+          '<div class="relative rounded-lg overflow-hidden bg-black aspect-video">' +
+            '<video src="' + escapeHtml(src) + '" class="w-full h-full" controls autoplay playsinline preload="auto"></video>' +
+            '<button type="button" class="batch-close-player absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 text-white flex items-center justify-center hover:bg-black/80 transition-colors z-10">' +
+              '<span class="material-symbols-outlined text-sm">close</span>' +
+            '</button>' +
+          '</div>';
+        var c = playerDiv.querySelector(".batch-close-player");
+        if (c) c.addEventListener("click", closePlayer);
+        var video = playerDiv.querySelector("video");
+        if (video && allowFetchFallback) {
+          video.addEventListener("error", function () {
+            renderLoading();
+            fetchVideoBuffer(videoUrl).then(function (buf) {
+              if (!playerDiv.isConnected) return;
+              if (blobUrlToRevoke) { try { URL.revokeObjectURL(blobUrlToRevoke); } catch (_) {} }
+              blobUrlToRevoke = URL.createObjectURL(new Blob([buf], { type: "video/mp4" }));
+              playerDiv.dataset.blobUrl = blobUrlToRevoke;
+              renderVideo(blobUrlToRevoke, false);
+            }).catch(renderFallback);
+          }, { once: true });
+        }
+      }
+
+      if (_isInternalVideoUrl(videoUrl) && !/[?&]sig=/.test(videoUrl)) {
+        renderLoading();
+        fetchVideoBuffer(videoUrl).then(function (buf) {
+          if (!playerDiv.isConnected) return;
+          blobUrlToRevoke = URL.createObjectURL(new Blob([buf], { type: "video/mp4" }));
+          playerDiv.dataset.blobUrl = blobUrlToRevoke;
+          renderVideo(blobUrlToRevoke, false);
+        }).catch(renderFallback);
+      } else {
+        renderVideo(videoUrl, true);
+      }
     });
   }
 
@@ -896,12 +1287,13 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     card.className = "task-card is-active";
     card.dataset.taskId = task.localId;
     card.innerHTML =
-      '<div class="tc-head">' +
-        '<span class="tc-badge tc-badge--submit">' + escapeHtml(task.statusCn) + '</span>' +
-        '<span class="tc-time">' + formatTime(task.createdAt) + '</span>' +
-      '</div>' +
-      '<p class="tc-prompt">' + escapeHtml(task.prompt) + '</p>' +
-      '<div class="tc-preview">' +
+	      '<div class="tc-head">' +
+	        '<span class="tc-badge tc-badge--submit">' + escapeHtml(task.statusCn) + '</span>' +
+	        '<span class="tc-time">' + formatTime(task.createdAt) + '</span>' +
+	      '</div>' +
+	      '<p class="tc-prompt">' + escapeHtml(_taskDisplayName(task) + ' · ' + _taskDisplayMeta(task)) + '</p>' +
+	      '<p class="tc-warning" style="margin:4px 0 0;color:#a15c00;font-size:11px;line-height:1.35" hidden></p>' +
+	      '<div class="tc-preview">' +
         '<div class="tc-busy"><div class="tc-spinner"></div><span class="tc-busy-text">提交中…</span></div>' +
         '<div class="tc-video-wrap" hidden>' +
           '<video playsinline preload="auto" muted></video>' +
@@ -925,9 +1317,10 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     task._videoWrap = card.querySelector(".tc-video-wrap");
     task._playOverlay = card.querySelector(".tc-play-overlay");
     task._videoLoading = card.querySelector(".tc-video-loading");
-    task._failedWrap = card.querySelector(".tc-failed");
-    task._failedText = card.querySelector(".tc-failed-text");
-    task._actions = card.querySelector(".tc-actions");
+	    task._failedWrap = card.querySelector(".tc-failed");
+	    task._failedText = card.querySelector(".tc-failed-text");
+	    task._warningText = card.querySelector(".tc-warning");
+	    task._actions = card.querySelector(".tc-actions");
 
     var playOv = task._playOverlay, vid = task.videoEl;
     if (playOv && vid) {
@@ -945,8 +1338,13 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var st = task.status, active = !isTerminal(task), done = st === "done";
     var fail = st === "failed" || st === "timeout", fetching = st === "fetching";
     task.cardEl.classList.toggle("is-active", active);
-    task._badge.textContent = task.statusCn;
-    task._badge.className = "tc-badge tc-badge--" + st;
+	    task._badge.textContent = task.statusCn;
+	    task._badge.className = "tc-badge tc-badge--" + st;
+	    if (task._warningText) {
+	      var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
+	      task._warningText.hidden = !firstWarning;
+	      task._warningText.textContent = firstWarning ? (firstWarning.message || firstWarning.key || String(firstWarning)) : "";
+	    }
 
     if (fetching) {
       task._busyWrap.hidden = true; task._videoWrap.hidden = false;
@@ -1073,8 +1471,27 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     return "file://" + s;
   }
 
+  var _INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
+
+  function _isInternalVideoUrl(url) {
+    return _INTERNAL_VIDEO_RE.test(String(url || ""));
+  }
+
+  function _protectedVideoUrlFrom(url) {
+    var m = _INTERNAL_VIDEO_RE.exec(String(url || ""));
+    return m ? "/api/videos/file/" + m[1] : "";
+  }
+
+  function _setStoryboardVideoUrl(gIdx, url, protectedUrl) {
+    if (!project || gIdx == null || !Array.isArray(project.storyboards)) return;
+    if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+    if (url) project.storyboards[gIdx].videoUrl = url;
+    if (protectedUrl) project.storyboards[gIdx]._originVideoUrl = protectedUrl;
+  }
+
   async function fetchVideoBuffer(url) {
-    var res; try { res = await fetch(url); } catch (e) { throw new Error((e && e.message || String(e)) + " — 网络请求失败"); }
+    var opts = _isInternalVideoUrl(url) ? { headers: getAuthHeaders(), cache: "no-store" } : {};
+    var res; try { res = await fetch(url, opts); } catch (e) { throw new Error((e && e.message || String(e)) + " — 网络请求失败"); }
     if (!res.ok) throw new Error("下载失败 HTTP " + res.status);
     return await res.arrayBuffer();
   }
@@ -1177,10 +1594,11 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     if (gIdx === undefined || gIdx === null) return;
     var originId = task._projectId || (project && project.id);
     if (!originId) return;
+    var protectedUrl = task.protectedUrl || _protectedVideoUrlFrom(task.videoUrl);
     _safeWriteBack(originId, function (proj) {
       if (!proj.storyboards) proj.storyboards = [];
       if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-      proj.storyboards[gIdx].videoUrl = task.videoUrl;
+      proj.storyboards[gIdx].videoUrl = protectedUrl || task.videoUrl;
       if (task.videoAssetId) proj.storyboards[gIdx].videoAssetId = task.videoAssetId;
       if (task.fetchStatus) proj.storyboards[gIdx].fetchStatus = task.fetchStatus;
       if (task.serverTaskId) proj.storyboards[gIdx].videoTaskId = task.serverTaskId;
@@ -1241,19 +1659,37 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     return Math.min(15, Math.max(5, n));
   }
 
-  async function createWorkflowVideoTask(gIdx, batchOpts) {
-    _syncVideoRefs();
-    if (activeTaskCount() >= MAX_CONCURRENT) throw new Error("同时处理数已达上限");
+	  async function createWorkflowVideoTask(gIdx, batchOpts) {
+	    _syncVideoRefs();
+	    if (activeTaskCount() >= MAX_CONCURRENT) throw new Error("同时处理数已达上限");
 
-    var opts = batchOpts || {};
+	    var opts = batchOpts || {};
+	    if (!project || !project.storyboards || !project.storyboards[gIdx]) throw new Error("片段 " + (gIdx + 1) + " 无数据");
+	    var sb = project.storyboards[gIdx];
+	    var groups = getStoryboardGroups();
+		    var group = groups[gIdx];
+		    if (!group) throw new Error("片段 " + (gIdx + 1) + " 分组异常");
+		    var promptReady = _videoPromptReadinessForGroup(gIdx);
+		    if (!promptReady.canStart) throw new Error(_videoPromptNotReadyMessage(gIdx, promptReady));
 
-    if (!project || !project.storyboards || !project.storyboards[gIdx]) throw new Error("片段 " + (gIdx + 1) + " 无数据");
-    var sb = project.storyboards[gIdx];
-    var groups = getStoryboardGroups();
-    var group = groups[gIdx];
-    if (!group) throw new Error("片段 " + (gIdx + 1) + " 分组异常");
+		    var groupLockHeld = !!opts._videoGroupLockHeld;
+	    var groupLockAcquired = false;
+	    if (!groupLockHeld) {
+	      if (!_lockVideoGroup(gIdx)) {
+	        showToast(_inFlightMessage([gIdx]), "warn");
+	        return;
+	      }
+	      groupLockAcquired = true;
+	    }
+	    function releaseGroupLock() {
+	      if (groupLockHeld || groupLockAcquired) {
+	        _unlockVideoGroup(gIdx);
+	        groupLockHeld = false;
+	        groupLockAcquired = false;
+	      }
+	    }
 
-    var task = createVideoTaskObj("片段" + (gIdx + 1) + ": " + ((sb.videoPrompt || "").slice(0, 80) || "准备中"), false);
+    var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
     task.status = "preparing"; task.statusCn = "提交中"; task.statusEn = "提交中";
     task._groupIdx = gIdx;
     task._projectId = project ? project.id : null;
@@ -1286,7 +1722,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     }];
 
     try {
-      var resp = await apiPost("/api/batch/start", {
+      var startResult = await _postVideoBatchStartWithPreflightHandling({
         batchType: "videos",
         projectId: project.id,
         storyboardIndices: [gIdx],
@@ -1299,16 +1735,26 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           watermark: watermark,
         },
       });
-
-      if (resp && resp.errorCode === "MODEL_UNAVAILABLE") {
-        await _handleModelUnavailable(task, resp, { videoModel: videoModel });
-        return;
-      }
-      if (!resp || resp.error || !resp.batchId) {
-        task.status = "failed"; task.statusCn = _friendlyVideoError((resp && resp.error) || "提交失败");
+      if (startResult && startResult.aborted) {
+        task.status = "failed"; task.statusCn = "已取消：生成前检查未通过";
         updateTaskCard(task); updateBadge();
+        releaseGroupLock();
         return;
       }
+      var resp = startResult && startResult.resp;
+      _showVideoSegmentPreflightWarnings(resp);
+
+	      if (resp && resp.errorCode === "MODEL_UNAVAILABLE") {
+	        await _handleModelUnavailable(task, resp, { videoModel: videoModel });
+	        releaseGroupLock();
+	        return;
+	      }
+	      if (!resp || resp.error || !resp.batchId) {
+	        task.status = "failed"; task.statusCn = _friendlyVideoError((resp && resp.error) || "提交失败");
+	        updateTaskCard(task); updateBadge();
+	        releaseGroupLock();
+	        return;
+	      }
 
       var batchId = resp.batchId;
       task.status = "polling"; task.statusCn = "生成中";
@@ -1329,8 +1775,8 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           task.status = "polling"; task.statusCn = "生成中";
           updateTaskCard(task);
         },
-        onTaskProgress: function () {
-          if (task.status !== "polling") { task.status = "polling"; task.statusCn = "生成中"; updateTaskCard(task); }
+        onTaskProgress: function (data) {
+          _applyVideoTaskProgress(task, data);
         },
         onTaskCompleted: function (data) {
           var url = data.resultUrl || data.videoUrl || "";
@@ -1341,17 +1787,29 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             if (typeof extra.readyForEdit === "boolean") {
               project.storyboards[eIdx].readyForEdit = extra.readyForEdit;
             }
+            if (Array.isArray(extra.videoWarnings)) {
+              project.storyboards[eIdx].videoWarnings = extra.videoWarnings;
+            }
           }
           if (url) {
+            _mergeVideoWarnings(task, extra, false);
+            var protectedUrl = (extra && extra.protectedUrl) || _protectedVideoUrlFrom(url);
             task.videoUrl = url;
+            task.protectedUrl = protectedUrl;
             if (project && task._groupIdx != null && Array.isArray(project.storyboards)) {
-              if (!project.storyboards[task._groupIdx]) project.storyboards[task._groupIdx] = {};
-              project.storyboards[task._groupIdx].videoUrl = url;
+	              if (!project.storyboards[task._groupIdx]) project.storyboards[task._groupIdx] = {};
+	              project.storyboards[task._groupIdx].videoUrl = url;
+	              project.storyboards[task._groupIdx].videoIsCurrent = true;
+	              delete project.storyboards[task._groupIdx].videoInvalidatedAt;
+	              delete project.storyboards[task._groupIdx].videoInvalidatedReason;
+	              if (protectedUrl) project.storyboards[task._groupIdx]._originVideoUrl = protectedUrl;
+              if (Array.isArray(extra.videoWarnings)) project.storyboards[task._groupIdx].videoWarnings = extra.videoWarnings;
             }
-            videoPipeline(task).then(function () { updateBadge(); renderBatchClipList(); });
+            videoPipeline(task).then(function () { updateBadge(); renderBatchClipList(); }).finally(releaseGroupLock);
           } else {
             task.status = "failed"; task.statusCn = "生成完成但无视频地址";
             updateTaskCard(task); updateBadge();
+            releaseGroupLock();
           }
         },
         onTaskFailed: function (data) {
@@ -1359,8 +1817,9 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           task.statusCn = _friendlyVideoError(data.reason || data.errorMsg || "failed");
           updateTaskCard(task); updateBadge();
           renderBatchClipList();
+          releaseGroupLock();
         },
-        onBatchCompleted: function () {},
+	        onBatchCompleted: function () { releaseGroupLock(); },
         onClose: function () {},
       });
     } catch (e) {
@@ -1370,11 +1829,13 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         updateTaskCard(task); updateBadge();
         showBillingPaywall(e.billing || null);
         showToast(task.statusCn, 'warn');
+        releaseGroupLock();
         return;
       }
       task.status = "failed"; task.statusCn = _friendlyVideoError((e && e.message) || e);
       updateTaskCard(task); updateBadge();
       showToast(task.statusCn, "error");
+      releaseGroupLock();
     }
   }
 
@@ -1382,22 +1843,26 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
   function _attachTaskStream(task, taskId) {
     if (task._sseHandle) { try { task._sseHandle.close(); } catch (_e) {} task._sseHandle = null; }
     task._sseHandle = subscribeTask(taskId, {
-      onProgress: function () {
-        if (task.status !== "polling") {
-          task.status = "polling"; task.statusCn = "生成中"; updateTaskCard(task);
-        }
+      onProgress: function (data) {
+        _applyVideoTaskProgress(task, data);
       },
       onCompleted: function (data) {
         var url = data.resultUrl || data.videoUrl || "";
+        var extra = (data && data.extra) || {};
+        var protectedUrl = extra.protectedUrl || _protectedVideoUrlFrom(url);
         // 簇 11：持久化链路产出的 assetId/fetchStatus 如果后端顺手带过来，
         // 就挂到 task 上，让 videoPipeline 能把"下载中→可播"写进分镜。
         if (data && data.assetId) task.videoAssetId = data.assetId;
         if (data && data.fetchStatus) task.fetchStatus = data.fetchStatus;
         if (url) {
+          _mergeVideoWarnings(task, extra, false);
           task.videoUrl = url;
+          task.protectedUrl = protectedUrl;
           if (project && task._groupIdx != null && Array.isArray(project.storyboards)) {
             if (!project.storyboards[task._groupIdx]) project.storyboards[task._groupIdx] = {};
             project.storyboards[task._groupIdx].videoUrl = url;
+            if (protectedUrl) project.storyboards[task._groupIdx]._originVideoUrl = protectedUrl;
+            if (Array.isArray(extra.videoWarnings)) project.storyboards[task._groupIdx].videoWarnings = extra.videoWarnings;
           }
           videoPipeline(task).then(function () { updateBadge(); });
         } else {
@@ -1488,6 +1953,14 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     if (clipList && !clipList._regenBound) {
       clipList._regenBound = true;
       clipList.addEventListener("click", function (e) {
+        var auditBtn = e.target.closest("[data-action='open-prompt-audit']");
+        if (auditBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          var auditIdx = parseInt(auditBtn.dataset.gidx, 10);
+          if (!isNaN(auditIdx)) _openVideoPromptAudit(auditIdx, auditBtn.dataset.shotIndices || "");
+          return;
+        }
         var senBtn = e.target.closest("[data-action='goto-fix-sensitive']");
         if (senBtn) {
           var gi = parseInt(senBtn.dataset.gidx, 10);
@@ -1555,8 +2028,11 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       thumb.style.left = thumbL + "%";
     }
 
-    list.removeEventListener("scroll", updateThumb);
-    list.addEventListener("scroll", updateThumb);
+    if (list._batchClipScrollHandler) {
+      list.removeEventListener("scroll", list._batchClipScrollHandler);
+    }
+    list._batchClipScrollHandler = updateThumb;
+    list.addEventListener("scroll", updateThumb, { passive: true });
     updateThumb();
 
     if (btnL && !btnL._bound) {
@@ -1607,16 +2083,19 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
 
     await Promise.all(prefetchTargets.map(async function (t) {
       var jobs = [_vpFetchAndCache(t.sb)];
-      if (!t.sb._matchedRefs || t.sb._matchedRefs._forText !== t.sb.videoPrompt) {
+      var sbRefUrl = (t.sb.firstFrameUrl || t.sb.rawUrl || t.sb.url || t.sb.imageUrl || "").trim();
+      var matchKey = [t.gIdx, sbRefUrl, Array.isArray(t.group && t.group.shotIndices) ? t.group.shotIndices.join(",") : ""].join("|");
+      if (!t.sb._matchedRefs || t.sb._matchedRefs._forKey !== matchKey) {
         jobs.push((async function () {
           try {
             var resp = await apiPost('/api/assets/match-references', {
               project: { assets: project.assets },
               group: t.group,
-              promptText: t.sb.videoPrompt || '',
+              groupIdx: t.gIdx,
+              storyboardImageUrl: sbRefUrl || null,
             });
             t.sb._matchedRefs = resp.refs || [];
-            t.sb._matchedRefs._forText = t.sb.videoPrompt;
+            t.sb._matchedRefs._forKey = matchKey;
           } catch (e) {
             console.warn('[BatchClip] match-references failed:', e);
             t.sb._matchedRefs = t.sb._matchedRefs || [];
@@ -1630,57 +2109,53 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     var validCount = 0;
     var totalDurAll = 0;
 
-    // Seedance 只出 5s / 10s：本组台词 ≤18 字用 5s，否则 10s。
-    // 跟 batch-executors.ts 的决策完全一致，这样批量页显示的时长和实际成片一致。
-    function _seedanceDurForBatch(grp) {
-      var QUOTED_RE = /[「『""''"'‘’“”]([\s\S]*?)[」』""''"'‘’“”]/g;
-      var PUNCT_RE = /[\s，。！？、…—·,.!?"'()（）「」『』"'‘’“”]/g;
-      var total = 0;
-      (grp.shots || []).forEach(function (sh) {
-        var raw = String((sh && sh.dialogue) || '').trim();
-        if (!raw || raw === '——' || raw === '-' || raw === '无') return;
-        raw.split(/\r?\n/).forEach(function (line) {
-          var stripped = line.replace(/^\s*[^：:\n]{1,20}[：:]\s*/, '');
-          var quoted = stripped.match(QUOTED_RE);
-          if (quoted && quoted.length) {
-            quoted.forEach(function (q) { total += q.replace(PUNCT_RE, '').length; });
-          } else {
-            total += stripped.replace(PUNCT_RE, '').length;
-          }
-        });
-      });
-      return total > 18 ? 10 : 5;
-    }
+	    // 批量页展示计划时长：直接累加镜头表 duration；真实文件时长生成后写入
+	    // storyboards[].videoDurationSec，剪辑页再以真实文件为准。
+	    function _plannedDurForBatch(grp) {
+	      var total = 0;
+	      (grp.shots || []).forEach(function (sh) {
+	        total += Number((sh && (sh.duration || sh.durationSec)) || 4) || 4;
+	      });
+	      return Math.max(1, Math.round(total * 10) / 10);
+	    }
 
-    groups.forEach(function (group, gIdx) {
-      var sb = project.storyboards[gIdx] || {};
-      if (!sb.videoPrompt) return;
-      validCount++;
-      var totalDur = _seedanceDurForBatch(group);
+	    groups.forEach(function (group, gIdx) {
+	      var sb = project.storyboards[gIdx] || {};
+	      if (!sb.videoPrompt) return;
+	      var promptReady = _videoPromptReadinessForGroup(gIdx);
+	      validCount++;
+	      var totalDur = _plannedDurForBatch(group);
       totalDurAll += totalDur;
 
-      var bcThumbSrc = sb.rawUrl || sb.imageUrl || '';
+      var bcThumbSrc = sb.firstFrameUrl || sb.rawUrl || sb.url || sb.imageUrl || '';
 
       var charCount = 0, sceneCount = 0;
       var assetRefs = sb._matchedRefs || [];
       assetRefs.forEach(function (r) {
-        if (r.type === "character") charCount++;
-        else sceneCount++;
+        var role = r.role || r.type;
+        if (role === "character") charCount++;
+        else if (role === "scene") sceneCount++;
       });
 
       var vpCache = _vpGetCache(sb);
       var batchSenHits = vpCache.sensitiveHits || [];
+      var groupShotIndicesText = Array.isArray(group.shotIndices) ? group.shotIndices.join(",") : "";
 
       var clipTask = _findTaskByGroup(gIdx);
       var statusLabel = '', statusClass = '';
-      if (clipTask && clipTask.status === 'failed') {
-        statusLabel = '失败'; statusClass = 'bg-error/10 text-error';
+	      if (!promptReady.canStart) {
+	        statusLabel = promptReady.status === 'generating' ? '提示词生成中' : '提示词失效';
+	        statusClass = promptReady.status === 'generating' ? 'bg-primary/10 text-primary' : 'bg-error/10 text-error';
+	      } else if (clipTask && clipTask.status === 'failed') {
+	        statusLabel = '失败'; statusClass = 'bg-error/10 text-error';
       } else if (clipTask && !isTerminal(clipTask)) {
         statusLabel = '生成中'; statusClass = 'bg-primary/10 text-primary';
       } else if (clipTask && clipTask.status === 'done') {
         statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
-      } else if (!clipTask && sb.videoUrl) {
-        statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
+	      } else if (!clipTask && sb.videoUrl && !_hasCurrentVideoForGroup(gIdx)) {
+	        statusLabel = '旧视频已过期'; statusClass = 'bg-surface-container-highest text-on-surface-variant';
+	      } else if (!clipTask && sb.videoUrl) {
+	        statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
       } else {
         statusLabel = '就绪 READY'; statusClass = 'bg-primary text-on-primary';
       }
@@ -1691,7 +2166,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       card.dataset.groupIdx = gIdx;
 
       var imgHtml = bcThumbSrc
-        ? '<img class="w-full h-full object-cover opacity-60 grayscale" src="' + escapeHtml(bcThumbSrc) + '" />'
+        ? '<img class="w-full h-full object-cover opacity-60 grayscale" loading="lazy" decoding="async" src="' + escapeHtml(bcThumbSrc) + '" />'
         : '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-3xl text-on-surface-variant/15">movie_filter</span></div>';
 
       card.innerHTML =
@@ -1711,7 +2186,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             '</div>'
           : '') +
         '<div class="flex items-center justify-between py-3 border-t border-outline-variant/5">' +
-          '<div class="flex gap-4">' +
+          '<div class="flex items-center gap-3 min-w-0">' +
             '<div class="flex items-center gap-1 opacity-60">' +
               '<span class="material-symbols-outlined text-[14px]">person</span>' +
               '<span class="text-[10px] font-bold">' + charCount + '</span>' +
@@ -1720,11 +2195,17 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
               '<span class="material-symbols-outlined text-[14px]">landscape</span>' +
               '<span class="text-[10px] font-bold">' + sceneCount + '</span>' +
             '</div>' +
+            '<button type="button" class="inline-flex items-center justify-center w-7 h-7 rounded-full bg-surface-container text-on-surface-variant border border-outline-variant/10 hover:text-primary hover:bg-primary/10 transition-all active:scale-95 shrink-0" data-action="open-prompt-audit" data-gidx="' + gIdx + '" data-shot-indices="' + escapeHtml(groupShotIndicesText) + '" title="查看生成规则与检查结果">' +
+              '<span class="material-symbols-outlined text-[15px]">article</span>' +
+            '</button>' +
           '</div>' +
-          (clipTask && !isTerminal(clipTask)
-            ? ''
-            : '<button type="button" class="flex items-center gap-1 px-3 py-1.5 bg-primary text-on-primary rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="gen-clip" data-gidx="' + gIdx + '">' +
-                '<span class="material-symbols-outlined text-sm">play_arrow</span>' +
+	          (clipTask && !isTerminal(clipTask)
+	            ? ''
+	            : !promptReady.canStart
+	              ? '<button type="button" class="flex items-center gap-1 px-3 py-1.5 bg-surface-container-highest text-on-surface-variant rounded-full text-[10px] font-bold tracking-wide opacity-60 cursor-not-allowed" disabled title="' + escapeHtml(_videoPromptNotReadyMessage(gIdx, promptReady)) + '">' +
+	                  '<span class="material-symbols-outlined text-sm">block</span>不可生成</button>'
+	            : '<button type="button" class="flex items-center gap-1 px-3 py-1.5 bg-primary text-on-primary rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="gen-clip" data-gidx="' + gIdx + '">' +
+	                '<span class="material-symbols-outlined text-sm">play_arrow</span>' +
                 (clipTask && clipTask.status === 'done' ? '重新生成' : '生成') +
               '</button>') +
         '</div>';
@@ -1739,6 +2220,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       var estMin = Math.ceil(totalDurAll * 3 / 60);
       estEl.textContent = "~ " + estMin + " 分钟";
     }
+    hydrateProtectedImageElements(list);
   }
 
   function _selectBatchVideoModel(alias) {
@@ -1755,6 +2237,38 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         (active ? "border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold"
                 : "border border-outline-variant/20 hover:border-primary-fixed-dim text-on-surface-variant font-medium");
     });
+  }
+
+  function _openVideoPromptAudit(gIdx, shotIndicesText) {
+    if (!project || !project.id) {
+      showToast("请先打开项目");
+      return;
+    }
+    var opts = _getDefaultBatchOpts();
+    var params = new URLSearchParams();
+    params.set("projectId", project.id);
+    params.set("groupIdx", String(gIdx));
+    params.set("ratio", opts.ratio || "16:9");
+    params.set("quality", opts.quality || "1080p");
+    params.set("videoModel", opts.videoModel || _currentVideoModelAlias());
+    params.set("genAudio", opts.genAudio ? "1" : "0");
+    params.set("watermark", opts.watermark ? "1" : "0");
+
+    var indices = String(shotIndicesText || "").trim();
+    if (!indices) {
+      var groups = getStoryboardGroups();
+      var group = groups[gIdx];
+      if (group && Array.isArray(group.shotIndices)) indices = group.shotIndices.join(",");
+    }
+    if (indices) params.set("shotIndices", indices);
+
+    var url = "/video-prompt-audit.html?" + params.toString();
+    try {
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      console.warn("[BatchClip] open prompt audit failed:", e);
+      showToast("浏览器阻止了新窗口，请允许弹窗后重试", "warn");
+    }
   }
 
   function _currentVideoModelAlias() {
@@ -1774,14 +2288,218 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     };
   }
 
-  async function regenSingleClip(gIdx) {
-    if (activeTaskCount() >= MAX_CONCURRENT) { showToast("最多同时运行 " + MAX_CONCURRENT + " 个任务", "warn"); return; }
+  function _continuityIgnoredStorageKey() {
+    var pid = project && project.id ? project.id : "unknown";
+    return "qd_continuity_ignored_" + pid;
+  }
+
+  function _loadIgnoredContinuityKeys() {
+    try {
+      var raw = localStorage.getItem(_continuityIgnoredStorageKey());
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.map(function (x) { return String(x); }).filter(Boolean) : [];
+    } catch (_e) {
+      return [];
+    }
+  }
+
+  function _saveIgnoredContinuityKeys(keys) {
+    try {
+      var uniq = Array.from(new Set((keys || []).map(function (x) { return String(x); }).filter(Boolean)));
+      localStorage.setItem(_continuityIgnoredStorageKey(), JSON.stringify(uniq.slice(-500)));
+    } catch (_e) {}
+  }
+
+  function _rememberContinuityWarnings(warnings) {
+    var keys = (warnings || []).map(function (w) { return w && w.key; }).filter(Boolean);
+    if (!keys.length) return;
+    _saveIgnoredContinuityKeys(_loadIgnoredContinuityKeys().concat(keys));
+  }
+
+  var _CONTINUITY_SEVERITY_COPY = { high: "高", medium: "中", low: "低" };
+  var _CONTINUITY_CATEGORY_COPY = {
+    scene: "场景",
+    character: "角色",
+    prop: "道具",
+    camera: "镜头",
+    other: "其他",
+  };
+
+  function _continuityWarningLine(w) {
+    var sev = _CONTINUITY_SEVERITY_COPY[w.severity] || "提醒";
+    var cat = _CONTINUITY_CATEGORY_COPY[w.category] || "连续性";
+    return "【" + sev + " · " + cat + "】片段 " + (Number(w.fromGroupIdx) + 1) +
+      " → " + (Number(w.toGroupIdx) + 1) + "：" + (w.title || "相邻镜头可能接不上");
+  }
+
+  function _showContinuityWarningModal(warnings, meta) {
+    return new Promise(function (resolve) {
+      var list = Array.isArray(warnings) ? warnings : [];
+      var shown = list.slice(0, 8);
+      var extra = Math.max(0, list.length - shown.length);
+      var overlay = document.createElement("div");
+      overlay.className = "fixed inset-0 z-[9999] bg-black/35 flex items-center justify-center px-4";
+
+      var panel = document.createElement("div");
+      panel.className = "w-full max-w-2xl rounded-[28px] bg-white shadow-2xl border border-outline-variant/30 p-6 text-on-surface";
+
+      var title = document.createElement("div");
+      title.className = "text-lg font-black tracking-wide";
+      title.textContent = "生成前发现相邻镜头可能接不上";
+      panel.appendChild(title);
+
+      var desc = document.createElement("div");
+      desc.className = "mt-2 text-sm text-on-surface-variant leading-relaxed";
+      desc.textContent = "这不是报错，只是提前提醒。你可以返回修改，也可以确认这些变化是故意的并继续生成。";
+      panel.appendChild(desc);
+
+      var box = document.createElement("div");
+      box.className = "mt-4 max-h-[48vh] overflow-auto space-y-3";
+      shown.forEach(function (w) {
+        var item = document.createElement("div");
+        item.className = "rounded-2xl border border-outline-variant/30 bg-surface-container-low p-4";
+
+        var head = document.createElement("div");
+        head.className = "text-sm font-black text-on-surface";
+        head.textContent = _continuityWarningLine(w);
+        item.appendChild(head);
+
+        if (w.reason) {
+          var reason = document.createElement("div");
+          reason.className = "mt-2 text-xs text-on-surface-variant leading-relaxed";
+          reason.textContent = "原因：" + w.reason;
+          item.appendChild(reason);
+        }
+        if (w.suggestion) {
+          var suggestion = document.createElement("div");
+          suggestion.className = "mt-1 text-xs text-on-surface-variant leading-relaxed";
+          suggestion.textContent = "建议：" + w.suggestion;
+          item.appendChild(suggestion);
+        }
+        box.appendChild(item);
+      });
+      if (extra > 0) {
+        var more = document.createElement("div");
+        more.className = "text-xs text-on-surface-variant";
+        more.textContent = "还有 " + extra + " 条提醒未展开显示。";
+        box.appendChild(more);
+      }
+      panel.appendChild(box);
+
+      var foot = document.createElement("div");
+      foot.className = "mt-5 flex flex-wrap items-center justify-end gap-3";
+
+      var cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "px-5 py-3 rounded-full border border-outline-variant/40 text-sm font-bold hover:bg-surface-container";
+      cancel.textContent = "返回修改";
+
+      var ignore = document.createElement("button");
+      ignore.type = "button";
+      ignore.className = "px-5 py-3 rounded-full border border-primary-fixed-dim text-sm font-bold hover:bg-surface-container";
+      ignore.textContent = "这是故意变化，下次不提醒";
+
+      var cont = document.createElement("button");
+      cont.type = "button";
+      cont.className = "px-6 py-3 rounded-full bg-ink text-white text-sm font-black hover:opacity-90";
+      cont.textContent = (meta && meta.count > 1) ? "继续生成全部" : "继续生成";
+
+      foot.appendChild(cancel);
+      foot.appendChild(ignore);
+      foot.appendChild(cont);
+      panel.appendChild(foot);
+      overlay.appendChild(panel);
+
+      var done = false;
+      function close(value) {
+        if (done) return;
+        done = true;
+        document.removeEventListener("keydown", onKey);
+        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        resolve(value);
+      }
+      function onKey(ev) {
+        if (ev.key === "Escape") close("cancel");
+      }
+      cancel.addEventListener("click", function () { close("cancel"); });
+      cont.addEventListener("click", function () { close("continue"); });
+      ignore.addEventListener("click", function () { close("ignore"); });
+      overlay.addEventListener("click", function (ev) {
+        if (ev.target === overlay) close("cancel");
+      });
+      document.addEventListener("keydown", onKey);
+      document.body.appendChild(overlay);
+    });
+  }
+
+  async function _runContinuityPreflight(indices, meta) {
+    _syncVideoRefs();
+    if (!project || !project.id) return true;
+    var selected = Array.from(new Set((indices || []).map(function (x) { return Number(x); }).filter(Number.isFinite)));
+    if (!selected.length) return true;
+
+    if (meta && meta.hintEl) meta.hintEl.textContent = "正在检查相邻镜头连续性…";
 
     try {
-      await createWorkflowVideoTask(gIdx, _getDefaultBatchOpts());
+      var saved = await _flushServerSave();
+      if (saved && saved.ok === false && !saved.stale) {
+        showToast("项目保存失败，已暂停生成，避免用旧数据检查连续性", "error");
+        return false;
+      }
+      if (saved && saved.stale) _syncVideoRefs();
+    } catch (e) {
+      console.warn("[continuity] flush before check failed:", e);
+      showToast("项目保存失败，已暂停生成，避免用旧数据检查连续性", "error");
+      return false;
+    }
+
+    var resp;
+    try {
+      resp = await apiPost("/api/continuity/check-adjacent", {
+        projectId: project.id,
+        indices: selected,
+        ignoredKeys: _loadIgnoredContinuityKeys(),
+      });
+    } catch (e) {
+      console.warn("[continuity] preflight request failed:", e);
+      showToast("连续性检查暂时失败，本次先继续生成", "warn");
+      return true;
+    }
+
+    if (resp && resp.checkFailed) {
+      console.warn("[continuity] model check failed:", resp.error || resp);
+      showToast("连续性检查暂时失败，本次先继续生成", "warn");
+      return true;
+    }
+
+    var warnings = resp && Array.isArray(resp.warnings) ? resp.warnings : [];
+    if (!warnings.length) return true;
+
+    var decision = await _showContinuityWarningModal(warnings, { count: selected.length });
+    if (decision === "ignore") {
+      _rememberContinuityWarnings(warnings);
+      showToast("已记住这些故意变化，继续生成", "ok");
+      return true;
+    }
+    if (decision === "continue") return true;
+    return false;
+  }
+
+  async function regenSingleClip(gIdx) {
+    if (activeTaskCount() >= MAX_CONCURRENT) { showToast("最多同时运行 " + MAX_CONCURRENT + " 个任务", "warn"); return; }
+    if (!_lockVideoGroup(gIdx)) { showToast(_inFlightMessage([gIdx]), "warn"); return; }
+    var handedOffLock = false;
+
+    try {
+      var ok = await _runContinuityPreflight([gIdx], { count: 1 });
+      if (!ok) return;
+      await createWorkflowVideoTask(gIdx, Object.assign({}, _getDefaultBatchOpts(), { _videoGroupLockHeld: true }));
+      handedOffLock = true;
       renderBatchClipList();
     } catch (e) {
       showToast("片段 " + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+    } finally {
+      if (!handedOffLock) _unlockVideoGroup(gIdx);
     }
   }
 
@@ -1817,22 +2535,37 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     return { ok: false, timeout: true };
   }
 
-  async function startBatchGeneration() {
-    _syncVideoRefs();
-    if (!project || !project.storyboards) return;
+	  async function startBatchGeneration() {
+	    _syncVideoRefs();
+	    if (!project || !project.storyboards) return;
+	    var btn = $("btnStartBatch");
+	    var hint = $("batchHint");
+	    await _reloadProjectFromServerForVideoBatch(hint);
+	    if (!project || !project.storyboards) return;
 
-    var batchOpts = _getDefaultBatchOpts();
-    var groups = getStoryboardGroups();
-    var indices = [];
-    var allHaveVideo = true; // 所有有 videoPrompt 的 sb 是否都已生成过视频
-    var hasAnyPrompt = false;
-    for (var i = 0; i < groups.length; i++) {
-      if (!project.storyboards[i] || !project.storyboards[i].videoPrompt) continue;
-      hasAnyPrompt = true;
-      if (project.storyboards[i].videoUrl) continue;
-      allHaveVideo = false;
-      indices.push(i);
-    }
+	    var batchOpts = _getDefaultBatchOpts();
+	    var groups = getStoryboardGroups();
+	    var indices = [];
+	    var allHaveVideo = true; // 所有有 videoPrompt 的 sb 是否都已生成过视频
+	    var hasAnyPrompt = false;
+	    var shouldClearExistingVideos = false;
+	    var blockedPrompts = [];
+	    for (var i = 0; i < groups.length; i++) {
+	      if (!project.storyboards[i] || !project.storyboards[i].videoPrompt) continue;
+	      hasAnyPrompt = true;
+	      var readiness = _videoPromptReadinessForGroup(i);
+	      if (!readiness.canStart) {
+	        blockedPrompts.push({ groupIdx: i, readiness: readiness });
+	        continue;
+	      }
+	      if (_hasCurrentVideoForGroup(i)) continue;
+	      allHaveVideo = false;
+	      indices.push(i);
+	    }
+	    if (blockedPrompts.length) {
+	      showToast(_videoPromptNotReadyMessage(blockedPrompts[0].groupIdx, blockedPrompts[0].readiness), "warn");
+	      return;
+	    }
 
     if (!indices.length) {
       if (!hasAnyPrompt) {
@@ -1850,27 +2583,27 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         );
       } catch (_e) { redoOk = false; }
       if (!redoOk) return;
-      // 清除 sb 上的 videoUrl，重新跑全部
+      // 先只规划要重跑哪些分镜；真正清除旧视频要等连续性预检通过后再做。
       for (var j = 0; j < groups.length; j++) {
-        if (project.storyboards[j] && project.storyboards[j].videoPrompt) {
-          delete project.storyboards[j].videoUrl;
-          delete project.storyboards[j].videoTaskId;
-          delete project.storyboards[j].videoCoverUrl;
-          delete project.storyboards[j].videoStatus;
-          delete project.storyboards[j].videoMode;
-          delete project.storyboards[j].videoTaskFinishedAt;
-          delete project.storyboards[j].videoDurationSec;
-          indices.push(j);
-        }
+	        if (project.storyboards[j] && project.storyboards[j].videoPrompt && _videoPromptReadinessForGroup(j).canStart) {
+	          indices.push(j);
+	        }
       }
-      // 把变更落到后端
-      try { saveProject(); } catch (_e) {}
-      renderBatchClipList();
-      showToast("将重新生成 " + indices.length + " 个分镜的视频", "ok");
+      shouldClearExistingVideos = true;
     }
 
-    var btn = $("btnStartBatch");
-    var hint = $("batchHint");
+	    var lockedBatchGroups = [];
+    function releaseBatchLocks(groups) {
+      var targetGroups = groups || lockedBatchGroups;
+      _unlockVideoGroups(targetGroups);
+      if (!groups) lockedBatchGroups = [];
+    }
+
+    var lockResult = _lockVideoGroups(indices);
+    if (lockResult.skipped.length) showToast(_inFlightMessage(lockResult.skipped), "warn");
+    indices = lockResult.locked;
+    lockedBatchGroups = lockResult.locked.slice();
+    if (!indices.length) return;
 
     // 前置检查：视频生成硬依赖 pencilUrl（video_content_builder.py 里缺
     // pencilUrl 的角色直接跳过），所以如果资产阶段的后台转绘还没跑完，
@@ -1904,10 +2637,11 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           if (btn) btn.disabled = true;
           if (hint) hint.textContent = "等待风格图补全…";
           var waitResult = await _waitForPencilReady(hint);
-          if (!waitResult.ok) {
-            if (btn) btn.disabled = false;
-            if (hint) hint.textContent = "";
-            var stillMissing = _getMissingPencilChars().length;
+	          if (!waitResult.ok) {
+	            if (btn) btn.disabled = false;
+	            if (hint) hint.textContent = "";
+	            releaseBatchLocks();
+	            var stillMissing = _getMissingPencilChars().length;
             showToast(
               (waitResult.timeout ? "等待超时，" : "后台补全已停止，") +
               "仍有 " + stillMissing + " 个角色缺风格图。可返回资产页手动重试或直接开始视频。",
@@ -1920,24 +2654,47 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           // 用户选"直接开始（可能缺角色）"——继续流程
         }
       } else {
-        if (!waitDecision) {
-          // 用户选"返回资产页"
-          return;
-        }
+	        if (!waitDecision) {
+	          // 用户选"返回资产页"
+	          releaseBatchLocks();
+	          return;
+	        }
       }
     }
 
     if (btn) btn.disabled = true;
+    var preflightOk = await _runContinuityPreflight(indices, { count: indices.length, hintEl: hint });
+    if (!preflightOk) {
+      if (btn) btn.disabled = false;
+      if (hint) hint.textContent = "";
+      releaseBatchLocks();
+      return;
+    }
+    if (shouldClearExistingVideos) {
+      indices.forEach(function (j) {
+        if (!project.storyboards[j]) return;
+        delete project.storyboards[j].videoUrl;
+        delete project.storyboards[j]._originVideoUrl;
+        delete project.storyboards[j].videoTaskId;
+        delete project.storyboards[j].videoCoverUrl;
+        delete project.storyboards[j].videoStatus;
+        delete project.storyboards[j].videoMode;
+        delete project.storyboards[j].videoTaskFinishedAt;
+        delete project.storyboards[j].videoDurationSec;
+      });
+      try { saveProject(); } catch (_e) {}
+      renderBatchClipList();
+      showToast("将重新生成 " + indices.length + " 个分镜的视频", "ok");
+    }
     if (hint) hint.textContent = "正在提交批量任务…";
 
     if (_batchHandle) { try { _batchHandle.close(); } catch (_e) {} _batchHandle = null; }
 
     // 为每个分镜插入 UI placeholder（serverTaskId 暂空，等 task_started 回填）
     indices.forEach(function (gIdx) {
-      var sb = project.storyboards[gIdx] || {};
       var existing = _findTaskByGroup(gIdx);
       if (existing && !isTerminal(existing)) return;
-      var task = createVideoTaskObj("片段" + (gIdx + 1) + ": " + (sb.videoPrompt || "").slice(0, 80), false);
+      var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
       task.status = "preparing"; task.statusCn = "排队中"; task.statusEn = "queued";
       task._groupIdx = gIdx;
       task._projectId = project.id;
@@ -1968,7 +2725,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
 
     var resp;
     try {
-      resp = await apiPost("/api/batch/start", {
+      var startResult = await _postVideoBatchStartWithPreflightHandling({
         batchType: "videos",
         projectId: project.id,
         storyboardIndices: indices,
@@ -1981,10 +2738,27 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
           watermark: batchOpts.watermark,
         },
       });
+      if (startResult && startResult.aborted) {
+        if (btn) btn.disabled = false;
+        if (hint) hint.textContent = "已取消：生成前检查未通过";
+        indices.forEach(function (gi) {
+          var t = _findTaskByGroup(gi);
+          if (!t || isTerminal(t)) return;
+          t.status = "failed";
+          t.statusCn = "已取消：生成前检查未通过";
+          updateTaskCard(t);
+        });
+        updateBadge();
+        releaseBatchLocks();
+        return;
+      }
+      resp = startResult && startResult.resp;
+      _showVideoSegmentPreflightWarnings(resp);
     } catch (e) {
       if (btn) btn.disabled = false;
       if (hint) hint.textContent = "提交失败：" + ((e && e.message) || e);
       showToast("批量提交失败：" + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+      releaseBatchLocks();
       return;
     }
 
@@ -1993,6 +2767,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       var errMsg = (resp && resp.error) || "未能创建批量任务";
       if (hint) hint.textContent = errMsg;
       showToast(errMsg, "error");
+      releaseBatchLocks();
       return;
     }
 
@@ -2069,21 +2844,30 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         if (typeof extra.readyForEdit === "boolean") {
           project.storyboards[gIdx].readyForEdit = extra.readyForEdit; // arch-guard:allow-ready-for-edit 后端 gate 镜像
         }
+        if (Array.isArray(extra.videoWarnings)) {
+          project.storyboards[gIdx].videoWarnings = extra.videoWarnings;
+        }
       }
       if (project && extra.editReadiness && typeof extra.editReadiness === "object") {
         if (!project.editData) project.editData = {};
         project.editData.readiness = extra.editReadiness; // arch-guard:allow-editdata gate 全景镜像（只读）
       }
       if (url) {
+        _mergeVideoWarnings(t, extra, false);
+        var protectedUrl = (extra && extra.protectedUrl) || _protectedVideoUrlFrom(url);
         t.videoUrl = url;
+        t.protectedUrl = protectedUrl;
         if (project && t._groupIdx != null && Array.isArray(project.storyboards)) {
           if (!project.storyboards[t._groupIdx]) project.storyboards[t._groupIdx] = {};
           project.storyboards[t._groupIdx].videoUrl = url;
+          if (protectedUrl) project.storyboards[t._groupIdx]._originVideoUrl = protectedUrl;
+          if (Array.isArray(extra.videoWarnings)) project.storyboards[t._groupIdx].videoWarnings = extra.videoWarnings;
         }
-        videoPipeline(t).then(function () { updateBadge(); renderBatchClipList(); });
+        videoPipeline(t).then(function () { updateBadge(); renderBatchClipList(); }).finally(function () { _unlockVideoGroup(gIdx); });
       } else {
         t.status = "failed"; t.statusCn = "生成完成但无视频地址";
         updateTaskCard(t); updateBadge();
+        _unlockVideoGroup(gIdx);
       }
     }
 
@@ -2100,6 +2884,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       t.statusCn = _friendlyVideoError(data.reason || data.errorMsg || "failed");
       updateTaskCard(t); updateBadge();
       renderBatchClipList();
+      _unlockVideoGroup(t._groupIdx);
     }
 
     // ===== Polling fallback =====
@@ -2134,13 +2919,15 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
             }
           });
         }
-        if (snap.status === "succeeded" || snap.status === "failed" ||
-            snap.status === "completed" || snap.status === "cancelled") {
-          _stopPoll();
-          if (btn) btn.disabled = false;
-          if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
-            (totalFail ? "（失败 " + totalFail + "）" : "");
-        }
+	        if (snap.status === "succeeded" || snap.status === "failed" ||
+	            snap.status === "completed" || snap.status === "cancelled" ||
+	            snap.status === "partial") {
+	          _stopPoll();
+	          if (btn) btn.disabled = false;
+	          if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
+	            (totalFail ? "（失败 " + totalFail + "）" : "");
+	          releaseBatchLocks();
+	        }
       } catch (e) {
         console.warn("[VideoBatch] poll failed:", e && e.message);
       }
@@ -2153,7 +2940,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       onTaskProgress: function (data) {
         var t = findTaskByServerId(data.taskId);
         if (!t) return;
-        if (t.status !== "polling") { t.status = "polling"; t.statusCn = "生成中"; updateTaskCard(t); }
+        _applyVideoTaskProgress(t, data);
       },
       onTaskCompleted: handleTaskCompleted,
       onTaskFailed: handleTaskFailed,
@@ -2162,11 +2949,11 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
         if (btn) btn.disabled = false;
         if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
           (totalFail ? "（失败 " + totalFail + "）" : "");
+        releaseBatchLocks();
       },
       onClose: function () {
-        _stopPoll();
         _batchHandle = null;
-        if (btn) btn.disabled = false;
+        if (_pollTimer && hint) hint.textContent = "实时连接断开，继续轮询后端结果…";
       },
     });
   }
@@ -2295,6 +3082,12 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
       try {
         if (project.storyboards[oldTask._groupIdx].videoUrl) {
           delete project.storyboards[oldTask._groupIdx].videoUrl;
+        }
+        if (project.storyboards[oldTask._groupIdx]._originVideoUrl) {
+          delete project.storyboards[oldTask._groupIdx]._originVideoUrl;
+        }
+        if (project.storyboards[oldTask._groupIdx].videoTaskId) {
+          delete project.storyboards[oldTask._groupIdx].videoTaskId;
         }
         await createWorkflowVideoTask(oldTask._groupIdx, _getDefaultBatchOpts());
         renderBatchClipList();

@@ -10,6 +10,7 @@ import {
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
 import { sinicizeColorPalette } from '@/lib/style-bible';
+import { sanitizePromptObject } from '@/lib/content-sanitize';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -88,7 +89,7 @@ export async function POST(req: NextRequest) {
         (raw) => parseJsonLoose(raw),
         'styleBible',
       );
-      styleBible = sinicizeColorPalette(styleBible);
+      styleBible = sanitizePromptObject(sinicizeColorPalette(styleBible));
       styleBibleStatus = 'ready';
       styleBibleGeneratedAt = new Date().toISOString();
     } catch (e: any) {

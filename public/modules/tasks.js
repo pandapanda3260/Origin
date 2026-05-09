@@ -259,7 +259,7 @@ export function syncTasksProject(p) { project = p; }
   }
 
   /**
-   * Phase 3-B-9：SSE 长连接接收 `tasks_snapshot` 事件。
+   * Phase 3-B-9：SSE 长连接接收活跃任务快照。
    *
    * 后端指纹去重 + 每 5 秒巡检一次，客户端只消费；收到就整包覆盖
    * `_globalTaskCenter.tasks` 再 render。断线时 2s / 4s / 8s 退避
@@ -286,18 +286,23 @@ export function syncTasksProject(p) { project = p; }
     }
     _globalTaskCenter.eventSource = es;
 
-    es.addEventListener("tasks_snapshot", function (ev) {
+    function handleTaskCenterSnapshot(ev) {
       try {
         var payload = JSON.parse(ev.data);
-        _globalTaskCenter.tasks = (payload && payload.tasks) || [];
+        var data = (payload && payload.data !== undefined) ? payload.data : payload;
+        _globalTaskCenter.tasks = (data && (data.items || data.tasks)) || [];
         _globalTaskCenter.lastFetch = Date.now();
         _globalTaskCenter.sseFailCount = 0;
         _renderGlobalTaskCenter();
         _updateGlobalTaskBadge();
       } catch (e) {
-        console.warn("[GlobalTaskCenter] parse tasks_snapshot failed:", e);
+        console.warn("[GlobalTaskCenter] parse task snapshot failed:", e);
       }
-    });
+    }
+
+    es.addEventListener("snapshot", handleTaskCenterSnapshot);
+    es.addEventListener("tasks_changed", handleTaskCenterSnapshot);
+    es.addEventListener("tasks_snapshot", handleTaskCenterSnapshot);
 
     es.addEventListener("error", function () {
       // 浏览器已经在自动重连，但连续失败太多就主动切 polling
