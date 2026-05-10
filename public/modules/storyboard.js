@@ -1,7 +1,7 @@
 import { $, escapeHtml, showToast, apiPost, apiPostStream, apiGet,
   consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js';
 import { attachDiagnostic } from './diagnostic.js';
-import { renderStoryboardCard } from './render_hooks.js';
+import { renderStoryboardCard, renderStoryboardFrameCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
 
@@ -51,6 +51,8 @@ export async function reattachStoryboardBatches() {
 
     if (bt === "storyboard_images") {
       _reattachImagesBatch(b);
+    } else if (bt === "tail_frame_images") {
+      _reattachTailFrameBatch(b);
     } else if (bt === "storyboard_prompts") {
       _reattachPromptsBatch(b);
     }
@@ -79,13 +81,19 @@ function _reattachImagesBatch(b) {
 
     if (isDone && url) {
       if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-      var displayUrl = url;
-      if (project.storyboards[gIdx].imageUrl) {
-        displayUrl = project.storyboards[gIdx].rawUrl || project.storyboards[gIdx].imageUrl;
+      if (_isTailPatchExtra(extra)) {
+        // 尾帧任务: 独立 apply, 只更新尾帧图位, 不触碰卡片主分镜/首帧 img。
+        _applyTailFrameFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
+        renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: url });
       } else {
-        _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
+        var displayUrl = url;
+        if (project.storyboards[gIdx].imageUrl) {
+          displayUrl = project.storyboards[gIdx].rawUrl || project.storyboards[gIdx].imageUrl;
+        } else {
+          _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
+        }
+        updateStoryboardCard(gIdx, "done", displayUrl);
       }
-      updateStoryboardCard(gIdx, "done", displayUrl);
     } else if (isFailed) {
       updateStoryboardCard(gIdx, "error", null, _snapshotTaskError(t, 120));
     } else {
@@ -160,11 +168,15 @@ function _reattachImagesBatch(b) {
         if (!proj.storyboards) proj.storyboards = [];
         var existing = proj.storyboards[groupIdx] || {};
         _archiveOldImage(existing, "storyboard");
-        _applyStoryboardImageFields(existing, rawUrl, extra, null);
+        _applyFrameImagePatch(existing, rawUrl, extra, null);
         proj.storyboards[groupIdx] = existing;
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
       }, data && data.serverVersion);
-      updateStoryboardCard(groupIdx, "done", rawUrl);
+      if (!_isTailPatchExtra(extra)) {
+        updateStoryboardCard(groupIdx, "done", rawUrl);
+      } else {
+        renderStoryboardFrameCard(groupIdx, 'tail', 'done', { imgUrl: rawUrl });
+      }
       rDoneCount++;
       _renderEtaR();
     },
@@ -193,6 +205,81 @@ function _reattachImagesBatch(b) {
       _stopTickR();
       _clearEtaR();
     },
+  });
+}
+
+/**
+ * 刷新/重连时恢复 tail_frame_images batch 的 UI 进度 (P2.5a.T5)。
+ * 只更新尾帧格, 不触碰首帧/主图。
+ */
+function _reattachTailFrameBatch(b) {
+  var batchId = b.batchId;
+  var snap = b.snapshot || {};
+  var tasks = b.tasks || [];
+  var originId = project.id;
+
+  console.log("[StoryboardReattach] Reattaching tail_frame_images batch:", batchId,
+    "total:", snap.total, "succeeded:", snap.succeeded);
+
+  if (!project.storyboards) project.storyboards = [];
+
+  tasks.forEach(function (t) {
+    var extra = _snapshotTaskExtra(t);
+    var target = _snapshotTaskTarget(t);
+    var gIdx = _firstTaskNumber([target.groupIdx, extra.groupIdx, t.target_idx, t.seq]);
+    if (gIdx == null) return;
+    var isDone = t.status === "succeeded" || t.status === "done" || t.status === "completed";
+    var isFailed = t.status === "failed" || t.status === "timeout";
+    var url = _snapshotTaskImageUrl(t);
+
+    if (isDone && url) {
+      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+      _applyTailFrameFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
+      renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: url });
+    } else if (isFailed) {
+      var errMsg = _snapshotTaskError(t, 120);
+      var displayMsg = _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(project.storyboards[gIdx], errMsg), errMsg);
+      renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: displayMsg });
+    } else {
+      renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: "生成尾帧中…" });
+    }
+  });
+
+  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
+  if (isComplete) return;
+
+  // 订阅剩余进度。尾帧批任务通常只有 1 个 target, 不设全局 _imagesGenerating 状态
+  // (它是首帧流程的锁, 尾帧不共享)。
+  subscribeBatch(batchId, {
+    onTaskCompleted: function (data) {
+      var extra = (data && data.extra) || {};
+      var target = (data && data.target) || {};
+      var gIdx2 = _firstTaskNumber([target.groupIdx, extra.groupIdx, data.targetSeq]);
+      var patch = (data && data.patch) || {};
+      var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || (data && data.resultUrl) || '';
+      if (typeof gIdx2 !== 'number' || !rawUrl) return;
+      _safeWriteBack(originId, function (proj) {
+        if (!proj.storyboards) proj.storyboards = [];
+        var existing = proj.storyboards[gIdx2] || {};
+        _applyTailFrameFields(existing, rawUrl, extra, target.shotIndices || null);
+        proj.storyboards[gIdx2] = existing;
+      });
+      renderStoryboardFrameCard(gIdx2, 'tail', 'done', { imgUrl: rawUrl });
+    },
+    onTaskFailed: function (data) {
+      var extra = (data && data.extra) || {};
+      var target = (data && data.target) || {};
+      var gIdx2 = _firstTaskNumber([target.groupIdx, extra.groupIdx, data.targetSeq]);
+      var errMsg2 = ((data && data.errorMsg) || '生成失败').toString().slice(0, 120);
+      if (typeof gIdx2 !== 'number') return;
+      var displayMsg2 = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsg2), errMsg2);
+      _clearFailedTailFrameLocally(gIdx2, errMsg2, extra);
+      renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
+    },
+    onBatchCompleted: function () {
+      // 数据已本地 apply, 不强制 reload project; 权威状态会在下次 reload 时到位。
+    },
+    onClose: function () { /* SSE 断开由 polling 兜底, 或由后端最终 snapshot 修正 */ },
   });
 }
 
@@ -381,18 +468,23 @@ function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndice
   existing.imageUrl = rawUrl;
   existing.rawUrl = rawUrl;
   if (extra.firstFrameUrl || extra.firstFrameMode) {
+    var firstFrameSource = extra.firstFrameSource || "generated";
     existing.firstFrameUrl = extra.firstFrameUrl || rawUrl;
     existing.firstFrameMode = extra.firstFrameMode || "multi_ref_v1";
+    existing.firstFrameSourceHash = Object.prototype.hasOwnProperty.call(extra, "firstFrameSourceHash")
+      ? extra.firstFrameSourceHash
+      : (existing.firstFrameSourceHash || null);
     existing.firstFrame = {
       currentUrl: existing.firstFrameUrl,
       rawUrl: rawUrl,
       status: extra.firstFrameStatus || "ready",
-      source: "generated",
+      source: firstFrameSource,
       lastKnownGoodUrl: existing.firstFrameUrl,
+      sourceHash: existing.firstFrameSourceHash,
       history: [{
         url: existing.firstFrameUrl,
         at: new Date().toISOString(),
-        source: "generated"
+        source: firstFrameSource
       }].concat((existing.firstFrame && Array.isArray(existing.firstFrame.history)) ? existing.firstFrame.history.filter(function (item) {
         return item && item.url && item.url !== existing.firstFrameUrl;
       }) : []).slice(0, 20)
@@ -412,6 +504,341 @@ function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndice
   else if (Array.isArray(fallbackShotIndices)) existing.shotIndices = fallbackShotIndices;
   if (existing.realPhotoUrl) delete existing.realPhotoUrl;
   return existing;
+}
+
+/**
+ * 判断 extra 是否属于尾帧 patch/extra。尾帧事件绝不能走 _applyStoryboardImageFields,
+ * 否则会把 existing.url/imageUrl/rawUrl 覆盖成尾帧图, 主分镜/首帧显示立即错乱。
+ */
+function _isTailPatchExtra(extra) {
+  if (!extra) return false;
+  return !!(
+    extra.tailFrameUrl ||
+    extra.tailFrameMode ||
+    (extra.frames && extra.frames.tail) ||
+    extra.type === 'tail_frame_image'
+  );
+}
+
+/**
+ * 尾帧专用 merge。独立于首帧/分镜图路径:只写 tailFrameUrl / tailFrameMode /
+ * tailFramePrompt / tailFrameSafetyAudit / tailFramePlanSummary / frames.tail。
+ * 不动 existing.url / imageUrl / rawUrl。尾帧现在会进入视频阶段, 因此这里同时维护
+ * tailFrameIntent / tailFrameReferenceStatus, 让刷新后的状态和视频输入链路一致。
+ */
+function _applyTailFrameFields(existing, rawUrl, extra, fallbackShotIndices) {
+  extra = extra || {};
+  var tailUrl = extra.tailFrameUrl || rawUrl;
+  if (!tailUrl) return existing;
+  existing.tailFrameUrl = tailUrl;
+  existing.tailFrameMode = extra.tailFrameMode || "structured_v1";
+  existing.tailFrameIntent = extra.tailFrameIntent || "requested";
+  existing.tailFrameIntentUpdatedAt = extra.tailFrameIntentUpdatedAt || new Date().toISOString();
+  existing.tailFrameSourceHash = Object.prototype.hasOwnProperty.call(extra, "tailFrameSourceHash")
+    ? extra.tailFrameSourceHash
+    : (existing.tailFrameSourceHash || null);
+  existing.tailFrameReferenceStatus = extra.tailFrameReferenceStatus || "ready";
+  if (extra.tailFramePrompt) existing.tailFramePrompt = extra.tailFramePrompt;
+  if (extra.tailFrameSafetyAudit) existing.tailFrameSafetyAudit = extra.tailFrameSafetyAudit;
+  if (extra.tailFramePlanSummary) existing.tailFramePlanSummary = extra.tailFramePlanSummary;
+  var incomingTail = (extra.frames && extra.frames.tail) ? extra.frames.tail : {
+    url: tailUrl,
+    prompt: extra.tailFramePrompt,
+    mode: existing.tailFrameMode,
+    status: "ready",
+    source: "generated",
+    generatedAt: new Date().toISOString(),
+  };
+  incomingTail = Object.assign({}, incomingTail, {
+    sourceHash: Object.prototype.hasOwnProperty.call(extra, "tailFrameSourceHash")
+      ? extra.tailFrameSourceHash
+      : incomingTail.sourceHash,
+    referenceStatus: extra.tailFrameReferenceStatus || incomingTail.referenceStatus || "ready",
+  });
+  existing.frames = Object.assign({}, existing.frames || {}, { tail: incomingTail });
+  delete existing.tailFrameLastError;
+  delete existing.tailFrameFailedAt;
+  if (Array.isArray(extra.shotIndices)) existing.shotIndices = extra.shotIndices;
+  else if (Array.isArray(fallbackShotIndices)) existing.shotIndices = fallbackShotIndices;
+  return existing;
+}
+
+/**
+ * 统一分发: tail 走 _applyTailFrameFields, 其它走 _applyStoryboardImageFields。
+ * 调用点不用自己判断字段归属。
+ */
+function _applyFrameImagePatch(existing, rawUrl, extra, fallbackShotIndices) {
+  if (_isTailPatchExtra(extra)) {
+    return _applyTailFrameFields(existing, rawUrl, extra, fallbackShotIndices);
+  }
+  return _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndices);
+}
+
+/**
+ * 前端 preflight: 尾帧是否可生成。和 lib/visual-reference-state.ts 的
+ * checkTailFramePreflight 保持一致 (mode ∈ structured_v1/multi_ref_v1, 或
+ * frames.first.status='ready', 且 frames.first.status !== 'failed')。
+ * 后端 executor 会再查一次, 前端按钮 disabled 只是 UX 兜底。
+ */
+function _canGenerateTailFrame(sb) {
+  if (!sb) return false;
+  var firstUrl =
+    sb.firstFrameUrl ||
+    (sb.frames && sb.frames.first && sb.frames.first.url) ||
+    (sb.firstFrame && sb.firstFrame.currentUrl);
+  if (!firstUrl) return false;
+  var mode = String(sb.firstFrameMode || '');
+  var framesFirstStatus = (sb.frames && sb.frames.first && sb.frames.first.status) || '';
+  var firstFrameStatus = (sb.firstFrame && sb.firstFrame.status) || '';
+  if (framesFirstStatus === 'failed' || firstFrameStatus === 'failed') return false;
+  // 显式拒 legacy_pencil: 即使某些混合数据写了 frames.first.status='ready', 手稿首帧
+  // 仍不能做尾帧锚点。必须先升级到彩色首帧。和 lib/visual-reference-state.ts 的
+  // checkTailFramePreflight 保持同样的 override 顺序。
+  if (mode === 'legacy_pencil') return false;
+  if (mode === 'structured_v1' || mode === 'multi_ref_v1') return true;
+  if (framesFirstStatus === 'ready') return true;
+  return false;
+}
+
+function _firstFrameImageUrl(sb) {
+  sb = sb || {};
+  return (sb.frames && sb.frames.first && sb.frames.first.url) ||
+    sb.firstFrameUrl ||
+    sb.rawUrl ||
+    sb.imageUrl ||
+    sb.url ||
+    '';
+}
+
+function _tailFrameImageUrl(sb) {
+  sb = sb || {};
+  var tail = (sb.frames && sb.frames.tail) || null;
+  return (tail && tail.url) || sb.tailFrameUrl || '';
+}
+
+function _tailFrameErrorRecordFromExtra(extra, fallbackMsg) {
+  extra = extra || {};
+  var tail = (extra.frames && extra.frames.tail) || {};
+  var lastError = tail.lastError || {};
+  var message = lastError.message || extra.tailFrameLastError || fallbackMsg || '生成失败';
+  return {
+    message: String(message || '生成失败').slice(0, 500),
+    errorCode: lastError.errorCode || extra.tailFrameErrorCode || extra.errorCode || '',
+    recoveryHint: lastError.recoveryHint || extra.tailFrameRecoveryHint || extra.recoveryHint || '',
+  };
+}
+
+function _tailFrameErrorRecordFromStoryboard(sb, fallbackMsg) {
+  sb = sb || {};
+  var tail = (sb.frames && sb.frames.tail) || {};
+  var lastError = tail.lastError || {};
+  var message = lastError.message || sb.tailFrameLastError || fallbackMsg || '';
+  return {
+    message: String(message || '').slice(0, 500),
+    errorCode: lastError.errorCode || sb.tailFrameErrorCode || '',
+    recoveryHint: lastError.recoveryHint || sb.tailFrameRecoveryHint || '',
+  };
+}
+
+function _tailFrameErrorDisplay(record, fallbackMsg) {
+  record = record || {};
+  return (record.recoveryHint || record.message || fallbackMsg || '生成失败').toString().slice(0, 200);
+}
+
+function _tailFrameUiState(sb) {
+  sb = sb || {};
+  var tail = (sb.frames && sb.frames.tail) || null;
+  var tailUrl = _tailFrameImageUrl(sb);
+  var tailStatus = (tail && tail.status) || (sb.tailFrameLastError ? 'failed' : (tailUrl ? 'ready' : 'missing'));
+  var canGenerate = _canGenerateTailFrame(sb);
+  var isLegacyPencil = String(sb.firstFrameMode || '') === 'legacy_pencil';
+  var preflightMsg;
+  if (isLegacyPencil) preflightMsg = '当前首帧是手稿版 (legacy_pencil), 需先升级为彩色首帧';
+  else if (!canGenerate) preflightMsg = '需先生成彩色首帧 (structured_v1)';
+  else preflightMsg = '';
+
+  var statusText;
+  if (tailStatus === 'ready') statusText = '已生成';
+  else if (tailStatus === 'failed') statusText = '生成失败';
+  else if (tailStatus === 'degraded') statusText = '已降级 (展示上次成功)';
+  else if (tailStatus === 'missing') {
+    if (isLegacyPencil) statusText = '需升级首帧';
+    else statusText = canGenerate ? '待生成' : '等待首帧';
+  } else statusText = tailStatus;
+
+  var btnText;
+  if (tailStatus === 'ready' || tailStatus === 'degraded') btnText = '重生成';
+  else if (tailStatus === 'failed') btnText = '重试';
+  else btnText = '生成尾帧';
+
+  return {
+    url: tailUrl,
+    status: tailStatus,
+    statusText: statusText,
+    btnText: btnText,
+    canGenerate: canGenerate,
+    isLegacyPencil: isLegacyPencil,
+    preflightMsg: preflightMsg,
+    errorMsg: _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(sb, '')),
+  };
+}
+
+function _clipNum(v, min, max, dflt) {
+  var n = Number(v);
+  if (!isFinite(n)) return dflt;
+  return Math.max(min, Math.min(max, n));
+}
+
+function _tailFrameSuggestionForGroup(group, sb) {
+  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
+  if (!shots.length) return { level: 'none', score: 0, label: '' };
+  if (_isTailRequested(sb)) return { level: 'requested', score: 100, label: '已选择尾帧' };
+  var weights = {
+    actionLandingNeed: 18,
+    visualTransformationNeed: 16,
+    revealNeed: 16,
+    endingCompositionNeed: 14,
+    emotionPeakNeed: 12,
+    continuityNeed: 0,
+  };
+  var weightTotal = 0;
+  Object.keys(weights).forEach(function (k) { weightTotal += weights[k]; });
+  var weighted = 0;
+  var simpleDialogueCount = 0;
+  var totalDuration = 0;
+  shots.forEach(function (shot) {
+    var sig = (shot && shot.tailFrameSignals) || {};
+    Object.keys(weights).forEach(function (key) {
+      weighted += _clipNum(sig[key], 0, 5, 0) * weights[key];
+    });
+    if (sig.isSimpleStaticDialogue === true) simpleDialogueCount++;
+    totalDuration += _clipNum(shot.duration || shot.durationSec, 0, 120, 4);
+  });
+  var base = weighted / Math.max(1, shots.length * weightTotal * 5) * 100;
+  var durationBonus = _clipNum(totalDuration - 6, 0, 10, 0);
+  var simpleDialoguePenalty = simpleDialogueCount === shots.length ? 15 : 0;
+  var score = Math.round(_clipNum(base + durationBonus - simpleDialoguePenalty, 0, 100, 0));
+  if (score >= 70) return { level: 'strong', score: score, label: '强烈建议尾帧' };
+  if (score >= 45) return { level: 'suggest', score: score, label: '建议尾帧' };
+  return { level: 'none', score: score, label: '' };
+}
+
+function _tailFrameSuggestionBadgeHtml(group, sb, gIdx) {
+  var suggestion = _tailFrameSuggestionForGroup(group, sb);
+  if (suggestion.level === 'none') return '';
+  var cls = suggestion.level === 'strong'
+    ? 'bg-error/10 text-error border-error/20 hover:bg-error/15'
+    : (suggestion.level === 'requested'
+      ? 'bg-primary/10 text-primary border-primary/20'
+      : 'bg-amber-100 text-amber-700 border-amber-200 hover:bg-amber-200/70');
+  var actionAttr = suggestion.level === 'requested'
+    ? ''
+    : ' data-action="accept-tail-suggestion" data-gidx="' + gIdx + '"';
+  var cursorCls = suggestion.level === 'requested' ? 'cursor-default' : 'cursor-pointer';
+  return '<button type="button" class="tail-suggestion-badge px-2.5 py-1 rounded-full border text-[10px] font-black tracking-widest uppercase transition-colors ' + cursorCls + ' ' + cls + '"' +
+    actionAttr +
+    ' title="点击采纳建议并生成尾帧，评分 ' + suggestion.score + '">' +
+    escapeHtml(suggestion.label) +
+    '</button>';
+}
+
+function _frameButtonHtml(action, gIdx, icon, text, title, variant, disabled) {
+  var cls = variant === 'primary'
+    ? 'bg-primary text-on-primary border-primary/20 shadow-sm hover:opacity-90'
+    : 'bg-white/80 text-on-surface-variant border-white/60 hover:bg-white';
+  return '<button type="button" class="flex items-center gap-1.5 px-3 py-2 rounded-full text-[10px] font-bold tracking-widest uppercase border backdrop-blur-md transition-all active:scale-95 ' + cls + '"' +
+    (action ? ' data-action="' + action + '" data-gidx="' + gIdx + '"' : '') +
+    (title ? ' title="' + escapeHtml(title) + '"' : '') +
+    (disabled ? ' disabled' : '') +
+    '>' +
+      '<span class="material-symbols-outlined text-sm">' + icon + '</span>' +
+      '<span>' + escapeHtml(text) + '</span>' +
+    '</button>';
+}
+
+function _storyboardFramePanelHtml(kind, sb, gIdx) {
+  sb = sb || {};
+  var isTail = kind === 'tail';
+  var imgUrl = isTail ? _tailFrameImageUrl(sb) : _firstFrameImageUrl(sb);
+  var hasImg = !!imgUrl;
+  var state = isTail ? _tailFrameUiState(sb) : null;
+  var label = isTail ? '尾帧' : '首帧';
+  var labelEn = isTail ? 'TAIL FRAME' : 'FIRST FRAME';
+  var icon = isTail ? 'skip_next' : 'play_arrow';
+  var statusText = isTail
+    ? state.statusText
+    : (hasImg ? (String(sb.firstFrameMode || '') === 'legacy_pencil' ? '手稿首帧' : '已生成') : '待生成');
+  var primaryAction = isTail ? 'regen-tail' : 'regen-sb';
+  var primaryIcon = isTail ? 'skip_next' : 'auto_awesome';
+  var primaryText = isTail ? state.btnText : (hasImg ? '重新生成' : '生成首帧');
+  var canPrimary = isTail ? state.canGenerate : true;
+  var primaryTitle = isTail ? state.preflightMsg : '';
+
+  var placeholderIcon = isTail ? 'skip_next' : 'image';
+  var imgHtml = hasImg
+    ? '<img data-frame-img class="w-full h-full object-cover cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgUrl) + '" />'
+    : '<div class="sb-frame-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/25" data-img-class="w-full h-full object-cover cursor-pointer">' +
+        '<span class="material-symbols-outlined text-5xl mb-2">' + placeholderIcon + '</span>' +
+        '<span class="text-[10px] font-bold uppercase tracking-[0.28em]">' + escapeHtml(statusText) + '</span>' +
+      '</div>';
+
+  var errorMsg = isTail ? state.errorMsg : (sb.firstFrameLastError || '');
+  var errorHtml = '<div class="sb-frame-error absolute inset-0 flex items-center justify-center bg-white/95 p-2 text-center"' +
+    ((isTail && state.status === 'failed') ? '' : ' hidden') + '>' +
+    '<span class="sb-frame-error-msg text-[10px] text-error leading-snug">' + escapeHtml(errorMsg || '生成失败') + '</span>' +
+    '</div>';
+
+  var buttons = '';
+  if (isTail && state.isLegacyPencil) {
+    buttons += _frameButtonHtml('upgrade-first-frame', gIdx, 'upgrade', '先升级首帧', '重新生成彩色首帧, 升级后可生成尾帧', 'primary', false);
+  } else {
+    buttons += _frameButtonHtml(isTail ? 'upload-tail' : 'upload-first', gIdx, 'upload', '上传', isTail ? '手动上传一张已有尾帧图' : '手动上传一张已有首帧图', 'secondary', false);
+    if (hasImg) buttons += _frameButtonHtml(isTail ? 'download-tail' : 'download-sb', gIdx, 'download', '下载', isTail ? '下载尾帧' : '下载首帧', 'secondary', false);
+    buttons += _frameButtonHtml(canPrimary ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'primary', !canPrimary);
+    // Tail-only: 删除按钮 = 清图 + 清意图。只有"已生成尾帧"或"已请求但尚未生成"才暴露该按钮。
+    if (isTail && (hasImg || sb.tailFrameIntent === 'requested')) {
+      buttons += _frameButtonHtml('delete-tail', gIdx, 'delete', '删除', '删除该尾帧并清除"需要尾帧"的意图（下次批量重做不会再生成）', 'secondary', false);
+    }
+  }
+
+  // Tail-only: 过期 / 不可解析 徽章。用独立小 badge 贴在 header statusText 旁边，
+  // 方便用户一眼看到"视频生成前必须处理此项"。
+  var tailBadgesHtml = '';
+  if (isTail) {
+    var tailRefStatus = String(sb.tailFrameReferenceStatus || '').toLowerCase();
+    var tailNeedsUpdate = _tailNeedsUpdate(sb, gIdx);
+    if (tailRefStatus === 'unresolvable') {
+      tailBadgesHtml += '<span class="shrink-0 ml-1 px-2 py-0.5 rounded-full text-[9px] font-black tracking-widest uppercase bg-error/10 text-error border border-error/20" title="尾帧文件在服务器上已不可解析，视频生成会降级到首帧+多图通道">文件不可解析</span>';
+    }
+    if (tailNeedsUpdate && hasImg && tailRefStatus !== 'unresolvable') {
+      tailBadgesHtml += '<span class="shrink-0 ml-1 px-2 py-0.5 rounded-full text-[9px] font-black tracking-widest uppercase bg-amber-100 text-amber-700 border border-amber-200" title="镜头或首帧已变更，当前尾帧可能过期，建议重新生成">需更新</span>';
+    }
+  }
+
+  return '<div data-frame="' + kind + '" class="sb-frame-panel min-h-0 flex flex-col rounded-3xl overflow-hidden border border-outline-variant/10 bg-white/55 shadow-inner">' +
+           '<div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-outline-variant/10">' +
+             '<div class="min-w-0">' +
+               '<div class="flex items-center gap-2">' +
+                 '<span class="material-symbols-outlined text-base text-primary/60">' + icon + '</span>' +
+                 '<span class="text-[11px] font-black tracking-widest text-on-background">' + label + '</span>' +
+                 '<span class="text-[9px] font-black tracking-[0.24em] text-on-surface-variant/45 uppercase">' + labelEn + '</span>' +
+               '</div>' +
+             '</div>' +
+             '<div class="flex items-center gap-1.5 min-w-0 shrink-0">' +
+               '<span class="text-[10px] font-bold text-on-surface-variant/60 truncate" title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
+               tailBadgesHtml +
+             '</div>' +
+           '</div>' +
+           '<div class="relative flex-1 min-h-[180px] bg-surface-container overflow-hidden">' +
+             imgHtml +
+             '<div class="sb-frame-loading absolute inset-0 flex items-center justify-center bg-white/95 backdrop-blur-sm" hidden>' +
+               '<div class="inline-block w-5 h-5 border-2 border-primary/20 border-t-primary rounded-full animate-spin"></div>' +
+               '<span class="text-[10px] ml-2 text-on-surface-variant">生成中…</span>' +
+             '</div>' +
+             errorHtml +
+             '<div class="absolute right-3 bottom-3 flex items-center justify-end gap-2 flex-wrap max-w-[calc(100%-1.5rem)]">' + buttons + '</div>' +
+           '</div>' +
+         '</div>';
 }
 
 /* ================================================================
@@ -849,8 +1276,6 @@ export function renderImageGrid() {
 
   groups.forEach(function (group, gIdx) {
     var sb = project.storyboards[gIdx] || {};
-    var hasImg = !!(sb.imageUrl || sb.rawUrl);
-    var imgSrc = sb.rawUrl || sb.imageUrl || '';
     var shotLabel = 'SHOT ' + String(group.shotIndices[0]+1).padStart(2,'0');
     if (group.shotIndices.length > 1) shotLabel += '-' + String(group.shotIndices[group.shotIndices.length-1]+1).padStart(2,'0');
     shotLabel += ' · ' + (group.shots[0].shotType || 'Shot');
@@ -898,7 +1323,7 @@ export function renderImageGrid() {
         // 而不是"老图依旧 + 底部一行小字"。
         '<div class="sb-sheet-error absolute inset-0 flex flex-col items-center justify-center bg-white z-30 rounded-[2.5rem] p-8 text-center" hidden>' +
           '<span class="material-symbols-outlined text-5xl text-error mb-3">error_outline</span>' +
-          '<span class="text-sm font-bold text-error mb-2">分镜图生成失败</span>' +
+          '<span class="text-sm font-bold text-error mb-2">首帧图生成失败</span>' +
           '<span class="sb-error-msg text-xs text-on-surface-variant/80 max-w-md leading-relaxed"></span>' +
           '<span class="text-[10px] text-on-surface-variant/40 mt-4">点击下方「重新生成」可再次尝试</span>' +
         '</div>' +
@@ -912,18 +1337,15 @@ export function renderImageGrid() {
               (_isStale("storyboard_" + gIdx) ? '<span class="stale-badge" title="前序内容已修改，建议重新生成">需更新</span>' : '') +
               '<span class="text-xs text-on-surface-variant/50 font-medium">' + group.shots.length + ' Shots</span>' +
               emotionTag +
+              _tailFrameSuggestionBadgeHtml(group, sb, gIdx) +
             '</div>' +
             '<div class="flex items-center gap-2">' +
               '<span class="text-[10px] text-on-surface-variant/30 font-bold tracking-widest uppercase">' + group.shots.length + ' shots</span>' +
             '</div>' +
           '</div>' +
-          '<div class="flex-1 bg-white rounded-3xl overflow-hidden border border-outline-variant/10 shadow-inner relative group-hover:shadow-xl transition-shadow duration-500 min-h-0">' +
-            (hasImg
-              ? '<img class="w-full h-full object-cover scale-105 group-hover:scale-100 transition-transform duration-1000 ease-out cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgSrc) + '" />'
-              : '<div class="sb-sheet-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/20">' +
-                  '<span class="material-symbols-outlined text-7xl mb-3">brush</span>' +
-                  '<span class="text-xs font-bold uppercase tracking-[0.3em]">待生成</span>' +
-                '</div>') +
+          '<div class="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-0">' +
+            _storyboardFramePanelHtml('first', sb, gIdx) +
+            _storyboardFramePanelHtml('tail', sb, gIdx) +
           '</div>' +
           '<div class="mt-5 min-h-0 shrink-0">' +
             '<div class="flex items-center gap-3 mb-2">' +
@@ -940,9 +1362,6 @@ export function renderImageGrid() {
               : '<p class="text-[11px] leading-relaxed text-on-surface-variant/60 font-medium mb-4">待生成画面描述</p>') +
             '<div class="flex items-center gap-2 flex-wrap">' +
               '<button type="button" class="w-9 h-9 rounded-full bg-surface-container-lowest/70 flex items-center justify-center hover:bg-white transition-colors" data-action="ref-agent-sb" title="引用到 AI 助手"><span class="material-symbols-outlined text-sm text-on-surface-variant">alternate_email</span></button>' +
-              '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-primary text-on-primary rounded-full text-[10px] font-bold tracking-widest uppercase hover:opacity-90 transition-all active:scale-95 shadow-md" data-action="regen-sb">' +
-                '<span class="material-symbols-outlined text-sm">refresh</span>重新生成' +
-              '</button>' +
               _historyBtnHtml(sb, "sb") +
               '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-white/60 hover:bg-white/90 text-on-surface-variant rounded-full text-[10px] font-bold tracking-widest uppercase transition-all active:scale-95 border border-outline-variant/20" data-action="regen-sb-prompt">' +
                 '<span class="material-symbols-outlined text-sm">auto_fix_high</span>重写画面指令' +
@@ -950,11 +1369,6 @@ export function renderImageGrid() {
               (promptText
                 ? '<button type="button" class="flex items-center gap-1.5 px-4 py-2 bg-white/60 hover:bg-white/90 text-on-surface-variant rounded-full text-[10px] font-bold tracking-widest uppercase transition-all active:scale-95 border border-outline-variant/20 sb-toggle-prompt">' +
                     '<span class="material-symbols-outlined text-sm">edit_note</span>编辑画面指令' +
-                  '</button>'
-                : '') +
-              (hasImg
-                ? '<button type="button" class="ml-auto w-9 h-9 rounded-full bg-white/40 hover:bg-white/80 transition-colors flex items-center justify-center text-on-surface-variant" data-action="download-sb" title="下载">' +
-                    '<span class="material-symbols-outlined text-lg">download</span>' +
                   '</button>'
                 : '') +
             '</div>' +
@@ -1227,6 +1641,101 @@ export function updateStoryboardCard(gIdx, status, imgUrl, errMsg) {
   if (result.needFullRerender) renderImageGrid();
 }
 
+function _firstFrameUrl(sb) {
+  sb = sb || {};
+  return (sb.frames && sb.frames.first && sb.frames.first.url) ||
+    sb.firstFrameUrl ||
+    sb.imageUrl ||
+    sb.url ||
+    '';
+}
+
+function _isFirstFrameFailed(sb) {
+  sb = sb || {};
+  var st = String((sb.frames && sb.frames.first && sb.frames.first.status) || sb.firstFrameStatus || '').toLowerCase();
+  return st === 'failed' || st === 'error' || !!sb.firstFrameLastError;
+}
+
+function _isTailRequested(sb) {
+  sb = sb || {};
+  return sb.tailFrameIntent === 'requested' || !!_tailFrameImageUrl(sb);
+}
+
+function _tailNeedsUpdate(sb, gIdx) {
+  if (!_isTailRequested(sb)) return false;
+  if (project && project._staleFlags && project._staleFlags["tail_frame_" + gIdx]) return true;
+  var tail = (sb.frames && sb.frames.tail) || null;
+  var status = String((tail && tail.status) || '').toLowerCase();
+  var refStatus = String(sb.tailFrameReferenceStatus || (tail && tail.referenceStatus) || '').toLowerCase();
+  if (!_tailFrameImageUrl(sb)) return true;
+  if (status === 'failed') return true;
+  if (refStatus === 'missing' || refStatus === 'unresolvable') return true;
+  return !(sb.tailFrameSourceHash || (tail && tail.sourceHash));
+}
+
+function _isFirstFrameStale(gIdx) {
+  return !!(project && project._staleFlags && project._staleFlags["storyboard_" + gIdx]);
+}
+
+function _computeImagesBatchState(groups, opts) {
+  opts = opts || {};
+  groups = groups || getStoryboardGroups();
+  var missingFirst = [];
+  var failedFirst = [];
+  var staleFirst = [];
+  var staleTail = [];
+  var readyFirstCount = 0;
+  for (var i = 0; i < groups.length; i++) {
+    var sb = (project.storyboards && project.storyboards[i]) || {};
+    var hasFirst = !!_firstFrameUrl(sb);
+    if (hasFirst) readyFirstCount++;
+    if (!hasFirst) missingFirst.push(i);
+    if (_isFirstFrameFailed(sb)) failedFirst.push(i);
+    if (hasFirst && _isFirstFrameStale(i)) staleFirst.push(i);
+    if (_tailNeedsUpdate(sb, i)) staleTail.push(i);
+  }
+  var staleCount = staleFirst.length + staleTail.length;
+  var action = 'generate_all';
+  var label = '一键生成全部';
+  if (_imagesGenerating && !opts.ignoreGenerating) {
+    action = 'generating';
+    label = '生成中…';
+  } else if (groups.length > 0 && missingFirst.length === groups.length) {
+    action = 'generate_all';
+    label = '一键生成全部';
+  } else if (failedFirst.length > 0) {
+    action = 'retry_failed';
+    label = '重试失败项 (' + failedFirst.length + ')' + (staleCount ? ' · 另有 ' + staleCount + ' 项需更新' : '');
+  } else if (missingFirst.length > 0) {
+    action = 'fill_missing';
+    label = '补全 ' + missingFirst.length + ' 个首帧';
+  } else if (staleCount > 0) {
+    action = 'update_stale';
+    label = '更新 ' + staleCount + ' 项需更新';
+  } else if (readyFirstCount > 0) {
+    action = 'regenerate_all';
+    label = '重新生成全部';
+  }
+  return {
+    action: action,
+    label: label,
+    missingFirst: missingFirst,
+    failedFirst: failedFirst,
+    staleFirst: staleFirst,
+    staleTail: staleTail,
+  };
+}
+
+function _updateImagesActionButton(groups) {
+  var btn = $("btnGenAllImages");
+  if (!btn || !project) return;
+  var state = _computeImagesBatchState(groups);
+  var iconName = state.action === 'retry_failed' ? 'refresh' : 'auto_fix_high';
+  btn.innerHTML = '<span class="material-symbols-outlined text-sm">' + iconName + '</span>' + escapeHtml(state.label);
+  btn.disabled = state.action === 'generating';
+  btn.dataset.actionState = state.action;
+}
+
 export function checkImagesConfirm() {
   var area = $("imagesConfirmArea");
   if (!area || !project || !project.shots) return;
@@ -1236,6 +1745,7 @@ export function checkImagesConfirm() {
     return project.storyboards[i] && project.storyboards[i].imageUrl;
   });
   area.hidden = !allDone;
+  _updateImagesActionButton(groups);
 }
 
 /**
@@ -1277,13 +1787,13 @@ export async function generateStoryboardSheet(gIdx) {
       return;
     }
     if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsg);
-    showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsg), "error");
+    showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsg), "error");
     return;
   }
   if (!startResp || !startResp.batchId) {
     var fErr = (startResp && startResp.error) || "未能创建批量任务";
     updateStoryboardCard(gIdx, "error", null, fErr);
-    showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(fErr), "error");
+    showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(fErr), "error");
     return;
   }
 
@@ -1292,24 +1802,16 @@ export async function generateStoryboardSheet(gIdx) {
     var pollTimer = null;
     var _gotResult = false;
     // —— 单张分镜倒计时 ——
-    // 用户反馈："单独生成第一张的时候没有倒计时"——和批量入口一样，
-    // 单张重生成也给一个"约剩 N 秒"的友好提示。medium 画质 + 中转排队
-    // 实测一张 60-90 秒，初始猜测 70 秒，每秒 -1 直到 5 秒兜底（避免
-    // 显示 0 / 负数让用户以为卡住）。
-    var etaStart = Date.now();
-    var initialEtaSec = 70;
-    var etaTimer = null;
-    function _updateEta() {
-      if (settled) return;
-      var elapsed = Math.floor((Date.now() - etaStart) / 1000);
-      var remain = Math.max(5, initialEtaSec - elapsed);
-      try { updateStoryboardCard(gIdx, "loading", null, "生成首帧中…约剩 " + remain + " 秒"); } catch (_e) {}
-    }
-    function _stopEta() { if (etaTimer) { clearInterval(etaTimer); etaTimer = null; } }
-    _updateEta();
-    etaTimer = setInterval(_updateEta, 1000);
+    // 抽到 _startSingleFrameEta helper (P2.5b.T3)。initial=70s 是 medium 画质 + 中转
+    // 排队实测典型值, 多余时间显示 "约剩 5 秒" 兜底。
+    var eta = _startSingleFrameEta({
+      initialSec: 70,
+      onTick: function (remain) {
+        try { updateStoryboardCard(gIdx, "loading", null, "生成首帧中…约剩 " + remain + " 秒"); } catch (_e) {}
+      },
+    });
     function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-    function finish() { if (!settled) { settled = true; _stopPoll(); _stopEta(); resolve(); } }
+    function finish() { if (!settled) { settled = true; _stopPoll(); eta.stop(); resolve(); } }
     var finishingFromServer = null;
 
     function _finishAfterServerSync() {
@@ -1332,15 +1834,22 @@ export async function generateStoryboardSheet(gIdx) {
     function _applyResult(rawUrl, extra) {
       if (!rawUrl || _gotResult) return;
       _gotResult = true;
+      var isTail = _isTailPatchExtra(extra);
       var isCurrent = _safeWriteBack(originId, function (proj) {
         if (!proj.storyboards) proj.storyboards = [];
         var existing = proj.storyboards[gIdx] || {};
         _archiveOldImage(existing, "storyboard");
-        _applyStoryboardImageFields(existing, rawUrl, extra, group.shotIndices);
+        _applyFrameImagePatch(existing, rawUrl, extra, group.shotIndices);
         proj.storyboards[gIdx] = existing;
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + gIdx];
       });
-      if (isCurrent) updateStoryboardCard(gIdx, "done", rawUrl);
+      if (isCurrent) {
+        if (isTail) {
+          renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
+        } else {
+          updateStoryboardCard(gIdx, "done", rawUrl);
+        }
+      }
     }
 
     // 5 秒兜底轮询：SSE 偶尔丢事件，靠它从 /api/batch/<id> 拿权威结果
@@ -1350,7 +1859,8 @@ export async function generateStoryboardSheet(gIdx) {
         var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
         if (!snap || settled) return;
         var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
-        tasks.forEach(function (t) {
+        for (var ti = 0; ti < tasks.length; ti++) {
+          var t = tasks[ti];
           if (t.status === 'completed' && !_gotResult) {
             var result = t.result || {};
             var extra = result.extra || {};
@@ -1360,10 +1870,10 @@ export async function generateStoryboardSheet(gIdx) {
           } else if (t.status === 'failed' && !_gotResult) {
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
             if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgPoll);
-            showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
+            showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
             _gotResult = true;
           }
-        });
+        }
         if (snap.status === 'completed' || snap.status === 'failed' ||
             snap.status === 'cancelled' || snap.status === 'partial') {
           await _finishAfterServerSync();
@@ -1384,7 +1894,7 @@ export async function generateStoryboardSheet(gIdx) {
       onTaskFailed: function (data) {
         var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
         if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgInner);
-        showToast("分镜图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgInner), "error");
+        showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgInner), "error");
         _gotResult = true;
       },
       onBatchCompleted: function () {
@@ -1411,6 +1921,707 @@ async function _autoConvertGroupPrompts(group) {
       await convertSinglePrompt(sIdx);
     }
   }
+}
+
+/**
+ * 单帧生成 ETA 倒计时 helper (P2.5b.T3)。
+ * opts.initialSec=70 (默认), minSec=5 (显示下限, 避免显示 0/负数),
+ * intervalMs=1000, onTick(remainSec) 每秒回调。
+ * 返回 { stop } 用于在 finish/error 时停止。
+ */
+function _startSingleFrameEta(opts) {
+  opts = opts || {};
+  var initialSec = Math.max(5, opts.initialSec || 70);
+  var minSec = Math.max(1, opts.minSec || 5);
+  var intervalMs = opts.intervalMs || 1000;
+  var onTick = opts.onTick || function () {};
+  var start = Date.now();
+  var timer = null;
+  function tick() {
+    var elapsed = Math.floor((Date.now() - start) / 1000);
+    var remain = Math.max(minSec, initialSec - elapsed);
+    try { onTick(remain); } catch (_) {}
+  }
+  tick();
+  timer = setInterval(tick, intervalMs);
+  return {
+    stop: function () { if (timer) { clearInterval(timer); timer = null; } },
+  };
+}
+
+/**
+ * 弹出 file picker 上传首帧/尾帧图。不走 upload-char-image, 避免 mutate
+ * character lock; 调 /api/frames/upload 独立接口, 成功后用返回的 url 更新 storyboard
+ * state, 并调 renderStoryboardFrameCard 只刷新对应 frame 位。
+ */
+function _pickAndUploadFrame(gIdx, kind) {
+  if (!project) return;
+  var input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.style.display = 'none';
+  input.addEventListener('change', function () {
+    var file = input.files && input.files[0];
+    if (!file) return;
+    _uploadFrameImage(gIdx, file, kind);
+  });
+  document.body.appendChild(input);
+  input.click();
+  setTimeout(function () { try { input.remove(); } catch (_) {} }, 5000);
+}
+
+function _pickAndUploadFirstFrame(gIdx) { _pickAndUploadFrame(gIdx, 'first'); }
+function _pickAndUploadTailFrame(gIdx) { _pickAndUploadFrame(gIdx, 'tail'); }
+
+async function _uploadFrameImage(gIdx, file, kind) {
+  if (!project) return;
+  var isTail = kind === 'tail';
+  var frameType = isTail ? 'tail_frame' : 'first_frame';
+  var frameLabel = isTail ? '尾帧' : '首帧';
+  var originId = project.id;
+  renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'loading', { loadingText: '上传中…' });
+
+  var formData = new FormData();
+  formData.append('file', file);
+  formData.append('projectId', String(originId || ''));
+  formData.append('groupIdx', String(gIdx));
+  formData.append('frameType', frameType);
+
+  try {
+    var authToken = '';
+    try { authToken = localStorage.getItem('sw_auth_token') || ''; } catch (_) {}
+    var resp = await fetch('/api/frames/upload', {
+      method: 'POST',
+      headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {},
+      body: formData,
+    });
+    var data = await resp.json();
+    if (!resp.ok || data.error) {
+      var errMsg = (data && data.error) || '上传失败';
+      renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'error', { errMsg: errMsg });
+      if (isTail) _clearFailedTailFrameLocally(gIdx, errMsg);
+      showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传失败: ' + errMsg, 'error');
+      return;
+    }
+    var url = data.url || '';
+    if (!url) {
+      renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'error', { errMsg: '服务器未返回图片 URL' });
+      return;
+    }
+    var extra = isTail
+      ? {
+        groupIdx: gIdx,
+        tailFrameUrl: url,
+        tailFrameMode: 'uploaded',
+        tailFrameIntent: data.tailFrameIntent || 'requested',
+        tailFrameIntentUpdatedAt: data.tailFrameIntentUpdatedAt || new Date().toISOString(),
+        tailFrameSourceHash: Object.prototype.hasOwnProperty.call(data, 'tailFrameSourceHash')
+          ? data.tailFrameSourceHash
+          : null,
+        tailFrameReferenceStatus: data.tailFrameReferenceStatus || 'ready',
+        frames: {
+          tail: {
+            url: url,
+            status: 'ready',
+            source: 'uploaded',
+            mode: 'uploaded',
+            generatedAt: new Date().toISOString(),
+            sourceHash: Object.prototype.hasOwnProperty.call(data, 'tailFrameSourceHash')
+              ? data.tailFrameSourceHash
+              : null,
+            referenceStatus: data.tailFrameReferenceStatus || 'ready',
+          },
+        },
+      }
+      : {
+        groupIdx: gIdx,
+        firstFrameUrl: url,
+        firstFrameMode: 'uploaded',
+        firstFrameSource: 'uploaded',
+        firstFrameSourceHash: Object.prototype.hasOwnProperty.call(data, 'firstFrameSourceHash')
+          ? data.firstFrameSourceHash
+          : null,
+        frames: {
+          first: {
+          url: url,
+          status: 'ready',
+          source: 'uploaded',
+          mode: 'uploaded',
+          generatedAt: new Date().toISOString(),
+          sourceHash: Object.prototype.hasOwnProperty.call(data, 'firstFrameSourceHash')
+            ? data.firstFrameSourceHash
+            : null,
+          },
+        },
+      };
+    _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      var existing = proj.storyboards[gIdx] || {};
+      _applyFrameImagePatch(existing, url, extra, null);
+      proj.storyboards[gIdx] = existing;
+    });
+    renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'done', { imgUrl: url });
+    saveProject();
+    showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传成功', 'success');
+  } catch (e) {
+    var msg = ((e && e.message) || e).toString().slice(0, 200);
+    renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'error', { errMsg: msg });
+    if (isTail) _clearFailedTailFrameLocally(gIdx, msg);
+    showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传失败: ' + msg, 'error');
+  }
+}
+
+/**
+ * 启动尾帧生成 (P2.5a.T4)。和 generateStoryboardSheet 结构对称, 但:
+ *   - batchType='tail_frame_images'
+ *   - UI 只更新尾帧格 (renderStoryboardFrameCard), 不触碰主分镜/首帧 img
+ *   - 失败走 _clearFailedTailFrameLocally 和 tail 的 error 渲染
+ *   - 不做 ETA 动画 (尾帧 UX 简化)
+ * 后端 executor 已在 P2/P2.5a.T0 做 preflight, 这里前端再挡一次。
+ */
+export async function generateStoryboardTailFrame(gIdx) {
+  if (!project) return;
+  var groups = getStoryboardGroups();
+  var group = groups[gIdx];
+  if (!group) return;
+  if (!project.storyboards) project.storyboards = [];
+  var sb = project.storyboards[gIdx] || {};
+
+  if (!_canGenerateTailFrame(sb)) {
+    sb.tailFrameIntent = "requested";
+    sb.tailFrameIntentUpdatedAt = new Date().toISOString();
+    sb.tailFrameReferenceStatus = _tailFrameImageUrl(sb) ? "ready" : "missing";
+    project.storyboards[gIdx] = sb;
+    saveProject();
+    renderImageGrid();
+    checkImagesConfirm();
+    showToast("已标记这段需要尾帧，请先生成彩色首帧", "info");
+    return;
+  }
+  sb.tailFrameIntent = "requested";
+  sb.tailFrameIntentUpdatedAt = sb.tailFrameIntentUpdatedAt || new Date().toISOString();
+  project.storyboards[gIdx] = sb;
+  saveProject();
+  var originId = project.id;
+  renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: "生成尾帧中…" });
+
+  var startResp;
+  try {
+    startResp = await apiPost('/api/batch/start', {
+      batchType: 'tail_frame_images',
+      projectId: originId,
+      targets: [{ groupIdx: gIdx, idx: gIdx, shotIndices: group.shotIndices || [] }],
+    });
+  } catch (e) {
+    var errMsg = ((e && e.message) || e).toString().slice(0, 120);
+    if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
+      if (project && project.id === originId) {
+        renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: '积分不足' });
+        _clearFailedTailFrameLocally(gIdx, '积分不足');
+      }
+      showBillingPaywall(e.billing || null);
+      return;
+    }
+    if (project && project.id === originId) {
+      renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errMsg });
+      _clearFailedTailFrameLocally(gIdx, errMsg);
+    }
+    showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsg), "error");
+    return;
+  }
+  if (!startResp || !startResp.batchId) {
+    var fErr = (startResp && startResp.error) || "未能创建批量任务";
+    renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: fErr });
+    _clearFailedTailFrameLocally(gIdx, fErr);
+    return;
+  }
+
+  return new Promise(function (resolve) {
+    var settled = false;
+    var pollTimer = null;
+    var _gotResult = false;
+    // 尾帧 ETA: initial=60s (尾帧不做多 ref 预处理, 通常比首帧快一点)
+    var eta = _startSingleFrameEta({
+      initialSec: 60,
+      onTick: function (remain) {
+        try {
+          renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: '生成尾帧中…约剩 ' + remain + ' 秒' });
+        } catch (_e) {}
+      },
+    });
+    function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function finish() { if (!settled) { settled = true; _stopPoll(); eta.stop(); resolve(); } }
+    var finishingFromServer = null;
+    function _finishAfterServerSync() {
+      if (finishingFromServer) return finishingFromServer;
+      finishingFromServer = (async function () {
+        try {
+          await _reloadProjectFromServerForStoryboard(originId);
+          if (project && project.id === originId) renderImageGrid();
+        } catch (e) {
+          console.warn('[TailFrame] reload after single completion failed:', (e && e.message) || e);
+        } finally {
+          finish();
+        }
+      })();
+      return finishingFromServer;
+    }
+
+    function _applyResult(rawUrl, extra) {
+      if (!rawUrl || _gotResult) return;
+      _gotResult = true;
+      var isCurrent = _safeWriteBack(originId, function (proj) {
+        if (!proj.storyboards) proj.storyboards = [];
+        var existing = proj.storyboards[gIdx] || {};
+        _applyFrameImagePatch(existing, rawUrl, extra, group.shotIndices);
+        proj.storyboards[gIdx] = existing;
+      });
+      if (isCurrent) {
+        renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
+      }
+    }
+
+    async function _pollOnce() {
+      if (settled) return;
+      try {
+        var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
+        if (!snap || settled) return;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        for (var ti = 0; ti < tasks.length; ti++) {
+          var t = tasks[ti];
+          if (t.status === 'completed' && !_gotResult) {
+            var result = t.result || {};
+            var extra = result.extra || {};
+            var patch = result.patch || {};
+            var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+            _applyResult(url, extra);
+          } else if (t.status === 'failed' && !_gotResult) {
+            var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
+            if (project && project.id === originId) {
+              var synced = await _reloadProjectFromServerForStoryboard(originId);
+              if (!synced) _clearFailedTailFrameLocally(gIdx, errMsgPoll);
+              var latestSb = project && project.storyboards && project.storyboards[gIdx];
+              var errDisplayPoll = _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(latestSb, errMsgPoll), errMsgPoll);
+              renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayPoll });
+            }
+            showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
+            _gotResult = true;
+          }
+        }
+        if (snap.status === 'completed' || snap.status === 'failed' ||
+            snap.status === 'cancelled' || snap.status === 'partial') {
+          await _finishAfterServerSync();
+        }
+      } catch (e) {
+        console.warn('[TailFrame-single] poll failed:', (e && e.message) || e);
+      }
+    }
+    pollTimer = setInterval(_pollOnce, 5000);
+
+    subscribeBatch(startResp.batchId, {
+      onTaskCompleted: function (data) {
+        var extra = (data && data.extra) || {};
+        var patch = (data && data.patch) || {};
+        var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || (data && data.resultUrl) || "";
+        _applyResult(rawUrl, extra);
+      },
+      onTaskFailed: function (data) {
+        var extra = (data && data.extra) || {};
+        var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
+        var errDisplayInner = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsgInner), errMsgInner);
+        if (project && project.id === originId) {
+          renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayInner });
+          _clearFailedTailFrameLocally(gIdx, errMsgInner, extra);
+        }
+        showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errDisplayInner), "error");
+        _gotResult = true;
+      },
+      onBatchCompleted: function () {
+        _finishAfterServerSync();
+      },
+      onClose: function () { /* 等 polling 兜底 */ },
+    });
+  });
+}
+
+/**
+ * 批量生成所有可生成的尾帧 (P2.5b.T2)。
+ * 筛选: _canGenerateTailFrame(sb) === true 且 (无尾帧 or 尾帧 failed) 的组。
+ * 不做脏数据清理, 不动主分镜/首帧; 用一个 batchType='tail_frame_images' 批提交全部,
+ * 复用尾帧单生成的 SSE/polling pattern。
+ */
+export async function generateAllTailFrames(opts) {
+  opts = opts || {};
+  if (!project) return;
+  if (!project.storyboards) project.storyboards = [];
+  var originId = project.id;
+  var groups = getStoryboardGroups();
+
+  var targets = Array.isArray(opts.targets) ? opts.targets.slice() : [];
+  var skipNoFirst = 0;
+  if (!targets.length) {
+    for (var i = 0; i < groups.length; i++) {
+      var sb = project.storyboards[i] || {};
+      if (!_canGenerateTailFrame(sb)) { skipNoFirst++; continue; }
+      var tailUrl = (sb.frames && sb.frames.tail && sb.frames.tail.url) || sb.tailFrameUrl;
+      var tailStatus = (sb.frames && sb.frames.tail && sb.frames.tail.status) || '';
+      var shouldGen = !tailUrl || tailStatus === 'failed';
+      if (shouldGen) {
+        targets.push({ groupIdx: i, idx: i, shotIndices: groups[i].shotIndices || [] });
+      }
+    }
+  }
+  if (!targets.length) {
+    var hintMsg = skipNoFirst > 0
+      ? '全部片段已有尾帧, 或缺少彩色首帧 (' + skipNoFirst + ' 个片段跳过)'
+      : '全部片段已有尾帧, 无需重新生成';
+    showToast(hintMsg, 'info');
+    return;
+  }
+
+  var btn = opts.buttonId ? $(opts.buttonId) : $("btnGenAllTailFrames");
+  if (btn) btn.disabled = true;
+  targets.forEach(function (t) {
+    renderStoryboardFrameCard(t.groupIdx, 'tail', 'loading', { loadingText: '生成尾帧中…' });
+  });
+
+  var startResp;
+  try {
+    startResp = await apiPost('/api/batch/start', {
+      batchType: 'tail_frame_images',
+      projectId: originId,
+      targets: targets,
+    });
+  } catch (e) {
+    var errMsg = ((e && e.message) || e).toString().slice(0, 120);
+    if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
+      showBillingPaywall(e.billing || null);
+    } else {
+      showToast('批量尾帧启动失败: ' + _diagnoseApiError(errMsg), 'error');
+    }
+    targets.forEach(function (t) {
+      renderStoryboardFrameCard(t.groupIdx, 'tail', 'error', { errMsg: errMsg });
+      _clearFailedTailFrameLocally(t.groupIdx, errMsg);
+    });
+    if (btn) btn.disabled = false;
+    return;
+  }
+  if (!startResp || !startResp.batchId) {
+    var fErr = (startResp && startResp.error) || '未能创建批量任务';
+    showToast(fErr, 'error');
+    targets.forEach(function (t) {
+      renderStoryboardFrameCard(t.groupIdx, 'tail', 'error', { errMsg: fErr });
+      _clearFailedTailFrameLocally(t.groupIdx, fErr);
+    });
+    if (btn) btn.disabled = false;
+    return;
+  }
+
+  return new Promise(function (resolve) {
+    var settled = false;
+    var pollTimer = null;
+    var completedIdx = Object.create(null);
+    var totalCount = targets.length;
+    var doneCount = 0;
+    var failCount = 0;
+    var finishingFromServer = null;
+
+    function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function finish() {
+      if (settled) return;
+      settled = true;
+      _stopPoll();
+      if (btn) btn.disabled = false;
+      if (failCount === 0) {
+        showToast('批量尾帧生成完成 (' + doneCount + ' 张)', 'success');
+      } else if (failCount === totalCount) {
+        showToast('批量尾帧全部失败', 'error');
+      } else {
+        showToast('批量尾帧: 成功 ' + doneCount + ', 失败 ' + failCount, 'warn');
+      }
+      checkImagesConfirm();
+      resolve();
+    }
+    function _finishAfterServerSync() {
+      if (finishingFromServer) return finishingFromServer;
+      finishingFromServer = (async function () {
+        try {
+          await _reloadProjectFromServerForStoryboard(originId);
+          if (project && project.id === originId) renderImageGrid();
+        } catch (e) {
+          console.warn('[TailFrame] reload after batch completion failed:', (e && e.message) || e);
+        } finally {
+          finish();
+        }
+      })();
+      return finishingFromServer;
+    }
+
+    function _applyOne(extra, rawUrl) {
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
+      if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
+      _safeWriteBack(originId, function (proj) {
+        if (!proj.storyboards) proj.storyboards = [];
+        var existing = proj.storyboards[gIdx] || {};
+        _applyFrameImagePatch(existing, rawUrl, extra, null);
+        proj.storyboards[gIdx] = existing;
+        if (proj._staleFlags) delete proj._staleFlags["tail_frame_" + gIdx];
+      });
+      renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
+      completedIdx[gIdx] = 'done';
+      doneCount++;
+    }
+    function _failOne(extra, errMsg) {
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
+      if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
+      var errDisplay = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsg), errMsg);
+      _clearFailedTailFrameLocally(gIdx, errMsg, extra);
+      renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
+      completedIdx[gIdx] = 'failed';
+      failCount++;
+    }
+
+    async function _pollOnce() {
+      if (settled) return;
+      try {
+        var snap = await apiGet('/api/batch/' + encodeURIComponent(startResp.batchId));
+        if (!snap || settled) return;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        tasks.forEach(function (t) {
+          if (t.status === 'completed') {
+            var result = t.result || {};
+            var extra = result.extra || {};
+            var patch = result.patch || {};
+            var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+            if (url) _applyOne(extra, url);
+          } else if (t.status === 'failed') {
+            var target = t.target || {};
+            var extraF = { groupIdx: target.groupIdx };
+            var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
+            _failOne(extraF, errMsgPoll);
+          }
+        });
+        if (snap.status === 'completed' || snap.status === 'failed' ||
+            snap.status === 'cancelled' || snap.status === 'partial') {
+          await _finishAfterServerSync();
+        }
+      } catch (e) {
+        console.warn('[TailFrame-all] poll failed:', (e && e.message) || e);
+      }
+    }
+    pollTimer = setInterval(_pollOnce, 5000);
+
+    subscribeBatch(startResp.batchId, {
+      onTaskCompleted: function (data) {
+        var extra = (data && data.extra) || {};
+        var patch = (data && data.patch) || {};
+        var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || (data && data.resultUrl) || '';
+        if (rawUrl) _applyOne(extra, rawUrl);
+      },
+      onTaskFailed: function (data) {
+        var extra = (data && data.extra) || {};
+        var target = (data && data.target) || {};
+        if (typeof extra.groupIdx !== 'number' && typeof target.groupIdx === 'number') {
+          extra.groupIdx = target.groupIdx;
+        }
+        var errMsgInner = ((data && data.errorMsg) || '生成失败').toString().slice(0, 120);
+        _failOne(extra, errMsgInner);
+      },
+      onBatchCompleted: function () {
+        _finishAfterServerSync();
+      },
+      onClose: function () { /* polling 兜底 */ },
+    });
+  });
+}
+
+/**
+ * 批量升级 legacy_pencil 首帧为彩色 structured_v1 (P2.5b 遗留)。
+ * 筛选条件:
+ *   - firstFrameMode === 'legacy_pencil'
+ *   - shotIndices 与当前分组匹配 (分组已变的 legacy 片段不在此处升级, 避免
+ *     写错位; 用户需要走"一键生成全部分镜图")
+ * 提交 batchType:'storyboard_images', 后端自然产出 structured_v1; 升级后尾帧
+ * 按钮自然 enable。复用 _imagesGenerating 全局锁, 和 generateAllImages 互斥。
+ */
+export async function upgradeLegacyFirstFrames() {
+  if (_imagesGenerating) { showToast('正在生成中，请稍候', 'warn'); return; }
+  if (!project) return;
+  if (!project.storyboards) project.storyboards = [];
+  var originId = project.id;
+  var groups = getStoryboardGroups();
+
+  var targets = [];
+  var mismatched = 0;
+  for (var i = 0; i < groups.length; i++) {
+    var sb = project.storyboards[i] || {};
+    if (String(sb.firstFrameMode || '') !== 'legacy_pencil') continue;
+    var savedSi = Array.isArray(sb.shotIndices) ? sb.shotIndices : null;
+    var newSi = groups[i].shotIndices || [];
+    var match = savedSi && savedSi.length === newSi.length
+      && savedSi.every(function (v, j) { return v === newSi[j]; });
+    if (!match) { mismatched++; continue; }
+    targets.push({ groupIdx: i, idx: i, shotIndices: newSi });
+  }
+
+  if (!targets.length) {
+    var emptyMsg = mismatched > 0
+      ? '有 ' + mismatched + ' 个 legacy 片段因分组已变, 请用"一键生成全部分镜图"重跑'
+      : '没有找到 legacy_pencil 首帧, 无需升级';
+    showToast(emptyMsg, 'info');
+    return;
+  }
+
+  _imagesGenerating = true;
+  var btn = $('btnUpgradeLegacyFirstFrames');
+  var btnAll = $('btnGenAllImages');
+  if (btn) btn.disabled = true;
+  if (btnAll) btnAll.disabled = true;
+
+  // 清掉每个 legacy slot (保留 history 用于 show-history), 防止旧手稿图影响新首帧的 diff
+  targets.forEach(function (t) {
+    var oldSb = project.storyboards[t.groupIdx];
+    if (oldSb) _archiveOldImage(oldSb, 'storyboard');
+    project.storyboards[t.groupIdx] = oldSb && Array.isArray(oldSb.imageHistory) && oldSb.imageHistory.length
+      ? { imageHistory: oldSb.imageHistory }
+      : null;
+    updateStoryboardCard(t.groupIdx, 'loading', null, '升级首帧中…');
+  });
+  saveProject();
+
+  var startResp;
+  try {
+    startResp = await apiPost('/api/batch/start', {
+      batchType: 'storyboard_images',
+      projectId: originId,
+      targets: targets,
+    });
+  } catch (e) {
+    var errMsg = ((e && e.message) || e).toString().slice(0, 120);
+    if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
+      showBillingPaywall(e.billing || null);
+    } else {
+      showToast('升级启动失败: ' + _diagnoseApiError(errMsg), 'error');
+    }
+    targets.forEach(function (t) {
+      updateStoryboardCard(t.groupIdx, 'error', null, errMsg);
+    });
+    _imagesGenerating = false;
+    if (btn) btn.disabled = false;
+    if (btnAll) btnAll.disabled = false;
+    return;
+  }
+  if (!startResp || !startResp.batchId) {
+    var fErr = (startResp && startResp.error) || '未能创建批量任务';
+    showToast(fErr, 'error');
+    targets.forEach(function (t) {
+      updateStoryboardCard(t.groupIdx, 'error', null, fErr);
+    });
+    _imagesGenerating = false;
+    if (btn) btn.disabled = false;
+    if (btnAll) btnAll.disabled = false;
+    return;
+  }
+
+  return new Promise(function (resolve) {
+    var settled = false;
+    var pollTimer = null;
+    var completedIdx = Object.create(null);
+    var totalCount = targets.length;
+    var doneCount = 0;
+    var failCount = 0;
+
+    function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function finish() {
+      if (settled) return;
+      settled = true;
+      _stopPoll();
+      _imagesGenerating = false;
+      if (btn) btn.disabled = false;
+      if (btnAll) btnAll.disabled = false;
+      if (failCount === 0) {
+        showToast('升级完成: ' + doneCount + ' 个首帧已转为 structured_v1, 可生成尾帧', 'success');
+      } else if (failCount === totalCount) {
+        showToast('升级全部失败', 'error');
+      } else {
+        showToast('升级: 成功 ' + doneCount + ', 失败 ' + failCount, 'warn');
+      }
+      try { renderImageGrid(); } catch (_) {}
+      resolve();
+    }
+
+    function _applyOne(extra, rawUrl) {
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
+      if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
+      _safeWriteBack(originId, function (proj) {
+        if (!proj.storyboards) proj.storyboards = [];
+        var existing = proj.storyboards[gIdx] || {};
+        _archiveOldImage(existing, 'storyboard');
+        _applyFrameImagePatch(existing, rawUrl, extra, null);
+        proj.storyboards[gIdx] = existing;
+      });
+      updateStoryboardCard(gIdx, 'done', rawUrl);
+      completedIdx[gIdx] = 'done';
+      doneCount++;
+    }
+    function _failOne(extra, errMsg) {
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
+      if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
+      updateStoryboardCard(gIdx, 'error', null, errMsg);
+      completedIdx[gIdx] = 'failed';
+      failCount++;
+    }
+
+    async function _pollOnce() {
+      if (settled) return;
+      try {
+        var snap = await apiGet('/api/batch/' + encodeURIComponent(startResp.batchId));
+        if (!snap || settled) return;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        tasks.forEach(function (t) {
+          if (t.status === 'completed') {
+            var result = t.result || {};
+            var extra = result.extra || {};
+            var patch = result.patch || {};
+            var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+            if (url) _applyOne(extra, url);
+          } else if (t.status === 'failed') {
+            var target = t.target || {};
+            var extraF = { groupIdx: target.groupIdx };
+            var errMsgPoll = (t.errorMsg || '升级失败').toString().slice(0, 120);
+            _failOne(extraF, errMsgPoll);
+          }
+        });
+        if (snap.status === 'completed' || snap.status === 'failed' ||
+            snap.status === 'cancelled' || snap.status === 'partial') {
+          finish();
+        }
+      } catch (e) {
+        console.warn('[LegacyUpgrade-all] poll failed:', (e && e.message) || e);
+      }
+    }
+    pollTimer = setInterval(_pollOnce, 5000);
+
+    subscribeBatch(startResp.batchId, {
+      onTaskCompleted: function (data) {
+        var extra = (data && data.extra) || {};
+        var patch = (data && data.patch) || {};
+        var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || (data && data.resultUrl) || '';
+        if (rawUrl) _applyOne(extra, rawUrl);
+      },
+      onTaskFailed: function (data) {
+        var extra = (data && data.extra) || {};
+        var target = (data && data.target) || {};
+        if (typeof extra.groupIdx !== 'number' && typeof target.groupIdx === 'number') {
+          extra.groupIdx = target.groupIdx;
+        }
+        var errMsgInner = ((data && data.errorMsg) || '升级失败').toString().slice(0, 120);
+        _failOne(extra, errMsgInner);
+      },
+      onBatchCompleted: function () { finish(); },
+      onClose: function () { /* polling 兜底 */ },
+    });
+  });
 }
 
 export async function generateAllImages() {
@@ -1470,22 +2681,51 @@ export async function generateAllImages() {
     try { renderImageGrid(); } catch (_) {}
   }
 
+  var buttonState = _computeImagesBatchState(groups, { ignoreGenerating: true });
   var targets = [];
-  for (var gk = 0; gk < groups.length; gk++) {
-    var sb = project.storyboards[gk];
-    if (!sb || (!sb.imageUrl && !sb.url)) {
-      targets.push({ groupIdx: gk, idx: gk, shotIndices: groups[gk].shotIndices || [] });
-    }
-  }
-  if (!targets.length) {
-    // 所有组都有图——按旧语义还是重跑一遍（用户可能点了想重生成全部）
+  var runRequestedTailsAfterFirst = false;
+  var requestedTailIdxMap = null; // null = all requested tails (regenerate_all only)
+  if (buttonState.action === 'retry_failed') {
+    targets = buttonState.failedFirst.map(function (gIdx) {
+      return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
+    });
+  } else if (buttonState.action === 'fill_missing') {
+    targets = buttonState.missingFirst.map(function (gIdx) {
+      return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
+    });
+  } else if (buttonState.action === 'update_stale') {
+    targets = buttonState.staleFirst.map(function (gIdx) {
+      return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
+    });
+    requestedTailIdxMap = Object.create(null);
+    buttonState.staleTail.forEach(function (gIdx) { requestedTailIdxMap[gIdx] = true; });
+    buttonState.staleFirst.forEach(function (gIdx) {
+      var sb = (project.storyboards && project.storyboards[gIdx]) || {};
+      if (_isTailRequested(sb)) requestedTailIdxMap[gIdx] = true;
+    });
+    runRequestedTailsAfterFirst = Object.keys(requestedTailIdxMap).length > 0;
+  } else {
     targets = groups.map(function (g, idx) {
       return { groupIdx: idx, idx: idx, shotIndices: g.shotIndices || [] };
     });
+    runRequestedTailsAfterFirst = buttonState.action === 'regenerate_all';
+  }
+  if (!targets.length && runRequestedTailsAfterFirst) {
+    _imagesGenerating = false;
+    if (btn) btn.disabled = false;
+    await generateAllTailFrames({
+      targets: Object.keys(requestedTailIdxMap || {}).map(function (gIdx) {
+        gIdx = Number(gIdx);
+        return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
+      }),
+      buttonId: 'btnGenAllImages',
+    });
+    checkImagesConfirm();
+    return;
   }
   var totalCount = targets.length;
-  if (hint) hint.textContent = "正在生成 " + totalCount + " 张分镜图…";
-  targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成分镜图中…"); });
+  if (hint) hint.textContent = "正在生成 " + totalCount + " 张首帧图…";
+  targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成首帧图中…"); });
 
   // —— 倒计时区域 ——
   // 用户反馈："这个位置改成倒计时吧 还有多久能生成完"。
@@ -1558,15 +2798,37 @@ export async function generateAllImages() {
   function finish() {
     if (finished) return;
     finished = true;
-    _imagesGenerating = false;
-    if (btn) btn.disabled = false;
     _stopEtaTick();
     _clearEta();
     var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
-    if (hint) hint.textContent = done + "/" + groups.length + " 张分镜图已生成";
+    if (hint) hint.textContent = done + "/" + groups.length + " 张首帧图已生成";
     var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
-    if (allSbDone && groups.length > 0) showToast("全部分镜图已生成", "success");
-    if (failCount > 0) showToast(failCount + " 张分镜图生成失败，请手动重试", "warn");
+    if (allSbDone && groups.length > 0) showToast("全部首帧图已生成", "success");
+    if (failCount > 0) showToast(failCount + " 张首帧图生成失败，请手动重试", "warn");
+    var requestedTailTargets = [];
+    if (runRequestedTailsAfterFirst && failCount === 0) {
+      for (var ti = 0; ti < groups.length; ti++) {
+        if (requestedTailIdxMap && !requestedTailIdxMap[ti]) continue;
+        var tailSb = project.storyboards[ti] || {};
+        if (!_isTailRequested(tailSb)) continue;
+        if (!_canGenerateTailFrame(tailSb)) continue;
+        requestedTailTargets.push({ groupIdx: ti, idx: ti, shotIndices: groups[ti].shotIndices || [] });
+      }
+    }
+    if (requestedTailTargets.length) {
+      if (hint) hint.textContent = "正在同步重新生成 " + requestedTailTargets.length + " 张尾帧…";
+      generateAllTailFrames({ targets: requestedTailTargets, buttonId: 'btnGenAllImages' })
+        .finally(function () {
+          _imagesGenerating = false;
+          if (btn) btn.disabled = false;
+          checkImagesConfirm();
+          setTimeout(function () { _checkAndSuggest("images"); }, 1000);
+        });
+      return;
+    }
+    _imagesGenerating = false;
+    if (btn) btn.disabled = false;
+    checkImagesConfirm();
     setTimeout(function () { _checkAndSuggest("images"); }, 1000);
   }
 
@@ -1582,17 +2844,26 @@ export async function generateAllImages() {
 
     var imageAssetId = (extra && extra.assetId) || '';
     var shotIndices = (extra && Array.isArray(extra.shotIndices)) ? extra.shotIndices : null;
+    var isTail = _isTailPatchExtra(extra);
 
       var isCurrent = _safeWriteBack(originId, function (proj) {
       if (!proj.storyboards) proj.storyboards = [];
       var existing = proj.storyboards[groupIdx] || {};
-      _archiveOldImage(existing, "storyboard");
-      _applyStoryboardImageFields(existing, rawUrl, extra, shotIndices);
+      if (!isTail) _archiveOldImage(existing, "storyboard");
+      _applyFrameImagePatch(existing, rawUrl, extra, shotIndices);
       if (imageAssetId && !existing.fetchStatus) existing.fetchStatus = 'done';
       proj.storyboards[groupIdx] = existing;
       if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
+      if (isTail && proj._staleFlags) delete proj._staleFlags["tail_frame_" + groupIdx];
     });
-    if (isCurrent) updateStoryboardCard(groupIdx, "done", rawUrl);
+    if (isCurrent) {
+      if (isTail) {
+        renderStoryboardFrameCard(groupIdx, 'tail', 'done', { imgUrl: rawUrl });
+      } else {
+        updateStoryboardCard(groupIdx, "done", rawUrl);
+      }
+    }
+    // 尾帧: UI 通过 renderStoryboardFrameCard 单独更新尾帧位, 不触碰首帧/主图 img
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
     _renderEta();
   }
@@ -1619,6 +2890,43 @@ export async function generateAllImages() {
         },
         history: (sb.firstFrame && Array.isArray(sb.firstFrame.history)) ? sb.firstFrame.history : []
       });
+      proj.storyboards[groupIdx] = sb;
+    });
+  }
+
+  /**
+   * 本地乐观写 tail 失败态, 对称 _clearFailedStoryboardLocally 但只动 tailFrame* 字段
+   * 和 frames.tail, 绝不触碰首帧/主分镜字段。server 端 batches.ts 的 _clearFailedTailFrameImageState
+   * 也会写同样一份, 这里只是在 server snapshot 到达前让 UI 立刻切到 failed/degraded 态。
+   */
+  function _clearFailedTailFrameLocally(groupIdx, errMsg, extra) {
+    if (typeof groupIdx !== 'number' || !project) return;
+    var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
+    var msg = errRecord.message;
+    _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      var sb = proj.storyboards[groupIdx] || {};
+      var prevTail = (sb.frames && sb.frames.tail) || null;
+      var fallbackUrl = (prevTail && (prevTail.url || prevTail.lastKnownGoodUrl)) || sb.tailFrameUrl || "";
+      sb.tailFrameLastError = msg;
+      sb.tailFrameFailedAt = new Date().toISOString();
+      sb.tailFrameIntent = "requested";
+      sb.tailFrameIntentUpdatedAt = sb.tailFrameIntentUpdatedAt || sb.tailFrameFailedAt;
+      sb.tailFrameReferenceStatus = fallbackUrl ? "ready" : "missing";
+      var nextTail = Object.assign({}, prevTail || {}, {
+        url: fallbackUrl || undefined,
+        status: fallbackUrl ? "degraded" : "failed",
+        source: fallbackUrl ? "last_known_good" : ((prevTail && prevTail.source) || "generated"),
+        lastKnownGoodUrl: fallbackUrl || ((prevTail && prevTail.lastKnownGoodUrl) || undefined),
+        referenceStatus: fallbackUrl ? "ready" : "missing",
+        lastError: {
+          message: msg,
+          errorCode: errRecord.errorCode || undefined,
+          recoveryHint: errRecord.recoveryHint || undefined,
+          failedAt: sb.tailFrameFailedAt
+        }
+      });
+      sb.frames = Object.assign({}, sb.frames || {}, { tail: nextTail });
       proj.storyboards[groupIdx] = sb;
     });
   }
@@ -1725,7 +3033,7 @@ export async function generateAllImages() {
 }
 
 export function confirmImages() {
-  if (!project || !project.shots) { showToast("请先生成分镜图", "warn"); return; }
+  if (!project || !project.shots) { showToast("请先生成首帧图", "warn"); return; }
   var groups = getStoryboardGroups();
   if (!project.storyboards) project.storyboards = [];
   var missing = groups.filter(function (_, i) { return !project.storyboards[i] || !project.storyboards[i].imageUrl; });
@@ -1783,6 +3091,81 @@ export function handleImageAction(e) {
       renderImageGrid();
       checkImagesConfirm();
     });
+  } else if (action === "accept-tail-suggestion") {
+    if (!project.storyboards) project.storyboards = [];
+    var suggestSb = project.storyboards[gIdx] || {};
+    var acceptedAt = new Date().toISOString();
+    suggestSb.tailFrameIntent = "requested";
+    suggestSb.tailFrameIntentUpdatedAt = acceptedAt;
+    suggestSb.tailFrameReferenceStatus = _tailFrameImageUrl(suggestSb) ? "ready" : "missing";
+    project.storyboards[gIdx] = suggestSb;
+    saveProject();
+    renderImageGrid();
+    checkImagesConfirm();
+    if (_canGenerateTailFrame(suggestSb)) {
+      generateStoryboardTailFrame(gIdx).then(function () {
+        saveProject();
+        checkImagesConfirm();
+      }).catch(function (err) {
+        console.warn('[TailFrame] accept suggestion failed:', (err && err.message) || err);
+      });
+    } else {
+      showToast("已标记这段需要尾帧，请先生成首帧", "info");
+    }
+  } else if (action === "regen-tail") {
+    // 尾帧独立生成: 不清首帧, 不 archive 主图, 生成完只刷新尾帧格 (renderStoryboardFrameCard
+    // 内部处理)。前端和后端都有 preflight 挡 legacy_pencil / 缺首帧的 case。
+    generateStoryboardTailFrame(gIdx).then(function () {
+      saveProject();
+    }).catch(function (err) {
+      console.warn('[TailFrame] regen-tail failed:', (err && err.message) || err);
+    });
+  } else if (action === "delete-tail") {
+    // 删除尾帧的语义 = 清图 + 清用户意图。
+    // 删后顶部 "重新生成全部" / 批量重试等都不会再带上此组的尾帧。
+    // 如果用户只是想"重做一张"，应该使用 regen-tail；delete-tail 表达的是
+    // "这一段不再需要尾帧"。
+    if (!project.storyboards) project.storyboards = [];
+    var delSb = project.storyboards[gIdx] || {};
+    if (delSb.frames && typeof delSb.frames === 'object') {
+      var nextFrames = Object.assign({}, delSb.frames);
+      delete nextFrames.tail;
+      delSb.frames = nextFrames;
+    }
+    delSb.tailFrameUrl = '';
+    delSb.tailFramePrompt = '';
+    delSb.tailFrameIntent = 'none';
+    delSb.tailFrameIntentUpdatedAt = new Date().toISOString();
+    delSb.tailFrameSourceHash = null;
+    delSb.tailFrameReferenceStatus = 'missing';
+    delSb.tailFrameLastError = '';
+    project.storyboards[gIdx] = delSb;
+    saveProject();
+    renderImageGrid();
+    checkImagesConfirm();
+    showToast('已删除尾帧并清除意图', 'info');
+  } else if (action === "upload-tail") {
+    _pickAndUploadTailFrame(gIdx);
+  } else if (action === "upload-first") {
+    _pickAndUploadFirstFrame(gIdx);
+  } else if (action === "upgrade-first-frame") {
+    // legacy_pencil 首帧升级: 重跑 storyboard_images batch, 后端会写 structured_v1,
+    // 升级成功后尾帧按钮自然 enable。复用 generateStoryboardSheet 的单片段路径。
+    if (_imagesGenerating) { showToast("正在生成中，请稍候", "warn"); return; }
+    if (!project.storyboards) project.storyboards = [];
+    var oldSbUpg = project.storyboards[gIdx];
+    if (oldSbUpg) _archiveOldImage(oldSbUpg, "storyboard");
+    project.storyboards[gIdx] = oldSbUpg && Array.isArray(oldSbUpg.imageHistory) && oldSbUpg.imageHistory.length
+      ? { imageHistory: oldSbUpg.imageHistory }
+      : null;
+    saveProject();
+    generateStoryboardSheet(gIdx).then(function () {
+      renderImageGrid();
+      checkImagesConfirm();
+      showToast("首帧已升级为彩色版, 现在可以生成尾帧", "success");
+    }).catch(function (err) {
+      console.warn('[LegacyUpgrade] failed:', (err && err.message) || err);
+    });
   } else if (action === "regen-sb-prompt") {
     if (_imagesGenerating || _promptsConverting) { showToast("正在生成中，请稍候", "warn"); return; }
     var groups = getStoryboardGroups();
@@ -1795,7 +3178,7 @@ export function handleImageAction(e) {
     saveProject();
     updateStoryboardCard(gIdx, "loading", null, "重写画面指令…");
     _autoConvertGroupPrompts(group).then(function () {
-      updateStoryboardCard(gIdx, "loading", null, "重新生成分镜图…");
+      updateStoryboardCard(gIdx, "loading", null, "重新生成首帧图…");
       return generateStoryboardSheet(gIdx);
     }).then(function () {
       renderImageGrid();
@@ -1805,14 +3188,27 @@ export function handleImageAction(e) {
     });
   } else if (action === "download-sb") {
     var sb = project.storyboards && project.storyboards[gIdx];
-    if (sb && sb.imageUrl) {
+    var firstUrl = _firstFrameImageUrl(sb);
+    if (firstUrl) {
       var a = document.createElement("a");
-      a.href = sb.imageUrl;
+      a.href = firstUrl;
       a.download = "storyboard_" + (gIdx + 1) + ".png";
       a.target = "_blank";
       document.body.appendChild(a);
       a.click();
       a.remove();
+    }
+  } else if (action === "download-tail") {
+    var sbTail = project.storyboards && project.storyboards[gIdx];
+    var tailUrl = _tailFrameImageUrl(sbTail);
+    if (tailUrl) {
+      var tailA = document.createElement("a");
+      tailA.href = tailUrl;
+      tailA.download = "storyboard_" + (gIdx + 1) + "_tail.png";
+      tailA.target = "_blank";
+      document.body.appendChild(tailA);
+      tailA.click();
+      tailA.remove();
     }
   }
 }

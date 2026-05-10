@@ -67,6 +67,7 @@ import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFr
 import { pickSceneForShots } from './scene-selection';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit } from './frame-image-plan';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
+import { computeTailFrameSourceHash } from './frame-workflow-state';
 
 function isPlanReferenceRole(role: string): role is VideoReferenceRole {
   return role === 'first_frame' || role === 'scene' || role === 'character' || role === 'prop';
@@ -1155,6 +1156,8 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     referenceImagePath,
   });
 
+  const generatedAt = nowIso();
+  const tailFrameSourceHash = computeTailFrameSourceHash(proj, ctx.user.id, groupIdx);
   const frameTail = {
     url: result.url,
     prompt: result.submittedPrompt,
@@ -1164,7 +1167,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     planSummary,
     safetyAudit: result.safetyAudit,
     visualAnchorDescription: result.visualAnchorDescription,
-    generatedAt: nowIso(),
+    generatedAt,
+    shotIndices,
+    sourceHash: tailFrameSourceHash,
+    referenceStatus: 'ready' as const,
   };
 
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
@@ -1182,6 +1188,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       tailFramePlanSummary: planSummary,
       tailFrameLastError: undefined,
       tailFrameFailedAt: undefined,
+      tailFrameIntent: 'requested',
+      tailFrameIntentUpdatedAt: generatedAt,
+      tailFrameSourceHash,
+      tailFrameReferenceStatus: 'ready',
       frames: { ...(prev.frames || {}), tail: frameTail },
     };
     return { storyboards: sbs };
@@ -1199,6 +1209,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       tailFramePrompt: result.submittedPrompt,
       tailFrameSafetyAudit: result.safetyAudit,
       tailFramePlanSummary: planSummary,
+      tailFrameIntent: 'requested',
+      tailFrameIntentUpdatedAt: generatedAt,
+      tailFrameSourceHash,
+      tailFrameReferenceStatus: 'ready',
       frames: { tail: frameTail },
     },
     extra: {
@@ -1212,6 +1226,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       originalTailFramePrompt: basePrompt,
       tailFrameSafetyAudit: result.safetyAudit,
       tailFramePlanSummary: planSummary,
+      tailFrameIntent: 'requested',
+      tailFrameIntentUpdatedAt: generatedAt,
+      tailFrameSourceHash,
+      tailFrameReferenceStatus: 'ready',
       frames: { tail: frameTail },
     },
   };
