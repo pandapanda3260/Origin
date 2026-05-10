@@ -801,7 +801,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       if (t.fetch_status) existing.fetchStatus = t.fetch_status;
       project.storyboards[tIdx] = existing;
       saveProject(); if (url) updateStoryboardCard(tIdx, "done", url);
-      if (url) showToast("分镜图 #" + (tIdx + 1) + " 已在后台生成完成", "ok");
+      if (url) showToast("首帧图 #" + (tIdx + 1) + " 已在后台生成完成", "ok");
     } else if (tType === "char") {
       var charItem = project.assets && project.assets.characters && project.assets.characters[tIdx];
       if (charItem) {

@@ -4372,7 +4372,7 @@ var _projectEpoch = 0;
     });
     if (failed.length) {
       showToast(
-        failed.length + " 张分镜图生成失败（片段 " + failed.slice(0, 5).join("、") + "），建议重试",
+        failed.length + " 张首帧图生成失败（片段 " + failed.slice(0, 5).join("、") + "），建议重试",
         "warn", 8000,
         [{ label: "重试失败项", action: function () { generateAllImages(); } }]
       );
