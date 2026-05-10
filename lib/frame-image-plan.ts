@@ -10,8 +10,12 @@
  *   - first_frame: primaryShot = 组内第一个 shot, 作为开场 beat。
  *   - tail_frame:  primaryShot = 组内最末 shot, 作为收尾 beat;
  *                  selfFirstFrame (本片段已生成的首帧图) 作为 slot 1 的连续性锚点。
- *   - referenceManifest 的 slot 与 renderer 里的 Image N 编号、提交给模型
- *     的 image[] 数组顺序三者严格一致。
+ *   - referenceManifest 的编号语义 (重要):
+ *       · slot     —— 候选序号 (1-based 连续, 含所有候选, 不论 delivery)。
+ *       · imageNo  —— 仅 delivery='image' 的 ref 才有, 1-based 连续, 严格对齐
+ *                     提交给模型的 image[] 数组下标 +1。
+ *     renderer 的 "Image N = ..." 标签用的是 imageNo, 不是 slot, 避免 scene
+ *     走 text_only 时出现 "Image 2 = character" 但 image[0] 其实就是它的错位。
  *   - 是否把 ref 作为 image 传给模型, 由 modelSnapshot.multiRefImageCap 决定;
  *     当前业务侧统一传 cap=1, 其余候选走 text_only 兜底。P3 再打开多图。
  */
@@ -47,8 +51,13 @@ export type FrameReferenceDroppedReason =
   | 'no_image_available';
 
 export type FrameReference = {
-  /** 1-based, 与 prompt 里的 "Image N" 编号一致; 同时是提交给模型的 image[] 数组顺序。 */
+  /** 候选序号 (manifest 输入顺序), 1-based 连续; 含所有候选 (不论 delivery)。
+   *  注意: 这不是传给图像模型的 "Image N" 编号。 */
   slot: number;
+  /** 传给图像模型的 "Image N" 编号, 1-based 连续; 仅 delivery='image' 的才有。
+   *  与实际提交给模型的 image[] 数组下标 +1 严格一致, 保证 prompt 里的 "Image 1 = ..."
+   *  指向 image[0] 而不是某个被跳过的 slot。 */
+  imageNo?: number;
   role: FrameRefRole;
   assetId?: string;
   assetName?: string;
@@ -93,6 +102,9 @@ export type FrameImageGenerationPlan = {
   characterLockText: string;
   sceneLockText: string;
   propLockText: string;
+  /** 本组所有 shot 的原始文本拼接 (visual/description/dialogue 等, 已 sanitize)。
+   *  用作 renderer 硬约束扫描源, 确保 shot.visual 里的 "不要补光灯" 等用户约束能被命中。 */
+  shotConstraintText: string;
   referenceManifest: FrameReference[];
   /** renderer 产出的最终 prompt, 提交前仍可能被 safe-image-gen 的审核恢复二次改写。 */
   finalPrompt: string;
@@ -107,7 +119,12 @@ export type FrameImagePlanSummary = {
   characterNames: string[];
   sceneName?: string;
   propNames: string[];
-  sentReferences: Array<{ slot: number; role: FrameRefRole; assetName?: string }>;
+  sentReferences: Array<{
+    slot: number;
+    imageNo: number;
+    role: FrameRefRole;
+    assetName?: string;
+  }>;
   textOnlyReferences: Array<{
     slot: number;
     role: FrameRefRole;
@@ -188,6 +205,29 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     )
     .join(' ');
   const groupText = sanitizeFillLightPositiveMentions(rawGroupText);
+
+  // shot 文本单独拼一遍, 作为硬约束扫描源。和 groupText 的区别: 这里只含用户真正
+  // 写进剧本/镜头表的字段 (visual/description/dialogue/keyInfo/imagePrompt 等),
+  // 不含 characters 数组这类元数据。覆盖面要尽量大, 避免用户把 "不要补光灯" 之类
+  // 硬约束写到某个字段却没被 enforceHardVisualConstraints 命中。
+  const shotConstraintText = sanitizeFillLightPositiveMentions(
+    groupShots
+      .map((sh: any) =>
+        [
+          sh?.visual,
+          sh?.description,
+          sh?.desc,
+          sh?.dialogue,
+          sh?.scriptRef,
+          sh?.keyInfo,
+          sh?.imagePrompt,
+        ]
+          .filter(Boolean)
+          .join(' '),
+      )
+      .filter(Boolean)
+      .join('\n'),
+  );
 
   // ---- characters ----
   const charNames = new Set<string>();
@@ -356,6 +396,10 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   const manifest: FrameReference[] = [];
   let imageBudget = cap;
   let slot = 1;
+  // imageNo 只在 delivery='image' 的 ref 上递增, 保证 "Image 1, 2, 3..." 连续,
+  // 和提交给模型的 image[] 数组下标严格对齐 (避免 prompt 出现 "Image 2" 但 image[0]
+  // 其实就是它的错位)。
+  let nextImageNo = 1;
   for (const cand of candidates) {
     // 若 candidate 自带已解析的 localPath (比如 self_first_frame), 优先使用; 否则走 resolver。
     const preResolved = cand.localPath;
@@ -381,6 +425,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     }
     manifest.push({
       slot: slot++,
+      imageNo: delivery === 'image' ? nextImageNo++ : undefined,
       role: cand.role,
       assetId: cand.assetId,
       assetName: cand.assetName,
@@ -443,12 +488,22 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     characterLockText,
     sceneLockText,
     propLockText,
+    shotConstraintText,
     referenceManifest: manifest,
     finalPrompt: '',
     modelSnapshot: input.modelSnapshot,
   };
   plan.finalPrompt = renderFramePrompt(plan);
   return plan;
+}
+
+function shotVisualForFramePrompt(shot: any): string {
+  return (
+    clean(shot?.imagePrompt) ||
+    clean(shot?.visual) ||
+    clean(shot?.description) ||
+    clean(shot?.desc)
+  );
 }
 
 export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
@@ -487,7 +542,7 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   );
   const pShotType = clean(primaryShot?.shotType || primaryShot?.framing);
   const pCamera = clean(primaryShot?.camera || primaryShot?.movement);
-  const pVisual = clean(primaryShot?.visual || primaryShot?.description || primaryShot?.desc);
+  const pVisual = shotVisualForFramePrompt(primaryShot);
   const pDialogue = clean(primaryShot?.dialogue || primaryShot?.scriptRef);
   if (pShotType) lines.push(`- framing: ${pShotType}`);
   if (pCamera) lines.push(`- camera: ${pCamera}`);
@@ -502,7 +557,7 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
     for (let i = 0; i < contextShots.length; i += 1) {
       const sh = contextShots[i];
       const idx = plan.contextShotIndices[i] + 1;
-      const visual = clean(sh?.visual || sh?.description || sh?.desc);
+      const visual = shotVisualForFramePrompt(sh);
       if (visual) lines.push(`- Shot ${idx}: ${truncate(visual, 160)}`);
     }
   }
@@ -525,7 +580,8 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
                 : r.role === 'self_first_frame'
                   ? 'this segment first frame — composition/identity anchor'
                   : String(r.role);
-      lines.push(`- Image ${r.slot} = ${roleText}`);
+      // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
+      lines.push(`- Image ${r.imageNo} = ${roleText}`);
     }
   }
 
@@ -587,6 +643,7 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   let out = sanitizeFillLightPositiveMentions(lines.join('\n'));
 
   const constraintSource = [
+    plan.shotConstraintText,
     plan.characterLockText,
     plan.sceneLockText,
     plan.propLockText,
@@ -614,7 +671,12 @@ export function summarizePlanForAudit(plan: FrameImageGenerationPlan): FrameImag
     characterNames: plan.characters.map((c) => c.name).filter(Boolean),
     sceneName: plan.scene?.name,
     propNames: plan.props.map((p) => p.name).filter(Boolean),
-    sentReferences: sent.map((r) => ({ slot: r.slot, role: r.role, assetName: r.assetName })),
+    sentReferences: sent.map((r) => ({
+      slot: r.slot,
+      imageNo: r.imageNo as number,
+      role: r.role,
+      assetName: r.assetName,
+    })),
     textOnlyReferences: textOnly.map((r) => ({
       slot: r.slot,
       role: r.role,
