@@ -12,6 +12,7 @@
     "test:sanitize": "node scripts/test-image-moderation-sanitizer.js",
     "test:moderation-recovery": "node scripts/test-image-moderation-recovery.js",
     "test:frame-image-plan": "node scripts/test-frame-image-plan.js",
+    "test:visual-reference-state": "node scripts/test-visual-reference-state.js",
     "prompt-eval:collect": "node scripts/prompt-sample-collect.mjs",
     "prompt-eval:report": "node scripts/prompt-eval.mjs",
     "start": "next start -p 3000",

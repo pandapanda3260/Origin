@@ -18,7 +18,7 @@ import type { UserRow } from './db';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from './credits';
 import { patchProjectForUser } from './projects-db';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
-import { markFirstFrameFailed } from './visual-reference-state';
+import { markFirstFrameFailed, markTailFrameFailed } from './visual-reference-state';
 
 export type BatchEventName =
   | 'snapshot'
@@ -63,11 +63,11 @@ export class ActiveVideoBatchConflictError extends Error {
   groupIdxs: number[];
   batchIds: string[];
 
-  constructor(groupIdxs: number[], batchIds: string[]) {
+  constructor(groupIdxs: number[], batchIds: string[], label = '视频生成') {
     super(
       groupIdxs.length
-        ? `片段 ${groupIdxs.map((n) => n + 1).join('、')} 已有视频生成任务正在运行，请等待完成后再重试`
-        : '已有视频生成任务正在运行，请等待完成后再重试',
+        ? `片段 ${groupIdxs.map((n) => n + 1).join('、')} 已有${label}任务正在运行，请等待完成后再重试`
+        : `已有${label}任务正在运行，请等待完成后再重试`,
     );
     this.name = 'ActiveVideoBatchConflictError';
     this.groupIdxs = groupIdxs;
@@ -119,6 +119,87 @@ function _clearFailedStoryboardImageState(opts: {
   }
 
   return { groupIdx, firstFrameLastError, invalidateVideo: true, firstFrameCleared: false };
+}
+
+function _clearFailedTailFrameImageState(opts: {
+  batchType: string;
+  projectId: string;
+  user: UserRow;
+  target: BatchTaskTarget;
+  message: string;
+  errorCode?: string;
+  recoveryHint?: string;
+  imageSafetyAudit?: any;
+}): null | {
+  groupIdx: number;
+  tailFrameLastError: string;
+  tailFrameErrorCode?: string;
+  tailFrameRecoveryHint?: string;
+  tailFrameCleared: false;
+  frames?: { tail: any };
+} {
+  if (opts.batchType !== 'tail_frame_images') return null;
+  const groupIdx = _targetGroupIdx(opts.target);
+  if (groupIdx == null || !opts.projectId) return null;
+  const tailFrameLastError = (opts.message || '生成失败').slice(0, 500);
+  const errorCode = typeof opts.errorCode === 'string' && opts.errorCode.trim()
+    ? opts.errorCode.trim()
+    : undefined;
+  const recoveryHint = typeof opts.recoveryHint === 'string' && opts.recoveryHint.trim()
+    ? opts.recoveryHint.trim()
+    : undefined;
+  let emittedTail: any = null;
+
+  try {
+    patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
+      if (!fresh) return null;
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      while (storyboards.length <= groupIdx) storyboards.push({});
+      const prev = storyboards[groupIdx] || {};
+      const failedAt = new Date().toISOString();
+      const errorRec = {
+        message: tailFrameLastError,
+        failedAt,
+        at: failedAt,
+        batchType: opts.batchType,
+        errorCode,
+        recoveryHint,
+        imageSafetyAudit: opts.imageSafetyAudit,
+      };
+      // 复用 markTailFrameFailed 的 degraded/failed 判定: 有旧图 → degraded + 保留
+      // lastKnownGoodUrl; 无旧图 → failed。前后端语义对齐, 前端 _clearFailedTailFrameLocally
+      // 和这里写出同一个结果, 刷新拿回 server snapshot 也不会变化。
+      const prevTail = (prev.frames && typeof prev.frames === 'object' ? prev.frames.tail : null) || null;
+      const nextTailState = markTailFrameFailed(prev, errorRec);
+      const nextTail = {
+        ...(prevTail || {}),
+        url: nextTailState.currentUrl,
+        lastKnownGoodUrl: nextTailState.lastKnownGoodUrl,
+        status: nextTailState.status,
+        source: nextTailState.source,
+        lastError: nextTailState.lastError,
+      };
+      emittedTail = nextTail;
+      storyboards[groupIdx] = {
+        ...prev,
+        tailFrameLastError,
+        tailFrameFailedAt: failedAt,
+        frames: { ...(prev.frames || {}), tail: nextTail },
+      };
+      return { storyboards };
+    });
+  } catch (cleanupErr) {
+    console.error('[batch] failed to clear storyboard tail-frame state:', opts.projectId, groupIdx, cleanupErr);
+  }
+
+  return {
+    groupIdx,
+    tailFrameLastError,
+    tailFrameErrorCode: errorCode,
+    tailFrameRecoveryHint: recoveryHint,
+    tailFrameCleared: false,
+    frames: emittedTail ? { tail: emittedTail } : undefined,
+  };
 }
 
 function _markFailedAssetImageState(opts: {
@@ -252,7 +333,14 @@ function _markFailedVideoPromptState(opts: {
   return { groupIdx, videoPromptStatus: 'failed', videoPromptLastError, invalidateVideo: true };
 }
 
-function _findActiveVideoBatchOverlap(db: any, opts: {
+function _activeGroupBatchLabel(batchType: string): string | null {
+  if (batchType === 'videos') return '视频生成';
+  if (batchType === 'storyboard_images') return '首帧生成';
+  if (batchType === 'tail_frame_images') return '尾帧生成';
+  return null;
+}
+
+function _findActiveGroupBatchOverlap(db: any, opts: {
   user: UserRow;
   batchType: string;
   projectId: string;
@@ -263,8 +351,10 @@ function _findActiveVideoBatchOverlap(db: any, opts: {
   overlapGroupIdxs: number[];
   batchIds: string[];
   canReuse: boolean;
+  label: string;
 } {
-  if (opts.batchType !== 'videos') return null;
+  const label = _activeGroupBatchLabel(opts.batchType);
+  if (!label) return null;
   const requested = Array.from(
     new Set(opts.targets.map(_targetGroupIdx).filter((n): n is number => n != null)),
   );
@@ -304,6 +394,7 @@ function _findActiveVideoBatchOverlap(db: any, opts: {
     overlapGroupIdxs,
     batchIds,
     canReuse: allRequestedCovered && batchIds.length === 1,
+    label,
   };
 }
 
@@ -322,6 +413,7 @@ function _concurrencyFor(batchType: string): number {
   // 3 比 4 慢一点点（5-6 张时差 1-2 张的并行位），但能显著降低中转 429 限流概率。
   // 中转站每分钟总配额是固定的，并发越高越容易撞限流，4 多次实测会触发 bad_response。
   if (batchType === 'storyboard_images') return 3;
+  if (batchType === 'tail_frame_images') return 3;
   // 资产图可能有 10+ 张，并发 3 在实测里容易触发中转 429。
   if (batchType === 'asset_images') {
     return _envInt('ASSET_IMAGE_BATCH_CONCURRENCY', 2, 1, 6);
@@ -426,7 +518,7 @@ export function createBatch(opts: {
 
   db.exec('BEGIN IMMEDIATE');
   try {
-    const active = _findActiveVideoBatchOverlap(db, opts);
+    const active = _findActiveGroupBatchOverlap(db, opts);
     if (active) {
       if (active.canReuse) {
         result = {
@@ -438,7 +530,7 @@ export function createBatch(opts: {
         db.exec('COMMIT');
         return result;
       }
-      throw new ActiveVideoBatchConflictError(active.overlapGroupIdxs, active.batchIds);
+      throw new ActiveVideoBatchConflictError(active.overlapGroupIdxs, active.batchIds, active.label);
     }
 
     db.prepare(
@@ -611,7 +703,13 @@ export function startBatchOrphanReaper() {
 }
 
 function costForBatchType(batchType: string): number {
-  if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
+  if (
+    batchType === 'asset_images' ||
+    batchType === 'storyboard_images' ||
+    batchType === 'tail_frame_images'
+  ) {
+    return CREDIT_PRICES.image;
+  }
   if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
   if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
   return 0;
@@ -745,6 +843,16 @@ async function runBatch(opts: {
           message: msg,
           imageSafetyAudit: e?.imageSafetyAudit,
         });
+        const tailCleanupExtra = _clearFailedTailFrameImageState({
+          batchType: opts.batchType,
+          projectId: opts.projectId,
+          user: opts.user,
+          target,
+          message: msg,
+          errorCode: typeof e?.errorCode === 'string' ? e.errorCode : undefined,
+          recoveryHint: typeof e?.recoveryHint === 'string' ? e.recoveryHint : undefined,
+          imageSafetyAudit: e?.imageSafetyAudit,
+        });
         const assetCleanupExtra = _markFailedAssetImageState({
           batchType: opts.batchType,
           projectId: opts.projectId,
@@ -763,13 +871,13 @@ async function runBatch(opts: {
         });
         const failureResult = e?.imageSafetyAudit
           ? JSON.stringify({ imageSafetyAudit: e.imageSafetyAudit })
-          : null;
+          : '{}';
         db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, result_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
           .run(msg.slice(0, 1000), failureResult, t.id);
         failed++;
         db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
         const failureStage = typeof e?.failureStage === 'string' ? e.failureStage : undefined;
-        const extra = cleanupExtra || assetCleanupExtra || promptCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
+        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
         if (extra && failureStage) (extra as any).failureStage = failureStage;
         if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
         _emit(opts.batchId, 'task_failed', {
@@ -785,7 +893,13 @@ async function runBatch(opts: {
     };
 
     function costPerTask(batchType: string): number {
-      if (batchType === 'asset_images' || batchType === 'storyboard_images') return CREDIT_PRICES.image;
+      if (
+        batchType === 'asset_images' ||
+        batchType === 'storyboard_images' ||
+        batchType === 'tail_frame_images'
+      ) {
+        return CREDIT_PRICES.image;
+      }
       if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
       if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
       return 0;

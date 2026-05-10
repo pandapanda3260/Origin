@@ -63,7 +63,7 @@ import {
 } from './video-prompt-state';
 import { buildSeedancePromptParts } from './video-prompt-runtime';
 import { validateCharacterConsistencyForGroup } from './character-consistency-gate';
-import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl } from './visual-reference-state';
+import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl, checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
 import { pickSceneForShots } from './scene-selection';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit } from './frame-image-plan';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
@@ -179,6 +179,17 @@ function nowIso(): string {
 function errorWithFailureStage(message: string, failureStage: VideoPromptFailureStage): Error & { failureStage: VideoPromptFailureStage } {
   const err = new Error(message) as Error & { failureStage: VideoPromptFailureStage };
   err.failureStage = failureStage;
+  return err;
+}
+
+function errorWithRecoveryHint(
+  message: string,
+  errorCode: string,
+  recoveryHint: string,
+): Error & { errorCode: string; recoveryHint: string } {
+  const err = new Error(message) as Error & { errorCode: string; recoveryHint: string };
+  err.errorCode = errorCode;
+  err.recoveryHint = recoveryHint;
   return err;
 }
 
@@ -1079,22 +1090,23 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     throw new Error(`分组 #${groupIdx} 没有对应的镜头数据`);
   }
 
-  // Preflight: 本片段首帧必须已就绪。尾帧必须用首帧做连续性锚点。
+  // Preflight: 本片段首帧必须已就绪 + 模式是彩色视频首帧, legacy_pencil 手稿图不可做尾帧锚。
   const storyboards = (proj as any).storyboards || [];
   const sb = storyboards[groupIdx] || {};
-  const firstFrameUrl: string | undefined =
-    sb.firstFrameUrl || sb.frames?.first?.url || sb.firstFrame?.currentUrl;
-  if (!firstFrameUrl) {
-    throw new Error(
-      `片段 ${groupIdx + 1} 首帧未就绪, 无法生成尾帧。请先在首帧阶段生成并确认首帧图后再生成尾帧。`,
-    );
+  const preflightErr = checkTailFramePreflight(sb);
+  if (preflightErr) {
+    throw new Error(formatTailFramePreflightError(groupIdx, preflightErr));
   }
+  const firstFrameUrl: string =
+    sb.firstFrameUrl || sb.frames?.first?.url || sb.firstFrame?.currentUrl;
 
   // 首帧图的本地路径; 无法解析时降级为 text_only 锚 (plan 会标 droppedReason='unresolvable')。
   const selfFirstFrameLocal = resolveLocalImagePath(firstFrameUrl, ctx.user.id) || undefined;
   if (!selfFirstFrameLocal) {
-    console.warn(
-      `[tail_frame_images] group ${groupIdx}: firstFrameUrl 无法解析到本地, 尾帧将降级为文字锚: ${firstFrameUrl}`,
+    throw errorWithRecoveryHint(
+      '首帧图片文件不可解析，无法生成尾帧。',
+      'first_frame_file_unresolvable',
+      '请重新生成首帧，或点击“上传”重新上传一张首帧图后，再生成尾帧。',
     );
   }
 
