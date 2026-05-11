@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_REBUILD },
         { role: 'user', content: ctx.join('\n\n') },
       ],
-      { temperature: 0.5, maxTokens: 400, modelRole: 'brain' },
+      { temperature: 0.5, maxTokens: 400, modelRole: 'structured' },
     );
   } catch (e: any) {
     return jsonError('提示词生成失败：' + (e?.message || String(e)), 502);

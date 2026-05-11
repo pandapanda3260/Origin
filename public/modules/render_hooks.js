@@ -104,7 +104,10 @@ export function renderStoryboardCard(gIdx, status, payload) {
     if (loading) loading.hidden = true;
     if (error) error.hidden = true;
     if (payload.imgUrl) {
-      var updated = _updateCardImageInPlace(card, payload.imgUrl);
+      var firstFrame = card.querySelector('[data-frame="first"]');
+      var updated = firstFrame
+        ? _updateFrameImageInPlace(firstFrame, payload.imgUrl)
+        : _updateCardImageInPlace(card, payload.imgUrl);
       return { ok: true, needFullRerender: !updated };
     }
     return { ok: true };
@@ -129,6 +132,113 @@ export function renderStoryboardCard(gIdx, status, payload) {
   }
 
   return { ok: true };
+}
+
+
+// ---------------------------------------------------------------------------
+// Storyboard frame card (first / tail frame - P2.5a.T3)
+// ---------------------------------------------------------------------------
+
+/**
+ * 按 frame 类型增量更新分镜卡片内的 first/tail 两个独立图位。
+ * 与旧 renderStoryboardCard 区别: 不遍历卡片所有 <img>, 只更新
+ * [data-frame="first"|"tail"] 容器内的 img/data-img/loading/error,
+ * 保证一张图更新不影响另一张。
+ *
+ * DOM 约定 (由 T4 的模板保证):
+ *   <div data-frame="first"> ... <img|placeholder> ... <.sb-frame-loading> <.sb-frame-error> </div>
+ *   <div data-frame="tail">  ... <img|placeholder> ... <.sb-frame-loading> <.sb-frame-error> </div>
+ *
+ * @param {number} gIdx
+ * @param {"first"|"tail"} kind
+ * @param {"loading"|"done"|"error"} status
+ * @param {{imgUrl?: string, loadingText?: string, errMsg?: string}} payload
+ * @returns {{ok: boolean, needFullRerender?: boolean}}
+ */
+export function renderStoryboardFrameCard(gIdx, kind, status, payload) {
+  payload = payload || {};
+  if (kind !== 'first' && kind !== 'tail') {
+    console.warn('[render_hooks] renderStoryboardFrameCard: invalid kind', kind);
+    return { ok: false };
+  }
+  var grid = $("imageGrid");
+  if (!grid) return { ok: false, needFullRerender: true };
+  var card = grid.querySelector('[data-group-idx="' + gIdx + '"]');
+  if (!card) return { ok: false };
+
+  var frame = card.querySelector('[data-frame="' + kind + '"]');
+  if (!frame) {
+    // T4 前的旧模板没有 data-frame 容器 — 让调用方触发整体 re-render,
+    // 下次 grid render 时会拿到 T4 新模板。
+    return { ok: false, needFullRerender: true };
+  }
+
+  var loading = frame.querySelector(".sb-frame-loading");
+  var error = frame.querySelector(".sb-frame-error");
+  var loadingText = loading ? loading.querySelector("span") : null;
+
+  if (status === "loading") {
+    if (loading) loading.hidden = false;
+    if (error) error.hidden = true;
+    if (loadingText) loadingText.textContent = payload.loadingText || "生成中…";
+    return { ok: true };
+  }
+
+  if (status === "done") {
+    if (loading) loading.hidden = true;
+    if (error) error.hidden = true;
+    if (payload.imgUrl) {
+      var updated = _updateFrameImageInPlace(frame, payload.imgUrl);
+      return { ok: true, needFullRerender: !updated };
+    }
+    return { ok: true };
+  }
+
+  if (status === "error") {
+    if (loading) loading.hidden = true;
+    if (error) {
+      error.hidden = false;
+      var msgSpan = error.querySelector('.sb-frame-error-msg');
+      var msg = (payload.errMsg || "生成失败，请稍后重试").slice(0, 200);
+      if (msgSpan) {
+        msgSpan.textContent = msg;
+      } else {
+        error.textContent = msg;
+      }
+    }
+    return { ok: true };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * 在一个 [data-frame] 容器内替换 img/placeholder 的 src/data-img, 不动兄弟容器。
+ */
+function _updateFrameImageInPlace(frame, imgUrl) {
+  var img = frame.querySelector('img');
+  if (!img) {
+    var placeholder = frame.querySelector('.sb-frame-placeholder');
+    if (!placeholder) return false;
+    img = document.createElement('img');
+    img.className = placeholder.dataset.imgClass || 'w-full h-full object-cover';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.dataset.action = 'lightbox';
+    img.src = imgUrl;
+    placeholder.replaceWith(img);
+  } else {
+    img.loading = img.loading || 'lazy';
+    img.decoding = 'async';
+    img.src = imgUrl;
+  }
+  var zoomEls = frame.querySelectorAll('[data-img]');
+  for (var i = 0; i < zoomEls.length; i += 1) {
+    zoomEls[i].dataset.img = imgUrl;
+    hydrateProtectedImageElements(zoomEls[i]);
+  }
+  hydrateProtectedImageElements(img);
+  return true;
 }
 
 

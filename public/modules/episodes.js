@@ -217,10 +217,11 @@ export async function _createNewEpisode(overlay) {
 
     var newEp = {
       id: "ep_" + Date.now(),
-      title: resp.title || ("第 " + (project.episodes.length + 1) + " 集"),
-      idea: direction || "续写自前集",
-      script: resp.script,
-      scriptTargetDurationSec: resp.durationSec || project.scriptTargetDurationSec,
+	      title: resp.title || ("第 " + (project.episodes.length + 1) + " 集"),
+	      idea: direction || "续写自前集",
+	      script: resp.script,
+	      scriptDraft: resp.script,
+	      scriptTargetDurationSec: resp.durationSec || project.scriptTargetDurationSec,
       scriptApproved: false,
       assets: null,
       assetsApproved: false,
@@ -237,7 +238,6 @@ export async function _createNewEpisode(overlay) {
 
     project.episodes.push(newEp);
     var newIdx = project.episodes.length - 1;
-    _ctx.addToScriptLibrary(newEp.title || ("第 " + (newIdx + 1) + " 集"), resp.script, "episode");
     _loadEpisode(newIdx);
     _ctx.resetProjectUI();
     _ctx.saveProject();

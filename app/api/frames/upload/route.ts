@@ -7,7 +7,12 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from '@/lib/db';
 import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
-import { computeFirstFrameSourceHash, computeTailFrameSourceHash } from '@/lib/frame-workflow-state';
+import {
+  computeFirstFrameSourceHash,
+  computeTailFrameSourceHash,
+  maybeAssertStoryboardsAlignedWithShots,
+  storyboardShotIndices,
+} from '@/lib/frame-workflow-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -114,8 +119,12 @@ export async function POST(req: NextRequest) {
       const storyboards = Array.isArray((fresh as any).storyboards)
         ? [...(fresh as any).storyboards]
         : [];
-      while (storyboards.length <= groupIdx) storyboards.push({});
+      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+      if (groupIdx >= shots.length) {
+        throw new Error(`槽位 ${groupIdx + 1} 没有对应镜头`);
+      }
       const prev = storyboards[groupIdx] || {};
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       const prevFrames =
         prev.frames && typeof prev.frames === 'object' ? prev.frames : {};
       const tailFrameSourceHash = isTail ? computeTailFrameSourceHash(fresh, user.id, groupIdx) : null;
@@ -125,6 +134,9 @@ export async function POST(req: NextRequest) {
       storyboards[groupIdx] = isTail
         ? {
           ...prev,
+          idx: groupIdx,
+          shotIdx: groupIdx + 1,
+          shotIndices,
           tailFrameUrl: url,
           tailFrameMode: 'uploaded',
           tailFrameLastError: undefined,
@@ -143,11 +155,15 @@ export async function POST(req: NextRequest) {
               generatedAt,
               sourceHash: tailFrameSourceHash,
               referenceStatus: 'ready',
+              shotIndices,
             },
           },
         }
         : {
           ...prev,
+          idx: groupIdx,
+          shotIdx: groupIdx + 1,
+          shotIndices,
           url,
           imageUrl: url,
           rawUrl: url,
@@ -179,9 +195,11 @@ export async function POST(req: NextRequest) {
               mode: 'uploaded',
               generatedAt,
               sourceHash: firstFrameSourceHash,
+              shotIndices,
             },
           },
         };
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'frame-upload');
       return { storyboards };
     });
 

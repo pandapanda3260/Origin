@@ -112,6 +112,7 @@ Business routes may set task-intrinsic values:
 - `responseFormat` / schema shape
 - prompt builders
 - `modelRole`
+- 视频参考图预算 / `VIDEO_REFERENCE_IMAGE_BUDGET` 这类 video matcher 策略常量：当它描述的是业务侧参考图选择规则，而不是 provider/model 路由能力时，可以集中放在 matcher 相关代码里；必须保持单点定义，并在这里登记原因。
 
 Business routes must not hardcode global tuning knobs:
 

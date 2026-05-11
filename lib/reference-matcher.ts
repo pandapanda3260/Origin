@@ -17,6 +17,9 @@ type Candidate = Omit<ReferenceManifestItem, 'imageNo'> & {
   name: string;
   score: number;
   _order: number;
+  mentionCount?: number;
+  firstMentionIndex?: number;
+  relevanceScore?: number;
 };
 
 export type BuildVideoReferenceManifestInput = {
@@ -102,6 +105,12 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+function firstOccurrenceIndex(haystack: string, needle: string): number {
+  if (!haystack || !needle) return Number.MAX_SAFE_INTEGER;
+  const idx = haystack.indexOf(needle);
+  return idx < 0 ? Number.MAX_SAFE_INTEGER : idx;
+}
+
 function shotsFromInput(input: BuildVideoReferenceManifestInput): any[] {
   if (Array.isArray(input.shots) && input.shots.length) return input.shots;
   const allShots = Array.isArray(input.project?.shots) ? input.project.shots : [];
@@ -145,6 +154,9 @@ function firstChars(shots: any[]): string[] {
 
 function pushCandidate(list: Candidate[], candidate: Omit<Candidate, '_order'>) {
   if (!candidate.url) return;
+  // The current video-reference policy intentionally pushes at most one image
+  // per character. If future work allows multiple panels for the same character,
+  // this de-dupe key must include panelInfo.panel.
   if (list.some((item) => item.url === candidate.url || (
     item.role === candidate.role &&
     normalizeReferenceName(item.assetName) === normalizeReferenceName(candidate.assetName)
@@ -208,7 +220,15 @@ function addFirstFrameCandidate(candidates: Candidate[], input: BuildVideoRefere
 function slotSelect(candidates: Candidate[], budget: number): { selected: Candidate[]; dropped: DroppedReference[] } {
   const byRole = (role: VideoReferenceRole) => candidates
     .filter((c) => c.role === role)
-    .sort((a, b) => (b.score - a.score) || (a._order - b._order));
+    .sort((a, b) => {
+      if (role === 'prop') {
+        return ((b.mentionCount || 0) - (a.mentionCount || 0)) ||
+          ((a.firstMentionIndex ?? Number.MAX_SAFE_INTEGER) - (b.firstMentionIndex ?? Number.MAX_SAFE_INTEGER)) ||
+          ((b.relevanceScore ?? b.score) - (a.relevanceScore ?? a.score)) ||
+          (a._order - b._order);
+      }
+      return (b.score - a.score) || (a._order - b._order);
+    });
 
   const selected: Candidate[] = [];
   const selectedKeys = new Set<string>();
@@ -226,11 +246,18 @@ function slotSelect(candidates: Candidate[], budget: number): { selected: Candid
   const chars = byRole('character');
   const props = byRole('prop');
 
-  take(firstFrames[0]);
-  take(scenes[0]);
-  take(chars[0]);
-  take(props[0] || chars[1]);
-  take(chars[1] || props[1] || chars[2]);
+  [
+    firstFrames[0],
+    scenes[0],
+    chars[0],
+    chars[1],
+    chars[2],
+    props[0],
+    chars[3],
+    props[1],
+    chars[4],
+    props[2],
+  ].forEach(take);
 
   const dropped: DroppedReference[] = [];
   for (const c of candidates) {
@@ -271,7 +298,8 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     ownerId: input.ownerId,
     groupShotIndices: input.groupShotIndices,
     shots,
-    maxSlots: budget,
+    maxSlots: 5,
+    perCharacterLimit: 1,
   });
   selectedPanels.forEach((panel, idx) => {
     const ch = findCharacterByName(chars, panel.characterName);
@@ -318,7 +346,13 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     const url = assetUrl(ch);
     if (!url) {
       if (panelCoveredCharacterNames.has(norm)) return;
-      dropped.push({ role: 'character', assetName: name, reason: 'missing_file' });
+      dropped.push({ role: 'character', assetName: name, reason: 'asset_missing' });
+      return;
+    }
+    const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
+    if (!localPath) {
+      if (panelCoveredCharacterNames.has(norm)) return;
+      dropped.push({ role: 'character', assetName: name, reason: 'asset_missing' });
       return;
     }
     const defaults = roleDefaults('character');
@@ -334,7 +368,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       name,
       label: `${name} character reference`,
       url,
-      localPath: resolveLocalImagePath(url, input.ownerId) || undefined,
+      localPath,
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
@@ -369,7 +403,12 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     if (!explicitMatch && !mentions && !isMain) return;
     const url = assetUrl(scene);
     if (!url) {
-      dropped.push({ role: 'scene', assetName: name, reason: 'missing_file' });
+      dropped.push({ role: 'scene', assetName: name, reason: 'asset_missing' });
+      return;
+    }
+    const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
+    if (!localPath) {
+      dropped.push({ role: 'scene', assetName: name, reason: 'asset_missing' });
       return;
     }
     const defaults = roleDefaults('scene');
@@ -386,7 +425,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       name,
       label: `${name} scene reference`,
       url,
-      localPath: resolveLocalImagePath(url, input.ownerId) || undefined,
+      localPath,
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
@@ -405,22 +444,25 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     if (fallback) {
       const name = assetName(fallback, '主场景');
       const url = assetUrl(fallback);
-      const defaults = roleDefaults('scene');
-      pushCandidate(candidates, {
-        type: 'scene',
-        role: 'scene',
-        assetId: assetId(fallback),
-        assetName: name,
-        name,
-        label: `${name} scene reference`,
-        url,
-        localPath: resolveLocalImagePath(url, input.ownerId) || undefined,
-        useFor: defaults.useFor,
-        immutable: defaults.immutable,
-        promptHint: defaults.promptHint,
-        matchReason: 'fallback first scene with image',
-        score: 35,
-      });
+      const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
+      if (localPath) {
+        const defaults = roleDefaults('scene');
+        pushCandidate(candidates, {
+          type: 'scene',
+          role: 'scene',
+          assetId: assetId(fallback),
+          assetName: name,
+          name,
+          label: `${name} scene reference`,
+          url,
+          localPath,
+          useFor: defaults.useFor,
+          immutable: defaults.immutable,
+          promptHint: defaults.promptHint,
+          matchReason: 'fallback first scene with image',
+          score: 35,
+        });
+      }
     }
   }
 
@@ -434,9 +476,15 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     const norm = normalizeReferenceName(name);
     const mentions = norm ? countOccurrences(normText, norm) : 0;
     if (!mentions) return;
+    const firstMention = firstOccurrenceIndex(normText, norm);
     const url = assetUrl(prop);
     if (!url) {
-      dropped.push({ role: 'prop', assetName: name, reason: 'missing_file' });
+      dropped.push({ role: 'prop', assetName: name, reason: 'asset_missing' });
+      return;
+    }
+    const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
+    if (!localPath) {
+      dropped.push({ role: 'prop', assetName: name, reason: 'asset_missing' });
       return;
     }
     const defaults = roleDefaults('prop');
@@ -453,12 +501,15 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       name,
       label: `${name} prop reference`,
       url,
-      localPath: resolveLocalImagePath(url, input.ownerId) || undefined,
+      localPath,
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
       matchReason: 'group visual/dialogue/keyInfo text match',
       score: 80 + mentions * 8 - idx,
+      mentionCount: mentions,
+      firstMentionIndex: firstMention,
+      relevanceScore: 80,
     });
   });
 

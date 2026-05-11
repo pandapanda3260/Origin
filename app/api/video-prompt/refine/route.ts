@@ -25,7 +25,7 @@ export async function POST(req: NextRequest) {
       await chatStream(
         user,
         buildRefineMessages(currentPrompt, instruction),
-        { temperature: 0.5, maxTokens: 1500, modelRole: 'brain' },
+        { temperature: 0.5, maxTokens: 1500, modelRole: 'structured' },
         (delta) => {
           buf += delta;
           writer.chunk(delta);

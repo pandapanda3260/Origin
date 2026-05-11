@@ -155,7 +155,37 @@ async function main() {
     assert(thrown.imageSafetyAudit?.attempts?.length === 1, 'parameter error audit should contain one attempt');
   }
 
-  console.log('image moderation recovery ok (3 scenarios)');
+  // P3a: retry 必须把 referenceImagePaths 完整透传, 不能因 prompt 改写而丢图。
+  {
+    const calls = [];
+    const paths = ['/local/scene.png', '/local/alice.png', '/local/lantern.png'];
+    const result = await generateImageWithModerationRecovery(
+      user,
+      { ...baseInput, prompt: '猪八戒袒胸站在石阶。', referenceImagePaths: paths },
+      {
+        generateImageImpl: async (_user, input) => {
+          calls.push(input);
+          if (calls.length === 1) throw moderationError('sexual', 'req_multi_1');
+          return { id: 'img_multi_recovered', url: '/api/images/file/img_multi_recovered', width: 1, height: 1, bytes: 1, mode: 'fake' };
+        },
+      },
+    );
+    assert(calls.length === 2, 'multi-ref retry should reach generateImage twice');
+    assert(Array.isArray(calls[0].referenceImagePaths), 'first call receives the array');
+    assert(calls[0].referenceImagePaths.length === 3, 'first call has 3 refs');
+    assert(Array.isArray(calls[1].referenceImagePaths), 'retry still receives the array (not dropped)');
+    assert(calls[1].referenceImagePaths.length === 3, 'retry preserves all 3 refs');
+    for (let i = 0; i < 3; i += 1) {
+      assert(
+        calls[0].referenceImagePaths[i] === calls[1].referenceImagePaths[i]
+          && calls[1].referenceImagePaths[i] === paths[i],
+        `retry ref[${i}] should be identical to original`,
+      );
+    }
+    assert(result.safetyAudit.moderationRecovered === true, 'multi-ref recovery should still succeed');
+  }
+
+  console.log('image moderation recovery ok (4 scenarios)');
 }
 
 main().catch((error) => {

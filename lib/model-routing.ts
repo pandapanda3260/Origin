@@ -17,6 +17,32 @@ export type ProviderKind =
 
 export type ModelConfigSource = 'user-settings' | 'env' | 'fallback';
 
+/**
+ * 图像模型的多图参考能力 (P3a)。
+ *   - multiRefImage: 作为参考图同时传给 provider 的最大数量。1 = 只单图; 0 = 不支持参考图。
+ *   - transport: 具体装配格式。由 scripts/probe-multi-ref-*.js 实测定型, 先以 'unverified_*'
+ *     占位, probe 跑完后改成 'verified_*'。业务代码 (image-gen.ts) 根据 transport 选择分支。
+ * 默认值在 inferImageCapabilities() 里按 provider 推断; env IMAGE_MULTI_REF_CAP 可 override
+ * multiRefImage (1-16)。
+ */
+export type ImageTransport =
+  | 'single_image'
+  | 'unverified_seedream_array'
+  | 'verified_seedream_array'
+  | 'unverified_openai_multipart_repeat'
+  | 'verified_openai_multipart_repeat'
+  | 'verified_openai_multipart_bracket'
+  | 'verified_openai_multipart_image_files';
+
+export type ImageModelCapabilities = {
+  multiRefImage: number;
+  transport: ImageTransport;
+};
+
+export type ModelCapabilities = {
+  image?: ImageModelCapabilities;
+};
+
 export type ResolvedModelConfig = {
   baseUrl: string;
   apiKey: string;
@@ -40,6 +66,7 @@ export type ResolvedModelConfig = {
   seedreamOptimizePromptMode?: string;
   timeoutMs?: number;
   minDurationSec?: number;
+  capabilities?: ModelCapabilities;
 };
 
 export function resolveTextModelConfig(
@@ -106,7 +133,7 @@ export function resolveSlotModelConfig(
     const provider = inferProvider(env('IMAGE_PROVIDER'), 'image');
     const isSeedream = provider === 'volcengine_seedream';
     const key = isSeedream
-      ? env('IMAGE_SEEDREAM_API_KEY') || env('VIDEO_API_KEY') || env('IMAGE_API_KEY')
+      ? env('IMAGE_SEEDREAM_API_KEY') || env('IMAGE_API_KEY')
       : env('IMAGE_API_KEY');
     if (key) {
       return real({
@@ -231,7 +258,47 @@ function real(input: RealModelInput): ResolvedModelConfig {
       ? normalizeEndpoint(input.imageGenerationEndpoint)
       : input.imageGenerationEndpoint,
     imageEditEndpoint: input.imageEditEndpoint ? normalizeEndpoint(input.imageEditEndpoint) : input.imageEditEndpoint,
+    capabilities: input.capabilities || inferDefaultCapabilities(input.provider),
     mode: 'real',
+  };
+}
+
+/**
+ * 按 provider 推断默认能力。env IMAGE_MULTI_REF_CAP 可 override multiRefImage (1-16)。
+ * transport 先用 'unverified_*', 跑过 scripts/probe-multi-ref-*.js 验证后手动改成 'verified_*'。
+ * 多图装配的实际格式依赖 probe 结论, 在 lib/image-gen.ts 按 transport 分支处理。
+ */
+function inferDefaultCapabilities(provider: ProviderKind): ModelCapabilities {
+  const envCapRaw = process.env.IMAGE_MULTI_REF_CAP;
+  const envCap = Number(envCapRaw);
+  const envCapValid = Number.isFinite(envCap) && envCap >= 1 ? Math.min(Math.floor(envCap), 16) : null;
+
+  if (provider === 'volcengine_seedream') {
+    // Seedream 4.0/4.5/5.0-lite 官方文档写明最多 14 张参考图;
+    // 本地 probe 已验证当前 env 模型的 2/3/4 图 image:string[] 形态可用。
+    return {
+      image: {
+        multiRefImage: envCapValid != null ? Math.min(envCapValid, 14) : 14,
+        transport: 'verified_seedream_array',
+      },
+    };
+  }
+  if (provider === 'zerail_images') {
+    // OpenAI GPT image models edit 官方上限 16; multipart 字段名需要 probe 实测
+    // (image 重复 / image[] / image_files[] 都是候选)。
+    return {
+      image: {
+        multiRefImage: envCapValid ?? 1,
+        transport: 'unverified_openai_multipart_repeat',
+      },
+    };
+  }
+  // 其它 provider 回退单图, transport=single_image 时 image-gen 走旧的 referenceImagePath 路径。
+  return {
+    image: {
+      multiRefImage: 1,
+      transport: 'single_image',
+    },
   };
 }
 

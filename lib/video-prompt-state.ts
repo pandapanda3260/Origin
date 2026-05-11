@@ -21,6 +21,7 @@ export type FirstFrameReadiness = {
 export type VideoPromptFailureStage =
   | 'preflight_video_prompt_not_ready'
   | 'preflight_missing_first_frame'
+  | 'preflight_target_end_not_supported'
   | 'submit_network'
   | 'submit_rate_limited'
   | 'submit_auth'

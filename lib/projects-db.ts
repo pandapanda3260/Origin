@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, unlinkSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { getDb, type ProjectRow } from './db';
-import { listScriptLibraryItems } from './script-library-db';
+import { buildFrameWorkflowNormalizationPatch, maybeAssertStoryboardsAlignedWithShots } from './frame-workflow-state';
 
 const EMPTY_DATA = {
   oneSentence: '',
@@ -69,7 +69,6 @@ function preserveExistingAssetUrls(existing: any, next: any) {
 function rowToPublic(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
-  const scriptLibrary = listScriptLibraryItems(r.owner_id, r.id);
   return {
     id: r.id,
     ownerId: r.owner_id,
@@ -83,7 +82,6 @@ function rowToPublic(r: ProjectRow) {
     updatedAt: r.updated_at,
     ...EMPTY_DATA,
     ...data,
-    ...(scriptLibrary.length ? { scriptLibrary } : {}),
   };
 }
 
@@ -104,7 +102,7 @@ export function listProjectsByUser(userId: number) {
   const db = getDb();
   const rows = db
     .prepare<{ uid: number }, ProjectRow>(
-      'SELECT * FROM projects WHERE owner_id = @uid ORDER BY updated_at DESC',
+      'SELECT * FROM projects WHERE owner_id = @uid ORDER BY created_at DESC',
     )
     .all({ uid: userId });
   return rows.map(rowToSummary);
@@ -117,7 +115,23 @@ export function getProjectByIdForUser(id: string, userId: number) {
       'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
     )
     .get({ id, uid: userId });
-  return row ? rowToPublic(row) : null;
+  if (!row) return null;
+  const project = rowToPublic(row);
+  const normalizationPatch = buildFrameWorkflowNormalizationPatch(project, userId);
+  if (normalizationPatch) {
+    const applied = applyPatchToRow(row, normalizationPatch);
+    db.prepare(
+      `UPDATE projects
+       SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND owner_id = ?`,
+    ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
+    return {
+      ...project,
+      ...normalizationPatch,
+    };
+  }
+  return project;
 }
 
 export function createProjectForUser(userId: number, payload: any = {}) {
@@ -180,6 +194,7 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   delete newData.createdAt;
   delete newData.updatedAt;
   delete newData.ownerId;
+  delete newData.scriptLibrary;
   delete newData.allowEmptyAssetUrls;
 
   return {
@@ -207,7 +222,21 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
       .get({ id, uid: userId });
     if (!existing) return;
     hit = true;
-    const applied = applyPatchToRow(existing, patch || {});
+    const current = rowToPublic(existing);
+    const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
+    const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
+    const rawPatch = patch || {};
+    const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...rawPatch } : rawPatch;
+    const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
+      Object.prototype.hasOwnProperty.call(combinedPatch, key)
+    ));
+    if (touchesFrameStructure) {
+      maybeAssertStoryboardsAlignedWithShots(
+        { ...normalizedCurrent, ...combinedPatch },
+        'updateProjectForUser',
+      );
+    }
+    const applied = applyPatchToRow(existing, combinedPatch);
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
@@ -227,8 +256,7 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
  * 使用示例（批量执行器）：
  *   patchProjectForUser(projectId, userId, (current) => {
  *     const sbs = Array.isArray(current.storyboards) ? [...current.storyboards] : [];
- *     while (sbs.length <= groupIdx) sbs.push({});
- *     sbs[groupIdx] = { ...sbs[groupIdx], imageUrl: url };
+ *     sbs[groupIdx] = { ...sbs[groupIdx], shotIndices: [groupIdx], imageUrl: url };
  *     return { storyboards: sbs };
  *   });
  */
@@ -248,8 +276,20 @@ export function patchProjectForUser(
     if (!existing) return;
     hit = true;
     const current = rowToPublic(existing);
-    const patch = patcher(current) || {};
-    const applied = applyPatchToRow(existing, patch);
+    const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
+    const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
+    const patch = patcher(normalizedCurrent) || {};
+    const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...patch } : patch;
+    const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
+      Object.prototype.hasOwnProperty.call(combinedPatch, key)
+    ));
+    if (touchesFrameStructure) {
+      maybeAssertStoryboardsAlignedWithShots(
+        { ...normalizedCurrent, ...combinedPatch },
+        'patchProjectForUser',
+      );
+    }
+    const applied = applyPatchToRow(existing, combinedPatch);
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,

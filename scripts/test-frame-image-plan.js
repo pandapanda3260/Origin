@@ -203,6 +203,82 @@ function makeFixtureScene() {
   };
 }
 
+function makeQualityPackProject() {
+  const propNames = ['lantern', 'map', 'coin', 'sword', 'cup', 'key', 'orb'];
+  return {
+    id: 'proj-quality-pack',
+    styleBible: {
+      visualStyle: 'premium cinematic realism',
+      colorPalette: 'deep red and gold',
+      mood: 'ceremonial tension',
+    },
+    shots: [
+      {
+        idx: 1,
+        shotType: 'medium',
+        camera: 'slow push',
+        visual: 'Bob raises the orb while Alice watches; Charlie waits near the lantern, map, coin, sword, cup, and key.',
+        imagePrompt: 'Bob must hold the glowing orb in the foreground.',
+        dialogue: 'Bob: Keep the orb safe.',
+        characters: ['Bob', 'Alice'],
+      },
+      {
+        idx: 2,
+        shotType: 'wide',
+        camera: 'pan left',
+        visual: 'Alice and Charlie move behind Bob as the lantern and map remain visible.',
+        dialogue: 'Alice: Charlie, guard the map.',
+        characters: ['Alice', 'Charlie'],
+      },
+    ],
+    assets: {
+      characters: [
+        {
+          characterId: 'c-alice',
+          name: 'Alice',
+          identity: 'strategist',
+          appearance: 'silver hair',
+          clothing: 'blue robe',
+          imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000101',
+        },
+        {
+          characterId: 'c-bob',
+          name: 'Bob',
+          identity: 'guardian',
+          appearance: 'broad shoulders',
+          clothing: 'red armor',
+          imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000102',
+        },
+        {
+          characterId: 'c-charlie',
+          name: 'Charlie',
+          identity: 'scout',
+          appearance: 'short black hair',
+          clothing: 'green cloak',
+          imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000103',
+        },
+      ],
+      props: propNames.map((name, idx) => ({
+        propId: `p-${name}`,
+        name,
+        description: `${name} reference prop`,
+        imageUrl: `/api/images/file/00000000-0000-0000-0000-00000000020${idx + 1}`,
+      })),
+    },
+  };
+}
+
+function makeQualityPackScene() {
+  return {
+    id: 's-hall',
+    name: 'Rainy Hall',
+    location: 'ceremonial stone hall',
+    description: 'wet stone floor, tall pillars, red banners',
+    lighting: 'golden overhead lamps',
+    imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000301',
+  };
+}
+
 const MODEL_SNAPSHOT_CAP1 = {
   provider: 'zerail_images',
   model: 'doubao-seedream-4-5',
@@ -241,9 +317,9 @@ async function testFirstFrameFullyResolved() {
   assert(plan.scene && plan.scene.name === 'Rainy Doorway', 'scene picked');
   assertEqual(plan.props.map((p) => p.name), ['lantern'], 'lantern picked');
 
-  // manifest: scene (slot 1) → character (slot 2) → prop (slot 3), 稳定顺序
+  // manifest: character (slot 1) → scene (slot 2) → prop (slot 3), 角色一致性优先
   const roles = plan.referenceManifest.map((r) => r.role);
-  assertEqual(roles, ['scene', 'character', 'prop'], 'manifest order');
+  assertEqual(roles, ['character', 'scene', 'prop'], 'manifest order');
   const slots = plan.referenceManifest.map((r) => r.slot);
   assertEqual(slots, [1, 2, 3], 'manifest slot is 1-based contiguous');
 
@@ -252,7 +328,7 @@ async function testFirstFrameFullyResolved() {
   assertEqual(deliveries, ['image', 'text_only', 'text_only'], 'cap=1 delivery pattern');
   const reasons = plan.referenceManifest.map((r) => r.droppedReason || null);
   assertEqual(reasons, [null, 'over_capacity', 'over_capacity'], 'droppedReason pattern');
-  assertEqual(plan.referenceManifest[0].localPath, '/local/scene.png', 'scene localPath resolved');
+  assertEqual(plan.referenceManifest[0].localPath, '/local/alice.png', 'character localPath resolved');
 
   // finalPrompt 必含 8 段关键标题
   const p = plan.finalPrompt;
@@ -268,8 +344,8 @@ async function testFirstFrameFullyResolved() {
     assert(p.includes(marker), `finalPrompt should contain ${marker}`);
   }
   // reference 描述中应点名 character 的 assetName
-  assert(p.includes('Image 1 = scene'), 'Image 1 = scene line present');
-  assert(!p.includes('Image 2 = character'), 'character slot is over_capacity so not shown as Image 2');
+  assert(p.includes('Image 1 = character'), 'Image 1 = character line present');
+  assert(!p.includes('Image 2 = scene'), 'scene slot is over_capacity so not shown as Image 2');
 
   // summary
   const summary = mod.summarizePlanForAudit(plan);
@@ -417,7 +493,7 @@ async function testTailFramePlanBasic() {
   // 没传 selfFirstFrame, 所以 manifest 不应含 self_first_frame
   const roles = plan.referenceManifest.map((r) => r.role);
   assert(!roles.includes('self_first_frame'), 'no selfFirstFrame input → no self_first_frame slot');
-  assertEqual(roles[0], 'scene', 'without self_first_frame, slot 1 is scene');
+  assertEqual(roles[0], 'character', 'without self_first_frame, slot 1 is primary character');
   // prompt 必含 closing + continuity 语言
   assert(plan.finalPrompt.includes('closing beat'), 'tail prompt mentions closing beat');
   assert(plan.finalPrompt.includes('Maintain continuity with the opening frame'), 'tail prompt enforces continuity with opening frame');
@@ -531,16 +607,15 @@ async function testImageNoContinuity() {
   });
 
   const manifest = plan.referenceManifest;
-  // scene 仍占 slot 1 但 delivery='text_only' (scene remoteUrl 存在但 local 解析失败)
-  assertEqual(manifest[0].role, 'scene', 'slot 1 = scene (by candidate order)');
+  // character 先占 slot 1; scene slot 2 因 local 解析失败降级 text_only, 不占 imageNo。
+  assertEqual(manifest[0].role, 'character', 'slot 1 = character (by candidate order)');
   assertEqual(manifest[0].slot, 1, 'slot 1');
-  assertEqual(manifest[0].delivery, 'text_only', 'scene text_only because local unresolvable');
-  assert(manifest[0].imageNo === undefined, 'scene (text_only) has no imageNo');
-  // character 是 slot 2, 但它是第一张真正的 image → imageNo=1
-  assertEqual(manifest[1].role, 'character', 'slot 2 = character');
+  assertEqual(manifest[0].delivery, 'image', 'character is image');
+  assertEqual(manifest[0].imageNo, 1, 'character imageNo = 1 (first image)');
+  assertEqual(manifest[1].role, 'scene', 'slot 2 = scene');
   assertEqual(manifest[1].slot, 2, 'slot 2');
-  assertEqual(manifest[1].delivery, 'image', 'character is image');
-  assertEqual(manifest[1].imageNo, 1, 'character imageNo = 1 (first image)');
+  assertEqual(manifest[1].delivery, 'text_only', 'scene text_only because local unresolvable');
+  assert(manifest[1].imageNo === undefined, 'scene (text_only) has no imageNo');
   // prop 是 slot 3, imageNo=2
   assertEqual(manifest[2].role, 'prop', 'slot 3 = prop');
   assertEqual(manifest[2].slot, 3, 'slot 3');
@@ -590,7 +665,7 @@ async function testPlanCapThreeAllImages() {
   assertEqual(manifest.map((r) => r.delivery), ['image', 'image', 'image'], 'all 3 go as image at cap=3');
   assertEqual(manifest.map((r) => r.imageNo), [1, 2, 3], 'imageNo 1/2/3 contiguous');
   assertEqual(manifest.map((r) => r.slot), [1, 2, 3], 'slot 1/2/3 contiguous too');
-  for (const marker of ['Image 1 = scene', 'Image 2 = character', 'Image 3 = prop']) {
+  for (const marker of ['Image 1 = character', 'Image 2 = scene', 'Image 3 = prop']) {
     assert(plan.finalPrompt.includes(marker), `prompt should mention ${marker}`);
   }
   const summary = mod.summarizePlanForAudit(plan);
@@ -632,6 +707,68 @@ async function testPlanCapFiveCandidatesThree() {
   assert(paths.every((p) => typeof p === 'string' && p.length > 0), 'all paths resolved');
 }
 
+async function testFirstFrameFourImageQualityPack() {
+  const project = makeQualityPackProject();
+  const scene = makeQualityPackScene();
+  const localMap = {
+    [scene.imageUrl]: '/local/scene-hall.png',
+  };
+  for (const ch of project.assets.characters) localMap[ch.imageUrl] = `/local/${ch.name}.png`;
+  for (const prop of project.assets.props) localMap[prop.imageUrl] = `/local/${prop.name}.png`;
+  const mod = loadAll({
+    imageGen: makeImageGenStub(localMap),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0, 1],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: { ...MODEL_SNAPSHOT_CAP1, multiRefImageCap: 14 },
+  });
+
+  const sent = plan.referenceManifest.filter((r) => r.delivery === 'image');
+  assertEqual(sent.length, 4, 'business budget sends exactly 4 refs');
+  assertEqual(sent.map((r) => r.imageNo), [1, 2, 3, 4], 'imageNo 1..4 contiguous');
+  assertEqual(sent.map((r) => r.role), ['character', 'scene', 'character', 'prop'], 'first frame 4-image role order');
+  assertEqual(sent.map((r) => r.assetName), ['Bob', 'Rainy Hall', 'Alice', 'orb'], 'primary, scene, secondary, key prop order');
+
+  const textOnly = plan.referenceManifest.filter((r) => r.delivery === 'text_only');
+  assert(textOnly.some((r) => r.assetName === 'Charlie'), 'third character falls to text_only');
+  assert(textOnly.some((r) => r.assetName === 'lantern'), 'remaining prop falls to text_only');
+  assert(textOnly.every((r) => String(r.textFallback || '').trim().length > 0), 'all text_only refs keep textFallback');
+}
+
+async function testTailFrameUnresolvableSelfFirstFrameShiftsImageNo() {
+  const scene = makeFixtureScene();
+  const firstFrameUrl = '/api/images/file/00000000-0000-0000-0000-0000000000ff';
+  const mod = loadAll({
+    imageGen: makeImageGenStub({
+      [scene.imageUrl]: '/local/scene.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000a1': '/local/alice.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000b1': '/local/lantern.png',
+    }),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project: makeFixtureProject(),
+    groupIdx: 0,
+    shotIndices: [0, 1],
+    ownerId: 42,
+    frameType: 'tail_frame',
+    modelSnapshot: { ...MODEL_SNAPSHOT_CAP1, multiRefImageCap: 4 },
+    selfFirstFrame: { remoteUrl: firstFrameUrl },
+  });
+  const manifest = plan.referenceManifest;
+  assertEqual(manifest[0].role, 'self_first_frame', 'self_first_frame remains slot 1 candidate');
+  assertEqual(manifest[0].delivery, 'text_only', 'unresolvable self_first_frame falls back to text_only');
+  assert(manifest[0].imageNo === undefined, 'unresolvable self_first_frame does not consume imageNo');
+  const sent = manifest.filter((r) => r.delivery === 'image');
+  assertEqual(sent[0].role, 'character', 'primary character shifts to Image 1');
+  assertEqual(sent[0].imageNo, 1, 'Image 1 is assigned to first real submitted image');
+}
+
 async function testTailFrameUnknownTypeRejected() {
   const mod = loadAll({
     imageGen: makeImageGenStub({}),
@@ -665,6 +802,8 @@ async function main() {
     ['imageNo continuity when scene skipped', testImageNoContinuity],
     ['plan cap=3 → all 3 candidates as image, imageNo 1/2/3', testPlanCapThreeAllImages],
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],
+    ['first_frame 4-image quality pack order and overflow text_only', testFirstFrameFourImageQualityPack],
+    ['tail_frame unresolvable self_first_frame shifts imageNo', testTailFrameUnresolvableSelfFirstFrameShiftsImageNo],
     ['unknown frameType rejected', testTailFrameUnknownTypeRejected],
   ];
   let pass = 0;

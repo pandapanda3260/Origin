@@ -1,5 +1,6 @@
 import { statSync } from 'node:fs';
 import { isIndependentMultiImageModeEnabled } from './feature-flags';
+import type { TargetEndStrategy } from './video-provider-capabilities';
 
 export type VideoReferenceImage = {
   role: 'first_frame' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
@@ -39,6 +40,9 @@ export type SeedancePromptInput = {
   }>;
   propReferencePaths?: string[];
   referenceImages?: VideoReferenceImage[];
+  targetEndStrategy?: TargetEndStrategy;
+  targetEndCaption?: string;
+  targetEndUnsupportedReason?: string;
 };
 
 function referenceRoleText(role: VideoReferenceImage['role']): string {
@@ -213,10 +217,34 @@ function buildIndependentStyleBlock(refCount: number): string {
     `已附上 ${refCount} 张独立 reference_image。必须按上方 Image 编号理解每张图的职责，不要把角色图、场景图、道具图混成拼贴画。\n` +
     `最终视频必须满足：\n` +
     `  · Image 1 若为 first frame，视频必须从该彩色首帧自然运动起来，开场构图和主体不能突变\n` +
+    `  · 若存在 target ending frame，视频最后一帧必须逐步接近它的构图、角色位置、动作状态和光照\n` +
     `  · 角色严格匹配对应 character reference；非人/拟人角色绝对不能画成真人\n` +
     `  · 场景、道具只参考其指定图片，保持全彩电影级真人画质\n` +
     `  · 画面中严禁出现参考图 UI、网格、黑条、缩略图条、边框、说明文字或字幕\n\n`
   );
+}
+
+function buildTargetEndConstraintBlock(input: SeedancePromptInput, refs: VideoReferenceImage[]): string {
+  const targetEndRefIndex = refs.findIndex((ref) => ref.role === 'target_end');
+  if (targetEndRefIndex >= 0) {
+    return (
+      `【目标结束帧约束】\n` +
+      `Image ${targetEndRefIndex + 1} 是本片段的 target ending frame。视频必须从 first frame 自然运动，` +
+      `并在结尾逐步接近 Image ${targetEndRefIndex + 1} 的构图、角色位置、动作结束状态、光照和空间关系。\n` +
+      `不要在中途硬切到尾帧；需要通过角色动作和镜头运动自然抵达该终点。\n\n`
+    );
+  }
+
+  const caption = String(input.targetEndCaption || '').trim();
+  if (caption && input.targetEndStrategy === 'caption') {
+    return (
+      `【目标结束帧约束】\n` +
+      `本片段结尾必须接近以下尾帧描述：${caption.slice(0, 800)}\n` +
+      `保持结尾构图、角色位置、动作结束状态、光照和空间关系，不要把这段描述画成字幕或屏幕文字。\n\n`
+    );
+  }
+
+  return '';
 }
 
 export function buildSeedancePromptParts(input: SeedancePromptInput) {
@@ -239,6 +267,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
   const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
   const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
   const independentReferenceBlock = buildIndependentReferencePromptBlock(independentReferenceImages);
+  const targetEndConstraintBlock = buildTargetEndConstraintBlock(input, independentReferenceImages);
   const motionOpeningBlock = buildMotionOpeningBlock();
 
   let styleOverrideBlock = '';
@@ -257,6 +286,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     { id: 'character-lock', title: '角色一致性主档', content: characterLockBlock },
     { id: 'continuity', title: '前后片段衔接规则', content: continuityBlock },
     { id: 'independent-reference', title: '独立多图参考规则', content: independentReferenceBlock },
+    { id: 'target-end', title: '目标结束帧约束', content: targetEndConstraintBlock },
     { id: 'motion-opening', title: '开场动态强制规则', content: motionOpeningBlock },
     { id: 'style-override', title: '风格/参考图负向约束', content: styleOverrideBlock },
   ].filter((block) => block.content);
@@ -266,6 +296,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     `${characterLockBlock}` +
     `${continuityBlock}` +
     `${independentReferenceBlock}` +
+    `${targetEndConstraintBlock}` +
     `${motionOpeningBlock}` +
     `${styleOverrideBlock}` +
     `${input.prompt}`;
@@ -277,6 +308,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     voiceBlock: '',
     continuityBlock,
     independentReferenceBlock,
+    targetEndConstraintBlock,
     motionOpeningBlock,
     styleOverrideBlock,
     ruleBlocks,
@@ -287,5 +319,79 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     hasFirstFrameRef,
     hasColorRefs,
     hasAnyRef,
+  };
+}
+
+// ============================================================================
+// Builder A — first + last frame prompt builder
+//
+// Seedance's "first+last frame image-to-video" mode is mutually exclusive
+// with its multi-reference mode. When Builder A is active, the payload
+// contains exactly two image_url items (role: first_frame / last_frame) and
+// NO reference_image items. The prompt therefore must not reference any
+// "Image N / character reference / scene reference" bindings.
+//
+// ratio and duration are sent as TOP-LEVEL body fields in Builder A, not
+// embedded in the prompt tail. So finalPrompt here does NOT append
+// "--ratio X --duration Y" (unlike buildSeedancePromptParts above).
+// ============================================================================
+
+export type SeedanceFirstLastFramePromptInput = {
+  prompt: string;
+  dialoguePairs?: Array<{ speaker: string; text: string }>;
+  characterLockRoster?: string;
+  voiceRoster?: string;
+  prevTailSummary?: string;
+  nextHeadSummary?: string;
+};
+
+function buildFirstLastFrameConstraintBlock(): string {
+  return (
+    `【首尾帧约束 - 首尾帧图生视频】\n` +
+    `本片段使用首尾帧模式生成，请严格遵守以下约束：\n` +
+    `  · 视频第 0 帧必须锚定到 first frame（提交的首帧图）：开场构图、角色站位、光照、色调与首帧一致\n` +
+    `  · 视频最后一帧必须接近 last frame（提交的尾帧图/target ending frame）：结尾构图、角色位置、动作结束状态、光照与尾帧一致\n` +
+    `  · 中间部分从首帧自然运动到尾帧，禁止硬切；通过角色动作和镜头运动自然抵达终点\n` +
+    `  · 保持全彩电影级真人画质；禁止保留参考图的 UI / 网格 / 边框 / 说明文字\n` +
+    `  · 不要把约束描述画成字幕或屏幕文字\n\n`
+  );
+}
+
+export function buildSeedanceFirstLastFramePromptParts(input: SeedanceFirstLastFramePromptInput) {
+  const dialogueBlock = buildDialogueBlock(input.dialoguePairs);
+  const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
+  const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
+  const firstLastFrameBlock = buildFirstLastFrameConstraintBlock();
+  const motionOpeningBlock = buildMotionOpeningBlock();
+
+  const ruleBlocks: VideoPromptRuleBlock[] = [
+    { id: 'dialogue', title: '台词系统规则', content: dialogueBlock },
+    { id: 'character-lock', title: '角色一致性主档', content: characterLockBlock },
+    { id: 'continuity', title: '前后片段衔接规则', content: continuityBlock },
+    { id: 'first-last-frame', title: '首尾帧约束', content: firstLastFrameBlock },
+    { id: 'motion-opening', title: '开场动态强制规则', content: motionOpeningBlock },
+  ].filter((block) => block.content);
+
+  const promptCore =
+    `${dialogueBlock}` +
+    `${characterLockBlock}` +
+    `${continuityBlock}` +
+    `${firstLastFrameBlock}` +
+    `${motionOpeningBlock}` +
+    `${input.prompt || ''}`;
+
+  // Intentional: no "--ratio X --duration Y" suffix. Those are top-level
+  // fields in Builder A's request body.
+  const finalPrompt = promptCore;
+
+  return {
+    dialogueBlock,
+    characterLockBlock,
+    continuityBlock,
+    firstLastFrameBlock,
+    motionOpeningBlock,
+    ruleBlocks,
+    promptCore,
+    finalPrompt,
   };
 }

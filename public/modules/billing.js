@@ -19,15 +19,13 @@ export function getBillingSummary() {
 }
 
 export function refreshBillingBadge() {
-  // 两处都刷：
-  //   - #accountBillingBadge  左下账户卡里的小字
-  //   - #navBillingLabel       左侧导航「订阅与积分」入口的 label
+  // 刷新账户余额文案：
+  //   - #accountBillingBadge  账户卡里的小字（如果当前布局提供）
   // 文案格式："<档位title> · <积分图标> <数字> 积分"，例如 "Pro · [toll] 1234 积分"。
   // 档位 title 直接取后端 /api/billing/me 下发的 currentPlan.title，前端不做 code→title 映射；
   // 这样后端加档位 / 改档位文案（services/billing_service.py PLANS 表），前端一行都不用动。
   var badgeEl = document.getElementById('accountBillingBadge');
-  var navLabelEl = document.getElementById('navBillingLabel');
-  if (!badgeEl && !navLabelEl) return;
+  if (!badgeEl) return;
 
   var planTitle, credits;
   if (!_summary) {
@@ -49,7 +47,6 @@ export function refreshBillingBadge() {
     safeCredits + ' 积分';
 
   if (badgeEl) badgeEl.innerHTML = html;
-  if (navLabelEl) navLabelEl.innerHTML = html;
 }
 
 export async function loadBillingSummary() {

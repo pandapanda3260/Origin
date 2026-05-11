@@ -846,143 +846,14 @@ function _storyboardFramePanelHtml(kind, sb, gIdx) {
    ================================================================ */
 export function getStoryboardGroups() {
   if (!project || !project.shots) return [];
-  var shots = project.shots;
-  var hasGroupBoundary = shots.some(function (s) { return s.groupBoundary; });
-  var rawGroups = [];
-
-  if (!hasGroupBoundary) {
-    // 按情绪段切组：同 emotion 连续的镜头放一组，emotion 变化就切；
-    // 单组上限放到 4——分镜稿一张图最多画 2x2 四格，超过 4 个镜头时另起一组。
-    // 之前 cap=3 会导致出现 3 格不规则布局，原网站只用 1×2 或 2×2 两种。
-    var bucket = [];
-    var bucketIndices = [];
-    var bucketEmotion = null;
-    var flush = function () {
-      if (!bucket.length) return;
-      rawGroups.push({
-        shotIndices: bucketIndices.slice(),
-        shots: bucket.slice(),
-        emotion: bucketEmotion || 'general',
-      });
-      bucket = [];
-      bucketIndices = [];
+  return project.shots.map(function (shot, idx) {
+    return {
+      groupIdx: idx,
+      shotIndices: [idx],
+      shots: [shot],
+      emotion: shot.emotion || 'general',
     };
-    shots.forEach(function (shot, idx) {
-      var em = shot.emotion || 'general';
-      if (bucketEmotion === null) bucketEmotion = em;
-      var emotionChanged = (em !== bucketEmotion);
-      var bucketFull = (bucket.length >= 4);
-      if (emotionChanged || bucketFull) {
-        flush();
-        bucketEmotion = em;
-      }
-      bucket.push(shot);
-      bucketIndices.push(idx);
-    });
-    flush();
-  } else {
-    var curShots = [];
-    var curIndices = [];
-    shots.forEach(function (shot, idx) {
-      curShots.push(shot);
-      curIndices.push(idx);
-      if (shot.groupBoundary || idx === shots.length - 1) {
-        rawGroups.push({
-          shotIndices: curIndices.slice(),
-          shots: curShots.slice(),
-          emotion: shot.emotion || "general"
-        });
-        curShots = [];
-        curIndices = [];
-      }
-    });
-  }
-
-  // —— Normalize 阶段 ——
-  // 用户要求："分镜图的排布要么 2 张要么 4 张 不要 3 张的"。这里把所有
-  // 大小为 1 / 3 / >4 的分组拆并合并成清一色的 4 / 2（必要时单尾允许 1）。
-  // 算法：把所有 raw groups 拍平成镜头序列（保留情绪标记），然后贪心切片：
-  //   - 剩余 ≥ 4 → 切 4
-  //   - 剩余 == 3 → 切 2 + 留 1（让下一轮处理；最终单尾才允许 1 格）
-  //   - 剩余 == 2 → 切 2
-  //   - 剩余 == 1 → 单格（仅在最后一格，无法和前一组并入时出现）
-  // 同时尽量按情绪边界对齐：贪心时如果第 4 张和第 1 张情绪相差太远，优先
-  // 切 2 而不是切 4——避免一张分镜稿里前后情绪拧得太别扭。
-  var flat = [];
-  rawGroups.forEach(function (g) {
-    g.shotIndices.forEach(function (si, i) {
-      flat.push({ idx: si, shot: g.shots[i], emotion: g.emotion });
-    });
   });
-
-  // 视频片段分组只看导演计划：同一情绪段内尽量合并，但保持片段可控。
-  // 片段计划时长 = 组内 shot.duration 之和；台词字数只在视频生成前做质量提醒，
-  // 不再反向决定 5s/10s 档位，也不在这里触发隐藏拆分。
-  var MAX_SHOTS_PER_GROUP = 4;
-  var MAX_GROUP_DURATION_SEC = 10;
-
-  // 第一步：按情绪段切成 emotion buckets
-  var emoBuckets = [];
-  var curBucket = [];
-  var curEm = null;
-  flat.forEach(function (item) {
-    if (curEm === null) curEm = item.emotion;
-    if (item.emotion !== curEm) {
-      if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
-      curBucket = [item];
-      curEm = item.emotion;
-    } else {
-      curBucket.push(item);
-    }
-  });
-  if (curBucket.length) emoBuckets.push({ items: curBucket, emotion: curEm });
-
-  // 第二步：每个情绪 bucket 内部贪心打包，受计划时长和分镜格数约束
-  var groups = [];
-  emoBuckets.forEach(function (eb) {
-    var items = eb.items;
-    if (!items.length) return;
-
-    var curItems = [];
-    var curDur = 0;
-    var flush = function () {
-      if (!curItems.length) return;
-      groups.push({
-        groupIdx: groups.length,
-        shotIndices: curItems.map(function (x) { return x.idx; }),
-        shots: curItems.map(function (x) { return x.shot; }),
-        emotion: eb.emotion,
-      });
-      curItems = [];
-      curDur = 0;
-    };
-
-    items.forEach(function (item) {
-      var shot = item.shot;
-      var dur = Number(shot.duration || shot.durationSec || 4) || 4;
-
-      // 单个镜头自己就超出建议片段时长：独占一组，尊重镜头表计划。
-      if (dur > MAX_GROUP_DURATION_SEC) {
-        flush();
-        curItems = [item];
-        curDur = dur;
-        flush();
-        return;
-      }
-
-      var wouldExceed =
-        curDur + dur > MAX_GROUP_DURATION_SEC ||
-        curItems.length >= MAX_SHOTS_PER_GROUP;
-
-      if (wouldExceed) flush();
-      curItems.push(item);
-      curDur += dur;
-    });
-
-    flush();
-  });
-
-  return groups;
 }
 
 function _getShotGroupIndices() {

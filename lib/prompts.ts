@@ -687,7 +687,15 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
       "emotion": "setup",
       "intensity": 2,
       "scriptRef": "对应剧本中的原文片段（10-40 字，直接复制原文，便于前端高亮联动）",
-      "characters": ["老周", "龙虾"]
+      "characters": ["老周", "龙虾"],
+      "tailFrameSignals": {
+        "actionLandingNeed": 0,
+        "visualTransformationNeed": 0,
+        "revealNeed": 0,
+        "endingCompositionNeed": 0,
+        "emotionPeakNeed": 0,
+        "isSimpleStaticDialogue": false
+      }
     }
   ]
 }
@@ -737,6 +745,15 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 ▸ scriptRef：必须是剧本中的**原文片段**（10-40 字直接复制），用于前端联动剧本高亮
 
 ▸ characters：本镜头**实际入画**的角色名（中文短名数组）；空场景写 []
+
+▸ tailFrameSignals：判断这个镜头/片段是否值得生成尾帧的语义信号
+  · 每个 need 字段都是 0-5 分：0=完全不需要，5=非常需要
+  · actionLandingNeed：动作是否需要明确落点（倒下、坐下、转身完成、举起/放下道具、走到某位置）
+  · visualTransformationNeed：画面状态是否发生明显变化（灯光/天气/空间/物体状态/角色外观状态改变）
+  · revealNeed：是否有揭示、反转、悬念落点、重要信息露出
+  · endingCompositionNeed：结尾构图是否需要稳定到一个明确画面（仪式、对峙、拥抱、定格式收束）
+  · emotionPeakNeed：情绪是否在本镜头末尾达到峰值或明显转折
+  · isSimpleStaticDialogue：近景/中近景/特写 + 固定镜头 + 长对白、几乎无动作变化时填 true
 
 ▸ sceneId / sceneName：本镜头发生在哪个已抽取场景里
   · 如果资产里提供了场景列表，sceneId 必须从资产场景的 id 中选择，sceneName 必须和该场景 name 一致

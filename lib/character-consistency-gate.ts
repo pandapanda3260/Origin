@@ -6,6 +6,7 @@ import {
 } from './character-consistency';
 import { resolveCharacterMentions } from './character-mention-resolver';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
+import { storyboardShotIndices } from './frame-workflow-state';
 
 export type CharacterConsistencyTarget = 'videoPrompt' | 'videoSegment';
 
@@ -80,14 +81,11 @@ function normalizeText(value: any): string {
 }
 
 function groupShotIndices(project: any, groupIdx: number, explicit?: number[]): number[] {
-  const shots = Array.isArray(project?.shots) ? project.shots : [];
   const sb = Array.isArray(project?.storyboards) ? project.storyboards[groupIdx] : null;
-  const candidates: number[] = Array.isArray(explicit) && explicit.length
-    ? explicit
-    : Array.isArray(sb?.shotIndices) && sb.shotIndices.length
-      ? sb.shotIndices
-      : [groupIdx];
-  return candidates.filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < shots.length);
+  return storyboardShotIndices(project, groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: explicit,
+  });
 }
 
 function groupText(project: any, groupIdx: number, explicitShotIndices?: number[]) {

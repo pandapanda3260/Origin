@@ -12,6 +12,7 @@ import {
 } from '@/lib/video-reference-manifest';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { validateCharacterConsistencyForGroup } from '@/lib/character-consistency-gate';
+import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -161,7 +162,7 @@ export async function POST(req: NextRequest) {
   // 用户反馈：videoPrompt 的内容跟 storyboards[i].shotIndices 对不上→视频段
   // 阶段抓不准本组对应的 shot.dialogue。这里把前端传过来的 shotIndices 和
   // 实际入参的 shots 一并落库，video_segments executor 才能拿到正确映射。
-  const shotIndices: number[] = Array.isArray(body.shotIndices)
+  let shotIndices: number[] = Array.isArray(body.shotIndices)
     ? body.shotIndices.filter((x: any) => Number.isInteger(x))
     : [];
 
@@ -174,6 +175,12 @@ export async function POST(req: NextRequest) {
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
+        const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
+        const sb = storyboards[groupIdx] || {};
+        shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+          mode: 'single-shot-strict',
+          explicitShotIndices: shotIndices,
+        });
         const gate = validateCharacterConsistencyForGroup(proj as any, {
           groupIdx,
           shotIndices,
@@ -183,11 +190,12 @@ export async function POST(req: NextRequest) {
           writer.error(`角色一致性未通过：${gate.blockers.map((b) => b.message).join('；')}`);
           return;
         }
-        const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
-        while (storyboards.length <= groupIdx) storyboards.push({});
         const now = new Date().toISOString();
         storyboards[groupIdx] = {
           ...markStoryboardVideoOutdated(storyboards[groupIdx] || {}, 'video_prompt_regeneration', now),
+          idx: groupIdx,
+          shotIdx: groupIdx + 1,
+          shotIndices,
           videoPromptStatus: 'generating',
           videoPromptRunId: promptRunId,
           videoPromptStartedAt: now,
@@ -198,6 +206,7 @@ export async function POST(req: NextRequest) {
         if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
           videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
         }
+        maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-generating');
         updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
       }
     }
@@ -207,7 +216,7 @@ export async function POST(req: NextRequest) {
       await chatStream(
         user,
         buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups }),
-        { temperature: 0.7, maxTokens: 1800, modelRole: 'brain' },
+        { temperature: 0.7, maxTokens: 1800, modelRole: 'structured' },
         (delta) => {
           prompt += delta;
           writer.chunk(delta);
@@ -218,12 +227,15 @@ export async function POST(req: NextRequest) {
         const proj = getProjectByIdForUser(projectId, user.id);
         if (proj) {
           const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
-          while (storyboards.length <= groupIdx) storyboards.push({});
           const prev = storyboards[groupIdx] || {};
+          const failedShotIndices = storyboardShotIndices(proj as any, groupIdx, prev, { mode: 'single-shot-strict' });
           if (!prev.videoPromptRunId || prev.videoPromptRunId === promptRunId) {
             const now = new Date().toISOString();
             storyboards[groupIdx] = {
               ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
+              idx: groupIdx,
+              shotIdx: groupIdx + 1,
+              shotIndices: failedShotIndices,
               videoPromptStatus: 'failed',
               videoPromptRunId: promptRunId,
               videoPromptFailedAt: now,
@@ -233,6 +245,7 @@ export async function POST(req: NextRequest) {
             if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
               videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
             }
+            maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-failed');
             updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
           }
         }
@@ -245,13 +258,21 @@ export async function POST(req: NextRequest) {
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
+        const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
+        const sb = storyboards[groupIdx] || {};
+        shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+          mode: 'single-shot-strict',
+          explicitShotIndices: shotIndices,
+        });
         const gate = validateCharacterConsistencyForGroup(proj as any, {
           groupIdx,
           shotIndices,
           target: 'videoPrompt',
         });
-        const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
         const patch: any = {
+          idx: groupIdx,
+          shotIdx: groupIdx + 1,
+          shotIndices,
           videoPrompt: prompt,
           videoPromptStatus: 'ready',
           videoPromptRunId: promptRunId,
@@ -271,7 +292,6 @@ export async function POST(req: NextRequest) {
             },
           },
         };
-        if (shotIndices.length) patch.shotIndices = shotIndices;
         if (storyboards[groupIdx]) {
           if (storyboards[groupIdx].videoPromptRunId && storyboards[groupIdx].videoPromptRunId !== promptRunId) {
             writer.error('视频提示词生成结果已过期：该片段已有更新的生成任务');
@@ -282,13 +302,14 @@ export async function POST(req: NextRequest) {
             ...patch,
           };
         } else {
-          while (storyboards.length <= groupIdx) storyboards.push({});
-          storyboards[groupIdx] = patch;
+          writer.error('视频提示词生成结果无法写回：当前槽位不存在');
+          return;
         }
         const videoTasks = Array.isArray((proj as any).videoTasks) ? [...(proj as any).videoTasks] : [];
         if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
           videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
         }
+        maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-ready');
         updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
       }
     }

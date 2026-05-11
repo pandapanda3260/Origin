@@ -12,7 +12,7 @@
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=87" />
+    <link rel="stylesheet" href="styles.css?v=90" />
     <script>
       tailwind.config = {
         theme: {
@@ -153,34 +153,30 @@
       <div class="flex flex-col items-center gap-1 mb-4 px-1">
         <img src="originrise-logo.png" alt="ORIGINRISE" class="w-36 h-36 object-contain" />
         <div class="flex flex-col items-center select-none -mt-1">
-          <div class="text-[1.05rem] leading-none font-light tracking-[0.25em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk'] whitespace-nowrap">ORIGINRISE</div>
+          <div class="text-[1.05rem] leading-none font-light tracking-[0.25em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk'] whitespace-nowrap">ORIGIN</div>
           <div class="text-[8px] mt-1.5 font-medium tracking-[0.18em] uppercase text-slate-500 dark:text-slate-400 whitespace-nowrap">Where Imagination Begins</div>
         </div>
       </div>
 
       <!--
-        订阅与积分入口：aside 顶层独立块，放在主导航之上，
-        视觉上脱离"功能 nav"序列，更像账户身份卡。
+        任务列表快捷入口：aside 顶层独立块，放在主导航之上，
+        视觉上脱离"功能 nav"序列，作为返回任务列表的强入口。
         视效用 PixelCard：hover / focus 时 canvas 像素从中心向外按距离延迟闪烁。
           - 容器 class="pixel-card" 提供 relative/overflow:hidden + 底色 + 细边框，
             样式见 static/styles.css 的 .pixel-card 块；
           - 子节点 <canvas class="pixel-canvas"> 由 mountPixelCard() 驱动
             （pointer-events:none，点击穿透到 button）；
           - 动画挂载：static/main.js init() 里
-              mountPixelCard($("navBillingWrap"), { variant: "blue" })
+              mountPixelCard($("navTaskListWrap"), { variant: "blue" })
           - 不再使用 glow-border-wrap / glow-edge-light / glow-border-inner。
-        文案由 static/modules/billing.js 的 refreshBillingBadge() 刷新（档位 +
-        实时积分），档位 title 直接取后端 /api/billing/me 的 currentPlan.title，
-        前端不做任何 code→title 映射。
-        button 保留 id="navBilling" / data-page="billing"，main.js 的路由绑定
-        （static/main.js 里 $("nav"+Page).click → switchPage(page)）按 id 走。
       -->
       <div class="flex-shrink-0 relative z-10 px-1 pb-5">
-        <div id="navBillingWrap" class="pixel-card rounded-2xl">
+        <div id="navTaskListWrap" class="pixel-card rounded-2xl">
           <canvas class="pixel-canvas"></canvas>
-          <button type="button" id="navBilling" data-page="billing" title="点击管理订阅与积分"
+          <button type="button" id="navTaskListShortcut" data-goto="overview" title="任务列表"
             class="relative z-10 !flex-row !flex items-center gap-2 px-4 py-3 w-full rounded-2xl cursor-pointer text-xs font-bold tracking-wide text-left text-white/90 active:scale-[0.97] transition-transform duration-200">
-            <span id="navBillingLabel" class="truncate flex-1">Free · <span class="material-symbols-outlined text-sm align-middle">toll</span> 0 积分</span>
+            <span class="material-symbols-outlined text-base">dashboard</span>
+            <span class="truncate flex-1">任务列表</span>
             <span class="material-symbols-outlined text-sm opacity-60">chevron_right</span>
           </button>
         </div>
@@ -202,15 +198,15 @@
             ></div>
           </div>
           <div class="space-y-1 relative z-10 pl-6">
-            <button type="button" id="navOverview" data-page="overview" title="任务列表"
-              class="sw-nav-item is-active flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-              <span class="material-symbols-outlined">dashboard</span>
-              <span>任务列表</span>
-            </button>
             <button type="button" id="navScript" data-page="script" title="剧本生成"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
               <span class="material-symbols-outlined">description</span>
               <span>剧本</span>
+            </button>
+            <button type="button" id="navStyle" data-page="style" title="视频整体风格"
+              class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
+              <span class="material-symbols-outlined">palette</span>
+              <span>风格</span>
             </button>
             <button type="button" id="navAssets" data-page="assets" title="资产库"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
@@ -232,10 +228,10 @@
               <span class="material-symbols-outlined">psychology</span>
               <span>提示词</span>
             </button>
-            <button type="button" id="navBatch" data-page="batch" title="批量生成"
+            <button type="button" id="navBatch" data-page="batch" title="片段"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
               <span class="material-symbols-outlined">layers</span>
-              <span>批量</span>
+              <span>片段</span>
             </button>
             <button type="button" id="navEdit" data-page="edit" title="自动剪辑"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
@@ -267,52 +263,32 @@
             <span class="material-symbols-outlined">face</span>
             <span>创作偏好</span>
           </button>
+          <button type="button" id="navLegacyStoryboardArchive" title="旧版多镜头生成历史" hidden
+            class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
+            <span class="material-symbols-outlined">inventory_2</span>
+            <span>旧版归档</span>
+          </button>
         </div>
 
       <div class="mt-auto shrink-0 pt-4 border-t border-outline-variant/10 relative z-10 pl-6 space-y-1">
-        <button type="button" id="navGlobalTasks" title="任务中心"
-          class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-          <span class="material-symbols-outlined">task_alt</span>
-          <span>任务中心</span>
-          <span id="globalTaskBadge" class="global-task-badge ml-auto">0</span>
-        </button>
         <button type="button" id="navAdmin" data-page="admin" title="管理面板" hidden
           class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
           <span class="material-symbols-outlined">dashboard</span>
           <span>管理面板</span>
+        </button>
+        <button type="button" id="accountBar" data-goto="billing" title="订阅积分"
+          class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
+          <span class="material-symbols-outlined">account_circle</span>
+          <span>订阅积分</span>
         </button>
         <button type="button" id="navSettings" data-page="settings" title="设置" hidden
           class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
           <span class="material-symbols-outlined">settings</span>
           <span>设置</span>
         </button>
-        <div id="accountBar" class="flex items-center gap-2 px-6 py-3 text-xs text-on-surface-variant/70">
-          <span class="material-symbols-outlined text-base">account_circle</span>
-          <div class="min-w-0 flex-1">
-            <div id="accountUsername" class="truncate">--</div>
-            <div id="accountBillingBadge" class="text-[10px] text-on-surface-variant/45 truncate">Free · 0 积分</div>
-          </div>
-          <button type="button" id="btnLogout" title="退出登录"
-            class="ml-auto p-1 rounded-full hover:bg-white/10 transition-colors cursor-pointer">
-            <span class="material-symbols-outlined text-base">logout</span>
-          </button>
-        </div>
       </div>
       </div>
     </aside>
-
-    <!-- ===== Global Task Panel (floating) ===== -->
-    <div id="globalTaskPanel" class="global-task-panel">
-      <div class="global-task-panel-header">
-        <span class="text-xs font-bold tracking-wide text-on-surface-variant">任务中心</span>
-        <button type="button" id="globalTaskPanelClose" class="p-1 rounded-full hover:bg-surface-container transition-colors">
-          <span class="material-symbols-outlined text-base text-on-surface-variant/60">close</span>
-        </button>
-      </div>
-      <div id="globalTaskListWrap" class="global-task-panel-body">
-        <p id="globalTaskEmpty" class="text-center text-xs text-on-surface-variant/40 py-8">暂无任务</p>
-      </div>
-    </div>
 
     <!-- ===== Vignette + Main Content Area ===== -->
     <div class="vignette-overlay"></div>
@@ -351,13 +327,9 @@
                 <span class="material-symbols-outlined">search</span>
                 <input type="search" id="ovTaskSearch" name="task_search" value="" aria-label="搜索视频任务" placeholder="搜索任务名称 / ID / 关键词" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" inputmode="search" data-form-type="other" data-lpignore="true" data-1p-ignore="true">
               </label>
-              <button type="button" class="vtd-toolbar-btn" id="ovTaskFilterBtn">
-                <span class="material-symbols-outlined">filter_list</span>
-                筛选
-              </button>
-              <button type="button" class="vtd-toolbar-btn" id="ovTaskSortBtn">
-                <span class="material-symbols-outlined">sort</span>
-                排序
+              <button type="button" class="vtd-toolbar-btn" id="ovBillingRechargeBtn" title="会员升级">
+                <span class="material-symbols-outlined">rocket_launch</span>
+                会员升级
               </button>
               <button type="button" id="ovNewTaskBtn" class="vtd-primary-btn">
                 <span class="material-symbols-outlined">add</span>
@@ -458,6 +430,106 @@
         </div>
       </div>
 
+      <!-- ══════ 视频整体风格 ══════ -->
+      <div class="page-scroll style-page-scroll" id="pageStyle" hidden>
+        <div class="style-page-shell">
+          <section class="style-page-header">
+            <div>
+              <p class="style-page-kicker" id="styleProjectKicker">PROJECT STYLE · 全局视频风格</p>
+              <h1>视频整体风格</h1>
+              <p>设置当前项目的视觉方向、色彩、氛围与镜头语言，后续资产、分镜和视频提示词会以这里的风格为统一参考。</p>
+            </div>
+            <div class="style-page-actions">
+              <button type="button" id="btnStyleExtract" class="style-soft-btn">
+                <span class="material-symbols-outlined">auto_awesome</span>
+                重新提取
+              </button>
+              <button type="button" id="btnStyleSave" class="style-soft-btn">
+                <span class="material-symbols-outlined">check</span>
+                保存风格
+              </button>
+              <button type="button" id="btnStyleConfirm" class="style-primary-btn">
+                <span class="material-symbols-outlined">arrow_forward</span>
+                确认风格，进入资产库
+              </button>
+            </div>
+          </section>
+
+          <section class="style-page-grid">
+            <div class="style-panel style-control-panel">
+              <div class="style-section-head">
+                <div>
+                  <h2>风格控制台</h2>
+                  <p>STYLE CONTROL</p>
+                </div>
+                <span id="styleSaveState" class="style-save-state">未保存</span>
+              </div>
+
+              <div id="styleHeroPixelWrap" class="pixel-card style-hero-card">
+                <canvas class="pixel-canvas"></canvas>
+                <div class="style-hero-card-inner">
+                  <span class="style-hero-label">STYLE BACKPLATE</span>
+                  <h3 id="styleHeroTitle">等待风格设定</h3>
+                  <p id="styleHeroDesc">保存或重新提取风格后，这里会汇总当前项目的整体视频气质。</p>
+                  <div id="styleHeroChips" class="style-hero-chips"></div>
+                </div>
+              </div>
+
+              <div class="style-form-grid">
+                <label class="style-field style-field--wide">
+                  <span>视觉风格</span>
+                  <textarea id="styleVisualInput" rows="3" placeholder="例如：冷雾山林、伪纪录直播、古典取经造型嵌入现代手机界面"></textarea>
+                </label>
+                <label class="style-field">
+                  <span>情绪基调</span>
+                  <textarea id="styleMoodInput" rows="3" placeholder="例如：冷面荒诞、节奏跳脱、危机感逐步升温"></textarea>
+                </label>
+                <label class="style-field">
+                  <span>镜头语言</span>
+                  <textarea id="styleCameraInput" rows="3" placeholder="例如：贴地缓慢推进、手持直播视角、强前景遮挡"></textarea>
+                </label>
+                <label class="style-field style-field--wide">
+                  <span>禁止项 / 负向约束</span>
+                  <textarea id="styleNegativeInput" rows="2" placeholder="例如：避免廉价网感滤镜、过曝霓虹、角色服装漂移、现代元素喧宾夺主"></textarea>
+                </label>
+              </div>
+            </div>
+
+            <aside class="style-panel style-side-panel">
+              <div class="style-section-head">
+                <div>
+                  <h2>色彩与强度</h2>
+                  <p>PALETTE & INTENSITY</p>
+                </div>
+              </div>
+              <label class="style-field">
+                <span>色彩调板</span>
+                <input id="stylePaletteInput" type="text" placeholder="雾灰, 霜白, 松墨, 石棕, 朱砂" />
+              </label>
+              <div id="stylePalettePreview" class="style-palette-preview"></div>
+
+              <label class="style-slider-field">
+                <div>
+                  <span>风格强度</span>
+                  <strong id="styleIntensityValue">70%</strong>
+                </div>
+                <input id="styleIntensityInput" type="range" min="0" max="100" value="70" />
+              </label>
+
+              <div class="style-check-card">
+                <div class="style-check-icon">
+                  <span class="material-symbols-outlined">movie_filter</span>
+                </div>
+                <div>
+                  <h3>视频应用范围</h3>
+                  <p>作为项目级视觉锁定，影响后续资产图、分镜图和多参生视频提示词的风格描述。</p>
+                </div>
+              </div>
+            </aside>
+          </section>
+        </div>
+      </div>
+
       <!-- ══════ 2. 剧本生成 ══════ -->
       <div class="page-scroll script-page-scroll" id="pageScript" hidden>
         <div class="script-dashboard-shell">
@@ -478,6 +550,15 @@
                 <span class="material-symbols-outlined">settings</span>
                 <span>设置</span>
               </button>
+              <button type="button" id="btnNewScript" class="script-toolbar-btn">
+                <span class="material-symbols-outlined">add</span>
+                <span>新建剧本</span>
+              </button>
+              <button type="button" id="btnUploadScript" class="script-toolbar-btn">
+                <span class="material-symbols-outlined">upload_file</span>
+                <span>导入剧本</span>
+              </button>
+              <input type="file" id="scriptFileInput" accept=".txt,.md" hidden />
               <button type="button" id="btnScriptHeaderRegen" class="script-toolbar-btn script-toolbar-btn--primary">
                 <span class="material-symbols-outlined">auto_awesome</span>
                 <span>重新生成</span>
@@ -486,39 +567,6 @@
           </header>
 
           <section class="script-dashboard-grid">
-            <aside id="scriptLibPanel" class="script-lib-panel script-library-panel script-lib--expanded">
-              <div class="script-lib-collapsed-strip" id="scriptLibToggle" hidden>
-                <span class="material-symbols-outlined">auto_stories</span>
-                <span>剧本库</span>
-                <span class="script-lib-badge" id="scriptLibCollapsedBadge" hidden>0</span>
-              </div>
-              <div class="script-lib-expanded script-panel-inner">
-                <div class="script-panel-heading">
-                  <div>
-                    <h2>剧本库</h2>
-                    <p>SCRIPT LIBRARY</p>
-                  </div>
-                  <span class="script-count-pill" id="scriptLibBadge" hidden>0</span>
-                </div>
-                <div class="script-library-actions">
-                  <button type="button" id="btnNewScript" class="script-action-btn script-action-btn--primary">
-                    <span class="material-symbols-outlined">add</span>
-                    <span>新建</span>
-                  </button>
-                  <button type="button" id="btnUploadScript" class="script-action-btn">
-                    <span class="material-symbols-outlined">upload_file</span>
-                    <span>上传</span>
-                  </button>
-                  <input type="file" id="scriptFileInput" accept=".txt,.docx,.doc" hidden />
-                </div>
-                <div class="script-library-subbar">
-                  <span>全部文档</span>
-                  <span class="material-symbols-outlined">sort</span>
-                </div>
-                <div class="script-lib-list script-library-list" id="scriptLibList"></div>
-              </div>
-            </aside>
-
             <section class="script-workbench-panel script-panel">
               <div class="script-panel-heading">
                 <div>
@@ -535,6 +583,37 @@
                   </div>
                   <h3>暂无剧本草稿</h3>
                   <p>输入一句创意，AI 会先帮你梳理需求，再生成可继续迭代的短视频剧本。</p>
+                </div>
+
+                <div id="scriptImportDraftCard" class="script-import-draft-card script-card" hidden>
+                  <div class="script-draft-head">
+                    <div>
+                      <div class="script-draft-brand">
+                        <span class="material-symbols-outlined">upload_file</span>
+                        <span>IMPORTED DRAFT</span>
+                      </div>
+                      <h3>导入草稿待确认</h3>
+                    </div>
+                    <div class="script-draft-meta">
+                      <span>未确认</span>
+                      <small>不会进入下游生成</small>
+                    </div>
+                  </div>
+                  <div class="script-import-draft-notice">
+                    <span class="material-symbols-outlined">info</span>
+                    <span>你有一份未确认的导入草稿。确认前不会覆盖当前正式剧本，也不会参与资产、镜头或视频生成。</span>
+                  </div>
+                  <textarea id="scriptDraftPreview" rows="10" class="script-output script-import-draft-textarea"></textarea>
+                  <div class="script-import-draft-actions">
+                    <button type="button" id="btnApplyImportedDraft" class="script-mini-btn script-mini-btn--primary">
+                      <span class="material-symbols-outlined">check</span>
+                      <span>使用此草稿并确认剧本</span>
+                    </button>
+                    <button type="button" id="btnDiscardImportedDraft" class="script-mini-btn">
+                      <span class="material-symbols-outlined">close</span>
+                      <span>放弃草稿</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div id="scriptResultCard" class="chat-msg chat-msg--ai script-result-card" hidden>
@@ -589,7 +668,7 @@
                 </div>
                 <div id="scriptConfirmArea" class="script-confirm-area" hidden>
                   <button type="button" id="btnConfirmScript" class="script-confirm-btn">
-                    <span>确认剧本，进入资产库</span>
+                    <span>确认剧本，进入风格制定</span>
                     <span class="material-symbols-outlined">arrow_forward</span>
                   </button>
                 </div>
@@ -608,19 +687,6 @@
               </div>
             </section>
 
-            <aside id="styleBibleCard" class="script-style-panel script-panel" hidden>
-              <div class="script-panel-heading">
-                <div>
-                  <h2>风格圣经</h2>
-                  <p>STYLE BIBLE</p>
-                </div>
-                <button type="button" id="btnRegenBible" class="script-soft-btn">
-                  <span class="material-symbols-outlined">auto_awesome</span>
-                  <span>重新生成</span>
-                </button>
-              </div>
-              <div id="styleBiblePreview" class="script-style-preview elegant-scroll"></div>
-            </aside>
           </section>
         </div>
       </div>
@@ -639,6 +705,9 @@
               <div class="flex items-center gap-3">
                 <button type="button" id="btnExtractAssets" class="h-10 px-6 bg-surface-container-lowest border border-outline/10 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2" hidden>
                   <span class="material-symbols-outlined text-[16px]">refresh</span>重新分析
+                </button>
+                <button type="button" id="btnSaveWorldTemplate" class="h-10 px-6 bg-surface-container-lowest border border-outline-variant/15 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2" hidden>
+                  <span class="material-symbols-outlined text-[16px]">bookmark_add</span>保存为世界观模板
                 </button>
                 <button type="button" id="btnCleanObsolete" class="h-10 px-6 bg-surface-container-lowest border border-[#e65100]/20 rounded-full text-xs font-bold tracking-wide text-[#e65100] hover:bg-[#fff3e0] transition-all flex items-center gap-2" hidden>
                   <span class="material-symbols-outlined text-[16px]">delete_sweep</span>清理过时资产
@@ -704,7 +773,7 @@
                   </div>
                   <span class="text-xs font-bold text-on-surface-variant/50 bg-surface-container px-3 py-1 rounded-full" id="assetSceneCount">0</span>
                 </div>
-                <div class="grid grid-cols-1 gap-6" id="assetSceneGrid"></div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-5" id="assetSceneGrid"></div>
               </section>
 
               <!-- Props Section -->
@@ -726,9 +795,6 @@
                 确认资产库，进入镜头设计
                 <span class="material-symbols-outlined text-lg">arrow_forward</span>
               </button>
-              <button type="button" id="btnSaveWorldTemplate" class="h-10 px-8 bg-surface-container-lowest border border-outline-variant/15 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2">
-                <span class="material-symbols-outlined text-sm">bookmark_add</span>保存为世界观模板
-              </button>
             </section>
           </div>
         </div>
@@ -737,9 +803,24 @@
       <!-- ══════ 3. 镜头设计 ══════ -->
       <div class="page-scroll p-12" id="pageShots" hidden>
         <div class="max-w-7xl mx-auto">
-          <header class="mb-16">
-            <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">镜头设计</h1>
-            <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Shot Design · AI 分析剧本，生成完整镜头表</p>
+          <header class="mb-16 flex items-start justify-between gap-6">
+            <div>
+              <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">镜头设计</h1>
+              <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Shot Design · AI 分析剧本，生成完整镜头表</p>
+            </div>
+            <div id="shotsTopActions" class="flex flex-col items-end gap-2 shrink-0" hidden>
+              <div class="flex flex-wrap items-start justify-end gap-3">
+                <button type="button" id="btnGenShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap">
+                  AI 镜头设计
+                </button>
+                <section id="shotsConfirmArea" class="flex items-start" hidden>
+                  <button type="button" id="btnConfirmShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap">
+                    确认镜头表，进入分镜图生成 →
+                  </button>
+                </section>
+              </div>
+              <p class="text-xs text-on-surface-variant text-right" id="shotsHint"></p>
+            </div>
           </header>
 
           <div id="shotsNeedScript" class="flex flex-col items-center justify-center py-24 text-center">
@@ -765,13 +846,6 @@
               </div>
             </div>
 
-            <section class="flex flex-col items-center mb-12">
-              <button type="button" id="btnGenShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all">
-                AI 镜头设计
-              </button>
-              <p class="text-xs text-on-surface-variant mt-3" id="shotsHint"></p>
-            </section>
-
             <section id="shotsDiagnostic" class="diag-container mb-10"></section>
 
             <!-- Shot table + script ref panel (two-col) -->
@@ -779,34 +853,24 @@
               <!-- Left: shot list -->
               <div class="shots-left-col">
                 <div class="space-y-4">
-                  <div class="grid grid-cols-12 gap-4 px-8 py-2 text-[10px] font-bold uppercase tracking-[0.1em] text-on-surface-variant/60">
-                    <div class="col-span-1">序号</div>
-                    <div class="col-span-1">时长</div>
-                    <div class="col-span-2">景别</div>
-                    <div class="col-span-2">运镜</div>
-                    <div class="col-span-3">画面描述</div>
-                    <div class="col-span-3">台词 / 音效</div>
-                  </div>
                   <div id="shotListWrap" class="space-y-4"></div>
                 </div>
               </div>
               <!-- Right: script reference panel -->
               <div class="shots-right-col" id="scriptRefColWrap" hidden>
                 <div class="script-ref-panel">
-                  <div class="flex items-center gap-2 mb-4 pb-3 border-b border-outline-variant/10">
-                    <span class="material-symbols-outlined text-base text-primary/60">description</span>
-                    <span class="text-xs font-bold tracking-widest uppercase text-on-surface-variant/60">剧本原文</span>
+                  <div class="flex items-center justify-between gap-3 mb-4 pb-3 border-b border-outline-variant/10">
+                    <div class="flex items-center gap-2 min-w-0">
+                      <span class="material-symbols-outlined text-base text-primary/60">description</span>
+                      <span class="text-xs font-bold tracking-widest uppercase text-on-surface-variant/60">剧本原文</span>
+                    </div>
+                    <span id="shotSummaryMeta" class="text-xs font-bold tracking-widest uppercase text-on-surface-variant/60 whitespace-nowrap"></span>
                   </div>
                   <div id="scriptRefPanel" class="script-ref-body"></div>
                 </div>
               </div>
             </div>
 
-            <section id="shotsConfirmArea" class="mt-10 flex justify-center" hidden>
-              <button type="button" id="btnConfirmShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all">
-                确认镜头表，进入分镜图生成 →
-              </button>
-            </section>
           </div>
         </div>
       </div>
@@ -822,7 +886,7 @@
           <div class="flex items-center gap-3" id="imagesActionBar" hidden>
             <button type="button" id="btnGenAllImages" class="px-6 py-3 bg-primary text-on-primary rounded-xl text-[11px] font-bold tracking-widest uppercase flex items-center gap-2 hover:opacity-90 transition-all shadow-lg active:scale-95">
               <span class="material-symbols-outlined text-sm">auto_fix_high</span>
-              一键生成全部分镜图
+              一键生成全部
             </button>
           </div>
         </div>
@@ -950,131 +1014,160 @@
             <button type="button" class="mt-4 px-6 py-2 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-goto="prompts">去写提示词</button>
           </div>
 
-          <div id="batchReady" hidden>
-            <!-- Header: Title + Launch Button -->
-            <section class="mb-14 flex flex-col md:flex-row md:items-end justify-between gap-8">
-              <div class="max-w-2xl">
-                <h2 class="text-[3.5rem] font-extralight tracking-tight text-on-background leading-none mb-4">批量生成</h2>
-                <p class="text-on-surface-variant text-lg font-light leading-relaxed">一键提交所有片段，同时生成多条视频，实时监控生成进度。</p>
+          <div id="batchReady" class="batch-redesign" hidden>
+            <!-- UI redesign according to high-fidelity mockup: header, stats, progress, config and unified segment workbench. -->
+            <section class="batch-redesign-hero">
+              <div class="batch-redesign-title">
+                <h2>批量生成</h2>
+                <p>一键提交所有片段，同时生成多条视频，实时监控生成进度。</p>
               </div>
-              <button type="button" id="btnStartBatch" class="relative overflow-hidden group flex items-center gap-4 bg-primary text-on-primary px-10 py-5 rounded-xl font-bold tracking-wider uppercase text-sm active:scale-95 transition-all shrink-0">
+              <button type="button" id="btnStartBatch" class="batch-primary-action">
                 <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">rocket_launch</span>
                 <span>一键提交全部</span>
               </button>
             </section>
-            <p class="text-xs text-on-surface-variant mb-4 -mt-6" id="batchHint"></p>
-            <div id="batchTotalProgressWrap" class="mb-8 rounded-xl border border-outline-variant/15 bg-surface-container-low/40 p-4 max-w-3xl" hidden>
-              <p class="text-xs text-on-surface-variant mb-2 font-medium" id="batchTotalProgressLabel"></p>
-              <div class="h-2 rounded-full bg-outline-variant/25 overflow-hidden">
-                <div id="batchTotalProgressBar" class="h-full bg-primary rounded-full transition-all duration-500 ease-out" style="width:0%"></div>
+
+            <p class="batch-hint" id="batchHint"></p>
+
+            <section class="batch-stat-grid" aria-label="批量生成统计">
+              <div class="batch-stat-card">
+                <span class="material-symbols-outlined batch-stat-icon is-total">calendar_month</span>
+                <div>
+                  <p>总片段</p>
+                  <strong id="batchStatTotal">0 个</strong>
+                </div>
               </div>
-              <p class="text-[10px] text-on-surface-variant/60 mt-1.5" id="batchTotalProgressEta"></p>
-            </div>
-
-            <!-- 12-col Grid: Config (left 4) + Clips (right 8) -->
-            <div class="grid grid-cols-12 gap-8">
-
-              <!-- Left: Global Configuration -->
-              <section class="col-span-12 lg:col-span-4 space-y-6">
-                <div class="bg-surface-container-lowest p-8 rounded-xl shadow-[0px_20px_40px_rgba(0,0,0,0.02)] border border-outline-variant/10">
-                  <div class="flex items-center gap-3 mb-8">
-                    <span class="material-symbols-outlined text-primary">tune</span>
-                    <h3 class="text-xs font-bold uppercase tracking-[0.2em] text-on-surface-variant">全局配置 Global Config</h3>
-                  </div>
-                  <div class="space-y-8">
-                    <!-- Aspect Ratio -->
-                    <div>
-                      <label class="block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/60 mb-4">画面比例 Aspect Ratio</label>
-                      <div class="grid grid-cols-3 gap-2" id="batchRatioGrid">
-                        <button type="button" data-ratio="16:9" class="py-3 rounded-lg border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold text-xs">16:9</button>
-                        <button type="button" data-ratio="9:16" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">9:16</button>
-                        <button type="button" data-ratio="1:1" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">1:1</button>
-                        <button type="button" data-ratio="21:9" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">21:9</button>
-                        <button type="button" data-ratio="4:3" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">4:3</button>
-                        <button type="button" data-ratio="3:4" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">3:4</button>
-                      </div>
-                      <input type="hidden" id="batchRatio" value="16:9" />
-                    </div>
-                    <!-- Quality -->
-                    <div>
-                      <label class="block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/60 mb-4">画质</label>
-                      <select id="batchQuality" class="w-full bg-surface-container-low border-none rounded-lg py-4 px-4 text-sm font-medium focus:ring-2 focus:ring-primary/20 transition-all">
-                        <option value="1080p" selected>高清 1080p</option>
-                        <option value="4k">超清 4K</option>
-                        <option value="720p">标清 720p</option>
-                      </select>
-                    </div>
-                    <!-- Model (platform-managed key pool) -->
-                    <div>
-                      <label class="block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/60 mb-4">模型</label>
-                      <div class="grid grid-cols-3 gap-2" id="batchVideoModelGrid">
-                        <button type="button" data-video-model="seedance" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">Seedance</button>
-                        <button type="button" data-video-model="seedance-fast" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">Seedance Fast</button>
-                        <button type="button" data-video-model="grok" class="py-3 rounded-lg border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold text-xs">Grok</button>
-                      </div>
-                      <input type="hidden" id="batchVideoModel" value="grok" />
-                      <p class="text-[10px] text-on-surface-variant/60 mt-2">系统会自动在可用通道间轮询，单通道故障时无感切换。</p>
-                    </div>
-                    <!-- Checkboxes -->
-                    <div class="flex gap-6 pt-2">
-                      <label class="flex items-center gap-2 text-xs text-on-surface cursor-pointer font-medium"><input type="checkbox" id="batchAudio" class="rounded border-outline-variant text-primary focus:ring-primary/30" /> 生成音频</label>
-                      <label class="flex items-center gap-2 text-xs text-on-surface cursor-pointer font-medium"><input type="checkbox" id="batchWatermark" class="rounded border-outline-variant text-primary focus:ring-primary/30" /> 水印</label>
-                    </div>
-                  </div>
+              <div class="batch-stat-card">
+                <span class="material-symbols-outlined batch-stat-icon is-done" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+                <div>
+                  <p>已完成</p>
+                  <strong id="batchStatDone">0 个</strong>
                 </div>
-                <!-- Estimated Duration -->
-                <div class="bg-primary/5 p-8 rounded-xl border border-primary/10 flex items-center justify-between" id="batchEstimate">
-                  <div>
-                    <p class="text-[10px] font-bold uppercase tracking-widest text-primary/60 mb-1">预计总时长 Est. Duration</p>
-                    <p class="text-xl font-bold text-primary" id="batchEstTime">计算中…</p>
-                  </div>
-                  <div class="w-12 h-12 rounded-full border-2 border-primary/20 flex items-center justify-center">
-                    <span class="material-symbols-outlined text-primary">schedule</span>
-                  </div>
+              </div>
+              <div class="batch-stat-card">
+                <span class="material-symbols-outlined batch-stat-icon is-running">motion_photos_auto</span>
+                <div>
+                  <p>进行中</p>
+                  <strong id="batchStatRunning">0 个</strong>
                 </div>
+              </div>
+              <div class="batch-stat-card">
+                <span class="material-symbols-outlined batch-stat-icon is-pending" style="font-variation-settings: 'FILL' 1;">radio_button_checked</span>
+                <div>
+                  <p>未开始</p>
+                  <strong id="batchStatPending">0 个</strong>
+                </div>
+              </div>
+              <div class="batch-stat-card">
+                <span class="material-symbols-outlined batch-stat-icon is-time">schedule</span>
+                <div>
+                  <p>预计时长</p>
+                  <strong id="batchStatEstimate">计算中…</strong>
+                </div>
+              </div>
+            </section>
+
+            <section id="batchTotalProgressWrap" class="batch-progress-card" hidden>
+              <div class="batch-progress-head">
+                <div>
+                  <span class="material-symbols-outlined">tune</span>
+                  <strong>整体进度</strong>
+                </div>
+                <em id="batchProgressPercent">0%</em>
+              </div>
+              <div class="batch-progress-track">
+                <div id="batchTotalProgressBar" class="batch-progress-fill" style="width:0%"></div>
+              </div>
+              <div class="batch-progress-meta">
+                <p id="batchTotalProgressLabel"></p>
+                <p id="batchTotalProgressEta"></p>
+              </div>
+            </section>
+
+            <div class="batch-layout-grid">
+              <section class="batch-config-panel" aria-label="全局配置">
+                <div class="batch-panel-head">
+                  <span class="material-symbols-outlined">tune</span>
+                  <h3>全局配置</h3>
+                </div>
+
+                <div class="batch-config-group">
+                  <label>画面比例</label>
+                  <div class="batch-choice-grid" id="batchRatioGrid">
+                    <button type="button" data-ratio="16:9" class="py-3 rounded-lg border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold text-xs">16:9</button>
+                    <button type="button" data-ratio="9:16" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">9:16</button>
+                    <button type="button" data-ratio="1:1" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">1:1</button>
+                    <button type="button" data-ratio="21:9" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">21:9</button>
+                    <button type="button" data-ratio="4:3" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">4:3</button>
+                    <button type="button" data-ratio="3:4" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">3:4</button>
+                  </div>
+                  <input type="hidden" id="batchRatio" value="16:9" />
+                </div>
+
+                <div class="batch-config-group">
+                  <label for="batchQuality">画质</label>
+                  <select id="batchQuality" class="batch-quality-select">
+                    <option value="1080p" selected>高清 1080p</option>
+                    <option value="4k">超清 4K</option>
+                    <option value="720p">标清 720p</option>
+                  </select>
+                </div>
+
+                <div class="batch-config-group">
+                  <label>模型</label>
+                  <div class="batch-model-grid" id="batchVideoModelGrid">
+                    <button type="button" data-video-model="seedance" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">Seedance</button>
+                    <button type="button" data-video-model="seedance-fast" class="py-3 rounded-lg border border-outline-variant/20 hover:border-primary-fixed-dim transition-colors text-on-surface-variant font-medium text-xs">Seedance Fast</button>
+                    <button type="button" data-video-model="grok" class="py-3 rounded-lg border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold text-xs">Grok</button>
+                  </div>
+                  <input type="hidden" id="batchVideoModel" value="grok" />
+                  <p class="batch-config-note">系统会自动在可用通道间轮询，单通道故障时无感切换。</p>
+                </div>
+
+                <div class="batch-switch-list">
+                  <label><span class="material-symbols-outlined">volume_up</span><span>生成音频</span><input type="checkbox" id="batchAudio" /></label>
+                  <label><span class="material-symbols-outlined">water_drop</span><span>水印</span><input type="checkbox" id="batchWatermark" /></label>
+                </div>
+
               </section>
 
-              <!-- Right: Clip Preview + Task Monitor -->
-              <section class="col-span-12 lg:col-span-8 min-w-0 overflow-hidden">
-                <!-- Clip Preview Sequence -->
-                <div class="mb-6 flex items-center justify-between">
-                  <div class="flex items-center gap-3">
-                    <span class="material-symbols-outlined text-primary">movie</span>
-                    <h3 class="text-xs font-bold uppercase tracking-[0.2em] text-on-surface-variant">片段预览 Clip Preview</h3>
+              <section class="batch-workbench" aria-label="片段工作台">
+                <div class="batch-workbench-head">
+                  <div>
+                    <span class="material-symbols-outlined">movie</span>
+                    <h3>片段工作台</h3>
                   </div>
-                  <span class="text-[10px] font-bold uppercase tracking-widest text-primary" id="batchClipCount"></span>
-                </div>
-                <div class="relative">
-                  <div id="batchClipList" class="flex flex-nowrap gap-6 pb-4 no-scrollbar" style="overflow-x:auto;overflow-y:hidden;"></div>
-                  <!-- Custom scroll bar -->
-                  <div class="flex items-center gap-3 mt-4">
-                    <button type="button" id="batchScrollLeft" class="w-8 h-8 rounded-full border border-outline-variant/20 flex items-center justify-center hover:bg-surface-container transition-colors shrink-0">
-                      <span class="material-symbols-outlined text-sm text-on-surface-variant">chevron_left</span>
-                    </button>
-                    <div class="flex-1 h-1.5 bg-surface-container-highest/40 rounded-full relative overflow-hidden">
-                      <div id="batchScrollThumb" class="absolute top-0 left-0 h-full bg-primary/40 rounded-full transition-all duration-150" style="width:30%;"></div>
-                    </div>
-                    <button type="button" id="batchScrollRight" class="w-8 h-8 rounded-full border border-outline-variant/20 flex items-center justify-center hover:bg-surface-container transition-colors shrink-0">
-                      <span class="material-symbols-outlined text-sm text-on-surface-variant">chevron_right</span>
-                    </button>
+                  <div class="batch-workbench-summary">
+                    <span id="batchClipCount"></span>
+                    <span id="batchTasksSummary">暂无任务</span>
                   </div>
                 </div>
 
-                <!-- Real-time Rendering Monitor -->
-                <div class="mt-10 bg-surface-container/30 backdrop-blur-md rounded-xl p-8 border border-outline-variant/10">
-                  <div class="flex items-center justify-between mb-8">
-                    <div class="flex items-center gap-3">
-                      <span class="material-symbols-outlined text-primary">analytics</span>
-                      <h3 class="text-xs font-bold uppercase tracking-[0.2em] text-on-surface-variant">实时渲染监控 Rendering Monitor</h3>
-                    </div>
-                    <span class="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/40" id="batchTasksSummary">暂无任务</span>
-                  </div>
-                  <div id="batchTaskListWrap" class="space-y-4"></div>
-                  <div id="batchTasksEmpty" class="flex flex-col items-center justify-center py-10 text-center">
-                    <span class="material-symbols-outlined text-4xl text-on-surface-variant/15 mb-3">hourglass_empty</span>
-                    <p class="text-on-surface-variant text-sm">提交后任务将在这里实时显示</p>
+                <div class="batch-workbench-tabs" aria-label="片段状态统计">
+                  <span class="is-active">全部 <b id="batchTabAll">0</b></span>
+                  <span>进行中 <b id="batchTabRunning">0</b></span>
+                  <span>已完成 <b id="batchTabDone">0</b></span>
+                  <span>未开始 <b id="batchTabPending">0</b></span>
+                  <span>异常 <b id="batchTabFailed">0</b></span>
+                </div>
+
+                <div class="batch-table-head" aria-hidden="true">
+                  <span>片段信息</span>
+                  <span>状态 / 进度</span>
+                  <span>时长 / 剩余时间</span>
+                  <span>基础信息</span>
+                  <span>操作</span>
+                </div>
+
+                <div class="batch-workbench-scroll">
+                  <div id="batchClipList" class="batch-segment-list no-scrollbar" style="overflow-x:auto;overflow-y:visible;"></div>
+                  <div id="batchTaskListWrap" class="batch-segment-list"></div>
+                  <div id="batchTasksEmpty" class="batch-empty-state">
+                    <span class="material-symbols-outlined">hourglass_empty</span>
+                    <p>提交后任务将在这里实时显示</p>
                   </div>
                 </div>
+
               </section>
             </div>
           </div>
@@ -1465,9 +1558,15 @@
       <!-- ══════ 8. API 配置中心 ══════ -->
       <div class="page-scroll p-12 overflow-y-auto" id="pageSettings" hidden>
         <div class="max-w-4xl mx-auto">
-          <header class="mb-12">
-            <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">API 配置中心</h1>
-            <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Settings · 配置 4 种 AI 模型即可驱动全链路</p>
+          <header class="mb-12 flex items-start justify-between gap-6">
+            <div>
+              <h1 class="text-2xl font-thin tracking-tighter text-[#90A4AE]">API 配置中心</h1>
+              <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Settings · 配置 4 种 AI 模型即可驱动全链路</p>
+            </div>
+            <button type="button" id="btnSettingsLogout" class="shrink-0 px-4 py-2.5 rounded-full border border-outline-variant/20 bg-surface-container-lowest text-on-surface-variant hover:bg-error/5 hover:text-error hover:border-error/20 transition-all text-xs font-bold tracking-wide flex items-center gap-2">
+              <span class="material-symbols-outlined text-base">logout</span>
+              <span>退出登录</span>
+            </button>
           </header>
 
           <p class="text-sm text-on-surface-variant mb-8">配置 4 种模型能力，每种只需填写 API 地址、Key 和模型名。如果使用同一个中转服务商，地址和 Key 填一样的，只改模型名即可。</p>
@@ -1497,6 +1596,22 @@
               <summary class="cursor-pointer text-[11px] font-bold text-on-surface-variant px-3 py-2 select-none hover:bg-surface-container-low/80 rounded-lg">高级 · 接口路径（开发者排查用）</summary>
               <div id="videoAdapterInfo" class="text-xs text-on-surface-variant bg-surface-container-low rounded-lg p-3 border-t border-outline-variant/10"></div>
             </details>
+          </section>
+
+          <section id="legacyStoryboardArchiveEntry" class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mt-6 mb-6 hidden">
+            <div class="flex items-center justify-between gap-4">
+              <div>
+                <div class="flex items-center gap-2 mb-1">
+                  <span class="material-symbols-outlined text-primary">inventory_2</span>
+                  <span class="font-bold text-sm text-on-background">旧版多镜头生成历史</span>
+                </div>
+                <p id="legacyStoryboardArchiveSummary" class="text-xs text-on-surface-variant">已归档的旧首帧、尾帧和视频可查看、下载。</p>
+              </div>
+              <button type="button" id="btnOpenLegacyStoryboardArchive" class="shrink-0 px-4 py-2.5 rounded-full border border-outline-variant/20 bg-surface-container-low text-on-surface-variant hover:bg-primary/5 hover:text-primary transition-all text-xs font-bold tracking-wide flex items-center gap-2">
+                <span class="material-symbols-outlined text-base">open_in_new</span>
+                <span>查看归档</span>
+              </button>
+            </div>
           </section>
 
           <div class="flex gap-3">
@@ -1683,19 +1798,19 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=102",
+        "/modules/assets.js":         "/modules/assets.js?v=104",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
         "/modules/edit.js":           "/modules/edit.js?v=101",
         "/modules/episodes.js":       "/modules/episodes.js?v=100",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
-        "/modules/project.js":        "/modules/project.js?v=100",
-        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=100",
+        "/modules/project.js":        "/modules/project.js?v=102",
+        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=101",
         "/modules/script.js":         "/modules/script.js?v=103",
         "/modules/settings.js":       "/modules/settings.js?v=100",
-        "/modules/shots.js":          "/modules/shots.js?v=100",
+        "/modules/shots.js":          "/modules/shots.js?v=102",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=101",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=104",
         "/modules/tasks.js":          "/modules/tasks.js?v=100",
         "/modules/utils.js":          "/modules/utils.js?v=100",
         "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=101",
@@ -1705,7 +1820,7 @@
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=100"></script>
-    <script type="module" src="main.js?v=126"></script>
+    <script type="module" src="main.js?v=132"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

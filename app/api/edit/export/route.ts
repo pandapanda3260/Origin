@@ -8,6 +8,7 @@ import { concatClips, addBgm, burnSubtitles, probeDurationSec, mixTransitionSfx 
 import { getDb } from '@/lib/db';
 import { getProjectByIdForUser } from '@/lib/projects-db';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
+import { storyboardShotIndices } from '@/lib/frame-workflow-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,6 +17,37 @@ const DATA_DIR = join(process.cwd(), 'data');
 const EXPORTS_DIR = join(DATA_DIR, 'exports');
 const VIDEOS_DIR = join(DATA_DIR, 'videos');
 const BGM_DIR = join(DATA_DIR, 'bgm');
+
+function extractVideoTaskIdFromUrl(value: any): string {
+  if (typeof value !== 'string') return '';
+  const m = /\/api\/videos\/file\/([a-zA-Z0-9-]+)/.exec(value);
+  return m ? m[1] : '';
+}
+
+function currentClipIdForGroup(proj: any, groupIdx: number): string {
+  const storyboards = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
+  const videoTasks = Array.isArray(proj?.videoTasks) ? proj.videoTasks : [];
+  const sb = storyboards[groupIdx];
+  if (!sb) return '';
+  try {
+    storyboardShotIndices(proj, groupIdx, sb, { mode: 'single-shot-strict' });
+  } catch {
+    return '';
+  }
+  const vt = videoTasks[groupIdx];
+  return String(
+    sb?.videoTaskId ||
+    vt?.taskId ||
+    vt?.serverTaskId ||
+    vt?.id ||
+    extractVideoTaskIdFromUrl(sb?.videoUrl) ||
+    extractVideoTaskIdFromUrl(sb?._originVideoUrl) ||
+    extractVideoTaskIdFromUrl(vt?.url) ||
+    extractVideoTaskIdFromUrl(vt?.videoUrl) ||
+    extractVideoTaskIdFromUrl(vt?.protectedUrl) ||
+    '',
+  ).trim();
+}
 
 /**
  * 启动一次导出（异步）。返回 { taskId } 给前端，前端通过 /api/tasks/<id>/stream 订阅，
@@ -84,19 +116,10 @@ async function _exportPost(req: NextRequest) {
   for (const e of timeline) {
     let clipId = String(e?.clipId || '').trim();
     if (!clipId && typeof e?.videoUrl === 'string') {
-      const m = /\/api\/videos\/file\/([a-zA-Z0-9-]+)/.exec(e.videoUrl);
-      if (m) clipId = m[1];
+      clipId = extractVideoTaskIdFromUrl(e.videoUrl);
     }
     if (!clipId && Number.isInteger(Number(e?.groupIdx))) {
-      const row = db
-        .prepare<{ uid: number; pid: string; gi: number }, any>(
-          `SELECT id FROM video_tasks
-           WHERE owner_id = @uid AND project_id = @pid AND group_idx = @gi
-                 AND status = 'completed' AND filename IS NOT NULL
-           ORDER BY created_at DESC LIMIT 1`,
-        )
-        .get({ uid: user.id, pid: projectId, gi: Number(e.groupIdx) });
-      if (row?.id) clipId = String(row.id);
+      clipId = currentClipIdForGroup(proj, Number(e.groupIdx));
     }
     if (!clipId) continue;
 
@@ -263,6 +286,7 @@ function buildSrt(items: { groupIdx: number | null; inSec: number; outSec: numbe
   // 抓不到才退回 shots[].dialogue。
   function dialogueForGroup(gIdx: number): string[] {
     const sb = sbs[gIdx];
+    const shotIndex = storyboardShotIndices(project, gIdx, sb, { mode: 'single-shot-strict' })[0];
     const lines: string[] = [];
     const prompt: string = (sb && sb.videoPrompt) || '';
     if (prompt) {
@@ -281,12 +305,9 @@ function buildSrt(items: { groupIdx: number | null; inSec: number; outSec: numbe
       }
     }
     if (!lines.length) {
-      const idxList: number[] = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
-      for (const si of idxList) {
-        const sh = shots[si];
-        if (!sh) continue;
-        const raw = String(sh.dialogue || '').trim();
-        if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
+      const sh = shots[shotIndex];
+      const raw = String(sh?.dialogue || '').trim();
+      if (raw && raw !== '——' && raw !== '-' && raw !== '无') {
         const pieces = splitDialogueLines(raw);
         for (const p of pieces) {
           const cleaned = p.replace(/[，。,.]/g, '').trim();

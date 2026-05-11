@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
+import { storyboardShotIndices } from './frame-workflow-state';
 
 export const SP_GENERATE_EDL = `你是工业级 AI 剪辑师。下面这组视频片段是同一个项目的连续故事节拍，请按
 **Walter Murch《眨眼之间》"剪辑六字诀"** + **行业短视频/电影叙事节奏** 给出剪辑方案。
@@ -120,6 +121,41 @@ function hashStable(value: any) {
   return createHash('sha256').update(stableStringify(value)).digest('hex');
 }
 
+function stringContainsTaskId(value: any, taskId: string): boolean {
+  return typeof value === 'string' && taskId.length > 0 && value.includes(taskId);
+}
+
+function videoRowBelongsToCurrentSlot(project: any, row: any): boolean {
+  const taskId = String(row?.id || '');
+  const gi = Number(row?.group_idx);
+  if (!taskId || !Number.isInteger(gi) || gi < 0) return false;
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+  const sb = storyboards[gi];
+  if (!sb) return false;
+  try {
+    storyboardShotIndices(project, gi, sb, { mode: 'single-shot-strict' });
+  } catch {
+    return false;
+  }
+  const vt = videoTasks[gi];
+  const linkedIds = [
+    sb?.videoTaskId,
+    vt?.taskId,
+    vt?.serverTaskId,
+    vt?.id,
+  ].map((v) => String(v || '').trim()).filter(Boolean);
+  if (linkedIds.includes(taskId)) return true;
+  return [
+    sb?.videoUrl,
+    sb?._originVideoUrl,
+    vt?.url,
+    vt?.videoUrl,
+    vt?.protectedUrl,
+    vt?._originVideoUrl,
+  ].some((value) => stringContainsTaskId(value, taskId));
+}
+
 export function collectEdlGenerationContext(args: {
   projectId: string;
   userId: number;
@@ -142,6 +178,7 @@ export function collectEdlGenerationContext(args: {
   for (const v of videos) {
     const gi = Number(v.group_idx);
     if (seen.has(gi)) continue;
+    if (!videoRowBelongsToCurrentSlot(proj, v)) continue;
     seen.add(gi);
     dedup.push(v);
   }
@@ -176,7 +213,12 @@ export function collectEdlGenerationContext(args: {
   const shotsForDialogue: any[] = Array.isArray(proj.shots) ? proj.shots : [];
   const dialogueForGroup = (gIdx: number): string => {
     const sb = sbsForDialogue[gIdx];
-    const idxList: number[] = (sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length) ? sb.shotIndices : [gIdx];
+    let idxList: number[] = [];
+    try {
+      idxList = storyboardShotIndices(proj, gIdx, sb, { mode: 'single-shot-strict' });
+    } catch {
+      idxList = [];
+    }
     const lines: string[] = [];
     for (const si of idxList) {
       const sh = shotsForDialogue[si];

@@ -20,6 +20,19 @@ log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$WATCHDOG_LOG"
 }
 
+ensure_dev_log() {
+  : >> "$DEV_LOG" 2>/dev/null || true
+}
+
+line_count_file() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    wc -l < "$file" 2>/dev/null | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
 release_lock() {
   local locked_pid
   locked_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
@@ -107,6 +120,7 @@ origin_related_pids() {
     pgrep -f "$PROJECT_DIR/node_modules/.bin/next dev -p $PORT" 2>/dev/null || true
     pgrep -f "cd $PROJECT_DIR && npm run dev" 2>/dev/null || true
     if [[ -f "$DEV_PID_FILE" ]]; then cat "$DEV_PID_FILE" 2>/dev/null || true; fi
+    listening_pids
   } | while read -r pid; do
     [[ -n "$pid" ]] || continue
     if is_origin_process "$pid"; then
@@ -128,8 +142,26 @@ stop_origin_dev() {
 }
 
 clean_next_cache() {
+  local target trash attempt err
+
+  target="$PROJECT_DIR/.next"
   log "cleaning Next dev cache: $PROJECT_DIR/.next"
-  rm -rf "$PROJECT_DIR/.next"
+  [[ -e "$target" || -L "$target" ]] || return 0
+
+  trash="$PROJECT_DIR/.next.delete.$(date +%s).$$"
+  if mv "$target" "$trash" 2>/dev/null; then
+    rm -rf "$trash" >/dev/null 2>&1 || log "deferred old Next cache removal: $trash"
+    return 0
+  fi
+
+  for attempt in 1 2 3; do
+    err="$(rm -rf "$target" 2>&1 || true)"
+    [[ ! -e "$target" && ! -L "$target" ]] && return 0
+    log "clean Next cache retry $attempt failed: ${err:-still exists}"
+    sleep 1
+  done
+
+  log "could not fully clean Next dev cache; continuing with existing .next"
 }
 
 latest_auth_token() {
@@ -147,7 +179,8 @@ start_origin_dev() {
   stop_origin_dev
   clean_next_cache
 
-  LOG_BASELINE=$(wc -l < "$DEV_LOG" 2>/dev/null | tr -d ' ')
+  ensure_dev_log
+  LOG_BASELINE=$(line_count_file "$DEV_LOG")
   LOG_BASELINE="${LOG_BASELINE:-0}"
 
   (
@@ -161,7 +194,7 @@ start_origin_dev() {
 log_has_build_errors() {
   [[ -f "$DEV_LOG" ]] || return 1
   local current new_lines scan_lines
-  current=$(wc -l < "$DEV_LOG" 2>/dev/null | tr -d ' ')
+  current=$(line_count_file "$DEV_LOG")
   current="${current:-0}"
   if (( current <= LOG_BASELINE )); then
     return 1

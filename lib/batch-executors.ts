@@ -10,11 +10,16 @@
 import { registerExecutor, aliasExecutor, type BatchExecCtx } from './batches';
 import { resolveLocalImagePath } from './image-gen';
 import { generateImageWithModerationRecovery } from './safe-image-gen';
-import { generateVideo, VideoGenerationError, classifyVideoFailureStage, type VideoReferenceImage } from './video-gen';
+import { generateVideo, VideoGenerationError, classifyVideoFailureStage, type VideoReferenceImage, type VideoGenInput } from './video-gen';
 import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose, resolveLLMConfig } from './llm';
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
 import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
-import { isIndependentMultiImageModeEnabled, isMultiRefVideoModeEnabled } from './feature-flags';
+import {
+  isFirstLastFrameVideoModeEnabled,
+  isIndependentMultiImageModeEnabled,
+  isMultiRefVideoModeEnabled,
+  isTailFrameCaptionFallbackEnabled,
+} from './feature-flags';
 import {
   buildVideoPromptAttemptMessages,
   videoPromptTemperatureForAttempt,
@@ -49,6 +54,7 @@ import {
   hashString,
   plannedDurationFromShots,
   resolveGenerationDurationSec,
+  VIDEO_REFERENCE_IMAGE_BUDGET,
   type DialoguePolicy,
   type DroppedReference,
   type ReferenceManifestItem,
@@ -67,10 +73,18 @@ import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFr
 import { pickSceneForShots } from './scene-selection';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit } from './frame-image-plan';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
-import { computeTailFrameSourceHash } from './frame-workflow-state';
+import { resolveTargetEndStrategy, resolveVideoModelCapability } from './video-provider-capabilities';
+import { captionTailFrameForVideo, hashImageFileContent, type TailFrameCaption } from './image-caption';
+import {
+  computeFirstFrameSourceHash,
+  computeTailFrameSourceHash,
+  makeSingleShotStoryboardSlots,
+  maybeAssertStoryboardsAlignedWithShots,
+  storyboardShotIndices,
+} from './frame-workflow-state';
 
 function isPlanReferenceRole(role: string): role is VideoReferenceRole {
-  return role === 'first_frame' || role === 'scene' || role === 'character' || role === 'prop';
+  return role === 'first_frame' || role === 'target_end' || role === 'scene' || role === 'character' || role === 'prop';
 }
 
 function findCharacterLock(project: any, character: any): CharacterLock | null {
@@ -98,6 +112,13 @@ function referenceDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem
       useFor: ['锁定第 0 帧开场构图', '光照', '主体位置', '画面比例', '色调基准'],
       immutable: ['构图', '光照方向', '主体站位', '画面比例'],
       promptHint: '角色身份由 character reference 锁定，场景细节由 scene reference 锁定。',
+    };
+  }
+  if (role === 'target_end') {
+    return {
+      useFor: ['锁定视频结尾构图', '结尾角色位置', '结尾动作状态', '结尾光照氛围'],
+      immutable: ['最终构图', '主体落点', '动作结束状态', '光照方向'],
+      promptHint: '视频必须从 first frame 自然运动，并在结尾逐步接近 target ending frame。',
     };
   }
   if (role === 'scene') {
@@ -154,13 +175,25 @@ function dedupeDroppedReferences(refs: any[]): DroppedReference[] {
     const role = String(ref.role);
     if (role !== 'scene' && role !== 'character' && role !== 'prop') continue;
     const assetName = String(ref.assetName || ref.label || '').trim();
-    const key = `${role}|${assetName.toLowerCase()}`;
+    const rawReason = String(ref.reason || 'image_budget_exceeded');
+    const reason: DroppedReference['reason'] =
+      rawReason === 'missing_file'
+        ? 'asset_missing'
+        : ([
+            'image_budget_exceeded',
+            'asset_missing',
+            'url_lookup_failed',
+            'filtered_constraint',
+          ].includes(rawReason)
+            ? rawReason as DroppedReference['reason']
+            : 'image_budget_exceeded');
+    const key = `${role}|${assetName.toLowerCase()}|${reason}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
       role: role as DroppedReference['role'],
       assetName: assetName || undefined,
-      reason: ref.reason || 'image_budget_exceeded',
+      reason,
     });
   }
   return out;
@@ -197,6 +230,67 @@ function errorWithRecoveryHint(
 function isTransientNetworkError(err: any): boolean {
   const msg = String(err?.message || err || '');
   return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+}
+
+type VideoPayloadModeDecision = {
+  payloadMode: 'first_last_frame' | 'first_frame_multi_ref';
+  reason:
+    | 'feature_disabled'
+    | 'no_tail_intent'
+    | 'capability_unsupported'
+    | 'first_frame_missing'
+    | 'tail_unresolvable'
+    | 'tail_ready';
+  firstLastFrameMode?: VideoGenInput['firstLastFrameMode'];
+  warning?: any;
+};
+
+function decideVideoPayloadMode(opts: {
+  featureEnabled: boolean;
+  tailIntentRequested: boolean;
+  capabilityFirstLastSupported: boolean;
+  firstFramePath?: string;
+  tailFramePath?: string;
+  tailReferenceStatus?: string;
+}): VideoPayloadModeDecision {
+  const degrade = (
+    reason: Exclude<VideoPayloadModeDecision['reason'], 'no_tail_intent' | 'tail_ready'>,
+    message: string,
+  ): VideoPayloadModeDecision => ({
+    payloadMode: 'first_frame_multi_ref',
+    reason,
+    warning: {
+      key: 'first_last_mode_degraded',
+      level: 'info',
+      reason,
+      message,
+    },
+  });
+
+  if (!opts.tailIntentRequested) {
+    return { payloadMode: 'first_frame_multi_ref', reason: 'no_tail_intent' };
+  }
+  if (!opts.featureEnabled) {
+    return degrade('feature_disabled', '首尾帧视频模式未开启，已稳定回退到首帧 + 多参考图通道。');
+  }
+  if (!opts.capabilityFirstLastSupported) {
+    return degrade('capability_unsupported', '当前视频模型未在 capability registry 标记为支持首尾帧，已降级到多图参考通道。');
+  }
+  if (!opts.firstFramePath) {
+    return degrade('first_frame_missing', '片段缺少可用的首帧本地文件，已降级到多图参考通道。');
+  }
+  if (!opts.tailFramePath || opts.tailReferenceStatus !== 'ready') {
+    return degrade('tail_unresolvable', '尾帧文件不可解析或 referenceStatus 非 ready，已降级到多图参考通道。');
+  }
+  return {
+    payloadMode: 'first_last_frame',
+    reason: 'tail_ready',
+    firstLastFrameMode: {
+      firstFramePath: opts.firstFramePath,
+      lastFramePath: opts.tailFramePath,
+      modeReason: 'tail_ready',
+    },
+  };
 }
 
 function sleep(ms: number) {
@@ -538,6 +632,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       ...charExtra,
     };
     if (type === 'char' && panelResult) nextAsset = applyCharacterPanelResult(nextAsset, panelResult);
+    delete (nextAsset as any).imageLastError;
+    delete (nextAsset as any).imageFailedAt;
+    if (nextAsset.reference) delete (nextAsset.reference as any).lastError;
     assets[cat][idx] = nextAsset;
     // 顶层 characters/environments/props 也同步（前端两种结构都读）
     const topKey = cat === 'characters' ? 'characters' : cat === 'scenes' ? 'environments' : 'props';
@@ -554,6 +651,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       ...charExtra,
     };
     if (type === 'char' && panelResult) nextTop = applyCharacterPanelResult(nextTop, panelResult);
+    delete (nextTop as any).imageLastError;
+    delete (nextTop as any).imageFailedAt;
+    if (nextTop.reference) delete (nextTop.reference as any).lastError;
     top[idx] = nextTop;
     const patch: any = { assets, [topKey]: top };
     if (type === 'char') {
@@ -735,17 +835,12 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
 
   const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? 0;
   const shots = (proj as any).shots || [];
-
-  // 优先使用前端传过来的 shotIndices（按情绪段切分组后的真实镜头索引数组）
-  // 退化场景：老的目标只传 groupIdx，就把它当成镜头索引（兼容旧调用）
-  let shotIndices: number[] = Array.isArray(ctx.target.shotIndices) && ctx.target.shotIndices.length
-    ? ctx.target.shotIndices.filter((i: any) => typeof i === 'number')
-    : [groupIdx];
-  // 越界保护
-  shotIndices = shotIndices.filter((i) => i >= 0 && i < shots.length);
-  if (!shotIndices.length) {
-    throw new Error(`分组 #${groupIdx} 没有对应的镜头数据`);
-  }
+  const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
+  const sb = storyboards[groupIdx] || {};
+  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: ctx.target.shotIndices,
+  });
 
   const groupShots = shotIndices.map((i) => shots[i]);
   const firstShot = groupShots[0];
@@ -755,9 +850,10 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   if (isMultiRefVideoModeEnabled()) {
     // P0: 用结构化的 FrameImageGenerationPlan 统一组织首帧输入。
     //   - prompt / 参考图清单 / 资产锁 / 模型能力快照都通过 plan 产出;
-    //   - 为保持零行为变更, multiRefImageCap 仍强制为 1 (只传一张参考图),
-    //     P3 升级多图时再把 cap 交给 provider 能力决定。
+    //   - P3a: multiRefImageCap 从 provider capabilities.image.multiRefImage 读;
+    //     env IMAGE_MULTI_REF_CAP 可覆盖默认值; probe 验证前默认 1 (行为不变)。
     const imgCfg = resolveLLMConfig(ctx.user, 'image');
+    const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
     const plan = buildFrameImageGenerationPlan({
       project: proj,
       groupIdx,
@@ -769,12 +865,15 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         model: imgCfg.model,
         baseUrl: imgCfg.baseUrl,
         quality: imgCfg.imageQuality || 'medium',
-        multiRefImageCap: 1,
+        multiRefImageCap: capMulti,
       },
     });
     const basePrompt = plan.finalPrompt;
-    const imageRef = plan.referenceManifest.find((r) => r.delivery === 'image');
-    const referenceImagePath = imageRef?.localPath;
+    const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
+    const referenceImagePaths = imageRefs
+      .map((r) => r.localPath)
+      .filter((p): p is string => typeof p === 'string' && p.length > 0);
+    const referenceImagePath = referenceImagePaths[0];
     const planSummary = summarizePlanForAudit(plan);
 
     ctx.progress({
@@ -792,11 +891,14 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       assetRef: `storyboards[${groupIdx}].firstFrame`,
       quality: 'medium',
       referenceImagePath,
+      referenceImagePaths,
     });
 
     // P1: storyboards[g].frames.first 作为新的结构化对外容器, 与旧的 firstFrameUrl /
     // firstFramePrompt / firstFrameMode / firstFrameSafetyAudit / firstFramePlanSummary
     // 并行输出, 方便 P2 尾帧以同一形状落到 frames.tail。旧字段保留做兼容。
+    const generatedAt = nowIso();
+    const firstFrameSourceHash = computeFirstFrameSourceHash(proj, ctx.user.id, groupIdx);
     const frameFirst = {
       url: result.url,
       prompt: result.submittedPrompt,
@@ -806,14 +908,18 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       planSummary,
       safetyAudit: result.safetyAudit,
       visualAnchorDescription: result.visualAnchorDescription,
-      generatedAt: nowIso(),
+      generatedAt,
+      shotIndices,
+      sourceHash: firstFrameSourceHash,
     };
 
     patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      while (storyboards.length <= groupIdx) storyboards.push({});
+      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
+      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       const {
         videoUrl: _oldVideoUrl,
         videoTaskId: _oldVideoTaskId,
@@ -837,6 +943,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         },
         firstFramePrompt: result.submittedPrompt,
         firstFrameMode: 'structured_v1',
+        firstFrameSourceHash,
         firstFrameLastError: undefined,
         firstFrameFailedAt: undefined,
         debugSketchUrl: prev.debugSketchUrl || prev.pencilUrl,
@@ -846,12 +953,13 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         effectiveVisualDescription: result.visualAnchorDescription,
         idx: groupIdx,
         shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
-        shotIndices,
+        shotIndices: freshShotIndices,
         firstFramePlanSummary: planSummary,
         frames: { ...(prev.frames || {}), first: frameFirst },
       };
       const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-      if (videoTasks.length > groupIdx) videoTasks[groupIdx] = {};
+      if (videoTasks.length > groupIdx) delete videoTasks[groupIdx];
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'storyboard-image-writeback');
       return { storyboards, videoTasks };
     });
 
@@ -865,6 +973,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         rawUrl: result.url,
         firstFrameUrl: result.url,
         firstFrameMode: 'structured_v1',
+        firstFrameSourceHash,
         shotIndices,
         imagePrompt: result.submittedPrompt,
         firstFrameSafetyAudit: result.safetyAudit,
@@ -879,6 +988,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         imageUrl: result.url,
         firstFrameUrl: result.url,
         firstFrameMode: 'structured_v1',
+        firstFrameSourceHash,
         shotIndices,
         imagePrompt: result.submittedPrompt,
         originalImagePrompt: basePrompt,
@@ -1002,8 +1112,10 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    while (storyboards.length <= groupIdx) storyboards.push({});
+    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+    if (groupIdx >= shots.length) return null;
     const prev = storyboards[groupIdx] || {};
+    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
     const prevFirstFrame = normalizeFirstFrameState(prev);
     const at = new Date().toISOString();
     storyboards[groupIdx] = {
@@ -1036,10 +1148,11 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       firstFrameFailedAt: undefined,
       idx: groupIdx,
       shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
-      shotIndices,
+      shotIndices: freshShotIndices,
     };
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    if (videoTasks.length > groupIdx) videoTasks[groupIdx] = {};
+    if (videoTasks.length > groupIdx) delete videoTasks[groupIdx];
+    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'legacy-storyboard-image-writeback');
     return { storyboards, videoTasks };
   });
 
@@ -1082,18 +1195,13 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? 0;
   const shots = (proj as any).shots || [];
 
-  let shotIndices: number[] =
-    Array.isArray(ctx.target.shotIndices) && ctx.target.shotIndices.length
-      ? ctx.target.shotIndices.filter((i: any) => typeof i === 'number')
-      : [groupIdx];
-  shotIndices = shotIndices.filter((i) => i >= 0 && i < shots.length);
-  if (!shotIndices.length) {
-    throw new Error(`分组 #${groupIdx} 没有对应的镜头数据`);
-  }
-
   // Preflight: 本片段首帧必须已就绪 + 模式是彩色视频首帧, legacy_pencil 手稿图不可做尾帧锚。
   const storyboards = (proj as any).storyboards || [];
   const sb = storyboards[groupIdx] || {};
+  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: ctx.target.shotIndices,
+  });
   const preflightErr = checkTailFramePreflight(sb);
   if (preflightErr) {
     throw new Error(formatTailFramePreflightError(groupIdx, preflightErr));
@@ -1114,6 +1222,7 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   ctx.progress({ stage: 'building_prompt' });
 
   const imgCfg = resolveLLMConfig(ctx.user, 'image');
+  const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
   const plan = buildFrameImageGenerationPlan({
     project: proj,
     groupIdx,
@@ -1125,7 +1234,7 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       model: imgCfg.model,
       baseUrl: imgCfg.baseUrl,
       quality: imgCfg.imageQuality || 'medium',
-      multiRefImageCap: 1,
+      multiRefImageCap: capMulti,
     },
     selfFirstFrame: {
       remoteUrl: firstFrameUrl,
@@ -1134,8 +1243,11 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   });
 
   const basePrompt = plan.finalPrompt;
-  const imageRef = plan.referenceManifest.find((r) => r.delivery === 'image');
-  const referenceImagePath = imageRef?.localPath;
+  const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
+  const referenceImagePaths = imageRefs
+    .map((r) => r.localPath)
+    .filter((p): p is string => typeof p === 'string' && p.length > 0);
+  const referenceImagePath = referenceImagePaths[0];
   const planSummary = summarizePlanForAudit(plan);
 
   ctx.progress({
@@ -1154,6 +1266,7 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     assetRef: `storyboards[${groupIdx}].tailFrame`,
     quality: 'medium',
     referenceImagePath,
+    referenceImagePaths,
   });
 
   const generatedAt = nowIso();
@@ -1273,31 +1386,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     _shotVisual ||
     `Video segment for shot ${groupIdx + 1}`;
 
-  // 收集本组所有 shot（按情绪段切分后的真实镜头索引）。
-  // 优先级：
-  //   1) ctx.target.shotIndices（前端最新分组，一定是正确的）
-  //   2) sb.shotIndices（DB 缓存，老 storyboards 没存所以可能空）
-  //   3) [groupIdx]（兜底，仅在没分组信息时用——会导致台词错位但不至于崩）
-  let groupShotIndices: number[] = [];
-  const tgtSi = (ctx.target as any).shotIndices;
-  if (Array.isArray(tgtSi) && tgtSi.length) {
-    groupShotIndices = tgtSi.filter((x: any) => Number.isInteger(x));
-  } else if (Array.isArray(sb.shotIndices) && sb.shotIndices.length) {
-    groupShotIndices = sb.shotIndices;
-  } else if (sb.videoPrompt) {
-    // 已经有视频提示词时（由 video_prompts 生成），prompt 已自包含台词信息，
-    // 即使没有 shotIndices 也不会走错台词——只用 [groupIdx] 做兜底就行。
-    groupShotIndices = [groupIdx];
-    console.warn(
-      `[video_segments] group ${groupIdx} 缺 shotIndices，但 videoPrompt 存在，兜底用 [${groupIdx}]`,
-    );
-  } else {
-    // 既没有分组索引，又没有 sb.videoPrompt ——这种情况强行兜底到 shots[groupIdx]
-    // 会用错误 shot 的台词和视觉，浪费视频生成额度（audit 原话）。直接抛错让用户重新生成提示词页。
-    throw new Error(
-      `group ${groupIdx} 分组索引丢失且缺 videoPrompt，请回到"视频提示词"页重新生成后再来这一步`,
-    );
-  }
+  const groupShotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: ctx.target.shotIndices,
+  });
 	  if (!sb.videoPrompt) {
 	    const firstGroupShot = shots[groupShotIndices[0]] || shot || {};
 	    const firstGroupVisual = firstGroupShot.visual || firstGroupShot.description || firstGroupShot.desc || '';
@@ -1426,6 +1518,12 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   // 旧模式/旧项目：继续使用原 storyboard 黑白草图，保证可回退。
   const multiRefMode = isMultiRefVideoModeEnabled();
   const independentMultiImageMode = multiRefMode && isIndependentMultiImageModeEnabled();
+  const firstLastFrameVideoEnabled = isFirstLastFrameVideoModeEnabled();
+  const rawTargetEndStrategy = resolveTargetEndStrategy(videoCfg);
+  const targetEndStrategy =
+    rawTargetEndStrategy === 'caption' && !isTailFrameCaptionFallbackEnabled()
+      ? 'unsupported'
+      : rawTargetEndStrategy;
   const resolvedFirstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
   const hasFirstFrame = !!resolvedFirstFrameUrl;
   console.log(
@@ -1478,12 +1576,39 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   let characterReferencePaths: string[] = [];
   let characterReferencePanels: CharacterReferencePanel[] = [];
   let propReferencePaths: string[] = [];
+  let targetEndUnsupportedReason: string | undefined;
+  const tailFrameUrl = String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
+  const tailFrameLocalPath = tailFrameUrl ? (resolveLocalImagePath(tailFrameUrl, ctx.user.id) || undefined) : undefined;
+  const tailCaption = sb?.frames?.tail?.caption;
+  let targetEndCaption =
+    targetEndStrategy === 'caption' && tailCaption && typeof tailCaption.text === 'string'
+      ? String(tailCaption.text || '').trim()
+      : undefined;
+  let refreshedTailCaption: TailFrameCaption | null = null;
+  if (tailFrameLocalPath && targetEndStrategy === 'caption') {
+    try {
+      const currentTailHash = hashImageFileContent(tailFrameLocalPath);
+      const cachedHash = String(tailCaption?.imageContentHash || '');
+      if (!targetEndCaption || cachedHash !== currentTailHash) {
+        refreshedTailCaption = await captionTailFrameForVideo(ctx.user, tailFrameLocalPath);
+        targetEndCaption = refreshedTailCaption.text;
+      }
+    } catch (captionErr: any) {
+      targetEndCaption = undefined;
+      targetEndUnsupportedReason = 'tail_frame_caption_failed';
+      console.warn(
+        `[video_segments] group ${groupIdx} target_end caption failed: ` +
+          String(captionErr?.message || captionErr).slice(0, 300),
+      );
+    }
+  }
 
   const referenceImages: VideoReferenceImage[] = [];
+  let referenceImageBudget = VIDEO_REFERENCE_IMAGE_BUDGET;
   const addReferenceImage = (ref: VideoReferenceImage) => {
     if (!independentMultiImageMode || !ref.path) return;
     if (referenceImages.some((item) => item.path === ref.path)) return;
-    if (referenceImages.length >= 4) return;
+    if (referenceImages.length >= referenceImageBudget) return;
     referenceImages.push(ref);
   };
 
@@ -1496,8 +1621,55 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     ownerId: ctx.user.id,
     storyboardImageUrl: sbImageUrl || null,
   });
+  referenceImageBudget = canonicalRefs.budget || VIDEO_REFERENCE_IMAGE_BUDGET;
+  let manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
+  const canonicalFirstFrame = manifestInImageOrder.find((ref) => ref.role === 'first_frame');
+  if (independentMultiImageMode && !canonicalFirstFrame?.localPath) {
+    throw errorWithFailureStage(
+      `片段 ${groupIdx + 1} 首帧参考图缺失或无法解析为本地文件，已阻止视频生成。` +
+        `请先重新生成该片段首帧，再生成视频。`,
+      'preflight_missing_first_frame',
+    );
+  }
+  if (tailFrameUrl && targetEndStrategy === 'image' && !independentMultiImageMode) {
+    targetEndUnsupportedReason = 'independent_multi_image_mode_disabled';
+  } else if (tailFrameUrl && targetEndStrategy === 'image' && !tailFrameLocalPath) {
+    targetEndUnsupportedReason = 'tail_frame_file_unresolvable';
+  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !tailFrameLocalPath) {
+    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_file_unresolvable';
+  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !targetEndCaption) {
+    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_caption_missing';
+  } else if (tailFrameUrl && targetEndStrategy === 'unsupported') {
+    targetEndUnsupportedReason = 'provider_target_end_unsupported';
+  }
+  if (targetEndUnsupportedReason) {
+    videoWarnings.push({
+      key: 'target_end_not_used',
+      level: 'info',
+      targetEndStrategy,
+      reason: targetEndUnsupportedReason,
+      message: '该片段存在尾帧，但当前视频 provider/配置无法让尾帧图片直接影响视频生成。',
+    });
+  }
+  if (refreshedTailCaption) {
+    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+      if (!fresh) return null;
+      const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      if (!sbs[groupIdx]) return null;
+      const frames = { ...(sbs[groupIdx].frames || {}) };
+      frames.tail = {
+        ...(frames.tail || {}),
+        caption: refreshedTailCaption,
+      };
+      sbs[groupIdx] = {
+        ...sbs[groupIdx],
+        frames,
+      };
+      return { storyboards: sbs };
+    });
+  }
   const persistedManifest = Array.isArray(sb.videoReferenceManifest) ? sb.videoReferenceManifest : [];
-  const manifestChanged = persistedManifest.length > 0 && manifestsDiffer(persistedManifest, canonicalRefs.manifest);
+  const manifestChanged = persistedManifest.length > 0 && manifestsDiffer(persistedManifest, manifestInImageOrder);
   if (persistedManifest.length === 0 && canonicalRefs.manifest.length > 0) {
     videoWarnings.push({
       key: 'reference_manifest_rebuilt_in_executor',
@@ -1514,16 +1686,16 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     });
   }
 
-  const firstFrameItem = canonicalRefs.manifest.find((ref) => ref.role === 'first_frame' && ref.localPath);
+  const firstFrameItem = manifestInImageOrder.find((ref) => ref.role === 'first_frame' && ref.localPath);
   if (firstFrameItem?.localPath) referenceImagePath = firstFrameItem.localPath;
-  const sceneItem = canonicalRefs.manifest.find((ref) => ref.role === 'scene' && ref.localPath);
+  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
   sceneReferencePath = sceneItem?.localPath || undefined;
   sceneReferenceLabel = sceneItem?.assetName || sceneItem?.label || sceneReferenceLabel;
   sceneReferenceHint = sceneItem?.promptHint || sceneReferenceHint;
-  characterReferencePaths = canonicalRefs.manifest
+  characterReferencePaths = manifestInImageOrder
     .filter((ref) => ref.role === 'character' && ref.localPath)
     .map((ref) => ref.localPath as string);
-  characterReferencePanels = canonicalRefs.manifest
+  characterReferencePanels = manifestInImageOrder
     .filter((ref) => ref.role === 'character' && ref.localPath && ref.panelInfo)
     .map((ref: any) => ({
       characterName: ref.assetName || ref.label,
@@ -1533,12 +1705,12 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       priority: Number(ref.score || ref.priority || 0),
       reason: ref.matchReason || `manifest:${ref.panelInfo.panel}`,
     }));
-  propReferencePaths = canonicalRefs.manifest
+  propReferencePaths = manifestInImageOrder
     .filter((ref) => ref.role === 'prop' && ref.localPath)
     .map((ref) => ref.localPath as string);
 
   referenceImages.length = 0;
-  for (const ref of canonicalRefs.manifest) {
+  for (const ref of manifestInImageOrder) {
     if (!ref.localPath) continue;
     addReferenceImage({
       role: ref.role,
@@ -1675,6 +1847,20 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		    });
 		  }
 
+  const videoCapability = resolveVideoModelCapability(videoCfg.model);
+  const payloadDecision = decideVideoPayloadMode({
+    featureEnabled: firstLastFrameVideoEnabled,
+    tailIntentRequested: sb?.tailFrameIntent === 'requested',
+    capabilityFirstLastSupported: videoCapability.firstLastFrameMode === 'supported',
+    firstFramePath: referenceImagePath,
+    tailFramePath: tailFrameLocalPath,
+    tailReferenceStatus: String(sb?.tailFrameReferenceStatus || '').toLowerCase(),
+  });
+  const firstLastFrameMode = payloadDecision.firstLastFrameMode;
+  const payloadModeDecision = payloadDecision.payloadMode;
+  const payloadModeReason = payloadDecision.reason;
+  if (payloadDecision.warning) videoWarnings.push(payloadDecision.warning);
+
   const videoInput = {
     prompt,
     ratio: userRatio,
@@ -1693,6 +1879,11 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     characterReferencePanels,
     propReferencePaths,
     referenceImages: independentMultiImageMode ? referenceImages : undefined,
+    targetEndStrategy,
+    targetEndCaption: targetEndCaption || undefined,
+    targetEndUnsupportedReason,
+    payloadModeReason,
+    firstLastFrameMode,
   };
 	  const plannedFinalPrompt = videoCfgIsVolcano
     ? buildSeedancePromptParts(videoInput).finalPrompt
@@ -1709,7 +1900,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       length: plannedFinalPrompt.length,
     },
     dialoguePolicy: 'budget_check_only',
-    references: planReferencesFromManifest(canonicalRefs.manifest),
+    references: planReferencesFromManifest(manifestInImageOrder),
     droppedReferences: [
       ...(Array.isArray(sb.videoReferenceDropped) ? sb.videoReferenceDropped : []),
       ...canonicalRefs.droppedReferences,
@@ -1732,7 +1923,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    while (videoTasks.length <= groupIdx) videoTasks.push({});
+    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+    if (groupIdx >= shots.length) return null;
+    const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+    storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], { mode: 'single-shot-strict' });
 	    videoTasks[groupIdx] = {
 	      ...(videoTasks[groupIdx] || {}),
 	      groupIdx,
@@ -1755,6 +1949,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	      },
 	      isCurrent: true,
 	    };
+    maybeAssertStoryboardsAlignedWithShots({ ...fresh, videoTasks }, 'video-segment-submit-writeback');
     return { videoTasks };
   });
 
@@ -1813,7 +2008,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
 		      if (!fresh) return null;
 		      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-		      while (videoTasks.length <= groupIdx) videoTasks.push({});
+		      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+		      if (groupIdx >= shots.length) return null;
+		      const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+		      storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], { mode: 'single-shot-strict' });
 		      videoTasks[groupIdx] = {
 		        ...(videoTasks[groupIdx] || {}),
 		        groupIdx,
@@ -1827,6 +2025,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		        videoPlan,
 		        isCurrent: true,
 		      };
+		      maybeAssertStoryboardsAlignedWithShots({ ...fresh, videoTasks }, 'video-segment-failure-writeback');
 		      return { videoTasks };
 		    });
 		    throw e;
@@ -1835,9 +2034,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		  const dialoguePolicy: DialoguePolicy = result.videoAudit?.dialoguePolicy || 'budget_check_only';
 		  const actualAuditRefs = result.videoAudit?.referenceImages || [];
 		  const sentPaths = new Set(actualAuditRefs.map((ref) => ref.path).filter(Boolean));
-		  const planReferences: ReferenceManifestItem[] = actualAuditRefs.length
-		    ? planReferencesFromAuditRefs(actualAuditRefs)
-		    : planReferencesFromManifest(canonicalRefs.manifest);
+			  const planReferences: ReferenceManifestItem[] = actualAuditRefs.length
+			    ? planReferencesFromAuditRefs(actualAuditRefs)
+			    : planReferencesFromManifest(manifestInImageOrder);
 		  videoPlan = buildVideoPlanSnapshot({
 		    projectId: ctx.projectId,
 		    groupIdx,
@@ -1888,7 +2087,11 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    while (videoTasks.length <= groupIdx) videoTasks.push({});
+    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+    if (groupIdx >= shots.length) return null;
+    const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+    const sb = sbs[groupIdx];
+    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, { mode: 'single-shot-strict' });
 		    videoTasks[groupIdx] = {
 		      groupIdx,
 		      taskId: result.taskId,
@@ -1900,6 +2103,16 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 				      prompt,
 			      warnings: videoWarnings,
 			      videoPlan,
+		      videoAudit: result.videoAudit
+		        ? {
+		            payloadMode: result.videoAudit.payloadMode,
+		            modeReason: result.videoAudit.modeReason,
+		            capabilityVerifiedAt: result.videoAudit.capabilityVerifiedAt,
+		            submittedLastFrameContentHash: result.videoAudit.submittedLastFrameContentHash,
+		            returnedLastFrameUrl: result.videoAudit.returnedLastFrameUrl,
+		            returnedLastFrameContentHash: result.videoAudit.returnedLastFrameContentHash,
+		          }
+		        : undefined,
 		      consistency: {
 		        ...((videoTasks[groupIdx] || {}).consistency || {}),
 		        videoSegment: {
@@ -1916,20 +2129,21 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
 	    // videoDurationSec 是真实生成文件时长；plannedDurationSec 是镜头表计划时长。
 	    // 剪辑工作台优先用真实文件时长，避免生成结果比计划略长时出现时间线错位。
-    const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-	    if (sbs[groupIdx]) {
-	      sbs[groupIdx] = {
-	        ...sbs[groupIdx],
-	        videoUrl: result.protectedUrl,
-	        videoTaskId: result.taskId,
-		        videoDurationSec: result.durationSec,
-		        plannedDurationSec,
-		        videoWarnings,
-	        videoIsCurrent: true,
-	        videoInvalidatedAt: undefined,
-	        videoInvalidatedReason: undefined,
-	      };
-	    }
+	    sbs[groupIdx] = {
+	      ...sb,
+	      idx: groupIdx,
+	      shotIdx: groupIdx + 1,
+	      shotIndices: freshShotIndices,
+	      videoUrl: result.protectedUrl,
+	      videoTaskId: result.taskId,
+	      videoDurationSec: result.durationSec,
+	      plannedDurationSec,
+	      videoWarnings,
+	      videoIsCurrent: true,
+	      videoInvalidatedAt: undefined,
+	      videoInvalidatedReason: undefined,
+	    };
+    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards: sbs, videoTasks }, 'video-segment-complete-writeback');
     return { videoTasks, storyboards: sbs };
   });
 
@@ -2142,11 +2356,18 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'assembling', percent: 95, hint: '正在保存镜头表…' });
 
+  const storyboards = makeSingleShotStoryboardSlots(shotsArr);
+  maybeAssertStoryboardsAlignedWithShots(
+    { shots: shotsArr, storyboards, videoTasks: [] },
+    'shots-batch-executor',
+  );
+
   // 写回项目：shots + 重置下游审批/分镜
   patchProjectForUser(ctx.projectId, ctx.user.id, () => ({
     shots: shotsArr,
     shotsApproved: false,
-    storyboards: [],
+    storyboards,
+    videoTasks: [],
     currentStep: 3,
   }));
 
@@ -2170,17 +2391,12 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
   const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? 0;
   const totalGroups: number = ctx.target.totalGroups || 1;
   const shots = (proj as any).shots || [];
-
-  // 优先用 target.shotIndices（前端按情绪段切组后传过来）
-  let shotIndices: number[] = Array.isArray(ctx.target.shotIndices) && ctx.target.shotIndices.length
-    ? ctx.target.shotIndices.filter((i: any) => typeof i === 'number')
-    : [];
-  shotIndices = shotIndices.filter((i) => i >= 0 && i < shots.length);
-		  if (!shotIndices.length) {
-		    // fallback：把 groupIdx 当镜头索引（兼容老调用）
-		    if (groupIdx < shots.length) shotIndices = [groupIdx];
-		    else throw new Error(`分组 #${groupIdx} 没有对应的镜头`);
-		  }
+  const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
+  const sb = storyboards[groupIdx] || {};
+  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: ctx.target.shotIndices,
+  });
 		  const promptGate = validateCharacterConsistencyForGroup(proj as any, {
 		    groupIdx,
 		    shotIndices,
@@ -2196,10 +2412,13 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
 	    if (!fresh) return null;
 	    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-	    while (storyboards.length <= groupIdx) storyboards.push({});
 	    const prev = storyboards[groupIdx] || {};
+	    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
 	    storyboards[groupIdx] = {
 	      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
+	      idx: groupIdx,
+	      shotIdx: groupIdx + 1,
+	      shotIndices: freshShotIndices,
 	      videoPromptStatus: 'generating',
 	      videoPromptRunId: promptRunId,
 	      videoPromptStartedAt: promptStartedAt,
@@ -2210,6 +2429,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
 	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', promptStartedAt);
 	    }
+	    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-batch-generating');
 	    return { storyboards, videoTasks };
 	  });
 
@@ -2342,8 +2562,8 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    while (storyboards.length <= groupIdx) storyboards.push({});
 	    const prev = storyboards[groupIdx] || {};
+	    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
 	    if (prev.videoPromptRunId && prev.videoPromptRunId !== promptRunId) {
 	      console.warn(
 	        `[video_prompts] ignored stale write project=${ctx.projectId} group=${groupIdx} ` +
@@ -2353,6 +2573,8 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    }
 		    storyboards[groupIdx] = {
 		      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration'),
+		      idx: groupIdx,
+		      shotIdx: groupIdx + 1,
 		      videoPrompt: cleaned,
 		      videoPromptStatus: 'ready',
 		      videoPromptRunId: promptRunId,
@@ -2360,7 +2582,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 		      videoPromptLastError: undefined,
 		      videoPromptFailedAt: undefined,
 		      narrationsUsed: narrations,
-		      shotIndices,
+		      shotIndices: freshShotIndices,
 		      consistency: {
 		        ...(prev.consistency || {}),
 		        videoPrompt: {
@@ -2375,6 +2597,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
 	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
 	    }
+	    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-batch-ready');
 	    return { storyboards, videoTasks };
 	  });
 

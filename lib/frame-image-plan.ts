@@ -16,8 +16,8 @@
  *                     提交给模型的 image[] 数组下标 +1。
  *     renderer 的 "Image N = ..." 标签用的是 imageNo, 不是 slot, 避免 scene
  *     走 text_only 时出现 "Image 2 = character" 但 image[0] 其实就是它的错位。
- *   - 是否把 ref 作为 image 传给模型, 由 modelSnapshot.multiRefImageCap 决定;
- *     当前业务侧统一传 cap=1, 其余候选走 text_only 兜底。P3 再打开多图。
+ *   - provider capability 和业务预算分开: modelSnapshot.multiRefImageCap 表示模型能力,
+ *     FRAME_IMAGE_REFERENCE_IMAGE_BUDGET=4 表示首/尾帧业务固定最多提交 4 张参考图。
  */
 
 import { createHash } from 'node:crypto';
@@ -76,7 +76,7 @@ export type FrameImageModelSnapshot = {
   model: string;
   baseUrl?: string;
   quality?: string;
-  /** 当前 provider 能接受的参考图数量上限; P0 业务侧强制 1 以保持零行为变更。 */
+  /** 当前 provider 能接受的参考图数量上限; 首/尾帧业务预算另由 FRAME_IMAGE_REFERENCE_IMAGE_BUDGET 限制。 */
   multiRefImageCap: number;
 };
 
@@ -160,9 +160,84 @@ export type BuildFramePlanInput = {
 };
 
 const MAX_FINAL_PROMPT_CHARS = 2200;
+export const FRAME_IMAGE_REFERENCE_IMAGE_BUDGET = 4;
 
 function hashText(text: string): string {
   return createHash('sha256').update(String(text || '')).digest('hex');
+}
+
+function importanceKey(value: unknown): string {
+  return clean(value)
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/\s+/g, '');
+}
+
+function characterName(ch: any): string {
+  return clean(ch?.name || ch?.role);
+}
+
+function propName(prop: any): string {
+  return clean(prop?.name || prop?.propName);
+}
+
+function shotCharacterKeys(shot: any): string[] {
+  if (!Array.isArray(shot?.characters)) return [];
+  return shot.characters
+    .map((name: any) => importanceKey(name))
+    .filter(Boolean);
+}
+
+export function orderCharactersByImportance(
+  primaryShot: any,
+  groupShots: any[],
+  allChars: any[],
+  groupText: string,
+): any[] {
+  const primaryKey = shotCharacterKeys(primaryShot)[0] || '';
+  const groupTextKey = importanceKey(groupText);
+  const occurrenceCounts = new Map<string, number>();
+  for (const shot of groupShots) {
+    for (const key of shotCharacterKeys(shot)) {
+      occurrenceCounts.set(key, (occurrenceCounts.get(key) || 0) + 1);
+    }
+  }
+
+  return allChars
+    .map((ch, index) => {
+      const name = characterName(ch);
+      const key = importanceKey(name);
+      return {
+        ch,
+        index,
+        key,
+        primaryRank: key && primaryKey && key === primaryKey ? 0 : 1,
+        occurrenceCount: key ? occurrenceCounts.get(key) || 0 : 0,
+        firstMentionIndex: key && groupTextKey.includes(key) ? groupTextKey.indexOf(key) : Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) =>
+      (a.primaryRank - b.primaryRank) ||
+      (b.occurrenceCount - a.occurrenceCount) ||
+      (a.firstMentionIndex - b.firstMentionIndex) ||
+      (a.index - b.index),
+    )
+    .map((item) => item.ch);
+}
+
+export function orderPropsByFirstOccurrence(usedProps: any[], groupText: string): any[] {
+  const groupTextKey = importanceKey(groupText);
+  return usedProps
+    .map((prop, index) => {
+      const key = importanceKey(propName(prop));
+      return {
+        prop,
+        index,
+        firstMentionIndex: key && groupTextKey.includes(key) ? groupTextKey.indexOf(key) : Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .sort((a, b) => (a.firstMentionIndex - b.firstMentionIndex) || (a.index - b.index))
+    .map((item) => item.prop);
 }
 
 // ---------- public API ----------
@@ -242,11 +317,11 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     ...((project?.assets?.characters || []) as any[]),
     ...((project?.characters || []) as any[]),
   ]);
-  const usedChars = allChars
+  const usedChars = orderCharactersByImportance(primaryShot, groupShots, allChars
     .filter((c: any) => {
       const nm = c?.name || c?.role;
       return nm && (charNames.has(nm) || groupText.includes(nm));
-    })
+    }), groupText)
     .slice(0, 6);
 
   const characterLockRoster = buildCharacterLockRoster(project, charNames, 'en', groupText);
@@ -297,12 +372,12 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
 
   // ---- props ----
   const allProps: any[] = (project?.assets?.props || []) as any[];
-  const usedProps = allProps
+  const usedProps = orderPropsByFirstOccurrence(allProps
     .filter((p: any) => {
       const nm = p?.name || p?.propName;
       if (!nm || hasFillLightPositiveMention(nm)) return false;
       return groupText.includes(sanitizeFillLightPositiveMentions(nm));
-    })
+    }), groupText)
     .slice(0, 6);
   const propLockText = sanitizeFillLightPositiveMentions(
     usedProps
@@ -338,28 +413,29 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   type Candidate = Omit<FrameReference, 'slot' | 'delivery'>;
   const candidates: Candidate[] = [];
 
-  // tail_frame: 本片段首帧图作为最高优先级锚 (slot 1)。
-  if (frameType === 'tail_frame' && input.selfFirstFrame?.remoteUrl) {
-    candidates.push({
+  const selfFirstFrameCandidate: Candidate | null =
+    frameType === 'tail_frame' && input.selfFirstFrame?.remoteUrl
+      ? {
       role: 'self_first_frame',
       assetName: 'this segment first frame',
       remoteUrl: input.selfFirstFrame.remoteUrl,
       localPath: input.selfFirstFrame.localPath,
       textFallback:
         'Self first frame: composition/identity anchor for this segment — match camera angle, wardrobe, props, and lighting of the opening frame.',
-    });
-  }
+      }
+      : null;
 
-  if (chosenScene) {
-    candidates.push({
-      role: 'scene',
-      assetId: chosenScene.sceneId || chosenScene.id || undefined,
-      assetName: chosenScene.name || chosenScene.location || 'scene',
-      remoteUrl: chosenScene.imageUrl || chosenScene.rawUrl || undefined,
-      textFallback: sceneLockText,
-    });
-  }
-  for (const c of usedChars) {
+  const sceneCandidate: Candidate | null = chosenScene
+    ? {
+        role: 'scene',
+        assetId: chosenScene.sceneId || chosenScene.id || undefined,
+        assetName: chosenScene.name || chosenScene.location || 'scene',
+        remoteUrl: chosenScene.imageUrl || chosenScene.rawUrl || undefined,
+        textFallback: sceneLockText,
+      }
+    : null;
+
+  const characterCandidates = usedChars.map((c: any): Candidate => {
     const nm = c.name || c.role;
     const baseDesc = [c.identity, c.appearance || c.description, c.clothing, c.equipment]
       .filter(Boolean)
@@ -368,17 +444,18 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       c.entityType === 'non-human'
         ? ' (NON-HUMAN anthropomorphic character, preserve species body)'
         : '';
-    candidates.push({
+    return {
       role: 'character',
       assetId: c.characterId || c.id || nm,
       assetName: nm,
       remoteUrl: c.imageUrl || c.rawUrl || undefined,
       textFallback: `${nm}${ent}: ${truncate(baseDesc, 180)}`,
-    });
-  }
-  for (const p of usedProps) {
+    };
+  });
+
+  const propCandidates = usedProps.map((p: any): Candidate => {
     const nm = p.name || p.propName;
-    candidates.push({
+    return {
       role: 'prop',
       assetId: p.propId || p.id || nm,
       assetName: nm,
@@ -389,10 +466,33 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         ),
         140,
       )}`,
-    });
+    };
+  });
+
+  const takeCandidate = (candidate: Candidate | null | undefined) => {
+    if (candidate) candidates.push(candidate);
+  };
+
+  if (frameType === 'first_frame') {
+    takeCandidate(characterCandidates[0]);
+    takeCandidate(sceneCandidate);
+    takeCandidate(characterCandidates[1]);
+    takeCandidate(propCandidates[0]);
+    takeCandidate(characterCandidates[2]);
+    propCandidates.slice(1).forEach(takeCandidate);
+    characterCandidates.slice(3).forEach(takeCandidate);
+  } else {
+    takeCandidate(selfFirstFrameCandidate);
+    takeCandidate(characterCandidates[0]);
+    takeCandidate(sceneCandidate);
+    takeCandidate(propCandidates[0]);
+    takeCandidate(characterCandidates[1]);
+    characterCandidates.slice(2).forEach(takeCandidate);
+    propCandidates.slice(1).forEach(takeCandidate);
   }
 
-  const cap = Math.max(0, Math.floor(input.modelSnapshot.multiRefImageCap || 0));
+  const providerCap = Math.max(0, Math.floor(input.modelSnapshot.multiRefImageCap || 0));
+  const cap = Math.min(FRAME_IMAGE_REFERENCE_IMAGE_BUDGET, providerCap);
   const manifest: FrameReference[] = [];
   let imageBudget = cap;
   let slot = 1;

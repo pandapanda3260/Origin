@@ -209,9 +209,13 @@ export function selectCharacterReferencePanels(opts: {
   groupShotIndices?: number[];
   shots?: any[];
   maxSlots?: number;
+  perCharacterLimit?: number;
 }): CharacterReferencePanel[] {
-  const maxSlots = Math.max(0, Math.min(4, Number(opts.maxSlots ?? 4)));
+  const maxSlots = Math.max(0, Math.min(9, Number(opts.maxSlots ?? 4)));
   if (!maxSlots) return [];
+  const perCharacterLimit = Number.isFinite(Number(opts.perCharacterLimit))
+    ? Math.max(1, Math.floor(Number(opts.perCharacterLimit)))
+    : null;
 
   const allShots = Array.isArray(opts.project?.shots) ? opts.project.shots : [];
   const shots = Array.isArray(opts.shots)
@@ -222,7 +226,9 @@ export function selectCharacterReferencePanels(opts: {
   if (!scored.length) return [];
 
   const intent = normalizeShotPanelIntent(shots);
-  const allocations = slotAllocation(scored.length, intent, maxSlots);
+  const allocations = slotAllocation(scored.length, intent, maxSlots).map((slots) =>
+    perCharacterLimit == null ? slots : Math.min(slots, perCharacterLimit),
+  );
   const selected: CharacterReferencePanel[] = [];
 
   for (let i = 0; i < scored.length && selected.length < maxSlots; i++) {

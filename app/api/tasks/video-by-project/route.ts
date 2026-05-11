@@ -3,9 +3,48 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { getProjectByIdForUser } from '@/lib/projects-db';
+import { storyboardShotIndices } from '@/lib/frame-workflow-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+function stringContainsTaskId(value: any, taskId: string): boolean {
+  return typeof value === 'string' && taskId.length > 0 && value.includes(taskId);
+}
+
+function rowBelongsToCurrentSlot(project: any, row: any): boolean {
+  const taskId = String(row?.id || '');
+  const gi = Number(row?.group_idx);
+  if (!taskId || !Number.isInteger(gi) || gi < 0) return false;
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+  const sb = storyboards[gi];
+  if (!sb) return false;
+  try {
+    storyboardShotIndices(project, gi, sb, { mode: 'single-shot-strict' });
+  } catch {
+    return false;
+  }
+
+  const vt = videoTasks[gi];
+  const linkedIds = [
+    sb?.videoTaskId,
+    vt?.taskId,
+    vt?.serverTaskId,
+    vt?.id,
+  ].map((v) => String(v || '').trim()).filter(Boolean);
+  if (linkedIds.includes(taskId)) return true;
+
+  return [
+    sb?.videoUrl,
+    sb?._originVideoUrl,
+    vt?.url,
+    vt?.videoUrl,
+    vt?.protectedUrl,
+    vt?._originVideoUrl,
+  ].some((value) => stringContainsTaskId(value, taskId));
+}
 
 /**
  * 返回当前项目下的视频任务历史，给前端 _reattachVideoTasks 用作刷新后
@@ -22,6 +61,9 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const projectId = url.searchParams.get('projectId');
   if (!projectId) return jsonError('缺 projectId', 400);
+
+  const project = getProjectByIdForUser(projectId, user.id) as any;
+  if (!project) return jsonError('项目不存在', 404);
 
   const db = getDb();
   const rows = db
@@ -40,6 +82,7 @@ export async function GET(req: NextRequest) {
   for (const r of rows) {
     const gi = Number(r.group_idx);
     if (seen.has(gi)) continue;
+    if (!rowBelongsToCurrentSlot(project, r)) continue;
     seen.add(gi);
     const protectedUrl = r.filename ? `/api/videos/file/${r.id}` : '';
     const resultUrl = r.filename ? buildSignedVideoUrl(r.id, user.id).url : '';

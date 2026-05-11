@@ -37,10 +37,21 @@ export type ImageGenInput = {
 	 * `/v1/images/generations` 切到 `/v1/images/edits`（multipart），把这张
 	 * 图作为视觉锚点喂给 gpt-image-1 / gpt-image-2，让生成图保留参考图的
 	 * 材质 / 色调 / 建筑结构 / 物件风格。当前主要用途：
-	 *   - 镜头分镜以场景图为参考，保证场景一致
-	 * 如果文件不存在或读取失败，会自动 fallback 到 generations 路径。
+   *   - 镜头分镜以场景图为参考，保证场景一致
+   * 如果文件不存在或读取失败，会自动 fallback 到 generations 路径。
+   *
+   * P3a 兼容字段: 当调用方传 referenceImagePaths (数组) 时, 这个单字段被忽略;
+   * 未传时内部自动包装成 [referenceImagePath] 走多图归并入口, 保证单图/多图走
+   * 同一套 provider 分支代码。
    */
   referenceImagePath?: string;
+  /**
+   * P3a 新增：多张参考图的本地绝对路径数组。顺序严格对齐 prompt 里的
+   * "Image 1 / Image 2 / Image 3 …" 编号和提交给 provider 的 image[] 数组顺序。
+   * 实际能传几张由 resolveLLMConfig 的 capabilities.image.multiRefImage 决定;
+   * 业务层若超出能力上限, 请在传进来之前自行截断 (或依靠 plan 的 imageNo 分配)。
+   */
+  referenceImagePaths?: string[];
 };
 
 export type ImageGenResult = {
@@ -63,6 +74,19 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+/**
+ * 归并 referenceImagePaths (新) 和 referenceImagePath (旧) 为统一的数组。
+ * 数组非空优先, 否则降级成 [referenceImagePath], 再降级空数组。
+ * provider 分支代码统一从这个 helper 拿路径, 不再直接读 input.referenceImagePath。
+ */
+export function collectImagePaths(input: ImageGenInput): string[] {
+  if (Array.isArray(input.referenceImagePaths) && input.referenceImagePaths.length) {
+    return input.referenceImagePaths.filter((p): p is string => typeof p === 'string' && p.length > 0);
+  }
+  if (input.referenceImagePath) return [input.referenceImagePath];
+  return [];
+}
+
 function retryAfterMs(raw: string | null): number | null {
   if (!raw) return null;
   const seconds = Number(raw);
@@ -79,6 +103,45 @@ function jitter(ms: number): number {
 function isTransientNetworkError(err: any): boolean {
   const msg = String(err?.message || err || '');
   return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+}
+
+let imageSubmitActive = 0;
+const imageSubmitQueue: Array<() => void> = [];
+
+function imageSubmitConcurrency(): number {
+  const fallback = envInt('IMAGE_GEN_SUBMIT_CONCURRENCY', 2, 1, 3);
+  return envInt('IMAGE_SUBMIT_CONCURRENCY', fallback, 1, 3);
+}
+
+async function acquireImageSubmitPermit(label: string): Promise<() => void> {
+  const limit = imageSubmitConcurrency();
+  if (imageSubmitActive >= limit) {
+    console.log(
+      `[image-gen][submit-semaphore] waiting label=${label} active=${imageSubmitActive} limit=${limit} queued=${imageSubmitQueue.length + 1}`,
+    );
+  }
+
+  await new Promise<void>((resolve) => {
+    const tryAcquire = () => {
+      if (imageSubmitActive < imageSubmitConcurrency()) {
+        imageSubmitActive += 1;
+        resolve();
+        return;
+      }
+      imageSubmitQueue.push(tryAcquire);
+    };
+    tryAcquire();
+  });
+
+  let released = false;
+  console.log(`[image-gen][submit-semaphore] acquired label=${label} active=${imageSubmitActive} limit=${imageSubmitConcurrency()}`);
+  return () => {
+    if (released) return;
+    released = true;
+    imageSubmitActive = Math.max(0, imageSubmitActive - 1);
+    const next = imageSubmitQueue.shift();
+    if (next) setImmediate(next);
+  };
 }
 
 /**
@@ -118,6 +181,8 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   } else {
     const t0 = Date.now();
     const modelName = cfg.model || 'gpt-image-1';
+    // P3a 多图: 先把所有 ref paths 归并出来, 后续 seedream / gpt-image edit 分支都从这里取。
+    const allRefPaths = collectImagePaths(input).filter((p) => existsSync(p));
     // 是否走 image-edit（参考图 → 同地点不同角度 / 同角色不同动作）
     // 兼容性：gpt-image-1 / gpt-image-2 / dall-e-2 都支持 /v1/images/edits，
     // dall-e-3 不支持（只有 generations）。如果调方给了参考图但模型不支持，
@@ -127,9 +192,19 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       const m = (modelName || '').toLowerCase();
       return m.includes('gpt-image') || m.includes('dall-e-2');
     })();
-    const useEdit = !!(input.referenceImagePath && existsSync(input.referenceImagePath) && editSupported);
-    if (input.referenceImagePath && !editSupported) {
-      console.warn(`[image-gen] reference image provided but model ${modelName} does not support edits — falling back to text-only generation`);
+    const useEdit = !!(allRefPaths.length && editSupported);
+    if (allRefPaths.length && !editSupported) {
+      console.warn(`[image-gen] reference image(s) provided but model ${modelName} does not support edits — falling back to text-only generation`);
+    }
+    // 实际提交给 provider 的 ref 张数, 受 capability 上限裁剪。
+    const capImage = cfg.capabilities?.image;
+    const multiRefCap = capImage ? Math.max(0, Math.floor(capImage.multiRefImage || 0)) : 1;
+    const effectiveRefPaths = allRefPaths.slice(0, multiRefCap);
+    const imageTransport = (capImage && capImage.transport) || 'single_image';
+    if (allRefPaths.length > effectiveRefPaths.length) {
+      console.warn(
+        `[image-gen] capability caps multiRefImage=${multiRefCap}, dropped ${allRefPaths.length - effectiveRefPaths.length} ref image(s)`,
+      );
     }
     const q = pickQuality(modelName, cfg.imageQuality || input.quality);
     const requestTimeoutMs = cfg.timeoutMs || 240_000;
@@ -154,20 +229,45 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       if (remainingBudget <= 0) {
         throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
       }
-      const attemptTimeoutMs = Math.max(1000, Math.min(requestTimeoutMs, remainingBudget));
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
+      let attemptTimeoutMs = 0;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
       const tA = Date.now();
+      let releaseSubmitPermit: null | (() => void) = null;
       try {
+        releaseSubmitPermit = await acquireImageSubmitPermit(`${input.kind}:${input.assetRef || 'unscoped'}:attempt${attempt}`);
+        const submitRemainingBudget = retryDeadlineAt - Date.now();
+        if (submitRemainingBudget <= 0) {
+          throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
+        }
+        attemptTimeoutMs = Math.max(1000, Math.min(requestTimeoutMs, submitRemainingBudget));
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
         let resp: Response;
         if (cfg.provider === 'volcengine_seedream') {
           const body = buildSeedreamImageBody(cfg, modelName, finalPrompt, input);
-          if (input.referenceImagePath && existsSync(input.referenceImagePath)) {
-            body.image = imagePathToDataUrl(input.referenceImagePath);
+          if (effectiveRefPaths.length === 1) {
+            // 单图路径: 旧行为, body.image = string (与文档 / 现网一致, 稳定)。
+            body.image = imagePathToDataUrl(effectiveRefPaths[0]);
+          } else if (effectiveRefPaths.length > 1) {
+            if (
+              imageTransport === 'unverified_seedream_array' ||
+              imageTransport === 'verified_seedream_array'
+            ) {
+              // Seedream 4.x/5.x 文档声称 image 字段接受数组。unverified_* 前提是
+              // scripts/probe-multi-ref-seedream.js 未跑过实测, 默认保守装配;
+              // probe 跑通后手动改成 'verified_seedream_array' 消除警告。
+              body.image = effectiveRefPaths.map((p) => imagePathToDataUrl(p));
+            } else {
+              console.warn(
+                `[image-gen][seedream] transport='${imageTransport}' not yet wired for multi-image, falling back to single ref (first image only)`,
+              );
+              body.image = imagePathToDataUrl(effectiveRefPaths[0]);
+            }
           }
           console.log(
             `[image-gen][seedream] start attempt=${attempt} model=${modelName} ` +
-              `size=${body.size || '-'} kind=${input.kind} ref=${body.image ? 'yes' : 'no'}`,
+              `size=${body.size || '-'} kind=${input.kind} refCount=${effectiveRefPaths.length} ` +
+              `transport=${imageTransport}`,
           );
           resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
             method: 'POST',
@@ -179,15 +279,25 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
             signal: controller.signal,
           });
         } else if (useEdit) {
-          console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit ref=${input.referenceImagePath}`);
+          // P3a: multipart 按 transport 决定字段名。probe 验证前先用 'image' 重复 (最常见),
+          // verified_openai_multipart_bracket → 'image[]', verified_openai_multipart_image_files → 'image_files[]'.
+          let fieldName = 'image';
+          if (imageTransport === 'verified_openai_multipart_bracket') fieldName = 'image[]';
+          else if (imageTransport === 'verified_openai_multipart_image_files') fieldName = 'image_files[]';
+          // 其它情况 (unverified / verified_repeat / single_image) 都用 'image', 重复 append 多次。
+          console.log(
+            `[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit refCount=${effectiveRefPaths.length} transport=${imageTransport} field=${fieldName}`,
+          );
           const fd = new FormData();
           fd.append('model', modelName);
           fd.append('prompt', finalPrompt);
           fd.append('size', input.size || '1024x1024');
           fd.append('n', '1');
           if (q) fd.append('quality', q);
-          const refBuf = readFileSync(input.referenceImagePath!);
-          fd.append('image', new Blob([refBuf], { type: 'image/png' }), 'reference.png');
+          for (let i = 0; i < effectiveRefPaths.length; i += 1) {
+            const refBuf = readFileSync(effectiveRefPaths[i]);
+            fd.append(fieldName, new Blob([refBuf], { type: 'image/png' }), `reference-${i + 1}.png`);
+          }
           resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageEditEndpoint || '/images/edits'}`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${cfg.apiKey}` },
@@ -232,6 +342,8 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           width = actualW;
           height = actualH;
         }
+        releaseSubmitPermit();
+        releaseSubmitPermit = null;
 
         let buf: Buffer;
         if (item.b64_json) {
@@ -314,7 +426,8 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         }
         throw new Error(friendly);
       } finally {
-        clearTimeout(timeoutId);
+        if (releaseSubmitPermit) releaseSubmitPermit();
+        if (timeoutId) clearTimeout(timeoutId);
       }
     }
     // 理论上不会走到这里，break 或 throw 二选一

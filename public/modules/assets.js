@@ -73,10 +73,12 @@ export function refreshAssetsPage() {
   var need = $("assetsNeedScript");
   var ready = $("assetsReady");
   var content = $("assetsContent");
+  var saveTplBtn = $("btnSaveWorldTemplate");
   if (!project || !project.scriptApproved) {
     need.hidden = false;
     if (ready) ready.hidden = true;
     if (content) content.hidden = true;
+    if (saveTplBtn) saveTplBtn.hidden = true;
     return;
   }
   need.hidden = true;
@@ -99,6 +101,7 @@ export function refreshAssetsPage() {
     if (content) content.hidden = true;
     var banner = $("assetsExtractBanner");
     if (banner) banner.hidden = true;
+    if (saveTplBtn) saveTplBtn.hidden = true;
   }
 }
 
@@ -415,68 +418,45 @@ function _renderSceneCards(container, items) {
     card.dataset.idx = idx;
 
     var imgSrc = item.rawUrl || item.imageUrl || '';
-    var isFirst = idx === 0;
+    var isMain = !!item.isMain || idx === 0;
+    var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"' : '';
+    var imageClass = imgSrc ? ' cursor-pointer' : '';
+    var imgHtml = imgSrc
+      ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" />'
+      : '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-4xl text-on-surface-variant/15">landscape</span></div>';
 
-    if (isFirst) {
-      card.className = "asset-card group relative overflow-hidden rounded-xl bg-surface-container-low p-1 col-span-full";
-      var imgHtml = imgSrc
-        ? '<img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover rounded-lg transform group-hover:scale-105 transition-transform duration-1000" />'
-        : '<div class="w-full h-full flex items-center justify-center bg-surface-container rounded-lg min-h-[280px]"><span class="material-symbols-outlined text-6xl text-on-surface-variant/10">landscape</span></div>';
+    var metaTags = '';
+    if (item.timeSetting) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</span>';
+    if (item.atmosphere) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</span>';
 
-      var metaHtml = '';
-      if (item.timeSetting) metaHtml += '<div class="flex items-center gap-1.5 text-xs font-semibold text-white/70"><span class="material-symbols-outlined text-sm">schedule</span>' + escapeHtml(item.timeSetting) + '</div>';
-      if (item.atmosphere) metaHtml += '<div class="flex items-center gap-1.5 text-xs font-semibold text-white/70"><span class="material-symbols-outlined text-sm">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</div>';
-
-      card.innerHTML =
-        '<div class="relative min-h-[320px] rounded-lg overflow-hidden">' +
-          imgHtml +
-          '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-[#0B1320]/50 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
-          '<div class="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent"></div>' +
-          '<div class="absolute bottom-8 left-8 text-white">' +
-            '<div class="flex items-center gap-2 mb-2">' +
-              '<span class="bg-primary/80 backdrop-blur px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>' +
-              (item.location ? '<span class="text-xs font-medium opacity-70">' + escapeHtml(item.location) + '</span>' : '') +
-            '</div>' +
-            '<h4 class="text-3xl font-light tracking-tight">' + escapeHtml(item.name) + '</h4>' +
-            (item.description ? '<p class="max-w-lg mt-3 text-sm opacity-80 leading-relaxed font-light">' + escapeHtml(item.description.slice(0, 120)) + '</p>' : '') +
-            (metaHtml ? '<div class="flex gap-4 mt-3">' + metaHtml + '</div>' : '') +
+    card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500";
+    card.innerHTML =
+      '<div class="relative aspect-[16/9] rounded-lg overflow-hidden' + imageClass + '"' + imageAttrs + '>' +
+        imgHtml +
+        '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
+        '<div class="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-black/65 via-black/20 to-transparent">' +
+          '<div class="flex items-center gap-2">' +
+            (isMain ? '<span class="bg-primary/90 text-on-primary px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>' : '') +
+            (item.location ? '<span class="text-[11px] font-medium text-white/80 truncate">' + escapeHtml(item.location) + '</span>' : '') +
           '</div>' +
-          '<div class="absolute top-6 right-6 flex gap-2">' +
-            (imgSrc ? '<button type="button" class="w-10 h-10 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center hover:bg-white/20 transition-all border border-white/20" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><span class="material-symbols-outlined text-white text-sm">zoom_in</span></button>' : '') +
-            '<button type="button" class="w-10 h-10 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center hover:bg-white/20 transition-all border border-white/20" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-white text-sm">alternate_email</span></button>' +
-            '<button type="button" class="w-10 h-10 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center hover:bg-white/20 transition-all border border-white/20" data-action="regen-asset"><span class="material-symbols-outlined text-white text-sm">refresh</span></button>' +
-            _ctx.historyBtnHtml(item, "pill-white") +
-            '<button type="button" class="w-10 h-10 bg-white/10 backdrop-blur-md rounded-full flex items-center justify-center hover:bg-white/20 transition-all border border-white/20" data-action="edit-asset"><span class="material-symbols-outlined text-white text-sm">edit</span></button>' +
-          '</div>' +
-        '</div>';
-    } else {
-      card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500 flex";
-      var imgBlock = imgSrc
-        ? '<img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover group-hover:scale-110 transition-transform duration-1000" />'
-        : '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-3xl text-on-surface-variant/15">landscape</span></div>';
-
-      var metaTags = '';
-      if (item.timeSetting) metaTags += '<div class="flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</div>';
-      if (item.atmosphere) metaTags += '<div class="flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</div>';
-
-      card.innerHTML =
-        '<div class="w-1/3 h-full overflow-hidden rounded-lg relative cursor-pointer" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '">' +
-          imgBlock +
-          '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
         '</div>' +
-        '<div class="w-2/3 p-5 flex flex-col justify-center">' +
-          '<span class="text-[9px] font-bold text-primary tracking-[0.15em] uppercase mb-1">' + (item.location || '场景') + '</span>' +
-          '<h4 class="text-lg font-bold tracking-tight text-on-background">' + escapeHtml(item.name) + '</h4>' +
-          (item.description ? '<p class="text-[11px] text-on-surface-variant/60 mt-1.5 line-clamp-2 leading-relaxed">' + escapeHtml(item.description.slice(0, 100)) + '</p>' : '') +
-          (metaTags ? '<div class="flex gap-3 mt-2">' + metaTags + '</div>' : '') +
-          '<div class="flex gap-1.5 mt-3 flex-wrap">' +
-            '<button type="button" class="h-7 px-3 text-[9px] font-bold text-on-surface-variant bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-lg transition-colors uppercase tracking-wide" data-action="regen-asset">重新生成</button>' +
-            _ctx.historyBtnHtml(item, "chip") +
-            '<button type="button" class="h-7 px-3 text-[9px] font-bold text-on-surface-variant bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-lg transition-colors uppercase tracking-wide" data-action="ref-agent" title="引用到 AI 助手">@</button>' +
-            '<button type="button" class="h-7 px-3 text-[9px] font-bold text-on-surface-variant bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-lg transition-colors uppercase tracking-wide" data-action="edit-asset">编辑</button>' +
+      '</div>' +
+      '<div class="p-4">' +
+        '<div class="flex items-start justify-between gap-3">' +
+          '<div class="min-w-0">' +
+            '<h4 class="text-base font-bold tracking-tight text-on-background truncate">' + escapeHtml(item.name || '场景') + '</h4>' +
+            (item.description ? '<p class="text-[11px] text-on-surface-variant/60 mt-1.5 leading-relaxed max-h-10 overflow-hidden">' + escapeHtml(item.description.slice(0, 120)) + '</p>' : '') +
           '</div>' +
-        '</div>';
-    }
+          '<div class="flex gap-1.5 shrink-0">' +
+            (imgSrc ? '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><span class="material-symbols-outlined text-on-surface text-sm">zoom_in</span></button>' : '') +
+            '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-sm">alternate_email</span></button>' +
+            '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="regen-asset" title="重新生成"><span class="material-symbols-outlined text-on-surface text-sm">refresh</span></button>' +
+            _ctx.historyBtnHtml(item, "chip") +
+            '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="edit-asset" title="编辑"><span class="material-symbols-outlined text-on-surface text-sm">edit</span></button>' +
+          '</div>' +
+        '</div>' +
+        (metaTags ? '<div class="flex flex-wrap gap-3 mt-3">' + metaTags + '</div>' : '') +
+      '</div>';
     container.appendChild(card);
   });
 }
@@ -890,6 +870,51 @@ export function _diagnoseApiError(msg) {
   return cleaned ? cleaned.slice(0, 120) : "生成失败，请稍后重试";
 }
 
+function _markAssetImageFailedLocally(originId, type, idx, err, extra, serverVersion) {
+  if (!type || typeof idx !== "number" || !_ctx.safeWriteBack) return false;
+  var cat = type === "char" ? "characters" : type === "scene" ? "scenes" : "props";
+  var topKey = type === "char" ? "characters" : type === "scene" ? "environments" : "props";
+  var message = (err || "生成失败").toString().slice(0, 1000);
+  var failedAt = new Date().toISOString();
+  return _ctx.safeWriteBack(originId, function (proj) {
+    if (!proj.assets) proj.assets = {};
+    if (!Array.isArray(proj.assets[cat])) proj.assets[cat] = [];
+    var item = proj.assets[cat][idx];
+    if (!item) return;
+    var existingUrl =
+      (item.reference && (item.reference.currentUrl || item.reference.lastKnownGoodUrl)) ||
+      item.imageUrl ||
+      item.rawUrl ||
+      item.realPhotoUrl ||
+      item.pencilUrl ||
+      "";
+    var referenceStatus = (extra && extra.referenceStatus) || (existingUrl ? "degraded" : "failed");
+    var lastError = {
+      message: message,
+      failedAt: failedAt,
+      batchType: "asset_images",
+      imageSafetyAudit: extra && extra.imageSafetyAudit
+    };
+    item.reference = Object.assign({}, item.reference || {}, {
+      currentUrl: (item.reference && item.reference.currentUrl) || item.imageUrl || item.rawUrl || undefined,
+      lastKnownGoodUrl: (item.reference && item.reference.lastKnownGoodUrl) || existingUrl || undefined,
+      status: referenceStatus,
+      lastError: lastError
+    });
+    item.imageLastError = message;
+    item.imageFailedAt = failedAt;
+    if (extra && extra.imageSafetyAudit) item.imageSafetyAudit = extra.imageSafetyAudit;
+
+    var top = Array.isArray(proj[topKey]) ? proj[topKey] : null;
+    if (top && top[idx]) {
+      top[idx].reference = item.reference;
+      top[idx].imageLastError = item.imageLastError;
+      top[idx].imageFailedAt = item.imageFailedAt;
+      if (item.imageSafetyAudit) top[idx].imageSafetyAudit = item.imageSafetyAudit;
+    }
+  }, serverVersion);
+}
+
 /**
  * 更新资产面板顶部的「风格图补全中 N/M」徽标。
  * N = 当前项目已就绪的 pencilUrl 数；M = 需要转绘的人形角色总数
@@ -1280,6 +1305,9 @@ function _attachAssetImageBatch(opts) {
         item.rawUrl = url;
         if (extra.assetId) item.assetId = extra.assetId;
         if (extra.fetchStatus) item.fetchStatus = extra.fetchStatus;
+        delete item.imageLastError;
+        delete item.imageFailedAt;
+        if (item.reference) delete item.reference.lastError;
         if (proj._staleFlags) delete proj._staleFlags["asset_img_" + type + "_" + idx];
       }, data && data.serverVersion);
 
@@ -1296,6 +1324,7 @@ function _attachAssetImageBatch(opts) {
       var err = (data && data.errorMsg) || "生成失败";
       console.error("[AssetImg] task_failed:", type, idx, err);
       if (type && typeof idx === "number") {
+        _markAssetImageFailedLocally(originId, type, idx, err, extra, data && data.serverVersion);
         updateAssetCardImage(type, idx, "error");
       }
       // 积分不足专门处理：弹一次付费墙、把 hint 改成醒目的提示，避免用户
@@ -1676,9 +1705,14 @@ function _runStylizeBatch(originId, targets) {
 
 export function checkAssetsConfirm() {
   var area = $("assetsConfirmArea");
-  if (!area || !project || !project.assets) return;
+  var saveTplBtn = $("btnSaveWorldTemplate");
+  if (!area || !project || !project.assets) {
+    if (saveTplBtn) saveTplBtn.hidden = true;
+    return;
+  }
   var hasAssets = (project.assets.characters || []).length > 0 || (project.assets.scenes || []).length > 0;
   area.hidden = !hasAssets;
+  if (saveTplBtn) saveTplBtn.hidden = !hasAssets;
 }
 
 export function confirmAssets() {

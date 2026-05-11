@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags } from './utils.js';
+import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags } from './utils.js';
 
 var _ctx = {};
 var project = null;
@@ -125,7 +125,7 @@ function _hideScriptConfirmArea() {
 }
 
 function _announceStyleBibleReady() {
-  chatAddMsg("status", '<span class="chat-status-ok">风格圣经提取完成，右侧可查看详情；请点击下方按钮确认剧本并进入资产库</span>');
+  chatAddMsg("status", '<span class="chat-status-ok">初版风格已生成；请确认剧本后到「风格制定」页检查</span>');
   _showScriptConfirmArea();
 }
 
@@ -137,7 +137,6 @@ export function refreshScriptPage() {
   // 回放多轮咨询历史（只在"还没走到正式剧本"阶段做，避免和已有 bible / script 卡重叠）
   _replayScriptConsultHistory();
   var resultCard = $("scriptResultCard");
-  var bibleCard = $("styleBibleCard");
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
 
@@ -147,25 +146,10 @@ export function refreshScriptPage() {
     if (displayText) displayText.textContent = _cleanScript;
     if (editArea) editArea.value = _cleanScript;
     showScriptDisplay();
-    if (hasUsableStyleBible(project.styleBible, project)) {
-      bibleCard.hidden = false;
-      renderStyleBible(project.styleBible);
-      _showScriptConfirmArea();
-    } else {
-      bibleCard.hidden = false;
-      renderStyleBibleFailure(_styleBibleErrorText(project, "风格圣经尚未提取或提取失败"));
-      _hideScriptConfirmArea();
-    }
+    _showScriptConfirmArea();
     _scrollChatToBottom();
   } else {
     resultCard.hidden = true;
-    if (bibleCard) {
-      bibleCard.hidden = false;
-      renderStyleBibleEmpty(
-        "等待剧本生成",
-        "生成或上传剧本后，系统会自动提取视觉风格、色彩、氛围与角色设定。"
-      );
-    }
     _hideScriptConfirmArea();
     if (displayText) displayText.textContent = "";
     if (editArea) editArea.value = "";
@@ -176,7 +160,126 @@ export function refreshScriptPage() {
   var ideaInput = $("ideaInput");
   if (ideaInput && project && !project.script) ideaInput.value = project.idea || "";
   _updateScriptInputPlaceholder();
-  renderScriptLibrary();
+  refreshScriptImportDraft();
+}
+
+function _pendingImportedDraft() {
+  if (!project) return "";
+  var draft = String(project.scriptDraft || "").trim();
+  if (!draft) return "";
+  var current = String(project.script || "").trim();
+  return draft && draft !== current ? draft : "";
+}
+
+export function refreshScriptImportDraft() {
+  var card = $("scriptImportDraftCard");
+  var textarea = $("scriptDraftPreview");
+  if (!card || !textarea) return;
+  var draft = _pendingImportedDraft();
+  if (!draft) {
+    card.hidden = true;
+    textarea.value = "";
+    return;
+  }
+  card.hidden = false;
+  if (textarea.value !== draft) textarea.value = draft;
+}
+
+async function _setImportedDraft(text) {
+  if (!project) _ctx.createNewProject && _ctx.createNewProject();
+  if (!project || !project.id) return false;
+  var originId = project.id;
+  _ctx.safeWriteBack(originId, function (proj) {
+    proj.scriptDraft = text || "";
+  });
+  _ctx.saveProject && _ctx.saveProject();
+  refreshScriptImportDraft();
+  return true;
+}
+
+export async function uploadScriptFile(file) {
+  if (!file) return;
+  var fname = String(file.name || "").toLowerCase();
+  if (!fname.endsWith(".txt") && !fname.endsWith(".md")) {
+    showToast("当前仅支持导入 .txt 或 .md 纯文本剧本", "error");
+    return;
+  }
+  try {
+    var formData = new FormData();
+    formData.append("file", file);
+    var headers = {};
+    var tk = _ctx.getAuthToken ? _ctx.getAuthToken() : null;
+    if (tk) headers["Authorization"] = "Bearer " + tk;
+    var resp = await fetch("/api/script/parse-upload", { method: "POST", headers: headers, body: formData });
+    var data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok || data.error) throw new Error(data.error || data.detail || ("导入失败: HTTP " + resp.status));
+    var text = String(data.text || "").trim();
+    if (!text) { showToast("文件内容为空", "error"); return; }
+    var ok = await _setImportedDraft(text);
+    if (ok) showToast("剧本已导入为待确认草稿", "success");
+  } catch (e) {
+    showToast("导入失败: " + ((e && e.message) || e), "error");
+  }
+}
+
+async function _applyImportedDraft() {
+  var textarea = $("scriptDraftPreview");
+  var text = String((textarea && textarea.value) || "").trim();
+  if (!text) { showToast("导入草稿为空", "warn"); return; }
+  await _setImportedDraft(text);
+  var scriptOutput = $("scriptOutput");
+  if (scriptOutput) scriptOutput.value = text;
+  var resultCard = $("scriptResultCard");
+  if (resultCard) resultCard.hidden = false;
+  var displayText = $("scriptDisplayText");
+  if (displayText) displayText.textContent = text;
+  await confirmScript();
+}
+
+function _discardImportedDraft() {
+  if (!project || !project.id) return;
+  var originId = project.id;
+  _ctx.safeWriteBack(originId, function (proj) {
+    proj.scriptDraft = proj.script || "";
+  });
+  _ctx.saveProject && _ctx.saveProject();
+  refreshScriptImportDraft();
+  showToast("已放弃导入草稿", "info");
+}
+
+var _scriptImportEventsBound = false;
+export function initScriptImportEvents() {
+  if (_scriptImportEventsBound) return;
+  _scriptImportEventsBound = true;
+  var newBtn = $("btnNewScript");
+  if (newBtn) newBtn.addEventListener("click", function () { startNewScript(); });
+  var uploadBtn = $("btnUploadScript");
+  var fileInput = $("scriptFileInput");
+  if (uploadBtn && fileInput) {
+    uploadBtn.addEventListener("click", function () { fileInput.click(); });
+    fileInput.addEventListener("change", function () {
+      if (fileInput.files && fileInput.files[0]) {
+        uploadScriptFile(fileInput.files[0]);
+        fileInput.value = "";
+      }
+    });
+  }
+  var draftPreview = $("scriptDraftPreview");
+  if (draftPreview) {
+    draftPreview.addEventListener("input", function () {
+      if (!project || !project.id) return;
+      var originId = project.id;
+      var text = draftPreview.value;
+      _ctx.safeWriteBack(originId, function (proj) {
+        proj.scriptDraft = text;
+      });
+      _ctx.saveProject && _ctx.saveProject();
+    });
+  }
+  var applyBtn = $("btnApplyImportedDraft");
+  if (applyBtn) applyBtn.addEventListener("click", function () { _applyImportedDraft(); });
+  var discardBtn = $("btnDiscardImportedDraft");
+  if (discardBtn) discardBtn.addEventListener("click", _discardImportedDraft);
 }
 
 export function showScriptDisplay() {
@@ -256,7 +359,6 @@ function renderStyleBibleEmpty(title, message, allowRetry) {
     '<span class="material-symbols-outlined">auto_stories</span>' +
     '<h3>' + heading + '</h3>' +
     '<p>' + detail + '</p>' +
-    (allowRetry ? '<button type="button" onclick="document.getElementById(\'btnRegenBible\').click()" class="script-soft-btn">重新生成</button>' : '') +
     '</div>';
 }
 
@@ -567,9 +669,10 @@ async function _consultConfirm() {
     });
 
     var styleBibleReady = _isStyleBibleReadyResponse(resp);
-    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-      proj.script = resp.script || "";
-      proj.scriptApproved = false;
+	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+	      proj.script = resp.script || "";
+	      proj.scriptDraft = resp.script || "";
+	      proj.scriptApproved = false;
       _applyStyleBibleResponse(proj, resp);
       proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
       proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
@@ -580,38 +683,22 @@ async function _consultConfirm() {
     });
 
     if (isCurrent) {
-      addToScriptLibrary((project.name || project.idea || "剧本").slice(0, 30), resp.script, "generated");
-      if (styleBibleReady) _cacheStyleBibleToLibrary(resp.script, resp.styleBible);
-      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
-      if (editArea) editArea.value = resp.script;
-      if (editBtn) editBtn.hidden = false;
+	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
+	      if (editArea) editArea.value = resp.script;
+	      refreshScriptImportDraft();
+	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
       if (stepEl) stepEl.hidden = true;
-      chatRemoveDots();
-      if (styleBibleReady) {
-        var bibleCard = $("styleBibleCard");
-        if (bibleCard) {
-          bibleCard.hidden = false;
-          bibleCard.classList.remove("sb-entrance");
-          void bibleCard.offsetWidth;
-          bibleCard.classList.add("sb-entrance");
-        }
-        renderStyleBible(resp.styleBible);
-        var bibleText = formatStyleBibleForChat(resp.styleBible);
-        var aiMsg2 = chatAddMsg("ai", "");
-        var bubble2 = aiMsg2.querySelector(".chat-bubble--ai");
-        await typewriter(bubble2, bibleText, 3, 12);
-        _announceStyleBibleReady();
-      } else {
-        var bibleErr = _styleBibleErrorText(resp);
-        var failCard = $("styleBibleCard");
-        if (failCard) failCard.hidden = false;
-        renderStyleBibleFailure(bibleErr);
-        _hideScriptConfirmArea();
-        chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
-      }
+	      chatRemoveDots();
+	      if (styleBibleReady) {
+	        _announceStyleBibleReady();
+	      } else {
+	        var bibleErr = _styleBibleErrorText(resp);
+	        _showScriptConfirmArea();
+	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请确认剧本后到「风格制定」页重试</span>');
+	      }
       renderEmotionSegments();
     }
   } catch (e) {
@@ -775,9 +862,10 @@ export async function generateScript(idea) {
     });
 
     var styleBibleReady = _isStyleBibleReadyResponse(resp);
-    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-      proj.script = resp.script || "";
-      proj.scriptApproved = false;
+	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+	      proj.script = resp.script || "";
+	      proj.scriptDraft = resp.script || "";
+	      proj.scriptApproved = false;
       _applyStyleBibleResponse(proj, resp);
       proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
       proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
@@ -788,38 +876,22 @@ export async function generateScript(idea) {
     });
 
     if (isCurrent) {
-      addToScriptLibrary((project.name || idea).slice(0, 30), resp.script, "generated");
-      if (styleBibleReady) _cacheStyleBibleToLibrary(resp.script, resp.styleBible);
-      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
-      if (editArea) editArea.value = resp.script;
-      if (editBtn) editBtn.hidden = false;
+	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
+	      if (editArea) editArea.value = resp.script;
+	      refreshScriptImportDraft();
+	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
       if (stepEl) stepEl.hidden = true;
-      chatRemoveDots();
-      if (styleBibleReady) {
-        var bibleCard = $("styleBibleCard");
-        if (bibleCard) {
-          bibleCard.hidden = false;
-          bibleCard.classList.remove("sb-entrance");
-          void bibleCard.offsetWidth;
-          bibleCard.classList.add("sb-entrance");
-        }
-        renderStyleBible(resp.styleBible);
-        var bibleText = formatStyleBibleForChat(resp.styleBible);
-        var aiMsg = chatAddMsg("ai", "");
-        var bubble = aiMsg.querySelector(".chat-bubble--ai");
-        await typewriter(bubble, bibleText, 3, 12);
-        _announceStyleBibleReady();
-      } else {
-        var bibleErr = _styleBibleErrorText(resp);
-        var failCard = $("styleBibleCard");
-        if (failCard) failCard.hidden = false;
-        renderStyleBibleFailure(bibleErr);
-        _hideScriptConfirmArea();
-        chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
-      }
+	      chatRemoveDots();
+	      if (styleBibleReady) {
+	        _announceStyleBibleReady();
+	      } else {
+	        var bibleErr = _styleBibleErrorText(resp);
+	        _showScriptConfirmArea();
+	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请确认剧本后到「风格制定」页重试</span>');
+	      }
       renderEmotionSegments();
     }
   } catch (e) {
@@ -857,12 +929,10 @@ function _updateScriptInputPlaceholder() {
 
 export function startNewScript() {
   if (_scriptGenerating) return;
-  if (project && project.script) {
-    addToScriptLibrary((project.name || "未命名").slice(0, 30), project.script, "archived");
-  }
-  _ctx.safeWriteBack(project ? project.id : null, function (proj) {
-    proj.script = "";
-    proj.scriptApproved = false;
+	  _ctx.safeWriteBack(project ? project.id : null, function (proj) {
+	    proj.script = "";
+	    proj.scriptDraft = "";
+	    proj.scriptApproved = false;
     proj.styleBible = null;
     proj.styleBibleStatus = "";
     proj.styleBibleError = "";
@@ -897,42 +967,28 @@ export async function extractStyleBible() {
     });
     if (!_isStyleBibleReadyResponse(resp)) throw new Error(_styleBibleErrorText(resp, "未知错误"));
     chatRemoveDots();
-    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-      _applyStyleBibleResponse(proj, resp);
-      if (proj.assets) {
-        if (!proj._staleFlags) proj._staleFlags = {};
-        proj._staleFlags["assets"] = true;
-      }
-    });
-    if (isCurrent) {
-      _cacheStyleBibleToLibrary(project.script, resp.styleBible);
-      var bibleCard = $("styleBibleCard");
-      if (bibleCard) {
-        bibleCard.hidden = false;
-        bibleCard.classList.remove("sb-entrance");
-        void bibleCard.offsetWidth;
-        bibleCard.classList.add("sb-entrance");
-      }
-      renderStyleBible(resp.styleBible);
-      var bibleText = formatStyleBibleForChat(resp.styleBible);
-      var aiMsg = chatAddMsg("ai", "");
-      var bubble = aiMsg.querySelector(".chat-bubble--ai");
-      await typewriter(bubble, bibleText, 3, 12);
-      _announceStyleBibleReady();
-    }
-  } catch (e) {
+	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+	      _applyStyleBibleResponse(proj, resp);
+	      if (proj.assets) {
+	        if (!proj._staleFlags) proj._staleFlags = {};
+	        proj._staleFlags["assets"] = true;
+	      }
+		    });
+		    if (isCurrent) {
+		      if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
+		      chatAddMsg("status", '<span class="chat-status-ok">风格已重新提取，请到「风格制定」页检查</span>');
+		      _showScriptConfirmArea();
+		    }
+	  } catch (e) {
     chatRemoveDots();
     var errText = ((e && e.message) || e).toString().slice(0, 150);
     _ctx.safeWriteBack(originId, function (proj) {
       proj.styleBibleStatus = "failed";
       proj.styleBibleError = errText;
     });
-    var bibleCard = $("styleBibleCard");
-    if (bibleCard) bibleCard.hidden = false;
-    renderStyleBibleFailure(errText);
-    _hideScriptConfirmArea();
-    chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(errText) + '</span>');
-  }
+	    _showScriptConfirmArea();
+	    chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(errText) + '，请到「风格制定」页重试</span>');
+	  }
 }
 
 export function formatStyleBibleForChat(sb) {
@@ -951,289 +1007,24 @@ export function formatStyleBibleForChat(sb) {
   if (sb.characters && sb.characters.length) {
     lines.push("角色: " + sb.characters.map(function (c) { return c.name; }).join("、"));
   }
-  lines.push("\n详细信息请查看右侧 Style Bible 面板 →");
+  lines.push("\n详细信息请前往「风格制定」页查看。");
   return lines.join("\n");
 }
 
-// E-script/B.3：剧本库规则（ID / 100 条上限 / 按 content upsert / rename
-// 长度 60）统一下沉到后端 services/script_workflow._upsert_script_library
-// 及 routers/project_api 的 /script-library CRUD。前端仅负责 UI render +
-// 调用 API。本函数封装「加一条到剧本库」——所有新入口（上传 / 归档 /
-// 生成后兜底）都走它：后端返回最新条目，前端直接用服务端数据覆盖本地。
-//
-// NOTE：生成 / 确认 / 扩写 流程里后端 workflow 已经在同一次原子写里 upsert
-// 过 scriptLibrary 了，这里再 POST 一次是幂等操作（upsert-by-content），
-// 只是让前端能第一时间拿到带服务端 ID / 时间戳的条目去 render。
-export async function addToScriptLibrary(name, content, source) {
-  if (!project || !project.id) return null;
-  var safeName = (name || "未命名剧本").slice(0, 60);
-  var safeContent = (content || "").trim();
-  if (!safeContent) return null;
-  try {
-    var resp = await apiPost("/api/projects/" + project.id + "/script-library", {
-      name: safeName,
-      content: safeContent,
-      source: source || "generated",
-    });
-    if (resp && resp.item) {
-      if (!Array.isArray(project.scriptLibrary)) project.scriptLibrary = [];
-      // 本地按 content 做同样的 upsert，保持跟后端视图一致
-      var idx = -1;
-      for (var i = 0; i < project.scriptLibrary.length; i++) {
-        if (project.scriptLibrary[i] && project.scriptLibrary[i].content === safeContent) {
-          idx = i; break;
-        }
-      }
-      if (idx >= 0) project.scriptLibrary.splice(idx, 1);
-      project.scriptLibrary.unshift(resp.item);
-      if (project.scriptLibrary.length > 100) project.scriptLibrary.length = 100;
-      renderScriptLibrary();
-      return resp.item;
-    }
-  } catch (e) {
-    console.warn("[scriptLibrary] add failed:", e && e.message || e);
-  }
-  return null;
-}
-
-export function renderScriptLibrary() {
-  var list = $("scriptLibList");
-  var badge = $("scriptLibBadge");
-  var collapsedBadge = $("scriptLibCollapsedBadge");
-  if (!list) return;
-  var items = (project && project.scriptLibrary) || [];
-  if (badge) {
-    badge.textContent = items.length;
-    badge.hidden = items.length === 0;
-  }
-  if (collapsedBadge) {
-    collapsedBadge.textContent = items.length;
-    collapsedBadge.hidden = items.length === 0;
-  }
-  if (!items.length) {
-    list.innerHTML =
-      '<div class="flex flex-col items-center justify-center py-16 text-center">' +
-      '<span class="material-symbols-outlined text-4xl" style="color:rgba(165,180,188,0.42);font-variation-settings:\'FILL\' 0">folder_open</span>' +
-      '<p class="text-[12px] font-bold mt-4 text-[#526168]">暂无剧本文档</p>' +
-      '<p class="text-[11px] mt-2 leading-relaxed" style="color:rgba(82,97,104,0.56)">创建或上传剧本，开启你的创作之旅</p>' +
-      '<button type="button" class="script-lib-empty-create" onclick="document.getElementById(\'btnNewScript\').click()"><span class="material-symbols-outlined" style="font-size:15px">add</span><span>新建剧本</span></button>' +
-      '</div>';
-    return;
-  }
-  var html = "";
-  items.forEach(function (item, idx) {
-    var isActive = project && project.script && project.script === item.content;
-    var barClass = "script-lib-item-thumb-bar--" + (item.source || "generated");
-    var date = new Date(item.createdAt || 0);
-    var now = Date.now();
-    var diffMs = now - (item.createdAt || 0);
-    var dateStr;
-    if (diffMs < 3600000) dateStr = Math.max(1, Math.floor(diffMs / 60000)) + " 分钟前";
-    else if (diffMs < 86400000) dateStr = Math.floor(diffMs / 3600000) + " 小时前";
-    else dateStr = (date.getMonth() + 1) + "月" + date.getDate() + "日";
-    html +=
-      '<div class="script-lib-item' + (isActive ? ' is-active' : '') + '" data-lib-idx="' + idx + '">' +
-      '<div class="script-lib-item-thumb"><div class="script-lib-item-thumb-bar ' + barClass + '"></div></div>' +
-      '<div class="script-lib-item-info">' +
-      '<div class="script-lib-item-name">' + escapeHtml(item.name) + '</div>' +
-      '<div class="script-lib-item-date">' + dateStr + '</div>' +
-      '</div>' +
-      '<div class="script-lib-item-actions">' +
-      '<button class="script-lib-item-btn" data-lib-action="rename" title="重命名"><span class="material-symbols-outlined" style="font-size:14px">edit</span></button>' +
-      '<button class="script-lib-item-btn" data-lib-action="delete" title="删除"><span class="material-symbols-outlined" style="font-size:14px">delete</span></button>' +
-      '</div></div>';
-  });
-  list.innerHTML = html;
-}
-
-export async function selectLibraryScript(idx) {
-  if (!project) return;
-  var items = project.scriptLibrary || [];
-  var item = items[idx];
-  if (!item) return;
-  project.script = item.content;
-  project.scriptApproved = false;
-  if (hasUsableStyleBible(item.styleBible, item)) {
-    project.styleBible = item.styleBible;
-    project.styleBibleStatus = "ready";
-    project.styleBibleError = "";
-    if (project._staleFlags) delete project._staleFlags["style_bible"];
-  } else {
-    project.styleBible = null;
-    project.styleBibleStatus = "";
-    project.styleBibleError = "";
-  }
-  _ctx.saveProject();
-  refreshScriptPage();
-  if (!hasUsableStyleBible(item.styleBible, item)) {
-    chatAddMsg("status", "正在为该剧本提取风格圣经…");
-    chatShowDots();
-    await extractStyleBible();
-    if (hasUsableStyleBible(project.styleBible, project)) {
-      item.styleBible = project.styleBible;
-      _ctx.saveProject();
-      renderScriptLibrary();
-    }
-  }
-}
-
-export async function uploadScriptFile(file) {
-  if (!file) return;
-  var fname = file.name.toLowerCase();
-  var name = file.name.replace(/\.(txt|docx|doc)$/i, "");
-  if (fname.endsWith(".txt")) {
-    var reader = new FileReader();
-    reader.onload = function (e) {
-      var text = (e.target.result || "").trim();
-      if (!text) { showToast("文件内容为空", "error"); return; }
-      addToScriptLibrary(name, text, "upload");
-      showToast("剧本已添加到库", "success");
-    };
-    reader.readAsText(file, "utf-8");
-    return;
-  }
-  if (fname.endsWith(".docx") || fname.endsWith(".doc")) {
-    try {
-      var formData = new FormData();
-      formData.append("file", file);
-      var uploadHeaders = {};
-      var tk = _ctx.getAuthToken ? _ctx.getAuthToken() : null;
-      if (tk) uploadHeaders["Authorization"] = "Bearer " + tk;
-      var resp = await fetch("/api/script/parse-upload", { method: "POST", headers: uploadHeaders, body: formData });
-      var data = await resp.json();
-      if (data.error) { showToast(data.error, "error"); return; }
-      if (!data.text || !data.text.trim()) { showToast("文件内容为空", "error"); return; }
-      addToScriptLibrary(name, data.text.trim(), "upload");
-      showToast("剧本已添加到库", "success");
-    } catch (e) {
-      showToast("上传失败: " + (e.message || e), "error");
-    }
-    return;
-  }
-  showToast("不支持的文件格式，请上传 .txt 或 .docx", "error");
-}
-
-// E-script/B.3：styleBible → scriptLibrary 的缓存规则已下沉到后端
-// （run_full_create._apply_post + workflow/extract-style-bible 的 _apply 里
-// 已经就地刷新 lib[].styleBible）。前端只做本地内存同步，保持打开中的
-// scriptLib panel 立刻看到新的 styleBible 缓存，刷新页后还是由后端 GET
-// 带回服务器视图，二次一致。
-function _cacheStyleBibleToLibrary(scriptContent, styleBible) {
-  if (!project || !Array.isArray(project.scriptLibrary) || !scriptContent || !styleBible) return;
-  var changed = false;
-  for (var i = 0; i < project.scriptLibrary.length; i++) {
-    if (project.scriptLibrary[i] && project.scriptLibrary[i].content === scriptContent) {
-      project.scriptLibrary[i].styleBible = styleBible;
-      changed = true;
-      break;
-    }
-  }
-  if (changed) renderScriptLibrary();
-}
-
-export function initScriptLibEvents() {
-  var toggle = $("scriptLibToggle");
-  var closeBtn = $("scriptLibClose");
-  var uploadBtn = $("btnUploadScript");
-  var fileInput = $("scriptFileInput");
-  var list = $("scriptLibList");
-  var panel = $("scriptLibPanel");
-  var uPrefix = _ctx.uPrefix || "";
-
-  var isOpen = localStorage.getItem(uPrefix + "sw_script_lib_open") === "1";
-  if (panel) {
-    panel.classList.toggle("script-lib--collapsed", !isOpen);
-    panel.classList.toggle("script-lib--expanded", isOpen);
-  }
-  if (toggle) toggle.addEventListener("click", function () {
-    if (!panel) return;
-    panel.classList.remove("script-lib--collapsed");
-    panel.classList.add("script-lib--expanded");
-    localStorage.setItem(uPrefix + "sw_script_lib_open", "1");
-    renderScriptLibrary();
-  });
-  if (closeBtn) closeBtn.addEventListener("click", function () {
-    if (!panel) return;
-    panel.classList.remove("script-lib--expanded");
-    panel.classList.add("script-lib--collapsed");
-    localStorage.setItem(uPrefix + "sw_script_lib_open", "0");
-  });
-  var newBtn = $("btnNewScript");
-  if (newBtn) newBtn.addEventListener("click", function () { startNewScript(); });
-  if (uploadBtn && fileInput) {
-    uploadBtn.addEventListener("click", function () { fileInput.click(); });
-    fileInput.addEventListener("change", function () {
-      if (fileInput.files && fileInput.files[0]) {
-        uploadScriptFile(fileInput.files[0]);
-        fileInput.value = "";
-      }
-    });
-  }
-  if (list) list.addEventListener("click", function (e) {
-    var item = e.target.closest(".script-lib-item");
-    if (!item) return;
-    var idx = parseInt(item.dataset.libIdx, 10);
-    var actionBtn = e.target.closest("[data-lib-action]");
-    if (actionBtn) {
-      var action = actionBtn.dataset.libAction;
-      if (action === "delete") {
-        var delItem = project.scriptLibrary && project.scriptLibrary[idx];
-        if (!delItem || !delItem.id) return;
-        showConfirm("删除剧本", "确定从剧本库中删除这条记录？", async function () {
-          try {
-            await apiPost(
-              "/api/projects/" + project.id + "/script-library/" + encodeURIComponent(delItem.id),
-              {},
-              "DELETE",
-            );
-            project.scriptLibrary.splice(idx, 1);
-            renderScriptLibrary();
-          } catch (e) {
-            showToast("删除失败：" + (e && e.message || e), "error");
-          }
-        });
-        return;
-      }
-      if (action === "rename") {
-        var renameItem = project.scriptLibrary && project.scriptLibrary[idx];
-        if (!renameItem || !renameItem.id) return;
-        var curName = renameItem.name;
-        var newName = prompt("输入新名称：", curName);
-        if (newName && newName.trim()) {
-          var trimmed = newName.trim().slice(0, 60);
-          (async function () {
-            try {
-              await apiPost(
-                "/api/projects/" + project.id + "/script-library/" + encodeURIComponent(renameItem.id),
-                { name: trimmed },
-                "PATCH",
-              );
-              renameItem.name = trimmed;
-              renderScriptLibrary();
-            } catch (e) {
-              showToast("重命名失败：" + (e && e.message || e), "error");
-            }
-          })();
-        }
-        return;
-      }
-    }
-    selectLibraryScript(idx);
-  });
-}
-
 export async function confirmScript() {
-  if (!project || !project.script) { showToast("请先生成剧本", "warn"); return; }
+  if (!project) { showToast("请先生成剧本", "warn"); return; }
   var originId = project.id;
   var oldScript = project.script;
   var edited = ($("scriptOutput").value || "").trim();
   var finalScript = edited || project.script;
+  if (!finalScript) { showToast("请先生成剧本", "warn"); return; }
 
   // 先把本地内存同步一下（不然切页瞬间 UI 有旧内容）。后端立刻会把
   // scriptApproved=true 和 script 持久化，narrations/emotionSegments 由后端
   // fire-and-forget 补齐，下次项目读取即生效。
   _ctx.safeWriteBack(originId, function (proj) {
     proj.script = finalScript;
+    proj.scriptDraft = finalScript;
     proj.scriptApproved = true;
     proj.currentStep = Math.max(proj.currentStep || 0, 2);
   });
@@ -1241,6 +1032,7 @@ export async function confirmScript() {
     _ctx.markDownstreamStale && _ctx.markDownstreamStale("script", {});
   }
   _ctx.saveProject && _ctx.saveProject();
+  refreshScriptImportDraft();
 
   try {
     await apiPost("/api/script/workflow/confirm", {
@@ -1255,10 +1047,7 @@ export async function confirmScript() {
     return;
   }
 
-  _ctx.switchPage && _ctx.switchPage("assets");
-  setTimeout(function () {
-    if (!project.assets) _ctx.triggerExtractAssets && _ctx.triggerExtractAssets();
-  }, 300);
+  _ctx.switchPage && _ctx.switchPage("style");
 }
 
 export async function tagEmotions() {
@@ -1571,45 +1360,33 @@ export async function reviseScript(instruction) {
     });
 
     var styleBibleReady = _isStyleBibleReadyResponse(resp);
-    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-      proj.script = resp.script || "";
-      proj.scriptApproved = false;
+	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+	      proj.script = resp.script || "";
+	      proj.scriptDraft = resp.script || "";
+	      proj.scriptApproved = false;
       _applyStyleBibleResponse(proj, resp);
       proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
       proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
     });
 
     if (isCurrent) {
-      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
-      if (editArea) editArea.value = resp.script;
-      if (editBtn) editBtn.hidden = false;
+	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
+	      if (editArea) editArea.value = resp.script;
+	      refreshScriptImportDraft();
+	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       if (stepEl2) stepEl2.hidden = true;
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
-      chatRemoveDots();
-      if (styleBibleReady) {
-        var bibleCard2 = $("styleBibleCard");
-        if (bibleCard2) {
-          bibleCard2.hidden = false;
-          bibleCard2.classList.remove("sb-entrance");
-          void bibleCard2.offsetWidth;
-          bibleCard2.classList.add("sb-entrance");
-        }
-        renderStyleBible(resp.styleBible);
-        var bibleText2 = formatStyleBibleForChat(resp.styleBible);
-        var aiMsg2 = chatAddMsg("ai", "");
-        var bubble2 = aiMsg2.querySelector(".chat-bubble--ai");
-        await typewriter(bubble2, bibleText2, 3, 12);
-        _announceStyleBibleReady();
-      } else {
-        var bibleErr = _styleBibleErrorText(resp);
-        var failCard = $("styleBibleCard");
-        if (failCard) failCard.hidden = false;
-        renderStyleBibleFailure(bibleErr);
-        _hideScriptConfirmArea();
-        chatAddMsg("status", '<span class="chat-status-err">风格圣经提取失败: ' + escapeHtml(bibleErr) + '，可点击"重新生成风格圣经"重试</span>');
-      }
+	      chatRemoveDots();
+	      if (styleBibleReady) {
+	        chatAddMsg("status", '<span class="chat-status-ok">新版剧本已生成，初版风格已更新；请确认剧本后到「风格制定」页检查</span>');
+	        _showScriptConfirmArea();
+	      } else {
+	        var bibleErr = _styleBibleErrorText(resp);
+	        _hideScriptConfirmArea();
+	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请到「风格制定」页重新提取</span>');
+	      }
       renderEmotionSegments();
     }
   } catch (e) {

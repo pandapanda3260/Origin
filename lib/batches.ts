@@ -19,6 +19,7 @@ import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError }
 import { patchProjectForUser } from './projects-db';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
 import { markFirstFrameFailed, markTailFrameFailed } from './visual-reference-state';
+import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
 
 export type BatchEventName =
   | 'snapshot'
@@ -98,8 +99,10 @@ function _clearFailedStoryboardImageState(opts: {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      while (storyboards.length <= groupIdx) storyboards.push({});
+      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       const error = {
         message: firstFrameLastError,
         failedAt: new Date().toISOString(),
@@ -108,10 +111,14 @@ function _clearFailedStoryboardImageState(opts: {
       };
       storyboards[groupIdx] = {
         ...prev,
+        idx: groupIdx,
+        shotIdx: groupIdx + 1,
+        shotIndices,
         firstFrame: markFirstFrameFailed(prev, error),
         firstFrameLastError,
         firstFrameFailedAt: error.failedAt,
       };
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-failure-cleanup');
       return { storyboards };
     });
   } catch (cleanupErr) {
@@ -154,8 +161,10 @@ function _clearFailedTailFrameImageState(opts: {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      while (storyboards.length <= groupIdx) storyboards.push({});
+      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       const failedAt = new Date().toISOString();
       const errorRec = {
         message: tailFrameLastError,
@@ -178,14 +187,19 @@ function _clearFailedTailFrameImageState(opts: {
         status: nextTailState.status,
         source: nextTailState.source,
         lastError: nextTailState.lastError,
+        shotIndices,
       };
       emittedTail = nextTail;
       storyboards[groupIdx] = {
         ...prev,
+        idx: groupIdx,
+        shotIdx: groupIdx + 1,
+        shotIndices,
         tailFrameLastError,
         tailFrameFailedAt: failedAt,
         frames: { ...(prev.frames || {}), tail: nextTail },
       };
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'tail-frame-failure-cleanup');
       return { storyboards };
     });
   } catch (cleanupErr) {
@@ -303,8 +317,10 @@ function _markFailedVideoPromptState(opts: {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      while (storyboards.length <= groupIdx) storyboards.push({});
+      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       if (prev.videoPromptRunId && prev.videoPromptRunId !== opts.batchId) {
         console.warn(
           `[batch] ignored stale video_prompt failure project=${opts.projectId} group=${groupIdx} ` +
@@ -314,6 +330,9 @@ function _markFailedVideoPromptState(opts: {
       }
       storyboards[groupIdx] = {
         ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
+        idx: groupIdx,
+        shotIdx: groupIdx + 1,
+        shotIndices,
         videoPromptStatus: 'failed',
         videoPromptRunId: opts.batchId,
         videoPromptFailedAt: now,
@@ -324,6 +343,7 @@ function _markFailedVideoPromptState(opts: {
       if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
         videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
       }
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-failure-cleanup');
       return { storyboards, videoTasks };
     });
   } catch (cleanupErr) {

@@ -7,7 +7,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
- * 用户在剧本页点"确认剧本，进入资产库"时调用，标记 scriptApproved=true。
+ * 用户在剧本页确认最终剧本时调用，标记 scriptApproved=true。
  */
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);

@@ -1,9 +1,9 @@
-export const VIDEO_REFERENCE_IMAGE_BUDGET = 4;
+export const VIDEO_REFERENCE_IMAGE_BUDGET = 7;
 export const DEFAULT_SHOT_DURATION_SEC = 4;
 export const DIALOGUE_WARNING_CHARS_PER_SEC = 4.5;
 export const DIALOGUE_STRIP_PATTERN = /[\s「」『』""''，。！？、,.!?；;：:（）()[\]【】《》<>]/g;
 
-export type VideoReferenceRole = 'first_frame' | 'scene' | 'character' | 'prop';
+export type VideoReferenceRole = 'first_frame' | 'target_end' | 'scene' | 'character' | 'prop';
 
 export type DialoguePolicy =
   | 'truncate_200_chars'
@@ -33,7 +33,12 @@ export type ReferenceManifestItem = {
 export type DroppedReference = {
   role: Exclude<VideoReferenceRole, 'first_frame'>;
   assetName?: string;
-  reason: 'image_budget_exceeded' | 'missing_file' | 'url_lookup_failed' | 'filtered_constraint';
+  reason:
+    | 'image_budget_exceeded'
+    | 'asset_missing'
+    | 'missing_file'
+    | 'url_lookup_failed'
+    | 'filtered_constraint';
 };
 
 export type DialogueBudgetLevel = 'ok' | 'soft_warning' | 'hard_block';

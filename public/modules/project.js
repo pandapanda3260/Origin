@@ -2,7 +2,17 @@
  * Project persistence — load, save, serialize, task recovery.
  * Extracted from main.js (stage 3 refactor).
  */
-import { showToast, apiPost, apiGet, getAuthHeaders, checkAuth, hydrateProjectAssetUrls } from './utils.js';
+import {
+  showToast,
+  apiPost,
+  apiGet,
+  getAuthHeaders,
+  checkAuth,
+  hydrateProjectAssetUrls,
+  escapeHtml,
+  fetchAssetSignedUrl,
+  fetchVideoSignedUrl,
+} from './utils.js';
 
 let _ctx = {};
 
@@ -27,6 +37,171 @@ function _getVideoState() { return _ctx.getVideoState ? _ctx.getVideoState() : {
 
 export function initProject(ctx) { _ctx = ctx; }
 export function getProject() { return _getProject(); }
+
+function _archiveImageUrl(sb) {
+  if (!sb) return "";
+  return sb.imageUrl || sb.rawUrl || sb.firstFrameUrl || (sb.frames && sb.frames.first && sb.frames.first.url) || "";
+}
+
+function _archiveTailUrl(sb) {
+  if (!sb) return "";
+  return sb.tailFrameUrl || (sb.frames && sb.frames.tail && sb.frames.tail.url) || "";
+}
+
+function _archiveVideoUrl(sb, vt) {
+  if (sb && (sb.videoUrl || sb._originVideoUrl)) return sb.videoUrl || sb._originVideoUrl;
+  if (vt && (vt.url || vt.videoUrl || vt.protectedUrl || vt._originVideoUrl)) {
+    return vt.url || vt.videoUrl || vt.protectedUrl || vt._originVideoUrl;
+  }
+  return "";
+}
+
+async function _resolveArchiveUrl(url, kind) {
+  url = String(url || "").trim();
+  if (!url) return "";
+  if (kind === "video") return await fetchVideoSignedUrl(url);
+  var m = /\/api\/images\/file\/([0-9a-fA-F-]{36})/.exec(url);
+  if (m) return await fetchAssetSignedUrl(m[1]);
+  return url;
+}
+
+async function _downloadArchiveMedia(url, kind) {
+  var resolved = await _resolveArchiveUrl(url, kind);
+  if (!resolved) {
+    showToast("没有可下载的文件", "warn");
+    return;
+  }
+  var a = document.createElement("a");
+  a.href = resolved;
+  a.target = "_blank";
+  a.rel = "noopener";
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { try { a.remove(); } catch (_) {} }, 0);
+}
+
+function _closeLegacyStoryboardArchive() {
+  var old = document.getElementById("legacyStoryboardArchiveModal");
+  if (old) old.remove();
+  document.removeEventListener("keydown", _legacyArchiveEsc, true);
+}
+
+function _legacyArchiveEsc(e) {
+  if (e.key === "Escape") _closeLegacyStoryboardArchive();
+}
+
+function _openLegacyStoryboardArchive() {
+  var proj = _getProject();
+  var archive = Array.isArray(proj && proj.legacyStoryboardArchive) ? proj.legacyStoryboardArchive : [];
+  _closeLegacyStoryboardArchive();
+  var modal = document.createElement("div");
+  modal.id = "legacyStoryboardArchiveModal";
+  modal.className = "legacy-archive-modal";
+  var rows = archive.map(function (item, idx) {
+    var sb = item && item.storyboard ? item.storyboard : {};
+    var vt = item && item.videoTask ? item.videoTask : {};
+    var imageUrl = _archiveImageUrl(sb);
+    var tailUrl = _archiveTailUrl(sb);
+    var videoUrl = _archiveVideoUrl(sb, vt);
+    var shots = Array.isArray(item && item.oldShotIndices)
+      ? item.oldShotIndices.map(function (n) { return Number(n) + 1; }).filter(function (n) { return Number.isFinite(n); }).join("、")
+      : "";
+    var title = "旧槽位 " + (Number(item && item.oldGroupIdx) + 1 || idx + 1);
+    if (shots) title += " / 原镜头 " + shots;
+    return '' +
+      '<section class="legacy-archive-item">' +
+        '<div class="legacy-archive-media">' +
+          (imageUrl
+            ? '<img data-archive-img="' + escapeHtml(imageUrl) + '" alt="旧首帧图" />'
+            : '<div class="legacy-archive-empty">无首帧图</div>') +
+        '</div>' +
+        '<div class="legacy-archive-body">' +
+          '<div class="legacy-archive-title">' + escapeHtml(title) + '</div>' +
+          '<div class="legacy-archive-meta">' + escapeHtml(item && item.archivedAt ? item.archivedAt : "已归档") + '</div>' +
+          '<div class="legacy-archive-actions">' +
+            (imageUrl ? '<button type="button" data-archive-download="image" data-url="' + escapeHtml(imageUrl) + '">下载首帧</button>' : '') +
+            (tailUrl ? '<button type="button" data-archive-download="image" data-url="' + escapeHtml(tailUrl) + '">下载尾帧</button>' : '') +
+            (videoUrl ? '<button type="button" data-archive-download="video" data-url="' + escapeHtml(videoUrl) + '">下载视频</button>' : '') +
+          '</div>' +
+        '</div>' +
+      '</section>';
+  }).join("");
+  modal.innerHTML = '' +
+    '<div class="legacy-archive-backdrop" data-archive-close="1"></div>' +
+    '<div class="legacy-archive-dialog" role="dialog" aria-modal="true" aria-labelledby="legacyArchiveTitle">' +
+      '<header class="legacy-archive-header">' +
+        '<div>' +
+          '<h2 id="legacyArchiveTitle">旧版多镜头生成历史</h2>' +
+          '<p>这些内容只读归档，可查看和下载，不会参与当前生成链路。</p>' +
+        '</div>' +
+        '<button type="button" class="legacy-archive-close material-symbols-outlined" data-archive-close="1" aria-label="关闭">close</button>' +
+      '</header>' +
+      '<div class="legacy-archive-list">' + (rows || '<div class="legacy-archive-empty">暂无归档内容</div>') + '</div>' +
+    '</div>';
+  modal.addEventListener("click", function (e) {
+    var close = e.target && e.target.closest && e.target.closest("[data-archive-close]");
+    if (close) {
+      _closeLegacyStoryboardArchive();
+      return;
+    }
+    var btn = e.target && e.target.closest && e.target.closest("[data-archive-download]");
+    if (btn) {
+      _downloadArchiveMedia(btn.getAttribute("data-url") || "", btn.getAttribute("data-archive-download") || "");
+    }
+  });
+  document.body.appendChild(modal);
+  document.addEventListener("keydown", _legacyArchiveEsc, true);
+  modal.querySelectorAll("[data-archive-img]").forEach(function (img) {
+    var raw = img.getAttribute("data-archive-img") || "";
+    _resolveArchiveUrl(raw, "image").then(function (url) {
+      if (url) img.setAttribute("src", url);
+    });
+  });
+}
+
+function _maybeShowLegacyStoryboardArchiveNotice(proj) {
+  var archive = Array.isArray(proj && proj.legacyStoryboardArchive) ? proj.legacyStoryboardArchive : [];
+  var count = Number(proj && proj.legacyStoryboardArchiveLastCount) || archive.length || 0;
+  if (!proj || !proj.id || count <= 0 || !archive.length) return;
+  var stamp = proj.legacyStoryboardArchiveLastMigratedAt || String(count);
+  var key = _uPrefix() + "legacy_storyboard_archive_seen_" + proj.id + "_" + stamp;
+  try {
+    if (localStorage.getItem(key)) return;
+    localStorage.setItem(key, "1");
+  } catch (_) {}
+  showToast("已归档 " + count + " 个旧版多镜头生成结果", "info", [
+    { label: "查看归档", onClick: _openLegacyStoryboardArchive },
+  ]);
+}
+
+function _updateLegacyStoryboardArchiveEntry(proj) {
+  var entry = document.getElementById("legacyStoryboardArchiveEntry");
+  if (!entry) return;
+  var archive = Array.isArray(proj && proj.legacyStoryboardArchive) ? proj.legacyStoryboardArchive : [];
+  if (!proj || !archive.length) {
+    entry.classList.add("hidden");
+    var navEmpty = document.getElementById("navLegacyStoryboardArchive");
+    if (navEmpty) navEmpty.hidden = true;
+    return;
+  }
+  entry.classList.remove("hidden");
+  var summary = document.getElementById("legacyStoryboardArchiveSummary");
+  if (summary) summary.textContent = "已归档 " + archive.length + " 条旧版生成结果，可查看、下载，不会参与当前生成链路。";
+  var btn = document.getElementById("btnOpenLegacyStoryboardArchive");
+  if (btn && !btn.__legacyArchiveBound) {
+    btn.__legacyArchiveBound = true;
+    btn.addEventListener("click", _openLegacyStoryboardArchive);
+  }
+  var nav = document.getElementById("navLegacyStoryboardArchive");
+  if (nav) {
+    nav.hidden = false;
+    if (!nav.__legacyArchiveBound) {
+      nav.__legacyArchiveBound = true;
+      nav.addEventListener("click", _openLegacyStoryboardArchive);
+    }
+  }
+}
 
   /**
    * Phase 5.9：启动时清理掉历史版本写到 localStorage 的"当前项目完整快照"
@@ -111,6 +286,7 @@ export function getProject() { return _getProject(); }
           { headers: _getAuthHeaders() },
           10000,
         );
+        _checkAuth(resp);
         if (resp.ok) {
           var data = await resp.json();
           serverList = data.projects || [];
@@ -149,6 +325,8 @@ export function getProject() { return _getProject(); }
         try { srv = await fetchProjectFromServer(targetId); } catch (_) {}
         if (srv && srv.id) {
           _setProject(srv);
+          _updateLegacyStoryboardArchiveEntry(srv);
+          _maybeShowLegacyStoryboardArchiveNotice(srv);
           try { localStorage.setItem(_LAST_PROJECT_ID_KEY(), srv.id); } catch (_) {}
           // Phase 5.9 bugfix：`hydrateProjectAssetUrls` 会并发发 N 次
           // `/api/asset/<id>/url` 请求（项目里每张图 / 每段视频都得签名一次），
@@ -216,6 +394,7 @@ export function getProject() { return _getProject(); }
         { headers: _getAuthHeaders() },
         10000,
       );
+      _checkAuth(resp);
       if (!resp.ok) return null;
       var data = await resp.json();
       return (data && data.id) ? data : null;
@@ -258,6 +437,8 @@ export function getProject() { return _getProject(); }
       var serverProj = await fetchProjectFromServer(projId);
       if (!serverProj) return;
       _setProject(serverProj);
+      _updateLegacyStoryboardArchiveEntry(serverProj);
+      _maybeShowLegacyStoryboardArchiveNotice(serverProj);
       await hydrateProjectAssetUrls(_getProject());
       try { _ctx.syncEditProject && _ctx.syncEditProject(_getProject()); } catch (_) {}
       try { _ctx.syncTasksProject && _ctx.syncTasksProject(_getProject()); } catch (_) {}
@@ -548,9 +729,6 @@ export function getProject() { return _getProject(); }
     apiPost("/api/tasks/register", body).catch(function (e) {
       console.warn("[TaskReg] register failed:", e);
     });
-    try {
-      if (_ctx.loadGlobalTaskCenter) setTimeout(_ctx.loadGlobalTaskCenter, 400);
-    } catch (_) {}
   }
 
   function _updateServerTaskStatus(taskId, status, resultUrl, errorMsg, assetId, fetchStatus) {
@@ -558,11 +736,6 @@ export function getProject() { return _getProject(); }
     var body = { status: status };
     if (status === 'failed' && typeof errorMsg !== 'undefined' && errorMsg !== null) body.errorMsg = errorMsg;
     apiPost("/api/tasks/" + encodeURIComponent(taskId) + "/status", body).catch(function () {});
-    if (status === "done" || status === "failed") {
-      try {
-        if (_ctx.loadGlobalTaskCenter) setTimeout(_ctx.loadGlobalTaskCenter, 400);
-      } catch (_) {}
-    }
   }
 
 export function setProject(p) { _setProject(p); }

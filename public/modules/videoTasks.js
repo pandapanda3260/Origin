@@ -58,8 +58,6 @@ function _notifyServerTaskDone() { if (_ctx.notifyServerTaskDone) return _ctx.no
 function _archiveOldImage() { if (_ctx.archiveOldImage) return _ctx.archiveOldImage.apply(null, arguments); }
 function updateAssetCardImage() { if (_ctx.updateAssetCardImage) return _ctx.updateAssetCardImage.apply(null, arguments); }
 function updateStoryboardCard() { if (_ctx.updateStoryboardCard) return _ctx.updateStoryboardCard.apply(null, arguments); }
-function _loadGlobalTaskCenter() { if (_ctx.loadGlobalTaskCenter) return _ctx.loadGlobalTaskCenter(); }
-function _gtcProgressHtml(status) { return _ctx.gtcProgressHtml ? _ctx.gtcProgressHtml(status) : ''; }
 function getStoryboardGroups() { return _ctx.getStoryboardGroups ? _ctx.getStoryboardGroups() : []; }
 function _vpFetchAndCache(sb) { return _ctx.vpFetchAndCache ? _ctx.vpFetchAndCache(sb) : Promise.resolve(null); }
 function _vpGetCache(sb) { return _ctx.vpGetCache ? _ctx.vpGetCache(sb) : { sensitiveHits: [] }; }
@@ -830,9 +828,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     _notifyServerTaskDone(t.task_id);
   }
 
-  function _recoverVideoServerTask(t) {
-    if (!project) return;
-    var tid = t.task_id;
+	  function _recoverVideoServerTask(t) {
+	    if (!project) return;
+	    var tid = t.task_id;
     var gIdx = t.target_idx || 0;
     if (videoState.tasks.some(function (vt) { return vt.serverTaskId === tid; })) return;
     var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
@@ -842,38 +840,116 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var card = createTaskCard(task);
     insertTaskCardToWraps(card); updateTaskCard(task);
     _attachTaskStream(task, tid);
-    syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();
-  }
+	    syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();
+	  }
 
-  function _updateBatchTotalProgress() {
-    var wrap = $("batchTotalProgressWrap");
-    var bar = $("batchTotalProgressBar");
-    var label = $("batchTotalProgressLabel");
-    var etaEl = $("batchTotalProgressEta");
-    if (!wrap || !bar || !label) return;
-    var tot = videoState.tasks.length;
-    if (tot === 0) {
-      wrap.hidden = true;
-      return;
-    }
-    var done = 0, active = 0, fail = 0;
-    var i;
-    for (i = 0; i < videoState.tasks.length; i++) {
-      var vt = videoState.tasks[i];
-      if (vt.status === "done") done++;
-      else if (vt.status === "failed" || vt.status === "timeout") fail++;
-      else active++;
-    }
-    wrap.hidden = false;
-    var finished = done + fail;
-    var pct = tot ? Math.round(finished / tot * 100) : 0;
-    bar.style.width = pct + "%";
-    label.textContent = "已完成 " + done + "/" + tot + " · 进行中 " + active + (fail ? " · 失败 " + fail : "");
-    if (etaEl) {
-      var etaText = "";
+	  function _plannedDurForBatchGroup(grp) {
+	    var total = 0;
+	    ((grp && grp.shots) || []).forEach(function (sh) {
+	      total += Number((sh && (sh.duration || sh.durationSec)) || 4) || 4;
+	    });
+	    return Math.max(1, Math.round(total * 10) / 10);
+	  }
+
+	  function _formatBatchDuration(sec) {
+	    var n = Number(sec) || 0;
+	    if (!n || n < 0) return "--:--";
+	    var m = Math.floor(n / 60);
+	    var s = Math.round(n % 60);
+	    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+	  }
+
+	  function _batchTaskProgress(task) {
+	    if (!task) return 0;
+	    if (task.status === "done") return 100;
+	    if (task.status === "failed" || task.status === "timeout") return 0;
+	    if (task.status === "fetching") return 95;
+	    var elapsedSec = task.createdAt ? (Date.now() - task.createdAt) / 1000 : 0;
+	    return elapsedSec > 0 ? Math.min(Math.round(elapsedSec / 90 * 100), 95) : 5;
+	  }
+
+	  function _batchRemainingText(task) {
+	    if (!task || isTerminal(task)) return "—";
+	    var pct = Math.max(1, _batchTaskProgress(task));
+	    var elapsedSec = task.createdAt ? Math.max(0, (Date.now() - task.createdAt) / 1000) : 0;
+	    if (!elapsedSec || pct <= 1) return "计算中";
+	    var estimatedTotal = elapsedSec / (pct / 100);
+	    var remaining = Math.max(0, Math.round(estimatedTotal - elapsedSec));
+	    return remaining ? "剩余约 " + _formatBatchDuration(remaining) : "即将完成";
+	  }
+
+	  function _batchThumbHtml(src) {
+	    return src
+	      ? '<img class="batch-row-thumb-img" loading="lazy" decoding="async" src="' + escapeHtml(src) + '" />'
+	      : '<div class="batch-row-thumb-empty"><span class="material-symbols-outlined">movie_filter</span></div>';
+	  }
+
+	  function _setText(id, text) {
+	    var el = $(id);
+	    if (el) el.textContent = text;
+	  }
+
+	  function _collectBatchVisualStats(groups) {
+	    var sourceGroups = groups || getStoryboardGroups();
+	    var stats = { total: 0, done: 0, running: 0, pending: 0, failed: 0, plannedSec: 0 };
+	    sourceGroups.forEach(function (group, gIdx) {
+	      var sb = project && project.storyboards && project.storyboards[gIdx];
+	      if (!sb || !sb.videoPrompt) return;
+	      stats.total++;
+	      stats.plannedSec += _plannedDurForBatchGroup(group);
+	      var task = _findTaskByGroup(gIdx);
+	      if (task && (task.status === "failed" || task.status === "timeout")) stats.failed++;
+	      else if (task && !isTerminal(task)) stats.running++;
+	      else if ((task && task.status === "done") || sb.videoUrl) stats.done++;
+	      else stats.pending++;
+	    });
+	    return stats;
+	  }
+
+	  function _renderBatchVisualStats(stats) {
+	    stats = stats || _collectBatchVisualStats();
+	    var estimateText = "~ " + Math.ceil((stats.plannedSec || 0) * 3 / 60) + " 分钟";
+	    _setText("batchStatTotal", stats.total + " 个");
+	    _setText("batchStatDone", stats.done + " 个");
+	    _setText("batchStatRunning", stats.running + " 个");
+	    _setText("batchStatPending", stats.pending + " 个");
+	    _setText("batchStatEstimate", estimateText);
+	    _setText("batchTabAll", stats.total);
+	    _setText("batchTabRunning", stats.running);
+	    _setText("batchTabDone", stats.done);
+	    _setText("batchTabPending", stats.pending);
+	    _setText("batchTabFailed", stats.failed);
+	    _setText("batchClipCount", stats.total + " 个片段");
+	    return stats;
+	  }
+
+	  function _updateBatchTotalProgress() {
+	    var wrap = $("batchTotalProgressWrap");
+	    var bar = $("batchTotalProgressBar");
+	    var label = $("batchTotalProgressLabel");
+	    var etaEl = $("batchTotalProgressEta");
+	    var pctEl = $("batchProgressPercent");
+	    if (!wrap || !bar || !label) return;
+		    var stats = _renderBatchVisualStats();
+		    var taskTotal = videoState && Array.isArray(videoState.tasks) ? videoState.tasks.length : 0;
+		    var tot = stats.total || taskTotal;
+	    if (tot === 0) {
+	      wrap.hidden = true;
+	      return;
+	    }
+	    var done = stats.done || 0, active = stats.running || 0, fail = stats.failed || 0;
+	    var i;
+	    wrap.hidden = false;
+	    var finished = done + fail;
+	    var pct = tot ? Math.round(finished / tot * 100) : 0;
+	    bar.style.width = pct + "%";
+	    if (pctEl) pctEl.textContent = pct + "%";
+	    label.textContent = "已完成 " + done + "/" + tot + " · 进行中 " + active + (fail ? " · 失败 " + fail : "");
+	    if (etaEl) {
+	      var etaText = "";
       if (active > 0 && done >= 1) {
         var sumMs = 0, cnt = 0;
-        for (i = 0; i < videoState.tasks.length; i++) {
+	        for (i = 0; videoState && Array.isArray(videoState.tasks) && i < videoState.tasks.length; i++) {
           var t2 = videoState.tasks[i];
           if (t2.status === "done" && t2.createdAt && t2._doneAt) {
             sumMs += (t2._doneAt - t2.createdAt);
@@ -915,11 +991,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (empty) empty.hidden = hasAny;
     if (summary) summary.textContent = statusText;
 
-    var bEmpty = $("batchTasksEmpty"), bSummary = $("batchTasksSummary");
-    if (bEmpty) bEmpty.hidden = hasAny;
-    if (bSummary) bSummary.textContent = statusText;
-    _updateBatchTotalProgress();
-  }
+	    var bEmpty = $("batchTasksEmpty"), bSummary = $("batchTasksSummary");
+	    var clipList = $("batchClipList");
+	    var hasPlanRows = !!(clipList && clipList.children && clipList.children.length);
+	    if (bEmpty) bEmpty.hidden = hasAny || hasPlanRows;
+	    if (bSummary) bSummary.textContent = statusText;
+	    _updateBatchTotalProgress();
+	  }
 
   function insertTaskCardToWraps(card) {
     var mainWrap = $("taskListWrap");
@@ -946,79 +1024,83 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var done = st === "done", active = !isTerminal(task);
     var fetching = st === "fetching";
 
-    var statusLabel, statusClass, iconHtml;
-    if (done) {
-      statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-secondary-container/20 flex items-center justify-center"><span class="material-symbols-outlined text-primary" style="font-variation-settings: \'FILL\' 1;">check_circle</span></div>';
-    } else if (fail) {
-      statusLabel = '失败'; statusClass = 'bg-error/10 text-error';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-error/10 flex items-center justify-center"><span class="material-symbols-outlined text-error">error</span></div>';
-    } else if (fetching) {
-      statusLabel = '下载中 FETCHING'; statusClass = 'bg-primary/10 text-primary';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-surface-container-low flex items-center justify-center"><span class="material-symbols-outlined text-primary animate-spin">sync</span></div>';
-    } else if (active) {
-      var elapsedSec = task.createdAt ? (Date.now() - task.createdAt) / 1000 : 0;
-      var pct = elapsedSec > 0 ? Math.min(Math.round(elapsedSec / 90 * 100), 95) : 5;
-      var dashOffset = Math.round(125 - (125 * pct / 100));
-      statusLabel = '生成中'; statusClass = 'bg-primary/10 text-primary';
-      iconHtml =
-        '<div class="relative w-12 h-12 flex items-center justify-center">' +
-          '<svg class="absolute inset-0 w-full h-full -rotate-90"><circle cx="24" cy="24" fill="none" r="20" stroke="#dfe2f0" stroke-width="4"></circle><circle cx="24" cy="24" fill="none" r="20" stroke="#5a5e6a" stroke-dasharray="125" stroke-dashoffset="' + dashOffset + '" stroke-width="4"></circle></svg>' +
-          '<span class="text-[10px] font-bold">' + pct + '%</span>' +
-        '</div>';
-    } else if (st === "preparing") {
-      statusLabel = '准备中 PREPARING'; statusClass = 'bg-[#7c8aff]/10 text-[#5b6abf]';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-[#7c8aff]/10 flex items-center justify-center"><span class="material-symbols-outlined text-[#5b6abf] animate-pulse">pending</span></div>';
-    } else if (st === "submitting") {
-      statusLabel = '提交中 SUBMITTING'; statusClass = 'bg-primary/10 text-primary';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-surface-container-low flex items-center justify-center"><span class="material-symbols-outlined text-primary animate-spin">sync</span></div>';
-    } else {
-      statusLabel = '排队中 QUEUED'; statusClass = 'bg-surface-variant text-on-surface-variant';
-      iconHtml = '<div class="w-10 h-10 rounded-full bg-surface-container-low flex items-center justify-center"><span class="material-symbols-outlined text-on-surface-variant/40 animate-pulse">hourglass_top</span></div>';
-    }
+	    var progressPct = _batchTaskProgress(task);
+	    var statusLabel, statusTone, statusIcon;
+	    if (done) {
+	      statusLabel = '已完成'; statusTone = 'is-done'; statusIcon = 'check_circle';
+	    } else if (fail) {
+	      statusLabel = '失败'; statusTone = 'is-failed'; statusIcon = 'error';
+	    } else if (fetching) {
+	      statusLabel = '下载中'; statusTone = 'is-running'; statusIcon = 'sync';
+	    } else if (active) {
+	      statusLabel = '进行中'; statusTone = 'is-running'; statusIcon = 'motion_photos_auto';
+	    } else if (st === "preparing") {
+	      statusLabel = '准备中'; statusTone = 'is-running'; statusIcon = 'pending';
+	    } else if (st === "submitting") {
+	      statusLabel = '提交中'; statusTone = 'is-running'; statusIcon = 'sync';
+	    } else {
+	      statusLabel = '未开始'; statusTone = 'is-pending'; statusIcon = 'radio_button_checked';
+	    }
 
-	    var taskMeta = escapeHtml(_taskDisplayMeta(task));
-	    var timeStr = formatTime(task.createdAt);
-	    var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
-	    var warningText = firstWarning ? escapeHtml(firstWarning.message || firstWarning.key || String(firstWarning)) : '';
+		    var taskMeta = escapeHtml(_taskDisplayMeta(task));
+		    var timeStr = formatTime(task.createdAt);
+		    var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
+		    var warningText = firstWarning ? escapeHtml(firstWarning.message || firstWarning.key || String(firstWarning)) : '';
+	    var rowGroupIdx = task._groupIdx != null && Number.isFinite(Number(task._groupIdx)) ? Number(task._groupIdx) : null;
+	    var rowGroups = [];
+	    try { rowGroups = getStoryboardGroups() || []; } catch (_rowGroupErr) { rowGroups = []; }
+	    var rowGroup = rowGroupIdx != null ? rowGroups[rowGroupIdx] : null;
+	    var rowSb = rowGroupIdx != null && project && project.storyboards ? (project.storyboards[rowGroupIdx] || {}) : {};
+	    var rowThumbSrc = rowSb.firstFrameUrl || rowSb.rawUrl || rowSb.url || rowSb.imageUrl || '';
+	    var rowPlannedSec = rowGroup ? _plannedDurForBatchGroup(rowGroup) : 0;
+	    var rowDurationText = _formatBatchDuration((rowSb && rowSb.videoDurationSec) || rowPlannedSec);
+	    var shotCount = rowGroup && Array.isArray(rowGroup.shots) ? rowGroup.shots.length : 1;
+	    var rowShotType = rowGroup && rowGroup.shots && rowGroup.shots[0] && rowGroup.shots[0].shotType ? rowGroup.shots[0].shotType : 'Clip';
+	    var rowCharCount = 0, rowSceneCount = 0;
+	    ((rowSb && rowSb._matchedRefs) || []).forEach(function (r) {
+	      var role = r.role || r.type;
+	      if (role === "character") rowCharCount++;
+	      else if (role === "scene") rowSceneCount++;
+	    });
+	    var remainingText = _batchRemainingText(task);
 
-    var playBtnHtml = '';
-    if (done && (task.videoUrl || task.blobUrl)) {
-      playBtnHtml =
-        '<button type="button" class="batch-play-btn w-8 h-8 rounded-full bg-primary text-on-primary flex items-center justify-center hover:scale-110 transition-transform active:scale-95" data-video-url="' + escapeHtml(task.blobUrl || task.videoUrl) + '">' +
-          '<span class="material-symbols-outlined text-sm" style="font-variation-settings: \'FILL\' 1;">play_arrow</span>' +
-        '</button>';
-    }
+	    var playBtnHtml = '';
+	    if (done && (task.videoUrl || task.blobUrl)) {
+	      playBtnHtml =
+	        '<button type="button" class="batch-row-action batch-row-action-primary batch-play-btn" data-video-url="' + escapeHtml(task.blobUrl || task.videoUrl) + '">' +
+	          '<span class="material-symbols-outlined" style="font-variation-settings: \'FILL\' 1;">play_arrow</span>播放' +
+	        '</button>';
+	    }
 
-    var failBtnsHtml = '';
-    if (fail && (task._retryBody || (task._groupIdx !== undefined && project && project.storyboards && project.storyboards[task._groupIdx]))) {
-      failBtnsHtml =
-        '<button type="button" class="w-8 h-8 rounded-full bg-surface-container-highest/40 text-on-surface-variant flex items-center justify-center hover:scale-110 transition-transform active:scale-95" data-action="retry" data-task-id="' + task.localId + '" title="重新生成">' +
-          '<span class="material-symbols-outlined text-sm">refresh</span>' +
-        '</button>';
-    }
+	    var failBtnsHtml = '';
+	    if (fail && (task._retryBody || (task._groupIdx !== undefined && project && project.storyboards && project.storyboards[task._groupIdx]))) {
+	      failBtnsHtml =
+	        '<button type="button" class="batch-row-action" data-action="retry" data-task-id="' + task.localId + '" title="重新生成">' +
+	          '<span class="material-symbols-outlined">refresh</span>重新生成' +
+	        '</button>';
+	    }
 
-    var regenBtnHtml = '';
-    var importBtnHtml = '';
-    if (done && task._groupIdx != null && (task.videoUrl || task.blobUrl)) {
-      regenBtnHtml =
-        '<button type="button" class="mirror-regen-btn px-3 py-1.5 rounded-full text-[10px] font-bold bg-surface-container-highest/40 text-on-surface-variant hover:opacity-90 transition-all active:scale-95" style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" data-action="retry" data-task-id="' + task.localId + '" title="重新生成">' +
-          '<span class="material-symbols-outlined" style="font-size:13px;line-height:1">refresh</span>重新生成' +
-        '</button>';
-      var _imported = false;
-      try { _imported = isGroupImported(task._groupIdx); } catch (_e) {}
-      if (_imported) {
-        importBtnHtml =
-          '<button type="button" class="mirror-import-btn px-3 py-1.5 rounded-full text-[10px] font-bold bg-surface-container-highest/40 text-on-surface-variant hover:opacity-90 transition-all active:scale-95" style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" data-action="mirror-import-edit" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '">' +
-            '<span class="material-symbols-outlined" style="font-size:13px;line-height:1">check_circle</span>已导入' +
-          '</button>';
-      } else {
-        importBtnHtml =
-          '<button type="button" class="mirror-import-btn px-3 py-1.5 rounded-full text-[10px] font-bold bg-primary text-on-primary hover:opacity-90 transition-all active:scale-95" style="display:inline-flex;align-items:center;gap:4px;white-space:nowrap" data-action="mirror-import-edit" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '">' +
-            '<span class="material-symbols-outlined" style="font-size:13px;line-height:1">movie</span>导入' +
-          '</button>';
-      }
-    }
+	    var regenBtnHtml = '';
+	    var importBtnHtml = '';
+	    if (done && task._groupIdx != null && (task.videoUrl || task.blobUrl)) {
+	      regenBtnHtml =
+	        '<button type="button" class="batch-row-action mirror-regen-btn" data-action="retry" data-task-id="' + task.localId + '" title="重新生成">' +
+	          '<span class="material-symbols-outlined">refresh</span>重新生成' +
+	        '</button>';
+	      var _imported = false;
+	      try { _imported = isGroupImported(task._groupIdx); } catch (_e) {}
+	      if (_imported) {
+	        importBtnHtml =
+	          '<button type="button" class="batch-row-action mirror-import-btn" data-action="mirror-import-edit" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '">' +
+	            '<span class="material-symbols-outlined">check_circle</span>已导入' +
+	          '</button>';
+	      } else {
+	        importBtnHtml =
+	          '<button type="button" class="batch-row-action batch-row-action-dark mirror-import-btn" data-action="mirror-import-edit" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '">' +
+	            '<span class="material-symbols-outlined">movie</span>导入' +
+	          '</button>';
+	      }
+	    }
 
     if (!mirror) {
       mirror = document.createElement("div");
@@ -1046,83 +1128,97 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var existingPlayer = mirror.querySelector('.batch-inline-player');
     var playerHtml = existingPlayer ? existingPlayer.outerHTML : '';
 
-    mirror.className = "bg-surface-container-lowest rounded-lg border border-outline-variant/5 transition-all overflow-hidden";
-    if (fail) mirror.className += " border-error/10";
-    mirror.innerHTML =
-      '<div class="flex items-center justify-between p-4">' +
-        '<div class="flex items-center gap-5">' +
-          iconHtml +
-	          '<div>' +
-	            '<h5 class="text-sm font-bold">' + escapeHtml(_taskDisplayName(task)) + '</h5>' +
-	            '<p class="text-[10px] font-medium text-on-surface-variant/60 max-w-xs truncate">' + taskMeta + '</p>' +
-	            (warningText ? '<p class="text-[10px] text-amber-700 max-w-xs truncate mt-0.5">' + warningText + '</p>' : '') +
-	            (fail && task.statusCn ? '<p class="text-[10px] text-error/70 max-w-xs truncate mt-0.5">' + escapeHtml(task.statusCn) + '</p>' : '') +
-	          '</div>' +
-        '</div>' +
-        '<div class="flex items-center gap-3">' +
-          playBtnHtml +
-          regenBtnHtml +
-          importBtnHtml +
-          failBtnsHtml +
-          '<span class="px-3 py-1 ' + statusClass + ' text-[10px] font-bold rounded-full" style="white-space:nowrap;display:inline-flex;align-items:center;gap:3px">' + statusLabel + '</span>' +
-          '<span class="text-[10px] font-mono text-on-surface-variant/40" style="white-space:nowrap">' + timeStr + '</span>' +
-        '</div>' +
-      '</div>' +
-      playerHtml;
-
-    var bEmpty = $("batchTasksEmpty");
-    if (bEmpty) bEmpty.hidden = videoState.tasks.length > 0;
-
-    _syncGlobalTaskCard(task);
-  }
-
-  function _syncGlobalTaskCard(task) {
-    var gWrap = $("globalTaskListWrap");
-    if (!gWrap) return;
-    var emptyEl = $("globalTaskEmpty");
-
-    var st = task.status;
-    // Map the video-task vocabulary onto the shared status set consumed
-    // by _gtcProgressHtml: anything that's not done/failed animates as
-    // indeterminate progress.
-    var ringStatus = "polling";
-    if (st === "done") ringStatus = "done";
-    else if (st === "failed" || st === "retry_failed") ringStatus = "failed";
-    var label = task._groupIdx !== undefined ? "片段 " + (task._groupIdx + 1) : "视频任务";
-    var statusText = task.statusCn || st || "";
-    var timeStr = formatTime(task.createdAt);
-
-    var card = gWrap.querySelector('[data-gtp-id="' + task.localId + '"]');
-    if (!card) {
-      card = document.createElement("div");
-      card.dataset.gtpId = task.localId;
-      card.className = "gtp-card";
-      if (gWrap.firstChild && gWrap.firstChild !== emptyEl) {
-        gWrap.insertBefore(card, gWrap.firstChild);
-      } else {
-        gWrap.appendChild(card);
+    // Tail-frame alignment check drawer: only meaningful when the video was
+    // generated via Builder A (payloadMode === 'first_last_frame') and the
+    // provider echoed back its own last_frame_url. Lets the user eyeball
+    // "did the video actually end on my submitted tail frame?"
+    var auditCompareHtml = '';
+    if (done && task._groupIdx != null) {
+      try {
+        var persistedVt = Array.isArray(project && project.videoTasks) ? project.videoTasks[task._groupIdx] : null;
+        var audit = persistedVt && persistedVt.videoAudit;
+        var persistedSb = project && project.storyboards && project.storyboards[task._groupIdx];
+        var submittedTailUrl = persistedSb
+          ? ((persistedSb.frames && persistedSb.frames.tail && persistedSb.frames.tail.url) || persistedSb.tailFrameUrl || '')
+          : '';
+        if (audit && audit.payloadMode === 'first_last_frame' && audit.returnedLastFrameUrl) {
+          var submittedHashDisplay = audit.submittedLastFrameContentHash
+            ? String(audit.submittedLastFrameContentHash).slice(0, 16) + '…'
+            : '(未记录)';
+          var returnedHashDisplay = audit.returnedLastFrameContentHash
+            ? String(audit.returnedLastFrameContentHash).slice(0, 16) + '…'
+            : '(未记录)';
+          auditCompareHtml =
+            '<details class="tail-align-check border-t border-outline-variant/10">' +
+              '<summary class="px-4 py-2 text-[10px] font-bold tracking-widest uppercase cursor-pointer text-on-surface-variant flex items-center gap-1.5 hover:bg-surface-container-low">' +
+                '<span class="material-symbols-outlined text-xs">compare_arrows</span>' +
+                '尾帧对齐检查 · first_last_frame' +
+                (audit.capabilityVerifiedAt ? '<span class="ml-auto text-[9px] font-mono text-on-surface-variant/40">cap ' + escapeHtml(String(audit.capabilityVerifiedAt)) + '</span>' : '') +
+              '</summary>' +
+              '<div class="px-4 pb-4 grid grid-cols-2 gap-3">' +
+                '<div class="flex flex-col gap-1.5">' +
+                  (submittedTailUrl
+                    ? '<img src="' + escapeHtml(submittedTailUrl) + '" class="w-full rounded-lg border border-outline-variant/20 aspect-video object-cover" alt="submitted tail frame" />'
+                    : '<div class="w-full aspect-video rounded-lg border border-outline-variant/20 bg-surface-container flex items-center justify-center text-[10px] text-on-surface-variant/40">提交的尾帧已丢失</div>') +
+                  '<p class="text-[10px] font-bold">你提交的尾帧</p>' +
+                  '<p class="text-[9px] font-mono text-on-surface-variant/40">sha256 ' + escapeHtml(submittedHashDisplay) + '</p>' +
+                '</div>' +
+                '<div class="flex flex-col gap-1.5">' +
+                  '<img src="' + escapeHtml(audit.returnedLastFrameUrl) + '" class="w-full rounded-lg border border-outline-variant/20 aspect-video object-cover" alt="Seedance returned last frame" />' +
+                  '<p class="text-[10px] font-bold">Seedance 视频实际结尾</p>' +
+                  '<p class="text-[9px] font-mono text-on-surface-variant/40">sha256 ' + escapeHtml(returnedHashDisplay) + '</p>' +
+                '</div>' +
+              '</div>' +
+              '<p class="px-4 pb-3 text-[10px] text-on-surface-variant/50">若两者视觉差异明显，建议点上方「重新生成」重跑视频。</p>' +
+            '</details>';
+        }
+      } catch (_auditErr) {
+        // audit 渲染出错不应该影响 mirror 主体，悄默失败
+        auditCompareHtml = '';
       }
     }
 
-    card.innerHTML =
-      '<div class="shrink-0">' + _gtcProgressHtml(ringStatus) + '</div>' +
-      '<div class="flex-1 min-w-0">' +
-        '<p class="text-xs font-bold truncate">' + escapeHtml(label) + '</p>' +
-        '<p class="text-[10px] text-on-surface-variant/60 truncate">' + escapeHtml(statusText) + '</p>' +
-      '</div>' +
-      '<span class="text-[10px] font-mono text-on-surface-variant/30 shrink-0">' + timeStr + '</span>';
+	    mirror.className = "batch-segment-row batch-live-row " + statusTone;
+	    mirror.innerHTML =
+	      '<div class="batch-row-info">' +
+	        '<div class="batch-row-thumb">' + _batchThumbHtml(rowThumbSrc) + '</div>' +
+	        '<div class="batch-row-copy">' +
+	          '<h4>' + escapeHtml(rowGroupIdx != null ? (String(rowGroupIdx + 1).padStart(2, "0") + '_片段_' + rowShotType) : _taskDisplayName(task)) + '</h4>' +
+	          '<p>镜头类型：' + escapeHtml(rowShotType) + '</p>' +
+	          '<p>来源：' + taskMeta + '</p>' +
+	          (warningText ? '<p class="batch-row-warning">' + warningText + '</p>' : '') +
+	          (fail && task.statusCn ? '<p class="batch-row-error">' + escapeHtml(task.statusCn) + '</p>' : '') +
+	        '</div>' +
+	      '</div>' +
+	      '<div class="batch-row-status">' +
+	        '<span class="batch-status-pill ' + statusTone + '"><span class="material-symbols-outlined">' + statusIcon + '</span>' + statusLabel + '</span>' +
+	        '<div class="batch-row-progress"><i style="width:' + progressPct + '%"></i></div>' +
+	        '<em>' + progressPct + '%</em>' +
+	      '</div>' +
+	      '<div class="batch-row-time">' +
+	        '<strong>' + rowDurationText + '</strong>' +
+	        '<span>' + escapeHtml(remainingText) + '</span>' +
+	        '<small>' + timeStr + '</small>' +
+	      '</div>' +
+	      '<div class="batch-row-basic">' +
+	        '<span><i class="material-symbols-outlined">person</i>' + rowCharCount + ' 人</span>' +
+	        '<span><i class="material-symbols-outlined">crop_free</i>' + shotCount + ' 镜头</span>' +
+	        (rowSceneCount ? '<span><i class="material-symbols-outlined">landscape</i>' + rowSceneCount + ' 场景</span>' : '') +
+	      '</div>' +
+	      '<div class="batch-row-actions">' +
+	        playBtnHtml +
+	        regenBtnHtml +
+	        importBtnHtml +
+	        failBtnsHtml +
+	      '</div>' +
+	      playerHtml +
+	      auditCompareHtml;
 
-    if (emptyEl) emptyEl.hidden = videoState.tasks.length > 0;
-  }
+	    var bEmpty = $("batchTasksEmpty");
+	    if (bEmpty) bEmpty.hidden = videoState.tasks.length > 0;
+	    hydrateProtectedImageElements(mirror);
 
-  function toggleGlobalTaskPanel(forceState) {
-    _syncVideoRefs();
-    var panel = $("globalTaskPanel");
-    if (!panel) return;
-    var shouldOpen = forceState !== undefined ? forceState : !panel.classList.contains("open");
-    panel.classList.toggle("open", shouldOpen);
-    if (shouldOpen) _loadGlobalTaskCenter();
-  }
+	  }
 
   function _initBatchPlayerEvents() {
     _syncVideoRefs();
@@ -2060,10 +2156,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
   }
 
-  function _findTaskByGroup(gIdx) {
-    for (var i = 0; i < videoState.tasks.length; i++) {
-      if (videoState.tasks[i]._groupIdx === gIdx) return videoState.tasks[i];
-    }
+	  function _findTaskByGroup(gIdx) {
+	    if (!videoState || !Array.isArray(videoState.tasks)) return null;
+	    for (var i = 0; i < videoState.tasks.length; i++) {
+	      if (videoState.tasks[i]._groupIdx === gIdx) return videoState.tasks[i];
+	    }
     return null;
   }
 
@@ -2105,29 +2202,17 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       await Promise.all(jobs);
     }));
 
-    list.innerHTML = "";
-    var validCount = 0;
-    var totalDurAll = 0;
+	    list.innerHTML = "";
+	    var liveWrap = $("batchTaskListWrap");
+	    var stats = _renderBatchVisualStats(_collectBatchVisualStats(groups));
 
-	    // 批量页展示计划时长：直接累加镜头表 duration；真实文件时长生成后写入
-	    // storyboards[].videoDurationSec，剪辑页再以真实文件为准。
-	    function _plannedDurForBatch(grp) {
-	      var total = 0;
-	      (grp.shots || []).forEach(function (sh) {
-	        total += Number((sh && (sh.duration || sh.durationSec)) || 4) || 4;
-	      });
-	      return Math.max(1, Math.round(total * 10) / 10);
-	    }
+		    groups.forEach(function (group, gIdx) {
+		      var sb = project.storyboards[gIdx] || {};
+		      if (!sb.videoPrompt) return;
+		      var promptReady = _videoPromptReadinessForGroup(gIdx);
+		      var totalDur = _plannedDurForBatchGroup(group);
 
-	    groups.forEach(function (group, gIdx) {
-	      var sb = project.storyboards[gIdx] || {};
-	      if (!sb.videoPrompt) return;
-	      var promptReady = _videoPromptReadinessForGroup(gIdx);
-	      validCount++;
-	      var totalDur = _plannedDurForBatch(group);
-      totalDurAll += totalDur;
-
-      var bcThumbSrc = sb.firstFrameUrl || sb.rawUrl || sb.url || sb.imageUrl || '';
+	      var bcThumbSrc = sb.firstFrameUrl || sb.rawUrl || sb.url || sb.imageUrl || '';
 
       var charCount = 0, sceneCount = 0;
       var assetRefs = sb._matchedRefs || [];
@@ -2139,89 +2224,84 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
       var vpCache = _vpGetCache(sb);
       var batchSenHits = vpCache.sensitiveHits || [];
-      var groupShotIndicesText = Array.isArray(group.shotIndices) ? group.shotIndices.join(",") : "";
+	      var groupShotIndicesText = Array.isArray(group.shotIndices) ? group.shotIndices.join(",") : "";
 
-      var clipTask = _findTaskByGroup(gIdx);
-      var statusLabel = '', statusClass = '';
-	      if (!promptReady.canStart) {
-	        statusLabel = promptReady.status === 'generating' ? '提示词生成中' : '提示词失效';
-	        statusClass = promptReady.status === 'generating' ? 'bg-primary/10 text-primary' : 'bg-error/10 text-error';
-	      } else if (clipTask && clipTask.status === 'failed') {
-	        statusLabel = '失败'; statusClass = 'bg-error/10 text-error';
-      } else if (clipTask && !isTerminal(clipTask)) {
-        statusLabel = '生成中'; statusClass = 'bg-primary/10 text-primary';
-      } else if (clipTask && clipTask.status === 'done') {
-        statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
-	      } else if (!clipTask && sb.videoUrl && !_hasCurrentVideoForGroup(gIdx)) {
-	        statusLabel = '旧视频已过期'; statusClass = 'bg-surface-container-highest text-on-surface-variant';
-	      } else if (!clipTask && sb.videoUrl) {
-	        statusLabel = '完成 FINISHED'; statusClass = 'bg-secondary-container text-on-secondary-container';
-      } else {
-        statusLabel = '就绪 READY'; statusClass = 'bg-primary text-on-primary';
-      }
+	      var clipTask = _findTaskByGroup(gIdx);
+	      var hasLiveRow = !!(clipTask && liveWrap && liveWrap.querySelector('[data-group-idx="' + gIdx + '"]'));
+	      if (hasLiveRow) return;
 
-      var card = document.createElement("div");
-      card.className = "flex-shrink-0 w-80 bg-surface-container-lowest rounded-xl p-4 shadow-[0px_10px_30px_rgba(0,0,0,0.01)] border border-outline-variant/10 snap-start" +
-        ((clipTask && clipTask.status === 'done') || (!clipTask && sb.videoUrl) ? '' : clipTask && !isTerminal(clipTask) ? ' opacity-90' : '');
-      card.dataset.groupIdx = gIdx;
+	      var statusLabel = '', statusTone = '', progressPct = 0, remainingText = '—';
+		      if (!promptReady.canStart) {
+		        statusLabel = promptReady.status === 'generating' ? '提示词生成中' : '提示词失效';
+		        statusTone = promptReady.status === 'generating' ? 'is-running' : 'is-failed';
+		        progressPct = promptReady.status === 'generating' ? 20 : 0;
+		      } else if (clipTask && clipTask.status === 'failed') {
+		        statusLabel = '失败'; statusTone = 'is-failed'; progressPct = 0;
+	      } else if (clipTask && !isTerminal(clipTask)) {
+	        statusLabel = '进行中'; statusTone = 'is-running'; progressPct = _batchTaskProgress(clipTask); remainingText = _batchRemainingText(clipTask);
+	      } else if (clipTask && clipTask.status === 'done') {
+	        statusLabel = '已完成'; statusTone = 'is-done'; progressPct = 100;
+		      } else if (!clipTask && sb.videoUrl && !_hasCurrentVideoForGroup(gIdx)) {
+		        statusLabel = '旧视频已过期'; statusTone = 'is-pending'; progressPct = 0;
+		      } else if (!clipTask && sb.videoUrl) {
+		        statusLabel = '已完成'; statusTone = 'is-done'; progressPct = 100;
+	      } else {
+	        statusLabel = '未开始'; statusTone = 'is-pending'; progressPct = 0;
+	      }
+	      var rowDurationText = _formatBatchDuration(sb.videoDurationSec || totalDur);
+	      var shotCount = Array.isArray(group.shots) ? group.shots.length : 1;
+	      var shotType = (group.shots[0] && group.shots[0].shotType) || 'Clip';
+	      var sourceText = sb.videoUrl ? '已有视频结果' : '基于片段设置生成';
 
-      var imgHtml = bcThumbSrc
-        ? '<img class="w-full h-full object-cover opacity-60 grayscale" loading="lazy" decoding="async" src="' + escapeHtml(bcThumbSrc) + '" />'
-        : '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-3xl text-on-surface-variant/15">movie_filter</span></div>';
+	      var card = document.createElement("div");
+	      card.className = "batch-segment-row batch-plan-row " + statusTone;
 
-      card.innerHTML =
-        '<div class="relative h-44 rounded-lg overflow-hidden mb-4 bg-surface-container-low">' +
-          imgHtml +
-          '<div class="absolute inset-0 bg-gradient-to-t from-surface-container-lowest/80 to-transparent"></div>' +
-          '<div class="absolute bottom-3 left-3 flex items-center gap-2">' +
-            '<span class="px-2 py-1 bg-surface-container-lowest/90 backdrop-blur text-[10px] font-black rounded-sm">' + String(totalDur).padStart(2, '0') + ':00s</span>' +
-            '<span class="px-2 py-1 ' + statusClass + ' text-[10px] font-black rounded-sm" style="white-space:nowrap">' + statusLabel + '</span>' +
-          '</div>' +
-        '</div>' +
-        '<h4 class="text-sm font-bold mb-3">' + String(gIdx + 1).padStart(2, '0') + '_片段_' + escapeHtml((group.shots[0] && group.shots[0].shotType) || 'Clip') + '</h4>' +
-        (batchSenHits.length
-          ? '<div class="flex items-center gap-1.5 mb-3 px-2 py-1.5 rounded-lg bg-error/8 cursor-pointer" data-action="goto-fix-sensitive" data-gidx="' + gIdx + '" title="点击前往提示词页面修改">' +
-              '<span class="material-symbols-outlined text-error text-xs">shield</span>' +
-              '<span class="text-[10px] text-error font-medium">' + batchSenHits.length + ' 个敏感词</span>' +
-            '</div>'
-          : '') +
-        '<div class="flex items-center justify-between py-3 border-t border-outline-variant/5">' +
-          '<div class="flex items-center gap-3 min-w-0">' +
-            '<div class="flex items-center gap-1 opacity-60">' +
-              '<span class="material-symbols-outlined text-[14px]">person</span>' +
-              '<span class="text-[10px] font-bold">' + charCount + '</span>' +
-            '</div>' +
-            '<div class="flex items-center gap-1 opacity-60">' +
-              '<span class="material-symbols-outlined text-[14px]">landscape</span>' +
-              '<span class="text-[10px] font-bold">' + sceneCount + '</span>' +
-            '</div>' +
-            '<button type="button" class="inline-flex items-center justify-center w-7 h-7 rounded-full bg-surface-container text-on-surface-variant border border-outline-variant/10 hover:text-primary hover:bg-primary/10 transition-all active:scale-95 shrink-0" data-action="open-prompt-audit" data-gidx="' + gIdx + '" data-shot-indices="' + escapeHtml(groupShotIndicesText) + '" title="查看生成规则与检查结果">' +
-              '<span class="material-symbols-outlined text-[15px]">article</span>' +
-            '</button>' +
-          '</div>' +
-	          (clipTask && !isTerminal(clipTask)
-	            ? ''
-	            : !promptReady.canStart
-	              ? '<button type="button" class="flex items-center gap-1 px-3 py-1.5 bg-surface-container-highest text-on-surface-variant rounded-full text-[10px] font-bold tracking-wide opacity-60 cursor-not-allowed" disabled title="' + escapeHtml(_videoPromptNotReadyMessage(gIdx, promptReady)) + '">' +
-	                  '<span class="material-symbols-outlined text-sm">block</span>不可生成</button>'
-	            : '<button type="button" class="flex items-center gap-1 px-3 py-1.5 bg-primary text-on-primary rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="gen-clip" data-gidx="' + gIdx + '">' +
-	                '<span class="material-symbols-outlined text-sm">play_arrow</span>' +
-                (clipTask && clipTask.status === 'done' ? '重新生成' : '生成') +
-              '</button>') +
-        '</div>';
-      list.appendChild(card);
-    });
-
-    var countEl = $("batchClipCount");
-    if (countEl) countEl.textContent = validCount + " 个片段";
-
-    var estEl = $("batchEstTime");
-    if (estEl) {
-      var estMin = Math.ceil(totalDurAll * 3 / 60);
-      estEl.textContent = "~ " + estMin + " 分钟";
-    }
-    hydrateProtectedImageElements(list);
-  }
+	      card.innerHTML =
+	        '<div class="batch-row-info">' +
+	          '<div class="batch-row-thumb">' + _batchThumbHtml(bcThumbSrc) + '</div>' +
+	          '<div class="batch-row-copy">' +
+	            '<h4>' + String(gIdx + 1).padStart(2, '0') + '_片段_' + escapeHtml(shotType) + '</h4>' +
+	            '<p>镜头类型：' + escapeHtml(shotType) + '</p>' +
+	            '<p>来源：' + escapeHtml(sourceText) + '</p>' +
+	          '</div>' +
+	        '</div>' +
+	        '<div class="batch-row-status">' +
+	          '<span class="batch-status-pill ' + statusTone + '"><span class="material-symbols-outlined">' + (statusTone === 'is-done' ? 'check_circle' : statusTone === 'is-running' ? 'motion_photos_auto' : statusTone === 'is-failed' ? 'error' : 'radio_button_checked') + '</span>' + statusLabel + '</span>' +
+	          '<div class="batch-row-progress"><i style="width:' + progressPct + '%"></i></div>' +
+	          '<em>' + progressPct + '%</em>' +
+	        '</div>' +
+	        '<div class="batch-row-time">' +
+	          '<strong>' + rowDurationText + '</strong>' +
+	          '<span>' + escapeHtml(remainingText) + '</span>' +
+	        '</div>' +
+	        '<div class="batch-row-basic">' +
+	          '<span><i class="material-symbols-outlined">person</i>' + charCount + ' 人</span>' +
+	          '<span><i class="material-symbols-outlined">crop_free</i>' + shotCount + ' 镜头</span>' +
+	          '<span><i class="material-symbols-outlined">landscape</i>' + sceneCount + ' 场景</span>' +
+	        '</div>' +
+	        '<div class="batch-row-actions">' +
+	        (batchSenHits.length
+	          ? '<button type="button" class="batch-row-action batch-row-action-danger" data-action="goto-fix-sensitive" data-gidx="' + gIdx + '" title="点击前往提示词页面修改">' +
+	              '<span class="material-symbols-outlined">shield</span>' + batchSenHits.length + ' 个敏感词</button>'
+	          : '') +
+	          '<button type="button" class="batch-row-icon-action" data-action="open-prompt-audit" data-gidx="' + gIdx + '" data-shot-indices="' + escapeHtml(groupShotIndicesText) + '" title="查看生成规则与检查结果" aria-label="查看生成规则与检查结果">' +
+	            '<span class="material-symbols-outlined">article</span>' +
+	          '</button>' +
+		          (clipTask && !isTerminal(clipTask)
+		            ? ''
+		            : !promptReady.canStart
+		              ? '<button type="button" class="batch-row-action is-disabled" disabled title="' + escapeHtml(_videoPromptNotReadyMessage(gIdx, promptReady)) + '">' +
+		                  '<span class="material-symbols-outlined">block</span>不可生成</button>'
+		            : '<button type="button" class="batch-row-action batch-row-action-dark" data-action="gen-clip" data-gidx="' + gIdx + '">' +
+		                '<span class="material-symbols-outlined">play_arrow</span>' +
+	                (clipTask && clipTask.status === 'done' ? '重新生成' : '生成') +
+	              '</button>') +
+	        '</div>';
+	      list.appendChild(card);
+	    });
+	    _renderBatchVisualStats(stats);
+	    hydrateProtectedImageElements(list);
+	  }
 
   function _selectBatchVideoModel(alias) {
     var grid = $("batchVideoModelGrid");
@@ -3180,7 +3260,6 @@ export {
   handleVideoTaskAction,
   syncTaskListVisibility,
   updateBadge,
-  toggleGlobalTaskPanel,
   createWorkflowVideoTask,
   activeTaskCount,
   refreshHistoryUI,

@@ -44,6 +44,205 @@ function _isStale(key) { return _ctx.isStale ? _ctx.isStale(key) : false; }
 function agentInsertRef(type, label, data) { if (_ctx.agentInsertRef) _ctx.agentInsertRef(type, label, data); }
 function emotionBadgeHtml(emotion, intensity) { return _ctx.emotionBadgeHtml ? _ctx.emotionBadgeHtml(emotion, intensity) : ''; }
 
+function _hasMeaningfulValue(value) {
+  if (value == null) return false;
+  if (Array.isArray(value)) return value.some(_hasMeaningfulValue);
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  if (typeof value === "string") return value.trim().length > 0;
+  return true;
+}
+
+function _singleShotSlot(idx, src) {
+  var slot = Object.assign({}, src || {});
+  slot.idx = idx;
+  slot.shotIdx = idx + 1;
+  slot.shotIndices = [idx];
+  if (slot.frames && typeof slot.frames === "object") {
+    slot.frames = Object.assign({}, slot.frames);
+    if (slot.frames.first && typeof slot.frames.first === "object") {
+      slot.frames.first = Object.assign({}, slot.frames.first, { shotIndices: [idx] });
+    }
+    if (slot.frames.tail && typeof slot.frames.tail === "object") {
+      slot.frames.tail = Object.assign({}, slot.frames.tail, { shotIndices: [idx] });
+    }
+  }
+  return slot;
+}
+
+function _makeSingleShotStoryboards(shots) {
+  return (Array.isArray(shots) ? shots : []).map(function (_, idx) { return _singleShotSlot(idx, null); });
+}
+
+function _archiveStoryboardSlot(oldGroupIdx, sb, vt, reason) {
+  if (!_hasMeaningfulValue(sb) && !_hasMeaningfulValue(vt)) return;
+  if (!Array.isArray(project.legacyStoryboardArchive)) project.legacyStoryboardArchive = [];
+  project.legacyStoryboardArchive.push({
+    oldGroupIdx: oldGroupIdx,
+    oldShotIndices: Array.isArray(sb && sb.shotIndices) ? sb.shotIndices.slice() : [],
+    storyboard: _hasMeaningfulValue(sb) ? sb : undefined,
+    videoTask: _hasMeaningfulValue(vt) ? vt : undefined,
+    archivedAt: new Date().toISOString(),
+    archiveReason: reason || "shot_structure_change",
+  });
+  project.legacyStoryboardArchiveLastMigratedAt = new Date().toISOString();
+  project.legacyStoryboardArchiveLastCount = 1;
+}
+
+function _remapEditDataAfterShotDelete(deletedIdx) {
+  if (!project || !project.editData || typeof project.editData !== "object") return;
+  var touched = false;
+  var timelineArchive = null;
+  var edl = project.editData.edl;
+  if (edl && Array.isArray(edl.timeline)) {
+    var oldTimeline = edl.timeline;
+    var nextTimeline = [];
+    var dropped = 0;
+    oldTimeline.forEach(function (entry) {
+      var oldGroupIdx = Number(entry && entry.groupIdx);
+      if (!Number.isInteger(oldGroupIdx)) {
+        nextTimeline.push(entry);
+      } else if (oldGroupIdx === deletedIdx) {
+        dropped++;
+      } else {
+        var nextGroupIdx = oldGroupIdx > deletedIdx ? oldGroupIdx - 1 : oldGroupIdx;
+        nextTimeline.push(Object.assign({}, entry, { groupIdx: nextGroupIdx }));
+        if (nextGroupIdx !== oldGroupIdx) touched = true;
+      }
+    });
+    if (dropped || nextTimeline.length !== oldTimeline.length) {
+      touched = true;
+      timelineArchive = timelineArchive || {};
+      timelineArchive.edl = edl;
+      timelineArchive.droppedTimelineCount = dropped;
+      project.editData.edl = Object.assign({}, edl, {
+        timeline: nextTimeline,
+        version: (Number(edl.version) || 0) + 1,
+      });
+    }
+  }
+  var tags = project.editData.segmentTags;
+  if (tags && Array.isArray(tags.segments)) {
+    var oldSegments = tags.segments;
+    var nextSegments = [];
+    var droppedTags = 0;
+    oldSegments.forEach(function (seg) {
+      var oldGroupIdx = Number(seg && seg.groupIdx);
+      if (!Number.isInteger(oldGroupIdx)) {
+        nextSegments.push(seg);
+      } else if (oldGroupIdx === deletedIdx) {
+        droppedTags++;
+      } else {
+        var nextGroupIdx = oldGroupIdx > deletedIdx ? oldGroupIdx - 1 : oldGroupIdx;
+        nextSegments.push(Object.assign({}, seg, { groupIdx: nextGroupIdx }));
+        if (nextGroupIdx !== oldGroupIdx) touched = true;
+      }
+    });
+    if (droppedTags || nextSegments.length !== oldSegments.length) {
+      touched = true;
+      timelineArchive = timelineArchive || {};
+      timelineArchive.segmentTags = tags;
+      timelineArchive.droppedSegmentTagCount = droppedTags;
+      project.editData.segmentTags = Object.assign({}, tags, { segments: nextSegments });
+    }
+  }
+  if (touched) {
+    project.editData.version = (Number(project.editData.version) || 0) + 1;
+    if (timelineArchive) {
+      if (!Array.isArray(project.legacyTimelineArchive)) project.legacyTimelineArchive = [];
+      project.legacyTimelineArchive.push(Object.assign({}, timelineArchive, {
+        archivedAt: new Date().toISOString(),
+        archiveReason: "shot_deleted",
+      }));
+    }
+  }
+}
+
+function _remapEditDataAfterShotInsert(insertIdx) {
+  if (!project || !project.editData || typeof project.editData !== "object") return;
+  var touched = false;
+  var edl = project.editData.edl;
+  if (edl && Array.isArray(edl.timeline)) {
+    var nextTimeline = edl.timeline.map(function (entry) {
+      var oldGroupIdx = Number(entry && entry.groupIdx);
+      if (!Number.isInteger(oldGroupIdx) || oldGroupIdx < insertIdx) return entry;
+      touched = true;
+      return Object.assign({}, entry, { groupIdx: oldGroupIdx + 1 });
+    });
+    if (touched) {
+      project.editData.edl = Object.assign({}, edl, {
+        timeline: nextTimeline,
+        version: (Number(edl.version) || 0) + 1,
+      });
+    }
+  }
+  var tags = project.editData.segmentTags;
+  if (tags && Array.isArray(tags.segments)) {
+    var tagTouched = false;
+    var nextSegments = tags.segments.map(function (seg) {
+      var oldGroupIdx = Number(seg && seg.groupIdx);
+      if (!Number.isInteger(oldGroupIdx) || oldGroupIdx < insertIdx) return seg;
+      tagTouched = true;
+      return Object.assign({}, seg, { groupIdx: oldGroupIdx + 1 });
+    });
+    if (tagTouched) {
+      touched = true;
+      project.editData.segmentTags = Object.assign({}, tags, { segments: nextSegments });
+    }
+  }
+  if (touched) project.editData.version = (Number(project.editData.version) || 0) + 1;
+}
+
+export function _syncSingleShotSlotsAfterDelete(deletedIdx) {
+  _syncRefs();
+  if (!project) return;
+  var oldStoryboards = Array.isArray(project.storyboards) ? project.storyboards : [];
+  var oldVideoTasks = Array.isArray(project.videoTasks) ? project.videoTasks : [];
+  _archiveStoryboardSlot(deletedIdx, oldStoryboards[deletedIdx], oldVideoTasks[deletedIdx], "shot_deleted");
+
+  var nextStoryboards = [];
+  var nextVideoTasks = [];
+  var shotCount = Array.isArray(project.shots) ? project.shots.length : 0;
+  for (var idx = 0; idx < shotCount; idx++) {
+    var oldIdx = idx < deletedIdx ? idx : idx + 1;
+    nextStoryboards[idx] = _singleShotSlot(idx, oldStoryboards[oldIdx]);
+    if (_hasMeaningfulValue(oldVideoTasks[oldIdx])) {
+      nextVideoTasks[idx] = Object.assign({}, oldVideoTasks[oldIdx], { groupIdx: idx });
+    }
+  }
+  for (var extraIdx = shotCount + 1; extraIdx < Math.max(oldStoryboards.length, oldVideoTasks.length); extraIdx++) {
+    _archiveStoryboardSlot(extraIdx, oldStoryboards[extraIdx], oldVideoTasks[extraIdx], "shot_deleted:orphan_after_shift");
+  }
+  project.storyboards = nextStoryboards;
+  project.videoTasks = nextVideoTasks;
+  project.frameWorkflowSchemaVersion = 3;
+  _remapEditDataAfterShotDelete(deletedIdx);
+}
+
+export function _syncSingleShotSlotsAfterInsert(insertIdx) {
+  _syncRefs();
+  if (!project) return;
+  var oldStoryboards = Array.isArray(project.storyboards) ? project.storyboards : [];
+  var oldVideoTasks = Array.isArray(project.videoTasks) ? project.videoTasks : [];
+  var shotCount = Array.isArray(project.shots) ? project.shots.length : 0;
+  var nextStoryboards = [];
+  var nextVideoTasks = [];
+  for (var idx = 0; idx < shotCount; idx++) {
+    if (idx === insertIdx) {
+      nextStoryboards[idx] = _singleShotSlot(idx, null);
+      continue;
+    }
+    var oldIdx = idx < insertIdx ? idx : idx - 1;
+    nextStoryboards[idx] = _singleShotSlot(idx, oldStoryboards[oldIdx]);
+    if (_hasMeaningfulValue(oldVideoTasks[oldIdx])) {
+      nextVideoTasks[idx] = Object.assign({}, oldVideoTasks[oldIdx], { groupIdx: idx });
+    }
+  }
+  project.storyboards = nextStoryboards;
+  project.videoTasks = nextVideoTasks;
+  project.frameWorkflowSchemaVersion = 3;
+  _remapEditDataAfterShotInsert(insertIdx);
+}
+
 /* ================================================================
    Shots page
    ================================================================ */
@@ -51,9 +250,11 @@ export function refreshShotsPage() {
   _syncRefs();
   var needScript = $("shotsNeedScript");
   var ready = $("shotsReady");
+  var topActions = $("shotsTopActions");
   if (!project || !project.assetsApproved) {
     if (needScript) needScript.hidden = false;
     if (ready) ready.hidden = true;
+    if (topActions) topActions.hidden = true;
     var wrap = $("shotListWrap");
     if (wrap) wrap.innerHTML = "";
     var ca = $("shotsConfirmArea");
@@ -62,6 +263,7 @@ export function refreshShotsPage() {
   }
   needScript.hidden = true;
   ready.hidden = false;
+  if (topActions) topActions.hidden = false;
   renderShotList();
 }
 
@@ -85,6 +287,8 @@ export function renderShotList() {
   if (!wrap) return;
   wrap.innerHTML = "";
   if (!project || !project.shots || !project.shots.length) {
+    var emptySummaryMeta = $("shotSummaryMeta");
+    if (emptySummaryMeta) emptySummaryMeta.textContent = "";
     var ca = $("shotsConfirmArea"); if (ca) ca.hidden = true;
     return;
   }
@@ -99,14 +303,12 @@ export function renderShotList() {
 
   var totalSec = 0;
   project.shots.forEach(function (s) { totalSec += (s.duration || 4); });
-  var summaryDiv = document.createElement("div");
-  summaryDiv.className = "text-sm text-on-surface-variant mb-6 px-8";
-  summaryDiv.textContent = "共 " + project.shots.length + " 个镜头 · 总时长约 " + totalSec + " 秒";
-  wrap.appendChild(summaryDiv);
+  var summaryMeta = $("shotSummaryMeta");
+  if (summaryMeta) summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · 总时长约 " + totalSec + " 秒";
 
   project.shots.forEach(function (shot, idx) {
     var card = document.createElement("div");
-    card.className = "sc-card group bg-surface-container-low/40 p-6 rounded-xl border border-outline-variant/10 hover:bg-surface-container-lowest transition-all duration-300 hover:shadow-lg";
+    card.className = "sc-card group bg-surface-container-lowest/40 backdrop-blur-xl p-6 rounded-xl border border-white/30 hover:bg-surface-container-lowest/70 transition-all duration-300 hover:shadow-lg";
     card.dataset.shotIdx = idx;
 
     card.innerHTML =
@@ -481,13 +683,15 @@ export async function generateShots(opts) {
         return;
       }
 
-      var isCurrent = _safeWriteBack(originId, function (proj) {
-        proj.shots = arr;
-        proj.shotsApproved = false;
-        proj.storyboards = [];
-        if (proj._staleFlags) {
-          Object.keys(proj._staleFlags).forEach(function (k) {
-            if (k.indexOf("shot_") === 0 || k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
+	      var isCurrent = _safeWriteBack(originId, function (proj) {
+	        proj.shots = arr;
+	        proj.shotsApproved = false;
+	        proj.storyboards = _makeSingleShotStoryboards(arr);
+	        proj.videoTasks = [];
+	        proj.frameWorkflowSchemaVersion = 3;
+	        if (proj._staleFlags) {
+	          Object.keys(proj._staleFlags).forEach(function (k) {
+	            if (k.indexOf("shot_") === 0 || k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
               delete proj._staleFlags[k];
             }
           });
@@ -580,17 +784,15 @@ export function handleShotAction(e) {
     agentInsertRef("分镜", String(idx + 1), { shotIdx: idx, visual: (shot && shot.visual) || "" });
     return;
   }
-  if (action === "delete-shot") {
-    if (!project || !project.shots) return;
-    project.shots.splice(idx, 1);
-    project.shots.forEach(function (s, i) { s.order = i + 1; s.id = "shot_" + (i + 1); });
-    if (project.storyboards && project.storyboards.length) {
-      project.storyboards = [];
-      showToast("分镜数量变化，分镜板和视频提示词已重置", "warn");
-    }
-    if (project._staleFlags) {
-      Object.keys(project._staleFlags).forEach(function (k) {
-        if (k.indexOf("shot_") === 0 || k.indexOf("shot_prompt_") === 0 ||
+	  if (action === "delete-shot") {
+	    if (!project || !project.shots) return;
+	    project.shots.splice(idx, 1);
+	    project.shots.forEach(function (s, i) { s.order = i + 1; s.id = "shot_" + (i + 1); });
+	    _syncSingleShotSlotsAfterDelete(idx);
+	    showToast("已删除镜头，后续分镜板已按镜头顺序对齐", "warn");
+	    if (project._staleFlags) {
+	      Object.keys(project._staleFlags).forEach(function (k) {
+	        if (k.indexOf("shot_") === 0 || k.indexOf("shot_prompt_") === 0 ||
             k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
           delete project._staleFlags[k];
         }

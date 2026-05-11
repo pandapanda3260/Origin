@@ -1,14 +1,12 @@
 import type { UserRow } from './db';
 import { resolveLLMConfig } from './llm';
 import { resolveTextModelConfig } from './model-routing';
-import { resolveLocalImagePath } from './image-gen';
 import { buildVideoPromptMessages } from './prompts';
-import { selectCharacterReferencePanels } from './panel-selection';
 import { buildSeedancePromptParts, type VideoReferenceImage } from './video-prompt-runtime';
 import { ensureProjectConsistency, renderCharacterLockRosterLine } from './character-consistency';
 import { plannedDurationFromShots, resolveGenerationDurationSec } from './video-reference-manifest';
 import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
-import { pickSceneForShots } from './scene-selection';
+import { buildVideoReferenceManifest } from './reference-matcher';
 import {
   buildVideoPromptRetryAudit,
   VIDEO_PROMPT_FIRST_TEMPERATURE,
@@ -154,31 +152,6 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     if (sketchId) storyboardReferencePath = `${process.cwd()}/data/images/${user.id}/${sketchId}.png`;
   }
 
-  let chosenScene: any = null;
-  let sceneReferencePath: string | undefined;
-  let sceneReferenceLabel = '';
-  let sceneReferenceHint = '';
-  const sceneShots = shotIndices.map((i) => shots[i]).filter(Boolean);
-  const sceneText = sceneShots
-    .map((sh: any) => [sh?.sceneId, sh?.sceneName, sh?.scene, sh?.location, sh?.visual].filter(Boolean).join(' '))
-    .join(' ');
-  const sceneSelection = pickSceneForShots({
-    project,
-    assets: (project as any).assets || {},
-    shots: sceneShots,
-    text: sceneText,
-  }, { requireImage: true, preferFirstShot: true });
-  chosenScene = sceneSelection.scene;
-  if (chosenScene) {
-    sceneReferencePath = resolveLocalImagePath(chosenScene.imageUrl || chosenScene.rawUrl, user.id) || undefined;
-    sceneReferenceLabel = String(chosenScene.name || chosenScene.title || chosenScene.sceneName || 'main scene').trim();
-    sceneReferenceHint = String([chosenScene.description, chosenScene.visual, chosenScene.promptHint, chosenScene.imagePrompt].filter(Boolean).join(' ')).slice(0, 120);
-  }
-
-  const allChars: any[] = [
-    ...((project as any).assets?.characters || []),
-    ...((project as any).characters || []),
-  ];
   const charNames = new Set<string>();
   for (const si of shotIndices) {
     const sh = shots[si];
@@ -188,35 +161,36 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     }
   }
 
-  const characterReferencePaths: string[] = [];
-  const characterReferenceNames: string[] = [];
-  const characterReferenceItems: Array<{ name: string; path: string; hint: string }> = [];
-  for (const name of charNames) {
-    const ch = allChars.find((c) => c && (c.name === name || c.role === name));
-    const url = ch?.imageUrl || ch?.rawUrl;
-    if (url) {
-      const p = resolveLocalImagePath(url, user.id);
-      if (p) {
-        characterReferencePaths.push(p);
-        characterReferenceNames.push(name);
-        characterReferenceItems.push({
-          name,
-          path: p,
-          hint: String([ch?.appearance, ch?.clothing, ch?.temperament, ch?.entityType].filter(Boolean).join(' ')).slice(0, 120),
-        });
-      }
-    }
-    if (characterReferencePaths.length >= 4) break;
-  }
-
-  const characterReferencePanels = selectCharacterReferencePanels({
+  const canonicalRefs = buildVideoReferenceManifest({
     project,
-    ownerId: user.id,
+    assets: (project as any).assets || {},
+    shots,
     groupShotIndices: shotIndices,
-    maxSlots: 4,
+    groupIdx,
+    ownerId: user.id,
+    storyboardImageUrl: sbImageUrl || null,
   });
-
-  const allProps: any[] = (project as any).assets?.props || [];
+  const manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
+  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
+  const sceneReferencePath = sceneItem?.localPath;
+  const sceneReferenceHint = sceneItem?.promptHint || '';
+  const characterReferencePaths = manifestInImageOrder
+    .filter((ref) => ref.role === 'character' && ref.localPath)
+    .map((ref) => ref.localPath as string);
+  const characterReferenceNames = manifestInImageOrder
+    .filter((ref) => ref.role === 'character')
+    .map((ref) => ref.assetName || ref.label)
+    .filter(Boolean);
+  const characterReferencePanels = manifestInImageOrder
+    .filter((ref) => ref.role === 'character' && ref.localPath && ref.panelInfo)
+    .map((ref: any) => ({
+      characterName: ref.assetName || ref.label,
+      panel: ref.panelInfo.panel,
+      path: ref.localPath,
+      intent: ref.panelInfo.intent,
+      priority: Number(ref.score || ref.priority || 0),
+      reason: ref.matchReason || `manifest:${ref.panelInfo.panel}`,
+    }));
   const groupTextForProps = shotIndices
     .map((i) => {
       const sh = shots[i];
@@ -225,25 +199,13 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
         .join(' ');
     })
     .join(' ');
-  const propReferencePaths: string[] = [];
-  const propReferenceNames: string[] = [];
-  const propReferenceItems: Array<{ name: string; path: string; hint: string }> = [];
-  for (const prop of allProps) {
-    const nm = prop?.name || prop?.propName;
-    if (!nm || !groupTextForProps.includes(nm)) continue;
-    const url = prop.imageUrl || prop.rawUrl;
-    const p = url ? resolveLocalImagePath(url, user.id) : null;
-    if (p) {
-      propReferencePaths.push(p);
-      propReferenceNames.push(nm);
-      propReferenceItems.push({
-        name: nm,
-        path: p,
-        hint: String([prop.description, prop.appearance, prop.imagePrompt, prop.promptHint].filter(Boolean).join(' ')).slice(0, 120),
-      });
-    }
-    if (propReferencePaths.length >= 4) break;
-  }
+  const propReferencePaths = manifestInImageOrder
+    .filter((ref) => ref.role === 'prop' && ref.localPath)
+    .map((ref) => ref.localPath as string);
+  const propReferenceNames = manifestInImageOrder
+    .filter((ref) => ref.role === 'prop')
+    .map((ref) => ref.assetName || ref.label)
+    .filter(Boolean);
 
   const characterLockRosterLines: string[] = [];
   const projectWithConsistency = ensureProjectConsistency(project as any, { source: 'migration' });
@@ -279,74 +241,18 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     if (nextIdx != null) nextHeadSummary = summarizeShot(shots[nextIdx]);
   }
 
-  const referenceImages: VideoReferenceImage[] = [];
-  const addReferenceImage = (ref: VideoReferenceImage) => {
-    if (!ref.path) return;
-    if (referenceImages.some((item) => item.path === ref.path)) return;
-    if (referenceImages.length >= 4) return;
-    referenceImages.push(ref);
-  };
-  addReferenceImage({
-    role: referenceImageRole === 'first_frame' ? 'first_frame' : 'storyboard_sketch',
-    path: referenceImagePath || '',
-    label: referenceImageRole === 'first_frame' ? `segment ${groupIdx + 1} first frame` : `segment ${groupIdx + 1} storyboard sketch`,
-    promptHint: referenceImageRole === 'first_frame'
-      ? 'Start from this exact composition, character placement, lighting, color, and cinematic texture.'
-      : 'Use only for composition and camera blocking; do not copy sketch texture.',
-    priority: 100,
-  });
-  const primaryPanel = characterReferencePanels[0];
-  if (primaryPanel) {
-    addReferenceImage({
-      role: 'character',
-      path: primaryPanel.path,
-      label: `${primaryPanel.characterName} character reference (${primaryPanel.panel})`,
-      promptHint: `Preserve identity, costume, species/body features, and ${primaryPanel.intent} details.`,
-      priority: 90,
-    });
-  } else if (characterReferenceItems[0]) {
-    addReferenceImage({
-      role: 'character',
-      path: characterReferenceItems[0].path,
-      label: `${characterReferenceItems[0].name} character reference`,
-      promptHint: characterReferenceItems[0].hint || 'Preserve identity, costume, body shape, and species traits.',
-      priority: 90,
-    });
-  }
-  addReferenceImage({
-    role: 'scene',
-    path: sceneReferencePath || '',
-    label: sceneReferenceLabel || 'main scene reference',
-    promptHint: sceneReferenceHint || 'Use for environment, lighting, color palette, architecture, and atmosphere.',
-    priority: 80,
-  });
-  if (propReferenceItems[0]) {
-    addReferenceImage({
-      role: 'prop',
-      path: propReferenceItems[0].path,
-      label: `${propReferenceItems[0].name} prop reference`,
-      promptHint: propReferenceItems[0].hint || 'Preserve material, color, scale, and recognizable details.',
-      priority: 70,
-    });
-  }
-  const secondaryPanel = characterReferencePanels.find((panel) => panel.path !== primaryPanel?.path);
-  if (referenceImages.length < 4 && secondaryPanel) {
-    addReferenceImage({
-      role: 'character',
-      path: secondaryPanel.path,
-      label: `${secondaryPanel.characterName} character reference (${secondaryPanel.panel})`,
-      promptHint: `Preserve identity, costume, species/body features, and ${secondaryPanel.intent} details.`,
-      priority: 60,
-    });
-  } else if (referenceImages.length < 4 && characterReferenceItems[1]) {
-    addReferenceImage({
-      role: 'character',
-      path: characterReferenceItems[1].path,
-      label: `${characterReferenceItems[1].name} character reference`,
-      promptHint: characterReferenceItems[1].hint || 'Preserve identity, costume, body shape, and species traits.',
-      priority: 60,
-    });
-  }
+  const referenceImages: VideoReferenceImage[] = manifestInImageOrder
+    .filter((ref) => !!ref.localPath)
+    .map((ref) => ({
+      role: ref.role,
+      path: ref.localPath as string,
+      label: ref.label,
+      sourceUrl: ref.url,
+      assetId: ref.assetId,
+      assetName: ref.assetName,
+      promptHint: ref.promptHint,
+      priority: ref.priority || ref.score,
+    }));
 
   return {
     prompt,
@@ -369,7 +275,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     debug: {
       groupShots,
       dialogueCharSum,
-      chosenSceneName: chosenScene?.name || '',
+      chosenSceneName: sceneItem?.assetName || sceneItem?.label || '',
       characterReferenceNames,
       propReferenceNames,
       referenceImages: referenceImages.map((ref) => ({ role: ref.role, label: ref.label, promptHint: ref.promptHint })),
