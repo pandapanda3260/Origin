@@ -48,6 +48,6 @@ export const appStore = createStore({
   activePage: 'overview',
   videoState: {
     tasks: [],
-    form: { ratio: '16:9', quality: '1080p', duration: 8, startDataUrl: '', endDataUrl: '' },
+    form: { ratio: '9:16', quality: '1080p', duration: 8, startDataUrl: '', endDataUrl: '' },
   },
 });

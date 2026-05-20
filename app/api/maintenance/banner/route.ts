@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
-import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { getDb } from '@/lib/db';
+import { dryRunPayload, withAdminAudit } from '@/lib/admin-audit';
+import { readSystemConfig, writeSystemConfig } from '@/lib/system-config';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -12,34 +12,30 @@ export async function GET() {
   return jsonOk(readBanner());
 }
 
-export async function PUT(req: NextRequest) {
-  const user = await getCurrentUser(req);
-  if (!user) return jsonError('unauthorized', 401);
-  if (!user.is_admin) return jsonError('forbidden', 403);
-  const body = await req.json().catch(() => ({} as any));
+export const PUT = withAdminAudit(async function updateMaintenanceBanner(_req: NextRequest, ctx) {
+  const before = readBanner();
+  const body = ctx.body || {};
   const v = {
     enabled: !!body.enabled,
     message: String(body.message || '').slice(0, 500),
     startsAt: body.startsAt || null,
     endsAt: body.endsAt || null,
   };
+  ctx.setAuditTarget({ type: 'system_config', ids: ['maintenance_banner'] });
+  ctx.setAuditDiff({ items: [{ id: 'maintenance_banner', before, after: v }] });
+  if (ctx.dryRun) return jsonOk(dryRunPayload('config.maintenance_banner.update', ctx.target, ctx.diff));
   saveBanner(v);
   return jsonOk(v);
-}
+}, 'config.maintenance_banner.update', {
+  category: 'config',
+  requireReason: true,
+  supportDryRun: true,
+  idempotent: true,
+});
 
 function readBanner() {
-  const db = getDb();
-  const row = db.prepare<[], any>(`SELECT value_json FROM system_config WHERE key='maintenance_banner'`).get();
-  if (!row) return DEFAULT;
-  try { return { ...DEFAULT, ...JSON.parse(row.value_json) }; } catch { return DEFAULT; }
+  return { ...DEFAULT, ...readSystemConfig('maintenance_banner', DEFAULT) };
 }
 function saveBanner(v: any) {
-  const db = getDb();
-  const json = JSON.stringify(v);
-  db.prepare(
-    `INSERT INTO system_config (key, value_json, updated_at)
-     VALUES ('maintenance_banner', ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-     ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,
-       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-  ).run(json);
+  writeSystemConfig('maintenance_banner', v);
 }

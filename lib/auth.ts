@@ -6,6 +6,7 @@ import { compare, hash } from 'bcryptjs';
 import { jwtVerify, SignJWT } from 'jose';
 import type { NextRequest } from 'next/server';
 import { getDb, userToPublic, type UserRow } from './db';
+import { clearUserAuthCache, isUserTokenStillValid } from './user-auth-cache';
 
 const SECRET = (() => {
   const env = process.env.JWT_SECRET;
@@ -32,9 +33,10 @@ export async function verifyPassword(plain: string, hashed: string): Promise<boo
 }
 
 export async function signToken(user: UserRow): Promise<string> {
-  return new SignJWT({ sub: String(user.id), username: user.username })
+  const issuedAtMs = Date.now();
+  return new SignJWT({ sub: String(user.id), username: user.username, iat_ms: issuedAtMs })
     .setProtectedHeader({ alg: ALG })
-    .setIssuedAt()
+    .setIssuedAt(Math.floor(issuedAtMs / 1000))
     .setExpirationTime(TOKEN_TTL)
     .sign(SECRET);
 }
@@ -44,7 +46,10 @@ export async function verifyToken(token: string): Promise<{ userId: number; user
     const { payload } = await jwtVerify(token, SECRET, { algorithms: [ALG] });
     const userId = Number(payload.sub);
     const username = String(payload.username || '');
+    const issuedAt = Number(payload.iat || 0);
+    const issuedAtMs = Number((payload as any).iat_ms || 0);
     if (!userId || !username) return null;
+    if (!isUserTokenStillValid(userId, issuedAt, issuedAtMs)) return null;
     return { userId, username };
   } catch {
     return null;
@@ -75,6 +80,7 @@ export async function getCurrentUser(req: NextRequest | Request): Promise<UserRo
   if (!decoded) return null;
   const db = getDb();
   const row = db.prepare<{ id: number }, UserRow>('SELECT * FROM users WHERE id = @id').get({ id: decoded.userId });
+  if (row?.disabled_at) return null;
   return row ?? null;
 }
 
@@ -111,24 +117,23 @@ export async function createUser(opts: {
   password: string;
   email?: string;
   displayName?: string;
-  isAdmin?: boolean;
 }): Promise<UserRow> {
   const db = getDb();
   const passwordHash = await hashPassword(opts.password);
   const stmt = db.prepare<
-    { username: string; email: string | null; displayName: string; passwordHash: string; isAdmin: number; emailVerified: number },
+    { username: string; email: string | null; displayName: string; passwordHash: string; emailVerified: number },
     UserRow
-  >(`INSERT INTO users (username, email, display_name, password_hash, is_admin, email_verified)
-     VALUES (@username, @email, @displayName, @passwordHash, @isAdmin, @emailVerified)
+  >(`INSERT INTO users (username, email, display_name, password_hash, email_verified)
+     VALUES (@username, @email, @displayName, @passwordHash, @emailVerified)
      RETURNING *`);
   return stmt.get({
     username: opts.username,
     email: opts.email || null,
     displayName: opts.displayName || opts.username,
     passwordHash,
-    isAdmin: opts.isAdmin ? 1 : 0,
     emailVerified: 1,
   })!;
 }
 
 export { userToPublic };
+export { clearUserAuthCache };

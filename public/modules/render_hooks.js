@@ -71,6 +71,12 @@ export function renderAssetCard(type, idx, status, payload) {
 // Storyboard card (分镜组)
 // ---------------------------------------------------------------------------
 
+function _findStoryboardCard(gIdx) {
+  var selector = '.sb-sheet[data-group-idx="' + gIdx + '"]';
+  var grid = $("imageGrid");
+  return (grid && grid.querySelector(selector)) || document.querySelector(selector);
+}
+
 /**
  * 更新分镜组卡片状态。
  * @param {number} gIdx
@@ -84,14 +90,19 @@ export function renderAssetCard(type, idx, status, payload) {
  */
 export function renderStoryboardCard(gIdx, status, payload) {
   payload = payload || {};
-  var grid = $("imageGrid");
-  if (!grid) return { ok: false, needFullRerender: true };
-  var card = grid.querySelector('[data-group-idx="' + gIdx + '"]');
+  var card = _findStoryboardCard(gIdx);
   if (!card) return { ok: false };
 
   var loading = card.querySelector(".sb-sheet-loading");
   var error = card.querySelector(".sb-sheet-error");
   var loadingText = loading ? loading.querySelector("span") : null;
+  var firstFrame = card.querySelector('[data-frame="first"]');
+
+  if (firstFrame) {
+    if (loading) loading.hidden = true;
+    if (error) error.hidden = true;
+    return renderStoryboardFrameCard(gIdx, 'first', status, payload);
+  }
 
   if (status === "loading") {
     if (loading) loading.hidden = false;
@@ -161,9 +172,7 @@ export function renderStoryboardFrameCard(gIdx, kind, status, payload) {
     console.warn('[render_hooks] renderStoryboardFrameCard: invalid kind', kind);
     return { ok: false };
   }
-  var grid = $("imageGrid");
-  if (!grid) return { ok: false, needFullRerender: true };
-  var card = grid.querySelector('[data-group-idx="' + gIdx + '"]');
+  var card = _findStoryboardCard(gIdx);
   if (!card) return { ok: false };
 
   var frame = card.querySelector('[data-frame="' + kind + '"]');
@@ -224,10 +233,12 @@ function _updateFrameImageInPlace(frame, imgUrl) {
     img.className = placeholder.dataset.imgClass || 'w-full h-full object-cover';
     img.loading = 'lazy';
     img.decoding = 'async';
+    img.dataset.frameImg = '';
     img.dataset.action = 'lightbox';
     img.src = imgUrl;
     placeholder.replaceWith(img);
   } else {
+    img.dataset.frameImg = '';
     img.loading = img.loading || 'lazy';
     img.decoding = 'async';
     img.src = imgUrl;

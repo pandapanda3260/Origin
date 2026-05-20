@@ -13,6 +13,9 @@ HEALTH_URL="http://127.0.0.1:${PORT}/api/settings"
 AUTH_HEALTH_URL="http://127.0.0.1:${PORT}/api/projects"
 BUILD_ERROR_REGEX='Cannot find module.*(vendor-chunks|\.next)|ENOENT.*\.next|webpack\.cache.*ENOENT|MODULE_NOT_FOUND'
 MIN_RESTART_INTERVAL="${ORIGIN_WATCHDOG_MIN_RESTART_INTERVAL:-120}"
+ACTIVE_BATCH_GRACE_SECONDS="${ORIGIN_WATCHDOG_ACTIVE_BATCH_GRACE_SECONDS:-600}"
+ORIGIN_DATA_DIR="${ORIGIN_DATA_DIR:-$PROJECT_DIR/data}"
+WATCHDOG_DB="${ORIGIN_WATCHDOG_DB:-$ORIGIN_DATA_DIR/qd.sqlite}"
 LOG_BASELINE=0
 LAST_AUTO_RESTART=0
 
@@ -211,6 +214,36 @@ should_auto_restart() {
   (( now - LAST_AUTO_RESTART >= MIN_RESTART_INTERVAL ))
 }
 
+active_batch_count() {
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    printf '0'
+    return 0
+  fi
+  if [[ ! -f "$WATCHDOG_DB" ]]; then
+    printf '0'
+    return 0
+  fi
+
+  sqlite3 "$WATCHDOG_DB" "
+    SELECT COUNT(*)
+    FROM batches
+    WHERE status IN ('queued','running')
+      AND runner_heartbeat_at IS NOT NULL
+      AND runner_heartbeat_at <> ''
+      AND runner_heartbeat_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${ACTIVE_BATCH_GRACE_SECONDS} seconds');
+  " 2>/dev/null | tr -d '[:space:]'
+}
+
+defer_restart_for_active_batch() {
+  local count
+  count="$(active_batch_count)"
+  if [[ "$count" =~ ^[1-9][0-9]*$ ]]; then
+    log "origin dev restart deferred: $count active batch(es) still have fresh heartbeat; avoiding orphaned generation tasks"
+    return 0
+  fi
+  return 1
+}
+
 mark_auto_restart() {
   LAST_AUTO_RESTART=$(date +%s)
 }
@@ -289,6 +322,10 @@ main() {
       origin-running:*)
         health="$(health_status)"
         if [[ "$health" == bad:* || "$health" == down:* ]]; then
+          if defer_restart_for_active_batch; then
+            sleep "$INTERVAL"
+            continue
+          fi
           if should_auto_restart; then
             log "origin dev is unhealthy ($health); restarting with clean cache"
             start_origin_dev
@@ -301,6 +338,10 @@ main() {
           continue
         fi
         if log_has_build_errors; then
+          if defer_restart_for_active_batch; then
+            sleep "$INTERVAL"
+            continue
+          fi
           if should_auto_restart; then
             log "origin dev log shows Next build/chunk corruption; restarting with clean cache"
             start_origin_dev

@@ -3,11 +3,12 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { getCurrentUser } from '@/lib/auth';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const BGM_DIR = join(process.cwd(), 'data', 'bgm');
+const BGM_DIR = dataPath('bgm');
 const BGM_DIR_RESOLVED = resolve(BGM_DIR);
 
 function toWebStream(nodeStream: NodeJS.ReadableStream): ReadableStream<Uint8Array> {

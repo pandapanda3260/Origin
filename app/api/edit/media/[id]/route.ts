@@ -1,10 +1,10 @@
 import { NextRequest } from 'next/server';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getCurrentUser } from '@/lib/auth';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -25,7 +25,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (!row) return new Response('not found', { status: 404 });
   if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
 
-  const fullPath = join(process.cwd(), 'data', 'uploads', String(row.owner_id), row.filename);
+  const fullPath = dataPath('uploads', String(row.owner_id), row.filename);
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });
 
   const stat = statSync(fullPath);
@@ -92,7 +92,7 @@ export async function DELETE(req: NextRequest, { params }: { params: { id: strin
     )
     .get({ id: params.id, uid: user.id });
   if (row) {
-    const fullPath = join(process.cwd(), 'data', 'uploads', String(row.owner_id), row.filename);
+    const fullPath = dataPath('uploads', String(row.owner_id), row.filename);
     try { if (existsSync(fullPath)) unlinkSync(fullPath); } catch (_) {}
   }
   db.prepare('DELETE FROM uploads WHERE id = ? AND owner_id = ?').run(params.id, user.id);

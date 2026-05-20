@@ -19,11 +19,147 @@ let _bgmCatalogCache = null;
 
 // E-1.1：edit.js 以前裸引用 sleep / _getAuthToken / _diagnoseApiError，
 // 但既没 import 也没在 ctx 里拿 → ES module strict mode 下任何触发它们的按钮都会
-// ReferenceError 崩（导出成片 / AI 分析 / AI 剪辑 / 素材上传 / 删除素材 5 个）。
+  // ReferenceError 崩（下载导出 / 内部分析 / 内部剪辑 / 素材上传 / 删除素材 5 个）。
 // 照 storyboard.js / videoTasks.js 的模式从 ctx 里读，带本地 fallback 兜底。
   function _diagnoseApiError(msg) { return _ctx.diagnoseApiError ? _ctx.diagnoseApiError(msg) : msg; }
 function sleep(ms) { return _ctx.sleep ? _ctx.sleep(ms) : new Promise(function (r) { setTimeout(r, ms); }); }
 function _getAuthToken() { return _ctx.getAuthToken ? _ctx.getAuthToken() : ""; }
+let _onlineEditorConfigRequested = false;
+let _onlineEditorConfigRetryAt = 0;
+const ONLINE_EDITOR_CONFIG_RETRY_DELAY_MS = 30000;
+
+function _forEachOnlineEditorEntry(fn) {
+  ["editCardRefine", "editGuardOnlineEditorEntry"].forEach(function (id) {
+    var el = $(id);
+    if (el) fn(el);
+  });
+}
+
+function _removeOnlineEditorEntries() {
+  _forEachOnlineEditorEntry(function (el) {
+    try { el.remove(); } catch (_) { el.hidden = true; }
+  });
+}
+
+function _setOnlineEditorEntriesHidden(hidden) {
+  _forEachOnlineEditorEntry(function (el) { el.hidden = !!hidden; });
+}
+
+function _syncOnlineEditorEntries() {
+  var cfg = _ctx.getOnlineEditorConfig ? _ctx.getOnlineEditorConfig() : null;
+  if (!cfg) {
+    _setOnlineEditorEntriesHidden(true);
+    var now = Date.now();
+    if (!_onlineEditorConfigRequested && _ctx.loadOnlineEditorConfig && now >= _onlineEditorConfigRetryAt) {
+      _onlineEditorConfigRequested = true;
+      Promise.resolve(_ctx.loadOnlineEditorConfig())
+        .then(function () { _syncOnlineEditorEntries(); })
+        .catch(function (err) {
+          console.warn("[Edit] 在线精修配置读取失败:", err);
+          _onlineEditorConfigRequested = false;
+          _onlineEditorConfigRetryAt = Date.now() + ONLINE_EDITOR_CONFIG_RETRY_DELAY_MS;
+          _setOnlineEditorEntriesHidden(true);
+        });
+    }
+    return;
+  }
+  if (cfg.reason === "disabled") {
+    _removeOnlineEditorEntries();
+    return;
+  }
+  _setOnlineEditorEntriesHidden(false);
+}
+
+function _getEditData() {
+  return (project && project.editData) ? project.editData : {};
+}
+
+function _currentEditEdl() {
+  var editData = _getEditData();
+  return editData.edl || (_editState && _editState.edl) || null;
+}
+
+function _hasUsableEdl() {
+  var edl = _currentEditEdl();
+  return !!(edl && Array.isArray(edl.timeline) && edl.timeline.length > 0);
+}
+
+function _currentEditEdlVersion() {
+  var edl = _currentEditEdl();
+  var v = Number(edl && edl.version);
+  return Number.isFinite(v) ? v : 0;
+}
+
+function _isAutoComposeRunning() {
+  if (_editActionBusy && _editActionBusy.btnEditAutoCompose) return true;
+  var runs = _getEditData().composeRuns;
+  return Array.isArray(runs) && runs.some(function (run) {
+    return run && run.status === "running";
+  });
+}
+
+function _exportVersionMatchesCurrentEdl() {
+  var editData = _getEditData();
+  if (!editData.exportUrl) return false;
+  var exportedVersion = Number(editData.exportedEdlVersion);
+  if (!Number.isFinite(exportedVersion)) return false;
+  return exportedVersion === _currentEditEdlVersion();
+}
+
+function _getEditExportState() {
+  var editData = _getEditData();
+  if (_isAutoComposeRunning()) {
+    return { state: "composing", label: "成片中", sub: "Composing", disabled: true, hint: "" };
+  }
+  if (!_hasUsableEdl()) {
+    return { state: "no-edl", label: "下载导出", sub: "Export", disabled: true, hint: "" };
+  }
+  if (editData.exportTaskId && !editData.exportUrl) {
+    return { state: "exporting", label: "导出中", sub: "Exporting", disabled: true, hint: "" };
+  }
+  if (editData.exportUrl) {
+    if (_exportVersionMatchesCurrentEdl()) {
+      return { state: "download", label: "下载成片", sub: "Download", disabled: false, hint: "" };
+    }
+    return {
+      state: "stale",
+      label: "需重新成片",
+      sub: "Outdated",
+      disabled: true,
+      hint: "时间线已修改，请先一键成片",
+    };
+  }
+  return { state: "export", label: "下载导出", sub: "Export", disabled: false, hint: "" };
+}
+
+function _syncEditExportButtonState() {
+  var btn = $("btnEditExport");
+  if (!btn) return;
+  if (_editActionBusy && _editActionBusy.btnEditExport) return;
+  var state = _getEditExportState();
+  btn.disabled = !!state.disabled;
+  btn.dataset.exportState = state.state;
+  var labelEl = btn.querySelector(".edit-action-label-cn");
+  if (labelEl) labelEl.textContent = state.label;
+  var subEl = labelEl && labelEl.nextElementSibling;
+  if (subEl) subEl.textContent = state.sub;
+  btn.title = state.hint || "";
+  var hintEl = $("editExportHint");
+  if (hintEl) {
+    hintEl.hidden = !state.hint;
+    hintEl.textContent = state.hint || "";
+  }
+}
+
+function _pulseAutoComposeButton() {
+  var card = $("editCardAutoCompose");
+  if (!card) return;
+  card.animate([
+    { transform: "scale(1)", filter: "brightness(1)" },
+    { transform: "scale(1.03)", filter: "brightness(1.25)" },
+    { transform: "scale(1)", filter: "brightness(1)" },
+  ], { duration: 520, easing: "ease-out" });
+}
 
 // PATCH /api/edit/timeline 撞车兜底：只把剪辑相关字段从后端权威拉回内存，
 // 不整包 reload 项目（避免跳页）。_sendTimelineOp / 媒体删除失败时调用。
@@ -56,6 +192,19 @@ async function _resyncEditDataFromServer() {
     if (ed.segmentTags) {
       project.editData.segmentTags = ed.segmentTags; // arch-guard:allow-editdata 强同步回灌
       _editState.segmentTags = ed.segmentTags;
+    }
+    if (Object.prototype.hasOwnProperty.call(ed, "exportTaskId")) {
+      project.editData.exportTaskId = ed.exportTaskId; // arch-guard:allow-editdata 强同步回灌
+    }
+    if (Object.prototype.hasOwnProperty.call(ed, "exportUrl")) {
+      project.editData.exportUrl = ed.exportUrl; // arch-guard:allow-editdata 强同步回灌
+    }
+    if (Object.prototype.hasOwnProperty.call(ed, "exportedEdlVersion")) {
+      project.editData.exportedEdlVersion = ed.exportedEdlVersion; // arch-guard:allow-editdata 强同步回灌
+    }
+    if (Array.isArray(ed.composeRuns)) project.editData.composeRuns = ed.composeRuns; // arch-guard:allow-editdata 强同步回灌
+    if (typeof ed.lastAutoComposeEdlVersion !== "undefined") {
+      project.editData.lastAutoComposeEdlVersion = ed.lastAutoComposeEdlVersion; // arch-guard:allow-editdata 强同步回灌
     }
     if (_ctx.getActivePage && _ctx.getActivePage() === "edit") {
       try { refreshEditPage(); } catch (_e) {}
@@ -228,6 +377,7 @@ export function syncEditProject(p) {
         if (!project.editData) project.editData = {};
         project.editData.readiness = resp.readiness; // arch-guard:allow-editdata gate 全景镜像（只读）
       }
+      _syncEditExportButtonState();
       return resp;
     }).catch(function (err) {
       var m = (err && err.message) || "网络错误";
@@ -356,7 +506,7 @@ export function syncEditProject(p) {
     if (!readiness) {
       el.innerHTML =
         '暂时还没有任何片段在剪辑工作台。<br/>' +
-        '在「批量视频生成」页任意一条生成成功的视频卡片上，点「导入剪辑工作台」即可。';
+        '在「片段生成」页任意一条生成成功的视频卡片上，点「导入剪辑工作台」即可。';
       return;
     }
     var ready = readiness.readyCount | 0;
@@ -364,7 +514,7 @@ export function syncEditProject(p) {
     if (ready >= 1) {
       el.innerHTML =
         '你已经有 <span class="text-white/90 font-medium">' + ready + '</span> 条视频就绪。' +
-        '<br/>回「批量视频生成」页，在想用的视频卡片上点「导入剪辑工作台」即可开剪。';
+        '<br/>回「片段生成」页，在想用的视频卡片上点「导入剪辑工作台」即可开剪。';
     } else if (total >= 1) {
       el.innerHTML =
         '所有视频还在生成中。<br/>' +
@@ -373,7 +523,7 @@ export function syncEditProject(p) {
     } else {
       el.innerHTML =
         '还没有可用的视频片段。<br/>' +
-        '先去「批量视频生成」生成至少一条视频，之后在卡片上点「导入剪辑工作台」。';
+        '先去「片段生成」页生成至少一条视频，之后在卡片上点「导入剪辑工作台」。';
     }
   }
 
@@ -388,6 +538,7 @@ export function syncEditProject(p) {
     // 可用的片段"—— 它读的 `importedToEdit === true` 本身也是后端权威字段。
     var guard = $("editGuard");
     var workspace = $("editWorkspace");
+    _syncOnlineEditorEntries();
     var readiness = (project && project.editData && project.editData.readiness) || null;
     var canEnter = readiness ? readiness.canEnterEdit === true : false;
     var segments = _getEditSegments();
@@ -421,9 +572,10 @@ export function syncEditProject(p) {
       var btnEdl2 = $("btnEditGenEdl");
       if (btnEdl2) btnEdl2.disabled = false;
     }
-    var btnExp = $("btnEditExport");
-    if (btnExp) {
-      btnExp.disabled = !(segments.length > 0);
+    _syncEditExportButtonState();
+    var btnAutoCompose = $("btnEditAutoCompose");
+    if (btnAutoCompose) {
+      btnAutoCompose.disabled = !(segments.length > 0) || !!_editActionBusy.btnEditAutoCompose;
     }
 
     if (_editState.edl && _editState._undoStack.length === 0) {
@@ -575,7 +727,7 @@ export function syncEditProject(p) {
             ev.stopPropagation();
             showConfirm(
               "移除片段 " + (idx + 1),
-              "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在批量页重新导入）",
+              "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在片段页重新导入）",
               function () {
                 removeGroupFromTimeline(idx);
                 showToast("已移除片段 " + (idx + 1), "ok");
@@ -2423,7 +2575,7 @@ export function syncEditProject(p) {
 
     var timeline = (_editState.edl && _editState.edl.timeline) || [];
     if (!timeline.length) {
-      summary.textContent = "AI 剪辑后显示当前转场分布";
+      summary.textContent = "成片后显示当前转场分布";
       summary.className = "text-[10px] text-white/40 mb-2";
       btn.disabled = true;
       return;
@@ -2624,12 +2776,13 @@ export function syncEditProject(p) {
       _renderEditTags();
       _renderEditTimeline();
       _renderBgmSelector();
-      $("btnEditGenEdl").disabled = false;
-      showToast("AI 分析完成", "ok");
+      var genBtn = $("btnEditGenEdl");
+      if (genBtn) genBtn.disabled = false;
+      showToast("片段分析完成", "ok");
     } catch (e) {
-      showToast("AI 分析失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+      showToast("片段分析失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
     }
-    _editActionEnd("btnEditAnalyze", "editCardAnalyze", "AI 分析");
+    _editActionEnd("btnEditAnalyze", "editCardAnalyze", "片段分析");
   }
 
   async function _applyGeneratedEdlResponse(resp) {
@@ -2646,8 +2799,8 @@ export function syncEditProject(p) {
         project.editData.edl = resp.result; // arch-guard:allow-editdata 内存镜像（后端 SSE 已落盘）
       }
 
-      // 自动选 BGM：按 AI 分析的 suggestedBGMCategory 命中第一首匹配类别的 BGM —— 
-      // 用户点完 AI 剪辑就能在工作台预览听到 BGM、看到字幕，不用再去选。
+      // 自动选 BGM：按片段分析的 suggestedBGMCategory 命中第一首匹配类别的 BGM。
+      // 生成剪辑方案后，工作台可以直接预览 BGM 与字幕。
       if (!_editState.edl.bgm || !_editState.edl.bgm.trackId) {
         var bgmList = await _loadBgmLibrary(); // ensure cache populated
         var sugCat = _editState.segmentTags && _editState.segmentTags.suggestedBGMCategory;
@@ -2663,11 +2816,11 @@ export function syncEditProject(p) {
       _renderBgmSelector();
       _renderBgmClearButton();
       _syncBgmPlayback();
-      $("btnEditExport").disabled = false;
-      // 把 LLM 给的剪辑思路一起 toast 出来，方便用户看出"AI 怎么剪的"
+      _syncEditExportButtonState();
+      // 把 LLM 给的剪辑思路一起 toast 出来，方便用户理解成片结构。
       var narr = (resp.result && resp.result.narrative) || (resp && resp.narrative) || "";
       var dur = (resp.result && resp.result.duration) || 0;
-      var msg = "AI 剪辑方案已生成";
+      var msg = "剪辑方案已生成";
       if (dur > 0) msg += "（共 " + dur.toFixed(1) + "s）";
       if (narr) msg += "：" + narr;
       showToast(msg, "ok");
@@ -2698,7 +2851,7 @@ export function syncEditProject(p) {
     var dur = Number(draft.duration) || 0;
     var narr = String(draft.narrative || "").trim();
     var warnings = Array.isArray(resp && resp.qcWarnings) ? resp.qcWarnings : [];
-    var msg = "AI 已生成剪辑草稿，确认后才会写入当前时间线。";
+    var msg = "已生成剪辑草稿，确认后才会写入当前时间线。";
     if (dur > 0) msg += "\n预计时长：" + dur.toFixed(1) + "s";
     if (warnings.length) msg += "\n质检提醒：" + warnings.length + " 条";
     if (narr) msg += "\n剪辑思路：" + narr;
@@ -2738,14 +2891,14 @@ export function syncEditProject(p) {
     if (!threadId) throw new Error("EDL 草稿缺少 threadId，无法确认");
 
     var ok = await showConfirm(
-      "确认 AI 剪辑草稿",
+      "确认剪辑草稿",
       _edlDraftConfirmMessage(pending),
       "应用到时间线",
       "放弃草稿"
     );
     if (!ok) {
       await _resumeEditEdlGraph(threadId, "reject").catch(function () {});
-      showToast("已放弃 AI 剪辑草稿", "ok");
+      showToast("已放弃剪辑草稿", "ok");
       return null;
     }
 
@@ -2769,9 +2922,9 @@ export function syncEditProject(p) {
       );
       await _resumeEditEdlGraph(threadId, rerun ? "rerun" : "discard").catch(function () {});
       if (rerun) {
-        showToast("请重新点击 AI 剪辑生成当前时间线的新草稿", "error");
+        showToast("请重新生成当前时间线的剪辑草稿", "error");
       } else {
-        showToast("已放弃冲突的 AI 剪辑草稿", "ok");
+        showToast("已放弃冲突的剪辑草稿", "ok");
       }
       return null;
     }
@@ -2781,7 +2934,7 @@ export function syncEditProject(p) {
 
   async function _generateEditEdl() {
     if (!_editState.segmentTags) {
-      showToast("请先进行 AI 分析", "error");
+      showToast("请先运行一键成片生成片段分析", "error");
       return;
     }
     if (!_editActionStart("btnEditGenEdl", "editCardGenEdl", "#c084fc", "正在生成剪辑方案…", "Generating")) return;
@@ -2792,9 +2945,9 @@ export function syncEditProject(p) {
       var resp = useLegacy ? await _generateEditEdlLegacy() : await _generateEditEdlGraph();
       if (resp) await _applyGeneratedEdlResponse(resp);
     } catch (e) {
-      showToast("AI 剪辑失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+      showToast("剪辑方案生成失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
     }
-    _editActionEnd("btnEditGenEdl", "editCardGenEdl", "AI 剪辑");
+    _editActionEnd("btnEditGenEdl", "editCardGenEdl", "剪辑方案");
   }
 
   // E-2.2：正在订阅中的导出 SSE 句柄。刷新 / 重入时幂等重订。
@@ -2802,8 +2955,9 @@ export function syncEditProject(p) {
 
   var _exportDownloaded = false;
 
-  function _downloadExportFile(url) {
-    if (_exportDownloaded) return;
+  function _downloadExportFile(url, opts) {
+    var force = !!(opts && opts.force);
+    if (_exportDownloaded && !force) return;
     _exportDownloaded = true;
     var fname = "export_" + (project && project.id ? project.id : "video") + ".mp4";
     fetch(url, { headers: getAuthHeaders() })
@@ -2828,6 +2982,34 @@ export function syncEditProject(p) {
       });
   }
 
+  function _handleEditExportClick(ev) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    var state = _getEditExportState();
+    var editData = _getEditData();
+    if (state.state === "composing") {
+      showToast("一键成片正在运行，完成后即可下载", "warn");
+      return;
+    }
+    if (state.state === "download" && editData.exportUrl) {
+      _downloadExportFile(editData.exportUrl, { force: true });
+      return;
+    }
+    if (state.state === "stale") {
+      showToast("时间线已修改，请先一键成片", "warn");
+      _pulseAutoComposeButton();
+      return;
+    }
+    if (state.state === "export") {
+      _exportEditVideo();
+      return;
+    }
+    if (state.state === "exporting") {
+      showToast("导出正在进行中，请稍候", "warn");
+      return;
+    }
+    showToast("请先一键成片，再下载成片", "warn");
+  }
+
   function _attachExportStream(taskId) {
     _exportDownloaded = false;
     if (!taskId) return;
@@ -2842,25 +3024,32 @@ export function syncEditProject(p) {
       },
       onCompleted: function (data) {
         var url = (data && (data.downloadUrl || data.resultUrl)) || "";
+        var edlVersion = data && data.edlVersion;
         if (project && url) {
           if (!project.editData) project.editData = {};
           // E-3.3 前置：exportUrl/exportTaskId 的权威落盘将由后端 _run_export → task_store
           // 承担（这里不再 saveProject 写盘），只把内存里的展示字段更新，让 UI 立刻显示下载按钮。
           project.editData.exportUrl = url; // arch-guard:allow-editdata 内存镜像（后端 task_store 是权威源）
           project.editData.exportTaskId = taskId;
+          if (typeof edlVersion !== "undefined") project.editData.exportedEdlVersion = edlVersion; // arch-guard:allow-editdata
         }
         if (url) {
           _downloadExportFile(url);
           showToast("成片导出完成，正在下载！", "ok");
         }
-        _editActionEnd("btnEditExport", "editCardExport", "导出成片");
+        _editActionEnd("btnEditExport", "editCardExport", "下载导出");
         _exportStreamHandle = null;
+        _syncEditExportButtonState();
       },
       onFailed: function (data) {
         var msg = (data && (data.reason || data.errorMsg)) || "导出失败";
+        if (project && project.editData && project.editData.exportTaskId === taskId && !project.editData.exportUrl) {
+          project.editData.exportTaskId = "";
+        }
         showToast("导出失败: " + _diagnoseApiError(msg), "error");
-        _editActionEnd("btnEditExport", "editCardExport", "导出成片");
+        _editActionEnd("btnEditExport", "editCardExport", "下载导出");
         _exportStreamHandle = null;
+        _syncEditExportButtonState();
       },
       onClose: function () {
         // SSE 异常断开：兜底拉一次 HTTP 状态确认结果，避免按钮卡死。
@@ -2869,6 +3058,7 @@ export function syncEditProject(p) {
           var isCompleted = status.done || status.status === "completed";
           var isFailed = status.status === "failed" || status.status === "cancelled" || status.status === "timeout";
           var downloadUrl = status.downloadUrl || status.url || "";
+          var edlVersion = status.edlVersion;
           var errorMsg = status.error || status.errorMsg || "";
           var restarted = status.restarted || errorMsg === "orphaned by server restart";
           if (isCompleted || isFailed) {
@@ -2877,18 +3067,24 @@ export function syncEditProject(p) {
                 if (!project.editData) project.editData = {};
                 project.editData.exportUrl = downloadUrl; // arch-guard:allow-editdata HTTP 兜底内存镜像
                 project.editData.exportTaskId = taskId;
+                if (typeof edlVersion !== "undefined") project.editData.exportedEdlVersion = edlVersion; // arch-guard:allow-editdata
               }
               _downloadExportFile(downloadUrl);
               showToast("成片导出完成，正在下载！", "ok");
             } else if (restarted) {
-              showToast("服务刚刚重启了，这次导出中断了，点「导出成片」重试一次就好", "warn");
+              showToast("服务刚刚重启了，这次导出中断了，点「下载导出」重试一次就好", "warn");
             } else if (isFailed || errorMsg) {
               showToast("导出失败: " + _diagnoseApiError(errorMsg || "导出失败"), "error");
             }
-            _editActionEnd("btnEditExport", "editCardExport", "导出成片");
+            if (isFailed && project && project.editData && project.editData.exportTaskId === taskId && !project.editData.exportUrl) {
+              project.editData.exportTaskId = "";
+            }
+            _editActionEnd("btnEditExport", "editCardExport", "下载导出");
+            _syncEditExportButtonState();
           }
         }).catch(function () {});
         _exportStreamHandle = null;
+        _syncEditExportButtonState();
       },
     });
     _exportStreamHandle = handle;
@@ -2900,7 +3096,7 @@ export function syncEditProject(p) {
       showToast("时间线上没有素材", "error");
       return;
     }
-    if (!_editActionStart("btnEditExport", "editCardExport", "#34d399", "正在导出成片…", "Exporting")) return;
+    if (!_editActionStart("btnEditExport", "editCardExport", "#34d399", "正在下载导出…", "Exporting")) return;
 
     var exportEdl = _editState.edl ? _edlForPersistence(_editState.edl) : {
       timeline: segs.map(function (s) {
@@ -2918,6 +3114,7 @@ export function syncEditProject(p) {
       var resp = await apiPost("/api/edit/export", {
         projectId: (project && project.id) || "",
         edl: exportEdl,
+        edlVersion: _currentEditEdlVersion(),
         segments: segs.map(function (s) {
           return { groupIdx: s.groupIdx, videoUrl: _segPersistedVideoUrl(s), duration: s.duration };
         }),
@@ -2933,7 +3130,9 @@ export function syncEditProject(p) {
       if (project) {
         if (!project.editData) project.editData = {};
         project.editData.exportTaskId = taskId;
+        project.editData.exportUrl = "";
       }
+      _syncEditExportButtonState();
       showToast("导出任务已提交，正在处理…", "ok");
       _attachExportStream(taskId);
     } catch (e) {
@@ -2942,7 +3141,118 @@ export function syncEditProject(p) {
       } else {
         showToast("导出失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
       }
+      _editActionEnd("btnEditExport", "editCardExport", "下载导出");
+      _syncEditExportButtonState();
     }
+  }
+
+  function _setAutoComposeBlocker(evt) {
+    var box = $("editAutoComposeBlocker");
+    if (!box) return;
+    var show = !!evt;
+    box.hidden = !show;
+    if (!show) return;
+    var title = $("editAutoComposeBlockerTitle");
+    var text = $("editAutoComposeBlockerText");
+    if (title) title.textContent = "检测到时间线被手工修改";
+    if (text) text.textContent = (evt && (evt.message || evt.error)) || "请选择如何处理当前时间线，然后再继续一键成片。";
+  }
+
+  async function _resolveAutoComposeTimeline(action) {
+    if (!project || !project.id) return;
+    try {
+      await apiPost("/api/edit/auto-compose/recovery", {
+        projectId: project.id,
+        action: action,
+      });
+      _setAutoComposeBlocker(null);
+      await _resyncEditDataFromServer();
+      showToast(action === "accept-current" ? "已将当前时间线设为新基线" : "已回到上次自动成片", "ok");
+    } catch (e) {
+      showToast("处理失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+    }
+  }
+
+  async function _autoComposeEditVideo() {
+    if (!project || !project.id) {
+      showToast("请先打开项目", "error");
+      return;
+    }
+    if (!_editState.segments || !_editState.segments.length) {
+      showToast("当前没有可用片段", "error");
+      return;
+    }
+    if (!_editActionStart("btnEditAutoCompose", "editCardAutoCompose", "#fbbf24", "检查片段中…", "Composing")) return;
+    _setAutoComposeBlocker(null);
+
+    var capturedError = null;
+    var partialHintShown = false;
+    try {
+      var resp = await apiPostStream("/api/edit/auto-compose", {
+        projectId: project.id,
+        mode: "start",
+      }, null, function (evt) {
+        if (!evt) return;
+        if (evt.type === "phase") {
+          _editActionProgress("editCardAutoCompose", evt.message || "处理中");
+        } else if (evt.type === "preflight_result") {
+          if (evt.partial && !partialHintShown) {
+            partialHintShown = true;
+            var skipped = Number(evt.skipped || 0) + Number(evt.stale || 0);
+            if (skipped > 0) showToast("将跳过 " + skipped + " 个不可用片段继续成片", "warn");
+          }
+        } else if (evt.type === "export_started") {
+          if (project) {
+            if (!project.editData) project.editData = {};
+            project.editData.exportTaskId = evt.taskId;
+            project.editData.exportUrl = "";
+          }
+          _syncEditExportButtonState();
+        } else if (evt.type === "export_progress") {
+          _editActionProgress("editCardAutoCompose", "导出成片中 " + (evt.progress || 0) + "%");
+        } else if (evt.type === "step") {
+          _editActionProgress("editCardAutoCompose", evt.label || "处理中");
+        } else if (evt.type === "warning") {
+          var warnings = Array.isArray(evt.warnings) ? evt.warnings : [];
+          if (warnings.length) showToast("剪辑质检提醒 " + warnings.length + " 条，已记录到成片记录", "warn");
+        } else if (evt.type === "error") {
+          capturedError = evt;
+        }
+      });
+
+      await _resyncEditDataFromServer();
+      if (resp && resp.exportTaskId && project) {
+        if (!project.editData) project.editData = {};
+        project.editData.exportTaskId = resp.exportTaskId;
+      }
+      if (resp && resp.exportUrl && project) {
+        if (!project.editData) project.editData = {};
+        project.editData.exportUrl = resp.exportUrl;
+        if (typeof resp.exportedEdlVersion !== "undefined") {
+          project.editData.exportedEdlVersion = resp.exportedEdlVersion;
+        }
+        _downloadExportFile(resp.exportUrl);
+      }
+      _syncEditExportButtonState();
+      if (resp && resp.partial) {
+        showToast("一键成片完成（已跳过部分不可用片段）", "ok");
+      } else {
+        showToast("一键成片完成，正在下载！", "ok");
+      }
+    } catch (e) {
+      if (capturedError && capturedError.code === "MANUAL_TIMELINE_EDIT_DETECTED") {
+        _setAutoComposeBlocker(capturedError);
+      } else if (capturedError && capturedError.code === "ALREADY_RUNNING") {
+        showToast("已有一键成片任务正在运行", "warn");
+      } else if (capturedError && capturedError.code) {
+        showToast("一键成片失败: " + _diagnoseApiError(capturedError.message || capturedError.error || capturedError.code), "error");
+      } else {
+        showToast("一键成片失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+      }
+      _syncEditExportButtonState();
+    }
+    _editActionEnd("btnEditAutoCompose", "editCardAutoCompose", "一键成片");
+    _syncEditExportButtonState();
   }
 
   // E-2.2：刷新/切页回来时如果 editData.exportTaskId 还在 running，主动重订 SSE。
@@ -2954,7 +3264,7 @@ export function syncEditProject(p) {
     if (project.editData.exportUrl) return;
     if (_exportStreamHandle) return;
     try {
-      _editActionStart("btnEditExport", "editCardExport", "#34d399", "正在导出成片…", "Exporting");
+      _editActionStart("btnEditExport", "editCardExport", "#34d399", "正在下载导出…", "Exporting");
     } catch (_e) {}
     _attachExportStream(tid);
   }
@@ -3064,7 +3374,7 @@ export function syncEditProject(p) {
         if (info.type === "clip") {
           showConfirm(
             "移除片段 " + (info.idx + 1),
-            "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在批量页重新导入）",
+            "确定从剪辑工作台移除这个片段？\n（不会删除已生成的视频文件，可在片段页重新导入）",
             function () {
               removeGroupFromTimeline(info.idx);
               showToast("已移除片段 " + (info.idx + 1), "ok");
@@ -3230,6 +3540,19 @@ export function syncEditProject(p) {
   }
 
   function _initEditEvents() {
+    var btnAutoCompose = $("btnEditAutoCompose");
+    if (btnAutoCompose) btnAutoCompose.addEventListener("click", _autoComposeEditVideo);
+
+    var btnAcceptBaseline = $("btnEditAcceptTimelineBaseline");
+    if (btnAcceptBaseline) btnAcceptBaseline.addEventListener("click", function () {
+      _resolveAutoComposeTimeline("accept-current");
+    });
+
+    var btnRollbackTimeline = $("btnEditRollbackTimeline");
+    if (btnRollbackTimeline) btnRollbackTimeline.addEventListener("click", function () {
+      _resolveAutoComposeTimeline("rollback");
+    });
+
     var btnAnalyze = $("btnEditAnalyze");
     if (btnAnalyze) btnAnalyze.addEventListener("click", _analyzeEditSegments);
 
@@ -3237,7 +3560,7 @@ export function syncEditProject(p) {
     if (btnEdl) btnEdl.addEventListener("click", _generateEditEdl);
 
     var btnExport = $("btnEditExport");
-    if (btnExport) btnExport.addEventListener("click", _exportEditVideo);
+    if (btnExport) btnExport.addEventListener("click", _handleEditExportClick);
 
     /* Play / Pause */
     var playBtn = $("editPlayBtn");
@@ -3350,12 +3673,11 @@ export function syncEditProject(p) {
 
       timelineScroll.addEventListener("wheel", function (ev) {
         ev.preventDefault();
-        if (ev.shiftKey) {
-          timelineScroll.scrollLeft += ev.deltaY || ev.deltaX;
-        } else {
-          timelineScroll.scrollTop += ev.deltaY;
-          timelineScroll.scrollLeft += ev.deltaX;
-        }
+        var dx = ev.deltaX || 0;
+        var dy = ev.deltaY || 0;
+        var shouldPanHorizontally = ev.shiftKey || Math.abs(dx) > Math.abs(dy);
+        if (!shouldPanHorizontally) return;
+        timelineScroll.scrollLeft += ev.shiftKey ? (dy || dx) : dx;
       }, { passive: false });
 
       var rulerCanvas = $("editRuler");

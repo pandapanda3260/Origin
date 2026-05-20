@@ -16,7 +16,8 @@
 - 注册新账号：邮箱 + 用户名 + 密码（本地 OTP 验证码任意 6-8 位数字）
 - 真登录：账号密码错就登录失败，对了发 JWT token
 - 工作台访问：没 token 自动踢回登录页（真鉴权）
-- 默认账号：`pokerman` / `joker0606`（admin，首次启动自动创建）
+- 普通开发账号：`pokerman` / `joker0606`（legacy user，首次启动自动创建）
+- 后台开发账号：`origin-admin` / `origin-admin-dev-2026!`（独立 admin，首次启动自动创建）
 
 ### 真项目持久化
 - 每个项目有自己的 UUID，存进 `data/qd.sqlite`

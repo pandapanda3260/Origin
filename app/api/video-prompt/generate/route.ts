@@ -11,8 +11,13 @@ import {
   type VideoReferenceRole,
 } from '@/lib/video-reference-manifest';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
-import { validateCharacterConsistencyForGroup } from '@/lib/character-consistency-gate';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
+import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
+import { logVideoPromptTrace, summarizePromptForTrace } from '@/lib/video-prompt-observability';
+import { describeArtifactStatus } from '@/lib/sentinel';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -51,6 +56,12 @@ function normalizeRole(value: unknown): VideoReferenceRole | null {
   const role = compactText(value);
   if (role === 'first_frame' || role === 'scene' || role === 'character' || role === 'prop') return role;
   return null;
+}
+
+function sentinelBlockMessage(decision: ReturnType<typeof describeArtifactStatus>) {
+  return decision.consistency?.blockers?.map((b) => b.message).filter(Boolean).join('；') ||
+    decision.blockingReasons.join('、') ||
+    'artifact_usage_blocked';
 }
 
 function buildReferenceManifestFromRequest(body: any, groupIdx: number): ReferenceManifestItem[] {
@@ -172,25 +183,31 @@ export async function POST(req: NextRequest) {
 
   return sseResponse(async (writer) => {
     writer.step(`正在生成第 ${groupIdx + 1}/${totalGroups} 组提示词…`);
+    let projectForKnowledge: any = null;
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
+        projectForKnowledge = proj;
         const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
         const sb = storyboards[groupIdx] || {};
         shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
           mode: 'single-shot-strict',
           explicitShotIndices: shotIndices,
         });
-        const gate = validateCharacterConsistencyForGroup(proj as any, {
+        const sentinel = describeArtifactStatus(proj as any, {
+          projectId,
+          targetArtifact: 'video_prompt',
           groupIdx,
           shotIndices,
-          target: 'videoPrompt',
+          consumerOperation: 'video_prompt_generate',
         });
-        if (!gate.allowed) {
-          writer.error(`角色一致性未通过：${gate.blockers.map((b) => b.message).join('；')}`);
+        if (sentinel.usability === 'BLOCKED') {
+          writer.error(`视频提示词生成前检查未通过：${sentinelBlockMessage(sentinel)}`);
           return;
         }
         const now = new Date().toISOString();
+        const previousStatus = sb?.videoPromptStatus || null;
+        const previousRunId = sb?.videoPromptRunId || null;
         storyboards[groupIdx] = {
           ...markStoryboardVideoOutdated(storyboards[groupIdx] || {}, 'video_prompt_regeneration', now),
           idx: groupIdx,
@@ -207,21 +224,116 @@ export async function POST(req: NextRequest) {
           videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
         }
         maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-generating');
-        updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+        const markedProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+        const markedSb = Array.isArray((markedProject as any)?.storyboards)
+          ? (markedProject as any).storyboards[groupIdx] || {}
+          : {};
+        logVideoPromptTrace('single_prompt_status_marked', {
+          projectId,
+          groupIdx,
+          previousStatus,
+          previousRunId,
+          newRunId: promptRunId,
+          applied: markedSb.videoPromptStatus === 'generating' && markedSb.videoPromptRunId === promptRunId,
+          storedStatus: markedSb.videoPromptStatus || null,
+          storedRunId: markedSb.videoPromptRunId || null,
+        });
+      }
+    }
+
+    const originalMessages = buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups });
+    let finalMessages = originalMessages;
+    let knowledgeContext: KnowledgeContextForStage | null = null;
+    if (projectId && projectForKnowledge) {
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(projectForKnowledge as any),
+            id: projectId,
+          },
+          stage: 'video_prompt',
+          stageTarget: {
+            groupIdx,
+            totalGroups,
+            shotIndices,
+            shotCount: shots.length,
+            referenceImages: referenceManifest.map((item) => ({
+              imageNo: item.imageNo,
+              role: item.role,
+              assetId: item.assetId || null,
+              label: item.label || null,
+            })),
+            droppedReferenceCount: droppedReferences.length,
+          },
+          runId: promptRunId,
+        });
+        const injected = maybeInjectKnowledgePromptBlock({ messages: originalMessages, context });
+        finalMessages = injected.messages;
+        knowledgeContext = injected.context;
+      } catch (error) {
+        console.warn('[video-prompt/generate] knowledge context injection skipped:', error);
       }
     }
 
     let prompt = '';
+    // 单镜头路由历史上把 maxTokens 硬编码成 1800，且没传 traceName，导致它绕过了
+    // lib/llm.ts 里 'video-prompts' 这条 task policy（baseMaxTokens=8000、retryMaxTokens=12000）。
+    // 中文长 prompt（~1000 字 + 推理 token）跑这个流式接口非常容易在中途撞 max_output_tokens。
+    // 这里把 traceName 加上让 policy 接管 maxTokens，并在 output_incomplete 错误时做一次更大
+    // 预算的兜底重试——和 chatComplete 内置的 output_incomplete 重试（lib/llm.ts:150-171）对齐。
+    const MAX_VIDEO_PROMPT_OUTPUT_INCOMPLETE_RETRIES = 1;
+    let streamAttempt = 1;
     try {
-      await chatStream(
-        user,
-        buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups }),
-        { temperature: 0.7, maxTokens: 1800, modelRole: 'structured' },
-        (delta) => {
-          prompt += delta;
-          writer.chunk(delta);
-        },
-      );
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          prompt = '';
+          await chatStream(
+            user,
+            finalMessages,
+            {
+              temperature: 0.7,
+              modelRole: 'structured',
+              traceName: 'video-prompts',
+              traceAttempt: streamAttempt,
+            },
+            (delta) => {
+              prompt += delta;
+              writer.chunk(delta);
+            },
+          );
+          break;
+        } catch (streamErr: any) {
+          const incompleteReason = String(streamErr?.incompleteReason || '').toLowerCase();
+          const isOutputIncomplete =
+            String(streamErr?.llmStatus || '').toLowerCase() === 'incomplete'
+            && (
+              incompleteReason.includes('max_output_tokens')
+              || incompleteReason.includes('max_tokens')
+              || incompleteReason === 'length'
+            );
+          if (!isOutputIncomplete || streamAttempt > MAX_VIDEO_PROMPT_OUTPUT_INCOMPLETE_RETRIES) {
+            throw streamErr;
+          }
+          console.warn(
+            `[video-prompt/generate] project=${projectId || '?'} group=${groupIdx} ` +
+              `attempt=${streamAttempt} output_incomplete (${streamErr.incompleteReason}); ` +
+              'retrying once with higher token budget',
+          );
+          logVideoPromptTrace('single_prompt_output_incomplete_retry', {
+            projectId: projectId || null,
+            groupIdx,
+            runId: promptRunId,
+            attempt: streamAttempt,
+            incompleteReason: String(streamErr.incompleteReason || 'unknown'),
+          }, 'warn');
+          // step 是 <step>…</step> 包装的 UI 提示，前端 consumeStreamStepTags 会把它当
+          // loading 文案显示，不会污染 prompt 正文。
+          writer.step('上次输出未完成，正在以更大预算重试…');
+          streamAttempt++;
+        }
+      }
     } catch (e: any) {
       if (projectId) {
         const proj = getProjectByIdForUser(projectId, user.id);
@@ -246,7 +358,19 @@ export async function POST(req: NextRequest) {
               videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
             }
             maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-failed');
-            updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+            const failedProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+            const failedSb = Array.isArray((failedProject as any)?.storyboards)
+              ? (failedProject as any).storyboards[groupIdx] || {}
+              : {};
+            logVideoPromptTrace('single_prompt_failure_marked', {
+              projectId,
+              groupIdx,
+              runId: promptRunId,
+              applied: failedSb.videoPromptStatus === 'failed' && failedSb.videoPromptRunId === promptRunId,
+              storedStatus: failedSb.videoPromptStatus || null,
+              storedRunId: failedSb.videoPromptRunId || null,
+              error: (e?.message || String(e)).slice(0, 500),
+            }, 'warn');
           }
         }
       }
@@ -264,11 +388,22 @@ export async function POST(req: NextRequest) {
           mode: 'single-shot-strict',
           explicitShotIndices: shotIndices,
         });
-        const gate = validateCharacterConsistencyForGroup(proj as any, {
+        const sentinel = describeArtifactStatus(proj as any, {
+          projectId,
+          targetArtifact: 'video_prompt',
           groupIdx,
           shotIndices,
-          target: 'videoPrompt',
+          consumerOperation: 'video_prompt_generate_writeback',
         });
+        if (sentinel.usability === 'BLOCKED') {
+          writer.error(`视频提示词生成结果已过期：${sentinelBlockMessage(sentinel)}`);
+          return;
+        }
+        const gate = sentinel.consistency;
+        if (!gate) {
+          writer.error('视频提示词生成结果无法写回：角色一致性检查结果缺失');
+          return;
+        }
         const patch: any = {
           idx: groupIdx,
           shotIdx: groupIdx + 1,
@@ -294,6 +429,14 @@ export async function POST(req: NextRequest) {
         };
         if (storyboards[groupIdx]) {
           if (storyboards[groupIdx].videoPromptRunId && storyboards[groupIdx].videoPromptRunId !== promptRunId) {
+            logVideoPromptTrace('single_prompt_writeback_rejected', {
+              projectId,
+              groupIdx,
+              incomingRunId: promptRunId,
+              currentRunId: storyboards[groupIdx].videoPromptRunId,
+              currentStatus: storyboards[groupIdx].videoPromptStatus || null,
+              reason: 'run_mismatch',
+            }, 'warn');
             writer.error('视频提示词生成结果已过期：该片段已有更新的生成任务');
             return;
           }
@@ -310,7 +453,32 @@ export async function POST(req: NextRequest) {
           videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
         }
         maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-ready');
-        updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+        const readyProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
+        const readySb = Array.isArray((readyProject as any)?.storyboards)
+          ? (readyProject as any).storyboards[groupIdx] || {}
+          : {};
+        const readyApplied =
+          readySb.videoPromptStatus === 'ready' &&
+          readySb.videoPromptRunId === promptRunId &&
+          String(readySb.videoPrompt || '').trim() === prompt;
+        logVideoPromptTrace('single_prompt_writeback_result', {
+          projectId,
+          groupIdx,
+          incomingRunId: promptRunId,
+          applied: readyApplied,
+          storedStatus: readySb.videoPromptStatus || null,
+          storedRunId: readySb.videoPromptRunId || null,
+          promptSummary: summarizePromptForTrace(prompt),
+        }, readyApplied ? 'info' : 'warn');
+        if (!readyApplied) {
+          writer.error('视频提示词生成完成，但结果没有成功写回项目，请重试。');
+          return;
+        }
+        try {
+          if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext, runId: promptRunId });
+        } catch (error) {
+          console.warn('[video-prompt/generate] knowledge context audit skipped:', error);
+        }
       }
     }
 

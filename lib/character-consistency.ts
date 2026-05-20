@@ -50,7 +50,7 @@ export type CharacterVoiceLock = {
   voiceSignatureHash: string;
 };
 
-export type CharacterReferenceStatus = 'missing' | 'ready' | 'degraded';
+export type CharacterReferenceStatus = 'missing' | 'ready' | 'degraded' | 'failed';
 
 export type CharacterReferenceLock = {
   sheetUrl?: string;
@@ -426,6 +426,7 @@ function normalizeVoiceLock(input: Partial<Omit<CharacterVoiceLock, 'voiceSignat
 
 function referenceQualityBucket(lock: CharacterReferenceLock): CharacterReferenceStatus {
   if (lock.referenceStatus === 'missing') return 'missing';
+  if (lock.referenceStatus === 'failed') return 'failed';
   if (typeof lock.qualityScore === 'number' && lock.qualityScore < READY_QUALITY_THRESHOLD) return 'degraded';
   return lock.referenceStatus === 'degraded' ? 'degraded' : 'ready';
 }
@@ -442,7 +443,7 @@ function normalizeReferenceLock(input: Partial<CharacterReferenceLock> | undefin
     qualityScore: Number.isFinite(Number(input?.qualityScore)) ? Number(input?.qualityScore) : fallback.qualityScore,
   };
   const hasAnyRef = !!(next.sheetUrl || next.headshotUrl || next.frontUrl || next.sideUrl || next.backUrl || next.sourceImageId);
-  if (!hasAnyRef) next.referenceStatus = 'missing';
+  if (!hasAnyRef) next.referenceStatus = next.referenceStatus === 'failed' ? 'failed' : 'missing';
   else next.referenceStatus = referenceQualityBucket(next);
   return next;
 }

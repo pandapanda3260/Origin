@@ -10,6 +10,12 @@ import {
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { sanitizePromptObject } from '@/lib/content-sanitize';
 import { mutateCharacterLock } from '@/lib/character-consistency';
+import { hashNormalizedScript } from '@/lib/script-style-state';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
+import type { ChatMessage } from '@/lib/llm';
+import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -32,6 +38,8 @@ export async function POST(req: NextRequest) {
   const rawStyleBible = (proj as any)?.styleBible || bodyStyleBible || null;
   const styleBible = sanitizePromptObject(rawStyleBible);
   const styleBibleSource = (proj as any)?.styleBible ? 'project' : (bodyStyleBible ? 'request' : 'none');
+  const rawWorldTemplate = (proj as any)?.worldTemplateSnapshot || body.worldTemplateSnapshot || null;
+  const worldTemplate = rawWorldTemplate ? sanitizePromptObject(rawWorldTemplate) : null;
 
   return sseResponse(async (writer) => {
     if (!finalScript) {
@@ -40,18 +48,51 @@ export async function POST(req: NextRequest) {
     }
     console.info(
       `[assets/extract] start projectId=${projectId || 'none'} scriptChars=${finalScript.length} ` +
-      `styleBible=${styleBibleSource}`,
+      `styleBible=${styleBibleSource} worldTemplate=${worldTemplate ? 'yes' : 'none'}`,
     );
 
     writer.step('正在分析剧本结构…');
     writer.chunk('开始抽取角色 / 场景 / 道具…\n');
+    const scriptHash = hashNormalizedScript(finalScript);
+    let knowledgeContext: KnowledgeContextForStage | null = null;
+    const applyKnowledge = (messages: ChatMessage[]) => {
+      if (!knowledgeContext) return messages;
+      const injected = maybeInjectKnowledgePromptBlock({ messages, context: knowledgeContext });
+      knowledgeContext = injected.context;
+      return injected.messages;
+    };
+    if (projectId && proj) {
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(proj as any),
+            id: projectId,
+            styleBible,
+            worldTemplateSnapshot: worldTemplate,
+          },
+          stage: 'assets_extract',
+          stageTarget: {
+            scriptHash,
+            styleBibleSource,
+            hasWorldTemplate: !!worldTemplate,
+          },
+        });
+        knowledgeContext = maybeInjectKnowledgePromptBlock({
+          messages: [{ role: 'user', content: 'asset extraction context probe' }],
+          context,
+        }).context;
+      } catch (error) {
+        console.warn('[assets/extract] knowledge context injection skipped:', error);
+      }
+    }
 
     let parsed: any = { characters: [], environments: [], props: [] };
     try {
       writer.step('正在识别角色…');
       const characters = await chatCompleteJsonWithRetry(
         user,
-        buildAssetCharactersExtractMessages(finalScript, styleBible),
+        applyKnowledge(buildAssetCharactersExtractMessages(finalScript, styleBible, worldTemplate)),
         { temperature: 0.35, maxTokens: 10000, modelRole: 'structured' },
         (raw) => {
           const json = parseJsonLoose(raw);
@@ -69,7 +110,7 @@ export async function POST(req: NextRequest) {
       const [environments, props] = await Promise.all([
         chatCompleteJsonWithRetry(
           user,
-          buildAssetScenesExtractMessages(finalScript, styleBible, characterRefs),
+          applyKnowledge(buildAssetScenesExtractMessages(finalScript, styleBible, characterRefs, worldTemplate)),
           { temperature: 0.35, maxTokens: 5000, modelRole: 'structured' },
           (raw) => {
             const json = parseJsonLoose(raw);
@@ -79,7 +120,7 @@ export async function POST(req: NextRequest) {
         ),
         chatCompleteJsonWithRetry(
           user,
-          buildAssetPropsExtractMessages(finalScript, styleBible, characterRefs),
+          applyKnowledge(buildAssetPropsExtractMessages(finalScript, styleBible, characterRefs, worldTemplate)),
           { temperature: 0.35, maxTokens: 2500, modelRole: 'structured' },
           (raw) => {
             const json = parseJsonLoose(raw);
@@ -215,6 +256,8 @@ export async function POST(req: NextRequest) {
         return { ...character, characterId: result.character.characterId };
       });
       assets.characters = parsed.characters;
+      const staleFlags = { ...(((proj as any)._staleFlags || {}) as Record<string, unknown>) };
+      delete staleFlags.assets;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
       updateProjectForUser(projectId, user.id, {
         characters: parsed.characters,
@@ -222,9 +265,15 @@ export async function POST(req: NextRequest) {
         props: parsed.props,
         assets,
         consistency: consistencyProject.consistency,
+        _staleFlags: staleFlags,
         assetsApproved: false,
         currentStep: 2,
       });
+      try {
+        if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext });
+      } catch (error) {
+        console.warn('[assets/extract] knowledge context audit skipped:', error);
+      }
     }
 
     // 前端读 resp.assets.{characters, scenes, props}，所以 done payload 必须有 assets 字段

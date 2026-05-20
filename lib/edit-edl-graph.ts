@@ -12,17 +12,22 @@ import {
 import { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 import type { UserRow } from './db';
 import { getDb } from './db';
-import { chatComplete, chatStream, parseJsonLoose } from './llm';
+import { chatComplete, chatStream, parseJsonLoose, type ChatMessage } from './llm';
+import { dataPath } from './runtime-paths';
 import {
   SP_GENERATE_EDL,
   buildEdlResult,
   collectEdlGenerationContext,
   normalizeGeneratedEdl,
 } from './edit-edl';
+import { buildKnowledgeContextForStage } from './knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from './knowledge/context-db';
+import { maybeInjectKnowledgePromptBlock } from './knowledge/inject-messages';
+import type { KnowledgeContextForStage } from './knowledge/types';
 
 const GRAPH_VERSION = 1;
 const MAX_REPAIR_ATTEMPTS = 2;
-const CHECKPOINT_FILE = path.join(process.cwd(), 'data', 'langgraph-checkpoints.sqlite');
+const CHECKPOINT_FILE = dataPath('langgraph-checkpoints.sqlite');
 const PENDING_STATUSES = new Set(['needs_approval', 'version_conflict']);
 const TERMINAL_STATUSES = new Set([
   'committed',
@@ -49,6 +54,9 @@ type StartArgs = {
   projectId: string;
   targetDurationSec: number;
   segments?: any[];
+  strictSegments?: boolean;
+  auditRunId?: string | null;
+  auditSource?: string | null;
   emit?: GraphEmit;
 };
 
@@ -66,6 +74,9 @@ const EdlGraphState = Annotation.Root({
   userId: Annotation<number>(),
   targetDurationSec: Annotation<number>(),
   segments: Annotation<any[]>(),
+  strictSegments: Annotation<boolean>(),
+  auditRunId: Annotation<string>(),
+  auditSource: Annotation<string>(),
   baseEditVersion: Annotation<number>(),
   inputHash: Annotation<string>(),
   clipIds: Annotation<string[]>(),
@@ -256,8 +267,12 @@ function collectForState(state: EdlGraphStateValue) {
     projectId: state.projectId,
     userId: state.userId,
     project: projectData,
-    body: { segments: Array.isArray(state.segments) ? state.segments : [] },
+    body: {
+      segments: Array.isArray(state.segments) ? state.segments : [],
+      strictSegments: state.strictSegments === true,
+    },
     targetDurationSec: Number(state.targetDurationSec) || 30,
+    strictSegments: state.strictSegments === true,
   });
   if (!collected.ok) return collected;
   return { ok: true as const, projectData, collected };
@@ -299,6 +314,9 @@ function commitDraftAtomically(state: EdlGraphStateValue) {
     const serverVersion = currentVersion + 1;
     editData.edl = result;
     editData.version = serverVersion;
+    if (state.strictSegments === true) {
+      editData.lastAutoComposeEdlVersion = Number(result.version) || 0;
+    }
     editData.edlGraph = {
       ...(editData.edlGraph || {}),
       runId: state.runId,
@@ -369,16 +387,42 @@ function createGraph(user: UserRow, emit?: GraphEmit) {
       }
 
       let raw = '';
+      let knowledgeContext: KnowledgeContextForStage | null = null;
       try {
         emitStep(emit, '正在生成剪辑方案…');
         const clipCount = loaded.collected.ctx.clips.length;
         const edlMaxTokens = Math.min(12_000, Math.max(4_000, clipCount * 800));
+        let messages: ChatMessage[] = [
+          { role: 'system', content: SP_GENERATE_EDL },
+          { role: 'user', content: JSON.stringify(loaded.collected.ctx) },
+        ];
+        try {
+          const context = buildKnowledgeContextForStage({
+            ownerId: state.userId,
+            project: {
+              ...(loaded.projectData || {}),
+              id: state.projectId,
+            },
+            stage: 'edit_edl',
+            stageTarget: {
+              source: state.auditSource || (state.strictSegments ? 'edl_graph_strict' : 'edl_graph'),
+              targetDurationSec: Number(state.targetDurationSec) || 30,
+              inputHash: loaded.collected.inputHash,
+              clipIds: loaded.collected.clipIds,
+              clipCount,
+              strictSegments: state.strictSegments === true,
+            },
+            runId: state.auditRunId || state.runId,
+          });
+          const injected = maybeInjectKnowledgePromptBlock({ messages, context });
+          messages = injected.messages;
+          knowledgeContext = injected.context;
+        } catch (error) {
+          console.warn('[edl-graph] knowledge context injection skipped:', error);
+        }
         await chatStream(
           user,
-          [
-            { role: 'system', content: SP_GENERATE_EDL },
-            { role: 'user', content: JSON.stringify(loaded.collected.ctx) },
-          ],
+          messages,
           {
             temperature: 0.5,
             responseFormat: 'json_object',
@@ -392,6 +436,14 @@ function createGraph(user: UserRow, emit?: GraphEmit) {
             emit?.({ type: 'chunk', content: delta });
           },
         );
+        if (knowledgeContext) {
+          recordKnowledgeContextBestEffort({
+            ownerId: state.userId,
+            projectId: state.projectId,
+            context: knowledgeContext,
+            runId: state.auditRunId || state.runId,
+          });
+        }
         return { rawJson: raw, status: 'raw_ready', updatedAt: nowIso() };
       } catch (e: any) {
         return { status: 'failed_generation', error: `EDL 生成失败：${e?.message || String(e)}`, updatedAt: nowIso() };
@@ -673,6 +725,9 @@ export async function startEdlGraphRun(args: StartArgs) {
     userId: args.user.id,
     targetDurationSec: args.targetDurationSec,
     segments: Array.isArray(args.segments) ? args.segments : [],
+    strictSegments: args.strictSegments === true,
+    auditRunId: args.auditRunId || runId,
+    auditSource: args.auditSource || '',
     repairAttempts: 0,
     status: 'started',
     createdAt: nowIso(),

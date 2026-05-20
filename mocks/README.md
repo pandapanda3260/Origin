@@ -6,7 +6,7 @@
 
 | 文件 | 包含什么 |
 | --- | --- |
-| `user.ts` | 当前登录用户（默认 `pokerman`，admin 权限） |
+| `user.ts` | 当前登录用户（默认 `pokerman`） |
 | `billing.ts` | 套餐 / 积分 / 订阅状态（默认 Free + 58 积分） |
 | `projects.ts` | 项目列表（内存存储，重启清空），含创建/更新/删除函数 |
 | `config.ts` | 客户端配置 + 维护横幅 + 管理面板 key 池 |

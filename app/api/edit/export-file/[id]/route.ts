@@ -1,9 +1,9 @@
 import { NextRequest } from 'next/server';
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,7 +27,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (!row || !row.filename || row.status !== 'completed') return new Response('not ready', { status: 404 });
   if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
 
-  const fullPath = join(process.cwd(), 'data', 'exports', String(row.owner_id), row.filename);
+  const fullPath = dataPath('exports', String(row.owner_id), row.filename);
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });
 
   const stat = statSync(fullPath);

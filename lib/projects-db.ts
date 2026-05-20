@@ -18,12 +18,39 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, unlinkSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { getDb, type ProjectRow } from './db';
-import { buildFrameWorkflowNormalizationPatch, maybeAssertStoryboardsAlignedWithShots } from './frame-workflow-state';
+import {
+  buildFrameWorkflowNormalizationPatch,
+  markTailFrameStaleForFirstFrameChange,
+  maybeAssertStoryboardsAlignedWithShots,
+} from './frame-workflow-state';
+import { buildShotPlanDependencyPatch } from './project-dependency-state';
+import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
+import { maybeMarkStyleBibleStale } from './script-style-state';
+import { dataPath } from './runtime-paths';
+
+const STYLE_ASPECT_DEFAULT_VERSION = '2026-05-14-9x16';
 
 const EMPTY_DATA = {
   oneSentence: '',
   scriptDraft: '',
+  scriptAnalysis: null as any,
   styleBible: { vision: '', narrative: '', camera: '', mood: '', promptHabits: '' },
+  styleOptions: { aspectRatio: '9:16', aspectRatioDefaultVersion: STYLE_ASPECT_DEFAULT_VERSION },
+  styleBibleStatus: '',
+  styleBibleError: '',
+  styleBibleGeneratedAt: null as any,
+  styleBibleSource: null as any,
+  styleBibleRunId: null as any,
+  styleBibleStartedAt: null as any,
+  styleBibleGenerationContext: null as any,
+  styleBibleSourceHash: null as any,
+  styleBibleStaleReason: null as any,
+  styleBibleStaleSince: null as any,
+  styleBibleManuallyEditedAt: null as any,
+  selectedWorldTemplateId: null as any,
+  worldTemplateSnapshot: null as any,
+  selectedStyleTemplateId: null as any,
+  styleTemplateSnapshot: null as any,
   characters: [] as any[],
   environments: [] as any[],
   props: [] as any[],
@@ -34,6 +61,19 @@ const EMPTY_DATA = {
   episodes: [] as any[],
   preferences: null as any,
 };
+
+function normalizeProjectStyleDefaults(data: any) {
+  const next = { ...(data || {}) };
+  const styleOptions = { ...(next.styleOptions || {}) };
+  if (!styleOptions.aspectRatioDefaultVersion) {
+    if (!styleOptions.aspectRatio || styleOptions.aspectRatio === '16:9') {
+      styleOptions.aspectRatio = '9:16';
+    }
+    styleOptions.aspectRatioDefaultVersion = STYLE_ASPECT_DEFAULT_VERSION;
+  }
+  next.styleOptions = styleOptions;
+  return next;
+}
 
 const PROTECTED_ASSET_URL_KEYS = new Set([
   'imageUrl',
@@ -66,9 +106,45 @@ function preserveExistingAssetUrls(existing: any, next: any) {
   }
 }
 
+const STYLE_BIBLE_LIFECYCLE_KEYS = [
+  'styleBibleStatus',
+  'styleBibleError',
+  'styleBibleErrorCode',
+  'styleBibleRunId',
+  'styleBibleStartedAt',
+  'styleBibleStage',
+  'styleBibleProgress',
+  'styleBibleNextRetryAt',
+  'styleBibleHeartbeatAt',
+] as const;
+
+const STYLE_BIBLE_CONTENT_KEYS = [
+  'styleBible',
+  'styleBibleGeneratedAt',
+  'styleBibleSource',
+  'styleBibleSourceHash',
+  'styleBibleGenerationContext',
+  'styleBibleStaleReason',
+  'styleBibleStaleSince',
+  'styleBibleManuallyEditedAt',
+] as const;
+
+function preserveStyleBibleFields(existing: any, next: any, patch: any) {
+  if (patch?.allowStyleBibleRunOverwrite === true) return;
+  for (const key of [...STYLE_BIBLE_LIFECYCLE_KEYS, ...STYLE_BIBLE_CONTENT_KEYS]) {
+    if (Object.prototype.hasOwnProperty.call(patch || {}, key)) {
+      next[key] = existing?.[key] ?? null;
+    }
+  }
+}
+
 function rowToPublic(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
+  const normalized = normalizeProjectStyleDefaults({
+    ...EMPTY_DATA,
+    ...data,
+  });
   return {
     id: r.id,
     ownerId: r.owner_id,
@@ -80,8 +156,7 @@ function rowToPublic(r: ProjectRow) {
     status: r.status,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
-    ...EMPTY_DATA,
-    ...data,
+    ...normalized,
   };
 }
 
@@ -95,6 +170,20 @@ function rowToSummary(r: ProjectRow) {
     status: r.status,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+  };
+}
+
+function buildExportedEdlVersionBackfillPatch(project: any) {
+  const editData = project?.editData;
+  if (!editData || !editData.exportUrl) return null;
+  if (typeof editData.exportedEdlVersion !== 'undefined') return null;
+  const edlVersion = Number(editData?.edl?.version);
+  if (!Number.isFinite(edlVersion)) return null;
+  return {
+    editData: {
+      ...editData,
+      exportedEdlVersion: edlVersion,
+    },
   };
 }
 
@@ -118,8 +207,15 @@ export function getProjectByIdForUser(id: string, userId: number) {
   if (!row) return null;
   const project = rowToPublic(row);
   const normalizationPatch = buildFrameWorkflowNormalizationPatch(project, userId);
-  if (normalizationPatch) {
-    const applied = applyPatchToRow(row, normalizationPatch);
+  const backfillPatch = buildExportedEdlVersionBackfillPatch({
+    ...project,
+    ...(normalizationPatch || {}),
+  });
+  const combinedPatch = normalizationPatch || backfillPatch
+    ? { ...(normalizationPatch || {}), ...(backfillPatch || {}) }
+    : null;
+  if (combinedPatch) {
+    const applied = applyPatchToRow(row, combinedPatch);
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
@@ -128,7 +224,7 @@ export function getProjectByIdForUser(id: string, userId: number) {
     ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
     return {
       ...project,
-      ...normalizationPatch,
+      ...combinedPatch,
     };
   }
   return project;
@@ -172,10 +268,18 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   let data: any = {};
   try { data = JSON.parse(existing.data_json || '{}'); } catch { data = {}; }
   const newData = { ...data, ...(patch || {}) };
-  const shouldPreserveAssetUrls = !patch?.allowEmptyAssetUrls;
-  if (shouldPreserveAssetUrls) preserveExistingAssetUrls(data, newData);
+	  const shouldPreserveAssetUrls = !patch?.allowEmptyAssetUrls;
+	  if (shouldPreserveAssetUrls) preserveExistingAssetUrls(data, newData);
+  preserveStyleBibleFields(data, newData, patch || {});
+	  if (Object.prototype.hasOwnProperty.call(patch || {}, 'script')) {
+	    const staleProbe = { ...data };
+	    if (maybeMarkStyleBibleStale(staleProbe, newData.script, 'script_changed')) {
+	      newData.styleBibleStaleReason = staleProbe.styleBibleStaleReason;
+	      newData.styleBibleStaleSince = staleProbe.styleBibleStaleSince;
+	    }
+	  }
 
-  const title = patch.name ?? patch.title ?? existing.title;
+	  const title = patch.name ?? patch.title ?? existing.title;
   const description = patch.description ?? existing.description;
   const coverUrl = shouldPreserveAssetUrls
     && Object.prototype.hasOwnProperty.call(patch || {}, 'coverUrl')
@@ -195,7 +299,11 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   delete newData.updatedAt;
   delete newData.ownerId;
   delete newData.scriptLibrary;
+  if (newData.scriptAnalysis && newData.scriptAnalysis.status === 'degraded') {
+    delete newData.scriptAnalysis;
+  }
   delete newData.allowEmptyAssetUrls;
+  delete newData.allowStyleBibleRunOverwrite;
 
   return {
     title,
@@ -204,6 +312,51 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
     status,
     dataJson: JSON.stringify(newData),
   };
+}
+
+function applyPutFirstFrameChangeGuard(current: any, patch: any): any {
+  if (!Array.isArray(patch?.storyboards)) return patch;
+  const currentStoryboards = Array.isArray(current?.storyboards) ? current.storyboards : [];
+  const nextStoryboards = [...patch.storyboards];
+  const nextVideoTasks = Array.isArray(patch?.videoTasks)
+    ? [...patch.videoTasks]
+    : (Array.isArray(current?.videoTasks) ? [...current.videoTasks] : []);
+  let storyboardsChanged = false;
+  let videoTasksChanged = false;
+
+  for (let groupIdx = 0; groupIdx < nextStoryboards.length; groupIdx += 1) {
+    const oldFirstFrameUrl = resolveStoryboardFirstFrameUrl(currentStoryboards[groupIdx] || {});
+    const newFirstFrameUrl = resolveStoryboardFirstFrameUrl(nextStoryboards[groupIdx] || {});
+    if (oldFirstFrameUrl === newFirstFrameUrl) continue;
+
+    const nextStoryboard = markTailFrameStaleForFirstFrameChange(nextStoryboards[groupIdx] || {});
+    if (nextStoryboard !== nextStoryboards[groupIdx]) {
+      nextStoryboards[groupIdx] = nextStoryboard;
+      storyboardsChanged = true;
+    }
+    if (nextVideoTasks[groupIdx]) {
+      delete nextVideoTasks[groupIdx];
+      videoTasksChanged = true;
+    }
+  }
+
+  if (!storyboardsChanged && !videoTasksChanged) return patch;
+  return {
+    ...patch,
+    ...(storyboardsChanged ? { storyboards: nextStoryboards } : {}),
+    ...(videoTasksChanged ? { videoTasks: nextVideoTasks } : {}),
+  };
+}
+
+function applyPutShotPlanDependencyGuard(current: any, patch: any): any {
+  if (!patch || typeof patch !== 'object') return patch;
+  const candidate = { ...(current || {}), ...(patch || {}) };
+  const dependencyPatch = buildShotPlanDependencyPatch({
+    current,
+    candidate,
+    changedPatch: patch,
+  });
+  return dependencyPatch ? { ...patch, ...dependencyPatch } : patch;
 }
 
 /**
@@ -226,7 +379,9 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
     const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
     const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
     const rawPatch = patch || {};
-    const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...rawPatch } : rawPatch;
+    const firstFrameGuardedPatch = applyPutFirstFrameChangeGuard(normalizedCurrent, rawPatch);
+    const guardedPatch = applyPutShotPlanDependencyGuard(normalizedCurrent, firstFrameGuardedPatch);
+    const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...guardedPatch } : guardedPatch;
     const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
       Object.prototype.hasOwnProperty.call(combinedPatch, key)
     ));
@@ -339,11 +494,15 @@ export function deleteProjectForUser(id: string, userId: number) {
     ).run(userId, id);
     db.prepare('DELETE FROM batches WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM continuity_cache WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM style_bible_runs WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM script_library_items WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM images WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM video_tasks WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM uploads WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM exports WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('DELETE FROM project_knowledge_contexts WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    // Keep derived world templates: they may be reused by other projects. Only sever provenance.
+    db.prepare('UPDATE world_templates SET source_project_id = NULL WHERE owner_id = ? AND source_project_id = ?').run(userId, id);
     const info = db.prepare('DELETE FROM projects WHERE id = ? AND owner_id = ?').run(id, userId);
     deleted = info.changes > 0;
   });
@@ -385,7 +544,7 @@ export function deleteProjectForUser(id: string, userId: number) {
 }
 
 function unlinkProjectDataFile(bucket: string, userId: number, filename: string) {
-  const base = resolve(process.cwd(), 'data', bucket, String(userId));
+  const base = resolve(dataPath(bucket, String(userId)));
   const target = resolve(base, filename);
   if (target === base || !target.startsWith(base + sep)) {
     console.warn('[ProjectDelete] Skip unsafe file path:', bucket, filename);

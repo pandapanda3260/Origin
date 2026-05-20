@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags } from './utils.js';
+import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders } from './utils.js';
 
 var _ctx = {};
 var project = null;
@@ -9,6 +9,10 @@ export function syncScriptProject(p) { project = p; }
 var _scriptGenerating = false;
 var _emotionTagInflight = {};
 var _emotionAutoTried = {};
+
+export function isScriptGenerating() {
+  return _scriptGenerating;
+}
 
 var EMOTION_LABEL_CN = {
   setup: "铺垫", rising: "升温", climax: "高潮",
@@ -124,11 +128,6 @@ function _hideScriptConfirmArea() {
   if (confirmArea) confirmArea.hidden = true;
 }
 
-function _announceStyleBibleReady() {
-  chatAddMsg("status", '<span class="chat-status-ok">初版风格已生成；请确认剧本后到「风格制定」页检查</span>');
-  _showScriptConfirmArea();
-}
-
 export function refreshScriptPage() {
   if (!project) return;
   if (_scriptGenerating) return;
@@ -156,6 +155,7 @@ export function refreshScriptPage() {
   }
 
   renderEmotionSegments();
+  renderScriptAnalysis();
 
   var ideaInput = $("ideaInput");
   if (ideaInput && project && !project.script) ideaInput.value = project.idea || "";
@@ -194,6 +194,7 @@ async function _setImportedDraft(text) {
   });
   _ctx.saveProject && _ctx.saveProject();
   refreshScriptImportDraft();
+  renderScriptAnalysis();
   return true;
 }
 
@@ -244,6 +245,7 @@ function _discardImportedDraft() {
   });
   _ctx.saveProject && _ctx.saveProject();
   refreshScriptImportDraft();
+  renderScriptAnalysis();
   showToast("已放弃导入草稿", "info");
 }
 
@@ -274,12 +276,15 @@ export function initScriptImportEvents() {
         proj.scriptDraft = text;
       });
       _ctx.saveProject && _ctx.saveProject();
+      renderScriptAnalysis();
     });
   }
   var applyBtn = $("btnApplyImportedDraft");
   if (applyBtn) applyBtn.addEventListener("click", function () { _applyImportedDraft(); });
   var discardBtn = $("btnDiscardImportedDraft");
   if (discardBtn) discardBtn.addEventListener("click", _discardImportedDraft);
+  var analysisBtn = $("btnScriptAnalysisRegen");
+  if (analysisBtn) analysisBtn.addEventListener("click", function () { runScriptAnalysis(); });
 }
 
 export function showScriptDisplay() {
@@ -287,6 +292,7 @@ export function showScriptDisplay() {
   var t = $("scriptOutput");
   if (d) d.classList.remove("hidden");
   if (t) t.classList.add("hidden");
+  setScriptEditControls(false);
 }
 
 export function showScriptEdit() {
@@ -295,9 +301,53 @@ export function showScriptEdit() {
   var t = $("scriptOutput");
   if (d) d.classList.add("hidden");
   if (t) { t.classList.remove("hidden"); t.focus(); }
+  setScriptEditControls(true);
 }
 
-var _SB_DOWNSTREAM_HINT = "修改后：画面描述、分镜参考图、视频提示词会标记为待重新生成（镜头结构本身保留）";
+function setScriptEditControls(editing) {
+  var editBtn = $("btnEditScript");
+  var saveBtn = $("btnSaveScriptEdit");
+  var cancelBtn = $("btnCancelScriptEdit");
+  var confirmBtn = $("btnConfirmScript");
+  if (editBtn) editBtn.hidden = !!editing;
+  if (saveBtn) saveBtn.hidden = !editing;
+  if (cancelBtn) cancelBtn.hidden = !editing;
+  var lockTitle = "请先保存或取消剧本编辑";
+  var lockedIds = [
+    "btnConfirmScript",
+    "btnExpandScript",
+    "btnNewScript",
+    "btnUploadScript",
+    "btnScriptHeaderRegen",
+    "btnGenScript",
+    "ideaInput",
+  ];
+  function setEditLocked(el) {
+    if (!el) return;
+    if (editing) {
+      if (!el.dataset.editLockSavedTitle) {
+        el.dataset.editLockSavedTitle = "1";
+        el.dataset.editLockTitle = el.getAttribute("title") || "";
+      }
+      el.disabled = true;
+      el.title = lockTitle;
+      return;
+    }
+    el.disabled = false;
+    if (el.dataset.editLockSavedTitle) {
+      var prevTitle = el.dataset.editLockTitle || "";
+      if (prevTitle) el.title = prevTitle;
+      else el.removeAttribute("title");
+      delete el.dataset.editLockSavedTitle;
+      delete el.dataset.editLockTitle;
+    } else if (el.title === lockTitle) {
+      el.removeAttribute("title");
+    }
+  }
+  lockedIds.forEach(function (id) { setEditLocked($(id)); });
+  var chips = document.querySelectorAll(".script-chip");
+  chips.forEach(function (chip) { setEditLocked(chip); });
+}
 
 function _styleBibleErrorText(source, fallback) {
   var sb = source && source.styleBible ? source.styleBible : source;
@@ -320,7 +370,7 @@ function _hasStyleBibleContent(sb) {
   if (!sb || typeof sb !== "object") return false;
   if (Array.isArray(sb.colorPalette) && sb.colorPalette.length) return true;
   if (Array.isArray(sb.characters) && sb.characters.length) return true;
-  var keys = ["visualStyle", "visualStyleDesc", "era", "mood", "cameraStyle", "worldRules"];
+  var keys = ["visualStyle", "visualStyleDesc", "era", "mood", "cameraStyle", "lighting", "texture", "editingRhythm", "audio", "subtitleStyle", "dialogueStyle", "worldRules"];
   for (var i = 0; i < keys.length; i++) {
     if (String(sb[keys[i]] || "").trim()) return true;
   }
@@ -337,170 +387,404 @@ function _isStyleBibleReadyResponse(resp) {
 
 function _applyStyleBibleResponse(proj, resp) {
   var ready = _isStyleBibleReadyResponse(resp);
-  proj.styleBible = ready ? resp.styleBible : null;
-  proj.styleBibleStatus = ready ? "ready" : "failed";
-  proj.styleBibleError = ready ? "" : _styleBibleErrorText(resp);
+  var status = (resp && (resp.styleBibleStatus || (resp.run && resp.run.status))) || "";
+  if (ready) proj.styleBible = resp.styleBible;
+  else if (resp && resp.styleBible && hasUsableStyleBible(resp.styleBible, resp)) proj.styleBible = resp.styleBible;
+  proj.styleBibleStatus = ready ? "ready" : (status === "generating" || status === "queued" || status === "running" || status === "retry_pending" ? "generating" : "failed");
+  proj.styleBibleError = ready || proj.styleBibleStatus === "generating" ? ((resp && resp.styleBibleError) || "") : _styleBibleErrorText(resp);
+  proj.styleBibleErrorCode = ready ? null : ((resp && (resp.styleBibleErrorCode || (resp.run && resp.run.errorCode))) || null);
   proj.styleBibleGeneratedAt = ready ? (resp.styleBibleGeneratedAt || new Date().toISOString()) : ((resp && resp.styleBibleGeneratedAt) || null);
+  proj.styleBibleRunId = resp ? (resp.styleBibleRunId || null) : null;
+  proj.styleBibleStartedAt = resp ? (resp.styleBibleStartedAt || proj.styleBibleStartedAt || null) : null;
+  proj.styleBibleStage = resp ? (resp.styleBibleStage || (resp.run && resp.run.stage) || null) : null;
+  proj.styleBibleProgress = resp ? (resp.styleBibleProgress == null ? proj.styleBibleProgress : resp.styleBibleProgress) : proj.styleBibleProgress;
+  proj.styleBibleNextRetryAt = resp ? (resp.styleBibleNextRetryAt || (resp.run && resp.run.nextRetryAt) || null) : null;
+  proj.styleBibleHeartbeatAt = resp ? (resp.styleBibleHeartbeatAt || (resp.run && resp.run.heartbeatAt) || null) : null;
+  if (ready) {
+    proj.styleBibleSourceHash = resp.styleBibleSourceHash || proj.styleBibleSourceHash || null;
+    proj.styleOptions = resp.styleOptions || proj.styleOptions || {};
+	    proj.styleBibleRunId = null;
+	    proj.styleBibleStartedAt = null;
+	    proj.styleBibleStage = null;
+	    proj.styleBibleProgress = 100;
+	    proj.styleBibleNextRetryAt = null;
+	    proj.styleBibleHeartbeatAt = null;
+	    proj.styleBibleStaleReason = resp.styleBibleStaleReason || null;
+	    proj.styleBibleStaleSince = resp.styleBibleStaleSince || null;
+	    proj.styleBibleManuallyEditedAt = resp.styleBibleManuallyEditedAt || null;
+	    proj.styleBibleSource = resp.styleBibleSource || "generated";
+	    proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
+	    if (resp.styleTemplateSnapshot) proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
+	    if (resp.worldTemplateSnapshot) proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;
+	  }
   if (ready && proj._staleFlags) delete proj._staleFlags["style_bible"];
   return ready;
 }
 
-function renderStyleBibleFailure(message) {
-  renderStyleBibleEmpty("风格圣经暂不可用", message || "风格圣经尚未提取或提取失败", true);
+function _styleBiblePollDelayMs(attempt) {
+  if (attempt < 5) return 2000;
+  if (attempt < 30) return 5000;
+  return 8000;
 }
 
-function renderStyleBibleEmpty(title, message, allowRetry) {
-  var el = $("styleBiblePreview");
-  if (!el) return;
-  var heading = escapeHtml(title || "风格圣经暂不可用");
-  var detail = escapeHtml(message || "生成剧本后将自动整理风格信息");
-  el.innerHTML =
-    '<div class="script-style-empty">' +
-    '<span class="material-symbols-outlined">auto_stories</span>' +
-    '<h3>' + heading + '</h3>' +
-    '<p>' + detail + '</p>' +
-    '</div>';
+async function _fetchStyleBibleStatus(projectId, runId) {
+  var url = "/api/script/workflow/extract-style-bible?projectId=" + encodeURIComponent(projectId);
+  if (runId) url += "&runId=" + encodeURIComponent(runId);
+  var httpResp = await fetch(url, { headers: getAuthHeaders() });
+  var resp = await httpResp.json().catch(function () { return {}; });
+  if (!httpResp.ok) {
+    var err = new Error(resp.detail || resp.error || ("风格圣经状态读取失败：" + httpResp.status));
+    err.status = httpResp.status;
+    err.payload = resp;
+    throw err;
+  }
+  return resp;
 }
 
-function _sbEditHtml(fieldKey, label, value, extra) {
-  var extraClass = extra || "";
-  var placeholder = value ? "" : " <span class=\"sb-edit-placeholder\">（点击编辑）</span>";
-  return '<div class="sb-editable ' + extraClass + '" data-sb-field="' + fieldKey + '" data-sb-label="' + escapeHtml(label) + '" title="' + escapeHtml(_SB_DOWNSTREAM_HINT) + '">' +
-    (value ? escapeHtml(value) : '') +
-    placeholder +
-    '<span class="sb-edit-icon material-symbols-outlined">edit</span>' +
-    '</div>';
+async function _waitStyleBibleReady(originId, initialResp) {
+  var runId = initialResp && initialResp.styleBibleRunId;
+  var deadline = Date.now() + 30 * 60 * 1000;
+  var attempt = 0;
+  var latest = initialResp;
+  while (Date.now() < deadline) {
+    await new Promise(function (resolve) { setTimeout(resolve, _styleBiblePollDelayMs(attempt++)); });
+    latest = await _fetchStyleBibleStatus(originId, runId);
+    var appliedReady = false;
+    _ctx.safeWriteBack(originId, function (proj) {
+      appliedReady = _applyStyleBibleResponse(proj, latest);
+    });
+    if (appliedReady) return latest;
+    if (latest && latest.styleBibleStatus === "failed") {
+      var err = new Error(_styleBibleErrorText(latest, "风格圣经生成失败"));
+      err.payload = latest;
+      throw err;
+    }
+  }
+  var timeout = new Error("风格圣经生成仍在进行，可稍后查看或重新生成");
+  timeout.status = 408;
+  timeout.payload = latest;
+  throw timeout;
 }
 
-function _sbModuleHead(icon, title, en, editable) {
-  return '<div class="script-style-module-head">' +
-    '<div class="script-style-module-title">' +
+function _analysisShortText(text, fallback, maxLen) {
+  var s = String(text || fallback || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  maxLen = maxLen || 80;
+  return s.length > maxLen ? s.slice(0, maxLen - 1) + "…" : s;
+}
+
+function _analysisScriptText() {
+  if (!project) return "";
+  return stripStepTags(project.script || project.scriptDraft || "").trim();
+}
+
+function _analysisSourceHash(text) {
+  var hash = 0;
+  var s = String(text || "");
+  for (var i = 0; i < s.length; i++) hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
+  return String(s.length) + ":" + String(hash >>> 0);
+}
+
+function _analysisScriptLines(text) {
+  return String(text || "").split(/\n+/).map(function (line) { return line.trim(); }).filter(Boolean);
+}
+
+function _analysisDialogueLines(lines) {
+  return lines.filter(function (line) {
+    return /^[^：:]{1,14}[：:]/.test(line) || /[“"][^”"]+[”"]/.test(line);
+  });
+}
+
+function _analysisExtractSpeakers(lines) {
+  var seen = {};
+  var out = [];
+  lines.forEach(function (line) {
+    var m = line.match(/^([^：:]{1,14})[：:]/);
+    if (!m) return;
+    var name = m[1].replace(/[【】\[\]（()]/g, "").trim();
+    if (!name || seen[name]) return;
+    seen[name] = true;
+    out.push({ name: name, role: "对白角色", desire: "目标待分析", pressure: "阻力待分析" });
+  });
+  return out.slice(0, 5);
+}
+
+function _analysisCharacters(lines) {
+  var sbChars = project && project.styleBible && Array.isArray(project.styleBible.characters) ? project.styleBible.characters : [];
+  if (sbChars.length) {
+    return sbChars.slice(0, 5).map(function (ch) {
+      var name = String((ch && ch.name) || "未命名").trim() || "未命名";
+      return {
+        name: name,
+        role: _analysisShortText((ch && (ch.role || ch.description || ch.appearance)) || "主要出场角色", "主要出场角色", 24),
+        desire: _analysisShortText((ch && ch.desire) || "围绕主冲突推进选择", "围绕主冲突推进选择", 26),
+        pressure: _analysisShortText((ch && ch.pressure) || "受到环境、关系或反转压力牵引", "受到环境、关系或反转压力牵引", 28),
+      };
+    });
+  }
+  return _analysisExtractSpeakers(lines);
+}
+
+function _analysisCore(lines, text) {
+  var first = lines[0] || "";
+  var second = lines[1] || "";
+  var conflict = lines.find(function (line) { return /却|但是|突然|发现|必须|危机|冲突|反转|争/.test(line); }) || second || first;
+  var promise = lines.find(function (line) { return /最后|终于|原来|结果|反转|真相|高潮|发现/.test(line); }) || lines[lines.length - 1] || first;
+  return {
+    logline: _analysisShortText(first.replace(/^[^：:]{1,8}[：:]/, ""), text ? "当前剧本已就绪，等待进一步分析。" : "", 92),
+    conflict: _analysisShortText(conflict.replace(/^[^：:]{1,8}[：:]/, ""), "核心冲突待分析", 92),
+    audiencePromise: _analysisShortText(promise.replace(/^[^：:]{1,8}[：:]/, ""), "观众期待点待分析", 92),
+  };
+}
+
+function _analysisPacing() {
+  var segs = (project && project.emotionSegments) || [];
+  if (!Array.isArray(segs) || !segs.length) return [];
+  return segs.slice(0, 5).map(function (seg, idx) {
+    var lv = Math.max(1, Math.min(5, Number(seg.intensity) || 3));
+    return {
+      label: EMOTION_LABEL_CN[seg.emotion] || seg.title || ("段落 " + (idx + 1)),
+      pacing: PACING_LABEL_CN[seg.pacing] || seg.pacing || "节奏待定",
+      intensity: lv,
+      note: _analysisShortText(seg.note || seg.paragraphStart || "", "情绪说明待补充", 54),
+    };
+  });
+}
+
+function _analysisKeyBeats(lines) {
+  var picked = lines.filter(function (line) {
+    return /突然|发现|原来|最后|终于|反转|真相|危机|高潮|决定|必须/.test(line);
+  });
+  if (!picked.length) picked = lines.slice(0, 4);
+  return picked.slice(0, 4).map(function (line, idx) {
+    var titles = ["开场钩子", "冲突升级", "关键转折", "收束回响"];
+    return {
+      title: titles[idx] || ("看点 " + (idx + 1)),
+      detail: _analysisShortText(line.replace(/^[^：:]{1,8}[：:]/, ""), "关键剧情点待分析", 70),
+    };
+  });
+}
+
+function _analysisNotes(stats, pacing) {
+  var notes = [];
+  if (stats.estimatedDurationSec > 75) notes.push("篇幅偏长，后续若面向短视频可重点压缩铺垫。");
+  if (stats.dialogueLines < 2) notes.push("对白信息较少，右栏先按叙述段落识别剧情重点。");
+  if (!pacing.length) notes.push("尚未生成情绪段，当前节奏结构为本地简版摘要。");
+  if (!notes.length) notes.push("结构信息已具备，可继续在工作台修改剧本内容。");
+  return notes.slice(0, 3);
+}
+
+function _buildLocalScriptAnalysis() {
+  var text = _analysisScriptText();
+  var lines = _analysisScriptLines(text);
+  var dialogue = _analysisDialogueLines(lines);
+  var pacing = _analysisPacing();
+  var stats = {
+    chars: text.length,
+    estimatedDurationSec: project && project.scriptTargetDurationSec ? Number(project.scriptTargetDurationSec) : Math.max(15, Math.round(text.length / 4.2)),
+    dialogueLines: dialogue.length,
+    segmentCount: pacing.length || Math.min(5, Math.max(1, Math.ceil(lines.length / 4))),
+  };
+  return {
+    schemaVersion: "local-v1",
+    sourceHash: _analysisSourceHash(text),
+    generatedAt: null,
+    stats: stats,
+    core: _analysisCore(lines, text),
+    pacing: pacing,
+    characters: _analysisCharacters(lines),
+    keyBeats: _analysisKeyBeats(lines),
+    notes: _analysisNotes(stats, pacing),
+  };
+}
+
+function _cachedScriptAnalysis(text) {
+  var cached = project && project.scriptAnalysis && typeof project.scriptAnalysis === "object" ? project.scriptAnalysis : null;
+  if (!cached) return null;
+  return cached.sourceHash === _analysisSourceHash(text) ? cached : null;
+}
+
+function _hasStaleScriptAnalysis(text) {
+  var cached = project && project.scriptAnalysis && typeof project.scriptAnalysis === "object" ? project.scriptAnalysis : null;
+  return !!(cached && cached.sourceHash && cached.sourceHash !== _analysisSourceHash(text));
+}
+
+function _analysisModuleHead(icon, title, en, chip) {
+  return '<div class="script-analysis-module-head">' +
+    '<div class="script-analysis-module-title">' +
       '<span class="material-symbols-outlined">' + icon + '</span>' +
-      '<span class="script-style-title-cn">' + title + '</span>' +
-      '<span class="script-style-title-en">' + en + '</span>' +
+      '<span class="script-analysis-title-cn">' + title + '</span>' +
+      '<span class="script-analysis-title-en">' + en + '</span>' +
     '</div>' +
-    (editable ? '<span class="script-style-edit-chip">可编辑</span>' : '') +
+    (chip ? '<span class="script-analysis-chip">' + escapeHtml(chip) + '</span>' : '') +
   '</div>';
 }
 
-function _sbShort(text, fallback, maxLen) {
-  var s = String(text || fallback || "").trim();
-  if (!s) return "";
-  maxLen = maxLen || 48;
-  return s.length > maxLen ? s.slice(0, maxLen) + "..." : s;
+function _renderAnalysisMetrics(stats) {
+  return '<div class="script-analysis-metrics">' +
+    '<div><strong>' + escapeHtml(String(stats.chars || 0)) + '</strong><span>字数</span></div>' +
+    '<div><strong>' + escapeHtml(String(stats.estimatedDurationSec || 0)) + 's</strong><span>预计</span></div>' +
+    '<div><strong>' + escapeHtml(String(stats.dialogueLines || 0)) + '</strong><span>对白</span></div>' +
+    '<div><strong>' + escapeHtml(String(stats.segmentCount || 0)) + '</strong><span>段落</span></div>' +
+  '</div>';
 }
 
-function _sbCharacterDesc(c) {
-  if (!c) return "";
-  return _sbShort(c.desc || c.description || c.role || c.appearance || c.clothing || "", "角色设定待完善", 42);
+function _renderAnalysisCore(core, stats) {
+  return '<div class="script-analysis-card">' +
+    _analysisModuleHead('target', '故事核心', 'CORE', '只读') +
+    _renderAnalysisMetrics(stats) +
+    '<dl class="script-analysis-list">' +
+      '<div><dt>一句话</dt><dd>' + escapeHtml(core.logline || "待生成剧本内容") + '</dd></div>' +
+      '<div><dt>主冲突</dt><dd>' + escapeHtml(core.conflict || "待分析") + '</dd></div>' +
+      '<div><dt>期待点</dt><dd>' + escapeHtml(core.audiencePromise || "待分析") + '</dd></div>' +
+    '</dl>' +
+  '</div>';
 }
 
-function _sbAvatarHtml(c) {
-  var src = c && (c.avatarUrl || c.imageUrl || c.referenceImageUrl || c.url || c.src);
-  var name = String((c && c.name) || "角").trim() || "角";
-  if (src) {
-    return '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(name) + '" />';
+function _renderAnalysisPacing(pacing) {
+  var body = "";
+  if (pacing.length) {
+    body = '<div class="script-analysis-pacing">' + pacing.map(function (seg) {
+      return '<div class="script-analysis-pace-row">' +
+        '<div class="script-analysis-pace-top"><span>' + escapeHtml(seg.label) + '</span><em>' + escapeHtml(seg.pacing) + '</em></div>' +
+        '<div class="script-analysis-pace-bar"><i style="width:' + escapeHtml(String(seg.intensity * 20)) + '%"></i></div>' +
+        '<p>' + escapeHtml(seg.note) + '</p>' +
+      '</div>';
+    }).join("") + '</div>';
+  } else {
+    body = '<p class="script-analysis-muted">情绪段尚未生成，确认或重新分析情绪后会显示五段式节奏。</p>';
   }
-  return escapeHtml(name.charAt(0));
+  return '<div class="script-analysis-card">' +
+    _analysisModuleHead('timeline', '节奏结构', 'PACING', pacing.length ? '情绪段' : '') +
+    body +
+  '</div>';
 }
 
-export function renderStyleBible(sb) {
-  var el = $("styleBiblePreview");
-  if (!el || !sb) return;
-  if (!hasUsableStyleBible(sb, project)) {
-    renderStyleBibleFailure(_styleBibleErrorText(project, "风格圣经尚未提取或提取失败"));
+function _renderAnalysisCharacters(chars) {
+  var body = "";
+  if (chars.length) {
+    body = '<div class="script-analysis-characters">' + chars.map(function (ch) {
+      var name = String(ch.name || "角").trim() || "角";
+      return '<article class="script-analysis-character">' +
+        '<div class="script-analysis-character-avatar">' + escapeHtml(name.charAt(0)) + '</div>' +
+        '<div class="script-analysis-character-body">' +
+          '<strong>' + escapeHtml(name) + '</strong>' +
+          '<span>' + escapeHtml(ch.role || "主要角色") + '</span>' +
+          '<p>' + escapeHtml(ch.desire || "目标待分析") + ' / ' + escapeHtml(ch.pressure || "阻力待分析") + '</p>' +
+        '</div>' +
+      '</article>';
+    }).join("") + '</div>';
+  } else {
+    body = '<p class="script-analysis-muted">暂未识别到明确角色，可在剧本中使用“角色名：台词”增强识别。</p>';
+  }
+  return '<div class="script-analysis-card">' +
+    _analysisModuleHead('groups', '人物驱动', 'CHARACTERS', '') +
+    body +
+  '</div>';
+}
+
+function _renderAnalysisBeats(beats) {
+  return '<div class="script-analysis-card">' +
+    _analysisModuleHead('bolt', '关键看点', 'KEY BEATS', '') +
+    '<div class="script-analysis-beats">' + beats.map(function (beat, idx) {
+      return '<div class="script-analysis-beat">' +
+        '<span>' + String(idx + 1) + '</span>' +
+        '<div><strong>' + escapeHtml(beat.title || ("看点 " + (idx + 1))) + '</strong><p>' + escapeHtml(beat.detail || "待分析") + '</p></div>' +
+      '</div>';
+    }).join("") + '</div>' +
+  '</div>';
+}
+
+function _renderAnalysisNotes(notes) {
+  return '<div class="script-analysis-card">' +
+    _analysisModuleHead('fact_check', '阅读提醒', 'NOTES', '') +
+    '<ul class="script-analysis-notes">' + notes.map(function (note) {
+      return '<li>' + escapeHtml(note) + '</li>';
+    }).join("") + '</ul>' +
+  '</div>';
+}
+
+function _renderAnalysisStaleBanner() {
+  return '<div class="script-analysis-stale">' +
+    '<span class="material-symbols-outlined">warning</span>' +
+    '<span>剧本已修改，剧本分析可能与当前文本不一致。右侧已先显示本地摘要，可点击重新分析刷新。</span>' +
+  '</div>';
+}
+
+export function renderScriptAnalysis() {
+  var el = $("scriptAnalysisPreview");
+  var regen = $("btnScriptAnalysisRegen");
+  if (!el) return;
+  var text = _analysisScriptText();
+  if (regen) regen.disabled = !text;
+  if (!text) {
+    el.innerHTML = '<div class="script-analysis-empty">' +
+      '<span class="material-symbols-outlined">insights</span>' +
+      '<h3>等待剧本草稿</h3>' +
+      '<p>生成或导入剧本后，这里会展示故事核心、节奏结构、人物驱动和关键看点。</p>' +
+    '</div>';
     return;
   }
-  var html = '';
-
-  if (_ctx.isStale && _ctx.isStale("style_bible")) {
-    html += '<div class="upstream-stale-banner"><span class="material-symbols-outlined">warning</span>剧本已修改，风格圣经可能与剧本不一致，建议重新提取</div>';
-  }
-
-  html += '<div class="sb-section script-style-card">' +
-    _sbModuleHead('visibility', '视觉风格', 'VISUAL STYLE', true) +
-    _sbEditHtml('visualStyle', '视觉风格', sb.visualStyle || '', 'script-style-main') +
-    _sbEditHtml('visualStyleDesc', '视觉风格描述', sb.visualStyleDesc || '', 'script-style-desc sb-editable-sm') +
-    '</div>';
-
-  html += '<div class="sb-section script-style-card">' +
-    _sbModuleHead('palette', '色彩调板', 'COLOR PALETTE', true);
-  if (Array.isArray(sb.colorPalette) && sb.colorPalette.length) {
-    html += '<div class="script-color-swatches">';
-    sb.colorPalette.slice(0, 5).forEach(function (c) {
-      var hex = (c && c.hex) || '#CFD8DC';
-      var name = (c && c.name) || hex;
-      html += '<div class="script-color-item"><div class="script-color-block" style="background:' + escapeHtml(hex) + '"></div><span class="script-color-name">' + escapeHtml(name) + '</span></div>';
-    });
-    html += '</div>';
-  } else {
-    html += '<p class="script-style-muted">' + escapeHtml(String(sb.colorPalette || '色彩调板待补充')) + '</p>';
-  }
-  html += '</div>';
-
-  html += '<div class="sb-section script-style-card">' +
-    _sbModuleHead('routine', '时代与氛围', 'ERA & ATMOSPHERE', true) +
-    _sbEditHtml('era', '时代与氛围', sb.era || '', 'script-style-desc') +
-    '</div>';
-
-  html += '<div class="sb-section script-style-card">' +
-    _sbModuleHead('water_drop', '情绪基调', 'MOOD', true) +
-    _sbEditHtml('mood', '情绪基调', sb.mood || '', 'script-style-desc') +
-    '</div>';
-
-  html += '<div class="sb-section script-style-card">' +
-    _sbModuleHead('groups', '主要角色', 'CHARACTERS', true);
-  if (Array.isArray(sb.characters) && sb.characters.length) {
-    html += '<div class="script-characters">';
-    sb.characters.slice(0, 5).forEach(function (c) {
-      var name = _sbShort(c && c.name, "未命名", 10);
-      html += '<div class="script-character">' +
-        '<div class="script-character-avatar">' + _sbAvatarHtml(c) + '</div>' +
-        '<div class="script-character-name">' + escapeHtml(name) + '</div>' +
-        '<div class="script-character-desc">' + escapeHtml(_sbCharacterDesc(c)) + '</div>' +
-      '</div>';
-    });
-    html += '</div>';
-  } else {
-    html += '<p class="script-style-muted">主要角色待补充</p>';
-  }
-  html += '</div>';
-
-  el.innerHTML = html;
-  var sections = el.querySelectorAll(".sb-section");
-  for (var si = 0; si < sections.length; si++) {
-    sections[si].style.animationDelay = (si * 0.09 + 0.15) + "s";
-  }
-
-  _bindStyleBibleEditors(el);
+  var localAnalysis = _buildLocalScriptAnalysis();
+  var cached = _cachedScriptAnalysis(text);
+  var analysis = cached || localAnalysis;
+  analysis.stats = analysis.stats || localAnalysis.stats;
+  analysis.core = analysis.core || localAnalysis.core;
+  analysis.pacing = Array.isArray(analysis.pacing) ? analysis.pacing : localAnalysis.pacing;
+  analysis.characters = Array.isArray(analysis.characters) ? analysis.characters : localAnalysis.characters;
+  analysis.keyBeats = Array.isArray(analysis.keyBeats) ? analysis.keyBeats : localAnalysis.keyBeats;
+  analysis.notes = Array.isArray(analysis.notes) ? analysis.notes : localAnalysis.notes;
+  var staleHtml = _hasStaleScriptAnalysis(text) ? _renderAnalysisStaleBanner() : "";
+  el.innerHTML =
+    staleHtml +
+    _renderAnalysisCore(analysis.core, analysis.stats) +
+    _renderAnalysisPacing(analysis.pacing) +
+    _renderAnalysisCharacters(analysis.characters) +
+    _renderAnalysisBeats(analysis.keyBeats) +
+    _renderAnalysisNotes(analysis.notes);
 }
 
-function _bindStyleBibleEditors(el) {
-  var editables = el.querySelectorAll(".sb-editable");
-  for (var i = 0; i < editables.length; i++) {
-    editables[i].addEventListener("click", _onStyleBibleFieldClick);
-  }
-}
-
-function _onStyleBibleFieldClick(e) {
-  if (!project || !hasUsableStyleBible(project.styleBible, project)) return;
-  if (e.currentTarget.classList.contains("sb-editing")) return;
-  var field = e.currentTarget.getAttribute("data-sb-field");
-  var label = e.currentTarget.getAttribute("data-sb-label") || field;
-  var current = project.styleBible[field] || "";
-  var next = window.prompt("编辑「" + label + "」\n\n" + _SB_DOWNSTREAM_HINT, current);
-  if (next === null) return;
-  next = next.trim();
-  if (next === current) return;
+export async function runScriptAnalysis() {
+  if (!project || !project.id) { showToast("请先创建或选择项目", "warn"); return; }
+  var text = _analysisScriptText();
+  if (!text) { showToast("请先生成或导入剧本", "warn"); return; }
   var originId = project.id;
-  _ctx.safeWriteBack(originId, function (proj) {
-    if (!proj.styleBible) proj.styleBible = {};
-    proj.styleBible[field] = next;
-  });
-  if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
-  _ctx.saveProject && _ctx.saveProject();
-  renderStyleBible(project.styleBible);
-  showToast("已保存「" + label + "」；下游画面/视频提示词已标记为需重新生成", "success");
+  var btn = $("btnScriptAnalysisRegen");
+  var oldHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="material-symbols-outlined">hourglass_top</span><span>分析中</span>';
+  }
+  try {
+    var resp = await apiPost("/api/script/workflow/analyze", {
+      projectId: originId,
+      script: text,
+      durationSec: project.scriptTargetDurationSec || null,
+    });
+    if (resp && resp.detail && !resp.scriptAnalysis) throw new Error(resp.detail);
+    if (!resp || !resp.scriptAnalysis) throw new Error("分析结果为空");
+    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+      proj.scriptAnalysis = resp.scriptAnalysis;
+    });
+    if (isCurrent) {
+      renderScriptAnalysis();
+      if (resp.scriptAnalysisStatus === "degraded") {
+        var hint = resp.scriptAnalysisError ? "：" + resp.scriptAnalysisError : "";
+        showToast("模型分析暂不可用" + hint + "，已刷新本地摘要", "warn");
+      } else {
+        showToast("剧本分析已刷新", "success");
+      }
+    }
+  } catch (e) {
+    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    showToast("剧本分析失败: " + errText, "error");
+    _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
+  } finally {
+    if (btn) {
+      btn.innerHTML = oldHtml || '<span class="material-symbols-outlined">auto_awesome</span><span>重新分析</span>';
+      btn.disabled = !(_analysisScriptText());
+    }
+  }
 }
 
 export async function handleScriptInput() {
@@ -603,10 +887,8 @@ function _ensureConfirmDraftDelegation() {
 
 // ── 多轮咨询：用户确认后走正式生成 ────────────────────────────────────
 //
-// 调后端 `/api/script/workflow/consult/confirm` SSE。这个端点的事件流
-// **完全复用**现有 `run_full_create` 的契约（phase / script_chunk /
-// style_bible_chunk / done{script,styleBible,emotionSegments}），所以前端
-// 消费代码和 `generateScript` 的 SSE 部分一字不差。
+// 调后端 `/api/script/workflow/consult/confirm` SSE。这个端点只负责把咨询
+// 大纲生成剧本草稿和情绪段；风格圣经必须在「风格制定」页显式生成。
 async function _consultConfirm() {
   if (!project) return;
   var originId = project.id;
@@ -644,8 +926,6 @@ async function _consultConfirm() {
   var _stepState = { buf: "" };
   var stepEl = $("scriptStreamStep");
   if (stepEl) { stepEl.hidden = true; stepEl.textContent = ""; }
-  var _gotBibleStart = false;
-
   try {
     var resp = await apiPostStream("/api/script/workflow/consult/confirm", {
       projectId: originId,
@@ -659,24 +939,16 @@ async function _consultConfirm() {
         });
         if (displayText) displayText.textContent += clean;
         if (!_userScrolledUp) _scrollChatToBottom();
-      } else if (evt.type === "phase" && evt.name === "style_bible_start" && !_gotBibleStart) {
-        _gotBibleStart = true;
-        var _approxChars = (displayText && displayText.textContent.length) || 0;
-        showToast("剧本草稿已生成（约 " + _approxChars + " 字），正在分析风格…", "info");
-        chatAddMsg("status", "正在提取风格圣经…");
-        chatShowDots();
       }
     });
 
-    var styleBibleReady = _isStyleBibleReadyResponse(resp);
 	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-	      proj.script = resp.script || "";
-	      proj.scriptDraft = resp.script || "";
-	      proj.scriptApproved = false;
-      _applyStyleBibleResponse(proj, resp);
-      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
-      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
-      proj.assets = null;
+		      proj.script = resp.script || "";
+		      proj.scriptDraft = resp.script || "";
+		      proj.scriptApproved = false;
+	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
+	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
+	      proj.assets = null;
       proj.assetsApproved = false;
       proj.shots = [];
       proj.shotsApproved = false;
@@ -691,16 +963,12 @@ async function _consultConfirm() {
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
       if (stepEl) stepEl.hidden = true;
-	      chatRemoveDots();
-	      if (styleBibleReady) {
-	        _announceStyleBibleReady();
-	      } else {
-	        var bibleErr = _styleBibleErrorText(resp);
-	        _showScriptConfirmArea();
-	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请确认剧本后到「风格制定」页重试</span>');
-	      }
-      renderEmotionSegments();
-    }
+		      chatRemoveDots();
+      _showScriptConfirmArea();
+      chatAddMsg("status", '<span class="chat-status-ok">剧本草稿已生成。请确认剧本后，到「风格制定」页选择画幅和模板，再生成风格圣经。</span>');
+		      renderEmotionSegments();
+	      renderScriptAnalysis();
+		    }
   } catch (e) {
     if (stepEl) stepEl.hidden = true;
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
@@ -796,7 +1064,7 @@ export async function generateScript(idea) {
   // 后端 run_full_create 里，当 body 没传 durationSec 时会自动从 idea 里嗅，
   // 嗅出来的值通过 done 事件的 resp.durationSec 回传给前端，下方 safeWriteBack
   // 里再回写 project.scriptTargetDurationSec 作为后续 revise / expand 的默认值。
-  // 走 generateScript 说明用户选择了"跳过咨询直接生成"（一般是 btnRegenScript
+  // 走 generateScript 说明用户选择了"跳过咨询直接生成"（一般是输入框发送
   // 或程序路径，而不是 handleScriptInput → _consultTurn 那条主路径）。把咨询
   // 历史清掉，避免后续 refreshScriptPage 又把旧对话回放出来。
   _clearScriptConsultState(originId);
@@ -836,7 +1104,6 @@ export async function generateScript(idea) {
   var _scriptStepState = { buf: "" };
   var stepEl = $("scriptStreamStep");
   if (stepEl) { stepEl.hidden = true; stepEl.textContent = ""; }
-  var _gotBibleStart = false;
   try {
     var resp = await apiPostStream("/api/script/workflow/full-create", {
       projectId: project.id,
@@ -852,24 +1119,16 @@ export async function generateScript(idea) {
         });
         if (displayText) displayText.textContent += clean;
         if (!_userScrolledUp) _scrollChatToBottom();
-      } else if (evt.type === "phase" && evt.name === "style_bible_start" && !_gotBibleStart) {
-        _gotBibleStart = true;
-        var _approxChars = (displayText && displayText.textContent.length) || 0;
-        showToast("剧本草稿已生成（约 " + _approxChars + " 字），正在分析风格…", "info");
-        chatAddMsg("status", "正在提取风格圣经…");
-        chatShowDots();
       }
     });
 
-    var styleBibleReady = _isStyleBibleReadyResponse(resp);
-	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-	      proj.script = resp.script || "";
-	      proj.scriptDraft = resp.script || "";
-	      proj.scriptApproved = false;
-      _applyStyleBibleResponse(proj, resp);
-      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
-      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
-      proj.assets = null;
+		    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+		      proj.script = resp.script || "";
+		      proj.scriptDraft = resp.script || "";
+		      proj.scriptApproved = false;
+	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
+	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
+	      proj.assets = null;
       proj.assetsApproved = false;
       proj.shots = [];
       proj.shotsApproved = false;
@@ -884,16 +1143,12 @@ export async function generateScript(idea) {
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
       if (stepEl) stepEl.hidden = true;
-	      chatRemoveDots();
-	      if (styleBibleReady) {
-	        _announceStyleBibleReady();
-	      } else {
-	        var bibleErr = _styleBibleErrorText(resp);
-	        _showScriptConfirmArea();
-	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请确认剧本后到「风格制定」页重试</span>');
-	      }
-      renderEmotionSegments();
-    }
+		      chatRemoveDots();
+      _showScriptConfirmArea();
+      chatAddMsg("status", '<span class="chat-status-ok">剧本草稿已生成。请确认剧本后，到「风格制定」页选择画幅和模板，再生成风格圣经。</span>');
+		      renderEmotionSegments();
+	      renderScriptAnalysis();
+		    }
   } catch (e) {
     if (stepEl) stepEl.hidden = true;
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
@@ -929,14 +1184,28 @@ function _updateScriptInputPlaceholder() {
 
 export function startNewScript() {
   if (_scriptGenerating) return;
-	  _ctx.safeWriteBack(project ? project.id : null, function (proj) {
-	    proj.script = "";
-	    proj.scriptDraft = "";
-	    proj.scriptApproved = false;
+  _ctx.safeWriteBack(project ? project.id : null, function (proj) {
+    proj.script = "";
+    proj.scriptDraft = "";
+    proj.scriptApproved = false;
     proj.styleBible = null;
     proj.styleBibleStatus = "";
     proj.styleBibleError = "";
     proj.styleBibleGeneratedAt = null;
+    proj.styleBibleSourceHash = null;
+	    proj.styleBibleStaleReason = null;
+	    proj.styleBibleStaleSince = null;
+	    proj.styleBibleManuallyEditedAt = null;
+	    proj.styleBibleSource = null;
+	    proj.styleBibleRunId = null;
+	    proj.styleBibleStartedAt = null;
+	    proj.styleBibleGenerationContext = null;
+		    proj.styleOptions = { aspectRatio: "9:16", aspectRatioDefaultVersion: "2026-05-14-9x16" };
+	    proj.selectedWorldTemplateId = null;
+	    proj.worldTemplateSnapshot = null;
+	    proj.selectedStyleTemplateId = null;
+	    proj.styleTemplateSnapshot = null;
+    proj.scriptAnalysis = null;
     proj.assets = null;
     proj.assetsApproved = false;
     proj.shots = [];
@@ -957,17 +1226,42 @@ export function startNewScript() {
   showToast("已新建空白剧本，开始你的创作", "success");
 }
 
-export async function extractStyleBible() {
+export async function extractStyleBible(options) {
   if (!project || !project.script) return;
+  options = options || {};
   var originId = project.id;
   try {
-    var resp = await apiPost("/api/script/workflow/extract-style-bible", {
-      projectId: project.id,
-      script: project.script,
+	    var payload = {
+	      projectId: project.id,
+	      styleOptions: options.styleOptions || null,
+	      styleTemplateSnapshot: options.styleTemplateSnapshot || project.styleTemplateSnapshot || null,
+	      worldTemplateSnapshot: options.worldTemplateSnapshot || project.worldTemplateSnapshot || null,
+	      creatorProfile: options.creatorProfile || (_ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null),
+	    };
+    var httpResp = await fetch("/api/script/workflow/extract-style-bible", {
+      method: "POST",
+      headers: getAuthHeaders(),
+      body: JSON.stringify(payload),
     });
-    if (!_isStyleBibleReadyResponse(resp)) throw new Error(_styleBibleErrorText(resp, "未知错误"));
+    var resp = await httpResp.json().catch(function () { return {}; });
+    if (!httpResp.ok) {
+      var err = new Error(resp.detail || resp.error || ("风格圣经生成失败：" + httpResp.status));
+      err.status = httpResp.status;
+      err.payload = resp;
+      throw err;
+    }
+    if (!_isStyleBibleReadyResponse(resp)) {
+      if (resp && (resp.accepted || resp.styleBibleStatus === "generating")) {
+        _ctx.safeWriteBack(originId, function (proj) {
+          _applyStyleBibleResponse(proj, resp);
+        });
+        resp = await _waitStyleBibleReady(originId, resp);
+      } else {
+        throw new Error(_styleBibleErrorText(resp, "未知错误"));
+      }
+    }
     chatRemoveDots();
-	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+		    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
 	      _applyStyleBibleResponse(proj, resp);
 	      if (proj.assets) {
 	        if (!proj._staleFlags) proj._staleFlags = {};
@@ -979,36 +1273,18 @@ export async function extractStyleBible() {
 		      chatAddMsg("status", '<span class="chat-status-ok">风格已重新提取，请到「风格制定」页检查</span>');
 		      _showScriptConfirmArea();
 		    }
-	  } catch (e) {
-    chatRemoveDots();
+		  } catch (e) {
+    if (e && e.status === 409) throw e;
+	  chatRemoveDots();
     var errText = ((e && e.message) || e).toString().slice(0, 150);
     _ctx.safeWriteBack(originId, function (proj) {
       proj.styleBibleStatus = "failed";
       proj.styleBibleError = errText;
     });
-	    _showScriptConfirmArea();
-	    chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(errText) + '，请到「风格制定」页重试</span>');
-	  }
-}
-
-export function formatStyleBibleForChat(sb) {
-  if (!hasUsableStyleBible(sb)) return "风格圣经提取失败，请点击重新生成";
-  var lines = ["✦ 风格圣经已提取"];
-  if (sb.visualStyle) lines.push("视觉风格: " + sb.visualStyle);
-  if (sb.colorPalette) {
-    if (Array.isArray(sb.colorPalette)) {
-      lines.push("色调: " + sb.colorPalette.map(function (c) { return c.name; }).join(" · "));
-    } else {
-      lines.push("色调: " + sb.colorPalette);
-    }
-  }
-  if (sb.era) lines.push("时代/背景: " + sb.era);
-  if (sb.mood) lines.push("情绪氛围: " + sb.mood);
-  if (sb.characters && sb.characters.length) {
-    lines.push("角色: " + sb.characters.map(function (c) { return c.name; }).join("、"));
-  }
-  lines.push("\n详细信息请前往「风格制定」页查看。");
-  return lines.join("\n");
+		    _showScriptConfirmArea();
+		    chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(errText) + '，请到「风格制定」页重试</span>');
+    throw e;
+		  }
 }
 
 export async function confirmScript() {
@@ -1067,8 +1343,9 @@ export async function tagEmotions() {
     var segments = (resp && resp.emotionSegments) || [];
     _ctx.safeWriteBack(originId, function (proj) { proj.emotionSegments = segments; });
     _ctx.saveProject();
-    renderEmotionSegments();
-  } catch (e) {
+	    renderEmotionSegments();
+    renderScriptAnalysis();
+	  } catch (e) {
     console.error("[EmotionTag] Tag failed:", e);
   } finally {
     delete _emotionTagInflight[inflightKey];
@@ -1296,8 +1573,9 @@ function _openEmotionSegEditor(segIdx) {
     });
     if (changed && _ctx.markDownstreamStale) _ctx.markDownstreamStale("emotion", {});
     _ctx.saveProject && _ctx.saveProject();
-    renderEmotionSegments();
-    close();
+	    renderEmotionSegments();
+    renderScriptAnalysis();
+	    close();
     if (changed) showToast("情绪段已更新；下游分镜/画面/视频提示词已标记为需重新生成", "success");
   });
 }
@@ -1334,7 +1612,6 @@ export async function reviseScript(instruction) {
   var _revStepState = { buf: "" };
   var stepEl2 = $("scriptStreamStep");
   if (stepEl2) { stepEl2.hidden = true; stepEl2.textContent = ""; }
-  var _gotBibleStart2 = false;
   try {
     var resp = await apiPostStream("/api/script/workflow/full-create", {
       projectId: project.id,
@@ -1351,23 +1628,16 @@ export async function reviseScript(instruction) {
         });
         if (displayText) displayText.textContent += clean;
         if (!_userScrolledUp) _scrollChatToBottom();
-      } else if (evt.type === "phase" && evt.name === "style_bible_start" && !_gotBibleStart2) {
-        _gotBibleStart2 = true;
-        showToast("剧本已修改，正在重新提取风格圣经…", "info");
-        chatAddMsg("status", "正在重新提取风格圣经…");
-        chatShowDots();
-      }
-    });
+	      }
+	    });
 
-    var styleBibleReady = _isStyleBibleReadyResponse(resp);
-	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-	      proj.script = resp.script || "";
-	      proj.scriptDraft = resp.script || "";
-	      proj.scriptApproved = false;
-      _applyStyleBibleResponse(proj, resp);
-      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
-      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
-    });
+		    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+		      proj.script = resp.script || "";
+		      proj.scriptDraft = resp.script || "";
+		      proj.scriptApproved = false;
+	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
+	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
+	    });
 
     if (isCurrent) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
@@ -1378,17 +1648,12 @@ export async function reviseScript(instruction) {
       if (stepEl2) stepEl2.hidden = true;
       _scrollChatToBottom();
       _updateScriptInputPlaceholder();
-	      chatRemoveDots();
-	      if (styleBibleReady) {
-	        chatAddMsg("status", '<span class="chat-status-ok">新版剧本已生成，初版风格已更新；请确认剧本后到「风格制定」页检查</span>');
-	        _showScriptConfirmArea();
-	      } else {
-	        var bibleErr = _styleBibleErrorText(resp);
-	        _hideScriptConfirmArea();
-	        chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(bibleErr) + '，请到「风格制定」页重新提取</span>');
-	      }
-      renderEmotionSegments();
-    }
+		      chatRemoveDots();
+      _showScriptConfirmArea();
+      chatAddMsg("status", '<span class="chat-status-ok">新版剧本已生成，点击确认剧本后开始制定画面风格。</span>');
+	      renderEmotionSegments();
+	      renderScriptAnalysis();
+		    }
   } catch (e) {
     if (stepEl2) stepEl2.hidden = true;
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }

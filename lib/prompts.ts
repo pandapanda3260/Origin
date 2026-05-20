@@ -10,6 +10,8 @@
  */
 
 import type { ChatMessage } from './llm';
+import type { StyleConstraints } from './style-template-constraints';
+import { formatWorldContextForPrompt, type WorldContext } from './world-template-context';
 import {
   buildReferenceManifestPromptBlock,
   cleanDialogueCharCountFromText,
@@ -373,9 +375,18 @@ export const SP_STYLE_BIBLE = `${COMMON_RULES}
     {"hex": "#十六进制颜色6", "name": "中文色名6"}
   ],
   "era": "时代与氛围（80-120字，详细描述：时代背景、地点环境、空间质感、时间段，如'当代城市海鲜自助餐厅打烊后的后场时段'）",
-  "mood": "情绪基调（30-80字，描述整体情绪走向和节奏感，如'轻松诙谐、鲜活热闹、带有职场复盘喜剧感'）",
-  "cameraStyle": "镜头风格（80-150字，详细描述：景别偏好、运镜方式、剪辑节奏、构图特点）",
-  "worldRules": "世界观规则（150-250字，详细描述：故事发生的世界规则、物理规则、人物设定基础、风格化程度。例：'故事发生在一家现实风格的海鲜自助餐厅内，空间、食材陈列、自助台、灯光和后厨秩序都遵循真实餐饮环境逻辑。海鲜以拟人化员工身份存在，能站立、说话、表达情绪，但仍保留各自食材的外形、质感和鲜度特征，不能完全变成人类。'）",
+	  "mood": "情绪基调（30-80字，描述整体情绪走向和节奏感，如'轻松诙谐、鲜活热闹、带有职场复盘喜剧感'）",
+	  "cameraStyle": "镜头风格（80-150字，详细描述：景别偏好、运镜方式、剪辑节奏、构图特点）",
+	  "lighting": "光线设计（40-100字，只写光源方向、软硬、明暗对比、轮廓光/补光，不重复整体风格）",
+	  "texture": "画面质感（30-80字，只写材质、颗粒、表面触感、空气感，不重复光线）",
+	  "editingRhythm": "剪辑节奏（30-80字，只写节奏、转场、停顿、快慢关系，不重复镜头景别）",
+	  "negativePrompt": "禁止项 / 负向约束（用分号分隔，写会破坏画面风格的一组禁止元素）",
+	  "additionalPrompt": "正向增强提示（用分号分隔，写需要额外强化的画面关键词）",
+	  "audio": "音频风格（预留字段，描述音乐/音效气质；如没有明确依据可留空）",
+	  "subtitleStyle": "字幕风格（预留字段，描述字体/位置/动效；如没有明确依据可留空）",
+	  "aspectRatio": "画幅比例（必须是 16:9 / 9:16 / 1:1 之一）",
+	  "compositionGuidance": "构图指导（80-150字，必须结合画幅比例说明主体、景别、运镜和空间调度）",
+	  "worldRules": "世界观规则（150-250字，详细描述：故事发生的世界规则、物理规则、人物设定基础、风格化程度。例：'故事发生在一家现实风格的海鲜自助餐厅内，空间、食材陈列、自助台、灯光和后厨秩序都遵循真实餐饮环境逻辑。海鲜以拟人化员工身份存在，能站立、说话、表达情绪，但仍保留各自食材的外形、质感和鲜度特征，不能完全变成人类。'）",
   "characters": [
     {
       "name": "角色名（如：老周）",
@@ -399,16 +410,298 @@ export const SP_STYLE_BIBLE = `${COMMON_RULES}
   · 描述要服务于画面绘制，避免笼统词（不要写"普通的衣服"，要写"黑色T恤、深色防水围裙"）
   · 至少 1 个角色，最多 6 个
 
-【约束】
-  · era / cameraStyle / worldRules 必须**详细饱满**，因为这些描述会直接驱动后续画面生成
-  · 视觉描述要紧扣剧本内容，避免泛泛而谈
-  · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要 "好的" 这种开场白）`;
+	【约束】
+	  · era / cameraStyle / worldRules 必须**详细饱满**，因为这些描述会直接驱动后续画面生成
+	  · 视觉描述要紧扣剧本内容，避免泛泛而谈
+	  · 剧本是事实来源；风格模板只提供视觉约束，不得复制模板角色或世界观事实
+	  · 如果存在模板锚定字段，请基于这些字段生成其他字段，不要改变锚定字段本身；如果偏离，后处理会强制覆盖你的输出
+	  · 如果不存在模板锚定字段，可基于剧本和世界观上下文合理推断视觉方向，但不要凭空生成模板级硬约束
+	  · 世界观上下文只提供内容语境；当风格模板锚定字段存在时，世界观不得影响 colorPalette / cameraStyle / mood / lighting / texture / visualStyleDesc / negativePrompt / additionalPrompt
+	  · characters 只包含剧本中真实出现的角色；如果与世界观候选池匹配，可借用候选池视觉描述；禁止添加剧本未出现的候选角色
+	  · 字段边界：visualStyleDesc 写整体视觉，不写光线/质感细节；lighting 只写光源、方向、软硬和对比；texture 只写材质/颗粒/表面质感；editingRhythm 只写剪辑节奏和转场；negativePrompt 只写禁止项；additionalPrompt 只写正向增强提示
+	  · aspectRatio 必须影响 compositionGuidance：
+	    - 9:16：强调纵向主体、近景/中景占比更高、减少宽横幅构图、大横摇和多人横向铺陈
+	    - 16:9：适合横向叙事、大全景、横摇、跟拍、空间关系和群像调度
+	    - 1:1：强调中心构图、对称关系、主体聚焦、减少极宽景别
+	  · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要 "好的" 这种开场白）`;
 
-export function buildStyleBibleMessages(scriptText: string): ChatMessage[] {
+export function buildStyleBibleMessages(scriptText: string, opts: {
+  aspectRatio?: string;
+  constraints?: StyleConstraints;
+  worldContext?: WorldContext;
+  creatorProfile?: any;
+} = {}): ChatMessage[] {
+  const ctx: string[] = [];
+  ctx.push(`剧本：\n${scriptText}`);
+  if (opts.aspectRatio) ctx.push(`目标画幅：${opts.aspectRatio}`);
+  const constraintsText = formatStyleConstraintsForPrompt(opts.constraints);
+  if (constraintsText) ctx.push(constraintsText);
+  const worldText = formatWorldContextForPrompt(opts.worldContext);
+  if (worldText) ctx.push(worldText);
+  if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
+    ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
+  }
   return [
     { role: 'system', content: SP_STYLE_BIBLE },
-    { role: 'user', content: `剧本：\n${scriptText}` },
+    { role: 'user', content: ctx.join('\n\n') },
   ];
+}
+
+export type StyleBibleStageName =
+  | 'core'
+  | 'characters'
+  | 'visual'
+  | 'visual_palette'
+  | 'visual_prompts'
+  | 'visual_lens'
+  | 'production';
+
+const STYLE_BIBLE_STAGE_COMMON = `${COMMON_RULES}
+
+【你的角色】风格圣经分段生成器。
+【总原则】
+  · 只输出当前阶段要求的 JSON 字段，不要输出其他字段。
+  · 剧本是事实来源；风格模板只提供视觉约束，不得复制模板角色或世界观事实。
+  · 已有草稿是上游阶段结论，当前阶段必须与它保持一致。
+  · 不要输出 markdown 围栏、解释、寒暄或 JSON 之外的任何内容。`;
+
+export const SP_STYLE_BIBLE_CORE = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】core：确定整支片子的基础风格合同。
+【输出严格 JSON】
+{
+  "visualStyle": "3-6个中文风格关键词，用 / 分隔",
+  "visualStyleDesc": "30-50字，描述整体视觉，不写光线/质感细节",
+  "era": "60-100字，描述时代、地点、空间质感、时间段",
+  "mood": "25-45字，描述整体情绪走向和节奏感",
+  "worldRules": "100-160字，描述世界规则、人物存在方式、风格化程度"
+}
+
+【约束】
+  · 这一段只做基础判断，不输出角色、色板、镜头、声音或字幕。
+  · worldRules 必须来自剧本和世界观上下文，不能添加剧本未出现的设定。`;
+
+export const SP_STYLE_BIBLE_CHARACTERS = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】characters：提取画面中真实亮相的角色视觉设定。
+【输出严格 JSON】
+{
+  "characters": [
+    {
+      "name": "角色名",
+      "appearance": "25-45字，年龄/体型/神态/外形特征",
+      "clothing": "20-35字，具体衣物、颜色、材质或职业痕迹"
+    }
+  ]
+}
+
+【约束】
+  · 只包含剧本中有画面亮相的角色，旁白者不算。
+  · 至少 1 个，最多 6 个。
+  · 可以借用世界观候选池的视觉描述，但禁止添加剧本未出现角色。`;
+
+export const SP_STYLE_BIBLE_VISUAL = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】visual：生成视觉执行层字段。
+【输出严格 JSON】
+{
+  "colorPalette": [
+    {"hex": "#E8D5B7", "name": "中文色名"},
+    {"hex": "#AABBCC", "name": "中文色名"}
+  ],
+  "cameraStyle": "50-90字，描述景别偏好、运镜方式、镜头语言",
+  "compositionGuidance": "50-90字，结合目标画幅描述主体位置、景别、运镜和空间调度",
+  "lighting": "30-60字，只写光源方向、软硬、明暗对比、轮廓光/补光",
+  "texture": "25-50字，只写材质、颗粒、表面触感、空气感",
+  "negativePrompt": "5-10个禁止项，用分号分隔",
+  "additionalPrompt": "5-10个正向增强关键词，用分号分隔"
+}
+
+【colorPalette 要求】
+  · 优先输出 6 个颜色；如果模板锚定只有 5 个，也至少输出 5 个。
+  · 每个颜色必须包含有效 hex 和 2-4 字中文色名。
+  · 禁止英文色名；颜色必须服务剧本场景、情绪、人物服装和核心风格。
+
+【约束】
+  · cameraStyle 与 compositionGuidance 必须互相一致。
+  · aspectRatio 不作为输出字段；但必须影响 compositionGuidance。`;
+
+export const SP_STYLE_BIBLE_VISUAL_PALETTE = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】visual_palette：只生成配色方案。
+【输出严格 JSON】
+{
+  "colorPalette": [
+    {"hex": "#E8D5B7", "name": "中文色名"},
+    {"hex": "#AABBCC", "name": "中文色名"}
+  ]
+}
+
+【约束】
+  · 优先输出 6 个颜色；如果模板锚定只有 5 个，也至少输出 5 个。
+  · 每个颜色必须包含有效 hex 和 2-4 字中文色名，禁止英文色名。
+  · 只输出 colorPalette；不要输出 negativePrompt、additionalPrompt 或镜头字段。`;
+
+export const SP_STYLE_BIBLE_VISUAL_PROMPTS = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】visual_prompts：只生成画面 prompt 约束。
+【输出严格 JSON】
+{
+  "negativePrompt": "5-10个禁止项，用分号分隔",
+  "additionalPrompt": "5-10个正向增强关键词，用分号分隔"
+}
+
+【约束】
+  · 必须基于 core、characters、visual_palette 草稿一致地推断。
+  · colorPalette 已存在，不要重新生成或复述色板。
+  · negativePrompt 只列禁止项；additionalPrompt 只列正向增强。
+  · 不要输出 cameraStyle、compositionGuidance、lighting、texture 或 aspectRatio。`;
+
+export const SP_STYLE_BIBLE_VISUAL_LENS = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】visual_lens：只生成镜头、构图、光线、质感。
+【输出严格 JSON】
+{
+  "cameraStyle": "50-90字，描述景别偏好、运镜方式、镜头语言",
+  "compositionGuidance": "50-90字，结合目标画幅描述主体位置、景别、运镜和空间调度",
+  "lighting": "30-60字，只写光源方向、软硬、明暗对比、轮廓光/补光",
+  "texture": "25-50字，只写材质、颗粒、表面触感、空气感"
+}
+
+【约束】
+  · cameraStyle 与 compositionGuidance 必须互相一致。
+  · aspectRatio 不作为输出字段；但必须影响 compositionGuidance。`;
+
+export const SP_STYLE_BIBLE_PRODUCTION = `${STYLE_BIBLE_STAGE_COMMON}
+
+【当前阶段】production：补齐剪辑、声音、字幕、旁白/对白。
+【输出严格 JSON】
+{
+  "editingRhythm": "25-50字，只写节奏、转场、停顿、快慢关系",
+  "audio": "20-40字，描述音乐、环境声、音效气质",
+  "subtitleStyle": "15-35字，描述字体、位置、出现方式或动效",
+  "dialogueStyle": "20-45字，描述旁白/对白的口吻、密度、节奏和信息边界"
+}
+
+【约束】
+  · 四个字段都必须填写，不允许留空或写“待补充”。
+  · 声音/字幕/对白必须服务 core 和 visual 草稿，不能另起一种风格。`;
+
+export function buildStyleBibleStageMessages(scriptText: string, opts: {
+  stage: StyleBibleStageName;
+  aspectRatio?: string;
+  constraints?: StyleConstraints;
+  worldContext?: WorldContext;
+  creatorProfile?: any;
+  draft?: any;
+}): ChatMessage[] {
+  const ctx = buildStyleBibleStageContext(scriptText, opts);
+  return [
+    { role: 'system', content: styleBibleStageSystemPrompt(opts.stage) },
+    { role: 'user', content: ctx.join('\n\n') },
+  ];
+}
+
+export function buildStyleBibleCoreMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'core' });
+}
+
+export function buildStyleBibleCharactersMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'characters' });
+}
+
+export function buildStyleBibleVisualMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'visual' });
+}
+
+export function buildStyleBibleVisualPaletteMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'visual_palette' });
+}
+
+export function buildStyleBibleVisualPromptsMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'visual_prompts' });
+}
+
+export function buildStyleBibleVisualLensMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'visual_lens' });
+}
+
+export function buildStyleBibleProductionMessages(scriptText: string, opts: Omit<Parameters<typeof buildStyleBibleStageMessages>[1], 'stage'> = {}) {
+  return buildStyleBibleStageMessages(scriptText, { ...opts, stage: 'production' });
+}
+
+function styleBibleStageSystemPrompt(stage: StyleBibleStageName): string {
+  if (stage === 'core') return SP_STYLE_BIBLE_CORE;
+  if (stage === 'characters') return SP_STYLE_BIBLE_CHARACTERS;
+  if (stage === 'visual_palette') return SP_STYLE_BIBLE_VISUAL_PALETTE;
+  if (stage === 'visual_prompts') return SP_STYLE_BIBLE_VISUAL_PROMPTS;
+  if (stage === 'visual_lens') return SP_STYLE_BIBLE_VISUAL_LENS;
+  if (stage === 'production') return SP_STYLE_BIBLE_PRODUCTION;
+  return SP_STYLE_BIBLE_VISUAL;
+}
+
+function buildStyleBibleStageContext(scriptText: string, opts: {
+  stage: StyleBibleStageName;
+  aspectRatio?: string;
+  constraints?: StyleConstraints;
+  worldContext?: WorldContext;
+  creatorProfile?: any;
+  draft?: any;
+}) {
+  const ctx: string[] = [];
+  ctx.push(`剧本：\n${scriptText}`);
+  ctx.push(`当前阶段：${opts.stage}`);
+  if (opts.aspectRatio) ctx.push(`目标画幅：${opts.aspectRatio}（只用于构图判断，不要输出 aspectRatio 字段）`);
+  if (opts.draft && Object.keys(opts.draft).length) {
+    ctx.push(`已有风格圣经草稿：\n${JSON.stringify(opts.draft, null, 2)}`);
+  }
+  const constraintsText = formatStyleConstraintsForPrompt(opts.constraints);
+  if (constraintsText) ctx.push(constraintsText);
+  const worldText = formatWorldContextForPrompt(opts.worldContext);
+  if (worldText) ctx.push(worldText);
+  if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
+    ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
+  }
+  return ctx;
+}
+
+function formatStyleConstraintsForPrompt(constraints?: StyleConstraints): string {
+  if (!constraints) return '';
+  const anchor: Record<string, any> = {};
+  const reference: Record<string, any> = {};
+  const reserved: Record<string, any> = {};
+  for (const key of ['colorPalette', 'cameraStyle', 'mood', 'negativePrompt', 'additionalPrompt'] as const) {
+    const value = constraints.anchor?.[key];
+    if (Array.isArray(value) ? value.length : String(value || '').trim()) anchor[key] = value;
+  }
+  for (const key of ['lighting', 'texture', 'editingRhythm'] as const) {
+    const value = constraints.reference?.[key];
+    if (String(value || '').trim()) reference[key] = value;
+  }
+  for (const key of ['audio', 'subtitleStyle', 'dialogueStyle'] as const) {
+    const value = constraints.reserved?.[key];
+    if (String(value || '').trim()) reserved[key] = value;
+  }
+  const parts: string[] = [];
+  if (Object.keys(anchor).length) {
+    parts.push(
+      '模板锚定字段（请严格复用，不要改变；若你偏离，后处理会强制覆盖）：\n' +
+        JSON.stringify(anchor, null, 2),
+    );
+  }
+  if (Object.keys(reference).length) {
+    parts.push(
+      '模板参考字段（用于补齐或启发 lighting / texture / editingRhythm，不要覆盖用户控制项）：\n' +
+        JSON.stringify(reference, null, 2),
+    );
+  }
+  if (Object.keys(reserved).length) {
+    parts.push(
+      '模板预留字段（可写入 styleBible，但当前主要用于展示/未来模块）：\n' +
+        JSON.stringify(reserved, null, 2),
+    );
+  }
+  return parts.join('\n\n');
 }
 
 /* =====================================================
@@ -485,6 +778,86 @@ export function buildRetagMessages(scriptText: string, totalDurationSec?: number
   if (totalDurationSec) ctx.push(`总时长 ${totalDurationSec} 秒，按时长比例划分时间区间。`);
   return [
     { role: 'system', content: SP_RETAG_EMOTIONS },
+    { role: 'user', content: ctx.join('\n\n') },
+  ];
+}
+
+export const SP_SCRIPT_ANALYSIS = `${COMMON_RULES}
+
+【你的角色】资深短视频编剧策划，只做"剧本阅读分析"，不改写剧本，不输出生成提示词。
+
+【任务】从当前剧本中提炼给创作者看的重点信息。这个分析只用于 UI 展示，不参与资产、镜头、分镜图或视频生成。
+
+【输出严格 JSON】
+{
+  "core": {
+    "logline": "一句话梗概，30-60字",
+    "conflict": "主冲突，30-70字",
+    "audiencePromise": "观众期待点/看点承诺，30-70字"
+  },
+  "pacing": [
+    {
+      "label": "铺垫/升温/高潮/回落/余韵中的一个",
+      "emotion": "setup/rising/climax/falling/resolution 中的一个",
+      "intensity": 3,
+      "pacing": "slow/steady/fast/burst 中的一个",
+      "note": "该段的节奏和情绪说明，20-45字"
+    }
+  ],
+  "characters": [
+    {
+      "name": "角色名",
+      "role": "戏剧功能，如主角/对手/见证者/推动反转者",
+      "desire": "角色想要什么，12-28字",
+      "pressure": "角色承受的阻力，12-28字"
+    }
+  ],
+  "keyBeats": [
+    {
+      "title": "看点标题，4-10字",
+      "detail": "剧情转折/爽点/反转/情绪爆点，25-55字"
+    }
+  ],
+  "notes": [
+    "给创作者的阅读提醒，20-45字"
+  ]
+}
+
+【数量约束】
+  · pacing 必须 3-5 条，优先贴合五段式结构
+  · intensity 必须是 1-5 整数，值越大情绪越强；尽量反映节奏起伏，不要每段都填相同值
+  · characters 1-5 条，只保留有戏剧功能的人物/拟人角色
+  · keyBeats 3-5 条，按剧情出现顺序排列
+  · notes 1-3 条，只写阅读提醒，不要写技术执行建议
+
+【边界】
+  · 不要输出视觉风格、镜头提示词、资产描述、分镜生成提示词
+  · 不要提到"我认为""可以考虑"这类空泛表达
+  · 不要编造剧本中没有的核心设定`;
+
+export function buildScriptAnalysisMessages(opts: {
+  scriptText: string;
+  totalDurationSec?: number | null;
+  styleBible?: any;
+  emotionSegments?: any[];
+}): ChatMessage[] {
+  const ctx = [`剧本：\n${opts.scriptText}`];
+  if (opts.totalDurationSec) ctx.push(`目标时长：${opts.totalDurationSec} 秒`);
+  if (opts.styleBible) {
+    const styleSummary = {
+      visualStyle: opts.styleBible.visualStyle || opts.styleBible.vision,
+      mood: opts.styleBible.mood || opts.styleBible.tone,
+      characters: Array.isArray(opts.styleBible.characters)
+        ? opts.styleBible.characters.map((c: any) => ({ name: c?.name, role: c?.role || c?.description })).slice(0, 6)
+        : [],
+    };
+    ctx.push(`已有风格/角色摘要（仅辅助识别角色，不要输出视觉提示词）：\n${JSON.stringify(styleSummary)}`);
+  }
+  if (Array.isArray(opts.emotionSegments) && opts.emotionSegments.length) {
+    ctx.push(`已有情绪段（可参考，不要机械照抄）：\n${JSON.stringify(opts.emotionSegments.slice(0, 5))}`);
+  }
+  return [
+    { role: 'system', content: SP_SCRIPT_ANALYSIS },
     { role: 'user', content: ctx.join('\n\n') },
   ];
 }
@@ -586,30 +959,37 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
   · imagePrompt 必须英文且不能为空。
   · 不要输出任何 JSON 之外的内容。`;
 
-export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any): ChatMessage[] {
+export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any, worldTemplate?: any): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_CHARACTERS_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, undefined, worldTemplate) },
   ];
 }
 
-export function buildAssetScenesExtractMessages(scriptText: string, styleBible: any, characters: any[]): ChatMessage[] {
+export function buildAssetScenesExtractMessages(scriptText: string, styleBible: any, characters: any[], worldTemplate?: any): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_SCENES_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldTemplate) },
   ];
 }
 
-export function buildAssetPropsExtractMessages(scriptText: string, styleBible: any, characters: any[]): ChatMessage[] {
+export function buildAssetPropsExtractMessages(scriptText: string, styleBible: any, characters: any[], worldTemplate?: any): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_PROPS_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldTemplate) },
   ];
 }
 
-function buildAssetContext(scriptText: string, styleBible?: any, characters?: any[]): string {
+function buildAssetContext(scriptText: string, styleBible?: any, characters?: any[], worldTemplate?: any): string {
   const parts = [`剧本：\n${scriptText}`];
   if (styleBible) parts.push(`风格圣经：${JSON.stringify(styleBible)}`);
+  if (worldTemplate) {
+    parts.push([
+      '世界观模板候选池（只作内容匹配参考，不覆盖剧本事实）：',
+      JSON.stringify(worldTemplate),
+      '复用规则：只有名称、身份、语境都匹配时才复用候选池里的角色/地点/道具定义；若剧本与候选池冲突，以剧本为准；剧本出现新对象时允许新建。',
+    ].join('\n'));
+  }
   if (characters && characters.length) parts.push(`已识别角色，只能引用这些 id：${JSON.stringify(characters)}`);
   return parts.join('\n\n');
 }
@@ -1016,9 +1396,17 @@ export function buildVideoPromptMessages(opts: {
       cameraStyle: sb.cameraStyle,
       mood: sb.mood || sb.tone,
       lighting: sb.lighting,
+      texture: sb.texture,
+      editingRhythm: sb.editingRhythm,
       audio: sb.audio || sb.audioStyle,
+      additionalPrompt: sb.additionalPrompt,
+      negativePrompt: sb.negativePrompt || sb.videoNegativePrompt,
     };
     parts.push(`风格圣经：${JSON.stringify(sbCondensed)}`);
+    if (sb.additionalPrompt) parts.push(`风格正向增强提示（必须体现在画面与镜头描述中）：${sb.additionalPrompt}`);
+    if (sb.negativePrompt || sb.videoNegativePrompt) {
+      parts.push(`风格负向约束（禁止出现在最终视频提示词中）：${sb.negativePrompt || sb.videoNegativePrompt}`);
+    }
   }
 
   // 4) 旁白/台词（仅本组涉及的）
@@ -1052,10 +1440,30 @@ export const SP_VIDEO_PROMPT_REFINE = `${COMMON_RULES}
   · 输出依然是与原版同样结构的中文视频提示词，纯文本
   · 不要解释，不要 markdown，直接输出新的 prompt`;
 
-export function buildRefineMessages(currentPrompt: string, instruction: string): ChatMessage[] {
+export const SP_VIDEO_PROMPT_REFINE_SANITIZE = `${COMMON_RULES}
+
+【任务】根据用户的"修改意图"对现有视频提示词做敏感词安全替换。
+【约束】
+  · 只替换用户明确列出的敏感词或高风险表达，改成更温和、可过审、语义接近的表达
+  · 本次允许在台词、角色描述、场景、动作或约束段中替换这些敏感词；这是唯一允许覆盖"台词逐字保留"规则的情况
+  · 除敏感词替换外，严禁修改时间轴、运镜、角色 ID、角色身份、参考图编号、段落结构和原有叙事含义
+  · 不得新增台词、删除台词、合并段落或扩写内容；只做必要的词级/短语级替换
+  · 输出依然是与原版同样结构的中文视频提示词，纯文本
+  · 不要解释，不要 markdown，直接输出新的 prompt`;
+
+export function buildRefineMessages(
+  currentPrompt: string,
+  instruction: string,
+  immutableFactsBlock = '',
+  options: { guardMode?: 'strict' | 'off' } = {},
+): ChatMessage[] {
+  const facts = immutableFactsBlock.trim();
+  const systemPrompt = options.guardMode === 'off'
+    ? SP_VIDEO_PROMPT_REFINE_SANITIZE
+    : SP_VIDEO_PROMPT_REFINE;
   return [
-    { role: 'system', content: SP_VIDEO_PROMPT_REFINE },
-    { role: 'user', content: `当前提示词：\n${currentPrompt}\n\n修改意图：${instruction}` },
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: `当前提示词：\n${currentPrompt}\n\n修改意图：${instruction}${facts ? `\n\n${facts}` : ''}` },
   ];
 }
 

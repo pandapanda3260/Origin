@@ -39,6 +39,7 @@ function loadSafeImageGen(contentSanitize) {
   const moduleObj = { exports: {} };
   function localRequire(id) {
     if (id === './content-sanitize') return contentSanitize;
+    if (id === './content-flags') return { recordContentFlag: () => null };
     if (id === './image-gen') {
       return {
         generateImage: async () => { throw new Error('test should inject generateImageImpl'); },

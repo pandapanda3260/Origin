@@ -14,15 +14,21 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
+import { recordModelCallEvent } from './model-routing';
 import { getDb } from './db';
 import type { UserRow } from './db';
 import { fetchViaProxy } from './proxy-fetch';
+import { getDataDir } from './runtime-paths';
+import { DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT, getGlobalImageConcurrencyLimit } from './system-config';
 
 export type ImageGenInput = {
   prompt: string;
   size?: '1024x1024' | '1024x1536' | '1536x1024' | '512x512' | '512x768' | '768x512';
   style?: 'natural' | 'vivid' | 'pencil' | 'photographic';
   quality?: 'low' | 'medium' | 'high' | 'auto' | 'standard' | 'hd';
+  styleLockApplied?: boolean;
+  styleBackdropColor?: string;
+  imageAuditMetadata?: Record<string, any>;
   // 用于持久化分类
   kind: 'character' | 'scene' | 'prop' | 'storyboard' | 'other';
   // 角色生成时区分人 / 非人（如海鲜拟人、机甲、动物）。
@@ -63,7 +69,7 @@ export type ImageGenResult = {
   mode: 'real' | 'fake';
 };
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const IMAGES_DIR = join(DATA_DIR, 'images');
 mkdirSync(IMAGES_DIR, { recursive: true });
 
@@ -109,8 +115,13 @@ let imageSubmitActive = 0;
 const imageSubmitQueue: Array<() => void> = [];
 
 function imageSubmitConcurrency(): number {
-  const fallback = envInt('IMAGE_GEN_SUBMIT_CONCURRENCY', 2, 1, 3);
-  return envInt('IMAGE_SUBMIT_CONCURRENCY', fallback, 1, 3);
+  const fallback = envInt(
+    'IMAGE_SUBMIT_CONCURRENCY',
+    envInt('IMAGE_GEN_SUBMIT_CONCURRENCY', DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT, 1, 8),
+    1,
+    8,
+  );
+  return getGlobalImageConcurrencyLimit(fallback);
 }
 
 async function acquireImageSubmitPermit(label: string): Promise<() => void> {
@@ -178,16 +189,93 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     writeFileSync(fullPath, placeholder);
     bytes = placeholder.length;
     mode = 'fake';
+    recordModelCallEvent({
+      cfg,
+      slot: 'image',
+      status: 'ok',
+      latencyMs: 0,
+      fallbackUsed: true,
+      traceName: input.kind,
+      message: 'image fake fallback',
+    });
   } else {
+    const generated = await generateRealImageBuffer(cfg, input, finalPrompt, w, h);
+    writeFileSync(fullPath, generated.buffer);
+    bytes = generated.buffer.length;
+    width = generated.width;
+    height = generated.height;
+  }
+
+  // 落 DB
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style, correlation_id)
+     VALUES (?, ?, ?, ?, ?, ?, 'image/png', ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    user.id,
+    input.projectId || null,
+    input.kind,
+    input.assetRef || null,
+    filename,
+    bytes,
+    width,
+    height,
+    finalPrompt.slice(0, 4000),
+    input.style || null,
+    input.correlationId || null,
+  );
+
+  return {
+    id,
+    url: `/api/images/file/${id}`,
+    width,
+    height,
+    bytes,
+    mode,
+  };
+}
+
+function parseSize(s: string): [number, number] {
+  const m = /^(\d+)x(\d+)$/i.exec(String(s || '').replace(/[×X]/g, 'x'));
+  if (m) return [Number(m[1]), Number(m[2])];
+  return [1024, 1024];
+}
+
+type ImageRuntimeConfig = ReturnType<typeof resolveLLMConfig>;
+
+type RealImageBufferResult = {
+  buffer: Buffer;
+  width: number;
+  height: number;
+};
+
+async function generateRealImageBuffer(
+  primaryCfg: ImageRuntimeConfig,
+  input: ImageGenInput,
+  finalPrompt: string,
+  initialWidth: number,
+  initialHeight: number,
+): Promise<RealImageBufferResult> {
+  const fallbackConfigs = (primaryCfg.fallbackConfigs || []).filter((cfg) => cfg.mode === 'real' && !!cfg.apiKey);
+  const fallbackAfter = envInt('IMAGE_FALLBACK_AFTER_FAILURES', 2, 1, 10);
+  const configs = [primaryCfg, ...fallbackConfigs];
+  const allRefPaths = collectImagePaths(input).filter((p) => existsSync(p));
+  let primaryFailures = 0;
+  let lastErr: any = null;
+
+  for (let cfgIndex = 0; cfgIndex < configs.length; cfgIndex += 1) {
+    const cfg = configs[cfgIndex];
+    const isFallback = cfgIndex > 0;
     const t0 = Date.now();
     const modelName = cfg.model || 'gpt-image-1';
-    // P3a 多图: 先把所有 ref paths 归并出来, 后续 seedream / gpt-image edit 分支都从这里取。
-    const allRefPaths = collectImagePaths(input).filter((p) => existsSync(p));
+    let width = initialWidth;
+    let height = initialHeight;
+
     // 是否走 image-edit（参考图 → 同地点不同角度 / 同角色不同动作）
     // 兼容性：gpt-image-1 / gpt-image-2 / dall-e-2 都支持 /v1/images/edits，
     // dall-e-3 不支持（只有 generations）。如果调方给了参考图但模型不支持，
-    // 会 fallback 到普通 generations + 文本 prompt（色调/构图至少有 styleBible
-    // lock 兜底）。
+    // 会 fallback 到普通 generations + 文本 prompt（色调/构图至少有 styleBible lock 兜底）。
     const editSupported = (() => {
       const m = (modelName || '').toLowerCase();
       return m.includes('gpt-image') || m.includes('dall-e-2');
@@ -196,6 +284,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     if (allRefPaths.length && !editSupported) {
       console.warn(`[image-gen] reference image(s) provided but model ${modelName} does not support edits — falling back to text-only generation`);
     }
+
     // 实际提交给 provider 的 ref 张数, 受 capability 上限裁剪。
     const capImage = cfg.capabilities?.image;
     const multiRefCap = capImage ? Math.max(0, Math.floor(capImage.multiRefImage || 0)) : 1;
@@ -206,12 +295,13 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         `[image-gen] capability caps multiRefImage=${multiRefCap}, dropped ${allRefPaths.length - effectiveRefPaths.length} ref image(s)`,
       );
     }
+
     const q = pickQuality(modelName, cfg.imageQuality || input.quality);
     const requestTimeoutMs = cfg.timeoutMs || 240_000;
 
     // 失败重试，专门针对中转站常见的 timeout / 502 / 503 / 504 / 429。
-    // 4xx（除 429）与 401/403 视为永久错误，立刻抛出，避免无意义浪费积分。
-    // 429 限流通常需要等下一个配额窗口，使用更长退避并尊重 Retry-After。
+    // 如果配置了 fallback，则主通道累计失败到 IMAGE_FALLBACK_AFTER_FAILURES 次后，
+    // 立即切到备用 provider（默认 Seedream），避免把用户卡在 GPT-image-2 长重试里。
     const TRANSIENT_MAX_ATTEMPTS = envInt('IMAGE_GEN_TRANSIENT_MAX_ATTEMPTS', 3, 1, 6);
     const NETWORK_MAX_ATTEMPTS = envInt('IMAGE_GEN_NETWORK_MAX_ATTEMPTS', 5, 1, 8);
     const RATE_LIMIT_MAX_ATTEMPTS = envInt('IMAGE_GEN_429_MAX_ATTEMPTS', 5, 1, 8);
@@ -221,9 +311,16 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     const NETWORK_MAX_DELAY_MS = envInt('IMAGE_GEN_NETWORK_RETRY_MAX_MS', 90_000, 1_000, 300_000);
     const RETRY_DEADLINE_MS = envInt('IMAGE_GEN_RETRY_DEADLINE_MS', 120_000, 10_000, 600_000);
     const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
-    const MAX_ATTEMPTS = Math.max(TRANSIENT_MAX_ATTEMPTS, RATE_LIMIT_MAX_ATTEMPTS, NETWORK_MAX_ATTEMPTS);
-    let lastErr: any = null;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const fallbackAttemptFloor = !isFallback && fallbackConfigs.length ? fallbackAfter : 1;
+    const MAX_ATTEMPTS = Math.max(
+      fallbackAttemptFloor,
+      TRANSIENT_MAX_ATTEMPTS,
+      RATE_LIMIT_MAX_ATTEMPTS,
+      NETWORK_MAX_ATTEMPTS,
+    );
+    let switchedToFallback = false;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       // 单次调用超时由平台 env 控制；未配置时保留原来的 240s。
       const remainingBudget = retryDeadlineAt - Date.now();
       if (remainingBudget <= 0) {
@@ -234,7 +331,9 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       const tA = Date.now();
       let releaseSubmitPermit: null | (() => void) = null;
       try {
-        releaseSubmitPermit = await acquireImageSubmitPermit(`${input.kind}:${input.assetRef || 'unscoped'}:attempt${attempt}`);
+        releaseSubmitPermit = await acquireImageSubmitPermit(
+          `${input.kind}:${input.assetRef || 'unscoped'}:${cfg.provider}:attempt${attempt}`,
+        );
         const submitRemainingBudget = retryDeadlineAt - Date.now();
         if (submitRemainingBudget <= 0) {
           throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
@@ -247,7 +346,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           const body = buildSeedreamImageBody(cfg, modelName, finalPrompt, input);
           if (effectiveRefPaths.length === 1) {
             // 单图路径: 旧行为, body.image = string (与文档 / 现网一致, 稳定)。
-            body.image = imagePathToDataUrl(effectiveRefPaths[0]);
+            body.image = await buildSeedreamReferenceDataUrl(effectiveRefPaths[0]);
           } else if (effectiveRefPaths.length > 1) {
             if (
               imageTransport === 'unverified_seedream_array' ||
@@ -256,18 +355,22 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
               // Seedream 4.x/5.x 文档声称 image 字段接受数组。unverified_* 前提是
               // scripts/probe-multi-ref-seedream.js 未跑过实测, 默认保守装配;
               // probe 跑通后手动改成 'verified_seedream_array' 消除警告。
-              body.image = effectiveRefPaths.map((p) => imagePathToDataUrl(p));
+              body.image = await Promise.all(effectiveRefPaths.map((p) => buildSeedreamReferenceDataUrl(p)));
             } else {
               console.warn(
                 `[image-gen][seedream] transport='${imageTransport}' not yet wired for multi-image, falling back to single ref (first image only)`,
               );
-              body.image = imagePathToDataUrl(effectiveRefPaths[0]);
+              body.image = await buildSeedreamReferenceDataUrl(effectiveRefPaths[0]);
             }
           }
+          const imagePayloadBytes = Array.isArray(body.image)
+            ? body.image.reduce((sum: number, value: string) => sum + Buffer.byteLength(value, 'utf8'), 0)
+            : (typeof body.image === 'string' ? Buffer.byteLength(body.image, 'utf8') : 0);
           console.log(
             `[image-gen][seedream] start attempt=${attempt} model=${modelName} ` +
               `size=${body.size || '-'} kind=${input.kind} refCount=${effectiveRefPaths.length} ` +
-              `transport=${imageTransport}`,
+              `transport=${imageTransport} refPayloadMB=${(imagePayloadBytes / 1024 / 1024).toFixed(2)}` +
+              `${isFallback ? ' fallback=true' : ''}`,
           );
           resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
             method: 'POST',
@@ -286,7 +389,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           else if (imageTransport === 'verified_openai_multipart_image_files') fieldName = 'image_files[]';
           // 其它情况 (unverified / verified_repeat / single_image) 都用 'image', 重复 append 多次。
           console.log(
-            `[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit refCount=${effectiveRefPaths.length} transport=${imageTransport} field=${fieldName}`,
+            `[image-gen] start attempt=${attempt} model=${modelName} size=${input.size || '1024x1024'} quality=${q || '-'} kind=${input.kind} mode=edit refCount=${effectiveRefPaths.length} transport=${imageTransport} field=${fieldName}${isFallback ? ' fallback=true' : ''}`,
           );
           const fd = new FormData();
           fd.append('model', modelName);
@@ -312,7 +415,9 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
             n: 1,
           };
           if (q) body.quality = q;
-          console.log(`[image-gen] start attempt=${attempt} model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind} mode=generate`);
+          console.log(
+            `[image-gen] start attempt=${attempt} model=${modelName} size=${body.size} quality=${q || '-'} kind=${input.kind} mode=generate${isFallback ? ' fallback=true' : ''}`,
+          );
           resp = await fetchViaProxy(`${cfg.baseUrl}${cfg.imageGenerationEndpoint || '/images/generations'}`, {
             method: 'POST',
             headers: {
@@ -367,12 +472,18 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
           width = normalized.width;
           height = normalized.height;
         }
-        writeFileSync(fullPath, buf);
-        bytes = buf.length;
         const elapsed = Date.now() - t0;
-        console.log(`[image-gen] ok attempt=${attempt} model=${modelName} bytes=${buf.length} elapsed=${elapsed}ms`);
-        lastErr = null;
-        break; // 成功
+        console.log(`[image-gen] ok attempt=${attempt} model=${modelName} bytes=${buf.length} elapsed=${elapsed}ms${isFallback ? ' fallback=true' : ''}`);
+        recordModelCallEvent({
+          cfg,
+          slot: 'image',
+          status: 'ok',
+          latencyMs: elapsed,
+          fallbackUsed: isFallback,
+          traceName: input.kind,
+          meta: { attempt, refCount: effectiveRefPaths.length, transport: imageTransport, fallbackUsed: isFallback },
+        });
+        return { buffer: buf, width, height };
       } catch (e: any) {
         const elapsed = Date.now() - tA;
         const aborted = e?.name === 'AbortError';
@@ -380,8 +491,37 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         const networkTransient = !status && isTransientNetworkError(e);
         const transient = aborted || networkTransient || status === 429 || (status !== undefined && status >= 500 && status < 600);
         const reason = aborted ? `请求超时（>${Math.round(attemptTimeoutMs / 1000)}s 未返回）` : (e?.message || String(e));
-        console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}`);
+        console.warn(`[image-gen] fail attempt=${attempt} model=${modelName} elapsed=${elapsed}ms transient=${transient} reason=${reason}${isFallback ? ' fallback=true' : ''}`);
+        recordModelCallEvent({
+          cfg,
+          slot: 'image',
+          status: status === 429 ? 'rate_limited' : 'failed',
+          statusCode: status || null,
+          errorCode: aborted ? 'timeout' : status ? `http_${status}` : 'network_or_exception',
+          latencyMs: elapsed,
+          fallbackUsed: isFallback,
+          traceName: input.kind,
+          message: reason,
+          meta: { attempt, transient, fallbackUsed: isFallback },
+        });
         lastErr = e;
+
+        if (!isFallback && fallbackConfigs.length) {
+          primaryFailures += 1;
+          if (primaryFailures >= fallbackAfter) {
+            const next = fallbackConfigs[0];
+            console.warn(
+              `[image-gen] switching to fallback provider after ${primaryFailures} primary failure(s): ${next.provider}/${next.model}`,
+            );
+            switchedToFallback = true;
+            break;
+          }
+          if (!transient) {
+            console.log(`[image-gen] retrying primary before fallback failure=${primaryFailures}/${fallbackAfter}`);
+            continue;
+          }
+        }
+
         if (transient) {
           const isRateLimit = status === 429;
           const isNetwork = networkTransient || aborted;
@@ -407,6 +547,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
             continue;
           }
         }
+
         // 永久错误 / 用尽重试次数 → 抛出最终错误（针对常见 status 给人话提示）
         let friendly: string;
         if (status === 429) {
@@ -430,47 +571,12 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
         if (timeoutId) clearTimeout(timeoutId);
       }
     }
-    // 理论上不会走到这里，break 或 throw 二选一
-    if (lastErr) throw new Error('图像生成失败：' + (lastErr?.message || lastErr));
+
+    if (switchedToFallback) continue;
   }
 
-  // 落 DB
-  const db = getDb();
-  db.prepare(
-    `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style, correlation_id)
-     VALUES (?, ?, ?, ?, ?, ?, 'image/png', ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    user.id,
-    input.projectId || null,
-    input.kind,
-    input.assetRef || null,
-    filename,
-    bytes,
-    width,
-    height,
-    finalPrompt.slice(0, 4000),
-    input.style || null,
-    input.correlationId || null,
-  );
-
-  return {
-    id,
-    url: `/api/images/file/${id}`,
-    width,
-    height,
-    bytes,
-    mode,
-  };
+  throw new Error('图像生成失败：' + (lastErr?.message || lastErr || 'primary_and_fallback_failed'));
 }
-
-function parseSize(s: string): [number, number] {
-  const m = /^(\d+)x(\d+)$/i.exec(String(s || '').replace(/[×X]/g, 'x'));
-  if (m) return [Number(m[1]), Number(m[2])];
-  return [1024, 1024];
-}
-
-type ImageRuntimeConfig = ReturnType<typeof resolveLLMConfig>;
 
 function buildSeedreamImageBody(
   cfg: ImageRuntimeConfig,
@@ -551,6 +657,41 @@ function imagePathToDataUrl(imagePath: string): string {
   return `data:${mime};base64,${readFileSync(imagePath).toString('base64')}`;
 }
 
+async function buildSeedreamReferenceDataUrl(imagePath: string): Promise<string> {
+  const source = readFileSync(imagePath);
+  const originalBytes = source.length;
+  const maxEdge = envInt('IMAGE_REFERENCE_MAX_EDGE', 1536, 512, 4096);
+  const quality = envInt('IMAGE_REFERENCE_JPEG_QUALITY', 86, 50, 95);
+  const canvasMod: any = await import('@napi-rs/canvas').catch(() => null);
+  if (!canvasMod?.createCanvas || !canvasMod?.loadImage) {
+    console.warn('[image-gen][seedream] @napi-rs/canvas unavailable; submitting original reference image');
+    return imagePathToDataUrl(imagePath);
+  }
+
+  try {
+    const image = await canvasMod.loadImage(source);
+    const originalWidth = Math.max(1, Number(image.width || 1));
+    const originalHeight = Math.max(1, Number(image.height || 1));
+    const scale = Math.min(1, maxEdge / Math.max(originalWidth, originalHeight));
+    const width = Math.max(1, Math.round(originalWidth * scale));
+    const height = Math.max(1, Math.round(originalHeight * scale));
+    const canvas = canvasMod.createCanvas(width, height);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(image, 0, 0, width, height);
+    const buf: Buffer = canvas.toBuffer('image/jpeg', quality);
+    console.log(
+      `[image-gen][seedream] reference compressed ${originalWidth}x${originalHeight}->${width}x${height} ` +
+        `${(originalBytes / 1024 / 1024).toFixed(2)}MB->${(buf.length / 1024 / 1024).toFixed(2)}MB`,
+    );
+    return `data:image/jpeg;base64,${buf.toString('base64')}`;
+  } catch (e: any) {
+    console.warn('[image-gen][seedream] reference compression failed; submitting original reference image:', e?.message || e);
+    return imagePathToDataUrl(imagePath);
+  }
+}
+
 async function normalizeGeneratedImageBuffer(
   buffer: Buffer,
   cfg: ImageRuntimeConfig,
@@ -588,23 +729,44 @@ function isPngBuffer(buffer: Buffer): boolean {
 }
 
 /**
- * 资产参考图统一风格后缀（白底 + 写实摄影；角色额外要求三视图布局）。
+ * 资产参考图统一风格后缀（角色额外要求多视图布局）。
  *
  * 设计动机：
- *   - 原网站效果是"白底 + 真人写实摄影 + 角色三视图（正/侧/背）"
- *   - LLM 抽资产时写出来的 imagePrompt 风格千差万别（半写实插画、动漫、CG…）
- *   - 这里在最终调图像 API 前强行追加一段 hard rule，覆盖掉风格漂移
+ *   - 角色参考图需要稳定布局和 splitter-safe 背景
+ *   - 如果调用方已注入 PROJECT CHARACTER STYLE LOCK，这里只锁布局/纯白背景
+ *   - 如果没有项目风格锁，保留旧的白底写实兜底行为
  */
 function forceStyleSuffix(
   kind: ImageGenInput['kind'],
   entityType: ImageGenInput['entityType'] = 'human',
+  opts: Pick<ImageGenInput, 'styleLockApplied' | 'styleBackdropColor'> = {},
 ): string {
   if (kind === 'character') {
+    const styleLocked = !!opts.styleLockApplied;
     if (entityType === 'non-human') {
       // 非人实体（拟人化海鲜、机甲、动物、异形）：保留生物本来的形态，
       // 不能强行画成真人；白底+写实摄影+三视图（前/严格 90° 侧/背），不要头部特写。
       // 用户反馈：拟人海鲜画头部特写没有意义（壳/钳子比脸更像它的"id"），
       // 三视图正侧背已经够用。布局回到 1×3 三栏。
+      if (styleLocked) {
+        return [
+          '=== MANDATORY CHARACTER REFERENCE SHEET RULES (must follow) ===',
+          'Style: high-detail character/creature reference sheet that follows the PROJECT CHARACTER STYLE LOCK above. Do not introduce a conflicting default model style.',
+          'Background: PURE WHITE (#FFFFFF) seamless reference-sheet backdrop. The backdrop MUST stay pure white regardless of the project style. NO color wash, NO gradient, NO texture, NO props, NO environment, NO room, NO street, NO neon signs, NO rain scene, NO color palette cards, NO swatches, NO readable text, NO readable hex codes or color names rendered as text INSIDE THE IMAGE.',
+          'Layout: ONE canvas split into THREE panels in a single row, evenly sized (each panel ~33% of canvas width), NO gaps between panels:',
+          '  · Panel 1 (left): FRONT VIEW — full subject, facing camera, neutral pose.',
+          '  · Panel 2 (middle): SIDE VIEW — STRICT pure 90° profile, body axis exactly perpendicular to the camera. Same pose as front view. NEVER 3/4, NEVER angled.',
+          '  · Panel 3 (right): BACK VIEW — full subject from behind, same pose.',
+          'CRITICAL: the SAME subject must appear in all three panels — same colors, same anatomy, same proportions, only the camera angle changes.',
+          'IMPORTANT: keep the subject\'s actual non-human anatomy (e.g. crab, shrimp, mech, animal) — do NOT redraw it as a human, do NOT add a human body or human face.',
+          'Lighting: controlled reference-sheet lighting following the project color temperature and contrast direction, while keeping anatomy, surface detail, and silhouette readable.',
+          'STRICTLY NOT allowed: style drift that contradicts the PROJECT CHARACTER STYLE LOCK.',
+          'STRICTLY NOT allowed: turning the subject into a human person if it is not one.',
+          'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels.',
+          'STRICTLY NOT allowed: 3/4 view in the side panel — if Panel 2 is not a strict 90° profile, the image is REJECTED.',
+          'STRICTLY NOT allowed: a head close-up panel — only the three full-body angle views.',
+        ].join('\n');
+      }
       return [
         '=== MANDATORY STYLE OVERRIDE (must follow) ===',
         'Style: photorealistic creature/object photography, sharp focus, high detail, magazine-grade quality.',
@@ -627,6 +789,23 @@ function forceStyleSuffix(
     // 布局：左 ~40% 大头部特写 + 右 ~60% 三视图（正面 / 严格 90° 侧面 / 背面）
     // ※ 用户反馈中"侧面是斜的"= 之前允许 3/4 视角 → 这里强制纯正侧 90°，并用
     //   "if humanoid, only ONE eye and ONE ear visible" 这种可验证规则收紧描述。
+    if (styleLocked) {
+      return [
+        '=== MANDATORY CHARACTER REFERENCE SHEET RULES (must follow) ===',
+        'Style: high-detail character reference sheet that follows the PROJECT CHARACTER STYLE LOCK above. Do not introduce a conflicting default model style.',
+        'Background: PURE WHITE (#FFFFFF) seamless reference-sheet backdrop. The backdrop MUST stay pure white regardless of the project style. NO color wash, NO gradient, NO texture, NO props, NO environment, NO room, NO street, NO neon signs, NO rain scene, NO color palette cards, NO swatches, NO readable text, NO readable hex codes or color names rendered as text INSIDE THE IMAGE.',
+        'Layout: ONE canvas split into FOUR panels in a single row, evenly spaced, NO gaps between panels:',
+        '  · Panel 1 (LARGEST, left ~40% of canvas): LARGE HEAD CLOSE-UP — head and shoulders only, face fills the panel from top to bottom, sharp portrait crop, eyes at upper third, looking straight at camera, neutral expression. Background remains pure white.',
+        '  · Panel 2 (right ~20% of canvas, 1st of three views): FRONT FULL-BODY VIEW — head to feet visible, facing camera squarely, arms relaxed at sides, neutral standing pose.',
+        '  · Panel 3 (right ~20% of canvas, 2nd of three views): SIDE FULL-BODY VIEW — STRICT pure 90° profile, body axis exactly perpendicular to the camera, ONLY ONE EYE AND ONE EAR VISIBLE, nose silhouette pointing left or right, shoulders perfectly aligned to one side. Same pose as front. NEVER 3/4, NEVER angled, NEVER turned partially.',
+        '  · Panel 4 (right ~20% of canvas, 3rd of three views): BACK FULL-BODY VIEW — full body from behind, head to feet visible, same pose as front.',
+        'CRITICAL: the SAME PERSON must appear in all four panels — same face, same hair, same clothing, same body type, same skin tone — only the camera angle changes.',
+        'Lighting: controlled reference-sheet lighting following the project color temperature and contrast direction, while keeping face, hair, clothing, anatomy and silhouette readable.',
+        'STRICTLY NOT allowed: style drift that contradicts the PROJECT CHARACTER STYLE LOCK.',
+        'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels, names.',
+        'STRICTLY NOT allowed: 3/4 view, three-quarter view, angled view in the side panel — if Panel 3 is not a strict 90° profile, the image is REJECTED.',
+      ].join('\n');
+    }
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
       'Style: photorealistic photography, professional studio headshot quality, sharp focus, magazine-grade photography, high detail of skin texture / hair / clothing fabric.',
@@ -653,13 +832,13 @@ function forceStyleSuffix(
       'Layout: ONE single continuous image of ONE location. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
       'Composition: wide establishing view at eye level or slightly high angle, clearly showing the main spatial layout, entrances/exits, floor, walls, ceiling, key furniture/equipment, and signature materials.',
       'Purpose: this image is a stable environment reference for video generation — prioritize readable space, lighting, color palette, material texture, and production design over dramatic camera tricks.',
-	      'CRITICAL: the image must depict one coherent physical space, not multiple rooms, not multiple angles, not a montage.',
-	      'No people / no human figures.',
-	      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
-	      'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
-	      'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
-	    ].join('\n');
-	  }
+      'CRITICAL: the image must depict one coherent physical space, not multiple rooms, not multiple angles, not a montage.',
+      'No people / no human figures.',
+      'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+      'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
+      'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
+    ].join('\n');
+  }
   if (kind === 'prop') {
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
@@ -675,7 +854,7 @@ function forceStyleSuffix(
 }
 
 export function composeFinalImagePrompt(
-  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType'>,
+  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType' | 'styleLockApplied' | 'styleBackdropColor'>,
 ): string {
   if (input.style === 'pencil') {
     const PENCIL_PREFIX = [
@@ -698,7 +877,7 @@ export function composeFinalImagePrompt(
     ].join('\n');
     return `${PENCIL_PREFIX}\n${input.prompt}\n${PENCIL_SUFFIX}`;
   }
-  return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType)}`;
+  return `${input.prompt}\n\n${forceStyleSuffix(input.kind, input.entityType, input)}`;
 }
 
 /**

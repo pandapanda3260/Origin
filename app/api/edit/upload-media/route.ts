@@ -5,11 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
+import { getDataDir } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const UPLOADS_DIR = join(DATA_DIR, 'uploads');
 
 // 单文件上限：视频 / 音频 200 MB，图片 20 MB

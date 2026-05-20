@@ -1,6 +1,7 @@
 import type { UserRow } from './db';
 import { getJson } from './kv-db';
 import { loadExternalEnv } from './env';
+import { recordObservabilityEvent } from './observability-events';
 import { MOCK_USER_SETTINGS } from '@/mocks/settings';
 
 export type ModelSlot = 'text' | 'image' | 'video' | 'storyboard';
@@ -43,6 +44,17 @@ export type ModelCapabilities = {
   image?: ImageModelCapabilities;
 };
 
+export function listKnownVideoModelIds(): string[] {
+  return [
+    // Fallback video model id used when no real video provider is configured.
+    'sora',
+    // Volcengine Seedance models that the product can route to via VIDEO_MODEL / MODEL_VIDEO_PRIMARY.
+    'doubao-seedance-2-0-260128',
+    'doubao-seedance-2-0-fast-260128',
+    'doubao-seedance-1-5-pro-251215',
+  ];
+}
+
 export type ResolvedModelConfig = {
   baseUrl: string;
   apiKey: string;
@@ -67,6 +79,9 @@ export type ResolvedModelConfig = {
   timeoutMs?: number;
   minDurationSec?: number;
   capabilities?: ModelCapabilities;
+  disableResponseStorage?: boolean;
+  fallbackOf?: string;
+  fallbackConfigs?: ResolvedModelConfig[];
 };
 
 export function resolveTextModelConfig(
@@ -97,7 +112,7 @@ export function resolveTextModelConfig(
     if (key) {
       const baseUrl = prefixedEnv(prefix, 'API_BASE') || env('TEXT_API_BASE') || env('OPENAI_BASE_URL') || 'https://api.openai.com/v1';
       const provider = inferResponsesProvider(prefixedEnv(prefix, 'PROVIDER') || env('TEXT_PROVIDER'), baseUrl);
-      return real({
+      const cfg = real({
         baseUrl,
         apiKey: key,
         model: prefixedEnv(prefix, 'MODEL') || env('TEXT_MODEL') || env('OPENAI_MODEL') || env('MODEL_STRUCTURED_WORKER') || 'gpt-5.5',
@@ -107,6 +122,7 @@ export function resolveTextModelConfig(
         source: 'env',
         reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
       });
+      return attachTextFallbackConfigs(cfg, role);
     }
   }
 
@@ -136,7 +152,7 @@ export function resolveSlotModelConfig(
       ? env('IMAGE_SEEDREAM_API_KEY') || env('IMAGE_API_KEY')
       : env('IMAGE_API_KEY');
     if (key) {
-      return real({
+      const cfg = real({
         baseUrl: env('IMAGE_API_BASE') || (isSeedream ? 'https://ark.cn-beijing.volces.com/api/v3' : 'https://gateway.zerail.com/v1'),
         apiKey: key,
         model: env('IMAGE_MODEL') || env('MODEL_IMAGE_PRIMARY') || (isSeedream ? 'doubao-seedream-4-5-251128' : 'gpt-image-2'),
@@ -153,6 +169,7 @@ export function resolveSlotModelConfig(
         timeoutMs: secondsToMs(env('IMAGE_TIMEOUT_SECONDS')),
         source: 'env',
       });
+      return attachImageFallbackConfigs(cfg);
     }
   }
 
@@ -199,6 +216,39 @@ export function getModelRoutingStatus(user: UserRow | null) {
       keys: loadExternalEnv().keys,
     },
   };
+}
+
+export function recordModelCallEvent(args: {
+  cfg: Pick<ResolvedModelConfig, 'provider' | 'model' | 'source' | 'role' | 'mode'> & { fallbackOf?: string };
+  slot?: string;
+  status: 'ok' | 'failed' | 'error' | 'rate_limited' | string;
+  statusCode?: number | null;
+  errorCode?: string | null;
+  latencyMs?: number | null;
+  fallbackUsed?: boolean;
+  traceName?: string;
+  message?: string;
+  meta?: Record<string, unknown>;
+}) {
+  const slot = args.slot || args.cfg.role || 'text';
+  recordObservabilityEvent({
+    type: 'model_call',
+    slot,
+    provider: args.cfg.provider,
+    model: args.cfg.model,
+    status: args.status,
+    statusCode: args.statusCode ?? null,
+    errorCode: args.errorCode || null,
+    latencyMs: args.latencyMs ?? null,
+    fallbackUsed: args.fallbackUsed || !!args.cfg.fallbackOf || args.cfg.mode === 'fake' || args.cfg.source === 'fallback',
+    message: args.message || args.traceName || '',
+    meta: {
+      traceName: args.traceName || null,
+      source: args.cfg.source,
+      role: args.cfg.role || null,
+      ...(args.meta || {}),
+    },
+  });
 }
 
 function resolveLegacyOpenAIConfig(
@@ -317,10 +367,12 @@ function fake(slot: ModelSlot, role: TextModelRole): ResolvedModelConfig {
   };
 }
 
-function redactConfig(cfg: ResolvedModelConfig) {
+function redactConfig(cfg: ResolvedModelConfig): Record<string, unknown> {
+  const fallbackConfigs: Record<string, unknown>[] | undefined = cfg.fallbackConfigs?.map(redactConfig);
   return {
     ...cfg,
     apiKey: cfg.apiKey ? '[configured]' : '',
+    ...(fallbackConfigs?.length ? { fallbackConfigs } : {}),
   };
 }
 
@@ -346,8 +398,111 @@ function defaultModel(slot: ModelSlot): string {
 function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind {
   const p = provider.toLowerCase();
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
+  if (p.includes('code80')) return 'openai_responses';
   if (p.includes('zerail') && p.includes('response')) return 'zerail_responses';
   return baseUrl.toLowerCase().includes('api.openai.com') ? 'openai_responses' : 'zerail_responses';
+}
+
+function attachTextFallbackConfigs(cfg: ResolvedModelConfig, role: TextModelRole): ResolvedModelConfig {
+  if (role === 'brain') return cfg;
+  const fallbackConfigs = resolveCode80TextFallbackConfigs(cfg, role);
+  return fallbackConfigs.length ? { ...cfg, fallbackConfigs } : cfg;
+}
+
+function attachImageFallbackConfigs(cfg: ResolvedModelConfig): ResolvedModelConfig {
+  if (cfg.provider === 'volcengine_seedream') return cfg;
+  if (env('IMAGE_FALLBACK_ENABLED').toLowerCase() === 'false') return cfg;
+
+  const fallback = resolveImageFallbackConfig(cfg);
+  return fallback ? { ...cfg, fallbackConfigs: [fallback] } : cfg;
+}
+
+function resolveImageFallbackConfig(primary: ResolvedModelConfig): ResolvedModelConfig | null {
+  const provider = inferProvider(env('IMAGE_FALLBACK_PROVIDER') || 'volcengine_seedream', 'image');
+  const isSeedream = provider === 'volcengine_seedream';
+  const apiKey =
+    env('IMAGE_FALLBACK_API_KEY') ||
+    env('IMAGE_FALLBACK_SEEDREAM_API_KEY') ||
+    (isSeedream ? env('IMAGE_SEEDREAM_API_KEY') : '');
+  if (!apiKey) return null;
+
+  const generationEndpoint =
+    env('IMAGE_FALLBACK_GENERATIONS_ENDPOINT') ||
+    env('IMAGE_FALLBACK_GENERATION_ENDPOINT') ||
+    env('IMAGE_FALLBACK_ENDPOINT') ||
+    '/images/generations';
+  const editEndpoint =
+    env('IMAGE_FALLBACK_EDITS_ENDPOINT') ||
+    env('IMAGE_FALLBACK_EDIT_ENDPOINT') ||
+    '/images/edits';
+
+  return real({
+    baseUrl: env('IMAGE_FALLBACK_API_BASE') || (isSeedream ? 'https://ark.cn-beijing.volces.com/api/v3' : primary.baseUrl),
+    apiKey,
+    model:
+      env('IMAGE_FALLBACK_MODEL') ||
+      env('IMAGE_FALLBACK_SEEDREAM_MODEL') ||
+      (isSeedream ? 'doubao-seedream-4-5-251128' : primary.model),
+    provider,
+    endpoint: generationEndpoint,
+    imageGenerationEndpoint: generationEndpoint,
+    imageEditEndpoint: editEndpoint,
+    imageQuality: env('IMAGE_FALLBACK_QUALITY') || undefined,
+    imageSize: env('IMAGE_FALLBACK_SEEDREAM_SIZE') || env('IMAGE_SEEDREAM_SIZE') || undefined,
+    imageResponseFormat: env('IMAGE_FALLBACK_SEEDREAM_RESPONSE_FORMAT') || env('IMAGE_SEEDREAM_RESPONSE_FORMAT') || undefined,
+    imageWatermark: envBool('IMAGE_FALLBACK_SEEDREAM_WATERMARK') ?? envBool('IMAGE_SEEDREAM_WATERMARK'),
+    seedreamSequentialImageGeneration:
+      env('IMAGE_FALLBACK_SEEDREAM_SEQUENTIAL_IMAGE_GENERATION') ||
+      env('IMAGE_SEEDREAM_SEQUENTIAL_IMAGE_GENERATION') ||
+      undefined,
+    seedreamOptimizePromptMode:
+      env('IMAGE_FALLBACK_SEEDREAM_OPTIMIZE_PROMPT_MODE') ||
+      env('IMAGE_SEEDREAM_OPTIMIZE_PROMPT_MODE') ||
+      undefined,
+    timeoutMs: secondsToMs(env('IMAGE_FALLBACK_TIMEOUT_SECONDS') || env('IMAGE_TIMEOUT_SECONDS')),
+    source: 'env',
+    fallbackOf: `${primary.provider}:${primary.model}`,
+  });
+}
+
+function resolveCode80TextFallbackConfigs(primary: ResolvedModelConfig, role: TextModelRole): ResolvedModelConfig[] {
+  if (env('TEXT_FALLBACK_ENABLED').toLowerCase() === 'false') return [];
+  const apiKey = env('CODE80_API_KEY') || env('TEXT_FALLBACK_API_KEY');
+  if (!apiKey) return [];
+
+  const prefix = roleEnvPrefix(role);
+  const roleFallbackPrefix = prefix ? `${prefix}_FALLBACK` : '';
+  const baseUrl = env('CODE80_API_BASE') || env('TEXT_FALLBACK_API_BASE') || 'https://code.ai80.vip';
+  const provider = inferResponsesProvider(env('CODE80_PROVIDER') || env('TEXT_FALLBACK_PROVIDER') || 'code80', baseUrl);
+  const endpoint = env('CODE80_API_ENDPOINT') || env('TEXT_FALLBACK_API_ENDPOINT') || '/responses';
+  const model =
+    prefixedEnv(roleFallbackPrefix, 'MODEL') ||
+    env('CODE80_MODEL') ||
+    env('TEXT_FALLBACK_MODEL') ||
+    env('CODE80_REVIEW_MODEL') ||
+    'gpt-5.4';
+  const reasoningEffort =
+    prefixedEnv(roleFallbackPrefix, 'REASONING_EFFORT') ||
+    env('CODE80_REASONING_EFFORT') ||
+    env('TEXT_FALLBACK_REASONING_EFFORT') ||
+    primary.reasoningEffort;
+
+  return [
+    real({
+      baseUrl,
+      apiKey,
+      model,
+      provider,
+      endpoint,
+      role,
+      source: 'env',
+      reasoningEffort,
+      contextWindow: positiveInt(env('CODE80_CONTEXT_WINDOW')) || positiveInt(env('TEXT_FALLBACK_CONTEXT_WINDOW')) || undefined,
+      maxOutputTokens: positiveInt(env('CODE80_MAX_OUTPUT_TOKENS')) || positiveInt(env('TEXT_FALLBACK_MAX_OUTPUT_TOKENS')) || undefined,
+      disableResponseStorage: envBool('CODE80_DISABLE_RESPONSE_STORAGE') ?? envBool('TEXT_FALLBACK_DISABLE_RESPONSE_STORAGE'),
+      fallbackOf: `${primary.provider}:${primary.model}`,
+    }),
+  ];
 }
 
 function resolveModelCapacity(input: RealModelInput): Pick<ResolvedModelConfig, 'contextWindow' | 'maxOutputTokens'> {

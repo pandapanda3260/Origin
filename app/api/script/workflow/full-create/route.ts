@@ -1,18 +1,18 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
-import { chatStream, chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
+import { chatStream, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import {
   buildFullCreateMessages,
-  buildStyleBibleMessages,
   buildRetagMessages,
   buildReviseMessages,
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
-import { sinicizeColorPalette } from '@/lib/style-bible';
-import { sanitizePromptObject } from '@/lib/content-sanitize';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { shortKnowledgeHash } from '@/lib/knowledge/hash';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -24,7 +24,7 @@ export const dynamic = 'force-dynamic';
  *
  * 同时支持 mode="revise"：基于已有剧本 + 修改指令重写。
  *   - 需要 body.script + body.instruction
- *   - 不重新写 oneSentence；style bible / emotions 重新提取
+ *   - 不重新写 oneSentence；情绪标签重新提取
  */
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
@@ -55,12 +55,12 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 计费：剧本生成 ≈ 3 次 LLM 调用（剧本 + 风格圣经 + 情绪标签）
+    // 计费：剧本生成 ≈ 2 次 LLM 调用（剧本 + 情绪标签）
     let charge: { ledgerId: string; balanceAfter: number } | null = null;
     try {
       charge = chargeCredits({
         userId: user.id,
-        amount: CREDIT_PRICES.text * 3,
+        amount: CREDIT_PRICES.text * 2,
         kind: 'text',
         reason: isRevise ? 'script.revise' : 'script.full-create',
         refId: projectId,
@@ -95,7 +95,7 @@ export async function POST(req: NextRequest) {
     } catch (e: any) {
       // LLM 调用失败 → 退积分 + 抛友好错误
       if (charge) {
-        try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 3, reason: 'script.error', refId: projectId }); } catch (_) {}
+        try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 2, reason: 'script.error', refId: projectId }); } catch (_) {}
       }
       writer.error(`剧本生成失败：${e?.message || String(e)}`);
       return;
@@ -106,30 +106,6 @@ export async function POST(req: NextRequest) {
     // 兜底：把 LLM 偷懒输出的字面量 "\n"（两字符）替换成真换行；
     // 还有 \r\n 序列、行尾多余空格、多空行也一并整理
     scriptText = normalizeScriptWhitespace(scriptText);
-
-    writer.phase('style_bible_start');
-    writer.step('正在提取风格圣经…');
-    let styleBible: any = null;
-    let styleBibleStatus: 'ready' | 'failed' = 'failed';
-    let styleBibleError = '';
-    let styleBibleGeneratedAt: string | null = null;
-    try {
-      styleBible = await chatCompleteJsonWithRetry(
-        user,
-        buildStyleBibleMessages(scriptText),
-        { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
-        (raw) => parseJsonLoose(raw),
-        'styleBible',
-      );
-      // 兜底：把 LLM 偷懒输出的英文色名翻成中文，避免前端展示 "TEAL · AMBER · CREAM" 这种
-      styleBible = sanitizePromptObject(sinicizeColorPalette(styleBible));
-      styleBibleStatus = 'ready';
-      styleBibleGeneratedAt = new Date().toISOString();
-    } catch (e: any) {
-      styleBibleError = e?.message || String(e);
-      console.warn('[full-create] styleBible failed after retries:', styleBibleError);
-      writer.event('style_bible_failed', { styleBibleStatus, styleBibleError });
-    }
 
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
@@ -151,10 +127,6 @@ export async function POST(req: NextRequest) {
       const writePayload: Record<string, any> = {
         scriptDraft: scriptText,
         script: scriptText,
-        styleBible,
-        styleBibleStatus,
-        styleBibleError,
-        styleBibleGeneratedAt,
         emotions,
         scriptApproved: false,
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
@@ -167,19 +139,39 @@ export async function POST(req: NextRequest) {
       } catch (e: any) {
         // 最终写库失败时，整个流程相当于白跑了——必须退款
         if (charge) {
-          try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 3, reason: 'script.persist.error', refId: projectId }); } catch (_) {}
+          try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 2, reason: 'script.persist.error', refId: projectId }); } catch (_) {}
         }
         writer.error('保存失败：' + (e?.message || String(e)));
         return;
+      }
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(proj as any),
+            id: projectId,
+            ...writePayload,
+          },
+          stage: 'script_create',
+          stageTarget: {
+            mode: isRevise ? 'revise' : 'create',
+            durationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
+            audience: audience || null,
+            oneSentenceHash: finalSentence ? shortKnowledgeHash(finalSentence) : null,
+            baseScriptHash: isRevise && finalBaseScript ? shortKnowledgeHash(finalBaseScript) : null,
+            instructionHash: isRevise && instruction ? shortKnowledgeHash(instruction) : null,
+            scriptHash: shortKnowledgeHash(scriptText),
+            emotionCount: emotions.length,
+          },
+        });
+        recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context });
+      } catch (error) {
+        console.warn('[script/full-create] knowledge context audit skipped:', error);
       }
     }
 
     writer.done({
       script: scriptText,
-      styleBible,
-      styleBibleStatus,
-      styleBibleError,
-      styleBibleGeneratedAt,
       // 前端 script.js 读 emotionSegments + durationSec
       emotionSegments: emotions,
       emotions,

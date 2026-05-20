@@ -6,6 +6,12 @@ import { buildShotsMessages } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { pickSceneForShots } from '@/lib/scene-selection';
 import { makeSingleShotStoryboardSlots, maybeAssertStoryboardsAlignedWithShots } from '@/lib/frame-workflow-state';
+import { hashNormalizedScript } from '@/lib/script-style-state';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
+import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
+import { computeShotPlanSourceHash, computeShotPlanSourceSnapshot } from '@/lib/project-dependency-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -51,15 +57,45 @@ export async function POST(req: NextRequest) {
       environments: (proj as any)?.environments || (proj as any)?.assets?.scenes || [],
       props: (proj as any)?.props || (proj as any)?.assets?.props || [],
     };
+    const scriptHash = hashNormalizedScript(finalScript);
+    let knowledgeContext: KnowledgeContextForStage | null = null;
+    const originalMessages = buildShotsMessages({
+      script: finalScript,
+      styleBible: (proj as any)?.styleBible,
+      assets: assetsForShots,
+      totalDurationSec: totalDurationSec || (proj as any)?.scriptTargetDurationSec,
+    });
+    let finalMessages = originalMessages;
+    if (projectId && proj) {
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(proj as any),
+            id: projectId,
+          },
+          stage: 'shots_generate',
+          stageTarget: {
+            scriptHash,
+            totalDurationSec: totalDurationSec || (proj as any)?.scriptTargetDurationSec || null,
+            assetCounts: {
+              characters: assetsForShots.characters.length,
+              environments: assetsForShots.environments.length,
+              props: assetsForShots.props.length,
+            },
+          },
+        });
+        const injected = maybeInjectKnowledgePromptBlock({ messages: originalMessages, context });
+        finalMessages = injected.messages;
+        knowledgeContext = injected.context;
+      } catch (error) {
+        console.warn('[shots/generate] knowledge context injection skipped:', error);
+      }
+    }
     try {
       const json = await chatCompleteJsonWithRetry<{ shots: any[] }>(
         user,
-        buildShotsMessages({
-          script: finalScript,
-          styleBible: (proj as any)?.styleBible,
-          assets: assetsForShots,
-          totalDurationSec: totalDurationSec || (proj as any)?.scriptTargetDurationSec,
-        }),
+        finalMessages,
         { temperature: 0.5, maxTokens: 3500, modelRole: 'structured' },
         parseJsonLoose,
         'shots.generate',
@@ -127,6 +163,26 @@ export async function POST(req: NextRequest) {
 
     if (projectId && proj) {
       const storyboards = makeSingleShotStoryboardSlots(shots);
+      const projectForHash = {
+        ...(proj as any),
+        script: finalScript,
+        ...(totalDurationSec != null ? { scriptTargetDurationSec: totalDurationSec } : {}),
+      };
+      const sourceSnapshot = computeShotPlanSourceSnapshot(projectForHash);
+      const sourceHash = computeShotPlanSourceHash(projectForHash);
+      const staleFlags = { ...(((proj as any)._staleFlags || {}) as Record<string, any>) };
+      Object.keys(staleFlags).forEach((key) => {
+        if (
+          key === 'shotPlan' ||
+          key.startsWith('storyboard_') ||
+          key.startsWith('video_prompt_') ||
+          key.startsWith('shot_prompt_') ||
+          key.startsWith('tail_frame_') ||
+          key.startsWith('shot_')
+        ) {
+          delete staleFlags[key];
+        }
+      });
       maybeAssertStoryboardsAlignedWithShots(
         { ...(proj as any), shots, storyboards, videoTasks: [] },
         'shots-generate-route',
@@ -137,7 +193,22 @@ export async function POST(req: NextRequest) {
         storyboards,
         videoTasks: [],
         currentStep: 3,
+        _staleFlags: staleFlags,
+        shotPlanStatus: 'ready',
+        shotPlanSourceHash: sourceHash,
+        shotPlanSourceSnapshot: sourceSnapshot,
+        shotPlanGeneratedAt: new Date().toISOString(),
+        shotPlanStaleReason: undefined,
+        shotPlanStaleReasons: [],
+        shotPlanStaleAt: undefined,
+        shotPlanLastError: undefined,
+        shotPlanFailedAt: undefined,
       });
+      try {
+        if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext });
+      } catch (error) {
+        console.warn('[shots/generate] knowledge context audit skipped:', error);
+      }
     }
 
     writer.done({ shots });

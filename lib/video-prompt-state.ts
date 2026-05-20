@@ -108,6 +108,7 @@ export function assertVideoPromptReadyForGroups(
   project: any,
   groupIdxs: number[],
   target: CharacterConsistencyTarget = 'videoSegment',
+  opts: { skipConsistency?: boolean } = {},
 ) {
   const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
   const readinessBlocked = groupIdxs
@@ -118,16 +119,18 @@ export function assertVideoPromptReadyForGroups(
     : [];
   const firstFrameBlocked = firstFrameReadiness.filter((item) => !item.canStart);
   const firstFrameWarnings = firstFrameReadiness.filter((item) => item.canStart && item.status === 'degraded');
-  const consistencyBlocked = groupIdxs
-    .map((groupIdx) => validateCharacterConsistencyForGroup(project, { groupIdx, target }))
-    .filter((gate) => !gate.allowed)
-    .map((gate) => ({
-      groupIdx: gate.groupIdx,
-      status: 'ready' as const,
-      canStart: false,
-      reason: gate.blockers[0]?.code || 'character_consistency_blocked',
-      consistency: gate,
-    }));
+  const consistencyBlocked = opts.skipConsistency
+    ? []
+    : groupIdxs
+        .map((groupIdx) => validateCharacterConsistencyForGroup(project, { groupIdx, target }))
+        .filter((gate) => !gate.allowed)
+        .map((gate) => ({
+          groupIdx: gate.groupIdx,
+          status: 'ready' as const,
+          canStart: false,
+          reason: gate.blockers[0]?.code || 'character_consistency_blocked',
+          consistency: gate,
+        }));
   const blocked = [...readinessBlocked, ...firstFrameBlocked, ...consistencyBlocked];
   if (!blocked.length) return { ok: true as const, blocked, warnings: firstFrameWarnings };
   return { ok: false as const, blocked, warnings: firstFrameWarnings };

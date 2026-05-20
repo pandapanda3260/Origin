@@ -38,6 +38,12 @@ import {
 } from './frame-prompt-helpers';
 import { resolveLocalImagePath as defaultResolveLocalImagePath } from './image-gen';
 import { pickSceneForShots } from './scene-selection';
+import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
+import {
+  normalizeStoryboardMaterialRole,
+  storyboardMaterialRoleToUiType,
+  type StoryboardMaterialRole,
+} from './reference-roles';
 
 export type FrameType = 'first_frame' | 'tail_frame';
 
@@ -87,6 +93,8 @@ export type FrameImageGenerationPlan = {
   primaryShotIdx: number;
   primaryShot: any;
   contextShots: any[];
+  aspectRatio: string;
+  compositionGuidance: string;
   /** 与 contextShots 对齐的绝对 shot index (来自 shotIndices, 排除 primary 的位置)。 */
   contextShotIndices: number[];
   characters: Array<{
@@ -116,6 +124,8 @@ export type FrameImagePlanSummary = {
   groupIdx: number;
   shotIndices: number[];
   primaryShotIdx: number;
+  aspectRatio: string;
+  compositionGuidance?: string;
   characterNames: string[];
   sceneName?: string;
   propNames: string[];
@@ -161,9 +171,31 @@ export type BuildFramePlanInput = {
 
 const MAX_FINAL_PROMPT_CHARS = 2200;
 export const FRAME_IMAGE_REFERENCE_IMAGE_BUDGET = 4;
+const DEFAULT_FRAME_ASPECT_RATIO = '9:16';
+const FRAME_ASPECT_RATIOS = new Set(['16:9', '9:16', '1:1']);
 
 function hashText(text: string): string {
   return createHash('sha256').update(String(text || '')).digest('hex');
+}
+
+function normalizeFrameAspectRatio(value: any): string {
+  const next = String(value || '').trim();
+  return FRAME_ASPECT_RATIOS.has(next) ? next : '';
+}
+
+function resolveFrameAspectRatio(project: any): string {
+  return (
+    normalizeFrameAspectRatio(project?.styleOptions?.aspectRatio) ||
+    normalizeFrameAspectRatio(project?.styleBible?.aspectRatio) ||
+    normalizeFrameAspectRatio(project?.videoAspectRatio) ||
+    DEFAULT_FRAME_ASPECT_RATIO
+  );
+}
+
+function compositionGuidanceForAspectRatio(aspectRatio: string): string {
+  if (aspectRatio === '9:16') return 'Compose for a vertical portrait frame, prioritizing subject focus, close/mid framing, and clear vertical staging over wide horizontal space.';
+  if (aspectRatio === '1:1') return 'Compose around a stable square frame with centered visual weight, clear foreground/background depth, and no ultra-wide staging.';
+  return 'Compose for a landscape frame with clear spatial relationships, environmental context, and horizontal movement when the shot calls for it.';
 }
 
 function importanceKey(value: unknown): string {
@@ -179,6 +211,58 @@ function characterName(ch: any): string {
 
 function propName(prop: any): string {
   return clean(prop?.name || prop?.propName);
+}
+
+function assetImageUrl(asset: any): string {
+  const reference = resolveAssetReferenceState(asset);
+  if (isBlockingReferenceStatus(reference.status)) return '';
+  return clean(
+    reference.currentUrl ||
+    reference.lastKnownGoodUrl ||
+    asset?.pencilUrl ||
+    asset?.realPhotoUrl,
+  );
+}
+
+function assetIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: number): string[] {
+  const source = asset || {};
+  const fields = role === 'character'
+    ? [source.characterId, source.materialId, source.id, source.assetId, source.name, source.role, source.identity]
+    : role === 'scene'
+      ? [source.sceneId, source.materialId, source.id, source.assetId, source.name, source.sceneName, source.location, source.title]
+      : [source.propId, source.materialId, source.id, source.assetId, source.name, source.propName, source.title, source.propType];
+  const keys: string[] = [];
+  const prefixes = role === 'character' ? ['character', 'char'] : [role];
+  for (const field of fields) {
+    const value = clean(field);
+    if (value) {
+      for (const prefix of prefixes) keys.push(`${prefix}:${value}`);
+    }
+  }
+  const url = assetImageUrl(source);
+  if (url) {
+    for (const prefix of prefixes) keys.push(`${prefix}:url:${url}`);
+  }
+  return [...new Set(keys)];
+}
+
+function isMaterialAssetExcluded(project: any, role: StoryboardMaterialRole, asset: any, groupIdx: number, idx?: number): boolean {
+  if (!asset) return false;
+  const buckets = [
+    project?.storyboardMaterialExclusions?.[String(groupIdx)]?.[role],
+    project?.storyboardMaterialExclusions?.[String(groupIdx)]?.[storyboardMaterialRoleToUiType(role) || role],
+  ].filter(Boolean);
+  if (!buckets.length) return false;
+  const keys = assetIdentityKeys(role, asset, idx);
+  return buckets.some((bucket: any) => keys.some((key) => !!bucket[key]));
+}
+
+function isStoryboardMaterialForGroup(asset: any, groupIdx: number, role: StoryboardMaterialRole): boolean {
+  if (asset?.reference?.status === 'missing') return false;
+  const materialGroupIdx = Number(asset?.storyboardMaterialGroupIdx);
+  if (!Number.isFinite(materialGroupIdx) || materialGroupIdx !== groupIdx) return false;
+  if (!asset?.storyboardMaterialRole) return true;
+  return normalizeStoryboardMaterialRole(asset.storyboardMaterialRole) === role;
 }
 
 function shotCharacterKeys(shot: any): string[] {
@@ -317,12 +401,17 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     ...((project?.assets?.characters || []) as any[]),
     ...((project?.characters || []) as any[]),
   ]);
-  const usedChars = orderCharactersByImportance(primaryShot, groupShots, allChars
+  const availableChars = allChars.filter((c: any, idx: number) =>
+    !isMaterialAssetExcluded(project, 'character', c, groupIdx, idx),
+  );
+  const manualChars = availableChars.filter((c: any) => isStoryboardMaterialForGroup(c, groupIdx, 'character'));
+  const matchedChars = orderCharactersByImportance(primaryShot, groupShots, availableChars
     .filter((c: any) => {
+      if (isStoryboardMaterialForGroup(c, groupIdx, 'character')) return false;
       const nm = c?.name || c?.role;
       return nm && (charNames.has(nm) || groupText.includes(nm));
-    }), groupText)
-    .slice(0, 6);
+    }), groupText);
+  const usedChars = [...manualChars, ...matchedChars].slice(0, 6);
 
   const characterLockRoster = buildCharacterLockRoster(project, charNames, 'en', groupText);
   const characterLockText = sanitizeFillLightPositiveMentions(
@@ -352,7 +441,14 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     },
     { requireImage: true, preferFirstShot: true },
   );
-  const chosenScene = sceneSelection.scene as any;
+  const manualScenes = ((project?.assets?.scenes || []) as any[])
+    .filter((scene: any, idx: number) =>
+      isStoryboardMaterialForGroup(scene, groupIdx, 'scene') &&
+      !isMaterialAssetExcluded(project, 'scene', scene, groupIdx, idx) &&
+      !!assetImageUrl(scene),
+    );
+  const chosenScene = (manualScenes[0] || sceneSelection.scene) as any;
+  const chosenSceneExcluded = isMaterialAssetExcluded(project, 'scene', chosenScene, groupIdx);
   const sceneLockTextRaw = chosenScene
     ? `${chosenScene.name || chosenScene.location || 'Scene'}: ${truncate(
         [
@@ -372,13 +468,19 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
 
   // ---- props ----
   const allProps: any[] = (project?.assets?.props || []) as any[];
-  const usedProps = orderPropsByFirstOccurrence(allProps
+  const availableProps = allProps.filter((p: any, idx: number) => {
+    if (isMaterialAssetExcluded(project, 'prop', p, groupIdx, idx)) return false;
+    const nm = p?.name || p?.propName;
+    return !!nm && !hasFillLightPositiveMention(nm);
+  });
+  const manualProps = availableProps.filter((p: any) => isStoryboardMaterialForGroup(p, groupIdx, 'prop'));
+  const matchedProps = orderPropsByFirstOccurrence(availableProps
     .filter((p: any) => {
+      if (isStoryboardMaterialForGroup(p, groupIdx, 'prop')) return false;
       const nm = p?.name || p?.propName;
-      if (!nm || hasFillLightPositiveMention(nm)) return false;
       return groupText.includes(sanitizeFillLightPositiveMentions(nm));
-    }), groupText)
-    .slice(0, 6);
+    }), groupText);
+  const usedProps = [...manualProps, ...matchedProps].slice(0, 6);
   const propLockText = sanitizeFillLightPositiveMentions(
     usedProps
       .map(
@@ -395,12 +497,18 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
 
   // ---- style bible ----
   const styleBible = project?.styleBible || {};
+  const aspectRatio = resolveFrameAspectRatio(project);
+  const compositionGuidance = clean(styleBible.compositionGuidance) || compositionGuidanceForAspectRatio(aspectRatio);
   const styleLock = joinPromptValues([
     styleBible.vision || styleBible.visualStyle,
     styleBible.colorPalette,
     styleBible.cameraStyle,
     styleBible.mood || styleBible.tone,
     styleBible.lighting,
+    styleBible.texture,
+    styleBible.editingRhythm,
+    styleBible.additionalPrompt && `Additional style prompt: ${styleBible.additionalPrompt}`,
+    (styleBible.negativePrompt || styleBible.videoNegativePrompt) && `Negative style constraints: ${styleBible.negativePrompt || styleBible.videoNegativePrompt}`,
     styleBible.era,
   ]);
 
@@ -425,15 +533,31 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       }
       : null;
 
-  const sceneCandidate: Candidate | null = chosenScene
+  const sceneCandidate: Candidate | null = chosenScene && !chosenSceneExcluded
     ? {
         role: 'scene',
         assetId: chosenScene.sceneId || chosenScene.id || undefined,
         assetName: chosenScene.name || chosenScene.location || 'scene',
-        remoteUrl: chosenScene.imageUrl || chosenScene.rawUrl || undefined,
+        remoteUrl: assetImageUrl(chosenScene) || undefined,
         textFallback: sceneLockText,
       }
     : null;
+  const chosenSceneUrl = assetImageUrl(chosenScene);
+  const supplementalSceneCandidates = manualScenes
+    .filter((scene: any) => {
+      const url = assetImageUrl(scene);
+      return scene !== chosenScene && url !== chosenSceneUrl;
+    })
+    .map((scene: any): Candidate => {
+      const nm = scene.name || scene.sceneName || scene.location || 'supplemental scene';
+      return {
+        role: 'scene',
+        assetId: scene.sceneId || scene.id || nm,
+        assetName: nm,
+        remoteUrl: assetImageUrl(scene),
+        textFallback: `${nm}: ${truncate([scene.description, scene.location, scene.lighting, scene.atmosphere, scene.elements, scene.features].filter(Boolean).join(', '), 180)}`,
+      };
+    });
 
   const characterCandidates = usedChars.map((c: any): Candidate => {
     const nm = c.name || c.role;
@@ -448,7 +572,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       role: 'character',
       assetId: c.characterId || c.id || nm,
       assetName: nm,
-      remoteUrl: c.imageUrl || c.rawUrl || undefined,
+      remoteUrl: assetImageUrl(c) || undefined,
       textFallback: `${nm}${ent}: ${truncate(baseDesc, 180)}`,
     };
   });
@@ -459,7 +583,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       role: 'prop',
       assetId: p.propId || p.id || nm,
       assetName: nm,
-      remoteUrl: p.imageUrl || p.rawUrl || undefined,
+      remoteUrl: assetImageUrl(p) || undefined,
       textFallback: `${sanitizeFillLightPositiveMentions(nm)}: ${truncate(
         sanitizeFillLightPositiveMentions(
           [p.description, p.features, p.propType].filter(Boolean).join(', '),
@@ -476,6 +600,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   if (frameType === 'first_frame') {
     takeCandidate(characterCandidates[0]);
     takeCandidate(sceneCandidate);
+    supplementalSceneCandidates.forEach(takeCandidate);
     takeCandidate(characterCandidates[1]);
     takeCandidate(propCandidates[0]);
     takeCandidate(characterCandidates[2]);
@@ -485,6 +610,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     takeCandidate(selfFirstFrameCandidate);
     takeCandidate(characterCandidates[0]);
     takeCandidate(sceneCandidate);
+    supplementalSceneCandidates.forEach(takeCandidate);
     takeCandidate(propCandidates[0]);
     takeCandidate(characterCandidates[1]);
     characterCandidates.slice(2).forEach(takeCandidate);
@@ -544,6 +670,8 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     primaryShotIdx,
     primaryShot,
     contextShots,
+    aspectRatio,
+    compositionGuidance,
     contextShotIndices,
     characters: usedChars.map((c: any) => ({
       name: c.name || c.role,
@@ -553,7 +681,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
           .join(', '),
         200,
       ),
-      imageUrl: c.imageUrl || c.rawUrl,
+      imageUrl: assetImageUrl(c),
       entityType: c.entityType,
     })),
     scene: chosenScene
@@ -572,7 +700,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
               .join(', '),
             220,
           ),
-          imageUrl: chosenScene.imageUrl || chosenScene.rawUrl,
+          imageUrl: assetImageUrl(chosenScene),
         }
       : null,
     props: usedProps.map((p: any) => ({
@@ -581,7 +709,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         [p.description, p.features, p.propType].filter(Boolean).join(', '),
         140,
       ),
-      imageUrl: p.imageUrl || p.rawUrl,
+      imageUrl: assetImageUrl(p),
     })),
     styleLock,
     driftGuardrails,
@@ -716,6 +844,7 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   // 6. Composition rules
   lines.push('');
   lines.push('【Composition rules】');
+  lines.push(`- Target aspect ratio: ${plan.aspectRatio}. ${plan.compositionGuidance}`);
   lines.push('- Use one coherent camera frame matching the primary shot framing/camera.');
   lines.push(
     '- Keep character identity, wardrobe, species/body type, scene materials, props and color palette consistent with the references.',
@@ -768,6 +897,8 @@ export function summarizePlanForAudit(plan: FrameImageGenerationPlan): FrameImag
     groupIdx: plan.groupIdx,
     shotIndices: plan.shotIndices,
     primaryShotIdx: plan.primaryShotIdx,
+    aspectRatio: plan.aspectRatio,
+    compositionGuidance: plan.compositionGuidance,
     characterNames: plan.characters.map((c) => c.name).filter(Boolean),
     sceneName: plan.scene?.name,
     propNames: plan.props.map((p) => p.name).filter(Boolean),

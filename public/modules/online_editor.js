@@ -1,0 +1,1921 @@
+/**
+ * 在线精修剪辑器 (Online Editor) 模块
+ *
+ * 当前状态: VevDemo iframe 集成模式
+ * 通过 iframe 嵌入 VevDemo 服务，使用 postMessage 进行通信
+ *
+ * 架构:
+ * - VevDemo Editor 由 VEVDEMO_EDITOR_URL / VEVDEMO_FRONTEND_URL 配置
+ * - Origin 后端 API 提供素材代理 (/api/volcengine/*)
+ * - 消息通过 postMessage 在 iframe 和主页面之间传递
+ */
+
+var _oeCtx = null;
+var _vevFrame = null;
+var _vevDemoConfig = null;
+var _messageHandlers = new Map();
+var _isVevDemoReady = false;
+var _eventsBound = false;
+var _connectStarted = false;
+var _messageListenerBound = false;
+var _hasVevDemoMessage = false;
+var _vevFrameAutoRetryTimer = null;
+var _vevFrameAutoRetryCount = 0;
+var _lastVevFrameUrl = '';
+var _ORIGIN_VIDEO_ID_RE = /\/api\/videos\/file\/([^/?#]+)/;
+var _exportState = _createDefaultExportState();
+var _exportPollingTimer = null;
+var _exportPollingStartedAt = 0;
+
+const OEV_IFRAME_LOAD_TIMEOUT_MS = 25000;
+const OEV_IFRAME_READY_TIMEOUT_MS = 10000;
+const OEV_IFRAME_AUTO_RETRY_DELAY_MS = 3000;
+const OEV_IFRAME_AUTO_RETRY_MAX = 2;
+const OEV_EXPORT_STORAGE_ID_KEY = 'oeLastExportId';
+const OEV_EXPORT_STORAGE_UPDATED_KEY = 'oeLastExportUpdatedAt';
+const OEV_EXPORT_STORAGE_STALE_MS = 24 * 60 * 60 * 1000;
+const OEV_EXPORT_POLL_INTERVAL_MS = 3000;
+const OEV_EXPORT_POLL_MAX_MS = 10 * 60 * 1000;
+
+// ============================================================================
+// 公开 API
+// ============================================================================
+
+/**
+ * 初始化在线剪辑器
+ * @param {Object} ctx - 上下文对象
+ */
+function initOnlineEditor(ctx) {
+  _oeCtx = ctx;
+
+  if (_eventsBound) return;
+  _eventsBound = true;
+
+  // 绑定 UI 事件（保留占位 UI 作为 fallback）；真实连接在页面进入时懒加载。
+  _bindToolbarEvents();
+  _bindMediaPanelEvents();
+  _bindInspectorEvents();
+  _bindTimelineEvents();
+  _bindPreviewEvents();
+}
+
+/**
+ * 每次进入在线精修页都执行的轻量恢复钩子。
+ * 必须独立于 mountOnlineEditor() 的 iframe guard，避免切页回来后状态轮询不恢复。
+ */
+function onOnlineEditorPageEnter() {
+  if (!_oeCtx) return;
+  _restoreExportStateFromStorage();
+}
+
+/**
+ * 页面进入时懒加载在线剪辑服务。
+ * 避免工作台启动阶段就请求 VevDemo 配置或创建 iframe。
+ */
+async function mountOnlineEditor() {
+  if (!_oeCtx) {
+    console.warn('[OnlineEditor] 尚未初始化上下文');
+    return;
+  }
+  if (_connectStarted || _vevFrame || _isVevDemoReady) return;
+  _setOnlineEditorControlsReady(false);
+  console.log('[OnlineEditor] mount start');
+  _connectStarted = true;
+
+  try {
+    _vevDemoConfig = await _loadVevDemoConfig();
+    const missingKeys = Array.isArray(_vevDemoConfig.missingKeys) ? _vevDemoConfig.missingKeys : [];
+
+    if (_vevDemoConfig.enabled === false || _vevDemoConfig.reason === 'disabled') {
+      _showSetupGuide(_vevDemoConfig.message || '在线精修剪辑器当前未启用', 'disabled', missingKeys);
+      console.log('[OnlineEditor] 在线精修未启用');
+      return;
+    }
+
+    if (!_vevDemoConfig.configured || !_getConfiguredIframeUrl(_vevDemoConfig)) {
+      const missingText = missingKeys.length > 0 ? `缺少配置项：${missingKeys.join(', ')}` : '';
+      _showSetupGuide(_vevDemoConfig.message || missingText || 'VevDemo 服务未配置', 'missing_config', missingKeys);
+      console.log('[OnlineEditor] VevDemo 未配置，显示设置引导');
+      return;
+    }
+
+    if (_vevDemoConfig.openMode === 'tab') {
+      _showSetupGuide('当前配置为新标签页打开，请从剪辑页入口进入 VevDemo。', 'tab_only', []);
+      return;
+    }
+
+    // 创建 VevDemo iframe
+    const iframeUrl = _getConfiguredIframeUrl(_vevDemoConfig);
+    _lastVevFrameUrl = iframeUrl;
+    _resetVevDemoAutoRetryState();
+    _createVevDemoFrame(iframeUrl);
+
+    // 监听 postMessage
+    if (!_messageListenerBound) {
+      window.addEventListener('message', _handleVevMessage);
+      _messageListenerBound = true;
+    }
+
+    console.log('[OnlineEditor] VevDemo iframe 初始化中...', _vevDemoConfig);
+  } catch (err) {
+    console.error('[OnlineEditor] 初始化失败:', err);
+    _connectStarted = false;
+    _showSetupGuide('连接 VevDemo 服务失败: ' + err.message, 'load_failed');
+  }
+}
+
+async function _loadVevDemoConfig() {
+  if (_oeCtx.getOnlineEditorConfig) {
+    const cached = _oeCtx.getOnlineEditorConfig();
+    if (cached) return cached;
+  }
+  if (_oeCtx.loadOnlineEditorConfig) {
+    return await _oeCtx.loadOnlineEditorConfig();
+  }
+  throw new Error('在线精修配置上下文未注入');
+}
+
+function _getConfiguredIframeUrl(config) {
+  if (!config) return '';
+  return config.iframeProjectUrl || config.iframeUrl || config.iframeBaseUrl || '';
+}
+
+/**
+ * 刷新素材列表
+ */
+async function refreshMediaList() {
+  // 如果 VevDemo 已就绪，通知它刷新素材
+  if (_isVevDemoReady) {
+    _sendToVevDemo('origin:refreshMaterials', {});
+  }
+  // 本地素材列表刷新逻辑
+  console.log('[OnlineEditor] 刷新素材列表');
+}
+
+/**
+ * 初始化时间线
+ */
+function initTimeline() {
+  if (_isVevDemoReady) {
+    _sendToVevDemo('origin:initTimeline', {
+      projectId: _oeCtx?.getProject?.()?.id,
+    });
+  }
+  console.log('[OnlineEditor] 初始化时间线');
+}
+
+/**
+ * 获取当前页面状态
+ */
+function getOnlineEditorState() {
+  return {
+    vevDemoReady: _isVevDemoReady,
+    exportState: { ..._exportState },
+    timestamp: Date.now(),
+  };
+}
+
+/**
+ * 恢复页面状态
+ */
+function restoreOnlineEditorState(state) {
+  console.log('[OnlineEditor] 恢复状态', state);
+}
+
+// ============================================================================
+// 导出状态：store + 恢复
+// ============================================================================
+
+function _createDefaultExportState() {
+  return {
+    exportId: null,
+    vevTaskId: null,
+    vevPayload: null,
+    phase: 'idle',
+    status: null,
+    localDownloadStatus: null,
+    url: null,
+    remoteUrl: null,
+    remoteUrlExpiresAt: null,
+    needsReviewReason: null,
+    reexportRequired: false,
+    errorMsg: '',
+    polling: false,
+    retrying: false,
+    callbackPosting: false,
+    callbackDedupKey: null,
+    stateVersion: 0,
+    dismissed: false,
+  };
+}
+
+function _setExportState(patch) {
+  _exportState = {
+    ..._exportState,
+    ...(patch || {}),
+  };
+  _renderExportStatusCard();
+  return _exportState;
+}
+
+function _replaceExportState(patch) {
+  _clearExportPollingTimer();
+  const nextVersion = (_exportState.stateVersion || 0) + 1;
+  _exportState = {
+    ..._createDefaultExportState(),
+    stateVersion: nextVersion,
+    ...(patch || {}),
+  };
+  _renderExportStatusCard();
+  return _exportState;
+}
+
+function _resetExportState() {
+  _replaceExportState({ phase: 'idle' });
+  _clearPersistedExportState();
+}
+
+function _clearExportPollingTimer() {
+  if (_exportPollingTimer) clearTimeout(_exportPollingTimer);
+  _exportPollingTimer = null;
+  _exportPollingStartedAt = 0;
+}
+
+function _renderExportStatusCard() {
+  const slot = document.getElementById('oeExportStatusSlot');
+  if (!slot) return;
+
+  const view = _getExportStatusViewModel(_exportState);
+  if (!view) {
+    slot.hidden = true;
+    slot.innerHTML = '';
+    return;
+  }
+
+  slot.hidden = false;
+  const busyHtml = view.busy
+    ? '<span class="inline-block w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin"></span>'
+    : `<span class="material-symbols-outlined text-[16px]">${view.icon}</span>`;
+  const actionsHtml = view.actions.map((action) => {
+    const disabled = action.disabled ? 'disabled aria-disabled="true"' : '';
+    const extraClass = action.primary
+      ? 'bg-white/90 text-black hover:bg-white'
+      : 'border border-white/10 bg-white/5 text-white/70 hover:bg-white/10';
+    return `<button type="button" data-oe-export-action="${action.action}" class="px-2.5 py-1 rounded-lg text-[10px] font-medium transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${extraClass}" ${disabled}>${_escapeOnlineEditorHtml(action.label)}</button>`;
+  }).join('');
+
+  slot.innerHTML = `
+    <div class="w-[280px] rounded-xl border ${view.borderClass} ${view.bgClass} px-3 py-2 shadow-lg shadow-black/20 backdrop-blur-xl">
+      <div class="flex items-start gap-2">
+        <div class="mt-0.5 ${view.textClass}">${busyHtml}</div>
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center justify-between gap-2">
+            <p class="truncate text-[11px] font-semibold ${view.titleClass}">${_escapeOnlineEditorHtml(view.title)}</p>
+            ${view.badge ? `<span class="shrink-0 rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] text-white/45">${_escapeOnlineEditorHtml(view.badge)}</span>` : ''}
+          </div>
+          <p class="mt-0.5 line-clamp-2 text-[10px] leading-snug text-white/45">${_escapeOnlineEditorHtml(view.detail)}</p>
+          ${actionsHtml ? `<div class="mt-2 flex flex-wrap items-center gap-1.5">${actionsHtml}</div>` : ''}
+        </div>
+      </div>
+    </div>
+  `;
+  _bindExportStatusCardActions(slot);
+}
+
+function _getExportStatusViewModel(state) {
+  const phase = state?.phase || 'idle';
+  if (phase === 'idle' || state?.dismissed) return null;
+
+  const errorText = _formatOnlineEditorExportError(state?.errorMsg);
+  const expired = _isRemoteUrlExpired(state?.remoteUrlExpiresAt)
+    || state?.errorMsg === 'remote_url_expired'
+    || state?.errorMsg === 'url_expired_need_reexport'
+    || state?.needsReviewReason === 'url_expired_need_reexport'
+    || !!state?.reexportRequired;
+  const base = {
+    bgClass: 'bg-[#0d141d]/92',
+    borderClass: 'border-white/10',
+    textClass: 'text-cyan-200',
+    titleClass: 'text-white/88',
+    icon: 'info',
+    badge: '',
+    busy: false,
+    actions: [],
+  };
+
+  switch (phase) {
+    case 'vev_exporting':
+      return {
+        ...base,
+        busy: true,
+        title: state?.callbackPosting ? '正在回写 Origin' : 'VevDemo 正在导出',
+        detail: state?.callbackPosting ? '导出地址已返回，正在写入 Origin 导出记录。' : '远程导出进行中，请不要关闭 VevDemo 标签页。',
+        badge: '远程',
+      };
+    case 'origin_callback_failed':
+      return {
+        ...base,
+        borderClass: 'border-amber-400/30',
+        bgClass: 'bg-amber-500/10',
+        textClass: 'text-amber-200',
+        icon: 'sync_problem',
+        title: 'Origin 回写失败',
+        detail: errorText || '导出已完成，但写入 Origin 记录失败。',
+        badge: '待回写',
+        actions: [
+          { action: 'retry-callback', label: state?.callbackPosting ? '回写中...' : '重新回写 Origin', primary: true, disabled: !!state?.callbackPosting },
+          { action: 'close', label: '关闭' },
+        ],
+      };
+    case 'vev_export_failed':
+      return {
+        ...base,
+        borderClass: 'border-red-400/30',
+        bgClass: 'bg-red-500/10',
+        textClass: 'text-red-200',
+        icon: 'error',
+        title: 'VevDemo 导出失败',
+        detail: errorText || '远程导出未完成，请在 VevDemo 内重新触发导出。',
+        badge: '失败',
+        actions: [{ action: 'close', label: '关闭' }],
+      };
+    case 'origin_waiting_download':
+      return {
+        ...base,
+        busy: true,
+        title: '等待下载到本地',
+        detail: '远程导出已完成，Origin 正在准备下载成片。',
+        badge: '本地化',
+      };
+    case 'origin_downloading':
+      return {
+        ...base,
+        busy: true,
+        title: '正在下载到本地',
+        detail: '成片正在写入 Origin 本地导出目录，完成后可播放或下载。',
+        badge: '下载中',
+      };
+    case 'origin_download_failed':
+      return {
+        ...base,
+        borderClass: 'border-amber-400/30',
+        bgClass: 'bg-amber-500/10',
+        textClass: 'text-amber-200',
+        icon: expired ? 'schedule' : 'warning',
+        title: expired ? '远程地址已过期' : '本地下载失败',
+        detail: expired ? '远程 MP4 地址已过期，请在 VevDemo 内重新导出。' : (errorText || '下载到本地失败，可重试本地下载。'),
+        badge: '需处理',
+        actions: expired
+          ? [
+              { action: 'reexport', label: '重新导出', primary: true },
+              { action: 'close', label: '关闭' },
+            ]
+          : [{ action: 'retry-local', label: state?.retrying ? '重试中...' : '重试下载（本地）', primary: true, disabled: !!state?.retrying }],
+      };
+    case 'ready':
+      return {
+        ...base,
+        borderClass: 'border-emerald-400/30',
+        bgClass: 'bg-emerald-500/10',
+        textClass: 'text-emerald-200',
+        icon: 'check_circle',
+        title: '导出完成',
+        detail: '成片已下载到 Origin 本地，可直接播放或下载。',
+        badge: '可用',
+        actions: [
+          { action: 'play', label: '播放', primary: true },
+          { action: 'download', label: '下载' },
+          { action: 'close', label: '关闭' },
+        ],
+      };
+    case 'polling_paused':
+    default:
+      return {
+        ...base,
+        borderClass: 'border-amber-400/25',
+        bgClass: 'bg-amber-500/10',
+        textClass: 'text-amber-200',
+        icon: 'hourglass_empty',
+        title: '导出状态待确认',
+        detail: errorText || '导出耗时较长或状态异常，可继续等待或手动刷新。',
+        badge: '待确认',
+        actions: [
+          { action: 'continue-polling', label: '继续等待', primary: true },
+          { action: 'refresh', label: '刷新状态' },
+        ],
+      };
+  }
+}
+
+function _bindExportStatusCardActions(slot) {
+  slot.querySelectorAll('[data-oe-export-action]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      const action = button.dataset.oeExportAction;
+      if (button.disabled) return;
+      if (action === 'close') {
+        _resetExportState();
+        return;
+      }
+      if (action === 'play') {
+        _openExportPlaybackModal(_exportState.url);
+        return;
+      }
+      if (action === 'download') {
+        _downloadReadyExport();
+        return;
+      }
+      if (action === 'refresh' || action === 'continue-polling') {
+        if (action === 'continue-polling') {
+          _continueExportStatusPolling();
+        } else {
+          _refreshCurrentExportStatusOnce();
+        }
+        return;
+      }
+      if (action === 'retry-local') {
+        _retryLocalDownload();
+        return;
+      }
+      if (action === 'retry-callback') {
+        _retryOriginCallback();
+        return;
+      }
+      if (action === 'reexport') {
+        _requestVevDemoReexport();
+      }
+    });
+  });
+}
+
+function _refreshCurrentExportStatusOnce() {
+  const exportId = _exportState.exportId;
+  if (!exportId) {
+    _oeCtx?.showToast?.('没有可刷新的导出任务', 'warning');
+    return;
+  }
+  _refreshPersistedExportUpdatedAt();
+  _fetchAndApplyExportStatus(exportId, _exportState.stateVersion, { allowPolling: false });
+}
+
+function _continueExportStatusPolling() {
+  const exportId = _exportState.exportId;
+  if (!exportId) {
+    _oeCtx?.showToast?.('没有可继续等待的导出任务', 'warning');
+    return;
+  }
+  _refreshPersistedExportUpdatedAt();
+  _startExportStatusPolling(exportId);
+}
+
+function _downloadReadyExport() {
+  if (!_exportState.url) return;
+  const link = document.createElement('a');
+  link.href = _exportState.url;
+  link.download = `${_exportState.exportId || 'online-editor-export'}.mp4`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function _openExportPlaybackModal(url) {
+  if (!url) return;
+  _closeExportPlaybackModal();
+  const modal = document.createElement('div');
+  modal.id = 'oeExportPlaybackModal';
+  modal.className = 'fixed inset-0 z-[80] flex items-center justify-center bg-black/75 p-6 backdrop-blur-md';
+  modal.innerHTML = `
+    <div class="w-full max-w-4xl rounded-2xl border border-white/10 bg-[#080d13] shadow-2xl shadow-black/50 overflow-hidden">
+      <div class="flex items-center justify-between gap-4 px-4 py-3 border-b border-white/10">
+        <div>
+          <p class="text-sm text-white/85">导出成片预览</p>
+          <p class="text-[11px] text-white/40">播放的是 Origin 本地导出文件</p>
+        </div>
+        <button type="button" data-oe-export-modal-close class="w-8 h-8 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 flex items-center justify-center">
+          <span class="material-symbols-outlined text-base text-white/60">close</span>
+        </button>
+      </div>
+      <div class="bg-black">
+        <video src="${_escapeOnlineEditorHtml(url)}" controls autoplay class="w-full max-h-[70vh] bg-black"></video>
+      </div>
+    </div>
+  `;
+  modal.addEventListener('click', (event) => {
+    if (event.target === modal || event.target.closest('[data-oe-export-modal-close]')) {
+      _closeExportPlaybackModal();
+    }
+  });
+  document.body.appendChild(modal);
+}
+
+function _closeExportPlaybackModal() {
+  const existing = document.getElementById('oeExportPlaybackModal');
+  if (existing) existing.remove();
+}
+
+function _isRemoteUrlExpired(value) {
+  const expiresAt = _getExportExpireTime(value);
+  if (!expiresAt) return false;
+  return Date.now() + 60 * 1000 >= expiresAt;
+}
+
+function _getExportExpireTime(value) {
+  if (!value) return 0;
+  if (typeof value === 'number') return value < 1e12 ? value * 1000 : value;
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    return numeric < 1e12 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function _formatOnlineEditorExportError(message) {
+  const raw = String(message || '').trim();
+  if (!raw) return '';
+  if (raw === 'missing remote url from VevDemo') return 'VevDemo 未返回导出地址';
+  if (raw === 'remote_url_expired') return '远程下载地址已过期';
+  if (raw === 'url_expired_need_reexport') return '远程下载地址已过期，需要重新导出';
+  if (raw === 'orphaned by server restart') return '服务重启导致下载中断';
+  if (/^remote_http_/i.test(raw)) return '远程文件下载失败，请重试';
+  if (raw === 'remote_empty_body' || raw === 'download_failed') return '下载失败，请重试';
+  return raw;
+}
+
+function _persistExportId(exportId) {
+  if (!exportId) return;
+  try {
+    localStorage.setItem(OEV_EXPORT_STORAGE_ID_KEY, String(exportId));
+    localStorage.setItem(OEV_EXPORT_STORAGE_UPDATED_KEY, new Date().toISOString());
+  } catch (err) {
+    console.warn('[OnlineEditor] 保存导出状态失败:', err);
+  }
+}
+
+function _refreshPersistedExportUpdatedAt() {
+  try {
+    const exportId = localStorage.getItem(OEV_EXPORT_STORAGE_ID_KEY);
+    if (!exportId) return;
+    localStorage.setItem(OEV_EXPORT_STORAGE_UPDATED_KEY, new Date().toISOString());
+  } catch (err) {
+    console.warn('[OnlineEditor] 刷新导出状态时间失败:', err);
+  }
+}
+
+function _clearPersistedExportState() {
+  try {
+    localStorage.removeItem(OEV_EXPORT_STORAGE_ID_KEY);
+    localStorage.removeItem(OEV_EXPORT_STORAGE_UPDATED_KEY);
+  } catch (err) {
+    console.warn('[OnlineEditor] 清理导出状态失败:', err);
+  }
+}
+
+function _readPersistedExportState() {
+  try {
+    const exportId = localStorage.getItem(OEV_EXPORT_STORAGE_ID_KEY);
+    if (!exportId) return null;
+    const updatedAt = localStorage.getItem(OEV_EXPORT_STORAGE_UPDATED_KEY);
+    const updatedTime = updatedAt ? new Date(updatedAt).getTime() : 0;
+    if (!Number.isFinite(updatedTime) || Date.now() - updatedTime > OEV_EXPORT_STORAGE_STALE_MS) {
+      _clearPersistedExportState();
+      return null;
+    }
+    return { exportId, updatedAt };
+  } catch (err) {
+    console.warn('[OnlineEditor] 读取导出状态失败:', err);
+    return null;
+  }
+}
+
+function _restoreExportStateFromStorage() {
+  const persisted = _readPersistedExportState();
+  if (!persisted?.exportId) return;
+  if (_exportState.exportId === persisted.exportId && _exportState.phase !== 'idle') return;
+
+  const version = (_exportState.stateVersion || 0) + 1;
+  _exportState = {
+    ..._createDefaultExportState(),
+    stateVersion: version,
+    exportId: persisted.exportId,
+    phase: 'origin_waiting_download',
+  };
+  _renderExportStatusCard();
+  _fetchAndApplyExportStatus(persisted.exportId, version, { allowPolling: false });
+}
+
+async function _fetchAndApplyExportStatus(exportId, requestVersion, options) {
+  options = options || {};
+  if (!exportId || !_oeCtx?.apiGet) return null;
+  try {
+    const payload = await _oeCtx.apiGet(`/api/edit/export-status/${encodeURIComponent(exportId)}`);
+    if (requestVersion !== _exportState.stateVersion) return null;
+    if (payload?.detail) {
+      if (/不存在|unauthorized|认证/.test(String(payload.detail))) {
+        _resetExportState();
+        return null;
+      }
+      throw new Error(payload.detail);
+    }
+    _applyServerExportStatus(payload);
+    _refreshPersistedExportUpdatedAt();
+    return payload;
+  } catch (err) {
+    if (requestVersion !== _exportState.stateVersion) return null;
+    if (err?.payload && (err.payload.status === 'completed' || err.payload.status === 'failed')) {
+      _applyServerExportStatus(err.payload);
+      _refreshPersistedExportUpdatedAt();
+      return err.payload;
+    }
+    if (err?.status === 401 || err?.status === 404 || /不存在|unauthorized|认证/.test(String(err?.message || ''))) {
+      _resetExportState();
+      return null;
+    }
+    console.warn('[OnlineEditor] 获取导出状态失败:', err);
+    _setExportState({
+      phase: 'polling_paused',
+      errorMsg: err?.message || '获取导出状态失败',
+      polling: false,
+    });
+    return null;
+  }
+}
+
+function _startExportStatusPolling(exportId) {
+  if (!exportId) return;
+  _clearExportPollingTimer();
+  _exportPollingStartedAt = Date.now();
+  const version = _exportState.stateVersion;
+  _setExportState({ polling: true, errorMsg: _exportState.errorMsg || '' });
+
+  const tick = async () => {
+    if (version !== _exportState.stateVersion || exportId !== _exportState.exportId) return;
+    if (Date.now() - _exportPollingStartedAt > OEV_EXPORT_POLL_MAX_MS) {
+      _clearExportPollingTimer();
+      _setExportState({
+        phase: 'polling_paused',
+        polling: false,
+        errorMsg: '导出耗时较长，可继续等待或手动刷新状态。',
+      });
+      return;
+    }
+
+    await _fetchAndApplyExportStatus(exportId, version, { allowPolling: true });
+    if (version !== _exportState.stateVersion || exportId !== _exportState.exportId) return;
+
+    if (_isExportPollingTerminalPhase(_exportState.phase)) {
+      _clearExportPollingTimer();
+      _setExportState({ polling: false });
+      return;
+    }
+
+    _exportPollingTimer = setTimeout(tick, OEV_EXPORT_POLL_INTERVAL_MS);
+  };
+
+  tick();
+}
+
+function _isExportPollingTerminalPhase(phase) {
+  return phase === 'ready'
+    || phase === 'vev_export_failed'
+    || phase === 'origin_callback_failed'
+    || phase === 'origin_download_failed'
+    || phase === 'polling_paused';
+}
+
+function _applyServerExportStatus(payload) {
+  const phase = _deriveServerExportPhase(payload);
+  _setExportState({
+    exportId: payload?.taskId || _exportState.exportId,
+    phase,
+    status: payload?.status || null,
+    localDownloadStatus: payload?.localDownloadStatus || null,
+    url: payload?.url || payload?.downloadUrl || null,
+    remoteUrl: payload?.remoteUrl || null,
+    remoteUrlExpiresAt: payload?.remoteUrlExpiresAt || null,
+    needsReviewReason: payload?.needsReviewReason || null,
+    reexportRequired: !!payload?.reexportRequired,
+    errorMsg: payload?.errorMsg || payload?.error || '',
+  });
+}
+
+function _deriveServerExportPhase(payload) {
+  const url = payload?.url || payload?.downloadUrl;
+  if (url) return 'ready';
+  if (payload?.status === 'failed') return 'vev_export_failed';
+  if (payload?.status === 'completed') {
+    switch (payload?.localDownloadStatus) {
+      case 'pending':
+        return 'origin_waiting_download';
+      case 'downloading':
+        return 'origin_downloading';
+      case 'download_failed':
+        return 'origin_download_failed';
+      case 'completed':
+        return 'polling_paused';
+      default:
+        return 'polling_paused';
+    }
+  }
+  return 'polling_paused';
+}
+
+// ============================================================================
+// iframe 管理
+// ============================================================================
+
+function _createVevDemoFrame(url) {
+  const container = document.getElementById('oeEditorContainer');
+  if (!container) {
+    console.error('[OnlineEditor] 未找到编辑器承载容器');
+    return;
+  }
+
+  // 清空容器
+  container.innerHTML = '';
+  container.style.position = 'relative';
+  _hasVevDemoMessage = false;
+
+  let iframeLoaded = false;
+  let readyTimer = null;
+  let loadTimer = null;
+  const clearFrameTimers = () => {
+    if (loadTimer) clearTimeout(loadTimer);
+    if (readyTimer) clearTimeout(readyTimer);
+  };
+  const failFrameLoad = (message) => {
+    clearFrameTimers();
+    _vevFrame = null;
+    _connectStarted = false;
+    _scheduleVevDemoAutoRetry(url, message);
+  };
+
+  // 创建加载指示器
+  const loadingOverlay = document.createElement('div');
+  loadingOverlay.id = 'oeVevLoadingOverlay';
+  loadingOverlay.className = 'flex flex-col items-center justify-center h-full bg-[#0a0e14]';
+  loadingOverlay.innerHTML = `
+    <div class="animate-spin w-12 h-12 border-3 border-cyan-500 border-t-transparent rounded-full mb-4"></div>
+    <p class="text-white/60 text-sm">正在连接视频剪辑服务...</p>
+    <p class="text-white/40 text-xs mt-2">${url}</p>
+  `;
+  container.appendChild(loadingOverlay);
+
+  // 创建 iframe
+  _vevFrame = document.createElement('iframe');
+  _vevFrame.id = 'vevdemo-frame';
+  _vevFrame.src = url;
+  _vevFrame.style.cssText = `
+    width: 100%;
+    height: 100%;
+    border: none;
+    background: #0a0e14;
+    display: none;
+  `;
+  const frame = _vevFrame;
+
+  loadTimer = setTimeout(() => {
+    if (iframeLoaded) return;
+    failFrameLoad(`编辑器加载超时，请检查 VevDemo 前端是否可访问，以及 Origin CSP frame-src 是否允许 ${url}`);
+  }, OEV_IFRAME_LOAD_TIMEOUT_MS);
+
+  // iframe 加载完成后显示
+  frame.addEventListener('load', () => {
+    if (_vevFrame !== frame) return;
+    iframeLoaded = true;
+    if (loadTimer) clearTimeout(loadTimer);
+    console.log('[OnlineEditor] VevDemo iframe 加载完成');
+    frame.style.display = 'block';
+    const overlay = document.getElementById('oeVevLoadingOverlay');
+    if (overlay) overlay.remove();
+
+    readyTimer = setTimeout(() => {
+      if (_isVevDemoReady || _hasVevDemoMessage || !_vevFrame) return;
+      _showEditorDiagnostic(
+        '编辑器已加载但未收到就绪消息',
+        '请检查 VevDemo 服务是否暴露 postMessage ready/beacon；页面可继续用于渲染验证。'
+      );
+    }, OEV_IFRAME_READY_TIMEOUT_MS);
+  });
+
+  // iframe 加载失败
+  frame.addEventListener('error', () => {
+    if (_vevFrame !== frame) return;
+    clearFrameTimers();
+    console.error('[OnlineEditor] VevDemo iframe 加载失败');
+    failFrameLoad('VevDemo iframe 加载失败，请检查服务是否运行、URL 是否正确，或是否被浏览器策略阻断');
+  });
+
+  container.appendChild(frame);
+}
+
+function _clearVevDemoAutoRetryTimer() {
+  if (_vevFrameAutoRetryTimer) {
+    clearTimeout(_vevFrameAutoRetryTimer);
+    _vevFrameAutoRetryTimer = null;
+  }
+}
+
+function _resetVevDemoAutoRetryState() {
+  _clearVevDemoAutoRetryTimer();
+  _vevFrameAutoRetryCount = 0;
+}
+
+function _isOnlineEditorPageActive() {
+  const page = document.getElementById('pageOnlineEditor');
+  return !!page && !page.hidden;
+}
+
+function _scheduleVevDemoAutoRetry(url, message) {
+  _clearVevDemoAutoRetryTimer();
+  if (!_isOnlineEditorPageActive()) {
+    _showSetupGuide(message, 'load_failed');
+    return;
+  }
+
+  if (_vevFrameAutoRetryCount >= OEV_IFRAME_AUTO_RETRY_MAX) {
+    _showSetupGuide(`${message} 已自动重试 ${OEV_IFRAME_AUTO_RETRY_MAX} 次，仍未连接成功。`, 'load_failed');
+    return;
+  }
+
+  const nextAttempt = _vevFrameAutoRetryCount + 1;
+  _showSetupGuide(
+    `${message} ${Math.ceil(OEV_IFRAME_AUTO_RETRY_DELAY_MS / 1000)} 秒后自动重试（${nextAttempt}/${OEV_IFRAME_AUTO_RETRY_MAX}）。`,
+    'load_failed'
+  );
+
+  _vevFrameAutoRetryTimer = setTimeout(() => {
+    _vevFrameAutoRetryTimer = null;
+    if (!_isOnlineEditorPageActive()) return;
+    _vevFrameAutoRetryCount = nextAttempt;
+    console.log(`[OnlineEditor] VevDemo iframe 自动重试 ${nextAttempt}/${OEV_IFRAME_AUTO_RETRY_MAX}`);
+    _retryVevDemoConnection({ auto: true, url });
+  }, OEV_IFRAME_AUTO_RETRY_DELAY_MS);
+}
+
+async function _retryVevDemoConnection(options) {
+  options = options || {};
+  const manual = !!options.manual;
+  const urlFromOptions = options.url || '';
+
+  _clearVevDemoAutoRetryTimer();
+  if (manual) _vevFrameAutoRetryCount = 0;
+  if (!_oeCtx) return;
+  if (!_isOnlineEditorPageActive()) return;
+
+  if (_vevFrame) {
+    _vevFrame.remove();
+    _vevFrame = null;
+  }
+  _isVevDemoReady = false;
+  _hasVevDemoMessage = false;
+  _connectStarted = false;
+  _setOnlineEditorControlsReady(false);
+
+  try {
+    if (!_vevDemoConfig || !_getConfiguredIframeUrl(_vevDemoConfig)) {
+      _vevDemoConfig = await _loadVevDemoConfig();
+    }
+    const url = urlFromOptions || _getConfiguredIframeUrl(_vevDemoConfig) || _lastVevFrameUrl;
+    if (!url) {
+      _showSetupGuide(_vevDemoConfig?.message || 'VevDemo 服务未配置', 'missing_config', _vevDemoConfig?.missingKeys || []);
+      return;
+    }
+    _lastVevFrameUrl = url;
+    if (!_messageListenerBound) {
+      window.addEventListener('message', _handleVevMessage);
+      _messageListenerBound = true;
+    }
+    _connectStarted = true;
+    _createVevDemoFrame(url);
+  } catch (err) {
+    console.error('[OnlineEditor] 重连 VevDemo 失败:', err);
+    _connectStarted = false;
+    _showSetupGuide(`连接 VevDemo 服务失败: ${err.message || '未知错误'}`, 'load_failed');
+  }
+}
+
+function _destroyVevDemoFrame() {
+  _clearVevDemoAutoRetryTimer();
+  if (_vevFrame) {
+    _vevFrame.remove();
+    _vevFrame = null;
+  }
+  _isVevDemoReady = false;
+  _setOnlineEditorControlsReady(false);
+  _connectStarted = false;
+  _hasVevDemoMessage = false;
+  if (_messageListenerBound) {
+    window.removeEventListener('message', _handleVevMessage);
+    _messageListenerBound = false;
+  }
+}
+
+function destroyOnlineEditor() {
+  _destroyVevDemoFrame();
+}
+
+function _getVevDemoOrigin() {
+  if (!_vevDemoConfig?.iframeUrl) return '';
+  try {
+    const url = new URL(_vevDemoConfig.iframeUrl);
+    return url.origin;
+  } catch {
+    console.warn('[OnlineEditor] VevDemo iframeUrl 无效，拒绝发送消息');
+    return '';
+  }
+}
+
+function _isFromVevDemo(origin) {
+  if (!_vevDemoConfig?.iframeUrl) return false;
+  try {
+    const expectedOrigin = new URL(_vevDemoConfig.iframeUrl).origin;
+    return origin === expectedOrigin;
+  } catch {
+    console.warn('[OnlineEditor] VevDemo iframeUrl 无效，拒绝接收消息');
+    return false;
+  }
+}
+
+// ============================================================================
+// postMessage 通信
+// ============================================================================
+
+function _sendToVevDemo(type, data) {
+  if (!_vevFrame?.contentWindow) {
+    console.warn('[OnlineEditor] VevDemo iframe 未就绪，无法发送消息:', type);
+    return false;
+  }
+
+  try {
+    const targetOrigin = _getVevDemoOrigin();
+    if (!targetOrigin) return false;
+    _vevFrame.contentWindow.postMessage({ type, data }, targetOrigin);
+    console.log('[OnlineEditor] -> VevDemo:', type, data);
+    return true;
+  } catch (err) {
+    console.error('[OnlineEditor] 发送消息失败:', err);
+    return false;
+  }
+}
+
+function _handleVevMessage(event) {
+  // 验证消息来源
+  if (!_isFromVevDemo(event.origin)) {
+    return;
+  }
+
+  _hasVevDemoMessage = true;
+  const { type, data } = event.data || {};
+  if (!type) return;
+
+  console.log('[OnlineEditor] <- VevDemo:', type, data);
+
+  // 处理预注册的处理器
+  const handler = _messageHandlers.get(type);
+  if (handler) {
+    try {
+      handler(data);
+    } catch (err) {
+      console.error('[OnlineEditor] 消息处理错误:', type, err);
+    }
+    return;
+  }
+
+  // 内置消息处理
+  switch (type) {
+    case 'vevdemo:ready':
+      _onVevDemoReady(data);
+      break;
+
+    case 'vevdemo:exportComplete':
+      _onExportComplete(data);
+      break;
+
+    case 'vevdemo:exportStatus':
+      _onVevDemoStatus(data);
+      break;
+
+    case 'vevdemo:exportError':
+      _onExportError(data);
+      break;
+
+    case 'vevdemo:timelineChange':
+      _onTimelineChange(data);
+      break;
+
+    case 'vevdemo:materialsImported':
+      _onMaterialsImported(data);
+      break;
+
+    case 'vevdemo:error':
+      _onVevDemoError(data);
+      break;
+
+    case 'vevdemo:status':
+      _onVevDemoStatus(data);
+      break;
+
+    default:
+      console.log('[OnlineEditor] 未处理的消息:', type, data);
+  }
+}
+
+// ============================================================================
+// VevDemo 消息处理
+// ============================================================================
+
+function _onVevDemoReady(data) {
+  _isVevDemoReady = true;
+  _resetVevDemoAutoRetryState();
+  _setOnlineEditorControlsReady(true);
+  const diagnostic = document.getElementById('oeVevDiagnostic');
+  if (diagnostic) diagnostic.remove();
+  console.log('[OnlineEditor] VevDemo 就绪');
+  if (data && data.uploadWorkflowConfigured === false) {
+    _oeCtx?.showToast?.('VevDemo 上传转码工作流未配置，新上传 MP4 可能仍无法拖入轨道', 'warning');
+  }
+
+  _bindCurrentOriginProjectToVevDemo();
+
+  // 发送欢迎消息，确认连接
+  _sendToVevDemo('origin:ping', { timestamp: Date.now() });
+
+  _oeCtx?.showToast?.('视频剪辑服务已连接', 'success');
+}
+
+async function _bindCurrentOriginProjectToVevDemo() {
+  const project = _oeCtx?.getProject?.();
+  if (!project?.id) return;
+  try {
+    const payload = await _oeCtx?.apiPost?.('/api/online-editor/project-binding', {
+      projectId: project.id,
+    });
+    if (!payload?.success || !payload?.vevProjectId || !payload?.vevGroupId) {
+      throw new Error(payload?.detail || 'VevDemo 工程绑定信息不完整');
+    }
+    _sendToVevDemo('origin:setProject', {
+      projectId: project.id,
+      title: project.title,
+      vevProjectId: payload.vevProjectId,
+      vevGroupId: payload.vevGroupId,
+      vevSpace: payload.vevSpace,
+    });
+  } catch (err) {
+    console.error('[OnlineEditor] VevDemo 工程绑定失败:', err);
+    _oeCtx?.showToast?.(`VevDemo 工程隔离暂不可用: ${err?.message || 'unknown error'}`, 'warning');
+    _sendToVevDemo('origin:setProject', {
+      projectId: project.id,
+      title: project.title,
+    });
+  }
+}
+
+function _onExportComplete(data) {
+  const payload = _normalizeVevExportPayload(data);
+  const key = _getExportCallbackDedupKey(payload);
+  console.log('[OnlineEditor] 导出完成:', payload);
+
+  if (!key) {
+    _setExportState({
+      phase: 'vev_export_failed',
+      errorMsg: 'VevDemo 导出完成事件缺少 taskId 和 outputUrl',
+      vevPayload: payload,
+      callbackPosting: false,
+    });
+    return;
+  }
+
+  if (key === _exportState.callbackDedupKey && (_exportState.callbackPosting || _exportState.exportId)) {
+    console.log('[OnlineEditor] 忽略重复导出完成事件:', key);
+    return;
+  }
+
+  if (key !== _exportState.callbackDedupKey || _exportState.phase !== 'vev_exporting') {
+    _beginNewVevExport(payload);
+  } else {
+    _setExportState({
+      vevTaskId: payload.taskId || _exportState.vevTaskId,
+      vevPayload: payload,
+      callbackDedupKey: key,
+      phase: 'vev_exporting',
+      status: payload.status || _exportState.status,
+      errorMsg: '',
+    });
+  }
+
+  _submitExportCallbackFromPayload(payload, _exportState.stateVersion);
+}
+
+function _onExportError(data) {
+  const payload = _normalizeVevExportPayload(data);
+  const key = _getExportCallbackDedupKey(payload);
+  if (_exportState.exportId && (!key || key === _exportState.callbackDedupKey)) {
+    console.log('[OnlineEditor] 忽略已入库导出的迟到错误事件:', payload);
+    return;
+  }
+  console.error('[OnlineEditor] 导出错误:', payload.code, payload.message);
+  _clearExportPollingTimer();
+  _setExportState({
+    phase: 'vev_export_failed',
+    status: payload.status || 'failed',
+    vevTaskId: payload.taskId || _exportState.vevTaskId,
+    vevPayload: payload,
+    callbackDedupKey: key || _exportState.callbackDedupKey,
+    callbackPosting: false,
+    polling: false,
+    retrying: false,
+    errorMsg: payload.message || 'VevDemo 导出失败',
+  });
+  _oeCtx?.showToast?.(`导出失败: ${payload.message || '未知错误'}`, 'error');
+}
+
+function _onTimelineChange(data) {
+  console.log('[OnlineEditor] 时间线变化:', data);
+  // 可以在这里同步本地状态
+}
+
+function _onMaterialsImported(data) {
+  const { count, mediaIds, results, mode, registeredCount, probedCount, registrationResults } = data || {};
+  console.log('[OnlineEditor] 素材同步完成:', { count, mediaIds, results, registrationResults });
+  if (mode === 'create-edit-material' && Number(registeredCount || 0) > 0) {
+    _oeCtx?.showToast?.(`已同步 ${registeredCount} 个素材到 VevDemo 素材库`, 'success');
+    return;
+  }
+  const skipped = Array.isArray(registrationResults)
+    ? registrationResults.filter((item) => item && item.ok === false).length
+    : 0;
+  const suffix = skipped > 0 ? `，${skipped} 个素材尚未完成 VOD/TOS 注册` : '，尚未完成 VOD/TOS 注册';
+  _oeCtx?.showToast?.(`已检测 ${probedCount || count || 0} 个浏览器侧可访问素材${suffix}`, 'warning');
+}
+
+function _onVevDemoError(data) {
+  const { message, code } = data || {};
+  console.error('[OnlineEditor] VevDemo 错误:', code, message);
+  _oeCtx?.showToast?.(`VevDemo 错误: ${message || '未知错误'}`, 'error');
+}
+
+function _onVevDemoStatus(data) {
+  const payload = _normalizeVevExportPayload(data);
+  if (!_isVevExportStatusPayload(payload)) {
+    if (data?.status === 'origin-project-received') {
+      console.warn('[OnlineEditor] VevDemo 已收到 Origin 项目，但当前桥接暂不支持切换底层 VevDemo 项目:', data);
+    }
+    console.log('[OnlineEditor] VevDemo 状态:', data);
+    return;
+  }
+
+  if (_isVevExportFailureStatus(payload.status)) {
+    _onExportError(payload);
+    return;
+  }
+
+  const key = _getExportCallbackDedupKey(payload);
+  const isPreTerminalFail = _exportState.phase === 'vev_export_failed'
+    || _exportState.phase === 'origin_callback_failed';
+
+  if (isPreTerminalFail) {
+    _beginNewVevExport(payload);
+    return;
+  }
+
+  if (key && _exportState.callbackDedupKey && key !== _exportState.callbackDedupKey) {
+    _beginNewVevExport(payload);
+    return;
+  }
+
+  if (!_exportState.exportId) {
+    _setExportState({
+      phase: 'vev_exporting',
+      status: payload.status || _exportState.status,
+      vevTaskId: payload.taskId || _exportState.vevTaskId,
+      vevPayload: payload,
+      callbackDedupKey: key || _exportState.callbackDedupKey,
+      errorMsg: payload.message || '',
+    });
+  }
+  console.log('[OnlineEditor] VevDemo 导出状态:', payload);
+}
+
+function _normalizeVevExportPayload(data) {
+  const raw = data?.status === 'export-status' && data?.payload ? data.payload : (data || {});
+  return {
+    taskId: raw.taskId || raw.exportId || raw.id || null,
+    outputUrl: raw.outputUrl || raw.url || raw.downloadUrl || null,
+    duration: raw.duration ?? raw.durationSec ?? null,
+    format: raw.format || 'mp4',
+    status: raw.status || raw.exportStatus || null,
+    message: raw.message || raw.error || raw.errorMsg || '',
+    code: raw.code || raw.errorCode || null,
+    raw,
+  };
+}
+
+function _isVevExportStatusPayload(payload) {
+  if (!payload) return false;
+  return Boolean(
+    payload.taskId
+    || payload.outputUrl
+    || _isKnownVevExportStatus(payload.status)
+    || payload.raw?.status === 'export-status'
+  );
+}
+
+function _isKnownVevExportStatus(status) {
+  return /export|queue|pending|submit|process|running|complete|success|fail|error|cancel/i.test(String(status || ''));
+}
+
+function _isVevExportFailureStatus(status) {
+  return /fail|error|cancel/i.test(String(status || ''));
+}
+
+function _getExportCallbackDedupKey(payload) {
+  return payload?.taskId || payload?.outputUrl || null;
+}
+
+function _beginNewVevExport(payload) {
+  const normalized = _normalizeVevExportPayload(payload);
+  const key = _getExportCallbackDedupKey(normalized);
+  _clearPersistedExportState();
+  return _replaceExportState({
+    phase: 'vev_exporting',
+    vevTaskId: normalized.taskId || null,
+    vevPayload: normalized,
+    callbackDedupKey: key,
+    status: normalized.status || null,
+    url: null,
+    remoteUrl: normalized.outputUrl || null,
+    remoteUrlExpiresAt: null,
+    errorMsg: normalized.message || '',
+    localDownloadStatus: null,
+    callbackPosting: false,
+    polling: false,
+    retrying: false,
+  });
+}
+
+async function _submitExportCallbackFromPayload(payload, requestVersion) {
+  const normalized = _normalizeVevExportPayload(payload);
+  const key = _getExportCallbackDedupKey(normalized);
+  if (!key) {
+    _setExportState({
+      phase: 'vev_export_failed',
+      errorMsg: '缺少 VevDemo 导出标识，无法回写 Origin',
+      callbackPosting: false,
+    });
+    return;
+  }
+
+  _setExportState({
+    phase: 'vev_exporting',
+    vevTaskId: normalized.taskId || _exportState.vevTaskId,
+    vevPayload: normalized,
+    callbackDedupKey: key,
+    callbackPosting: true,
+    errorMsg: '',
+  });
+
+  try {
+    const response = await _oeCtx?.apiPost?.('/api/online-editor/export-complete', {
+      projectId: _oeCtx?.getProject?.()?.id,
+      taskId: normalized.taskId,
+      outputUrl: normalized.outputUrl,
+      duration: normalized.duration,
+      format: normalized.format,
+    });
+    if (requestVersion !== _exportState.stateVersion) return;
+
+    if (response?.success && response?.exportId) {
+      _persistExportId(response.exportId);
+      _setExportState({
+        exportId: response.exportId,
+        phase: 'origin_waiting_download',
+        status: response.status || 'completed',
+        localDownloadStatus: response.vevDemo?.localDownloadStatus || 'pending',
+        remoteUrl: response.vevDemo?.remoteUrl || normalized.outputUrl || null,
+        remoteUrlExpiresAt: response.vevDemo?.remoteUrlExpiresAt || null,
+        callbackPosting: false,
+        errorMsg: '',
+      });
+      _oeCtx?.showToast?.('导出完成，正在下载到 Origin 本地', 'success');
+      _startExportStatusPolling(response.exportId);
+      return;
+    }
+
+    const message = response?.error || response?.message || 'Origin 未能确认导出回写结果';
+    _setExportState({
+      exportId: response?.exportId || null,
+      phase: 'vev_export_failed',
+      status: response?.status || 'failed',
+      callbackPosting: false,
+      errorMsg: message,
+    });
+    _oeCtx?.showToast?.(`导出回写异常: ${message}`, 'error');
+  } catch (err) {
+    if (requestVersion !== _exportState.stateVersion) return;
+    console.error('[OnlineEditor] 导出回调失败:', err);
+    _setExportState({
+      phase: 'origin_callback_failed',
+      callbackPosting: false,
+      errorMsg: err?.message || 'Origin 回写失败',
+    });
+    _oeCtx?.showToast?.('导出已完成但 Origin 回写失败，可在状态卡片里重新回写', 'error');
+  }
+}
+
+function _retryOriginCallback() {
+  if (_exportState.callbackPosting) return;
+  if (!_exportState.vevPayload) {
+    _oeCtx?.showToast?.('没有可重新回写的 VevDemo 导出信息', 'warning');
+    return;
+  }
+  _submitExportCallbackFromPayload(_exportState.vevPayload, _exportState.stateVersion);
+}
+
+async function _retryLocalDownload() {
+  const exportId = _exportState.exportId;
+  if (!exportId) {
+    _oeCtx?.showToast?.('没有可重试的导出任务', 'warning');
+    return;
+  }
+  if (_isRemoteUrlExpired(_exportState.remoteUrlExpiresAt)) {
+    _setExportState({
+      errorMsg: 'remote_url_expired',
+      retrying: false,
+    });
+    _oeCtx?.showToast?.('远程下载地址已过期，请在 VevDemo 内重新导出', 'warning');
+    return;
+  }
+
+  const version = _exportState.stateVersion;
+  _refreshPersistedExportUpdatedAt();
+  _setExportState({ retrying: true, errorMsg: '' });
+
+  try {
+    const response = await _oeCtx?.apiPost?.(`/api/online-editor/download/${encodeURIComponent(exportId)}/retry`, {});
+    if (version !== _exportState.stateVersion) return;
+    if (response?.success !== true) {
+      _handleLocalRetryFailure(response?.detail || response?.error || response?.message || '重试下载失败');
+      return;
+    }
+    _setExportState({
+      phase: 'origin_waiting_download',
+      localDownloadStatus: response?.localDownloadStatus || 'pending',
+      retrying: false,
+      errorMsg: '',
+    });
+    _oeCtx?.showToast?.('已重新提交本地下载', 'success');
+    _startExportStatusPolling(exportId);
+  } catch (err) {
+    if (version !== _exportState.stateVersion) return;
+    _handleLocalRetryFailure(err?.message || '重试下载失败', err?.status);
+  }
+}
+
+function _handleLocalRetryFailure(detail, status) {
+  const message = String(detail || '重试下载失败');
+  if (status === 404 || /不存在/.test(message)) {
+    _resetExportState();
+    _oeCtx?.showToast?.('导出任务不存在，已清理本地状态', 'warning');
+    return;
+  }
+  if (status === 409 || /过期|expired/i.test(message)) {
+    _setExportState({
+      phase: 'origin_download_failed',
+      retrying: false,
+      errorMsg: 'remote_url_expired',
+    });
+    _oeCtx?.showToast?.('远程下载地址已过期，请在 VevDemo 内重新导出', 'warning');
+    return;
+  }
+  _setExportState({
+    phase: 'origin_download_failed',
+    retrying: false,
+    errorMsg: message,
+  });
+  _oeCtx?.showToast?.(`重试下载失败: ${message}`, 'error');
+}
+
+function _requestVevDemoReexport() {
+  if (_isVevDemoReady) {
+    _sendToVevDemo('origin:requestExport', {
+      reason: 'url_expired_need_reexport',
+      previousExportId: _exportState.exportId || null,
+      previousRemoteUrlExpiresAt: _exportState.remoteUrlExpiresAt || null,
+    });
+  }
+  _oeCtx?.showToast?.('请在 VevDemo 中重新触发导出，完成后 Origin 会重新接收回写。', 'info');
+}
+
+// ============================================================================
+// 公开方法：与 VevDemo 交互
+// ============================================================================
+
+/**
+ * 同步 Origin 视频素材到 VevDemo。
+ * 后端会优先补齐 VOD/EditMaterial binding；bridge 收到 vid:// 后会复用或创建 VevDemo 素材。
+ * @param {string[]} resourceIds - 素材 ID 数组
+ */
+async function importMaterialsToVevDemo(resourceIds) {
+  if (!_isVevDemoReady) {
+    _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
+    return;
+  }
+  const ids = Array.isArray(resourceIds) && resourceIds.length > 0
+    ? resourceIds
+    : _collectCurrentVideoResourceIds();
+  if (!ids.length) {
+    _oeCtx?.showToast?.('当前项目没有可同步的视频素材', 'warning');
+    return;
+  }
+
+  try {
+    _setSyncMaterialsBusy(true);
+    // 调用后端获取素材；缺少 binding 的视频任务会在服务端自动注册到 VOD/VevDemo。
+    const payload = await _oeCtx?.apiPost?.('/api/volcengine/import', {
+      resourceIds: ids,
+    });
+    const materials = Array.isArray(payload.materials) ? payload.materials : [];
+    if (!materials.length) {
+      _oeCtx?.showToast?.('没有找到可同步的视频素材', 'warning');
+      return;
+    }
+    const reachableMaterials = materials.filter((item) => item && item.browserReachable !== false);
+    const skippedCount = materials.length - reachableMaterials.length;
+    if (skippedCount > 0) {
+      _oeCtx?.showToast?.(`${skippedCount} 条素材浏览器侧不可达，已跳过`, 'warning');
+    }
+    if (!reachableMaterials.length) {
+      _oeCtx?.showToast?.('没有可发送到 VevDemo 的素材', 'warning');
+      return;
+    }
+
+    // 发送到 VevDemo bridge：带 vevEditMid 的素材会直接复用；带 vid:// / tos:// / directurl:// 的素材会尝试注册。
+    await _sendMaterialsToVevDemo(reachableMaterials);
+
+    console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
+  } catch (err) {
+    console.error('[OnlineEditor] 同步素材失败:', err);
+    _oeCtx?.showToast?.('同步素材失败: ' + err.message, 'error');
+  } finally {
+    _setSyncMaterialsBusy(false);
+  }
+}
+
+function _sendMaterialsToVevDemo(materials) {
+  return new Promise((resolve, reject) => {
+    if (!_isVevDemoReady) {
+      reject(new Error('VevDemo 未就绪'));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      _messageHandlers.delete('vevdemo:materialsImported');
+      reject(new Error('未收到 VevDemo 素材同步回执，请检查 console'));
+    }, 8000);
+
+    _messageHandlers.set('vevdemo:materialsImported', (data) => {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:materialsImported');
+      _onMaterialsImported(data);
+      resolve(data);
+    });
+
+    const sent = _sendToVevDemo('origin:importMaterials', { materials });
+    if (!sent) {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:materialsImported');
+      reject(new Error('发送素材同步消息失败'));
+    }
+  });
+}
+
+function _collectCurrentVideoResourceIds() {
+  const project = _oeCtx?.getProject?.();
+  const ids = new Set();
+  const addFromUrl = (url) => {
+    const match = _ORIGIN_VIDEO_ID_RE.exec(String(url || ''));
+    if (match && match[1]) ids.add(decodeURIComponent(match[1]));
+  };
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  storyboards.forEach((sb) => {
+    addFromUrl(sb?._originVideoUrl);
+    addFromUrl(sb?.protectedUrl);
+    addFromUrl(sb?.videoUrl);
+  });
+  const tasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+  tasks.forEach((task) => {
+    addFromUrl(task?.protectedUrl);
+    addFromUrl(task?.videoUrl);
+    addFromUrl(task?.url);
+    if (task?.id && /^[a-zA-Z0-9-]{16,}$/.test(String(task.id))) ids.add(String(task.id));
+    if (task?.serverTaskId && /^[a-zA-Z0-9-]{16,}$/.test(String(task.serverTaskId))) ids.add(String(task.serverTaskId));
+  });
+  return Array.from(ids);
+}
+
+/**
+ * 触发导出
+ * @param {Object} options - 导出选项
+ */
+function triggerExport(options = {}) {
+  if (!_isVevDemoReady) {
+    _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
+    return;
+  }
+
+  _sendToVevDemo('origin:triggerExport', {
+    format: options.format || 'mp4',
+    quality: options.quality || 'high',
+    callbackUrl: `${window.location.origin}/api/online-editor/export-complete`,
+  });
+
+  _oeCtx?.showToast?.('正在导出...', 'info');
+}
+
+/**
+ * 获取时间线数据
+ * @returns {Promise} 时间线数据
+ */
+function requestTimelineData() {
+  return new Promise((resolve, reject) => {
+    if (!_isVevDemoReady) {
+      reject(new Error('VevDemo 未就绪'));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      _messageHandlers.delete('vevdemo:timelineData');
+      reject(new Error('获取时间线超时'));
+    }, 5000);
+
+    _messageHandlers.set('vevdemo:timelineData', (data) => {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:timelineData');
+      resolve(data);
+    });
+
+    _sendToVevDemo('origin:getTimeline', {});
+  });
+}
+
+// ============================================================================
+// 导出到 ffmpeg（降级方案）
+// ============================================================================
+
+/**
+ * 将 VevDemo 时间线转换为 EDL 格式并导出到 ffmpeg
+ */
+async function exportToFfmpeg() {
+  if (!_isVevDemoReady) {
+    _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
+    return;
+  }
+
+  try {
+    // 获取时间线数据
+    const timeline = await requestTimelineData();
+
+    // 转换为 EDL 格式
+    const edl = _convertTimelineToEDL(timeline);
+
+    // 调用现有 ffmpeg 导出 API
+    const res = await _oeCtx?.apiPost?.('/api/edit/export', {
+      projectId: _oeCtx?.getProject?.()?.id,
+      edl,
+    });
+
+    if (res?.ok) {
+      const result = await res.json();
+      _oeCtx?.showToast?.('已提交到 ffmpeg 导出队列', 'success');
+      return result;
+    } else {
+      throw new Error('提交导出失败');
+    }
+  } catch (err) {
+    console.error('[OnlineEditor] ffmpeg 导出失败:', err);
+    _oeCtx?.showToast?.('导出失败: ' + err.message, 'error');
+  }
+}
+
+/**
+ * 将 VevDemo 时间线格式转换为 EDL 格式
+ */
+function _convertTimelineToEDL(timeline) {
+  if (!timeline || !Array.isArray(timeline.tracks)) {
+    return [];
+  }
+
+  const edl = [];
+  for (const track of timeline.tracks) {
+    if (track.type !== 'video') continue;
+
+    for (const clip of track.clips || []) {
+      edl.push({
+        clipId: clip.mediaId,
+        videoUrl: clip.url,
+        inPoint: clip.inPoint || 0,
+        outPoint: clip.outPoint || clip.duration,
+        duration: clip.duration,
+        groupIdx: clip.groupIdx,
+        transitionIn: clip.transition?.type || 'cut',
+      });
+    }
+  }
+
+  return edl;
+}
+
+// ============================================================================
+// 设置引导
+// ============================================================================
+
+function _showSetupGuide(message, state, missingKeys) {
+  const container = document.getElementById('oeEditorContainer');
+  if (!container) return;
+  state = state || 'missing_config';
+  missingKeys = Array.isArray(missingKeys) ? missingKeys : [];
+  const stateMap = {
+    disabled: {
+      title: '在线精修剪辑器未启用',
+      intro: message || '当前环境关闭了在线精修入口，请在 Origin 配置中启用后再使用。',
+      iconBg: 'bg-white/10',
+      iconText: 'text-white/50',
+    },
+    missing_config: {
+      title: '视频剪辑服务未配置',
+      intro: message || '请按照以下步骤配置 VevDemo 服务',
+      iconBg: 'bg-cyan-500/20',
+      iconText: 'text-cyan-500',
+    },
+    load_failed: {
+      title: '视频剪辑服务加载失败',
+      intro: message || '请检查 VevDemo 服务、iframe 地址与 CSP frame-src 配置',
+      iconBg: 'bg-amber-500/20',
+      iconText: 'text-amber-300',
+    },
+    tab_only: {
+      title: '在线精修配置为新标签页模式',
+      intro: message || '当前配置为新标签页打开，请从剪辑页入口进入 VevDemo。',
+      iconBg: 'bg-white/10',
+      iconText: 'text-white/50',
+    },
+  };
+  const copy = stateMap[state] || stateMap.missing_config;
+  const introSuffix = (state === 'disabled' || state === 'missing_config')
+    ? ' 修改配置后请刷新页面。'
+    : '';
+  const introText = `${copy.intro}${introSuffix}`;
+  const missingHtml = missingKeys.length
+    ? `<p class="mt-2 text-[11px] text-amber-200/80">缺少配置项：${missingKeys.map(_escapeOnlineEditorHtml).join(', ')}</p>`
+    : '';
+  const guideHidden = (state === 'disabled' || state === 'tab_only') ? 'hidden' : '';
+  let actionHtml = '';
+  if (state === 'disabled' || state === 'tab_only') {
+    actionHtml = `
+      <button type="button" data-goto="edit" class="mt-6 px-6 py-2 bg-white/10 text-white font-medium rounded-lg hover:bg-white/15 transition-colors">
+        返回剪辑页
+      </button>`;
+  } else if (state === 'load_failed') {
+    actionHtml = `
+      <button type="button" data-oe-retry-connect class="mt-6 px-6 py-2 bg-cyan-500 text-black font-medium rounded-lg hover:bg-cyan-400 transition-colors">
+        重试连接
+      </button>`;
+  } else {
+    actionHtml = `
+      <button onclick="location.reload()" class="mt-6 px-6 py-2 bg-cyan-500 text-black font-medium rounded-lg hover:bg-cyan-400 transition-colors">
+        重新读取配置
+      </button>`;
+  }
+
+  container.innerHTML = `
+    <div class="flex flex-col items-center justify-center h-full bg-[#0a0e14] p-8">
+      <div class="max-w-md text-center">
+        <div class="w-16 h-16 mx-auto mb-6 rounded-full ${copy.iconBg} flex items-center justify-center">
+          <svg class="w-8 h-8 ${copy.iconText}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+          </svg>
+        </div>
+        <h2 class="text-xl font-semibold text-white mb-3">${copy.title}</h2>
+        <p class="text-white/60 text-sm mb-6">${_escapeOnlineEditorHtml(introText)}</p>
+        ${missingHtml}
+        
+        <div class="bg-white/5 rounded-lg p-4 text-left text-sm text-white/80 space-y-3 ${guideHidden}">
+          <div class="flex items-start gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">1</span>
+            <div>
+              <p class="font-medium">克隆 VevDemo 仓库</p>
+              <code class="text-cyan-400 text-xs">git clone https://github.com/volcengine/vevdemo.git</code>
+            </div>
+          </div>
+          <div class="flex items-start gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">2</span>
+            <div>
+              <p class="font-medium">配置后端环境变量</p>
+              <code class="text-cyan-400 text-xs">cd vevdemo/nodejs && cp .env.example .env</code>
+              <p class="text-white/50 text-xs mt-1">填入 VOLC_ACCESS_KEY, VOLC_SECRET_KEY</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">3</span>
+            <div>
+              <p class="font-medium">启动服务</p>
+              <code class="text-cyan-400 text-xs">npm run dev</code>
+              <p class="text-white/50 text-xs mt-1">VevDemo Editor（前端）: 8084 | VevDemo API（后端）: 3002</p>
+            </div>
+          </div>
+          <div class="flex items-start gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">4</span>
+            <div>
+              <p class="font-medium">配置 Origin 环境变量</p>
+              <code class="text-cyan-400 text-xs">VEVDEMO_EDITOR_URL=http://127.0.0.1:8084</code>
+              <p class="text-white/50 text-xs mt-1">VEVDEMO_API_URL=http://127.0.0.1:3002</p>
+            </div>
+          </div>
+        </div>
+        
+        ${actionHtml}
+      </div>
+	    </div>
+	  `;
+
+  const retryButton = container.querySelector('[data-oe-retry-connect]');
+  if (retryButton) {
+    retryButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      _retryVevDemoConnection({ manual: true });
+    });
+  }
+}
+
+function _escapeOnlineEditorHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function _showEditorDiagnostic(message, detail) {
+  const container = document.getElementById('oeEditorContainer');
+  if (!container) return;
+
+  let diagnostic = document.getElementById('oeVevDiagnostic');
+  if (!diagnostic) {
+    diagnostic = document.createElement('div');
+    diagnostic.id = 'oeVevDiagnostic';
+    diagnostic.className = 'absolute left-4 right-4 top-4 z-20 rounded-xl border border-amber-400/30 bg-[#171006]/92 px-4 py-3 shadow-lg shadow-black/30 backdrop-blur-xl';
+    container.appendChild(diagnostic);
+  }
+
+  diagnostic.innerHTML = `
+    <div class="flex items-start gap-3">
+      <span class="material-symbols-outlined text-amber-300 text-lg mt-0.5">info</span>
+      <div class="min-w-0">
+        <p class="text-sm text-amber-100">${message}</p>
+        <p class="text-xs text-amber-100/60 mt-1">${detail || ''}</p>
+      </div>
+    </div>
+  `;
+}
+
+// ============================================================================
+// 内部事件绑定（保留占位 UI 的交互）
+// ============================================================================
+
+function _bindToolbarEvents() {
+  const toolbarBtns = document.querySelectorAll('.oe-toolbar-btn');
+  toolbarBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const tool = btn.dataset.tool;
+      console.log(`[OnlineEditor] 工具栏按钮点击: ${tool}`);
+    });
+  });
+
+  // 导出按钮
+  const exportBtn = document.getElementById('oeBtnExport');
+  if (exportBtn) {
+    exportBtn.hidden = true;
+    exportBtn.disabled = true;
+    exportBtn.setAttribute('aria-hidden', 'true');
+  }
+}
+
+function _bindMediaPanelEvents() {
+  const mediaTabs = document.querySelectorAll('.oe-media-tab');
+  mediaTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      mediaTabs.forEach(t => t.classList.remove('oe-media-tab--active'));
+      tab.classList.add('oe-media-tab--active');
+      const category = tab.dataset.cat;
+      console.log(`[OnlineEditor] 素材分类切换: ${category}`);
+      refreshMediaList();
+    });
+  });
+
+  const mediaItems = document.querySelectorAll('.oe-media-item');
+  mediaItems.forEach(item => {
+    item.addEventListener('click', () => {
+      const type = item.dataset.type;
+      const name = item.querySelector('.oe-media-name')?.textContent;
+      console.log(`[OnlineEditor] 素材点击: ${name} (${type})`);
+    });
+  });
+}
+
+function _bindInspectorEvents() {
+  const inspectorTabs = document.querySelectorAll('.oe-inspector-tab');
+  inspectorTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      inspectorTabs.forEach(t => t.classList.remove('oe-inspector-tab--active'));
+      tab.classList.add('oe-inspector-tab--active');
+      console.log(`[OnlineEditor] 属性面板切换: ${tab.dataset.tab}`);
+    });
+  });
+}
+
+function _bindTimelineEvents() {
+  const undoBtn = document.getElementById('oeUndoBtn');
+  const redoBtn = document.getElementById('oeRedoBtn');
+
+  if (undoBtn) {
+    undoBtn.addEventListener('click', () => {
+      console.log('[OnlineEditor] 撤销');
+      if (_isVevDemoReady) {
+        _sendToVevDemo('origin:undo', {});
+      }
+    });
+  }
+
+  if (redoBtn) {
+    redoBtn.addEventListener('click', () => {
+      console.log('[OnlineEditor] 重做');
+      if (_isVevDemoReady) {
+        _sendToVevDemo('origin:redo', {});
+      }
+    });
+  }
+}
+
+function _bindPreviewEvents() {
+  const playBtn = document.getElementById('oePlayBtn');
+  if (playBtn) {
+    playBtn.addEventListener('click', () => {
+      console.log('[OnlineEditor] 播放按钮点击');
+      if (_isVevDemoReady) {
+        _sendToVevDemo('origin:togglePlayback', {});
+      }
+    });
+  }
+}
+
+function _setOnlineEditorControlsReady(ready) {
+  const syncBtn = document.getElementById('oeBtnSyncMaterials');
+  if (!syncBtn) return;
+  syncBtn.hidden = !ready;
+  syncBtn.disabled = !ready;
+  if (!ready) syncBtn.textContent = '同步素材';
+  syncBtn.onclick = ready
+    ? (event) => {
+        event.preventDefault();
+        importMaterialsToVevDemo();
+      }
+    : null;
+}
+
+function _setSyncMaterialsBusy(busy) {
+  const syncBtn = document.getElementById('oeBtnSyncMaterials');
+  if (!syncBtn) return;
+  syncBtn.disabled = !!busy;
+  syncBtn.textContent = busy ? '同步中...' : '同步素材';
+}
+
+// ============================================================================
+// 导出处理
+// ============================================================================
+
+function _handleExport() {
+  _oeCtx?.showToast?.('P0 阶段请在 VevDemo 编辑器内部触发导出，Origin 只负责展示导出状态。', 'info');
+}
+
+// ============================================================================
+// 模块导出
+// ============================================================================
+
+export {
+  initOnlineEditor,
+  mountOnlineEditor,
+  onOnlineEditorPageEnter,
+  destroyOnlineEditor,
+  refreshMediaList,
+  initTimeline,
+  getOnlineEditorState,
+  restoreOnlineEditorState,
+  importMaterialsToVevDemo,
+  triggerExport,
+  exportToFfmpeg,
+  requestTimelineData,
+};

@@ -74,6 +74,45 @@ TEXT_CONTEXT_WINDOW="400000"
 TEXT_MAX_OUTPUT_TOKENS="32768"
 ```
 
+### Image Provider Primary/Fallback
+
+Image generation is routed through `IMAGE_*`. The intended production setup is:
+
+```env
+# Primary image channel: Zerail OpenAI-compatible image API.
+IMAGE_PROVIDER="zerail_images"
+IMAGE_API_BASE="https://gateway.zerail.com/v1"
+IMAGE_API_KEY="<zerail image key>"
+IMAGE_MODEL="gpt-image-2"
+IMAGE_GENERATIONS_ENDPOINT="/images/generations"
+IMAGE_EDITS_ENDPOINT="/images/edits"
+
+# Fallback image channel: Volcengine Seedream. This is used only after the
+# primary channel fails IMAGE_FALLBACK_AFTER_FAILURES consecutive request attempts.
+IMAGE_FALLBACK_ENABLED="true"
+IMAGE_FALLBACK_AFTER_FAILURES="2"
+IMAGE_FALLBACK_PROVIDER="volcengine_seedream"
+IMAGE_FALLBACK_API_BASE="https://ark.cn-beijing.volces.com/api/v3"
+IMAGE_FALLBACK_MODEL="doubao-seedream-4-5-251128"
+
+# Either set an explicit fallback key, or keep the existing Seedream key.
+# IMAGE_FALLBACK_API_KEY="<seedream key>"
+IMAGE_SEEDREAM_API_KEY="<seedream key>"
+
+# Existing Seedream tuning still applies to the fallback channel unless a
+# matching IMAGE_FALLBACK_SEEDREAM_* override is provided.
+IMAGE_SEEDREAM_SIZE="4K"
+IMAGE_SEEDREAM_RESPONSE_FORMAT="b64_json"
+IMAGE_SEEDREAM_WATERMARK="0"
+IMAGE_SEEDREAM_SEQUENTIAL_IMAGE_GENERATION="disabled"
+IMAGE_SEEDREAM_OPTIMIZE_PROMPT_MODE="standard"
+```
+
+Business code must continue to call `generateImage(...)`; it should not choose
+between GPT-image and Seedream directly. Fallback selection belongs in
+`lib/model-routing.ts` and `lib/image-gen.ts`, and provider failures are recorded
+through the shared model-call observability path.
+
 Emergency and tuning switches:
 
 ```env

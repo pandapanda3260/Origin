@@ -10,6 +10,8 @@
  * 简单但好用；上线规模大时再换 pino + 文件 + 切割。
  */
 
+import { recordObservabilityEvent } from './observability-events';
+
 const MAX = 1000;
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -27,6 +29,14 @@ export function pushLog(level: LogLevel, message: string) {
   const redacted = redactSensitive(message).slice(0, 2000);
   ring.push({ ts: Date.now(), level, message: redacted });
   if (ring.length > MAX) ring.splice(0, ring.length - MAX);
+  if (level === 'warn' || level === 'error') {
+    recordObservabilityEvent({
+      type: level === 'error' ? 'system_error' : 'system_warn',
+      status: level,
+      message: redacted,
+      meta: { source: 'console' },
+    });
+  }
 }
 
 /**

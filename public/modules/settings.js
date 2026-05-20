@@ -142,9 +142,9 @@ export function initSettings(ctx) {
     resultsDiv.innerHTML = "";
 
     // Video API key is platform-managed now —普通用户只测 image。
-    // 管理员若配了视频 BYOK 作为兜底，也一并测。
-    var isAdmin = await _isAdminUser();
-    var slots = isAdmin && (settings.models.video.key || "").trim()
+    // 独立后台不再复用普通用户身份，旧工作台不展示视频 BYOK 测试。
+    var showVideoSlot = await _canShowPlatformVideoControls();
+    var slots = showVideoSlot && (settings.models.video.key || "").trim()
       ? ["image", "video"]
       : ["image"];
     var slotLabels = { image: "图片生成模型", video: "视频生成模型" };
@@ -202,17 +202,9 @@ export function initSettings(ctx) {
     '</div>';
   }
 
-  // Admin detection (lightweight — avoids coupling to main.js state)
-  let _isAdminCached = null;
-  async function _isAdminUser() {
-    if (_isAdminCached !== null) return _isAdminCached;
-    try {
-      var resp = await fetch("/api/auth/me", { headers: _getAuthHeaders() });
-      if (!resp.ok) { _isAdminCached = false; return false; }
-      var data = await resp.json();
-      _isAdminCached = !!(data && data.isAdmin);
-    } catch (_e) { _isAdminCached = false; }
-    return _isAdminCached;
+  // 独立后台身份已与普通工作台彻底分离，这里不再从 /api/auth/me 推断后台身份。
+  async function _canShowPlatformVideoControls() {
+    return false;
   }
 
   function _renderModelSlotCards() {
@@ -380,9 +372,9 @@ export function initSettings(ctx) {
       '<div id="videoModelPoolStatus" class="text-xs text-on-surface-variant"></div>';
     container.appendChild(sec);
 
-    // Admin-only: live pool status for the 3 video models.
-    _isAdminUser().then(function (admin) {
-      if (!admin) return;
+    // 独立后台里看模型池状态；普通工作台不再展示这块内部监控。
+    _canShowPlatformVideoControls().then(function (visible) {
+      if (!visible) return;
       var desc = $("videoModelCardDesc");
       if (desc) desc.textContent = "管理员视图：实时监控 3 个视频模型的通道健康。";
       _refreshVideoPoolStatus();
@@ -455,10 +447,10 @@ export function initSettings(ctx) {
     var sel = $("videoAdapterSelect");
     var info = $("videoAdapterInfo");
     if (!sel) return;
-    // 视频 adapter 设置只对管理员可见。普通用户整块隐藏。
+    // 视频 adapter 设置只在独立后台治理，不在普通工作台展示。
     var section = sel.closest("section");
-    _isAdminUser().then(function (admin) {
-      if (section) section.style.display = admin ? "" : "none";
+    _canShowPlatformVideoControls().then(function (visible) {
+      if (section) section.style.display = visible ? "" : "none";
     });
     sel.innerHTML = "";
     for (var id in VIDEO_ADAPTERS) {

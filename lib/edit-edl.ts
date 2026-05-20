@@ -162,8 +162,9 @@ export function collectEdlGenerationContext(args: {
   project: any;
   body?: any;
   targetDurationSec: number;
+  strictSegments?: boolean;
 }): CollectedEdlContext {
-  const { projectId, userId, project: proj, body = {}, targetDurationSec } = args;
+  const { projectId, userId, project: proj, body = {}, targetDurationSec, strictSegments = false } = args;
   const db = getDb();
   const videos = db
     .prepare<{ uid: number; pid: string }, any>(
@@ -203,10 +204,20 @@ export function collectEdlGenerationContext(args: {
   const filtered = allowedGroupIdx.size > 0
     ? dedup.filter((v) => allowedGroupIdx!.has(Number(v.group_idx)))
     : dedup;
-  const finalVideos = filtered.length > 0 ? filtered : dedup;
+  if (strictSegments && allowedGroupIdx.size > 0) {
+    if (!filtered.length) {
+      return { ok: false, error: '传入的可用片段没有匹配到当前完成视频，请重新预检后再试' };
+    }
+    if (filtered.length < allowedGroupIdx.size) {
+      const got = new Set(filtered.map((v) => Number(v.group_idx)));
+      const missing = Array.from(allowedGroupIdx).filter((gi) => !got.has(gi));
+      return { ok: false, error: `部分可用片段没有匹配到当前完成视频：${missing.join(', ')}` };
+    }
+  }
+  const finalVideos = filtered.length > 0 ? filtered : (strictSegments ? [] : dedup);
 
   if (!finalVideos.length) {
-    return { ok: false, error: '当前还没有已生成的视频片段，先去批量页生成' };
+    return { ok: false, error: '当前还没有已生成的视频片段，先去片段页生成' };
   }
 
   const sbsForDialogue: any[] = Array.isArray(proj.storyboards) ? proj.storyboards : [];

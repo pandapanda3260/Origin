@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
+import { recordModelCallEvent } from './model-routing';
 import { getDb } from './db';
 import type { UserRow } from './db';
 import { makeBlackVideo, extractCover } from './ffmpeg';
@@ -36,15 +37,31 @@ import { hashString, resolveGenerationDurationSec } from './video-reference-mani
 import type { DialoguePolicy } from './video-reference-manifest';
 import type { VideoPromptFailureStage } from './video-prompt-state';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
+import { DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT, getGlobalVideoConcurrencyLimit, isVideoGenerationEnabled } from './system-config';
+import { getDataDir } from './runtime-paths';
+import type { ProviderTaskAdapter, ProviderTaskRow, ProviderPollResult } from './provider-recovery';
 
 export type VideoGenInput = {
   prompt: string;
+  /** 可选：调用方预分配本地 video_tasks.id，用于先创建外部索引再提交生成。 */
+  taskId?: string;
   size?: '1080x1920' | '1920x1080' | '1024x1024';
   /** 画面比例，如 "16:9" / "9:16" / "1:1"，优先级高于 size */
   ratio?: string;
+  /** Seedance 清晰度。旧路径没传时默认 720p，避免改变历史任务语义。 */
+  resolution?: SeedanceResolution | string;
   durationSec?: number;
   projectId?: string;
   groupIdx?: number;
+  idempotencyKey?: string;
+  deferProviderPolling?: boolean;
+  onProviderTaskCreated?: (info: {
+    provider: 'volcengine_seedance_video';
+    providerTaskId: string;
+    localVideoTaskId: string;
+    idempotencyKey?: string;
+    deferProviderPolling?: boolean;
+  }) => void;
   /** 角色台词（必须严格按此演绎/配音）。grok-video 支持音画同出。
    *  老路径：单字符串"老板：xxx 帝王蟹：yyy"——已被 dialoguePairs 取代，
    *  保留是为了向后兼容（fake / sora 路径还在用）。
@@ -78,6 +95,8 @@ export type VideoGenInput = {
   referenceImagePath?: string;
   /** 标记 referenceImagePath 的语义，避免把彩色首帧误当成黑白草图解释。 */
   referenceImageRole?: 'first_frame' | 'storyboard_sketch';
+  /** Seedance 图片提交策略。strict_first_frame 会把首帧按 first_frame role 提交。 */
+  seedanceImageMode?: 'strict_first_frame' | 'reference_images';
   /** 可选黑白草图路径：新模式只把它当构图调试/辅助，不再作为主参考。 */
   storyboardReferencePath?: string;
   /**
@@ -129,6 +148,15 @@ export type VideoGenInput = {
 };
 
 export type { VideoReferenceImage };
+
+export type SeedanceResolution = '720p' | '1080p';
+
+export function normalizeSeedanceResolution(value?: unknown, fallback: SeedanceResolution = '720p'): SeedanceResolution {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return fallback;
+  if (raw === '720p' || raw === '1080p') return raw;
+  throw new Error(`Seedance 不支持的视频清晰度：${String(value)}。当前仅支持 720p / 1080p。`);
+}
 
 /**
  * 把"彩色场景图（主） + 彩色角色图（缩略图条） + 黑白分镜草图（小角标）"
@@ -380,7 +408,7 @@ function normalizeRatio(ratio?: string): { ratio: string; size: '1080x1920' | '1
   return { ratio: '9:16', size: '1080x1920' };
 }
 
-export type VideoGenResult = {
+export type VideoGenCompletedResult = {
   taskId: string;
   status: 'completed' | 'failed';
   url: string;
@@ -422,6 +450,18 @@ export type VideoGenResult = {
   };
 };
 
+export type VideoGenUpstreamPendingResult = {
+  taskId: string;
+  status: 'upstream_pending';
+  provider: 'volcengine_seedance_video';
+  providerTaskId: string;
+  durationSec: number;
+  mode: 'real';
+  videoAudit?: VideoGenCompletedResult['videoAudit'];
+};
+
+export type VideoGenResult = VideoGenCompletedResult | VideoGenUpstreamPendingResult;
+
 /**
  * Per-reference record written into videoAudit. Semantic fields (role, label...)
  * describe planning intent; apiRole + apiContentIndex describe what was actually
@@ -434,17 +474,24 @@ export type VideoAuditReferenceImage =
     apiRole?: string;
     apiContentIndex?: number;
     imageContentHash?: string;
+    originalBytes?: number;
+    submittedBytes?: number;
+    submittedWidth?: number;
+    submittedHeight?: number;
+    submittedMime?: string;
   };
 
 export class VideoGenerationError extends Error {
   taskId?: string;
-  videoAudit?: VideoGenResult['videoAudit'];
+  videoAudit?: VideoGenCompletedResult['videoAudit'];
   failureStage: VideoPromptFailureStage;
+  status?: number;
 
   constructor(message: string, opts: {
     taskId?: string;
-    videoAudit?: VideoGenResult['videoAudit'];
+    videoAudit?: VideoGenCompletedResult['videoAudit'];
     failureStage?: VideoPromptFailureStage;
+    status?: number;
     cause?: any;
   } = {}) {
     super(message);
@@ -452,6 +499,7 @@ export class VideoGenerationError extends Error {
     this.taskId = opts.taskId;
     this.videoAudit = opts.videoAudit;
     this.failureStage = opts.failureStage || classifyVideoFailureStage(opts.cause || message);
+    this.status = opts.status;
     if (opts.cause) (this as any).cause = opts.cause;
   }
 }
@@ -461,6 +509,13 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function envFloat(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
 function retryAfterMs(raw: string | null): number | null {
@@ -525,7 +580,7 @@ let _submitSemaphoreLimit = 0;
 let _submitSemaphore: Semaphore | null = null;
 
 function videoSubmitSemaphore(): Semaphore {
-  const limit = envInt('VIDEO_SUBMIT_CONCURRENCY', 2, 1, 3);
+  const limit = getGlobalVideoConcurrencyLimit(envInt('VIDEO_SUBMIT_CONCURRENCY', DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT, 1, 8));
   if (!_submitSemaphore || _submitSemaphoreLimit !== limit) {
     _submitSemaphoreLimit = limit;
     _submitSemaphore = new Semaphore(limit);
@@ -540,7 +595,7 @@ async function withVideoSubmitSlot<T>(label: string, fn: () => Promise<T>): Prom
   });
 }
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const VIDEOS_DIR = join(DATA_DIR, 'videos');
 mkdirSync(VIDEOS_DIR, { recursive: true });
 
@@ -555,8 +610,15 @@ export async function generateVideo(
   input: VideoGenInput,
   onProgress?: (pct: number, hint?: string) => void,
 ): Promise<VideoGenResult> {
+  if (!isVideoGenerationEnabled()) {
+    throw new VideoGenerationError('视频生成暂时关闭，请稍后再试', {
+      status: 503,
+      failureStage: 'submit_upstream_reject',
+    });
+  }
+
   const cfg = resolveLLMConfig(user, 'video');
-  const taskId = randomUUID();
+  const taskId = input.taskId || randomUUID();
   const ownerDir = join(VIDEOS_DIR, String(user.id));
   mkdirSync(ownerDir, { recursive: true });
   const filename = `${taskId}.mp4`;
@@ -578,10 +640,11 @@ export async function generateVideo(
     input.ratio || (input.size === '1080x1920' ? '9:16' : input.size === '1920x1080' ? '16:9' : input.size === '1024x1024' ? '1:1' : '16:9'),
   );
   const size = (sizeArgPresent && !input.ratio ? input.size! : sizeFromRatio) as '1080x1920' | '1920x1080' | '1024x1024';
-  console.log(`[video-gen] resolved ratio=${aspectRatio} size=${size} dur=${dur}s model=${cfg.model}`);
+  const seedanceResolution = normalizeSeedanceResolution(input.resolution);
+  console.log(`[video-gen] resolved ratio=${aspectRatio} size=${size} dur=${dur}s resolution=${seedanceResolution} model=${cfg.model}`);
 
   let mode: 'real' | 'fake' = 'real';
-  let videoAudit: VideoGenResult['videoAudit'] | undefined;
+  let videoAudit: VideoGenCompletedResult['videoAudit'] | undefined;
 
   // 入库登记
   const db = getDb();
@@ -652,7 +715,7 @@ export async function generateVideo(
 	    const remoteId = submit.id || submit.task_id;
 	    if (!remoteId) throw new Error('Grok API 返回缺 id：' + JSON.stringify(submit).slice(0, 200));
 	    console.log('[video-gen][grok] remoteId =', remoteId);
-	    db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+		    db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(remoteId, taskId);
 	    if (videoAudit) videoAudit.providerTaskId = remoteId;
 
     const isTerminalStatus = (s: string) =>
@@ -699,7 +762,7 @@ export async function generateVideo(
       providerProgress = Number.isFinite(j.progress) ? Number(j.progress) : providerProgress;
       const stageHint = Math.min(85, Math.max(20 + pollCount * 4, providerProgress));
       onProgress?.(stageHint, `Grok 状态：${status || '生成中'}（${providerProgress}%）`);
-      db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(stageHint, taskId);
+      db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(stageHint, taskId);
       console.log(`[video-gen][grok] poll #${pollCount} status=${status} progress=${providerProgress} videoUrl=${videoUrl ? 'yes' : 'no'}`);
     }
 
@@ -757,18 +820,23 @@ export async function generateVideo(
         });
         const finalPrompt = promptParts.finalPrompt;
 
-        const body = buildSeedanceFirstLastFrameBody({
+        const body = await buildSeedanceFirstLastFrameBody({
           model: cfg.model || 'doubao-seedance-2-0-260128',
           prompt: finalPrompt,
           firstFramePath,
           lastFramePath,
           ratio: aspectRatio,
           durationSec: dur,
-          resolution: '720p',
+          resolution: seedanceResolution,
           watermark: false,
           generateAudio: false,
           returnLastFrame: capability.supportsReturnLastFrame,
         });
+
+	        const firstSubmitted = body.__submittedImages?.first;
+	        const lastSubmitted = body.__submittedImages?.last;
+	        delete body.__submittedImages;
+        const bodyJson = stringifySeedanceRequestBody(body);
 
         videoAudit = {
           provider: 'seedance',
@@ -789,6 +857,11 @@ export async function generateVideo(
               apiRole: 'first_frame',
               apiContentIndex: 1,
               imageContentHash: submittedFirstHash,
+              originalBytes: firstSubmitted?.originalBytes,
+              submittedBytes: firstSubmitted?.submittedBytes,
+              submittedWidth: firstSubmitted?.width,
+              submittedHeight: firstSubmitted?.height,
+              submittedMime: firstSubmitted?.mime,
             },
             {
               role: 'target_end',
@@ -797,6 +870,11 @@ export async function generateVideo(
               apiRole: 'last_frame',
               apiContentIndex: 2,
               imageContentHash: submittedLastHash,
+              originalBytes: lastSubmitted?.originalBytes,
+              submittedBytes: lastSubmitted?.submittedBytes,
+              submittedWidth: lastSubmitted?.width,
+              submittedHeight: lastSubmitted?.height,
+              submittedMime: lastSubmitted?.mime,
             },
           ],
         };
@@ -804,17 +882,36 @@ export async function generateVideo(
         const submit: any = await withVideoSubmitSlot('[seedance first-last submit]', () => retryFetch(
           `${cfg.baseUrl}/contents/generations/tasks`,
           {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-            body: JSON.stringify(body),
-          },
+	            method: 'POST',
+	            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+	            body: bodyJson,
+	          },
           '[seedance first-last submit]',
         ));
         const remoteId = submit.id;
         if (!remoteId) throw new Error('Seedance API 返回缺 id');
-        console.log(`[video-gen][seedance][first-last] task created id=${remoteId}`);
-        db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
-        if (videoAudit) videoAudit.providerTaskId = remoteId;
+	        console.log(`[video-gen][seedance][first-last] task created id=${remoteId}`);
+		        db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(remoteId, taskId);
+	        input.onProviderTaskCreated?.({
+	          provider: 'volcengine_seedance_video',
+	          providerTaskId: remoteId,
+	          localVideoTaskId: taskId,
+	          idempotencyKey: input.idempotencyKey,
+	          deferProviderPolling: input.deferProviderPolling,
+	        });
+	        if (videoAudit) videoAudit.providerTaskId = remoteId;
+        if (input.deferProviderPolling) {
+	          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
+          return {
+            taskId,
+            status: 'upstream_pending',
+            provider: 'volcengine_seedance_video',
+            providerTaskId: remoteId,
+            durationSec: dur,
+            mode: 'real',
+            videoAudit,
+          };
+        }
 
         const deadline = Date.now() + 15 * 60 * 1000;
         let status = (submit.status || '').toLowerCase();
@@ -845,7 +942,7 @@ export async function generateVideo(
           }
           const stageHint = status === 'queued' ? 20 : (status === 'running' || status === 'in_progress') ? Math.min(70, 30 + pollCount * 3) : 85;
           onProgress?.(stageHint, `Seedance 首尾帧状态：${status}`);
-          db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(stageHint, taskId);
+	          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(stageHint, taskId);
         }
         if (status !== 'succeeded') {
           throw new Error(lastErrorPayload || `任务结束状态: ${status}`);
@@ -912,15 +1009,19 @@ export async function generateVideo(
             (input.prompt || '').slice(0, 200),
           );
           coverUrl = `/api/images/file/${coverImageId}`;
-          db.prepare('UPDATE video_tasks SET cover_image_id=? WHERE id=?').run(coverImageId, taskId);
+          db.prepare(`UPDATE video_tasks SET cover_image_id=? WHERE id=? AND status IN ('queued','running')`).run(coverImageId, taskId);
         } catch (e: any) {
           console.warn('[video-gen][seedance][first-last] extract cover failed:', e?.message);
         }
 
-        db.prepare(
+        const completeInfo = db.prepare(
           `UPDATE video_tasks SET status='completed', progress=100,
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
         ).run(taskId);
+        if (completeInfo.changes <= 0) {
+          console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
+          return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode, videoAudit };
+        }
 
         onProgress?.(100, '完成');
         const protectedUrl = `/api/videos/file/${taskId}`;
@@ -1010,10 +1111,13 @@ export async function generateVideo(
 
       if (hasIndependentImageRefs) {
         try {
+          const submittedRefs: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
           for (const ref of independentReferenceImages) {
+            const image = await buildVideoSubmitImageDataUrl(ref.path);
+            submittedRefs.push({ ref, image });
             content.push({
               type: 'image_url',
-              image_url: { url: imagePathToDataUrl(ref.path) },
+              image_url: { url: image.dataUrl },
               role: 'reference_image',
             });
           }
@@ -1026,7 +1130,7 @@ export async function generateVideo(
             dialoguePolicy: 'budget_check_only',
             payloadMode: 'first_frame_multi_ref',
             modeReason: input.payloadModeReason || 'no_tail_intent',
-            referenceImages: independentReferenceImages.map((ref) => ({
+            referenceImages: submittedRefs.map(({ ref, image }) => ({
               role: ref.role,
               path: ref.path,
               label: ref.label,
@@ -1034,11 +1138,19 @@ export async function generateVideo(
               assetId: ref.assetId,
               assetName: ref.assetName,
               promptHint: ref.promptHint,
+              originalBytes: image.originalBytes,
+              submittedBytes: image.submittedBytes,
+              submittedWidth: image.width,
+              submittedHeight: image.height,
+              submittedMime: image.mime,
             })),
           };
+          const originalBytes = submittedRefs.reduce((sum, item) => sum + item.image.originalBytes, 0);
+          const submittedBytes = submittedRefs.reduce((sum, item) => sum + item.image.submittedBytes, 0);
           console.log(
             `[video-gen][seedance] attached independent reference images ` +
-              `(${independentReferenceImages.map((ref, i) => `Image${i + 1}:${ref.role}:${ref.label}`).join(' | ')})`,
+              `(${submittedRefs.map(({ ref, image }, i) => `Image${i + 1}:${ref.role}:${ref.label}:${image.width}x${image.height}`).join(' | ')}) ` +
+              `payloadImages=${(originalBytes / 1024 / 1024).toFixed(2)}MB->${(submittedBytes / 1024 / 1024).toFixed(2)}MB`,
           );
           console.log(
             `[metric][seedance][multi-image] attempted groupIdx=${input.groupIdx ?? -1} ` +
@@ -1054,10 +1166,13 @@ export async function generateVideo(
       } else if (hasAnyRef) {
         try {
           let refBuf: Buffer | null = null;
+          let directFirstFrameImage: VideoSubmitImageDataUrl | null = null;
+          let directFirstFramePath: string | undefined;
           if (hasFirstFrameRef && input.referenceImagePath) {
-            refBuf = readFileSync(input.referenceImagePath);
+            directFirstFramePath = input.referenceImagePath;
+            directFirstFrameImage = await buildVideoSubmitImageDataUrl(input.referenceImagePath);
             console.log(
-              `[video-gen][seedance] attached first-frame reference directly ` +
+              `[video-gen][seedance] attached first-frame ${input.seedanceImageMode === 'strict_first_frame' ? 'as first_frame' : 'as reference_image'} ` +
                 `(props=${input.propReferencePaths?.length || 0}, panels=${input.characterReferencePanels?.length || 0})`,
             );
           } else if (hasColorRefs) {
@@ -1085,7 +1200,35 @@ export async function generateVideo(
             refBuf = await applyFaceSafetyMask(input.referenceImagePath);
           }
 
-          if (refBuf) {
+          if (directFirstFrameImage) {
+            content.push({
+              type: 'image_url',
+              image_url: { url: directFirstFrameImage.dataUrl },
+              role: input.seedanceImageMode === 'strict_first_frame' ? 'first_frame' : 'reference_image',
+            });
+            videoAudit = {
+              provider: 'seedance',
+              model: cfg.model,
+              finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
+              finalPromptHash: hashString(seedancePrompt.finalPrompt),
+              finalPromptLength: seedancePrompt.finalPrompt.length,
+              dialoguePolicy: 'budget_check_only',
+              payloadMode: 'first_frame_multi_ref',
+              modeReason: input.payloadModeReason || input.seedanceImageMode || 'first_frame_reference',
+              referenceImages: [{
+                role: 'first_frame',
+                path: directFirstFramePath || '',
+                label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
+                apiRole: input.seedanceImageMode === 'strict_first_frame' ? 'first_frame' : 'reference_image',
+                apiContentIndex: content.length - 1,
+                originalBytes: directFirstFrameImage.originalBytes,
+                submittedBytes: directFirstFrameImage.submittedBytes,
+                submittedWidth: directFirstFrameImage.width,
+                submittedHeight: directFirstFrameImage.height,
+                submittedMime: directFirstFrameImage.mime,
+              }],
+            };
+          } else if (refBuf) {
             const dataUrl = `data:image/png;base64,${refBuf.toString('base64')}`;
             content.push({ type: 'image_url', image_url: { url: dataUrl }, role: 'reference_image' });
             console.log(`[video-gen][seedance] attached i2v ref image (${refBuf.length} bytes)`);
@@ -1100,23 +1243,24 @@ export async function generateVideo(
 
       let submit: any;
       try {
-	        submit = await withVideoSubmitSlot('[seedance submit]', () => retryFetch(
-	          `${cfg.baseUrl}/contents/generations/tasks`,
-	          {
-	            method: 'POST',
-	            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-	            body: JSON.stringify({
-	              model: cfg.model || 'doubao-seedance-2-0-260128',
-	              content,
-	              ratio: aspectRatio,
-	              duration: dur,
-	              resolution: '720p',
-	              watermark: false,
-	              generate_audio: false,
-	            }),
-	          },
-	          '[seedance submit]',
-	        ));
+        const bodyJson = stringifySeedanceRequestBody({
+          model: cfg.model || 'doubao-seedance-2-0-260128',
+          content,
+          ratio: aspectRatio,
+          duration: dur,
+          resolution: seedanceResolution,
+          watermark: false,
+          generate_audio: false,
+        });
+        submit = await withVideoSubmitSlot('[seedance submit]', () => retryFetch(
+          `${cfg.baseUrl}/contents/generations/tasks`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+            body: bodyJson,
+          },
+          '[seedance submit]',
+        ));
       } catch (submitErr: any) {
         if (hasIndependentImageRefs && hasFirstFrameRef && input.referenceImagePath && isInputImageSensitiveError(submitErr)) {
           console.warn(
@@ -1127,64 +1271,84 @@ export async function generateVideo(
             `[metric][seedance][multi-image] fallback groupIdx=${input.groupIdx ?? -1} ` +
               `reason=sensitive images=${independentReferenceImages.length}`,
           );
-              const fallbackPrompt = buildSeedancePromptParts({
-                ...input,
-                ratio: aspectRatio,
-                durationSec: dur,
-                referenceImages: undefined,
-                referenceImageRole: 'first_frame',
-              });
-              videoAudit = {
-                provider: 'seedance',
-                model: cfg.model,
-                finalPromptPreview: fallbackPrompt.finalPrompt.slice(0, 500),
-                finalPromptHash: hashString(fallbackPrompt.finalPrompt),
-                finalPromptLength: fallbackPrompt.finalPrompt.length,
-                dialoguePolicy: 'budget_check_only',
-                payloadMode: 'first_frame_multi_ref',
-                modeReason: input.payloadModeReason || 'first_frame_fallback',
-                referenceImages: [{
-                  role: 'first_frame',
-                  path: input.referenceImagePath,
-                  label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
-                  promptHint: 'Fallback after independent reference images were rejected.',
-                }],
-                fallbackReason: 'independent_refs_rejected_by_input_image_safety',
-              };
-              const fallbackContent: any[] = [
-                { type: 'text', text: fallbackPrompt.finalPrompt },
+          const fallbackPrompt = buildSeedancePromptParts({
+            ...input,
+            ratio: aspectRatio,
+            durationSec: dur,
+            referenceImages: undefined,
+            referenceImageRole: 'first_frame',
+          });
+          videoAudit = {
+            provider: 'seedance',
+            model: cfg.model,
+            finalPromptPreview: fallbackPrompt.finalPrompt.slice(0, 500),
+            finalPromptHash: hashString(fallbackPrompt.finalPrompt),
+            finalPromptLength: fallbackPrompt.finalPrompt.length,
+            dialoguePolicy: 'budget_check_only',
+            payloadMode: 'first_frame_multi_ref',
+            modeReason: input.payloadModeReason || 'first_frame_fallback',
+            referenceImages: [{
+              role: 'first_frame',
+              path: input.referenceImagePath,
+              label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
+              promptHint: 'Fallback after independent reference images were rejected.',
+            }],
+            fallbackReason: 'independent_refs_rejected_by_input_image_safety',
+          };
+          const fallbackContent: any[] = [
+            { type: 'text', text: fallbackPrompt.finalPrompt },
             {
               type: 'image_url',
-              image_url: { url: imagePathToDataUrl(input.referenceImagePath) },
-              role: 'reference_image',
+              image_url: { url: (await buildVideoSubmitImageDataUrl(input.referenceImagePath)).dataUrl },
+              role: 'first_frame',
             },
           ];
-	          submit = await withVideoSubmitSlot('[seedance submit first-frame fallback]', () => retryFetch(
-	            `${cfg.baseUrl}/contents/generations/tasks`,
-	            {
-	              method: 'POST',
-	              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
-	              body: JSON.stringify({
-	                model: cfg.model || 'doubao-seedance-2-0-260128',
-	                content: fallbackContent,
-	                ratio: aspectRatio,
-	                duration: dur,
-	                resolution: '720p',
-	                watermark: false,
-	                generate_audio: false,
-	              }),
-	            },
-	            '[seedance submit first-frame fallback]',
-	          ));
+          const fallbackBodyJson = stringifySeedanceRequestBody({
+            model: cfg.model || 'doubao-seedance-2-0-260128',
+            content: fallbackContent,
+            ratio: aspectRatio,
+            duration: dur,
+            resolution: seedanceResolution,
+            watermark: false,
+            generate_audio: false,
+          });
+          submit = await withVideoSubmitSlot('[seedance submit first-frame fallback]', () => retryFetch(
+            `${cfg.baseUrl}/contents/generations/tasks`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+              body: fallbackBodyJson,
+            },
+            '[seedance submit first-frame fallback]',
+          ));
         } else {
           throw submitErr;
         }
       }
       const remoteId = submit.id;
       if (!remoteId) throw new Error('Seedance API 返回缺 id');
-      console.log(`[video-gen][seedance] task created id=${remoteId}`);
-      db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
-      if (videoAudit) videoAudit.providerTaskId = remoteId;
+	      console.log(`[video-gen][seedance] task created id=${remoteId}`);
+		      db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(remoteId, taskId);
+	      input.onProviderTaskCreated?.({
+	        provider: 'volcengine_seedance_video',
+	        providerTaskId: remoteId,
+	        localVideoTaskId: taskId,
+	        idempotencyKey: input.idempotencyKey,
+	        deferProviderPolling: input.deferProviderPolling,
+	      });
+	      if (videoAudit) videoAudit.providerTaskId = remoteId;
+      if (input.deferProviderPolling) {
+	        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
+        return {
+          taskId,
+          status: 'upstream_pending',
+          provider: 'volcengine_seedance_video',
+          providerTaskId: remoteId,
+          durationSec: dur,
+          mode: 'real',
+          videoAudit,
+        };
+      }
 
       // 用户反馈：10 分钟有时撞到 Seedance 排队/慢推理导致"等待时间过长"误报失败。
       // 加长到 15 分钟兜住高峰期排队，并把超时文案带上重试建议。
@@ -1219,7 +1383,7 @@ export async function generateVideo(
         }
         const stageHint = status === 'queued' ? 20 : status === 'running' || status === 'in_progress' ? Math.min(70, 30 + pollCount * 3) : 85;
         onProgress?.(stageHint, `Seedance 状态：${status}`);
-        db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(stageHint, taskId);
+	        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(stageHint, taskId);
       }
       if (status !== 'succeeded') {
         const reason = lastErrorPayload || `任务结束状态: ${status}`;
@@ -1291,7 +1455,7 @@ export async function generateVideo(
 	      ));
       const remoteId = submit.id;
       if (!remoteId) throw new Error('Video API 返回缺 id');
-      db.prepare('UPDATE video_tasks SET provider_task=? WHERE id=?').run(remoteId, taskId);
+      db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(remoteId, taskId);
       if (videoAudit) videoAudit.providerTaskId = remoteId;
 
       const deadline = Date.now() + 6 * 60 * 1000;
@@ -1311,7 +1475,7 @@ export async function generateVideo(
         status = j.status || 'queued';
         progress = j.progress ?? progress;
         onProgress?.(Math.max(progress, 10), `远端状态：${status} (${progress}%)`);
-        db.prepare('UPDATE video_tasks SET progress=?, updated_at=strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE id=?').run(progress, taskId);
+        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(progress, taskId);
       }
       if (status === 'failed') throw new Error('远端视频任务 failed');
 
@@ -1327,7 +1491,7 @@ export async function generateVideo(
       try { require('node:fs').unlinkSync(fullPath); } catch (_) {}
       await makeBlackVideo({ outputPath: fullPath, durationSec: dur, withTone: true });
       mode = 'fake';
-      db.prepare('UPDATE video_tasks SET error_msg=? WHERE id=?').run(String(e?.message || e).slice(0, 1000), taskId);
+      db.prepare(`UPDATE video_tasks SET error_msg=? WHERE id=? AND status IN ('queued','running')`).run(String(e?.message || e).slice(0, 1000), taskId);
     }
   }
 
@@ -1354,15 +1518,19 @@ export async function generateVideo(
       input.prompt.slice(0, 200),
     );
     coverUrl = `/api/images/file/${coverImageId}`;
-    db.prepare('UPDATE video_tasks SET cover_image_id=? WHERE id=?').run(coverImageId, taskId);
+    db.prepare(`UPDATE video_tasks SET cover_image_id=? WHERE id=? AND status IN ('queued','running')`).run(coverImageId, taskId);
   } catch (e: any) {
     console.warn('[video-gen] extract cover failed:', e?.message);
   }
 
-  db.prepare(
+  const completeInfo = db.prepare(
     `UPDATE video_tasks SET status='completed', progress=100,
-       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
   ).run(taskId);
+  if (completeInfo.changes <= 0) {
+    console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
+    return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode };
+  }
 
   onProgress?.(100, '完成');
 
@@ -1384,19 +1552,109 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function imagePathToDataUrl(imagePath: string): string {
-  const ext = imagePath.split('.').pop()?.toLowerCase() || 'png';
-  const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'webp' ? 'image/webp' : 'image/png';
-  return `data:${mime};base64,${readFileSync(imagePath).toString('base64')}`;
+export type VideoSubmitImageDataUrl = {
+  dataUrl: string;
+  mime: string;
+  width: number;
+  height: number;
+  originalWidth: number;
+  originalHeight: number;
+  originalBytes: number;
+  submittedBytes: number;
+};
+
+const SEEDANCE_IMAGE_MAX_BYTES = Math.floor(30 * 1024 * 1024 * 0.9);
+const SEEDANCE_REQUEST_MAX_BYTES = Math.floor(64 * 1024 * 1024 * 0.9);
+const SEEDANCE_MIN_IMAGE_EDGE = 300;
+const SEEDANCE_MAX_IMAGE_EDGE = 6000;
+const SEEDANCE_MIN_ASPECT_RATIO = 0.4;
+const SEEDANCE_MAX_ASPECT_RATIO = 2.5;
+const SEEDANCE_MIN_JPEG_BYTES_PER_PIXEL = 0.08;
+
+export function assertSeedanceSubmitImage(image: VideoSubmitImageDataUrl, label = 'image'): void {
+  const width = Math.max(1, Number(image.width || 1));
+  const height = Math.max(1, Number(image.height || 1));
+  const bytes = Math.max(0, Number(image.submittedBytes || 0));
+  const minEdge = Math.min(width, height);
+  const maxEdge = Math.max(width, height);
+  const aspectRatio = width / height;
+  if (aspectRatio < SEEDANCE_MIN_ASPECT_RATIO || aspectRatio > SEEDANCE_MAX_ASPECT_RATIO) {
+    throw new Error(
+      `Seedance 图片校验失败：${label} 宽高比 ${aspectRatio.toFixed(2)} 超出 ${SEEDANCE_MIN_ASPECT_RATIO}-${SEEDANCE_MAX_ASPECT_RATIO}。`,
+    );
+  }
+  if (minEdge < SEEDANCE_MIN_IMAGE_EDGE || maxEdge > SEEDANCE_MAX_IMAGE_EDGE) {
+    throw new Error(
+      `Seedance 图片校验失败：${label} 尺寸 ${width}x${height} 超出 ${SEEDANCE_MIN_IMAGE_EDGE}-${SEEDANCE_MAX_IMAGE_EDGE}px 范围。`,
+    );
+  }
+  if (bytes > SEEDANCE_IMAGE_MAX_BYTES) {
+    throw new Error(
+      `Seedance 图片校验失败：${label} 文件 ${(bytes / 1024 / 1024).toFixed(2)}MB 超过内部上限 ${(SEEDANCE_IMAGE_MAX_BYTES / 1024 / 1024).toFixed(2)}MB。`,
+    );
+  }
+  const bytesPerPixel = bytes / (width * height);
+  if (image.mime === 'image/jpeg' && bytesPerPixel < SEEDANCE_MIN_JPEG_BYTES_PER_PIXEL) {
+    throw new Error(
+      `Seedance 图片校验失败：${label} JPEG 字节/像素 ${bytesPerPixel.toFixed(3)} 过低，疑似低质量提交图。`,
+    );
+  }
+}
+
+export function stringifySeedanceRequestBody(body: any): string {
+  const json = JSON.stringify(body);
+  const bytes = Buffer.byteLength(json, 'utf8');
+  if (bytes > SEEDANCE_REQUEST_MAX_BYTES) {
+    throw new Error(
+      `Seedance 请求体校验失败：${(bytes / 1024 / 1024).toFixed(2)}MB 超过内部上限 ${(SEEDANCE_REQUEST_MAX_BYTES / 1024 / 1024).toFixed(2)}MB。`,
+    );
+  }
+  return json;
+}
+
+export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<VideoSubmitImageDataUrl> {
+  const source = readFileSync(imagePath);
+  const originalBytes = source.length;
+  const canvasMod: any = await import('@napi-rs/canvas').catch(() => null);
+  if (!canvasMod?.createCanvas || !canvasMod?.loadImage) {
+    throw new Error('视频参考图提交前压缩失败：@napi-rs/canvas 不可用');
+  }
+  const image = await canvasMod.loadImage(source);
+  const originalWidth = Math.max(1, Number(image.width || 1));
+  const originalHeight = Math.max(1, Number(image.height || 1));
+  const maxEdge = envInt('VIDEO_SUBMIT_IMAGE_MAX_EDGE', 1280, 512, 2048);
+  // @napi-rs/canvas expects JPEG quality in the 0-100 range, not 0-1.
+  const quality = envInt('VIDEO_SUBMIT_IMAGE_JPEG_QUALITY', 84, 50, 95);
+  const scale = Math.min(1, maxEdge / Math.max(originalWidth, originalHeight));
+  const width = Math.max(1, Math.round(originalWidth * scale));
+  const height = Math.max(1, Math.round(originalHeight * scale));
+  const canvas = canvasMod.createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.drawImage(image, 0, 0, width, height);
+  const buf: Buffer = canvas.toBuffer('image/jpeg', quality);
+  const result = {
+    dataUrl: `data:image/jpeg;base64,${buf.toString('base64')}`,
+    mime: 'image/jpeg',
+    width,
+    height,
+    originalWidth,
+    originalHeight,
+    originalBytes,
+    submittedBytes: buf.length,
+  };
+  assertSeedanceSubmitImage(result, imagePath);
+  return result;
 }
 
 /**
  * Builder A — construct the Seedance first+last frame request body.
  *
- * This is a pure function: takes validated paths and runtime knobs, returns
- * the POST body shape. The executor is responsible for choosing this builder
- * (based on VideoModelCapability + tailFrameIntent) and for writing/reading
- * audit records.
+ * This builder reads validated local paths, creates compressed submit copies,
+ * and returns the POST body shape. The executor is responsible for choosing
+ * this builder (based on VideoModelCapability + tailFrameIntent) and for
+ * writing/reading audit records.
  *
  * Official request shape (Volcengine Ark doubao-seedance-2-0, verified 2026-05-09):
  *   {
@@ -1413,7 +1671,7 @@ function imagePathToDataUrl(imagePath: string): string {
  * Strict mutual exclusion with reference_image mode is enforced upstream; this
  * builder will not accept any reference_image param.
  */
-export function buildSeedanceFirstLastFrameBody(opts: {
+export async function buildSeedanceFirstLastFrameBody(opts: {
   model: string;
   prompt: string;
   firstFramePath: string;
@@ -1424,7 +1682,7 @@ export function buildSeedanceFirstLastFrameBody(opts: {
   watermark?: boolean;
   generateAudio?: boolean;
   returnLastFrame?: boolean;
-}): any {
+}): Promise<any> {
   const {
     model,
     prompt,
@@ -1437,18 +1695,20 @@ export function buildSeedanceFirstLastFrameBody(opts: {
     generateAudio = false,
     returnLastFrame = true,
   } = opts;
+  const firstImage = await buildVideoSubmitImageDataUrl(firstFramePath);
+  const lastImage = await buildVideoSubmitImageDataUrl(lastFramePath);
   return {
     model,
     content: [
       { type: 'text', text: prompt },
       {
         type: 'image_url',
-        image_url: { url: imagePathToDataUrl(firstFramePath) },
+        image_url: { url: firstImage.dataUrl },
         role: 'first_frame',
       },
       {
         type: 'image_url',
-        image_url: { url: imagePathToDataUrl(lastFramePath) },
+        image_url: { url: lastImage.dataUrl },
         role: 'last_frame',
       },
     ],
@@ -1458,6 +1718,10 @@ export function buildSeedanceFirstLastFrameBody(opts: {
     watermark,
     generate_audio: generateAudio,
     return_last_frame: returnLastFrame,
+    __submittedImages: {
+      first: firstImage,
+      last: lastImage,
+    },
   };
 }
 
@@ -1480,6 +1744,7 @@ async function retryFetch(url: string, init: any, label: string, retries = 3): P
   let lastErr: any;
 
   for (let i = 0; i < maxAttempts; i++) {
+    const attemptStarted = Date.now();
     try {
       const resp = await fetchViaProxy(url, init);
       if (!resp.ok) {
@@ -1489,11 +1754,22 @@ async function retryFetch(url: string, init: any, label: string, retries = 3): P
         err.retryAfterMs = retryAfterMs(resp.headers.get('retry-after'));
         throw err;
       }
-      return await resp.json();
+      const json = await resp.json();
+      recordVideoModelCall(label, url, 'ok', null, null, Date.now() - attemptStarted);
+      return json;
     } catch (e: any) {
       lastErr = e;
       const status = Number(e?.status || e?.statusCode);
       const msg = e?.message || String(e);
+      recordVideoModelCall(
+        label,
+        url,
+        status === 429 ? 'rate_limited' : 'failed',
+        status || null,
+        status === 429 ? 'rate_limited' : status ? `http_${status}` : 'network_or_exception',
+        Date.now() - attemptStarted,
+        msg,
+      );
       const retryable =
         status === 429 ||
         (status >= 500 && status < 600) ||
@@ -1534,6 +1810,50 @@ async function retryFetch(url: string, init: any, label: string, retries = 3): P
   throw lastErr;
 }
 
+function recordVideoModelCall(
+  label: string,
+  url: string,
+  status: 'ok' | 'failed' | 'rate_limited',
+  statusCode: number | null,
+  errorCode: string | null,
+  latencyMs: number,
+  message?: string,
+) {
+  const provider = /seedance|volces|ark\.cn-|contents\/generations/i.test(label + ' ' + url)
+    ? 'seedance'
+    : /grok/i.test(label + ' ' + url)
+      ? 'openai_chat'
+      : /sora|\/videos/i.test(label + ' ' + url)
+        ? 'openai_chat'
+        : 'seedance';
+  recordModelCallEvent({
+    cfg: {
+      provider: provider as any,
+      model: 'video-provider',
+      source: 'env',
+      role: 'legacy',
+      mode: 'real',
+    },
+    slot: 'video',
+    status,
+    statusCode,
+    errorCode,
+    latencyMs,
+    traceName: label,
+    message,
+    meta: { url: redactUrlForMetrics(url) },
+  });
+}
+
+function redactUrlForMetrics(url: string) {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return String(url || '').split('?')[0].slice(0, 200);
+  }
+}
+
 /**
  * 带重试的下载（视频 URL 是 CDN，可能抖一下）。
  */
@@ -1570,6 +1890,14 @@ export function getVideoTaskMeta(id: string, ownerId: number) {
 }
 
 const recoveringVideoTasks = new Set<string>();
+const VIDEO_RECOVERY_LOOP_KEY = '__qd_video_recovery_loop_timer__';
+
+function videoRecoveryEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
 
 export function recoverRunningVideoTasks(limit = 12) {
   const db = getDb();
@@ -1578,6 +1906,13 @@ export function recoverRunningVideoTasks(limit = 12) {
       `SELECT *
        FROM video_tasks
        WHERE status IN ('queued','running')
+         AND NOT EXISTS (
+           SELECT 1
+             FROM batch_tasks bt
+            WHERE bt.provider = 'volcengine_seedance_video'
+              AND bt.provider_task_id = video_tasks.provider_task
+              AND bt.status IN ('running','upstream_pending','retry_pending')
+         )
        ORDER BY created_at ASC
        LIMIT ${Math.max(1, Math.min(limit, 50))}`,
     )
@@ -1621,6 +1956,24 @@ export function recoverRunningVideoTasks(limit = 12) {
 
   if (started) console.warn(`[video-recover] started ${started} in-flight video recovery task(s)`);
   return started;
+}
+
+export function startVideoRecoveryLoop() {
+  const globalScope = globalThis as any;
+  if (globalScope[VIDEO_RECOVERY_LOOP_KEY]) return globalScope[VIDEO_RECOVERY_LOOP_KEY] as NodeJS.Timeout;
+
+  const intervalMs = videoRecoveryEnvInt('VIDEO_RECOVERY_INTERVAL_MS', 30_000, 5_000, 10 * 60_000);
+  const timer = setInterval(() => {
+    try {
+      recoverRunningVideoTasks();
+    } catch (e) {
+      console.error('[video-recover] periodic recovery failed:', e);
+    }
+  }, intervalMs);
+  timer.unref?.();
+  globalScope[VIDEO_RECOVERY_LOOP_KEY] = timer;
+  console.log(`[video-recover] recovery loop started interval=${intervalMs}ms`);
+  return timer;
 }
 
 async function recoverOneRunningVideoTask(user: UserRow, row: any) {
@@ -1744,7 +2097,7 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
     }
   }
 
-  db.prepare(
+  const completeInfo = db.prepare(
     `UPDATE video_tasks
      SET status='completed',
          progress=100,
@@ -1752,13 +2105,24 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
          cover_image_id=?,
          error_msg=NULL,
          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     WHERE id=?`,
+     WHERE id=? AND status IN ('queued','running')`,
   ).run(filename, coverImageId, taskId);
+  if (completeInfo.changes <= 0) {
+    console.warn('[video-recover] completion ignored because task is no longer active:', taskId);
+    return {
+      taskId,
+      status: 'cancelled',
+      url: '',
+      protectedUrl: '',
+      durationSec: Number(row.duration_sec) || 0,
+    };
+  }
+
+  const protectedUrl = `/api/videos/file/${taskId}`;
+  const durationSec = Number(row.duration_sec) || 0;
 
   if (row.project_id && row.group_idx != null) {
     const groupIdx = Number(row.group_idx);
-    const protectedUrl = `/api/videos/file/${taskId}`;
-    const durationSec = Number(row.duration_sec) || undefined;
     patchProjectForUser(String(row.project_id), user.id, (fresh) => {
       if (!fresh) return null;
       const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
@@ -1791,4 +2155,118 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
       return { videoTasks, storyboards };
     });
   }
+
+  return {
+    taskId,
+    protectedUrl,
+    coverUrl,
+    durationSec,
+    mode: 'real' as const,
+  };
+}
+
+function safeParseVideoTaskJson(value: string | null | undefined) {
+  try {
+    return JSON.parse(value || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function seedanceReasonFromResponse(j: any, status: string) {
+  return String(
+    j?.error?.message ||
+    j?.error?.code ||
+    j?.fail_reason ||
+    j?.failReason ||
+    j?.message ||
+    `Seedance 远端状态：${status}`,
+  ).slice(0, 1000);
+}
+
+function seedanceProgressFromStatus(status: string, currentProgress: number) {
+  if (status === 'queued') return Math.max(20, currentProgress || 0);
+  if (status === 'running' || status === 'in_progress') return Math.max(30, Math.min(85, (currentProgress || 30) + 5));
+  if (status === 'succeeded') return 90;
+  return currentProgress || 0;
+}
+
+export function createSeedanceVideoProviderAdapter(): ProviderTaskAdapter {
+  return {
+    provider: 'volcengine_seedance_video',
+    async submit() {
+      throw new Error('seedance provider submit is handled by generateVideo');
+    },
+    async poll(taskRow: ProviderTaskRow): Promise<ProviderPollResult> {
+      const db = getDb();
+      const submission = safeParseVideoTaskJson(taskRow.result_json)?.providerSubmission || {};
+      const localVideoTaskId = String(submission.localVideoTaskId || '');
+      const videoRow = localVideoTaskId
+        ? db.prepare<{ id: string }, any>('SELECT * FROM video_tasks WHERE id = @id').get({ id: localVideoTaskId })
+        : db.prepare<{ providerTask: string }, any>(
+            'SELECT * FROM video_tasks WHERE provider_task = @providerTask ORDER BY created_at DESC LIMIT 1',
+          ).get({ providerTask: taskRow.provider_task_id || '' });
+      if (!videoRow) {
+        return { status: 'failed', reason: 'local_video_task_missing' };
+      }
+      if (!videoRow.provider_task && taskRow.provider_task_id) {
+        db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(taskRow.provider_task_id, videoRow.id);
+        videoRow.provider_task = taskRow.provider_task_id;
+      }
+      const user = db
+        .prepare<{ id: number }, UserRow>('SELECT * FROM users WHERE id = @id')
+        .get({ id: Number(videoRow.owner_id) });
+      if (!user) return { status: 'failed', reason: 'video_task_owner_missing' };
+
+      const cfg = resolveLLMConfig(user, 'video');
+      const remoteId = String(taskRow.provider_task_id || videoRow.provider_task || '');
+      if (!remoteId) return { status: 'failed', reason: 'provider_task_id_missing' };
+      const j: any = await retryFetch(
+        `${cfg.baseUrl}/contents/generations/tasks/${remoteId}`,
+        { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
+        `[provider-poll seedance ${remoteId}]`,
+      );
+      const status = String(j.status || '').toLowerCase();
+      const progress = seedanceProgressFromStatus(status, Number(videoRow.progress || 0));
+      dbUpdateVideoProgress(String(videoRow.id), progress);
+
+      if (status === 'succeeded') {
+        const videoUrl = j?.content?.video_url || j?.video_url || '';
+        if (!videoUrl) return { status: 'failed', reason: 'Seedance 完成但没返回 video_url', raw: j };
+        const final = await finalizeRecoveredVideoTask(user, videoRow, videoUrl);
+        return {
+          status: 'completed',
+          result: {
+            resultUrl: final.protectedUrl,
+            patch: {
+              type: 'video_segment',
+              groupIdx: videoRow.group_idx,
+              url: final.protectedUrl,
+              coverUrl: final.coverUrl,
+              durationSec: final.durationSec,
+              taskId: final.taskId,
+            },
+            extra: {
+              mode: final.mode,
+              groupIdx: videoRow.group_idx,
+              durationSec: final.durationSec,
+              protectedUrl: final.protectedUrl,
+            },
+          },
+          raw: j,
+        };
+      }
+
+      if (status === 'failed' || status === 'cancelled') {
+        const reason = seedanceReasonFromResponse(j, status);
+        markVideoTaskFailed(String(videoRow.id), reason);
+        return { status: 'failed', reason, raw: j };
+      }
+
+      return { status: 'pending', raw: j };
+    },
+    async recoverByKey() {
+      return null;
+    },
+  };
 }

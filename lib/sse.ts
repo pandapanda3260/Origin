@@ -27,6 +27,7 @@ export type SSEWriter = {
   step: (label: string) => void;
   event: (eventName: string, data: any) => void; // 任意自定义事件
   done: (data?: Record<string, any>) => void;
+  fail: (data: Record<string, any>) => void;
   error: (msg: string) => void;
   isClosed: () => boolean;
 };
@@ -56,6 +57,13 @@ export function sseResponse(handler: (writer: SSEWriter) => Promise<void> | void
         event: (eventName, data) => send({ type: eventName, ...(data || {}) }),
         done: (data = {}) => {
           send({ type: 'done', ...data });
+          if (!closed) {
+            closed = true;
+            try { controller.close(); } catch (_) {}
+          }
+        },
+        fail: (data) => {
+          send({ type: 'error', ...(data || {}) });
           if (!closed) {
             closed = true;
             try { controller.close(); } catch (_) {}

@@ -76,6 +76,17 @@ const CAPABILITY_DEFAULT: VideoModelCapability = {
 };
 
 const CAPABILITIES: Record<string, VideoModelCapability> = {
+  // OpenAI Sora fallback id is known to model routing, but this product has
+  // not verified a compatible first+last-frame submit shape for it.
+  sora: {
+    firstLastFrameMode: 'unsupported',
+    multiReferenceMode: 'unsupported',
+    modesAreMutuallyExclusive: true,
+    supportsReturnLastFrame: false,
+    bodyShape: 'openai_content_array',
+    verifiedBy: 'official_doc',
+    verifiedAt: '2026-05-19',
+  },
   // Volcengine Ark Seedance 2.0 — verified via live API probe
   // (cgt-20260510020416-zrtrs: returned content.last_frame_url when
   // request used role=first_frame/last_frame + top-level
@@ -131,4 +142,3 @@ export function resolveVideoModelCapability(modelId: string | undefined | null):
 export function listRegisteredVideoModelIds(): string[] {
   return Object.keys(CAPABILITIES);
 }
-

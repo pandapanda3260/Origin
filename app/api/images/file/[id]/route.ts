@@ -1,9 +1,9 @@
 import { NextRequest } from 'next/server';
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { verifySignedImageUrl } from '@/lib/signed-asset-url';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -57,9 +57,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     if (!signedOk) return new Response('unauthorized', { status: 401 });
   }
 
-  let fullPath = join(process.cwd(), 'data', 'images', String(row.owner_id), row.filename);
+  let fullPath = dataPath('images', String(row.owner_id), row.filename);
   if (!existsSync(fullPath) && (row.style === 'video-cover' || String(row.asset_ref || '').startsWith('video-cover/'))) {
-    const videoCoverPath = join(process.cwd(), 'data', 'videos', String(row.owner_id), row.filename);
+    const videoCoverPath = dataPath('videos', String(row.owner_id), row.filename);
     if (existsSync(videoCoverPath)) fullPath = videoCoverPath;
   }
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });

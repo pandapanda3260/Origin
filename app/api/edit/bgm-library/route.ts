@@ -4,11 +4,12 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const BGM_DIR = join(process.cwd(), 'data', 'bgm');
+const BGM_DIR = dataPath('bgm');
 const META_FILE = join(BGM_DIR, '_meta.json');
 
 /**

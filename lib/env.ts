@@ -53,6 +53,25 @@ export function getExternalEnvLoadResult() {
   return loadResult || loadExternalEnv();
 }
 
+export function getExternalEnvValue(key: string): string | undefined {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return undefined;
+
+  let value: string | undefined;
+  for (const path of getExternalEnvPaths()) {
+    if (!path || !existsSync(path)) continue;
+
+    try {
+      const parsed = parseDotEnv(readFileSync(path, 'utf8'));
+      if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+        value = parsed[key];
+      }
+    } catch {
+      // loadExternalEnv() owns reporting parse/read warnings; this helper stays read-only.
+    }
+  }
+  return value;
+}
+
 function getExternalEnvPaths(): string[] {
   const single = (process.env.ORIGIN_ENV_FILE || '').trim();
   if (single) return [single];

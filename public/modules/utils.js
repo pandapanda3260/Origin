@@ -164,6 +164,40 @@ const _videoUrlCache = new Map();
 const _INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
 const _INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
 const _protectedImageBlobCache = new Map();
+const _protectedImageBlobPendingCache = new Map();
+
+/* UI redesign note is not applicable here.
+ * Phase A performance optimization: reuse sufficiently fresh signed image URLs
+ * directly in the DOM, and keep blob hydration only as a fallback for bare or
+ * near-expiry protected image URLs. */
+function _safeUrl(url) {
+  try {
+    return new URL(String(url || '').trim(), window.location.origin);
+  } catch (_e) {
+    return null;
+  }
+}
+
+function _imageSignedUrlSafeMarginSec(remainingSec) {
+  remainingSec = Number(remainingSec || 0);
+  if (!Number.isFinite(remainingSec) || remainingSec <= 0) return Infinity;
+  if (remainingSec >= 1800) return 60;
+  if (remainingSec >= 300) return 30;
+  return Infinity;
+}
+
+function _canDirectLoadProtectedImage(url) {
+  var parsed = _safeUrl(url);
+  if (!parsed) return false;
+  var sig = parsed.searchParams.get('sig');
+  var exp = parseInt(parsed.searchParams.get('exp') || '0', 10);
+  if (!sig || !Number.isFinite(exp) || exp <= 0) return false;
+  var nowSec = Math.floor(Date.now() / 1000);
+  var remainingSec = exp - nowSec;
+  var safeMarginSec = _imageSignedUrlSafeMarginSec(remainingSec);
+  if (!Number.isFinite(safeMarginSec)) return false;
+  return remainingSec > safeMarginSec;
+}
 
 export async function fetchAssetSignedUrl(assetId, ttl) {
   assetId = (assetId || '').trim();
@@ -382,17 +416,31 @@ function _isProtectedImageUrl(url) {
 }
 
 async function _resolveProtectedImageBlobUrl(url) {
-  url = String(url || '').trim();
+  var cacheKey = String(url || '');
+  url = cacheKey.trim();
   if (!_isProtectedImageUrl(url)) return url;
-  var cached = _protectedImageBlobCache.get(url);
+  var cached = _protectedImageBlobCache.get(cacheKey);
   if (cached) return cached;
+  var pending = _protectedImageBlobPendingCache.get(cacheKey);
+  if (pending) return pending;
 
-  var resp = await fetch(url, { headers: getAuthHeaders(), cache: 'force-cache' });
-  checkAuth(resp);
-  if (!resp.ok) throw new Error('图片加载失败 (' + resp.status + ')');
-  var blobUrl = URL.createObjectURL(await resp.blob());
-  _protectedImageBlobCache.set(url, blobUrl);
-  return blobUrl;
+  var task = fetch(url, { headers: getAuthHeaders(), cache: 'force-cache' })
+    .then(function (resp) {
+      checkAuth(resp);
+      if (!resp.ok) throw new Error('图片加载失败 (' + resp.status + ')');
+      return resp.blob();
+    })
+    .then(function (blob) {
+      var blobUrl = URL.createObjectURL(blob);
+      _protectedImageBlobCache.set(cacheKey, blobUrl);
+      return blobUrl;
+    })
+    .finally(function () {
+      _protectedImageBlobPendingCache.delete(cacheKey);
+    });
+
+  _protectedImageBlobPendingCache.set(cacheKey, task);
+  return task;
 }
 
 export function hydrateProtectedImageElements(root) {
@@ -405,7 +453,7 @@ export function hydrateProtectedImageElements(root) {
 
   nodes.forEach(function (node) {
     var imgUrl = node.getAttribute && node.getAttribute('src');
-    if (imgUrl && _isProtectedImageUrl(imgUrl)) {
+    if (imgUrl && _isProtectedImageUrl(imgUrl) && !_canDirectLoadProtectedImage(imgUrl)) {
       _resolveProtectedImageBlobUrl(imgUrl).then(function (blobUrl) {
         node.setAttribute('src', blobUrl);
       }).catch(function (e) {
@@ -414,7 +462,7 @@ export function hydrateProtectedImageElements(root) {
     }
 
     var dataImg = node.getAttribute && node.getAttribute('data-img');
-    if (dataImg && _isProtectedImageUrl(dataImg)) {
+    if (dataImg && _isProtectedImageUrl(dataImg) && !_canDirectLoadProtectedImage(dataImg)) {
       _resolveProtectedImageBlobUrl(dataImg).then(function (blobUrl) {
         node.setAttribute('data-img', blobUrl);
       }).catch(function (e) {

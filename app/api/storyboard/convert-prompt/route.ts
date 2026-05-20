@@ -2,6 +2,9 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { chatStream } from '@/lib/llm';
 import { sseResponse } from '@/lib/sse';
+import { getProjectByIdForUser } from '@/lib/projects-db';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -44,6 +47,7 @@ export async function POST(req: NextRequest) {
   const assets = body.assets || null;
   const assetRefs: any[] = Array.isArray(body.assetRefs) ? body.assetRefs : [];
   const idx: number = typeof body.idx === 'number' ? body.idx : 0;
+  const projectId = typeof body.projectId === 'string' ? body.projectId : '';
   // creatorProfile 暂未用到，预留参数
 
   return sseResponse(async (writer) => {
@@ -129,6 +133,33 @@ export async function POST(req: NextRequest) {
     if (!cleaned) {
       writer.error('AI 没有返回提示词，请稍后重试');
       return;
+    }
+
+    if (projectId) {
+      try {
+        const project = getProjectByIdForUser(projectId, user.id);
+        if (project) {
+          const context = buildKnowledgeContextForStage({
+            ownerId: user.id,
+            project: {
+              ...(project as any),
+              id: projectId,
+            },
+            stage: 'storyboard_sketch_prompt',
+            stageTarget: {
+              idx,
+              shotIdx: shot.idx ?? idx + 1,
+              shotType,
+              camera,
+              assetRefCount: assetRefs.length,
+              hasStyleBible: !!styleBible,
+            },
+          });
+          recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context });
+        }
+      } catch (error) {
+        console.warn('[storyboard/convert-prompt] knowledge context audit skipped:', error);
+      }
     }
 
     writer.done({ imagePrompt: cleaned, idx });

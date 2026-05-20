@@ -8,11 +8,12 @@ import { getDb } from '@/lib/db';
 import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
 import { mutateCharacterLock } from '@/lib/character-consistency';
+import { getDataDir } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const IMAGES_DIR = join(DATA_DIR, 'images');
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;       // 20 MB

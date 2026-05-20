@@ -14,6 +14,7 @@ import {
   VIDEO_PROMPT_RETRY_EXTRA_RULE,
   VIDEO_PROMPT_RETRY_TEMPERATURE,
 } from './video-prompt-attempts';
+import { dataPath } from './runtime-paths';
 
 type AuditOptions = {
   ratio?: string;
@@ -38,7 +39,22 @@ function normalizeRatio(ratio?: string): { ratio: string; size: '1080x1920' | '1
   if (r === '1:1') return { ratio: '1:1', size: '1024x1024' };
   if (r === '4:3' || r === '21:9') return { ratio: '16:9', size: '1920x1080' };
   if (r === '3:4') return { ratio: '9:16', size: '1080x1920' };
-  return { ratio: '16:9', size: '1920x1080' };
+  return { ratio: '9:16', size: '1080x1920' };
+}
+
+function resolveAuditRatio(project: any, opts: AuditOptions): string {
+  const candidates = [
+    opts.ratio,
+    project?.styleOptions?.aspectRatio,
+    project?.styleBible?.aspectRatio,
+    project?.videoAspectRatio,
+    '9:16',
+  ];
+  for (const candidate of candidates) {
+    const value = String(candidate || '').trim();
+    if (['16:9', '9:16', '1:1', '21:9', '4:3', '3:4'].includes(value)) return value;
+  }
+  return '9:16';
 }
 
 function parseDialogue(raw: string): Array<{ speaker: string; text: string }> {
@@ -143,13 +159,13 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     ? resolvedFirstFrameUrl
     : (sb.rawUrl || sb.url || sb.imageUrl || '');
   const sbImageId = localImageId(sbImageUrl);
-  const referenceImagePath = sbImageId ? `${process.cwd()}/data/images/${user.id}/${sbImageId}.png` : undefined;
+  const referenceImagePath = sbImageId ? dataPath('images', String(user.id), `${sbImageId}.png`) : undefined;
   const referenceImageRole: 'first_frame' | 'storyboard_sketch' = resolvedFirstFrameUrl ? 'first_frame' : 'storyboard_sketch';
 
   let storyboardReferencePath: string | undefined;
   if (referenceImageRole === 'first_frame') {
     const sketchId = localImageId(sb.debugSketchUrl || sb.pencilUrl || '');
-    if (sketchId) storyboardReferencePath = `${process.cwd()}/data/images/${user.id}/${sketchId}.png`;
+    if (sketchId) storyboardReferencePath = dataPath('images', String(user.id), `${sketchId}.png`);
   }
 
   const charNames = new Set<string>();
@@ -423,7 +439,7 @@ export function buildVideoPromptAudit(user: UserRow, project: any, groupIdx: num
     totalGroups: storyboards.length || 1,
   });
 
-  const ratio = opts.ratio || '16:9';
+  const ratio = resolveAuditRatio(project, opts);
   const videoInput = buildVideoInput(project, user, groupIdx, shotIndices, ratio);
   const providerAudit = buildProviderAudit(user, videoInput, ratio);
   const textCfg = resolveTextModelConfig(user, 'structured');
@@ -456,7 +472,7 @@ export function buildVideoPromptAudit(user: UserRow, project: any, groupIdx: num
       quality: opts.quality || '',
       genAudio: opts.genAudio,
       watermark: opts.watermark,
-      note: 'requestedVideoModel 是前端批量页当前选择；实际视频模型由后端 settings.models.video / 环境变量解析。',
+      note: 'requestedVideoModel 是前端片段页当前选择；实际视频模型由后端 settings.models.video / 环境变量解析。',
     },
     promptGeneration: {
       title: '视频提示词生成阶段（文本大模型）',

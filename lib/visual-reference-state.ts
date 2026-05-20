@@ -23,6 +23,7 @@ function cleanUrl(value: any): string {
 export function resolveStoryboardFirstFrameUrl(storyboard: any): string {
   return cleanUrl(
     storyboard?.firstFrame?.currentUrl ||
+      storyboard?.frames?.first?.url ||
       storyboard?.firstFrameUrl ||
       storyboard?.url ||
       storyboard?.imageUrl ||

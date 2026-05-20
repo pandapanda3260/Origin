@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { UserRow } from './db';
 import { resolveLocalImagePath } from './image-gen';
+import { getDataDir } from './runtime-paths';
 
 export type CharacterEntityType = 'human' | 'non-human';
 export type PanelName = 'headshot' | 'front' | 'side' | 'back';
@@ -47,7 +48,7 @@ type PreparedPanel = {
   quality: PanelQuality;
 };
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const IMAGES_DIR = join(DATA_DIR, 'images');
 
 function imageIdFromUrl(url: string | undefined | null): string | null {

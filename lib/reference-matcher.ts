@@ -1,9 +1,13 @@
-import { basename } from 'node:path';
+import { basename, relative } from 'node:path';
 import { hasFillLightPositiveMention } from './content-sanitize';
 import { resolveLocalImagePath } from './image-gen';
-import { resolveAssetReferenceState } from './visual-reference-state';
+import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 import { selectCharacterReferencePanels, type CharacterReferencePanel } from './panel-selection';
 import { pickSceneForShots } from './scene-selection';
+import {
+  materialRoleToVideoRole,
+  type StoryboardMaterialRole,
+} from './reference-roles';
 import {
   normalizeReferenceName,
   VIDEO_REFERENCE_IMAGE_BUDGET,
@@ -11,6 +15,7 @@ import {
   type ReferenceManifestItem,
   type VideoReferenceRole,
 } from './video-reference-manifest';
+import { dataPath } from './runtime-paths';
 
 type Candidate = Omit<ReferenceManifestItem, 'imageNo'> & {
   type: VideoReferenceRole;
@@ -50,12 +55,55 @@ function assetName(asset: any, fallback: string): string {
 
 function assetUrl(asset: any): string {
   const reference = resolveAssetReferenceState(asset);
+  if (isBlockingReferenceStatus(reference.status)) return '';
   return compactText(reference.currentUrl || reference.lastKnownGoodUrl || asset?.imageUrl || asset?.rawUrl || asset?.realPhotoUrl || asset?.coverUrl);
 }
 
 function assetId(asset: any): string | undefined {
   const id = compactText(asset?.id || asset?.assetId || asset?.uuid);
   return id || undefined;
+}
+
+function uiTypeForRole(role: StoryboardMaterialRole): 'scene' | 'char' | 'prop' {
+  return role === 'character' ? 'char' : role;
+}
+
+function materialIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: number): string[] {
+  const source = asset || {};
+  const fields = role === 'character'
+    ? [source.characterId, source.materialId, source.id, source.assetId, source.name, source.role, source.identity]
+    : role === 'scene'
+      ? [source.sceneId, source.materialId, source.id, source.assetId, source.name, source.sceneName, source.location, source.title]
+      : [source.propId, source.materialId, source.id, source.assetId, source.name, source.propName, source.title, source.propType];
+  const prefixes = role === 'character' ? ['character', 'char'] : [role];
+  const keys: string[] = [];
+  for (const field of fields) {
+    const value = compactText(field);
+    if (value) {
+      for (const prefix of prefixes) keys.push(`${prefix}:${value}`);
+    }
+  }
+  const url = assetUrl(source);
+  if (url) {
+    for (const prefix of prefixes) keys.push(`${prefix}:url:${url}`);
+  }
+  return [...new Set(keys)];
+}
+
+function isMaterialAssetExcluded(
+  project: any,
+  role: StoryboardMaterialRole,
+  asset: any,
+  groupIdx: number | undefined,
+  idx?: number,
+): boolean {
+  if (!asset || !Number.isInteger(groupIdx) || Number(groupIdx) < 0) return false;
+  const exclusions = project?.storyboardMaterialExclusions?.[String(groupIdx)];
+  if (!exclusions) return false;
+  const buckets = [exclusions[role], exclusions[uiTypeForRole(role)]].filter(Boolean);
+  if (!buckets.length) return false;
+  const keys = materialIdentityKeys(role, asset, idx);
+  return buckets.some((bucket: any) => keys.some((key) => !!bucket[key]));
 }
 
 function collectCharacters(project: any, assets: any): any[] {
@@ -65,6 +113,16 @@ function collectCharacters(project: any, assets: any): any[] {
   ];
 }
 
+function isStoryboardMaterialForGroup(asset: any, groupIdx: number | undefined, role: VideoReferenceRole): boolean {
+  if (role === 'first_frame') return false;
+  if (!Number.isInteger(groupIdx) || Number(groupIdx) < 0) return false;
+  if (asset?.reference?.status === 'missing' || asset?.reference?.status === 'failed') return false;
+  const materialGroupIdx = Number(asset?.storyboardMaterialGroupIdx);
+  if (!Number.isFinite(materialGroupIdx) || materialGroupIdx !== Number(groupIdx)) return false;
+  if (!asset?.storyboardMaterialRole) return false;
+  return materialRoleToVideoRole(asset.storyboardMaterialRole) === role;
+}
+
 function findCharacterByName(characters: any[], name: string): any | null {
   const key = normalizeReferenceName(name);
   return characters.find((ch) => normalizeReferenceName(ch?.name || ch?.role || ch?.id || ch?.label) === key) || null;
@@ -72,12 +130,15 @@ function findCharacterByName(characters: any[], name: string): any | null {
 
 function publicImageUrlFromLocalPath(path: string, ownerId: number): string {
   const normalized = String(path || '');
-  if (!normalized.includes(`/data/images/${ownerId}/`)) return '';
+  const rel = relative(dataPath('images', String(ownerId)), normalized);
+  if (!rel || rel.startsWith('..') || rel.includes('/')) return '';
   const m = /^([0-9a-fA-F-]{36})\.png$/.exec(basename(normalized));
   return m ? `/api/images/file/${m[1]}` : '';
 }
 
 function panelUrlForCharacter(character: any, panel: CharacterReferencePanel, ownerId: number): string {
+  const reference = resolveAssetReferenceState(character);
+  if (isBlockingReferenceStatus(reference.status)) return '';
   const panels = character?.panels || {};
   const key = panel.panel === 'sheet' ? 'sheetUrl' : `${panel.panel}Url`;
   const urls = [
@@ -112,11 +173,20 @@ function firstOccurrenceIndex(haystack: string, needle: string): number {
 }
 
 function shotsFromInput(input: BuildVideoReferenceManifestInput): any[] {
+  if (Array.isArray(input.groupShotIndices) && input.groupShotIndices.length) {
+    const projectShots = Array.isArray(input.project?.shots) ? input.project.shots : [];
+    if (projectShots.length) {
+      return input.groupShotIndices.map((idx) => projectShots[idx]).filter(Boolean);
+    }
+    const inputShots = Array.isArray(input.shots) ? input.shots : [];
+    const canIndexInputShots = input.groupShotIndices.every((idx) => Number.isInteger(idx) && idx >= 0 && idx < inputShots.length);
+    return canIndexInputShots
+      ? input.groupShotIndices.map((idx) => inputShots[idx]).filter(Boolean)
+      : inputShots;
+  }
   if (Array.isArray(input.shots) && input.shots.length) return input.shots;
   const allShots = Array.isArray(input.project?.shots) ? input.project.shots : [];
-  if (Array.isArray(input.groupShotIndices) && input.groupShotIndices.length) {
-    return input.groupShotIndices.map((idx) => allShots[idx]).filter(Boolean);
-  }
+  if (allShots.length) return allShots;
   return [];
 }
 
@@ -157,10 +227,16 @@ function pushCandidate(list: Candidate[], candidate: Omit<Candidate, '_order'>) 
   // The current video-reference policy intentionally pushes at most one image
   // per character. If future work allows multiple panels for the same character,
   // this de-dupe key must include panelInfo.panel.
-  if (list.some((item) => item.url === candidate.url || (
+  const duplicateIdx = list.findIndex((item) => item.url === candidate.url || (
     item.role === candidate.role &&
     normalizeReferenceName(item.assetName) === normalizeReferenceName(candidate.assetName)
-  ))) return;
+  ));
+  if (duplicateIdx >= 0) {
+    if ((candidate.score || 0) > (list[duplicateIdx].score || 0)) {
+      list[duplicateIdx] = { ...candidate, _order: list[duplicateIdx]._order };
+    }
+    return;
+  }
   list.push({ ...candidate, _order: list.length });
 }
 
@@ -200,6 +276,8 @@ function characterPanelUseFor(panel: CharacterReferencePanel): string[] {
 function addFirstFrameCandidate(candidates: Candidate[], input: BuildVideoReferenceManifestInput) {
   const url = compactText(input.storyboardImageUrl);
   if (!url) return;
+  const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
+  if (!localPath) return;
   const defaults = roleDefaults('first_frame');
   pushCandidate(candidates, {
     type: 'first_frame',
@@ -207,7 +285,7 @@ function addFirstFrameCandidate(candidates: Candidate[], input: BuildVideoRefere
     name: 'first_frame',
     label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
     url,
-    localPath: resolveLocalImagePath(url, input.ownerId) || undefined,
+    localPath,
     useFor: defaults.useFor,
     immutable: defaults.immutable,
     promptHint: defaults.promptHint,
@@ -303,6 +381,8 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   });
   selectedPanels.forEach((panel, idx) => {
     const ch = findCharacterByName(chars, panel.characterName);
+    const chIdx = ch ? chars.indexOf(ch) : -1;
+    if (ch && isMaterialAssetExcluded(project, 'character', ch, input.groupIdx, chIdx >= 0 ? chIdx : undefined)) return;
     const url = ch ? panelUrlForCharacter(ch, panel, input.ownerId) : '';
     if (!url) {
       dropped.push({ role: 'character', assetName: panel.characterName, reason: 'url_lookup_failed' });
@@ -337,12 +417,14 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   );
 
   chars.forEach((ch, idx) => {
+    if (isMaterialAssetExcluded(project, 'character', ch, input.groupIdx, idx)) return;
     const name = assetName(ch, `角色${idx + 1}`);
     const norm = normalizeReferenceName(name);
     if (!norm) return;
     const explicit = explicitCharNorms.has(norm);
     const mentions = countOccurrences(normText, norm);
-    if (!explicit && mentions <= 0) return;
+    const manualMatch = isStoryboardMaterialForGroup(ch, input.groupIdx, 'character');
+    if (!manualMatch && !explicit && mentions <= 0) return;
     const url = assetUrl(ch);
     if (!url) {
       if (panelCoveredCharacterNames.has(norm)) return;
@@ -372,8 +454,12 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
-      matchReason: explicit ? 'shot.characters exact match' : 'group text name match',
-      score: (explicit ? 100 : 70) + mentions * 5 - idx,
+      matchReason: manualMatch
+        ? 'storyboard material group match'
+        : explicit
+          ? 'shot.characters exact match'
+          : 'group text name match',
+      score: (manualMatch ? 520 : explicit ? 100 : 70) + mentions * 5 - idx,
     });
   });
 
@@ -392,6 +478,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   const explicitSceneId = explicitScene ? assetId(explicitScene) : '';
   const explicitSceneName = explicitScene ? normalizeReferenceName(assetName(explicitScene, '')) : '';
   scenes.forEach((scene, idx) => {
+    if (isMaterialAssetExcluded(project, 'scene', scene, input.groupIdx, idx)) return;
     const name = assetName(scene, `场景${idx + 1}`);
     const norm = normalizeReferenceName(name);
     const mentions = norm ? countOccurrences(normText, norm) : 0;
@@ -400,7 +487,8 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       (!!explicitSceneId && assetId(scene) === explicitSceneId) ||
       (!!explicitSceneName && norm === explicitSceneName)
     );
-    if (!explicitMatch && !mentions && !isMain) return;
+    const manualMatch = isStoryboardMaterialForGroup(scene, input.groupIdx, 'scene');
+    if (!manualMatch && !explicitMatch && !mentions && !isMain) return;
     const url = assetUrl(scene);
     if (!url) {
       dropped.push({ role: 'scene', assetName: name, reason: 'asset_missing' });
@@ -429,18 +517,22 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
-      matchReason: explicitMatch
+      matchReason: manualMatch
+        ? 'storyboard material group match'
+        : explicitMatch
         ? `shot ${explicitSceneSelection.matchReason} match`
         : mentions
           ? 'group visual/location text match'
           : 'fallback main scene',
-      score: explicitMatch
-        ? 260 - idx
-        : (mentions ? 85 + mentions * 8 : 45) + (isMain ? 10 : 0) - idx,
+      score: manualMatch
+        ? 540 - idx
+        : explicitMatch
+          ? 260 - idx
+          : (mentions ? 85 + mentions * 8 : 45) + (isMain ? 10 : 0) - idx,
     });
   });
   if (!candidates.some((c) => c.role === 'scene')) {
-    const fallback = scenes.find((s) => assetUrl(s));
+    const fallback = scenes.find((s, idx) => assetUrl(s) && !isMaterialAssetExcluded(project, 'scene', s, input.groupIdx, idx));
     if (fallback) {
       const name = assetName(fallback, '主场景');
       const url = assetUrl(fallback);
@@ -468,6 +560,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
 
   const props: any[] = Array.isArray(assets?.props) ? assets.props : [];
   props.forEach((prop, idx) => {
+    if (isMaterialAssetExcluded(project, 'prop', prop, input.groupIdx, idx)) return;
     const name = assetName(prop, `道具${idx + 1}`);
     if (hasFillLightPositiveMention(name)) {
       dropped.push({ role: 'prop', assetName: name, reason: 'filtered_constraint' });
@@ -475,7 +568,8 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     }
     const norm = normalizeReferenceName(name);
     const mentions = norm ? countOccurrences(normText, norm) : 0;
-    if (!mentions) return;
+    const manualMatch = isStoryboardMaterialForGroup(prop, input.groupIdx, 'prop');
+    if (!manualMatch && !mentions) return;
     const firstMention = firstOccurrenceIndex(normText, norm);
     const url = assetUrl(prop);
     if (!url) {
@@ -505,8 +599,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
-      matchReason: 'group visual/dialogue/keyInfo text match',
-      score: 80 + mentions * 8 - idx,
+      matchReason: manualMatch
+        ? 'storyboard material group match'
+        : 'group visual/dialogue/keyInfo text match',
+      score: (manualMatch ? 500 : 80) + mentions * 8 - idx,
       mentionCount: mentions,
       firstMentionIndex: firstMention,
       relevanceScore: 80,

@@ -5,10 +5,11 @@ const Database = require('better-sqlite3');
 
 const MEDIA_BUCKETS = ['images', 'videos', 'uploads', 'exports'];
 const PROJECT_TABLES = ['images', 'video_tasks', 'uploads', 'exports', 'batches', 'continuity_cache', 'script_library_items'];
+const DATA_DIR = path.resolve(process.env.ORIGIN_DATA_DIR || process.env.DATA_DIR || path.join(process.cwd(), 'data'));
 
 function parseArgs(argv) {
   const args = {
-    db: process.env.DB_PATH || path.join('data', 'qd.sqlite'),
+    db: process.env.DB_PATH || path.join(DATA_DIR, 'qd.sqlite'),
     apply: false,
     minAgeHours: 24,
     deleteUser: '',
@@ -58,7 +59,7 @@ function fileKey(ownerId, filename) {
 function safeFilePath(bucket, ownerId, filename) {
   const name = String(filename || '').trim();
   if (!MEDIA_BUCKETS.includes(bucket) || !name) return null;
-  const base = path.resolve(process.cwd(), 'data', bucket, String(ownerId));
+  const base = path.resolve(DATA_DIR, bucket, String(ownerId));
   const target = path.resolve(base, name);
   if (target === base || !target.startsWith(base + path.sep)) return null;
   return target;
@@ -141,7 +142,7 @@ function collectUnreferencedFiles(db, minAgeHours) {
   const cutoff = Date.now() - minAgeHours * 60 * 60 * 1000;
   const files = new Map();
   for (const bucket of MEDIA_BUCKETS) {
-    const bucketDir = path.join(process.cwd(), 'data', bucket);
+    const bucketDir = path.join(DATA_DIR, bucket);
     if (!fs.existsSync(bucketDir)) continue;
     for (const ownerId of fs.readdirSync(bucketDir)) {
       const ownerDir = path.join(bucketDir, ownerId);

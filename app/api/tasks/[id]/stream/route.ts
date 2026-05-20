@@ -100,6 +100,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
                   progress: 100,
                   downloadUrl: `/api/edit/export-file/${row.id}`,
                   resultUrl: `/api/edit/export-file/${row.id}`,
+                  edlVersion: row.edl_version,
                 });
               } else {
                 const protectedUrl = row.filename ? `/api/videos/file/${row.id}` : '';

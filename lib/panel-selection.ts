@@ -5,6 +5,7 @@ import {
   type CharacterEntityType,
   type PanelName,
 } from './character-panels';
+import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 
 export type ShotPanelIntent = 'face' | 'body' | 'profile' | 'back' | 'group';
 
@@ -199,7 +200,9 @@ function panelsForIntent(intent: ShotPanelIntent, entityType: CharacterEntityTyp
 }
 
 function fallbackSheetPath(character: any, ownerId: number): string | undefined {
-  const url = character?.rawUrl || character?.imageUrl || character?.realPhotoUrl || character?.pencilUrl;
+  const reference = resolveAssetReferenceState(character);
+  if (isBlockingReferenceStatus(reference.status)) return undefined;
+  const url = reference.currentUrl || reference.lastKnownGoodUrl || character?.realPhotoUrl || character?.pencilUrl;
   return resolveLocalImagePath(url, ownerId) || undefined;
 }
 
@@ -235,6 +238,8 @@ export function selectCharacterReferencePanels(opts: {
     const item = scored[i];
     const slots = allocations[i] || 0;
     if (!slots) continue;
+    const reference = resolveAssetReferenceState(item.character);
+    if (isBlockingReferenceStatus(reference.status)) continue;
 
     const entityType = inferEntityTypeFromCharacter(item.character);
     const paths = resolveCharacterPanelPaths(item.character?.panels, opts.ownerId);

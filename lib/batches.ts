@@ -15,11 +15,30 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { UserRow } from './db';
-import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from './credits';
+import { InsufficientCreditsError } from './credits';
+import { costForBatchType, creditKindForBatchType, finalizeBatchFromTasks } from './batch-task-accounting';
+import {
+  TASK_STATUS_TRANSITIONS,
+  batchHeartbeat as heartbeatDurableTasks,
+  chargeTaskLedger,
+  claimNextTask,
+  refundTaskLedger,
+  releaseExpiredTaskLeases,
+  requestTaskCancel,
+  transitionTaskStatus,
+} from './durable-tasks';
 import { patchProjectForUser } from './projects-db';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
 import { markFirstFrameFailed, markTailFrameFailed } from './visual-reference-state';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
+import { failShotPlanGenerationPatch } from './project-dependency-state';
+import { recordTextFlagIfSensitive } from './content-flags';
+import {
+  DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT,
+  DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT,
+  getGlobalImageConcurrencyLimit,
+  getGlobalVideoConcurrencyLimit,
+} from './system-config';
 
 export type BatchEventName =
   | 'snapshot'
@@ -27,6 +46,7 @@ export type BatchEventName =
   | 'task_progress'
   | 'task_completed'
   | 'task_failed'
+  | 'task_cancelled'
   | 'batch_completed'
   | 'batch_cancelled';
 
@@ -38,10 +58,13 @@ export type BatchExecCtx = {
   options: any;
   batchId: string;
   taskId: string;
+  idempotencyKey: string;
   seq: number;
   target: BatchTaskTarget;
   /** 用来主动推送进度（前端会转成 task_progress 事件）*/
   progress: (payload: any) => void;
+  isCancelled: () => boolean;
+  throwIfCancelled: () => void;
 };
 
 export type BatchExecutor = (ctx: BatchExecCtx) => Promise<{
@@ -58,7 +81,16 @@ const _emitters = new Map<string, EventEmitter>();
 const BATCH_RUNNER_ID = `${process.pid || 'pid'}:${randomUUID()}`;
 const BATCH_HEARTBEAT_INTERVAL_MS = 15_000;
 const BATCH_HEARTBEAT_TIMEOUT_MS = 2 * 60_000;
-const LEGACY_ORPHAN_GRACE_MS = 30 * 60_000;
+const BATCH_TASK_LEASE_MS = 60_000;
+const LEGACY_ORPHAN_GRACE_MS = 60 * 60_000;
+const BATCH_RECOVERY_LOOP_KEY = '__qd_batch_recovery_loop_timer__';
+
+class BatchTaskCancelledError extends Error {
+  constructor(message = 'task cancelled') {
+    super(message);
+    this.name = 'BatchTaskCancelledError';
+  }
+}
 
 export class ActiveVideoBatchConflictError extends Error {
   groupIdxs: number[];
@@ -353,8 +385,35 @@ function _markFailedVideoPromptState(opts: {
   return { groupIdx, videoPromptStatus: 'failed', videoPromptLastError, invalidateVideo: true };
 }
 
+function _markFailedShotPlanState(opts: {
+  batchType: string;
+  batchId: string;
+  projectId: string;
+  user: UserRow;
+  message: string;
+}): null | { shotPlanStatus: 'failed'; shotPlanLastError: string } {
+  if (opts.batchType !== 'shots') return null;
+  const shotPlanLastError = (opts.message || '镜头计划生成失败').slice(0, 500);
+  let applied = false;
+  try {
+    patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
+      if (!fresh) return null;
+      const failure = failShotPlanGenerationPatch(fresh, {
+        batchId: opts.batchId,
+        error: shotPlanLastError,
+      });
+      if (!failure.ok) return null;
+      applied = true;
+      return failure.patch;
+    });
+  } catch (cleanupErr) {
+    console.error('[batch] failed to mark shot-plan failure state:', opts.projectId, cleanupErr);
+  }
+  return applied ? { shotPlanStatus: 'failed', shotPlanLastError } : null;
+}
+
 function _activeGroupBatchLabel(batchType: string): string | null {
-  if (batchType === 'videos') return '视频生成';
+  if (batchType === 'video_segments' || batchType === 'videos') return '视频生成';
   if (batchType === 'storyboard_images') return '首帧生成';
   if (batchType === 'tail_frame_images') return '尾帧生成';
   return null;
@@ -419,24 +478,26 @@ function _findActiveGroupBatchOverlap(db: any, opts: {
 }
 
 /**
- * 不同 batchType 用不同的并发上限：
- *   - 分镜：3（gpt-image-1 单张 30-60s，3 在多数中转上仍稳定）
- *   - 资产图：默认 2，避免 10+ 张资产同时打到中转限流
- *   - 视频：3（准备阶段可并行；真正 submit 由 lib/video-gen.ts 的 semaphore 限速）
- *   - 其它（纯文本类）：3
+ * P1 内测期并发规则：
+ *   - 图片/视频类 batch 读取 system_config 的进程级全局上限，默认 3。
+ *   - 这个上限由当前 Next.js/worker 进程内所有用户共享，不是单用户额度。
+ *   - 大规模用户下的跨进程公平队列留到后续调度层处理。
+ *   - 其它（纯文本类）：3。
  */
 function _concurrencyFor(batchType: string): number {
   // 视频生成：grok 中转端是异步的（提交后轮询），所以可以并行多个
   // 5 个片段并行 → 总时间约 = 单个片段时间 (1~2 分钟) 而非 5 倍
-  if (batchType === 'video_segments' || batchType === 'videos') return 3;
+  if (batchType === 'video_segments' || batchType === 'videos') {
+    return getGlobalVideoConcurrencyLimit(DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT);
+  }
   // 分镜图通常 ≤ 6 张：concurrency 6 会把中转站打到排队 → 后面的请求超时；
   // 3 比 4 慢一点点（5-6 张时差 1-2 张的并行位），但能显著降低中转 429 限流概率。
   // 中转站每分钟总配额是固定的，并发越高越容易撞限流，4 多次实测会触发 bad_response。
-  if (batchType === 'storyboard_images') return 3;
-  if (batchType === 'tail_frame_images') return 3;
-  // 资产图可能有 10+ 张，并发 3 在实测里容易触发中转 429。
+  if (batchType === 'storyboard_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
+  if (batchType === 'tail_frame_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
+  // 资产图也先跟随全局图片上限；后续如需按任务类型细分，再单独加调度策略。
   if (batchType === 'asset_images') {
-    return _envInt('ASSET_IMAGE_BATCH_CONCURRENCY', 2, 1, 6);
+    return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   }
   return 3;
 }
@@ -446,6 +507,19 @@ function _envInt(name: string, fallback: number, min: number, max: number): numb
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function _envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  if (raw == null || raw === '') return fallback;
+  const normalized = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+export function shouldStartInlineBatchRunner() {
+  return _envFlag('BATCH_INLINE_RUNNER', true);
 }
 
 export function registerExecutor(batchType: string, fn: BatchExecutor) {
@@ -475,7 +549,7 @@ export function subscribeBatchEvents(batchId: string, listener: (eventName: Batc
   const handlers: Array<[string, any]> = [];
   const events: BatchEventName[] = [
     'snapshot', 'task_started', 'task_progress', 'task_completed',
-    'task_failed', 'batch_completed', 'batch_cancelled',
+    'task_failed', 'task_cancelled', 'batch_completed', 'batch_cancelled',
   ];
   for (const ev of events) {
     const h = handler(ev);
@@ -505,6 +579,7 @@ function _touchBatchHeartbeat(batchId: string) {
         "UPDATE batches SET runner_id=?, runner_heartbeat_at=? WHERE id=? AND status IN ('queued','running')",
       )
       .run(BATCH_RUNNER_ID, _nowIso(), batchId);
+    heartbeatDurableTasks({ runnerId: BATCH_RUNNER_ID, leaseMs: BATCH_TASK_LEASE_MS });
   } catch (e) {
     console.warn('[batch] heartbeat update failed:', batchId, e);
   }
@@ -526,6 +601,7 @@ export function createBatch(opts: {
   projectId: string;
   targets: BatchTaskTarget[];
   options?: any;
+  beforeStart?: (batchId: string) => void;
 }): { batchId: string; total: number; reused?: boolean; duplicateGroupIdxs?: number[] } {
   const db = getDb();
   const total = opts.targets.length;
@@ -553,25 +629,67 @@ export function createBatch(opts: {
       throw new ActiveVideoBatchConflictError(active.overlapGroupIdxs, active.batchIds, active.label);
     }
 
+    const inlineRunner = shouldStartInlineBatchRunner();
     db.prepare(
       `INSERT INTO batches (id, owner_id, project_id, batch_type, status, total, options_json, runner_id, runner_heartbeat_at)
        VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
-    ).run(batchId, opts.user.id, opts.projectId, opts.batchType, total, optsJson, BATCH_RUNNER_ID, leaseAt);
+    ).run(
+      batchId,
+      opts.user.id,
+      opts.projectId,
+      opts.batchType,
+      total,
+      optsJson,
+      inlineRunner ? BATCH_RUNNER_ID : null,
+      inlineRunner ? leaseAt : null,
+    );
 
     const insertTask = db.prepare(
-      `INSERT INTO batch_tasks (id, batch_id, seq, target_json, status)
-       VALUES (?, ?, ?, ?, 'queued')`,
+      `INSERT INTO batch_tasks (id, batch_id, seq, task_type, target_json, status)
+       VALUES (?, ?, ?, ?, ?, 'queued')`,
     );
     for (let i = 0; i < opts.targets.length; i++) {
       const tid = randomUUID();
-      insertTask.run(tid, batchId, i, JSON.stringify(opts.targets[i]));
+      insertTask.run(tid, batchId, i, opts.batchType, JSON.stringify(opts.targets[i]));
     }
-    shouldStartRunner = true;
+    shouldStartRunner = inlineRunner;
     result = { batchId, total };
     db.exec('COMMIT');
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch {}
     throw e;
+  }
+
+  if (opts.beforeStart && result && !result.reused) {
+    try {
+      opts.beforeStart(batchId);
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      try {
+        db.prepare(
+          `UPDATE batch_tasks
+             SET status='failed',
+                 error_msg=?,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE batch_id=? AND status IN ('queued','running')`,
+        ).run(`batch pre-start failed: ${msg.slice(0, 500)}`, batchId);
+        db.prepare(
+          `UPDATE batches
+             SET status='failed',
+                 failed=total,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id=?`,
+        ).run(batchId);
+        _emit(batchId, 'batch_completed', {
+          batchId,
+          status: 'failed',
+          reason: 'pre-start failed',
+        });
+      } catch (cleanupError) {
+        console.error('[batch]', batchId, 'pre-start cleanup failed:', cleanupError);
+      }
+      throw e;
+    }
   }
 
   // 后台启动（不 await，立即返回 batchId）
@@ -609,56 +727,38 @@ export function createBatch(opts: {
  * 启动时调用一次：把上次进程退出时仍处于 queued/running 的 batch 全部标 failed，
  * 并把它们还在 running 的 task 做一次退款尝试，避免用户积分被永久吞掉。
  *
- * 注意：这是一次"兜底清理"，不尝试续跑——续跑需要重建 setImmediate 上下文、
- * 重新订阅 SSE，比本 app 的范围大得多；标 failed + 退款让用户手动重试更稳。
+ * 注意：这是旧兜底清理路径，只处理没有 runner heartbeat 的历史遗留数据。
+ * 生产环境优先使用 recovery worker 的 lease 回收路径。
+ * 已进入 running 的任务不自动失败/退款，而是进入 needs_review，避免上游已执行但本地误退。
  *
- * 租约窗口：只回收 heartbeat 已过期的 batch。Next dev 下不同 route 可能有
- * 独立 globalThis，不能用"本 route 启动时间"判断孤儿；runner_heartbeat_at
- * 是跨 route / 跨进程共享在 DB 里的权威依据。
- *
- * 旧数据没有 runner_heartbeat_at 时走保守宽限，只清理创建时间已经明显过旧的
- * queued/running batch，避免迁移瞬间误杀正在跑的任务。
+ * 旧数据没有 runner_heartbeat_at 时走 1 小时保守宽限，避免和 recovery worker 抢占同一批任务。
  */
 export function reapOrphanBatches() {
   const db = getDb();
   try {
-    const staleHeartbeatBefore = _isoAgo(BATCH_HEARTBEAT_TIMEOUT_MS);
     const legacyCreatedBefore = _isoAgo(LEGACY_ORPHAN_GRACE_MS);
     const orphanBatches = db
-      .prepare<[string, string], any>(
+      .prepare<[string], any>(
         `SELECT id, owner_id, project_id, batch_type, created_at
          FROM batches
          WHERE status IN ('queued','running')
-           AND (
-             (runner_heartbeat_at IS NOT NULL AND runner_heartbeat_at <> '' AND runner_heartbeat_at < ?)
-             OR ((runner_heartbeat_at IS NULL OR runner_heartbeat_at = '') AND created_at < ?)
-           )`,
+           AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at = '')
+           AND created_at < ?`,
       )
-      .all(staleHeartbeatBefore, legacyCreatedBefore);
+      .all(legacyCreatedBefore);
     if (!orphanBatches.length) return;
-    console.warn(`[batch] reap: 发现 ${orphanBatches.length} 个 heartbeat 过期的孤儿 batch，标记 failed 并退款`);
+    console.warn(`[batch] reap: 发现 ${orphanBatches.length} 个 heartbeat 过期的孤儿 batch，转入可审计恢复状态`);
     for (const b of orphanBatches) {
-      // 退款还在 running 的 task
       const runningTasks = db
         .prepare<{ bid: string }, any>(
           "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
         )
         .all({ bid: b.id });
-      const cost = costForBatchType(b.batch_type);
-      if (cost > 0 && runningTasks.length) {
-        for (const t of runningTasks) {
-          try {
-            refundCredits({
-              userId: b.owner_id,
-              amount: cost,
-              reason: `orphan batch reap:${b.batch_type}`,
-              refId: t.id,
-            });
-          } catch (e) {
-            console.error('[batch] reap refund failed for task', t.id, e);
-          }
-        }
-      }
+      const queuedTasks = db
+        .prepare<{ bid: string }, any>(
+          "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'queued'",
+        )
+        .all({ bid: b.id });
 
       if ((b.batch_type === 'video_segments' || b.batch_type === 'videos') && b.project_id) {
         const staleVideoTasks = db
@@ -686,21 +786,343 @@ export function reapOrphanBatches() {
         }
       }
 
+      for (const t of queuedTasks) {
+        try {
+          transitionTaskStatus({
+            taskId: String(t.id),
+            from: 'queued',
+            to: 'cancelled',
+            reason: 'orphaned before worker claim',
+            actor: 'worker',
+            runnerId: BATCH_RUNNER_ID,
+          });
+        } catch (e) {
+          console.error('[batch] reap queued cancel transition failed:', b.id, t.id, e);
+        }
+      }
       db.prepare(
-        "UPDATE batch_tasks SET status='failed', error_msg='orphaned by server restart', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE batch_id=? AND status IN ('queued','running')",
-      ).run(b.id);
+        `UPDATE batch_tasks
+            SET runner_id=NULL,
+                lease_expires_at=NULL,
+                heartbeat_at=NULL,
+                error_msg='orphaned by server restart; provider state requires review',
+                updated_at=?
+          WHERE batch_id=? AND status='running'`,
+      ).run(_nowIso(), b.id);
+      for (const t of runningTasks) {
+        try {
+          transitionTaskStatus({
+            taskId: String(t.id),
+            from: 'running',
+            to: 'needs_review',
+            reason: `orphaned by server restart:${b.batch_type}`,
+            actor: 'worker',
+            runnerId: BATCH_RUNNER_ID,
+          });
+        } catch (e) {
+          console.error('[batch] reap running needs_review transition failed:', b.id, t.id, e);
+        }
+      }
       db.prepare(
         `UPDATE batches
-         SET status='failed',
+         SET status=?,
              succeeded=(SELECT COUNT(*) FROM batch_tasks WHERE batch_id=? AND status='completed'),
              failed=(SELECT COUNT(*) FROM batch_tasks WHERE batch_id=? AND status='failed'),
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id=?`,
-      ).run(b.id, b.id, b.id);
+      ).run(runningTasks.length ? 'running' : 'cancelled', b.id, b.id, b.id);
     }
   } catch (e) {
     console.error('[batch] reap orphan failed:', e);
   }
+}
+
+const recoveringBatchIds = new Set<string>();
+
+function isBatchLeaseStale(row: any, staleHeartbeatBefore: string, legacyCreatedBefore: string) {
+  const heartbeat = String(row?.runner_heartbeat_at || '');
+  if (heartbeat) return heartbeat < staleHeartbeatBefore;
+  const runnerId = String(row?.runner_id || '');
+  if (!runnerId) return true;
+  const createdAt = String(row?.created_at || '');
+  return !createdAt || createdAt < legacyCreatedBefore;
+}
+
+function claimBatchForRecovery(batchId: string) {
+  const db = getDb();
+  const staleHeartbeatBefore = _isoAgo(BATCH_HEARTBEAT_TIMEOUT_MS);
+  const legacyCreatedBefore = _isoAgo(LEGACY_ORPHAN_GRACE_MS);
+  const now = _nowIso();
+  let claimed: any | null = null;
+  let interruptedTaskIds: string[] = [];
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const row = db.prepare<{ id: string }, any>('SELECT * FROM batches WHERE id = @id').get({ id: batchId });
+    if (!row || !['queued', 'running'].includes(String(row.status || ''))) {
+      db.exec('COMMIT');
+      return null;
+    }
+    if (!isBatchLeaseStale(row, staleHeartbeatBefore, legacyCreatedBefore)) {
+      db.exec('COMMIT');
+      return null;
+    }
+
+    const runningTasks = db
+      .prepare<{ bid: string }, any>(
+        "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
+      )
+      .all({ bid: batchId });
+    interruptedTaskIds = runningTasks.map((task: any) => String(task.id)).filter(Boolean);
+    if (interruptedTaskIds.length) {
+      db.prepare(
+        `UPDATE batch_tasks
+            SET runner_id=NULL,
+                lease_expires_at=NULL,
+                heartbeat_at=NULL,
+                error_msg='interrupted by worker recovery; provider state requires review',
+                updated_at=?
+          WHERE batch_id=? AND status='running'`,
+      ).run(now, batchId);
+    }
+
+    const counters = db
+      .prepare<{ bid: string }, any>(
+        `SELECT
+           SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS succeeded,
+           SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+         FROM batch_tasks
+         WHERE batch_id = @bid`,
+      )
+      .get({ bid: batchId }) || { succeeded: 0, failed: 0 };
+
+    db.prepare(
+      `UPDATE batches
+          SET status='queued',
+              runner_id=?,
+              runner_heartbeat_at=?,
+              succeeded=?,
+              failed=?,
+              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id=?`,
+    ).run(
+      BATCH_RUNNER_ID,
+      now,
+      Number(counters.succeeded || 0),
+      Number(counters.failed || 0),
+      batchId,
+    );
+
+    claimed = { ...row, interruptedTaskIds };
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw e;
+  }
+
+  for (const taskId of interruptedTaskIds) {
+    try {
+      transitionTaskStatus({
+        taskId,
+        from: 'running',
+        to: 'needs_review',
+        reason: `worker recovery requires provider reconciliation:${claimed.batch_type}`,
+        actor: 'worker',
+        runnerId: BATCH_RUNNER_ID,
+        meta: { batchId },
+      });
+    } catch (e) {
+      console.error('[batch] recovery needs_review transition failed:', batchId, taskId, e);
+    }
+  }
+
+  return claimed;
+}
+
+export function recoverStaleBatches(limit = 8) {
+  const db = getDb();
+  try {
+    releaseExpiredTaskLeases();
+    moveReleasedExpiredTasksToNeedsReview();
+  } catch (e) {
+    console.error('[batch] task lease recovery failed:', e);
+  }
+  const staleHeartbeatBefore = _isoAgo(BATCH_HEARTBEAT_TIMEOUT_MS);
+  const legacyCreatedBefore = _isoAgo(LEGACY_ORPHAN_GRACE_MS);
+  const rows = db
+    .prepare<{ stale: string; legacy: string; limit: number }, any>(
+      `SELECT *
+         FROM batches
+        WHERE status IN ('queued','running')
+          AND (
+            runner_id IS NULL
+            OR runner_id = ''
+            OR (runner_heartbeat_at IS NOT NULL AND runner_heartbeat_at <> '' AND runner_heartbeat_at < @stale)
+            OR ((runner_heartbeat_at IS NULL OR runner_heartbeat_at = '') AND created_at < @legacy)
+          )
+        ORDER BY created_at ASC
+        LIMIT @limit`,
+    )
+    .all({
+      stale: staleHeartbeatBefore,
+      legacy: legacyCreatedBefore,
+      limit: Math.max(1, Math.min(50, Math.floor(limit || 8))),
+    });
+
+  let started = 0;
+  for (const row of rows) {
+    const batchId = String(row.id || '');
+    if (!batchId || recoveringBatchIds.has(batchId)) continue;
+
+    let claimed: any | null = null;
+    try {
+      claimed = claimBatchForRecovery(batchId);
+    } catch (e) {
+      console.error('[batch] recovery claim failed:', batchId, e);
+      continue;
+    }
+    if (!claimed) continue;
+
+    const user = db
+      .prepare<{ id: number }, UserRow>('SELECT * FROM users WHERE id = @id')
+      .get({ id: Number(claimed.owner_id) });
+    if (!user) {
+      console.warn('[batch] recovery skipped, missing user:', batchId, claimed.owner_id);
+      continue;
+    }
+
+    let options: any = {};
+    try { options = JSON.parse(String(claimed.options_json || '{}')); } catch {}
+    recoveringBatchIds.add(batchId);
+    started++;
+    setImmediate(() => {
+      runBatch({
+        user,
+        batchId,
+        batchType: String(claimed.batch_type || ''),
+        projectId: String(claimed.project_id || ''),
+        options,
+      })
+        .catch((e) => console.error('[batch] recovered runner fatal:', batchId, e))
+        .finally(() => recoveringBatchIds.delete(batchId));
+    });
+  }
+
+  if (started) console.warn(`[batch] recovery: claimed ${started} stale/queued batch(es)`);
+  return started;
+}
+
+function moveReleasedExpiredTasksToNeedsReview(limit = 100) {
+  const db = getDb();
+  const now = _nowIso();
+  const rows = db
+    .prepare<{ now: string; limit: number }, any>(
+      `SELECT bt.id, bt.status, bt.batch_id, b.batch_type
+         FROM batch_tasks bt
+         JOIN batches b ON b.id = bt.batch_id
+        WHERE bt.status IN ('running', 'upstream_pending')
+          AND (bt.runner_id IS NULL OR bt.runner_id = '')
+          AND bt.lease_expires_at IS NOT NULL
+          AND bt.lease_expires_at < @now
+        ORDER BY bt.lease_expires_at ASC
+        LIMIT @limit`,
+    )
+    .all({ now, limit: Math.max(1, Math.min(500, Math.floor(limit || 100))) });
+
+  for (const row of rows) {
+    try {
+      transitionTaskStatus({
+        taskId: String(row.id),
+        from: String(row.status) as any,
+        to: 'needs_review',
+        reason: `lease expired; provider state requires review:${row.batch_type || 'batch'}`,
+        actor: 'worker',
+        runnerId: BATCH_RUNNER_ID,
+        meta: { batchId: row.batch_id, previousStatus: row.status },
+      });
+      db.prepare("UPDATE batches SET status='running', updated_at=? WHERE id=? AND status IN ('queued','running')")
+        .run(_nowIso(), row.batch_id);
+    } catch (e) {
+      console.error('[batch] expired task needs_review transition failed:', row.id, e);
+    }
+  }
+  return rows.length;
+}
+
+export function cancelBatchForUser(opts: {
+  batchId: string;
+  ownerId: number;
+  reason?: string;
+}): { cancelled: number; requested: number; ignored: number; snapshot: any | null } {
+  const db = getDb();
+  const batch = db
+    .prepare<{ id: string; ownerId: number }, any>(
+      'SELECT id FROM batches WHERE id = @id AND owner_id = @ownerId',
+    )
+    .get({ id: opts.batchId, ownerId: opts.ownerId });
+  if (!batch) {
+    const err = new Error('batch not found');
+    (err as any).status = 404;
+    throw err;
+  }
+
+  const tasks = db
+    .prepare<{ bid: string }, any>(
+      `SELECT id FROM batch_tasks
+       WHERE batch_id = @bid
+         AND status IN ('queued', 'retry_pending', 'running', 'upstream_pending')`,
+    )
+    .all({ bid: opts.batchId });
+  let cancelled = 0;
+  let requested = 0;
+  let ignored = 0;
+  for (const task of tasks) {
+    const result = requestTaskCancel({
+      taskId: String(task.id),
+      actor: 'user',
+      reason: opts.reason || 'batch cancel requested',
+    });
+    if (result.mode === 'cancelled') cancelled++;
+    else if (result.mode === 'requested') requested++;
+    else ignored++;
+  }
+
+  const final = finalizeBatchFromTasks(opts.batchId);
+  if (final.status === 'cancelled') {
+    _emit(opts.batchId, 'batch_cancelled', {
+      batchId: opts.batchId,
+      status: 'cancelled',
+      cancelled: final.cancelled,
+      total: final.total,
+    });
+  } else {
+    emitSnapshot(opts.batchId);
+  }
+  return {
+    cancelled,
+    requested,
+    ignored,
+    snapshot: getBatchSnapshot(opts.batchId, opts.ownerId),
+  };
+}
+
+export function startBatchRecoveryLoop() {
+  const globalScope = globalThis as any;
+  if (globalScope[BATCH_RECOVERY_LOOP_KEY]) return globalScope[BATCH_RECOVERY_LOOP_KEY] as NodeJS.Timeout;
+
+  const intervalMs = _envInt('BATCH_RECOVERY_INTERVAL_MS', 10_000, 2_000, 10 * 60_000);
+  try { recoverStaleBatches(); } catch (e) { console.error('[batch] initial recovery failed:', e); }
+  const timer = setInterval(() => {
+    try {
+      recoverStaleBatches();
+    } catch (e) {
+      console.error('[batch] periodic recovery failed:', e);
+    }
+  }, intervalMs);
+  timer.unref?.();
+  globalScope[BATCH_RECOVERY_LOOP_KEY] = timer;
+  console.log(`[batch] recovery loop started interval=${intervalMs}ms`);
+  return timer;
 }
 
 export function startBatchOrphanReaper() {
@@ -722,23 +1144,84 @@ export function startBatchOrphanReaper() {
   return timer;
 }
 
-function costForBatchType(batchType: string): number {
-  if (
-    batchType === 'asset_images' ||
-    batchType === 'storyboard_images' ||
-    batchType === 'tail_frame_images'
-  ) {
-    return CREDIT_PRICES.image;
+function isTaskCancelRequested(taskId: string) {
+  const row = getDb()
+    .prepare<{ id: string }, { cancel_requested_at: string | null; status: string }>(
+      'SELECT cancel_requested_at, status FROM batch_tasks WHERE id = @id',
+    )
+    .get({ id: taskId });
+  return Boolean(row?.cancel_requested_at) || row?.status === 'cancelled';
+}
+
+function throwIfTaskCancelRequested(taskId: string) {
+  if (isTaskCancelRequested(taskId)) {
+    throw new BatchTaskCancelledError('task cancelled by request');
   }
-  if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
-  if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
-  return 0;
+}
+
+export function resolveTaskStartTransitionConflict(opts: {
+  taskId: string;
+  runnerId: string;
+  batchId?: string;
+  targetSeq?: number;
+  target?: BatchTaskTarget;
+}) {
+  const db = getDb();
+  let row: { status: string; runner_id: string | null } | undefined;
+  try {
+    row = db
+      .prepare<{ id: string }, { status: string; runner_id: string | null }>(
+        'SELECT status, runner_id FROM batch_tasks WHERE id = @id',
+      )
+      .get({ id: opts.taskId });
+  } catch (e: any) {
+    throw new Error(`task start conflict unreadable: ${opts.taskId}: ${e?.message || String(e)}`);
+  }
+  if (!row) {
+    throw new Error(`task start conflict unreadable: ${opts.taskId}: task not found`);
+  }
+
+  const status = String(row.status || '');
+  if (!Object.prototype.hasOwnProperty.call(TASK_STATUS_TRANSITIONS, status)) {
+    throw new Error(`task start conflict unknown status: ${opts.taskId}: ${status || '(empty)'}`);
+  }
+
+  if (status === 'cancelled') {
+    db.prepare(
+      `UPDATE batch_tasks
+          SET runner_id = NULL,
+              lease_expires_at = NULL,
+              heartbeat_at = NULL,
+              updated_at = ?
+        WHERE id = ? AND status = 'cancelled'`,
+    ).run(_nowIso(), opts.taskId);
+    if (opts.batchId) {
+      _emit(opts.batchId, 'task_cancelled', {
+        taskId: opts.taskId,
+        targetSeq: opts.targetSeq,
+        target: opts.target || {},
+        reason: 'cancelled before start transition',
+      });
+    }
+    return { handled: true as const, mode: 'cancelled' as const };
+  }
+
+  if (
+    ['running', 'upstream_pending', 'completed', 'failed', 'needs_review'].includes(status) &&
+    String(row.runner_id || '') !== opts.runnerId
+  ) {
+    return { handled: true as const, mode: 'lost_race' as const };
+  }
+
+  throw new Error(
+    `task start transition conflict: ${opts.taskId} status=${status} runner_id=${row.runner_id || ''}`,
+  );
 }
 
 /**
  * 真正的执行循环。
  */
-async function runBatch(opts: {
+export async function runBatch(opts: {
   user: UserRow;
   batchId: string;
   batchType: string;
@@ -758,34 +1241,42 @@ async function runBatch(opts: {
   db.prepare(`UPDATE batches SET status='running', runner_id=?, runner_heartbeat_at=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
     .run(BATCH_RUNNER_ID, _nowIso(), opts.batchId);
 
-  // 取所有任务
-  const tasks = db
-    .prepare<{ bid: string }, any>('SELECT * FROM batch_tasks WHERE batch_id = @bid ORDER BY seq ASC')
-    .all({ bid: opts.batchId });
+  const counters = db
+    .prepare<{ bid: string }, { succeeded: number; failed: number }>(
+      `SELECT
+         SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS succeeded,
+         SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+       FROM batch_tasks
+       WHERE batch_id = @bid`,
+    )
+    .get({ bid: opts.batchId }) || { succeeded: 0, failed: 0 };
 
   // 先发 snapshot 给晚订阅的订阅者
   setImmediate(() => emitSnapshot(opts.batchId));
 
-  // 简单 worker pool
-  const queue = [...tasks];
-  let succeeded = 0;
-  let failed = 0;
+  let succeeded = Number(counters.succeeded || 0);
+  let failed = Number(counters.failed || 0);
   let running = 0;
   const concurrency = _concurrencyFor(opts.batchType);
 
   await new Promise<void>((resolveAll) => {
     const tryNext = () => {
-      while (running < concurrency && queue.length) {
-        const t = queue.shift();
+      while (running < concurrency) {
+        const t = claimNextTask({
+          runnerId: BATCH_RUNNER_ID,
+          batchId: opts.batchId,
+          taskTypes: [opts.batchType],
+          statuses: ['queued'],
+          leaseMs: BATCH_TASK_LEASE_MS,
+        });
         if (!t) break;
         running++;
         runOne(t).finally(() => {
           running--;
-          if (queue.length === 0 && running === 0) resolveAll();
-          else tryNext();
+          tryNext();
         });
       }
-      if (queue.length === 0 && running === 0) resolveAll();
+      if (running === 0) resolveAll();
     };
 
     const runOne = async (t: any) => {
@@ -793,26 +1284,71 @@ async function runBatch(opts: {
         try { return JSON.parse(t.target_json || '{}'); } catch { return {}; }
       })();
 
-      db.prepare(`UPDATE batch_tasks SET status='running', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(t.id);
+      try {
+        transitionTaskStatus({
+          taskId: t.id,
+          from: 'queued',
+          to: 'running',
+          reason: `batch:${opts.batchType}:start`,
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+        });
+      } catch (e: any) {
+        try {
+          const resolved = resolveTaskStartTransitionConflict({
+            taskId: t.id,
+            runnerId: BATCH_RUNNER_ID,
+            batchId: opts.batchId,
+            targetSeq: t.seq,
+            target,
+          });
+          if (resolved.handled) return;
+        } catch (resolutionErr) {
+          throw resolutionErr;
+        }
+        throw e;
+      }
       _emit(opts.batchId, 'task_started', { taskId: t.id, targetSeq: t.seq, target });
 
+      if (isTaskCancelRequested(t.id)) {
+        transitionTaskStatus({
+          taskId: t.id,
+          from: 'running',
+          to: 'cancelled',
+          reason: 'cancelled before execution',
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+        });
+        _emit(opts.batchId, 'task_cancelled', { taskId: t.id, targetSeq: t.seq, target });
+        return;
+      }
+
       // 单任务计费（图片/视频每条扣一份）
-      const cost = costPerTask(opts.batchType);
+      const cost = costForBatchType(opts.batchType);
       let chargeId: string | null = null;
       if (cost > 0) {
         try {
-          const r = chargeCredits({
+          const r = chargeTaskLedger({
             userId: opts.user.id,
+            taskId: t.id,
             amount: cost,
-            kind: cost === CREDIT_PRICES.video ? 'video' : 'image',
+            kind: creditKindForBatchType(opts.batchType),
             reason: `batch:${opts.batchType}`,
-            refId: t.id,
           });
           chargeId = r.ledgerId;
         } catch (e: any) {
           const msg = e?.message || String(e);
-          db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
-            .run(msg.slice(0, 1000), t.id);
+          db.prepare(`UPDATE batch_tasks SET error_msg=?, updated_at=? WHERE id=?`)
+            .run(msg.slice(0, 1000), _nowIso(), t.id);
+          transitionTaskStatus({
+            taskId: t.id,
+            from: 'running',
+            to: 'failed',
+            reason: msg.slice(0, 500),
+            actor: 'worker',
+            runnerId: BATCH_RUNNER_ID,
+            meta: { errorCode: e instanceof InsufficientCreditsError ? 'INSUFFICIENT_CREDITS' : undefined },
+          });
           failed++;
           db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
           _emit(opts.batchId, 'task_failed', {
@@ -824,19 +1360,60 @@ async function runBatch(opts: {
       }
 
       try {
+        throwIfTaskCancelRequested(t.id);
         const result = await exec({
           user: opts.user,
           projectId: opts.projectId,
           options: opts.options,
           batchId: opts.batchId,
           taskId: t.id,
+          idempotencyKey: String(t.idempotency_key || `task:${t.id}`),
           seq: t.seq,
           target,
           progress: (payload) => _emit(opts.batchId, 'task_progress', { taskId: t.id, targetSeq: t.seq, ...payload }),
+          isCancelled: () => isTaskCancelRequested(t.id),
+          throwIfCancelled: () => throwIfTaskCancelRequested(t.id),
         });
 
-        db.prepare(`UPDATE batch_tasks SET status='completed', result_json=?, error_msg=NULL, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
-          .run(JSON.stringify(result || {}), t.id);
+        const afterExec = db
+          .prepare<{ id: string }, { status: string }>('SELECT status FROM batch_tasks WHERE id = @id')
+          .get({ id: t.id });
+        if (afterExec?.status === 'upstream_pending') {
+          _emit(opts.batchId, 'task_progress', {
+            taskId: t.id,
+            targetSeq: t.seq,
+            target,
+            stage: 'upstream_pending',
+            hint: '上游任务已提交，等待后台轮询完成',
+            extra: result?.extra,
+          });
+          return;
+        }
+
+        if (opts.batchType === 'storyboard_prompts' || opts.batchType === 'video_prompts') {
+          try {
+            recordTextFlagIfSensitive({
+              ownerId: opts.user.id,
+              projectId: opts.projectId,
+              sourceId: t.id,
+              text: JSON.stringify(result || {}),
+              reasonPrefix: `batch:${opts.batchType}`,
+            });
+          } catch (flagError) {
+            console.warn('[batch] failed to persist content flag:', flagError);
+          }
+        }
+
+        db.prepare(`UPDATE batch_tasks SET result_json=?, error_msg=NULL, updated_at=? WHERE id=?`)
+          .run(JSON.stringify(result || {}), _nowIso(), t.id);
+        transitionTaskStatus({
+          taskId: t.id,
+          from: 'running',
+          to: 'completed',
+          reason: `batch:${opts.batchType}:completed`,
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+        });
         succeeded++;
         db.prepare(`UPDATE batches SET succeeded=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(succeeded, opts.batchId);
 
@@ -850,10 +1427,25 @@ async function runBatch(opts: {
         });
       } catch (e: any) {
         const msg = e?.message || String(e);
+        const wasCancelled = e instanceof BatchTaskCancelledError;
         // 任务失败：把刚预扣的积分退还
         if (cost > 0) {
-          try { refundCredits({ userId: opts.user.id, amount: cost, reason: `refund:${opts.batchType}`, refId: t.id }); }
+          try { refundTaskLedger({ userId: opts.user.id, taskId: t.id, amount: cost, reason: `refund:${opts.batchType}` }); }
           catch (refundErr) { console.error('[batch] refund failed:', opts.batchId, t.id, refundErr); }
+        }
+        if (wasCancelled) {
+          db.prepare(`UPDATE batch_tasks SET error_msg=?, result_json='{}', updated_at=? WHERE id=?`)
+            .run(msg.slice(0, 1000), _nowIso(), t.id);
+          transitionTaskStatus({
+            taskId: t.id,
+            from: 'running',
+            to: 'cancelled',
+            reason: msg.slice(0, 500),
+            actor: 'worker',
+            runnerId: BATCH_RUNNER_ID,
+          });
+          _emit(opts.batchId, 'task_cancelled', { taskId: t.id, targetSeq: t.seq, target, reason: msg });
+          return;
         }
         const cleanupExtra = _clearFailedStoryboardImageState({
           batchType: opts.batchType,
@@ -889,16 +1481,41 @@ async function runBatch(opts: {
           target,
           message: msg,
         });
-        const failureResult = e?.imageSafetyAudit
-          ? JSON.stringify({ imageSafetyAudit: e.imageSafetyAudit })
+        const shotPlanCleanupExtra = _markFailedShotPlanState({
+          batchType: opts.batchType,
+          batchId: opts.batchId,
+          projectId: opts.projectId,
+          user: opts.user,
+          message: msg,
+        });
+        const failureStage = typeof e?.failureStage === 'string' ? e.failureStage : undefined;
+        const errorCode = typeof e?.errorCode === 'string' ? e.errorCode : undefined;
+        const failureResultPayload: Record<string, any> = {};
+        if (failureStage) failureResultPayload.failureStage = failureStage;
+        if (errorCode) failureResultPayload.errorCode = errorCode;
+        if (e?.imageSafetyAudit) failureResultPayload.imageSafetyAudit = e.imageSafetyAudit;
+        const failureResult = Object.keys(failureResultPayload).length
+          ? JSON.stringify(failureResultPayload)
           : '{}';
-        db.prepare(`UPDATE batch_tasks SET status='failed', error_msg=?, result_json=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`)
-          .run(msg.slice(0, 1000), failureResult, t.id);
+        db.prepare(`UPDATE batch_tasks SET error_msg=?, result_json=?, updated_at=? WHERE id=?`)
+          .run(msg.slice(0, 1000), failureResult, _nowIso(), t.id);
+        transitionTaskStatus({
+          taskId: t.id,
+          from: 'running',
+          to: 'failed',
+          reason: msg.slice(0, 500),
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+          meta: {
+            failureStage,
+            errorCode,
+          },
+        });
         failed++;
         db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
-        const failureStage = typeof e?.failureStage === 'string' ? e.failureStage : undefined;
-        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
+        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || shotPlanCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
         if (extra && failureStage) (extra as any).failureStage = failureStage;
+        if (extra && errorCode) (extra as any).errorCode = errorCode;
         if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
         _emit(opts.batchId, 'task_failed', {
           taskId: t.id,
@@ -907,41 +1524,60 @@ async function runBatch(opts: {
           errorMsg: msg,
           reason: msg,
           failureStage,
+          errorCode,
           extra,
         });
       }
     };
 
-    function costPerTask(batchType: string): number {
-      if (
-        batchType === 'asset_images' ||
-        batchType === 'storyboard_images' ||
-        batchType === 'tail_frame_images'
-      ) {
-        return CREDIT_PRICES.image;
-      }
-      if (batchType === 'video_segments' || batchType === 'videos') return CREDIT_PRICES.video;
-      if (batchType === 'storyboard_prompts' || batchType === 'video_prompts') return CREDIT_PRICES.text;
-      return 0;
-    }
-
     tryNext();
   });
 
-  const finalStatus = failed === 0
-    ? 'completed'
-    : succeeded === 0
-      ? 'failed'
-      : failed > succeeded
-        ? 'failed'
-        : 'partial';
-  db.prepare(`UPDATE batches SET status=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(finalStatus, opts.batchId);
+  const finalCounts = db
+    .prepare<{ bid: string }, any>(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+         SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+         SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+         SUM(CASE WHEN status='needs_review' THEN 1 ELSE 0 END) AS needs_review,
+         SUM(CASE WHEN status IN ('queued','running','retry_pending','upstream_pending') THEN 1 ELSE 0 END) AS active
+       FROM batch_tasks
+       WHERE batch_id = @bid`,
+    )
+    .get({ bid: opts.batchId }) || {};
+  const totalTasks = Number(finalCounts.total || 0);
+  const completedTasks = Number(finalCounts.completed || 0);
+  const failedTasks = Number(finalCounts.failed || 0);
+  const cancelledTasks = Number(finalCounts.cancelled || 0);
+  const needsReviewTasks = Number(finalCounts.needs_review || 0);
+  const activeTasks = Number(finalCounts.active || 0);
+  const finalStatus =
+    needsReviewTasks > 0 || activeTasks > 0
+      ? 'running'
+      : totalTasks > 0 && completedTasks === totalTasks
+        ? 'completed'
+        : totalTasks > 0 && cancelledTasks === totalTasks
+          ? 'cancelled'
+          : totalTasks > 0 && failedTasks === totalTasks
+            ? 'failed'
+            : 'partial';
+  db.prepare(
+    `UPDATE batches
+       SET status=?,
+           succeeded=?,
+           failed=?,
+           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE id=?`,
+  ).run(finalStatus, completedTasks, failedTasks, opts.batchId);
   _emit(opts.batchId, 'batch_completed', {
     batchId: opts.batchId,
     status: finalStatus,
-    succeeded,
-    failed,
-    total: succeeded + failed,
+    succeeded: completedTasks,
+    failed: failedTasks,
+    cancelled: cancelledTasks,
+    needsReview: needsReviewTasks,
+    total: Number(getBatchSnapshot(opts.batchId)?.total || totalTasks),
   });
   // 60 秒后回收 EventEmitter，避免 _emitters map 无限膨胀。
   // 留 60s 是给"stream 路由晚订阅一帧"的用户仍能收到最终事件；超时后即使有订阅也只是静默。

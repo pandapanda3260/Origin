@@ -1,3 +1,6 @@
+import type { VideoSubmitMode } from './feature-flags';
+import type { VideoPayloadDecisionReason, VideoPayloadMode } from './video-payload-decision';
+
 export const VIDEO_REFERENCE_IMAGE_BUDGET = 7;
 export const DEFAULT_SHOT_DURATION_SEC = 4;
 export const DIALOGUE_WARNING_CHARS_PER_SEC = 4.5;
@@ -56,6 +59,11 @@ export type VideoGenerationPlan = {
   projectId: string;
   groupIdx: number;
   shotIndices: number[];
+  submitMode?: VideoSubmitMode;
+  payloadMode?: VideoPayloadMode;
+  modeReason?: VideoPayloadDecisionReason | string;
+  plannedReferenceRoles?: VideoReferenceRole[];
+  planAuditPayloadModeMismatch?: boolean;
   promptAudit: {
     sourcePrompt: {
       source: 'storyboard.videoPrompt' | 'shot.imagePrompt' | 'shot.visual';
@@ -77,6 +85,7 @@ export type VideoGenerationPlan = {
   };
   params: {
     ratio: string;
+    resolution?: string;
     durationSec: number;
     plannedDurationSec?: number;
     subtitles: 'none';

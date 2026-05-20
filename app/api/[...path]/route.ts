@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { appendFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname } from 'node:path';
+import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,7 +27,7 @@ const notImplementedBody = (path: string, audited: boolean) => ({
   data: null,
 });
 
-const auditPath = join(process.cwd(), 'data', 'mock-audit.jsonl');
+const auditPath = dataPath('mock-audit.jsonl');
 const DEFAULT_AUDIT_MAX_BYTES = 1024 * 1024;
 
 function fallbackMode() {
@@ -47,7 +48,7 @@ function shouldWriteAudit(mode: string) {
 
 function writeAudit(req: NextRequest, path: string, url: URL) {
   try {
-    mkdirSync(join(process.cwd(), 'data'), { recursive: true });
+    mkdirSync(dirname(auditPath), { recursive: true });
     if (existsSync(auditPath) && statSync(auditPath).size >= auditMaxBytes()) {
       console.warn('[mock-audit] size cap reached, skip writing:', auditPath);
       return false;

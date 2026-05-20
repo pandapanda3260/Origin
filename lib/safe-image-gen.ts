@@ -10,6 +10,7 @@ import {
   type RewriteDiff,
   type ViolationCategory,
 } from './content-sanitize';
+import { recordContentFlag } from './content-flags';
 
 export type ImageGenerationSafetyAudit = {
   correlationId: string;
@@ -160,9 +161,9 @@ function persistImageGenerationAudit(
       `INSERT INTO image_generation_audits (
         correlation_id, owner_id, project_id, asset_ref, kind, generated_image_id,
         moderation_recovered, original_prompt, final_submitted_prompt, final_composed_prompt, attempts_json,
-        safety_violations_json, updated_at
+        safety_violations_json, metadata_json, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       ON CONFLICT(correlation_id) DO UPDATE SET
         generated_image_id=excluded.generated_image_id,
         moderation_recovered=excluded.moderation_recovered,
@@ -170,6 +171,7 @@ function persistImageGenerationAudit(
         final_composed_prompt=excluded.final_composed_prompt,
         attempts_json=excluded.attempts_json,
         safety_violations_json=excluded.safety_violations_json,
+        metadata_json=excluded.metadata_json,
         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
     ).run(
       audit.correlationId,
@@ -184,6 +186,7 @@ function persistImageGenerationAudit(
       audit.finalComposedPrompt || '',
       JSON.stringify(audit.attempts || []),
       JSON.stringify(auditSafetyViolations(audit)),
+      JSON.stringify(input.imageAuditMetadata || {}),
     );
   } catch (error) {
     console.warn('[safe-image-gen] failed to persist image generation audit:', error);
@@ -238,6 +241,21 @@ export async function generateImageWithModerationRecovery(
       };
     } catch (e: any) {
       const info = extractImageModerationError(e, { preflight: audit.preflight });
+      if (info.blocked) {
+        try {
+          recordContentFlag({
+            ownerId: user.id,
+            projectId: input.projectId || null,
+            sourceType: 'image',
+            sourceId: audit.correlationId,
+            rawExcerpt: submittedPrompt,
+            scanReason: `image_moderation:${(info.safetyViolations || ['unknown']).join(',')}`,
+            severity: 'high',
+          });
+        } catch (flagError) {
+          console.warn('[safe-image-gen] failed to persist content flag:', flagError);
+        }
+      }
       audit.attempts.push({
         attempt: attempt as 0 | 1 | 2,
         submittedPrompt,

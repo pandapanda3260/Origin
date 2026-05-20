@@ -44,6 +44,161 @@ function _isStale(key) { return _ctx.isStale ? _ctx.isStale(key) : false; }
 function agentInsertRef(type, label, data) { if (_ctx.agentInsertRef) _ctx.agentInsertRef(type, label, data); }
 function emotionBadgeHtml(emotion, intensity) { return _ctx.emotionBadgeHtml ? _ctx.emotionBadgeHtml(emotion, intensity) : ''; }
 
+function _applyShotPlanServerProjectSnapshot(proj, snap) {
+  if (!proj || !snap) return;
+  [
+    "shots",
+    "shotsApproved",
+    "storyboards",
+    "videoTasks",
+    "currentStep",
+    "frameWorkflowSchemaVersion",
+    "_staleFlags",
+    "shotPlanStatus",
+    "shotPlanSourceHash",
+    "shotPlanSourceSnapshot",
+    "shotPlanStaleReasons",
+    "shotPlanStaleAt",
+    "shotPlanGeneratedAt",
+    "shotPlanLastBatchId",
+    "shotPlanBatchId",
+    "shotPlanLastError",
+    "shotPlanFailedAt",
+    "shotPlanLastConfirmedAt",
+    "shotPlanLastConfirmedHash",
+    "shotsManuallyEditedAt",
+    "legacyShotPlanArchive",
+  ].forEach(function (key) {
+    if (Object.prototype.hasOwnProperty.call(snap, key)) proj[key] = snap[key];
+  });
+}
+
+function _shotPlanStatusLabel(status) {
+  if (status === "generating") return "生成中";
+  if (status === "failed") return "生成失败";
+  if (status === "stale") return "上游已变化";
+  if (status === "legacy_unknown") return "旧版镜头计划";
+  if (status === "ready") return "已就绪";
+  return "";
+}
+
+function _shotPlanReasonLabel(reason) {
+  var map = {
+    script_changed: "剧本",
+    style_bible_changed: "风格圣经",
+    assets_changed: "资产库",
+    duration_changed: "时长",
+    emotion_changed: "情绪节奏",
+    upstream_changed_during_generation: "生成中上游变化",
+    manual_shot_edit: "手动编辑",
+    unknown: "未知变化",
+  };
+  return map[reason] || reason || "上游变化";
+}
+
+function _getShotPlanActionState() {
+  var hasShots = !!(project && Array.isArray(project.shots) && project.shots.length);
+  var status = (project && project.shotPlanStatus) || "";
+  var hasShotPlanFlag = !!(project && project._staleFlags && project._staleFlags.shotPlan);
+  var reasons = project && Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
+  var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
+
+  if (!project || !project.assetsApproved) {
+    return {
+      label: "生成镜头计划",
+      disabled: true,
+      hint: "请先完成资产库确认",
+    };
+  }
+  if (status === "generating") {
+    return {
+      label: "镜头计划生成中…",
+      disabled: true,
+      hint: "后台正在生成镜头计划，请稍候。",
+    };
+  }
+  if (status === "failed") {
+    return {
+      label: "重新生成镜头计划",
+      disabled: false,
+      hint: project.shotPlanLastError ? ("上次生成失败：" + String(project.shotPlanLastError).slice(0, 60)) : "上次生成失败，请重新生成。",
+    };
+  }
+  if (status === "stale" || (hasShots && hasShotPlanFlag)) {
+    return {
+      label: "重新生成镜头计划",
+      disabled: false,
+      hint: reasonText || "剧本/风格/资产已变化，建议重新生成镜头计划。",
+    };
+  }
+  if (status === "legacy_unknown") {
+    return {
+      label: "重新生成镜头计划",
+      disabled: false,
+      hint: "旧版镜头计划，建议确认仍可用或重新生成。",
+    };
+  }
+  if (hasShots) {
+    return {
+      label: "重新生成镜头计划",
+      disabled: false,
+      hint: "当前已有镜头计划，重新生成会更新镜头表。",
+    };
+  }
+  return {
+    label: "生成镜头计划",
+    disabled: false,
+    hint: "根据剧本、风格和资产生成镜头计划。",
+  };
+}
+
+function _shotPlanActionIcon(label) {
+  var s = String(label || "");
+  if (s.indexOf("生成中") !== -1) return "progress_activity";
+  if (s.indexOf("重新生成") !== -1) return "refresh";
+  return "movie_filter";
+}
+
+function _refreshShotPlanActionState(override) {
+  var btn = $("btnGenShots");
+  var hint = $("shotsHint");
+  var state = override || _getShotPlanActionState();
+  if (btn) {
+    var iconName = _shotPlanActionIcon(state.label);
+    btn.innerHTML =
+      '<span class="material-symbols-outlined text-sm">' + iconName + '</span>' +
+      '<span>' + escapeHtml(state.label || "") + '</span>';
+    btn.disabled = !!state.disabled;
+  }
+  if (hint) hint.textContent = state.hint || "";
+}
+
+async function confirmShotPlanStillValid() {
+  _syncRefs();
+  if (!project || !project.id) return;
+  try {
+    var p = await apiPost("/api/projects/" + encodeURIComponent(project.id) + "/shot-plan/confirm", {});
+    _safeWriteBack(project.id, function (proj) {
+      _applyShotPlanServerProjectSnapshot(proj, p);
+    });
+    showToast("已确认当前镜头计划仍可用", "success");
+    _refreshShotPlanActionState();
+    renderShotList();
+  } catch (e) {
+    var msg = ((e && e.message) || e || "确认失败").toString();
+    showToast("确认镜头计划失败：" + _diagnoseApiError(msg), "error");
+  }
+}
+
+function _scrollToStoryboardWorkbench() {
+  window.setTimeout(function () {
+    var target = document.querySelector(".shots-storyboard-shell") || $("imagesReady");
+    if (target && target.scrollIntoView) {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, 80);
+}
+
 function _hasMeaningfulValue(value) {
   if (value == null) return false;
   if (Array.isArray(value)) return value.some(_hasMeaningfulValue);
@@ -259,11 +414,13 @@ export function refreshShotsPage() {
     if (wrap) wrap.innerHTML = "";
     var ca = $("shotsConfirmArea");
     if (ca) ca.hidden = true;
+    _refreshShotPlanActionState();
     return;
   }
   needScript.hidden = true;
   ready.hidden = false;
   if (topActions) topActions.hidden = false;
+  _refreshShotPlanActionState();
   renderShotList();
 }
 
@@ -290,7 +447,39 @@ export function renderShotList() {
     var emptySummaryMeta = $("shotSummaryMeta");
     if (emptySummaryMeta) emptySummaryMeta.textContent = "";
     var ca = $("shotsConfirmArea"); if (ca) ca.hidden = true;
+    _refreshShotPlanActionState();
     return;
+  }
+  _refreshShotPlanActionState();
+
+  var shotPlanStatus = project.shotPlanStatus || "";
+  var shotPlanNeedsAttention = shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown" || shotPlanStatus === "generating" || shotPlanStatus === "failed" || (project._staleFlags && project._staleFlags.shotPlan);
+  if (shotPlanNeedsAttention) {
+    var spb = document.createElement("div");
+    spb.className = "upstream-stale-banner mx-8";
+    var reasons = Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
+    var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
+    var message = "";
+    if (shotPlanStatus === "generating") {
+      message = "镜头计划正在重新生成，请等待完成后再进入下游生成。";
+    } else if (shotPlanStatus === "failed") {
+      message = "镜头计划生成失败，请重新生成。";
+    } else if (shotPlanStatus === "legacy_unknown") {
+      message = "当前镜头计划来自旧版本，建议校验后继续或重新生成。";
+    } else {
+      message = "剧本/风格/资产已变化，当前镜头计划可能不是最新版本。";
+    }
+    spb.innerHTML =
+      '<span class="material-symbols-outlined">warning</span>' +
+      '<div class="flex-1 min-w-0">' +
+        '<div class="font-semibold">' + escapeHtml(_shotPlanStatusLabel(shotPlanStatus) || "镜头计划需校验") + '</div>' +
+        '<div class="text-xs opacity-75">' + escapeHtml(message + (reasonText ? " " + reasonText : "")) + '</div>' +
+      '</div>' +
+      '<div class="flex gap-2 ml-auto">' +
+        ((shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown") ? '<button type="button" class="pill-btn" data-action="confirm-shot-plan-valid">确认仍可用</button>' : '') +
+        ((shotPlanStatus !== "generating") ? '<button type="button" class="pill-btn primary" data-action="regen-shot-plan">重新生成镜头计划</button>' : '') +
+      '</div>';
+    wrap.appendChild(spb);
   }
 
   var hasShotStale = project.shots.some(function (_, si) { return _isStale("shot_" + si); });
@@ -308,50 +497,66 @@ export function renderShotList() {
 
   project.shots.forEach(function (shot, idx) {
     var card = document.createElement("div");
-    card.className = "sc-card group bg-surface-container-lowest/40 backdrop-blur-xl p-6 rounded-xl border border-white/30 hover:bg-surface-container-lowest/70 transition-all duration-300 hover:shadow-lg";
+    card.className = "sc-card shot-workbench-card group";
     card.dataset.shotIdx = idx;
 
     card.innerHTML =
-      '<div class="flex items-center justify-between mb-4">' +
-        '<div class="flex items-center gap-3">' +
-          '<span class="text-2xl font-thin text-primary-dim/50">' + String(idx+1).padStart(2,'0') + '</span>' +
-          '<span class="bg-surface-container-highest px-3 py-1 rounded-lg text-[10px] font-bold text-on-tertiary-container">' + (shot.duration||4) + 's</span>' +
-          (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
+      '<div class="shot-card-form-pane">' +
+        '<div class="shot-card-head">' +
+          '<div class="shot-card-title">' +
+            '<span class="shot-card-index">' + String(idx+1).padStart(2,'0') + '</span>' +
+            '<span class="shot-card-duration">' + (shot.duration||4) + 's</span>' +
+            (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
+          '</div>' +
+          '<div class="shot-card-actions">' +
+            '<button type="button" class="shot-icon-btn" data-action="ref-agent" title="引用到 AI 助手">' +
+              '<span class="material-symbols-outlined">alternate_email</span>' +
+            '</button>' +
+            '<button type="button" class="shot-icon-btn is-danger" data-action="delete-shot" title="删除镜头">' +
+              '<span class="material-symbols-outlined">delete_outline</span>' +
+            '</button>' +
+          '</div>' +
         '</div>' +
-        '<button type="button" class="w-8 h-8 flex items-center justify-center rounded-full hover:bg-primary/10 transition-colors" data-action="ref-agent" title="引用到 AI 助手">' +
-          '<span class="material-symbols-outlined text-sm text-[#90A4AE] hover:text-primary">alternate_email</span>' +
-        '</button>' +
-        '<button type="button" class="w-8 h-8 flex items-center justify-center rounded-full hover:bg-red-500/10 transition-colors" data-action="delete-shot" title="删除镜头">' +
-          '<span class="material-symbols-outlined text-sm text-[#90A4AE] hover:text-red-500">delete_outline</span>' +
-        '</button>' +
-      '</div>' +
-      '<div class="grid grid-cols-2 gap-3 mb-4">' +
-        '<div>' +
-          '<label class="text-[10px] font-bold text-[#90A4AE] uppercase tracking-widest mb-1 block">景别</label>' +
-          '<select class="shot-field w-full bg-surface-container-highest/60 text-xs font-bold text-on-surface rounded-lg px-3 py-2 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none cursor-pointer" data-field="shotType">' +
-            _buildSelectOptions(SHOT_TYPES, shot.shotType || "") +
-          '</select>' +
+        '<div class="shot-form-grid">' +
+          '<div>' +
+            '<label class="shot-field-label">景别</label>' +
+            '<select class="shot-field shot-select" data-field="shotType">' +
+              _buildSelectOptions(SHOT_TYPES, shot.shotType || "") +
+            '</select>' +
+          '</div>' +
+          '<div>' +
+            '<label class="shot-field-label">运镜</label>' +
+            '<select class="shot-field shot-select" data-field="camera">' +
+              _buildSelectOptions(CAMERA_MOVES, shot.camera || "") +
+            '</select>' +
+          '</div>' +
         '</div>' +
-        '<div>' +
-          '<label class="text-[10px] font-bold text-[#90A4AE] uppercase tracking-widest mb-1 block">运镜</label>' +
-          '<select class="shot-field w-full bg-surface-container-highest/60 text-xs font-bold text-on-surface rounded-lg px-3 py-2 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none cursor-pointer" data-field="camera">' +
-            _buildSelectOptions(CAMERA_MOVES, shot.camera || "") +
-          '</select>' +
+        '<div class="shot-field-block">' +
+          '<label class="shot-field-label">画面描述</label>' +
+          '<textarea class="shot-field shot-textarea" data-field="visual" rows="4" placeholder="画面内容">' + escapeHtml(shot.visual||"") + '</textarea>' +
         '</div>' +
+        '<div class="shot-field-block">' +
+          '<label class="shot-field-label">对白/旁白</label>' +
+          '<textarea class="shot-field shot-textarea" data-field="dialogue" rows="2" placeholder="对白或旁白">' + escapeHtml(shot.dialogue||"") + '</textarea>' +
+        '</div>' +
+        '<div class="shot-field-block shot-keyinfo-block">' +
+          '<label class="shot-field-label shot-keyinfo-label"><span class="material-symbols-outlined">key</span><span>关键信息</span></label>' +
+          '<div class="shot-keyinfo-shell">' +
+            '<span class="material-symbols-outlined">sell</span>' +
+            '<input type="text" class="shot-field shot-input shot-keyinfo-input" data-field="keyInfo" value="' + escapeHtml(shot.keyInfo||"") + '" placeholder="情绪 / 道具 / 场景线索" />' +
+          '</div>' +
+        '</div>' +
+        '<div class="shot-material-slot" id="shotMaterialSlot_' + idx + '" data-shot-idx="' + idx + '">' +
+          '<div class="shot-material-slot-empty">确认镜头表后显示生成素材区</div>' +
+        '</div>' +
+        '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />' +
       '</div>' +
-      '<div class="mb-3">' +
-        '<label class="text-[10px] font-bold text-[#90A4AE] uppercase tracking-widest mb-1 block">画面描述</label>' +
-        '<textarea class="shot-field w-full bg-transparent text-sm font-light text-on-surface rounded-lg px-3 py-2 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none resize-none leading-relaxed transition-colors hover:border-primary/20" data-field="visual" rows="3" placeholder="画面内容">' + escapeHtml(shot.visual||"") + '</textarea>' +
-      '</div>' +
-      '<div class="mb-3">' +
-        '<label class="text-[10px] font-bold text-[#90A4AE] uppercase tracking-widest mb-1 block">对白/旁白</label>' +
-        '<textarea class="shot-field w-full bg-transparent text-sm font-light text-on-surface rounded-lg px-3 py-2 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none resize-none leading-relaxed transition-colors hover:border-primary/20" data-field="dialogue" rows="2" placeholder="对白或旁白">' + escapeHtml(shot.dialogue||"") + '</textarea>' +
-      '</div>' +
-      '<div class="mb-3">' +
-        '<label class="text-[10px] font-bold text-[#90A4AE] uppercase tracking-widest mb-1 block">关键信息</label>' +
-        '<input type="text" class="shot-field w-full bg-transparent text-sm font-light text-on-surface rounded-lg px-3 py-2 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none" data-field="keyInfo" value="' + escapeHtml(shot.keyInfo||"") + '" placeholder="情绪/道具/特效等" />' +
-      '</div>' +
-      '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />';
+      '<aside class="shot-storyboard-slot" id="shotStoryboardSlot_' + idx + '" data-shot-idx="' + idx + '" data-group-idx="' + idx + '">' +
+        '<div class="shot-storyboard-slot-empty">' +
+          '<span class="material-symbols-outlined">image</span>' +
+          '<p>分镜首尾帧将在这里显示</p>' +
+        '</div>' +
+      '</aside>';
     wrap.appendChild(card);
   });
 
@@ -527,7 +732,11 @@ export async function generateShots(opts) {
 
   var originId = project.id;
   var btn = $("btnGenShots");
-  if (btn) btn.disabled = true;
+  _refreshShotPlanActionState({
+    label: "镜头计划生成中…",
+    disabled: true,
+    hint: existingBatchId ? "正在重新连接镜头计划生成任务。" : "后台正在生成镜头计划，请稍候。",
+  });
   _setShotsProgress(5, "AI 正在分析剧本与资产…", "准备生成完整镜头表，请稍候");
   var _progressBar = $("shotsGenProgress");
   if (_progressBar) _progressBar.classList.add("extract-bar-pulse");
@@ -556,7 +765,7 @@ export async function generateShots(opts) {
       var errTextStart = ((e && e.message) || e).toString().slice(0, 150);
       _setShotsProgress(0, "镜头设计失败", errTextStart);
       showToast("镜头设计启动失败：" + _diagnoseApiError(errTextStart), "error");
-      if (btn) btn.disabled = false;
+      _refreshShotPlanActionState();
       return;
     }
   } else {
@@ -571,7 +780,7 @@ export async function generateShots(opts) {
     finished = true;
     _stopPoll();
     if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
-    if (btn) btn.disabled = false;
+    _refreshShotPlanActionState();
   }
 
   // 兜底轮询：每 5 秒主动 GET /api/batch/<id> 拿权威状态。
@@ -591,17 +800,7 @@ export async function generateShots(opts) {
           if (resp.ok) {
             var p = await resp.json();
             if (p && p.id === originId && Array.isArray(p.shots)) {
-              _safeWriteBack(originId, function (proj) {
-                proj.shots = p.shots;
-                proj.shotsApproved = !!p.shotsApproved;
-                if (proj._staleFlags) {
-                  Object.keys(proj._staleFlags).forEach(function (k) {
-                    if (k.indexOf("shot_") === 0 || k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
-                      delete proj._staleFlags[k];
-                    }
-                  });
-                }
-              });
+              _safeWriteBack(originId, function (proj) { _applyShotPlanServerProjectSnapshot(proj, p); });
               _setShotsProgress(100, "镜头设计完成", "共生成 " + p.shots.length + " 个镜头");
               setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 2000);
               renderShotList();
@@ -674,7 +873,7 @@ export async function generateShots(opts) {
         _setShotsProgress(Math.max(90, data.percent || 90), "整理中", data.hint || "正在整理镜头表");
       }
     },
-    onTaskCompleted: function (data) {
+    onTaskCompleted: async function (data) {
       var patch = (data && data.patch) || {};
       var arr = Array.isArray(patch.value) ? patch.value : null;
       if (!arr || !arr.length) {
@@ -683,20 +882,26 @@ export async function generateShots(opts) {
         return;
       }
 
-	      var isCurrent = _safeWriteBack(originId, function (proj) {
-	        proj.shots = arr;
-	        proj.shotsApproved = false;
-	        proj.storyboards = _makeSingleShotStoryboards(arr);
-	        proj.videoTasks = [];
-	        proj.frameWorkflowSchemaVersion = 3;
-	        if (proj._staleFlags) {
-	          Object.keys(proj._staleFlags).forEach(function (k) {
-	            if (k.indexOf("shot_") === 0 || k.indexOf("storyboard_") === 0 || k.indexOf("video_prompt_") === 0) {
-              delete proj._staleFlags[k];
-            }
-          });
+      var isCurrent = false;
+      try {
+        var resp = await fetch("/api/projects/" + encodeURIComponent(originId), { headers: getAuthHeaders() });
+        if (resp.ok) {
+          var serverProject = await resp.json();
+          isCurrent = _safeWriteBack(originId, function (proj) {
+            _applyShotPlanServerProjectSnapshot(proj, serverProject);
+          }, data && data.serverVersion);
         }
-      }, data && data.serverVersion);
+      } catch (e) {
+        console.warn("[Shots] reload after completion failed:", e);
+      }
+      if (!isCurrent) {
+        isCurrent = _safeWriteBack(originId, function (proj) {
+          proj.shots = arr;
+          proj.shotsApproved = false;
+          proj.storyboards = _makeSingleShotStoryboards(arr);
+          proj.frameWorkflowSchemaVersion = 3;
+        }, data && data.serverVersion);
+      }
 
       _setShotsProgress(100, "镜头设计完成", "共生成 " + arr.length + " 个镜头");
       if (isCurrent) {
@@ -768,16 +973,26 @@ export function confirmShots() {
   project.currentStep = Math.max(project.currentStep, 4);
   saveProject();
   switchPage("images");
+  _scrollToStoryboardWorkbench();
+  showToast("镜头表已确认，已切到分镜工作区", "success");
 }
 
 export function handleShotAction(e) {
   _syncRefs();
   var btn = e.target.closest("[data-action]");
   if (!btn) return;
+  var action = btn.dataset.action;
+  if (action === "regen-shot-plan") {
+    generateShots();
+    return;
+  }
+  if (action === "confirm-shot-plan-valid") {
+    confirmShotPlanStillValid();
+    return;
+  }
   var card = btn.closest(".sc-card[data-shot-idx]");
   if (!card) return;
   var idx = parseInt(card.dataset.shotIdx, 10);
-  var action = btn.dataset.action;
 
   if (action === "ref-agent") {
     var shot = project && project.shots && project.shots[idx];

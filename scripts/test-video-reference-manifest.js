@@ -43,8 +43,20 @@ function loadVideoReferenceManifest() {
   return moduleObj.exports;
 }
 
+function loadReferenceRoles() {
+  const compiled = compileTs('lib/reference-roles.ts');
+  const moduleObj = { exports: {} };
+  vm.runInNewContext(
+    compiled.code,
+    { require, module: moduleObj, exports: moduleObj.exports, console, process },
+    { filename: compiled.sourcePath },
+  );
+  return moduleObj.exports;
+}
+
 function makeLoader(pathMap, state) {
   const videoReferenceManifest = loadVideoReferenceManifest();
+  const referenceRoles = loadReferenceRoles();
   const compiled = compileTs('lib/reference-matcher.ts');
   const moduleObj = { exports: {} };
 
@@ -60,13 +72,21 @@ function makeLoader(pathMap, state) {
         resolveLocalImagePath: (url) => pathMap[url] || null,
       };
     }
+    if (id === './runtime-paths') {
+      return {
+        dataPath: (...parts) => path.join(root, 'data', ...parts),
+        getDataDir: () => path.join(root, 'data'),
+      };
+    }
     if (id === './visual-reference-state') {
       return {
         resolveAssetReferenceState: (asset) => ({
           currentUrl: asset?.reference?.currentUrl || asset?.imageUrl || asset?.rawUrl || asset?.realPhotoUrl || asset?.coverUrl || '',
           lastKnownGoodUrl: asset?.reference?.lastKnownGoodUrl || '',
+          status: asset?.reference?.status || (asset?.reference?.currentUrl || asset?.imageUrl || asset?.rawUrl || asset?.realPhotoUrl || asset?.coverUrl ? 'ready' : 'missing'),
           effectiveDescription: asset?.description || asset?.visual || asset?.imagePrompt || '',
         }),
+        isBlockingReferenceStatus: (status) => status === 'missing' || status === 'failed' || status === 'legacy_sketch_only',
       };
     }
     if (id === './panel-selection') {
@@ -110,6 +130,7 @@ function makeLoader(pathMap, state) {
       };
     }
     if (id === './video-reference-manifest') return videoReferenceManifest;
+    if (id === './reference-roles') return referenceRoles;
     return require(id);
   }
 
@@ -199,7 +220,7 @@ function urlsForProject(project, firstFrameUrl) {
   return urls.filter(Boolean);
 }
 
-function build(project, firstFrameUrl, state = {}) {
+function build(project, firstFrameUrl, state = {}, overrides = {}) {
   const pathMap = makePathMap(urlsForProject(project, firstFrameUrl));
   const mod = makeLoader(pathMap, state);
   return mod.buildVideoReferenceManifest({
@@ -210,6 +231,7 @@ function build(project, firstFrameUrl, state = {}) {
     groupIdx: 0,
     ownerId: 7,
     storyboardImageUrl: firstFrameUrl,
+    ...overrides,
   });
 }
 
@@ -246,6 +268,25 @@ async function testMissingSceneCompactsImageNumbers() {
     ['1:first_frame:first frame', '2:character:角色1', '3:character:角色2'],
     'missing scene compacts image numbers and does not fill unused budget',
   );
+}
+
+async function testUnresolvableFirstFrameSkipped() {
+  const project = makeProject({ characterCount: 1, propCount: 0, includeScene: true });
+  const firstFrameUrl = img('missing-first-frame');
+  const pathMap = makePathMap(urlsForProject(project, null));
+  const mod = makeLoader(pathMap, {});
+  const result = mod.buildVideoReferenceManifest({
+    project,
+    assets: project.assets,
+    shots: project.shots,
+    groupShotIndices: [0],
+    groupIdx: 0,
+    ownerId: 7,
+    storyboardImageUrl: firstFrameUrl,
+  });
+  assert(!result.manifest.some((ref) => ref.role === 'first_frame'), 'unresolvable first frame should not enter manifest');
+  assertEqual(result.manifest[0].imageNo, 1, 'imageNo starts at 1 for the first resolvable reference');
+  assert(result.manifest[0].role === 'scene' || result.manifest[0].role === 'character', 'next resolvable reference is promoted');
 }
 
 async function testThreeCharactersNoPropsKeepsThirdCharacter() {
@@ -292,14 +333,148 @@ async function testAssetMissingReason() {
   );
 }
 
+async function testGroupShotIndicesScopeFullShotsInput() {
+  const state = {};
+  const project = makeProject({ characterCount: 2, propCount: 2, includeScene: false });
+  project.shots = [
+    {
+      visual: '角色1 拿起 道具1',
+      description: '',
+      dialogue: '',
+      characters: ['角色1'],
+    },
+    {
+      visual: '角色2 拿起 道具2',
+      description: '',
+      dialogue: '',
+      characters: ['角色2'],
+    },
+  ];
+
+  const result = build(project, img('first-frame'), state, {
+    shots: project.shots,
+    groupShotIndices: [1],
+    groupIdx: 1,
+  });
+
+  assertEqual(state.lastPanelOptions.shots.map((shot) => shot.characters), [['角色2']], 'panel selector receives only scoped shot');
+  assertEqual(
+    result.manifest.map((ref) => `${ref.role}:${ref.assetName}`),
+    ['first_frame:first frame', 'character:角色2', 'prop:道具2'],
+    'full shots input is scoped by groupShotIndices',
+  );
+  assert(!result.manifest.some((ref) => ref.assetName === '角色1' || ref.assetName === '道具1'), 'other shots do not leak into current group');
+}
+
+async function testStoryboardMaterialGroupReferences() {
+  const project = makeProject({ characterCount: 0, propCount: 0, includeScene: false });
+  project.shots[0] = {
+    visual: '无明确素材名的镜头',
+    description: '',
+    dialogue: '',
+    characters: [],
+  };
+  project.assets.scenes = [{
+    id: 'manual-scene',
+    name: '手动场景',
+    imageUrl: img('manual-scene'),
+    storyboardMaterialRole: 'scene',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-scene') },
+  }];
+  project.assets.characters = [{
+    id: 'manual-char',
+    name: '手动角色',
+    imageUrl: img('manual-char'),
+    storyboardMaterialRole: 'character',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-char') },
+  }];
+  project.assets.props = [{
+    id: 'manual-prop',
+    name: '手动道具',
+    imageUrl: img('manual-prop'),
+    storyboardMaterialRole: 'prop',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-prop') },
+  }, {
+    id: 'missing-prop',
+    name: '缺失道具',
+    imageUrl: img('missing-prop'),
+    storyboardMaterialRole: 'prop',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'missing', currentUrl: img('missing-prop') },
+  }];
+
+  const result = build(project, img('first-frame'));
+  assertEqual(
+    result.manifest.map((ref) => `${ref.role}:${ref.assetName}`),
+    ['first_frame:first frame', 'scene:手动场景', 'character:手动角色', 'prop:手动道具'],
+    'manual storyboard materials are selected by group role even without text mention',
+  );
+  assert(!result.manifest.some((ref) => ref.assetName === '缺失道具'), 'missing storyboard material is not selected');
+}
+
+async function testStoryboardMaterialExclusions() {
+  const project = makeProject({ characterCount: 0, propCount: 0, includeScene: false });
+  project.shots[0] = {
+    visual: '无明确素材名的镜头',
+    description: '',
+    dialogue: '',
+    characters: [],
+  };
+  project.assets.scenes = [{
+    id: 'manual-scene',
+    name: '手动场景',
+    imageUrl: img('manual-scene'),
+    storyboardMaterialRole: 'scene',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-scene') },
+  }];
+  project.assets.characters = [{
+    id: 'manual-char',
+    name: '手动角色',
+    imageUrl: img('manual-char'),
+    storyboardMaterialRole: 'character',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-char') },
+  }];
+  project.assets.props = [{
+    id: 'manual-prop',
+    name: '手动道具',
+    imageUrl: img('manual-prop'),
+    storyboardMaterialRole: 'prop',
+    storyboardMaterialGroupIdx: 0,
+    reference: { status: 'ready', currentUrl: img('manual-prop') },
+  }];
+  project.storyboardMaterialExclusions = {
+    0: {
+      scene: { 'scene:manual-scene': { key: 'scene:manual-scene' } },
+      char: { 'char:manual-char': { key: 'char:manual-char' } },
+      prop: { 'prop:manual-prop': { key: 'prop:manual-prop' } },
+    },
+  };
+
+  const result = build(project, img('first-frame'));
+  assertEqual(
+    result.manifest.map((ref) => `${ref.role}:${ref.assetName}`),
+    ['first_frame:first frame'],
+    'excluded storyboard materials are not selected by video manifest',
+  );
+}
+
 async function run() {
   const tests = [
     ['full priority chain', testFullPriorityChain],
     ['missing scene compacts image numbers', testMissingSceneCompactsImageNumbers],
+    ['unresolvable first frame skipped', testUnresolvableFirstFrameSkipped],
     ['three characters no props keeps third character', testThreeCharactersNoPropsKeepsThirdCharacter],
     ['duplicate character only once', testDuplicateCharacterOnlyOnce],
     ['prop sort uses mentions then text order', testPropSortUsesMentionsThenTextOrder],
     ['asset missing reason', testAssetMissingReason],
+    ['groupShotIndices scopes full shots input', testGroupShotIndicesScopeFullShotsInput],
+    ['storyboard material group references', testStoryboardMaterialGroupReferences],
+    ['storyboard material exclusions', testStoryboardMaterialExclusions],
   ];
   for (const [name, fn] of tests) {
     await fn();

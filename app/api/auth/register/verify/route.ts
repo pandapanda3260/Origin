@@ -2,11 +2,16 @@ import { NextRequest } from 'next/server';
 import { createUser, findUserByLogin, signToken, userToPublic } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { verifyOtpCode } from '@/lib/otp';
+import { isRegistrationEnabled } from '@/lib/system-config';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: NextRequest) {
+  if (!isRegistrationEnabled()) {
+    return jsonError('注册暂时关闭，请稍后再试', 503);
+  }
+
   const body = await req.json().catch(() => ({} as any));
   const username = (body.username || '').toString().trim();
   const email = (body.email || '').toString().trim().toLowerCase();

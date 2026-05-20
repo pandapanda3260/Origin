@@ -254,13 +254,13 @@ export function validateCharacterConsistencyForGroup(
       });
     }
     if (opts.target === 'videoSegment' && lock.referenceLock.referenceStatus !== 'ready') {
-      if (lock.referenceLock.referenceStatus === 'missing') {
+      if (lock.referenceLock.referenceStatus === 'missing' || lock.referenceLock.referenceStatus === 'failed') {
         blockers.push({
           code: 'critical_reference_missing',
           characterId: lock.characterId,
           characterName: lock.canonicalName,
-          subReason: 'character:missing',
-          message: `${lock.canonicalName} 的角色参考图缺失，不能进入 videoSegment。`,
+          subReason: `character:${lock.referenceLock.referenceStatus}`,
+          message: `${lock.canonicalName} 的角色参考图状态为 ${lock.referenceLock.referenceStatus}，不能进入 videoSegment。`,
         });
       } else {
         warnings.push({

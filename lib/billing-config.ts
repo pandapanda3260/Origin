@@ -44,6 +44,12 @@ export const TOPUP_PACKS = [
   { code: 'topup_10000', title: '10000 积分包', credits: 10000, price_cents: 29900 },
 ];
 
+export const ADMIN_MANUAL_ADJUST_LIMITS = {
+  secondConfirmAbove: 10_000,
+  absoluteBlockAbove: 100_000,
+  dailyAdminAbsCap: 50_000,
+};
+
 export function getPlan(code: string) {
   return PLANS.find((p) => p.code === code);
 }

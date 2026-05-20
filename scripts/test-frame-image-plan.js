@@ -92,12 +92,24 @@ function makeSceneSelectionStub(sceneToReturn) {
   };
 }
 
+function loadReferenceRoles() {
+  const compiled = compileTs('lib/reference-roles.ts');
+  const moduleObj = { exports: {} };
+  vm.runInNewContext(
+    compiled.code,
+    { require, module: moduleObj, exports: moduleObj.exports, console, process },
+    { filename: compiled.sourcePath },
+  );
+  return moduleObj.exports;
+}
+
 function loadFrameImagePlan({
   contentSanitize,
   characterConsistency,
   imageGen,
   sceneSelection,
   frameHelpers,
+  referenceRoles,
 }) {
   const compiled = compileTs('lib/frame-image-plan.ts');
   const moduleObj = { exports: {} };
@@ -107,6 +119,18 @@ function loadFrameImagePlan({
     if (id === './image-gen') return imageGen;
     if (id === './scene-selection') return sceneSelection;
     if (id === './frame-prompt-helpers') return frameHelpers;
+    if (id === './reference-roles') return referenceRoles;
+    if (id === './visual-reference-state') {
+      return {
+        resolveAssetReferenceState: (asset) => ({
+          currentUrl: asset?.reference?.currentUrl || asset?.imageUrl || asset?.rawUrl || '',
+          lastKnownGoodUrl: asset?.reference?.lastKnownGoodUrl || '',
+          status: asset?.reference?.status || (asset?.reference?.currentUrl || asset?.imageUrl || asset?.rawUrl ? 'ready' : 'missing'),
+          effectiveDescription: asset?.description || asset?.features || asset?.appearance || '',
+        }),
+        isBlockingReferenceStatus: (status) => status === 'missing' || status === 'failed' || status === 'legacy_sketch_only',
+      };
+    }
     return require(id);
   }
   vm.runInNewContext(
@@ -121,12 +145,14 @@ function loadAll({ imageGen, sceneSelection, characterConsistency }) {
   const contentSanitize = loadContentSanitize();
   const cc = characterConsistency || makeCharacterConsistencyStub();
   const frameHelpers = loadFramePromptHelpers({ contentSanitize, characterConsistency: cc });
+  const referenceRoles = loadReferenceRoles();
   return loadFrameImagePlan({
     contentSanitize,
     characterConsistency: cc,
     imageGen,
     sceneSelection,
     frameHelpers,
+    referenceRoles,
   });
 }
 
@@ -144,11 +170,15 @@ function assertEqual(actual, expected, message) {
 function makeFixtureProject() {
   return {
     id: 'proj-1',
+    styleOptions: {
+      aspectRatio: '9:16',
+    },
     styleBible: {
       visualStyle: 'gritty noir',
       colorPalette: 'teal + amber',
       mood: 'tense',
       lighting: 'low-key rim light',
+      compositionGuidance: 'Keep the detective framed in a vertical portrait composition.',
     },
     shots: [
       {
@@ -346,9 +376,11 @@ async function testFirstFrameFullyResolved() {
   // reference 描述中应点名 character 的 assetName
   assert(p.includes('Image 1 = character'), 'Image 1 = character line present');
   assert(!p.includes('Image 2 = scene'), 'scene slot is over_capacity so not shown as Image 2');
+  assert(p.includes('Target aspect ratio: 9:16'), 'prompt should include target aspect ratio');
 
   // summary
   const summary = mod.summarizePlanForAudit(plan);
+  assertEqual(summary.aspectRatio, '9:16', 'summary aspect ratio');
   assertEqual(summary.sentReferences.length, 1, 'summary sent = 1');
   assertEqual(summary.textOnlyReferences.length, 2, 'summary text_only = 2');
   assertEqual(summary.droppedReferences.length, 0, 'summary dropped = 0');
@@ -740,6 +772,64 @@ async function testFirstFrameFourImageQualityPack() {
   assert(textOnly.every((r) => String(r.textFallback || '').trim().length > 0), 'all text_only refs keep textFallback');
 }
 
+async function testManualStoryboardMaterialsFirst() {
+  const project = makeFixtureProject();
+  project.assets.scenes = [{
+    id: 'manual-scene',
+    name: 'Manual Scene',
+    imageUrl: '/api/images/file/manual-scene',
+    storyboardMaterialRole: 'scene',
+    storyboardMaterialGroupIdx: 0,
+    description: 'manual scene reference',
+  }];
+  project.assets.characters.push({
+    id: 'manual-character',
+    name: 'Manual Character',
+    imageUrl: '/api/images/file/manual-character',
+    storyboardMaterialRole: 'character',
+    storyboardMaterialGroupIdx: 0,
+    appearance: 'manual character reference',
+  });
+  project.assets.props.push({
+    id: 'manual-prop',
+    name: 'Manual Prop',
+    imageUrl: '/api/images/file/manual-prop',
+    storyboardMaterialRole: 'prop',
+    storyboardMaterialGroupIdx: 0,
+    description: 'manual prop reference',
+  });
+  const localMap = {
+    '/api/images/file/manual-scene': '/local/manual-scene.png',
+    '/api/images/file/manual-character': '/local/manual-character.png',
+    '/api/images/file/manual-prop': '/local/manual-prop.png',
+    '/api/images/file/00000000-0000-0000-0000-0000000000a1': '/local/alice.png',
+    '/api/images/file/00000000-0000-0000-0000-0000000000b1': '/local/lantern.png',
+  };
+  const mod = loadAll({
+    imageGen: makeImageGenStub(localMap),
+    sceneSelection: makeSceneSelectionStub(makeFixtureScene()),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0, 1],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: { ...MODEL_SNAPSHOT_CAP1, multiRefImageCap: 4 },
+  });
+  const sent = plan.referenceManifest.filter((r) => r.delivery === 'image');
+  assertEqual(
+    sent.map((r) => `${r.role}:${r.assetName}`),
+    [
+      'character:Manual Character',
+      'scene:Manual Scene',
+      'character:Alice',
+      'prop:Manual Prop',
+    ],
+    'manual storyboard materials are prioritized ahead of text fallback candidates',
+  );
+}
+
 async function testTailFrameUnresolvableSelfFirstFrameShiftsImageNo() {
   const scene = makeFixtureScene();
   const firstFrameUrl = '/api/images/file/00000000-0000-0000-0000-0000000000ff';
@@ -803,6 +893,7 @@ async function main() {
     ['plan cap=3 → all 3 candidates as image, imageNo 1/2/3', testPlanCapThreeAllImages],
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],
     ['first_frame 4-image quality pack order and overflow text_only', testFirstFrameFourImageQualityPack],
+    ['manual storyboard materials before fallback', testManualStoryboardMaterialsFirst],
     ['tail_frame unresolvable self_first_frame shifts imageNo', testTailFrameUnresolvableSelfFirstFrameShiftsImageNo],
     ['unknown frameType rejected', testTailFrameUnknownTypeRejected],
   ];

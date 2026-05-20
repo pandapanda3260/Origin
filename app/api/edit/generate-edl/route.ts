@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { chatStream, parseJsonLoose } from '@/lib/llm';
+import { chatStream, parseJsonLoose, type ChatMessage } from '@/lib/llm';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { sseResponse } from '@/lib/sse';
 import {
@@ -9,6 +9,10 @@ import {
   collectEdlGenerationContext,
   normalizeGeneratedEdl,
 } from '@/lib/edit-edl';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
+import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -54,15 +58,39 @@ export async function POST(req: NextRequest) {
     const { ctx, clips, segTags } = collected;
 
     let raw = '';
+    let knowledgeContext: KnowledgeContextForStage | null = null;
     try {
       writer.step('正在生成剪辑方案…');
       const edlMaxTokens = Math.min(12_000, Math.max(4_000, clips.length * 800));
+      let messages: ChatMessage[] = [
+        { role: 'system', content: SP_GENERATE_EDL },
+        { role: 'user', content: JSON.stringify(ctx) },
+      ];
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(proj as any),
+            id: projectId,
+          },
+          stage: 'edit_edl',
+          stageTarget: {
+            source: 'api_edit_generate_edl',
+            targetDurationSec,
+            inputHash: collected.inputHash,
+            clipIds: collected.clipIds,
+            clipCount: clips.length,
+          },
+        });
+        const injected = maybeInjectKnowledgePromptBlock({ messages, context });
+        messages = injected.messages;
+        knowledgeContext = injected.context;
+      } catch (error) {
+        console.warn('[edit/generate-edl] knowledge context injection skipped:', error);
+      }
       await chatStream(
         user,
-        [
-          { role: 'system', content: SP_GENERATE_EDL },
-          { role: 'user', content: JSON.stringify(ctx) },
-        ],
+        messages,
         { temperature: 0.5, responseFormat: 'json_object', maxTokens: edlMaxTokens, modelRole: 'structured', reasoningEffort: 'none' },
         (delta) => { raw += delta; writer.chunk(delta); },
       );
@@ -103,6 +131,9 @@ export async function POST(req: NextRequest) {
       const patch: any = { editData };
       if (sbsTouched) patch.storyboards = sbs;
       updateProjectForUser(projectId, user.id, patch);
+      if (knowledgeContext) {
+        recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext });
+      }
 
       writer.done({ result, serverVersion: editData.version });
     } catch (e: any) {

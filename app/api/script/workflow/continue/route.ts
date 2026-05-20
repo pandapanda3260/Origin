@@ -3,6 +3,9 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream } from '@/lib/llm';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
+import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { shortKnowledgeHash } from '@/lib/knowledge/hash';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -50,6 +53,27 @@ export async function POST(req: NextRequest) {
         scriptDraft: buf,
         script: buf,
       });
+      try {
+        const context = buildKnowledgeContextForStage({
+          ownerId: user.id,
+          project: {
+            ...(proj as any),
+            id: projectId,
+            scriptDraft: buf,
+            script: buf,
+          },
+          stage: 'script_create',
+          stageTarget: {
+            mode: 'continue',
+            baseScriptHash: shortKnowledgeHash(baseScript),
+            directionHash: direction ? shortKnowledgeHash(direction) : null,
+            scriptHash: shortKnowledgeHash(buf),
+          },
+        });
+        recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context });
+      } catch (error) {
+        console.warn('[script/continue] knowledge context audit skipped:', error);
+      }
     }
 
     writer.done({

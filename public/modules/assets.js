@@ -19,6 +19,8 @@ var _assetsExtracting = false;
 var _assetImagesGenerating = false;
 var _assetGenStatus = {};
 var _pendingAssetRerender = false;
+var _assetStyleStaleSyncing = false;
+var _assetStyleStaleSyncKey = "";
 var _libActiveProject = null;
 var _libActiveTab = "all";
 var ASSET_ENTRANCE_ANIM_MS = 1400;
@@ -74,11 +76,13 @@ export function refreshAssetsPage() {
   var ready = $("assetsReady");
   var content = $("assetsContent");
   var saveTplBtn = $("btnSaveWorldTemplate");
+  var knowledgeBtn = $("btnKnowledgeSnapshot");
   if (!project || !project.scriptApproved) {
     need.hidden = false;
     if (ready) ready.hidden = true;
     if (content) content.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
+    if (knowledgeBtn) knowledgeBtn.hidden = true;
     return;
   }
   need.hidden = true;
@@ -94,6 +98,7 @@ export function refreshAssetsPage() {
       content.insertBefore(_sb, content.firstChild);
     }
     renderAssets();
+    _syncAssetStyleStaleFlags();
     _showAssetActions();
     checkAssetsConfirm();
     _updateStylizeBadge();
@@ -102,6 +107,7 @@ export function refreshAssetsPage() {
     var banner = $("assetsExtractBanner");
     if (banner) banner.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
+    if (knowledgeBtn) knowledgeBtn.hidden = true;
   }
 }
 
@@ -127,10 +133,11 @@ export async function extractAssets() {
   var _extractCharCount = 0;
 
   try {
-    var extractBody = {
-      projectId: project.id,
-      script: project.script,
-    };
+	    var extractBody = {
+	      projectId: project.id,
+	      script: project.script,
+	      worldTemplateSnapshot: project.worldTemplateSnapshot || null,
+	    };
     if (!extractBody.projectId && project.styleBible) extractBody.styleBible = project.styleBible;
 
     _setExtractProgress(20, "正在提取资产", "");
@@ -188,6 +195,8 @@ export async function extractAssets() {
 
       var contentEl = $("assetsContent");
       if (contentEl) {
+        var staleBanner = contentEl.querySelector(".upstream-stale-banner");
+        if (staleBanner) staleBanner.remove();
         contentEl.hidden = false;
         contentEl.classList.remove("asset-cards-entrance");
         void contentEl.offsetWidth;
@@ -270,7 +279,7 @@ function _injectAssetStaleBadges() {
         if (cardEl && !cardEl.querySelector(".stale-badge")) {
           var badge = document.createElement("span");
           badge.className = "stale-badge";
-          badge.title = "角色已修改，关联资产建议重新生成";
+          badge.title = "该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成";
           badge.textContent = "需更新";
           badge.style.cssText = "position:absolute;top:8px;left:8px;z-index:5;";
           cardEl.style.position = "relative";
@@ -278,6 +287,84 @@ function _injectAssetStaleBadges() {
         }
       }
     });
+  });
+}
+
+export function _applyServerStaleFlagsToProject(targetProject, prefixes, serverFlags) {
+  if (!targetProject) return false;
+  var prefixList = Array.isArray(prefixes) ? prefixes : [prefixes || ""];
+  var matchesPrefix = function (key) {
+    return prefixList.some(function (prefix) {
+      return !prefix || key.indexOf(prefix) === 0;
+    });
+  };
+  var authoritativeFlags = serverFlags || {};
+  if (!targetProject._staleFlags) targetProject._staleFlags = {};
+  var changed = false;
+
+  Object.keys(targetProject._staleFlags).forEach(function (key) {
+    if (!matchesPrefix(key)) return;
+    if (!authoritativeFlags[key] && targetProject._staleFlags[key]) {
+      delete targetProject._staleFlags[key];
+      changed = true;
+    }
+  });
+
+  Object.keys(authoritativeFlags).forEach(function (key) {
+    if (!matchesPrefix(key)) return;
+    if (authoritativeFlags[key] && targetProject._staleFlags[key] !== true) {
+      targetProject._staleFlags[key] = true;
+      changed = true;
+    }
+  });
+
+  return changed;
+}
+
+function _styleBibleSyncFingerprint() {
+  try {
+    return JSON.stringify(project && project.styleBible ? project.styleBible : {});
+  } catch (_e) {
+    return "";
+  }
+}
+
+function _assetStyleSyncKey() {
+  if (!project || !project.assets) return "";
+  return [
+    project.id || "",
+    project.styleBibleGeneratedAt || "",
+    project.styleBibleManuallyEditedAt || "",
+    project.styleBibleSourceHash || "",
+    project.styleBibleSource || "",
+    _styleBibleSyncFingerprint(),
+    (project.assets.characters || []).length,
+    (project.assets.scenes || []).length,
+    (project.assets.props || []).length
+  ].join("|");
+}
+
+function _syncAssetStyleStaleFlags() {
+  if (!project || !project.assets || _assetStyleStaleSyncing) return;
+  var key = _assetStyleSyncKey();
+  if (!key || key === _assetStyleStaleSyncKey) return;
+  _assetStyleStaleSyncing = true;
+  _assetStyleStaleSyncKey = key;
+  var body = project.id
+    ? { projectId: project.id }
+    : { project: { styleBible: project.styleBible, shots: project.shots, storyboards: project.storyboards, assets: project.assets } };
+  apiPost("/api/orchestration/compute-stale", body).then(function (resp) {
+    var staleFlags = resp && resp.staleFlags;
+    if (!staleFlags) return;
+    var changed = _applyServerStaleFlagsToProject(project, "asset_img_", staleFlags);
+    if (changed) {
+      _ctx.saveProject();
+      renderAssets();
+    }
+  }).catch(function (e) {
+    console.warn("[AssetStyleStale] sync failed:", e);
+  }).finally(function () {
+    _assetStyleStaleSyncing = false;
   });
 }
 
@@ -300,6 +387,37 @@ export function renderAssetGrid(containerId, items, type, placeholderIcon) {
   hydrateProtectedImageElements(container);
 }
 
+function _characterReferenceFailureMessage(lastError) {
+  if (!lastError || typeof lastError !== "object") {
+    return "本次角色图未通过参考图切片，未用于后续镜头/视频引用";
+  }
+  if (lastError.message) {
+    return "参考图切片失败：" + String(lastError.message);
+  }
+  if (lastError.cropMethod === "percent-fallback") {
+    return "模型背景不够纯白或 panel 边界不可靠，未用于后续镜头/视频引用";
+  }
+  if (Array.isArray(lastError.unusablePanels) && lastError.unusablePanels.length) {
+    return "部分角色视图切片不可用（" + lastError.unusablePanels.join("、") + "），未用于后续镜头/视频引用";
+  }
+  return "本次角色图未通过参考图切片，未用于后续镜头/视频引用";
+}
+
+export function deriveAssetCardState(item) {
+  item = item || {};
+  var reference = (item.reference && typeof item.reference === "object") ? item.reference : {};
+  var mainImageUrl = item.realPhotoUrl || item.rawUrl || item.imageUrl || "";
+  var failed = reference.status === "failed";
+  return {
+    status: failed ? "failed" : (mainImageUrl ? "ready" : "missing"),
+    mainImageUrl: mainImageUrl,
+    thumbnailUrl: mainImageUrl,
+    failedAttemptUrl: failed ? (reference.lastAttemptUrl || "") : "",
+    statusLabel: failed ? "生成失败" : (mainImageUrl ? "已完成" : "待生成"),
+    statusMessage: failed ? _characterReferenceFailureMessage(reference.lastError) : "",
+  };
+}
+
 function _renderCharCards(container, items) {
   items.forEach(function (item, idx) {
     var card = document.createElement("div");
@@ -307,7 +425,8 @@ function _renderCharCards(container, items) {
     card.dataset.type = "char";
     card.dataset.idx = idx;
 
-    var imgSrc = item.realPhotoUrl || item.rawUrl || item.imageUrl || '';
+    var cardState = deriveAssetCardState(item);
+    var imgSrc = cardState.mainImageUrl || '';
 
     var imgHtml = '';
     if (imgSrc) {
@@ -361,8 +480,19 @@ function _renderCharCards(container, items) {
 
     var isAssetStale = _ctx.isStale("asset_img_char_" + idx);
     var statusHtml = '';
-    if (imgSrc) {
-      var staleTag = isAssetStale ? '<span class="stale-badge" title="描述已修改，建议重新生成参考图">需更新</span>' : '';
+    if (cardState.status === "failed") {
+      var staleFailedTag = isAssetStale ? '<span class="stale-badge" title="该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成">需更新</span>' : '';
+      var failedPreview = cardState.failedAttemptUrl
+        ? '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-red-400/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(cardState.failedAttemptUrl) + '">' +
+            '<img src="' + escapeHtml(cardState.failedAttemptUrl) + '" class="w-full h-full object-cover object-[left_top] opacity-85" />' +
+          '</div>'
+        : '<div class="w-full aspect-square rounded-lg bg-red-500/5 border border-red-500/20 flex items-center justify-center text-red-400 text-[11px] font-bold">无失败图预览</div>';
+      statusHtml =
+        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">参考图</span><span class="text-[10px] font-bold text-red-500">' + escapeHtml(cardState.statusLabel) + staleFailedTag + '</span></div>' +
+        failedPreview +
+        '<p class="mt-2 text-[11px] leading-relaxed text-red-500/80">' + escapeHtml(cardState.statusMessage) + '</p>';
+    } else if (imgSrc) {
+      var staleTag = isAssetStale ? '<span class="stale-badge" title="该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成">需更新</span>' : '';
       statusHtml =
         '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">三视图</span><span class="text-[10px] font-bold text-primary">已完成' + staleTag + '</span></div>' +
         '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '">' +
@@ -392,7 +522,7 @@ function _renderCharCards(container, items) {
               '</div>' +
               '<span class="material-symbols-outlined text-primary cursor-pointer hover:scale-110 transition-transform text-lg" data-action="char-menu">more_vert</span>' +
             '</div>' +
-            '<div class="asset-desc-wrap mt-4" data-action="edit-asset">' +
+            '<div class="asset-desc-wrap mt-3" data-action="edit-asset">' +
               '<p class="asset-desc-text text-[11px] text-on-surface-variant/60 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors">' + escapeHtml(desc.slice(0, 300)) + '</p>' +
               '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4">' + escapeHtml(desc.slice(0, 300)) + '</textarea>' +
             '</div>' +
@@ -669,6 +799,7 @@ function _assetItemFor(type, idx) {
 function _assetDisplayUrl(type, item) {
   if (!item) return "";
   if (type === "char") {
+    if (item.reference && item.reference.status === "failed") return "";
     return item.imageUrl || item.pencilUrl || item.realPhotoUrl || item.rawUrl || "";
   }
   return item.imageUrl || item.rawUrl || "";
@@ -1263,6 +1394,36 @@ function _attachAssetImageBatch(opts) {
       var idx = tgt.idx;
       var url = extra.rawUrl || patch.value || patch.imageUrl || "";
       console.log("[AssetImg] task_completed seq=" + data.targetSeq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
+      if (type === "char" && typeof idx === "number" && extra.referenceStatus === "failed") {
+        failCount++;
+        var failedAttemptUrl = extra.lastAttemptUrl || "";
+        var isFailedCurrent = _ctx.safeWriteBack(originId, function (proj) {
+          if (!proj.assets) proj.assets = {};
+          if (!proj.assets.characters) proj.assets.characters = [];
+          var item = proj.assets.characters[idx];
+          if (!item) return;
+          item.reference = Object.assign({}, item.reference || {}, {
+            status: "failed",
+            updatedAt: new Date().toISOString(),
+            styleBibleSignature: extra.styleBibleSignature,
+            styleLockVersion: extra.styleLockVersion,
+            resolvedBackdropColor: extra.resolvedBackdropColor,
+            lastAttemptUrl: failedAttemptUrl,
+            lastFailedAt: new Date().toISOString(),
+            lastError: extra.lastError || { reason: "character_panel_split_failed", message: extra.panelsError || "" }
+          });
+          item.panelsError = extra.panelsError || "character_panel_split_failed";
+          item.panelsErrorAt = item.reference.lastFailedAt;
+          if (proj._staleFlags) delete proj._staleFlags["asset_img_char_" + idx];
+        }, data && data.serverVersion);
+        console.warn("[AssetImg] character reference rejected by panel split; keeping downstream URLs unchanged", extra.lastError || extra.panelsError || "");
+        if (isFailedCurrent) {
+          updateAssetCardImage(type, idx, "error");
+          renderAssets();
+        }
+        _refreshHint();
+        return;
+      }
       if (!type || typeof idx !== "number" || !url) {
         // SSE 帧缺信息：图已落盘但 UI 收不到必要字段。改成主动从 server 拉一次
         // project，让当前还在 loading 的卡片按权威数据补图——而不是默默吞掉等用户 F5。
@@ -1303,11 +1464,20 @@ function _attachAssetImageBatch(opts) {
         }
         item.imageUrl = displayUrl;
         item.rawUrl = url;
+        item.reference = Object.assign({}, item.reference || {}, {
+          currentUrl: displayUrl,
+          lastKnownGoodUrl: displayUrl,
+          status: "ready",
+          updatedAt: new Date().toISOString(),
+          styleBibleSignature: extra.styleBibleSignature,
+          styleLockVersion: extra.styleLockVersion,
+          resolvedBackdropColor: extra.resolvedBackdropColor
+        });
         if (extra.assetId) item.assetId = extra.assetId;
         if (extra.fetchStatus) item.fetchStatus = extra.fetchStatus;
         delete item.imageLastError;
         delete item.imageFailedAt;
-        if (item.reference) delete item.reference.lastError;
+	        if (item.reference) delete item.reference.lastError;
         if (proj._staleFlags) delete proj._staleFlags["asset_img_" + type + "_" + idx];
       }, data && data.serverVersion);
 
@@ -1705,14 +1875,20 @@ function _runStylizeBatch(originId, targets) {
 
 export function checkAssetsConfirm() {
   var area = $("assetsConfirmArea");
+  var topBtn = $("btnConfirmAssetsTop");
   var saveTplBtn = $("btnSaveWorldTemplate");
+  var knowledgeBtn = $("btnKnowledgeSnapshot");
   if (!area || !project || !project.assets) {
+    if (topBtn) topBtn.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
+    if (knowledgeBtn) knowledgeBtn.hidden = true;
     return;
   }
   var hasAssets = (project.assets.characters || []).length > 0 || (project.assets.scenes || []).length > 0;
   area.hidden = !hasAssets;
+  if (topBtn) topBtn.hidden = !hasAssets;
   if (saveTplBtn) saveTplBtn.hidden = !hasAssets;
+  if (knowledgeBtn) knowledgeBtn.hidden = false;
 }
 
 export function confirmAssets() {
@@ -2002,7 +2178,7 @@ function _showCharMenu(anchor, type, idx) {
       _ctx.saveProject();
       renderAssets();
       _showAssetActions();
-      if (project.styleBible) _ctx.renderStyleBible(project.styleBible);
+      if (project.styleBible && _ctx.refreshStylePage) _ctx.refreshStylePage();
       _detectObsoleteAssets().then(function (_afterDelObsolete) {
         if (_afterDelObsolete.length) {
           setTimeout(function () {
@@ -2220,18 +2396,26 @@ async function _uploadCharImage(charIdx, file) {
   }
 }
 
-export function _openLightbox(imgUrl) {
+export function _openLightbox(imgUrl, title) {
   var existing = document.getElementById("assetLightbox");
   if (existing) existing.remove();
 
+  var safeTitle = String(title || "").trim();
+  var headerHtml = safeTitle
+    ? '<div class="asset-lightbox-header" style="position:absolute;top:-52px;left:50%;transform:translateX(-50%);z-index:10010;width:100vw;height:42px;display:flex;align-items:center;justify-content:center;pointer-events:none;" onclick="event.stopPropagation()">' +
+        '<div class="asset-lightbox-caption" style="width:auto;max-width:min(80vw,960px);padding:0 52px;border:0;background:transparent;color:#fff;font-size:16px;font-weight:900;line-height:1.45;text-align:center;box-shadow:none;text-shadow:0 2px 4px rgba(0,0,0,.95),0 8px 24px rgba(0,0,0,.72);">' + escapeHtml(safeTitle) + '</div>' +
+      '</div>'
+    : '';
+  var overlayClass = 'asset-lightbox' + (safeTitle ? ' has-caption' : '');
   var overlay = document.createElement("div");
   overlay.id = "assetLightbox";
-  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 backdrop-blur-sm cursor-pointer";
+  overlay.className = overlayClass;
   overlay.style.animation = "fadeIn .2s ease";
   overlay.innerHTML =
-    '<div class="relative max-w-[90vw] max-h-[90vh] rounded-2xl overflow-hidden shadow-2xl" onclick="event.stopPropagation()">' +
-      '<img src="' + imgUrl + '" class="max-w-[90vw] max-h-[90vh] object-contain" />' +
-      '<button class="absolute top-3 right-3 w-10 h-10 bg-black/40 backdrop-blur rounded-full flex items-center justify-center text-white hover:bg-black/60 transition-colors" onclick="this.closest(\'#assetLightbox\').remove()">' +
+    '<div class="asset-lightbox-dialog" onclick="event.stopPropagation()">' +
+      headerHtml +
+      '<img src="' + escapeHtml(imgUrl) + '" class="asset-lightbox-image" />' +
+      '<button class="asset-lightbox-close" onclick="this.closest(\'#assetLightbox\').remove()">' +
         '<span class="material-symbols-outlined">close</span>' +
       '</button>' +
     '</div>';
@@ -2346,6 +2530,9 @@ function runConcurrent(tasks, opts) {
 var _worldTemplatesMem = null;      // null = 尚未 prime，[] = prime 过但空
 var _worldTemplatesPrimed = false;
 var _worldTemplatesPrimePromise = null;
+var _styleTemplatesMem = null;      // 独立风格模板，不再复用 world_templates
+var _styleTemplatesPrimed = false;
+var _styleTemplatesPrimePromise = null;
 
 function _worldTemplatesStorageKey() {
   return (_ctx.uPrefix || "") + "sw_world_templates";
@@ -2406,6 +2593,10 @@ export function _getWorldTemplates() {
   return Array.isArray(_worldTemplatesMem) ? _worldTemplatesMem : [];
 }
 
+export function _getStyleTemplates() {
+  return Array.isArray(_styleTemplatesMem) ? _styleTemplatesMem : [];
+}
+
 async function _loadWorldTemplateDetail(tpl) {
   if (!tpl || !tpl.id) return tpl;
   if (!tpl.summaryOnly && (Array.isArray(tpl.characters) || tpl.styleBible || tpl.loadedAt)) return tpl;
@@ -2420,6 +2611,28 @@ async function _loadWorldTemplateDetail(tpl) {
     });
   }
   return full;
+}
+
+export function snapshotWorldTemplate(tpl) {
+  var source = tpl && typeof tpl === "object" ? tpl : {};
+  var snap = {};
+  try {
+    snap = JSON.parse(JSON.stringify(source || {}));
+  } catch (_) {
+    snap = {};
+  }
+  var ownerId = snap.ownerId || snap.owner_id || source.ownerId || source.owner_id || null;
+  if (typeof ownerId === "string" && ownerId.trim()) {
+    var numericOwnerId = Number(ownerId);
+    ownerId = Number.isFinite(numericOwnerId) ? numericOwnerId : ownerId;
+  }
+  delete snap.styleBible;
+  delete snap.style_bible;
+  delete snap.hasStyleBible;
+  snap.ownerId = ownerId || null;
+  if (!snap.id && source.id) snap.id = source.id;
+  if (!snap.name && source.name) snap.name = source.name;
+  return snap;
 }
 
 function _parseWorldTemplateResponse(resp) {
@@ -2483,6 +2696,9 @@ async function _migrateLegacyWorldTemplatesIfNeeded(serverTemplates) {
       legacyId: tpl.id || "",
       migrationKey: migrationKey,
     });
+    delete payload.styleBible;
+    delete payload.style_bible;
+    delete payload.hasStyleBible;
     var resp = await fetch("/api/world-templates", {
       method: "POST",
       headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
@@ -2531,6 +2747,30 @@ export async function _primeWorldTemplates() {
   return _worldTemplatesPrimePromise;
 }
 
+export async function _primeStyleTemplates() {
+  if (_styleTemplatesPrimePromise) return _styleTemplatesPrimePromise;
+  _styleTemplatesPrimePromise = (async function () {
+    try {
+      var resp = await fetch("/api/style-templates", { headers: _getAuthHeaders() });
+      if (!resp.ok) {
+        _styleTemplatesMem = _styleTemplatesMem || [];
+        _styleTemplatesPrimed = true;
+        return;
+      }
+      var data = await resp.json();
+      _styleTemplatesMem = Array.isArray(data.templates) ? data.templates : (Array.isArray(data.items) ? data.items : []);
+      _styleTemplatesPrimed = true;
+    } catch (e) {
+      console.warn("[StyleTemplates] prime failed:", e);
+      _styleTemplatesMem = _styleTemplatesMem || [];
+      _styleTemplatesPrimed = true;
+    } finally {
+      _styleTemplatesPrimePromise = null;
+    }
+  })();
+  return _styleTemplatesPrimePromise;
+}
+
 /** 追加一条模板：本地 unshift + 后端 POST。返回 Promise 便于 UI 等落盘。 */
 function _appendWorldTemplate(tpl) {
   return fetch("/api/world-templates", {
@@ -2571,13 +2811,182 @@ export function saveAsWorldTemplate() {
   _openSaveTemplateDialog();
 }
 
+function _knowledgeText(value, fallback) {
+  var text = String(value || "").trim();
+  return text || (fallback || "未设置");
+}
+
+function _knowledgeDriftLabel(drift) {
+  if (!drift || !drift.hasSnapshot) return { text: "未绑定", cls: "text-[#90A4AE]" };
+  if (!drift.hasSource) return { text: "源模板不可用", cls: "text-[#8A6D3B]" };
+  if (drift.isDrifted) return { text: "项目使用旧快照", cls: "text-[#B45309]" };
+  return { text: "与源模板一致", cls: "text-[#2E7D32]" };
+}
+
+function _knowledgeInfoRow(label, value) {
+  return '<div class="grid grid-cols-[92px_1fr] gap-3 text-xs">' +
+    '<div class="text-[#90A4AE] font-medium">' + escapeHtml(label) + '</div>' +
+    '<div class="text-[#2C3E50] leading-relaxed">' + escapeHtml(_knowledgeText(value)) + '</div>' +
+  '</div>';
+}
+
+function _renderKnowledgeTemplate(title, tpl, drift) {
+  var d = _knowledgeDriftLabel(drift);
+  if (!tpl) {
+    return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
+      '<div class="flex items-center justify-between mb-3">' +
+        '<h4 class="text-sm font-bold text-[#1a1a1a]">' + escapeHtml(title) + '</h4>' +
+        '<span class="text-[11px] font-bold ' + d.cls + '">' + escapeHtml(d.text) + '</span>' +
+      '</div>' +
+      '<p class="text-xs text-[#90A4AE]">当前项目还没有绑定模板。</p>' +
+    '</section>';
+  }
+  return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4 space-y-2">' +
+    '<div class="flex items-center justify-between mb-1">' +
+      '<h4 class="text-sm font-bold text-[#1a1a1a]">' + escapeHtml(title) + '</h4>' +
+      '<span class="text-[11px] font-bold ' + d.cls + '">' + escapeHtml(d.text) + '</span>' +
+    '</div>' +
+    _knowledgeInfoRow("名称", tpl.name || tpl.id) +
+    (tpl.summary ? _knowledgeInfoRow("摘要", tpl.summary) : '') +
+    (typeof tpl.characterCount === "number" ? _knowledgeInfoRow("内容", tpl.characterCount + " 个角色 / " + (tpl.locationCount || 0) + " 个场景 / " + (tpl.propCount || 0) + " 个道具") : '') +
+  '</section>';
+}
+
+function _renderKnowledgeCharacters(characters) {
+  if (!characters || !characters.length) {
+    return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
+      '<h4 class="text-sm font-bold text-[#1a1a1a] mb-2">角色一致性</h4>' +
+      '<p class="text-xs text-[#90A4AE]">暂无角色锁。</p>' +
+    '</section>';
+  }
+  return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
+    '<h4 class="text-sm font-bold text-[#1a1a1a] mb-3">角色一致性</h4>' +
+    '<div class="space-y-3 max-h-[260px] overflow-y-auto pr-1">' +
+      characters.map(function (ch) {
+        var identity = ch.identityLock || {};
+        var visual = ch.visualLock || {};
+        var performance = ch.performanceLock || {};
+        var voice = ch.voiceLock || {};
+        var reference = ch.referenceLock || {};
+        return '<div class="rounded-lg bg-[#F8F9FA] p-3 text-xs">' +
+          '<div class="flex items-center justify-between gap-3 mb-2">' +
+            '<div class="font-bold text-[#2C3E50]">' + escapeHtml(ch.canonicalName || ch.characterId || "未命名角色") + '</div>' +
+            '<span class="text-[10px] text-[#607D8B]">' + escapeHtml(ch.status || "unknown") + '</span>' +
+          '</div>' +
+          '<div class="space-y-1.5">' +
+            _knowledgeInfoRow("身份", [identity.role, identity.identity, identity.entityType].filter(Boolean).join(" / ")) +
+            _knowledgeInfoRow("外观", [visual.appearance, visual.clothing, visual.equipment].filter(Boolean).join("；")) +
+            _knowledgeInfoRow("表演", [performance.temperament, performance.actionTraits].filter(Boolean).join("；")) +
+            _knowledgeInfoRow("声音", [voice.voiceGender, voice.voiceAge, voice.timbre, voice.speechStyle, voice.accent].filter(Boolean).join(" / ")) +
+            _knowledgeInfoRow("参考", [reference.referenceStatus, reference.qualityScore != null ? "质量 " + reference.qualityScore : ""].filter(Boolean).join(" / ")) +
+          '</div>' +
+        '</div>';
+      }).join("") +
+    '</div>' +
+  '</section>';
+}
+
+function _renderKnowledgeStages(stages) {
+  if (!stages || !stages.length) {
+    return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
+      '<h4 class="text-sm font-bold text-[#1a1a1a] mb-2">最近阶段上下文</h4>' +
+      '<p class="text-xs text-[#90A4AE]">还没有知识上下文审计记录。</p>' +
+    '</section>';
+  }
+  return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
+    '<h4 class="text-sm font-bold text-[#1a1a1a] mb-3">最近阶段上下文</h4>' +
+    '<div class="grid grid-cols-1 sm:grid-cols-2 gap-2">' +
+      stages.map(function (stage) {
+        return '<div class="rounded-lg bg-[#F8F9FA] px-3 py-2">' +
+          '<div class="flex items-center justify-between gap-2">' +
+            '<span class="text-xs font-bold text-[#2C3E50]">' + escapeHtml(stage.label || stage.stage) + '</span>' +
+            '<span class="text-[10px] text-[#607D8B]">' + Number(stage.ruleCardCount || 0) + ' 条规则</span>' +
+          '</div>' +
+          '<div class="text-[10px] text-[#90A4AE] mt-1">' + escapeHtml(stage.updatedAt || '') + '</div>' +
+        '</div>';
+      }).join("") +
+    '</div>' +
+  '</section>';
+}
+
+export async function openKnowledgeSnapshot() {
+  if (!project || !project.id) { showToast("请先打开项目", "warn"); return; }
+  var existing = document.getElementById("knowledgeSnapshotDialog");
+  if (existing) existing.remove();
+  var overlay = document.createElement("div");
+  overlay.id = "knowledgeSnapshotDialog";
+  overlay.className = "fixed inset-0 z-[9998] flex items-center justify-center bg-black/50 backdrop-blur-sm";
+  overlay.innerHTML =
+    '<div class="bg-[#F8F9FA] rounded-2xl shadow-2xl w-[760px] max-w-[94vw] max-h-[86vh] overflow-hidden" onclick="event.stopPropagation()">' +
+      '<div class="px-6 py-5 bg-white border-b border-[#ECEFF1] flex items-start justify-between gap-4">' +
+        '<div>' +
+          '<h3 class="text-base font-bold text-[#1a1a1a]">当前项目知识</h3>' +
+          '<p class="text-xs text-[#90A4AE] mt-1">查看当前项目绑定的风格、世界观和角色一致性，不展示底层 prompt 与 hash。</p>' +
+        '</div>' +
+        '<button type="button" id="knowledgeSnapshotClose" class="w-9 h-9 rounded-full hover:bg-[#F8F9FA] text-[#607D8B] flex items-center justify-center">' +
+          '<span class="material-symbols-outlined text-lg">close</span>' +
+        '</button>' +
+      '</div>' +
+      '<div id="knowledgeSnapshotBody" class="p-5 overflow-y-auto max-h-[calc(86vh-86px)]">' +
+        '<div class="rounded-xl border border-[#ECEFF1] bg-white p-5 text-sm text-[#607D8B]">正在读取项目知识快照…</div>' +
+      '</div>' +
+    '</div>';
+  overlay.addEventListener("click", function (ev) {
+    if (ev.target === overlay) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+  overlay.querySelector("#knowledgeSnapshotClose").addEventListener("click", function () { overlay.remove(); });
+  try {
+    var resp = await fetch("/api/projects/" + encodeURIComponent(project.id) + "/knowledge-snapshot", {
+      headers: _getAuthHeaders(),
+    });
+    var data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok) throw new Error(data.detail || "读取失败");
+    var style = data.style || {};
+    var world = data.world || {};
+    var body = overlay.querySelector("#knowledgeSnapshotBody");
+    body.innerHTML =
+      '<div class="space-y-4">' +
+        '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4 space-y-2">' +
+          '<h4 class="text-sm font-bold text-[#1a1a1a] mb-2">风格圣经摘要</h4>' +
+          _knowledgeInfoRow("视觉", style.styleBible && style.styleBible.vision) +
+          _knowledgeInfoRow("镜头", style.styleBible && style.styleBible.camera) +
+          _knowledgeInfoRow("节奏", style.styleBible && style.styleBible.editingRhythm) +
+        '</section>' +
+        _renderKnowledgeTemplate("风格模板", style.template, style.drift) +
+        _renderKnowledgeTemplate("世界观模板", world.template, world.drift) +
+        _renderKnowledgeCharacters(data.characters || []) +
+        _renderKnowledgeStages(data.recentStages || []) +
+      '</div>';
+  } catch (e) {
+    var errBody = overlay.querySelector("#knowledgeSnapshotBody");
+    if (errBody) {
+      errBody.innerHTML = '<div class="rounded-xl border border-[#FFCDD2] bg-[#FFF5F5] p-5 text-sm text-[#B71C1C]">读取失败：' + escapeHtml((e && e.message) || e) + '</div>';
+    }
+  }
+}
+
 function _openSaveTemplateDialog() {
   var existing = document.getElementById("saveTplDialog");
   if (existing) existing.remove();
 
+  if (!_worldTemplatesPrimed) {
+    showToast("正在加载世界观模板…", "info");
+    _primeWorldTemplates().then(function () { _openSaveTemplateDialog(); });
+    return;
+  }
+
   var defaultName = (project.name || "未命名") + " · 世界观";
-  var charCount = (project.assets && project.assets.characters) ? project.assets.characters.length : 0;
-  var hasStyleBible = project.styleBible ? "包含" : "无";
+  var templates = _getWorldTemplates();
+  var currentWorldId = (project.worldTemplateSnapshot && project.worldTemplateSnapshot.id) || project.selectedWorldTemplateId || "";
+  var lockedCount = 0;
+  var draftCount = 0;
+  var locks = project.consistency && Array.isArray(project.consistency.characters) ? project.consistency.characters : [];
+  locks.forEach(function (lock) {
+    if (lock && lock.status === "locked") lockedCount += 1;
+    else if (lock) draftCount += 1;
+  });
+  var charCount = lockedCount || ((project.assets && project.assets.characters) ? project.assets.characters.length : 0);
 
   var charPreviewHtml = "";
   if (project.assets && project.assets.characters) {
@@ -2588,6 +2997,9 @@ function _openSaveTemplateDialog() {
       }
     });
   }
+  var updateOptions = templates.map(function (tpl) {
+    return '<option value="' + escapeHtml(tpl.id) + '"' + (tpl.id === currentWorldId ? ' selected' : '') + '>' + escapeHtml(tpl.name || tpl.id) + '</option>';
+  }).join("");
 
   var overlay = document.createElement("div");
   overlay.id = "saveTplDialog";
@@ -2603,24 +3015,32 @@ function _openSaveTemplateDialog() {
           '</div>' +
           '<div>' +
           '<h3 class="text-base font-bold text-[#1a1a1a]">保存为世界观模板</h3>' +
-          '<p class="text-[11px] text-[#90A4AE] mt-0.5">打包风格圣经和角色设定，供其他项目复用</p>' +
+          '<p class="text-[11px] text-[#90A4AE] mt-0.5">保存角色与世界观参考，不包含风格圣经</p>' +
           '</div>' +
         '</div>' +
         '<div class="mb-5">' +
           '<label class="block text-[11px] font-bold text-[#607D8B] tracking-wide uppercase mb-2">模板名称</label>' +
           '<input type="text" id="saveTplNameInput" class="w-full px-4 py-3 bg-[#F8F9FA] border border-[#E0E0E0] rounded-xl text-sm text-[#1a1a1a] focus:outline-none focus:ring-2 focus:ring-[#5B6ABF]/30 focus:border-[#5B6ABF]/50 transition-all" value="' + escapeHtml(defaultName) + '" />' +
         '</div>' +
+        '<div class="mb-5 bg-[#F8F9FA] rounded-xl p-4 space-y-3">' +
+          '<label class="flex items-center gap-2 text-xs font-bold text-[#2C3E50]"><input type="radio" name="saveTplMode" value="create" checked />新建模板</label>' +
+          '<label class="flex items-center gap-2 text-xs font-bold text-[#2C3E50] ' + (templates.length ? '' : 'opacity-40') + '"><input type="radio" name="saveTplMode" value="update" ' + (templates.length ? '' : 'disabled') + ' />更新已有模板</label>' +
+          '<select id="saveTplUpdateSelect" class="w-full px-3 py-2 bg-white border border-[#E0E0E0] rounded-lg text-xs text-[#2C3E50]" ' + (templates.length ? '' : 'disabled') + '>' + updateOptions + '</select>' +
+        '</div>' +
         '<div class="bg-[#F8F9FA] rounded-xl p-4 space-y-2.5">' +
           '<div class="flex items-center justify-between text-[11px]">' +
-            '<span class="text-[#90A4AE] font-medium">风格圣经</span>' +
-            '<span class="text-[#2C3E50] font-bold">' + hasStyleBible + '</span>' +
-          '</div>' +
-          '<div class="flex items-center justify-between text-[11px]">' +
-            '<span class="text-[#90A4AE] font-medium">角色</span>' +
+            '<span class="text-[#90A4AE] font-medium">locked 角色</span>' +
             '<div class="flex items-center gap-2">' +
               (charPreviewHtml ? '<div class="flex items-center">' + charPreviewHtml + '</div>' : '') +
               '<span class="text-[#2C3E50] font-bold">' + charCount + ' 个</span>' +
             '</div>' +
+          '</div>' +
+          (draftCount ? '<p class="text-[10px] text-[#8A6D3B]">另有 ' + draftCount + ' 个 draft / needs_review 角色，默认不会保存。</p>' : '') +
+          '<div class="grid grid-cols-2 gap-2 pt-2 border-t border-[#E0E0E0]">' +
+            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeCharacters" checked /> 包含角色</label>' +
+            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeLocations" checked /> 包含场景</label>' +
+            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeProps" checked /> 包含道具</label>' +
+            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeTerminology" checked /> 包含术语</label>' +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -2640,57 +3060,68 @@ function _openSaveTemplateDialog() {
   input.focus();
   input.select();
 
-  overlay.querySelector("#saveTplCancel").addEventListener("click", function () { overlay.remove(); });
-  overlay.querySelector("#saveTplConfirm").addEventListener("click", async function () {
+  async function submitSaveTemplate() {
     var name = input.value.trim();
     if (!name) { input.focus(); return; }
+    var modeNode = overlay.querySelector('input[name="saveTplMode"]:checked');
+    var mode = modeNode ? modeNode.value : "create";
+    var select = overlay.querySelector("#saveTplUpdateSelect");
+    var templateId = mode === "update" && select ? select.value : "";
+    if (mode === "update" && !templateId) {
+      showToast("请选择要更新的世界观模板", "warn");
+      return;
+    }
     try {
-      await _doSaveWorldTemplate(name);
+      await _doSaveWorldTemplate(name, {
+        mode: mode,
+        templateId: templateId,
+        include: {
+          characters: !!overlay.querySelector("#saveTplIncludeCharacters").checked,
+          locations: !!overlay.querySelector("#saveTplIncludeLocations").checked,
+          props: !!overlay.querySelector("#saveTplIncludeProps").checked,
+          terminology: !!overlay.querySelector("#saveTplIncludeTerminology").checked
+        }
+      });
       overlay.remove();
     } catch (_) {}
-  });
+  }
+
+  overlay.querySelector("#saveTplCancel").addEventListener("click", function () { overlay.remove(); });
+  overlay.querySelector("#saveTplConfirm").addEventListener("click", submitSaveTemplate);
 
   input.addEventListener("keydown", async function (ev) {
     if (ev.key === "Enter") {
-      var name = input.value.trim();
-      if (!name) return;
-      try {
-        await _doSaveWorldTemplate(name);
-        overlay.remove();
-      } catch (_) {}
+      await submitSaveTemplate();
     }
   });
 }
 
-async function _doSaveWorldTemplate(name) {
-  var chars = [];
-  if (project.assets && project.assets.characters) {
-    chars = project.assets.characters.map(function (ch) {
-      return {
-        name: ch.name, role: ch.role, identity: ch.identity,
-        appearance: ch.appearance, description: ch.description,
-        clothing: ch.clothing, equipment: ch.equipment,
-        temperament: ch.temperament, actionTraits: ch.actionTraits,
-        imagePrompt: ch.imagePrompt,
-        imageUrl: ch.imageUrl, rawUrl: ch.rawUrl,
-        realPhotoUrl: ch.realPhotoUrl, pencilUrl: ch.pencilUrl
-      };
-    });
+async function _doSaveWorldTemplate(name, options) {
+  options = options || {};
+  if (!project || !project.id) {
+    showToast("当前项目尚未保存，无法沉淀世界观模板", "error");
+    throw new Error("missing project id");
   }
-
-  var tpl = {
-    id: "tpl_" + Date.now(),
-    name: name,
-    createdAt: Date.now(),
-    sourceProjectId: project.id || "",
-    coverImageUrl: (chars[0] && (chars[0].realPhotoUrl || chars[0].rawUrl || chars[0].imageUrl || chars[0].pencilUrl)) || "",
-    styleBible: project.styleBible || null,
-    characters: chars
-  };
-
   try {
-    await _appendWorldTemplate(tpl);
-    showToast("世界观模板「" + name + "」已保存", "success");
+    var resp = await fetch("/api/world-templates/from-project", {
+      method: "POST",
+      headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        projectId: project.id,
+        name: name,
+        mode: options.mode || "create",
+        templateId: options.templateId || undefined,
+        include: options.include || {}
+      })
+    });
+    var data = await _parseWorldTemplateResponse(resp);
+    var saved = data.template;
+    if (saved) {
+      if (!_worldTemplatesMem) _worldTemplatesMem = [];
+      _worldTemplatesMem = _worldTemplatesMem.filter(function (tpl) { return tpl.id !== saved.id; });
+      _worldTemplatesMem.unshift(saved);
+    }
+    showToast((options.mode === "update" ? "世界观模板已更新：" : "世界观模板已保存：") + "「" + name + "」", "success");
   } catch (e) {
     showToast("保存世界观模板失败：" + ((e && e.message) || e), "error");
     throw e;
@@ -2700,7 +3131,9 @@ async function _doSaveWorldTemplate(name) {
 export function _applyWorldTemplate(tpl) {
   if (!project) return;
 
-  project.styleBible = tpl.styleBible || project.styleBible || null;
+  var worldSnapshot = snapshotWorldTemplate(tpl);
+  project.selectedWorldTemplateId = worldSnapshot.id || tpl.id || project.selectedWorldTemplateId || null;
+  project.worldTemplateSnapshot = worldSnapshot;
 
   if (tpl.characters && tpl.characters.length) {
     if (!project.assets) project.assets = { characters: [], scenes: [], props: [] };
@@ -2732,10 +3165,58 @@ export function _applyWorldTemplate(tpl) {
   _ctx.saveProject();
 
   var charCount = (tpl.characters || []).length;
-  showToast("已导入世界观模板：风格圣经已替换，" + charCount + " 个角色已追加到资产库", "success");
+  showToast("已导入世界观模板：世界观来源已记录，" + charCount + " 个角色已追加到资产库", "success");
 
   _ctx.refreshOverview();
   _ctx.switchPage("assets");
+}
+
+export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
+  if (!project || !tpl) return;
+
+  var selectedId = String(project.selectedWorldTemplateId || "");
+  var tplId = String(tpl.id || "");
+  if (selectedId && tplId && selectedId === tplId) {
+    project.selectedWorldTemplateId = null;
+    project.worldTemplateSnapshot = null;
+    _ctx.saveProject();
+    if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+    showToast("已清除关联世界观", "info");
+    return;
+  }
+
+  var full = await _loadWorldTemplateDetail(tpl);
+  var worldSnapshot = snapshotWorldTemplate(full || tpl);
+  project.selectedWorldTemplateId = worldSnapshot.id || full.id || tpl.id || null;
+  project.worldTemplateSnapshot = worldSnapshot;
+  _ctx.saveProject();
+  if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+  showToast("已关联世界观「" + ((full && full.name) || "未命名") + "」。它会作为资产候选池和内容规则参考。", "success");
+}
+
+export async function _applyWorldTemplateFromStylePage(tpl) {
+  return _applyWorldTemplateReferenceFromStylePage(tpl);
+}
+
+export async function _applyStyleTemplateFromStylePage(tpl) {
+  if (!project || !tpl) return;
+
+  var selectedId = String(project.selectedStyleTemplateId || "");
+  var tplId = String(tpl.id || "");
+  if (selectedId && tplId && selectedId === tplId) {
+    project.selectedStyleTemplateId = null;
+    project.styleTemplateSnapshot = null;
+    _ctx.saveProject();
+    if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+    showToast("已清除风格模板选择", "info");
+    return;
+  }
+
+  project.selectedStyleTemplateId = tpl.id || null;
+  project.styleTemplateSnapshot = JSON.parse(JSON.stringify(tpl));
+  _ctx.saveProject();
+  if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+  showToast("已选择风格模板「" + ((tpl && tpl.name) || "未命名") + "」。它会参与生成风格圣经。", "success");
 }
 
 async function _deleteWorldTemplate(tplId) {
@@ -2782,7 +3263,6 @@ export function _openTemplateImportModal() {
     previewUrls.slice(0, 3).forEach(function (src) {
       charImgs += '<img src="' + escapeHtml(src) + '" class="w-8 h-8 rounded-full object-cover border-2 border-white -ml-2 first:ml-0" />';
     });
-    var styleSummary = (tpl.hasStyleBible || tpl.styleBible) ? "包含风格圣经" : "无风格圣经";
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
 
     gridHtml +=
@@ -2793,7 +3273,7 @@ export function _openTemplateImportModal() {
             '<span class="material-symbols-outlined text-error text-sm">delete_outline</span>' +
           '</button>' +
         '</div>' +
-        '<p class="text-[11px] text-on-surface-variant/60 leading-relaxed mb-3">' + escapeHtml(styleSummary) + ' · ' + charCount + ' 个角色</p>' +
+        '<p class="text-[11px] text-on-surface-variant/60 leading-relaxed mb-3">世界观参考 · ' + charCount + ' 个角色</p>' +
         '<div class="flex items-center justify-between">' +
           '<div class="flex items-center">' +
             (charImgs ? '<div class="flex items-center">' + charImgs + '</div>' : '') +
@@ -2810,7 +3290,7 @@ export function _openTemplateImportModal() {
       '<div class="flex items-center justify-between px-6 py-4 border-b border-outline-variant/10">' +
         '<div>' +
           '<h3 class="text-lg font-bold text-on-background">从世界观模板创建</h3>' +
-          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个模板，将导入风格圣经并追加角色到当前项目</p>' +
+          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个模板，将关联世界观并追加角色到当前项目</p>' +
         '</div>' +
         '<button class="w-9 h-9 rounded-full hover:bg-surface-container flex items-center justify-center transition-colors" id="btnCloseTplModal">' +
           '<span class="material-symbols-outlined text-on-surface-variant">close</span>' +
@@ -2836,7 +3316,7 @@ export function _openTemplateImportModal() {
       if (!tpl) return;
       showConfirm(
         "导入模板",
-        "将替换风格圣经并追加角色到资产库，已有镜头表和分镜将被清空，确定继续？",
+        "将关联世界观并追加角色到资产库，已有镜头表和分镜将被清空，确定继续？",
         async function () {
           try {
             var full = await _loadWorldTemplateDetail(tpl);
@@ -3187,7 +3667,6 @@ function _renderLibraryTemplates(container, templates) {
       charImgs += '<img src="' + escapeHtml(src) + '" class="w-9 h-9 rounded-full object-cover border-2 border-white -ml-2 first:ml-0 shadow-sm" />';
     });
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
-    var hasStyleBible = (tpl.hasStyleBible || tpl.styleBible) ? "有" : "无";
 
     html +=
       '<div class="group bg-white/60 rounded-xl p-6 border border-[#CFD8DC] shadow-sm hover:shadow-xl transition-all duration-300">' +
@@ -3209,9 +3688,6 @@ function _renderLibraryTemplates(container, templates) {
           '<div class="flex items-center gap-3">' +
             '<div class="flex items-center gap-1.5 text-[10px] text-[#90A4AE]">' +
               '<span class="material-symbols-outlined text-xs">person</span>' + charCount + ' 角色' +
-            '</div>' +
-            '<div class="flex items-center gap-1.5 text-[10px] text-[#90A4AE]">' +
-              '<span class="material-symbols-outlined text-xs">palette</span>风格圣经: ' + hasStyleBible +
             '</div>' +
           '</div>' +
           (charImgs ? '<div class="flex items-center ml-2">' + charImgs + '</div>' : '') +
@@ -3237,7 +3713,7 @@ function _renderLibraryTemplates(container, templates) {
       var idx = parseInt(btn.dataset.tplLibApply, 10);
       var tpl = templates[idx];
       if (!tpl) return;
-      if (!confirm("导入模板将替换风格圣经并追加角色到资产库，已有的镜头表和分镜将被清空，确定继续？")) return;
+      if (!confirm("导入模板将关联世界观并追加角色到资产库，已有的镜头表和分镜将被清空，确定继续？")) return;
       try {
         var full = await _loadWorldTemplateDetail(tpl);
         _applyWorldTemplate(full);
@@ -3348,7 +3824,7 @@ export function _syncAssetToStyleBible(type, idx) {
     if (resp.styleBible) {
       project.styleBible = resp.styleBible;
       _ctx.saveProject();
-      if (typeof _ctx.renderStyleBible === "function") _ctx._ctx.renderStyleBible(project.styleBible);
+      if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     }
   }).catch(function (e) {
     console.warn("[SyncUpstream] backend sync failed:", e);
@@ -3380,7 +3856,7 @@ var _scriptSyncPending = false;
 
 export async function _autoSyncUpstream(type, idx, oldDesc) {
   _syncAssetToStyleBible(type, idx);
-  if (project.styleBible) _ctx.renderStyleBible(project.styleBible);
+  if (project.styleBible && _ctx.refreshStylePage) _ctx.refreshStylePage();
 
   var assetName = _getAssetName(type, idx);
   var newDesc = _getAssetDescText(type, idx);
@@ -3602,11 +4078,14 @@ export function _markDownstreamStale(scope, detail) {
   apiPost("/api/orchestration/compute-stale", {
     scope: scope,
     detail: detail,
-    project: { shots: project.shots, storyboards: project.storyboards, assets: project.assets },
+    project: { styleBible: project.styleBible, shots: project.shots, storyboards: project.storyboards, assets: project.assets },
   }).then(function (resp) {
     if (resp.staleFlags) {
+      _applyServerStaleFlagsToProject(project, ["asset_img_", "storyboard_", "tail_frame_"], resp.staleFlags);
       Object.keys(resp.staleFlags).forEach(function (k) {
-        project._staleFlags[k] = resp.staleFlags[k];
+        // Managed prefixes were mirrored above; other stale families keep their additive semantics.
+        if (/^(asset_img_|storyboard_|tail_frame_)/.test(k)) return;
+        if (resp.staleFlags[k]) project._staleFlags[k] = true;
       });
     }
     _ctx.saveProject();

@@ -4,7 +4,7 @@ import { resolveLocalImagePath } from './image-gen';
 
 export const FRAME_WORKFLOW_SCHEMA_VERSION = 3;
 export type TailFrameIntent = 'none' | 'requested';
-export type TailFrameReferenceStatus = 'ready' | 'unresolvable' | 'missing';
+export type TailFrameReferenceStatus = 'missing' | 'pending' | 'ready' | 'failed' | 'stale' | 'file_missing';
 
 const SINGLE_SHOT_MIGRATION_REASON = 'single_shot_migration';
 
@@ -206,6 +206,36 @@ function tailFrameUrl(sb: any): string {
   return cleanUrl(sb?.frames?.tail?.url) || cleanUrl(sb?.tailFrameUrl);
 }
 
+export function markTailFrameStaleForFirstFrameChange(storyboard: any, opts: { staleAt?: string } = {}): any {
+  const sb = storyboard && typeof storyboard === 'object' ? storyboard : {};
+  const url = tailFrameUrl(sb);
+  if (!url) return sb;
+  const alreadyStaleForFirstFrame =
+    sb.tailFrameReferenceStatus === 'stale' &&
+    (sb.tailFrameStaleReason === 'first_frame_changed' || sb.frames?.tail?.staleReason === 'first_frame_changed');
+  const existingStaleAt = cleanUrl(sb.tailFrameStaleAt) || cleanUrl(sb.frames?.tail?.staleAt);
+  const staleAt = alreadyStaleForFirstFrame && existingStaleAt
+    ? existingStaleAt
+    : opts.staleAt || new Date().toISOString();
+  const frames = sb.frames && typeof sb.frames === 'object' ? { ...sb.frames } : {};
+  if (frames.tail && typeof frames.tail === 'object') {
+    frames.tail = {
+      ...frames.tail,
+      referenceStatus: 'stale',
+      staleAt,
+      staleReason: 'first_frame_changed',
+    };
+  }
+  return {
+    ...sb,
+    frames,
+    tailFrameIntent: validIntent(sb.tailFrameIntent) || 'requested',
+    tailFrameReferenceStatus: 'stale',
+    tailFrameStaleAt: staleAt,
+    tailFrameStaleReason: 'first_frame_changed',
+  };
+}
+
 function validIntent(value: any): TailFrameIntent | null {
   return value === 'requested' || value === 'none' ? value : null;
 }
@@ -218,7 +248,7 @@ function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, 
   const localPath = url ? resolveProtectedImageFilePath(url, userId) : null;
   const referenceStatus: TailFrameReferenceStatus =
     intent === 'requested'
-      ? (url ? (localPath ? 'ready' : 'unresolvable') : 'missing')
+      ? (url ? (localPath ? 'ready' : 'file_missing') : 'missing')
       : 'missing';
   const storedTailShotIndices = Array.isArray(sb?.frames?.tail?.shotIndices)
     ? normalizedShotIndices(sb.frames.tail.shotIndices, Array.isArray(project?.shots) ? project.shots.length : 0)

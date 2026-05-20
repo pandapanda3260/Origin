@@ -7,9 +7,11 @@ import { randomUUID } from 'node:crypto';
 import { getDb } from '@/lib/db';
 import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
+import { getDataDir } from '@/lib/runtime-paths';
 import {
   computeFirstFrameSourceHash,
   computeTailFrameSourceHash,
+  markTailFrameStaleForFirstFrameChange,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
 } from '@/lib/frame-workflow-state';
@@ -17,7 +19,7 @@ import {
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-const DATA_DIR = join(process.cwd(), 'data');
+const DATA_DIR = getDataDir();
 const IMAGES_DIR = join(DATA_DIR, 'images');
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_REQUEST_BYTES = MAX_IMAGE_BYTES + 1 * 1024 * 1024;
@@ -131,7 +133,7 @@ export async function POST(req: NextRequest) {
       const firstFrameSourceHash = !isTail ? computeFirstFrameSourceHash(fresh, user.id, groupIdx) : null;
       if (isTail) uploadedTailFrameSourceHash = tailFrameSourceHash;
       else uploadedFirstFrameSourceHash = firstFrameSourceHash;
-      storyboards[groupIdx] = isTail
+      const nextStoryboard = isTail
         ? {
           ...prev,
           idx: groupIdx,
@@ -199,6 +201,9 @@ export async function POST(req: NextRequest) {
             },
           },
         };
+      storyboards[groupIdx] = isTail
+        ? nextStoryboard
+        : markTailFrameStaleForFirstFrameChange(nextStoryboard, { staleAt: generatedAt });
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'frame-upload');
       return { storyboards };
     });

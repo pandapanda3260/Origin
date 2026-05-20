@@ -1,16 +1,13 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
-import { chatStream, chatComplete, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
+import { chatStream, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import {
   buildFullCreateMessages,
-  buildStyleBibleMessages,
   buildRetagMessages,
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
-import { sinicizeColorPalette } from '@/lib/style-bible';
-import { sanitizePromptObject } from '@/lib/content-sanitize';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -74,31 +71,7 @@ export async function POST(req: NextRequest) {
       .replace(/\n{3,}/g, '\n\n')
       .trim();
 
-    // === 2. 提取风格圣经（非流式 JSON，带 3 次重试）===
-    writer.phase('style_bible_start');
-    writer.step('正在提取风格圣经…');
-    let styleBible: any = null;
-    let styleBibleStatus: 'ready' | 'failed' = 'failed';
-    let styleBibleError = '';
-    let styleBibleGeneratedAt: string | null = null;
-    try {
-      styleBible = await chatCompleteJsonWithRetry(
-        user,
-        buildStyleBibleMessages(scriptText),
-        { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
-        (raw) => parseJsonLoose(raw),
-        'styleBible',
-      );
-      styleBible = sanitizePromptObject(sinicizeColorPalette(styleBible));
-      styleBibleStatus = 'ready';
-      styleBibleGeneratedAt = new Date().toISOString();
-    } catch (e: any) {
-      styleBibleError = e?.message || String(e);
-      console.warn('[consult/confirm] styleBible failed after retries:', styleBibleError);
-      writer.event('style_bible_failed', { styleBibleStatus, styleBibleError });
-    }
-
-    // === 3. 情绪标记（非流式 JSON，带 3 次重试）===
+    // === 2. 情绪标记（非流式 JSON，带 3 次重试）===
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
     let emotions: any[] = [];
@@ -115,15 +88,11 @@ export async function POST(req: NextRequest) {
       console.warn('[consult/confirm] emotions failed after retries:', e?.message);
     }
 
-    // === 4. 写回项目 ===
+    // === 3. 写回项目 ===
     if (projectId && proj) {
       updateProjectForUser(projectId, user.id, {
         scriptDraft: scriptText,
         script: scriptText,
-        styleBible,
-        styleBibleStatus,
-        styleBibleError,
-        styleBibleGeneratedAt,
         emotions,
         scriptApproved: false,
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
@@ -133,10 +102,6 @@ export async function POST(req: NextRequest) {
 
     writer.done({
       script: scriptText,
-      styleBible,
-      styleBibleStatus,
-      styleBibleError,
-      styleBibleGeneratedAt,
       // 前端 script.js 读 emotionSegments；同时保留 emotions 便于其它老调用方
       emotionSegments: emotions,
       emotions,

@@ -6,6 +6,27 @@ function readBoolEnv(name: string, defaultValue: boolean): boolean {
   return defaultValue;
 }
 
+export type VideoSubmitMode = 'auto' | 'strict_first_frame' | 'first_last_frame' | 'reference_images';
+
+function readEnumEnv<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+  const raw = String(process.env[name] || '').trim().toLowerCase();
+  if (!raw) return fallback;
+  return (allowed as readonly string[]).includes(raw) ? raw as T : fallback;
+}
+
+/**
+ * 视频提交模式唯一入口：
+ * - auto: 按片段条件选择最稳的合法模式。
+ * - strict_first_frame: 首帧按 Seedance first_frame 提交，其他视觉参考降级到提示词。
+ * - first_last_frame: 仅允许官方首尾帧通道。
+ * - reference_images: 多图全部按 reference_image 提交，牺牲严格首帧换多视觉参考。
+ *
+ * 默认 auto 是产品策略选择；如需完全复用旧多图行为，可显式设为 reference_images。
+ */
+export function getVideoSubmitMode(): VideoSubmitMode {
+  return readEnumEnv('VIDEO_SUBMIT_MODE', ['auto', 'strict_first_frame', 'first_last_frame', 'reference_images'] as const, 'auto');
+}
+
 /**
  * 多参生视频模式：
  * - on: 分镜槽位生成彩色视频首帧，并让视频生成优先使用首帧 + 多资产参考。
@@ -36,10 +57,11 @@ export function isIndependentMultiImageModeEnabled(): boolean {
  *   (content: text + first_frame + last_frame)。
  * - off: 稳定回退到 Builder B（首帧 + 多参考图），尾帧只保留为 UI/数据状态。
  *
- * 默认关闭，避免有老尾帧意图的项目在未确认时自动切换到互斥的首尾帧通道。
+ * 默认开启；仍要求 tailFrameIntent=requested、尾帧 ready、模型 capability
+ * supported，且可用 ORIGIN_FIRST_LAST_FRAME_VIDEO_MODE=0 快速回滚。
  */
 export function isFirstLastFrameVideoModeEnabled(): boolean {
-  return readBoolEnv('ORIGIN_FIRST_LAST_FRAME_VIDEO_MODE', false);
+  return readBoolEnv('ORIGIN_FIRST_LAST_FRAME_VIDEO_MODE', true);
 }
 
 /**
@@ -49,4 +71,19 @@ export function isFirstLastFrameVideoModeEnabled(): boolean {
  */
 export function isTailFrameCaptionFallbackEnabled(): boolean {
   return readBoolEnv('ORIGIN_TAIL_FRAME_CAPTION_FALLBACK', false);
+}
+
+export function getKnowledgeSelectiveInjectionStages(): string[] {
+  const raw = String(process.env.KNOWLEDGE_SELECTIVE_INJECTION_STAGES || '').trim();
+  if (!raw) return [];
+  if (raw === '*') return ['*'];
+  return raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function isKnowledgeSelectiveInjectionEnabledForStage(stage: string): boolean {
+  const stages = getKnowledgeSelectiveInjectionStages();
+  return stages.includes('*') || stages.includes(stage);
 }

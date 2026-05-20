@@ -160,7 +160,8 @@ function recommendOrder(byDriftType) {
   return emitted;
 }
 
-const dbPath = process.env.DB_PATH || path.join(process.cwd(), 'data', 'qd.sqlite');
+const dataDir = process.env.ORIGIN_DATA_DIR || process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const dbPath = process.env.DB_PATH || path.join(dataDir, 'qd.sqlite');
 const db = new Database(dbPath, { readonly: true, fileMustExist: false });
 const since = new Date(Date.now() - budget.days * 24 * 60 * 60 * 1000).toISOString();
 const limitClause = Number.isFinite(budget.maxProjects) ? `LIMIT ${Math.max(1, Math.floor(budget.maxProjects))}` : '';

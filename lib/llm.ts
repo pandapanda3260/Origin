@@ -14,6 +14,7 @@ import type { UserRow } from './db';
 import {
   resolveSlotModelConfig,
   resolveTextModelConfig,
+  recordModelCallEvent,
   type ResolvedModelConfig,
   type TextModelRole,
 } from './model-routing';
@@ -37,6 +38,7 @@ export type LLMOptions = {
   traceName?: string;
   traceAttempt?: number;
   traceMaxAttempts?: number;
+  maxAttempts?: number;
   // 覆盖默认模型选择（默认用 settings 里的 text 模型）
   modelOverride?: string;
 };
@@ -145,6 +147,16 @@ export async function chatComplete(
   try {
     return await chatCompleteOnce(cfg, messages, budgetedOpts);
   } catch (e: any) {
+    const fallbackCfg = selectTextFallbackConfig(cfg, e, opts);
+    if (fallbackCfg) {
+      console.warn(
+        `[llm.fallback] ${opts.traceName || 'chatComplete'} ` +
+        `${cfg.provider}/${cfg.model} -> ${fallbackCfg.provider}/${fallbackCfg.model}: ${String(e?.message || e).slice(0, 240)}`,
+      );
+      const fallbackOpts = applyTokenBudget(fallbackCfg, messages, initialOpts, 'complete');
+      return chatCompleteOnce(fallbackCfg, messages, fallbackOpts);
+    }
+
     const policy = resolveTaskOutputPolicy(opts.traceName);
     const decision = classifyJsonRetryError(e);
     const canRetryOutputIncomplete =
@@ -183,6 +195,74 @@ async function chatCompleteOnce(
   return openAIChatComplete(cfg, messages, opts);
 }
 
+function selectTextFallbackConfig(
+  cfg: ResolvedModelConfig,
+  error: any,
+  opts: LLMOptions,
+): ResolvedModelConfig | null {
+  if (!cfg.fallbackConfigs?.length) return null;
+  if (opts.modelOverride) return null;
+  if (!isTextFallbackEligible(error)) return null;
+  return cfg.fallbackConfigs[0] || null;
+}
+
+function isTextFallbackEligible(error: any): boolean {
+  const parsed = classifyModelCallError(error);
+  const statusCode = parsed.statusCode;
+  if (statusCode === 429 || (statusCode != null && statusCode >= 500)) return true;
+  if (statusCode != null && statusCode >= 400) return false;
+
+  const message = String(error?.message || error || '').toLowerCase();
+  if (error?.llmStatus === 'incomplete') return false;
+  return [
+    'timeout',
+    '超时',
+    'fetch failed',
+    'network',
+    'econnreset',
+    'etimedout',
+    'eai_again',
+    'socket hang up',
+    'retry_deadline_exceeded',
+  ].some((needle) => message.includes(needle));
+}
+
+async function observeTextModelCall<T>(
+  cfg: ResolvedModelConfig,
+  opts: LLMOptions,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const started = Date.now();
+  try {
+    const result = await fn();
+    recordModelCallEvent({
+      cfg,
+      slot: cfg.role || opts.modelRole || 'text',
+      status: 'ok',
+      latencyMs: Date.now() - started,
+      traceName: opts.traceName,
+      fallbackUsed: !!cfg.fallbackOf,
+      meta: modelUsageMeta(result),
+    });
+    return result;
+  } catch (error: any) {
+    const parsed = classifyModelCallError(error);
+    recordModelCallEvent({
+      cfg,
+      slot: cfg.role || opts.modelRole || 'text',
+      status: parsed.status,
+      statusCode: parsed.statusCode,
+      errorCode: parsed.errorCode,
+      latencyMs: Date.now() - started,
+      traceName: opts.traceName,
+      fallbackUsed: !!cfg.fallbackOf,
+      message: parsed.message,
+      meta: modelUsageMeta(error?.usage),
+    });
+    throw error;
+  }
+}
+
 async function openAIChatComplete(
   cfg: ResolvedModelConfig,
   messages: ChatMessage[],
@@ -201,13 +281,13 @@ async function openAIChatComplete(
   }
 
   const timeoutMs = opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS;
-  const json: any = await postJsonWithTimeout(
+  const json: any = await observeTextModelCall(cfg, opts, () => postJsonWithTimeout(
     `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
     cfg.apiKey,
     body,
     timeoutMs,
     `LLM 请求超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
-  );
+  ));
   const choice = json?.choices?.[0];
   const finishReason = String(choice?.finish_reason || '');
   if (finishReason === 'length') {
@@ -225,13 +305,13 @@ async function claudeMessagesComplete(
   opts: LLMOptions = {},
 ): Promise<string> {
   const body = buildClaudeMessagesBody(cfg, messages, opts, false);
-  const json = await postJsonWithTimeout(
+  const json = await observeTextModelCall(cfg, opts, () => postJsonWithTimeout(
     `${cfg.baseUrl}${cfg.endpoint || '/messages'}`,
     cfg.apiKey,
     body,
     opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS,
     `LLM 请求超时（>${Math.round((opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS) / 1000)}s 未返回）`,
-  );
+  ));
   const stopReason = String(json?.stop_reason || json?.message?.stop_reason || '').toLowerCase();
   if (stopReason === 'max_tokens') {
     throw outputIncompleteError('max_tokens', opts, json?.usage || null, { stop_reason: stopReason });
@@ -247,13 +327,13 @@ async function responsesComplete(
   opts: LLMOptions = {},
 ): Promise<string> {
   const body = buildResponsesBody(cfg, messages, opts, false);
-  const json = await postJsonWithTimeout(
+  const json = await observeTextModelCall(cfg, opts, () => postJsonWithTimeout(
     `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
     cfg.apiKey,
     body,
     opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS,
     `LLM 请求超时（>${Math.round((opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS) / 1000)}s 未返回）`,
-  );
+  ));
   const status = String(json?.status || json?.response?.status || 'unknown');
   const usage = summarizeResponsesUsage(json);
   const incompleteDetails = getResponsesIncompleteDetails(json);
@@ -287,6 +367,28 @@ function summarizeResponsesUsage(json: any) {
     totalTokens: typeof usage?.total_tokens === 'number' ? usage.total_tokens : null,
     reasoningTokens: typeof outputDetails?.reasoning_tokens === 'number' ? outputDetails.reasoning_tokens : null,
   };
+}
+
+function modelUsageMeta(value: any): Record<string, unknown> {
+  const usage = value?.usage || value?.response?.usage || value || {};
+  const outputDetails = usage?.output_tokens_details || {};
+  const inputTokens = firstNumber(usage.inputTokens, usage.input_tokens, usage.prompt_tokens);
+  const outputTokens = firstNumber(usage.outputTokens, usage.output_tokens, usage.completion_tokens);
+  const totalTokens = firstNumber(usage.totalTokens, usage.total_tokens);
+  const reasoningTokens = firstNumber(usage.reasoningTokens, outputDetails.reasoning_tokens);
+  const meta: Record<string, unknown> = {};
+  if (inputTokens !== null) meta.inputTokens = inputTokens;
+  if (outputTokens !== null) meta.outputTokens = outputTokens;
+  if (totalTokens !== null) meta.totalTokens = totalTokens;
+  if (reasoningTokens !== null) meta.reasoningTokens = reasoningTokens;
+  return meta;
+}
+
+function firstNumber(...values: any[]) {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return null;
 }
 
 function formatUsageSummary(usage: ReturnType<typeof summarizeResponsesUsage> | undefined): string {
@@ -345,6 +447,26 @@ function extractApiErrorMessage(text: string): string {
   } catch {
     return '';
   }
+}
+
+function classifyModelCallError(error: any) {
+  const message = String(error?.message || error || '').slice(0, 500);
+  const statusMatch = /\bLLM\s+(\d{3})\b/.exec(message);
+  const statusCode = statusMatch ? Number(statusMatch[1]) : null;
+  const lower = message.toLowerCase();
+  if (statusCode === 429 || lower.includes('rate limit') || lower.includes('rate_limited') || lower.includes('too many requests')) {
+    return { status: 'rate_limited', statusCode, errorCode: 'rate_limited', message };
+  }
+  if (lower.includes('timeout') || lower.includes('超时')) {
+    return { status: 'failed', statusCode, errorCode: 'timeout', message };
+  }
+  if (statusCode && statusCode >= 500) {
+    return { status: 'failed', statusCode, errorCode: `http_${statusCode}`, message };
+  }
+  if (statusCode && statusCode >= 400) {
+    return { status: 'error', statusCode, errorCode: `http_${statusCode}`, message };
+  }
+  return { status: 'failed', statusCode, errorCode: error?.llmStatus || 'exception', message };
 }
 
 function selectTextRole(opts: LLMOptions): TextModelRole {
@@ -609,6 +731,7 @@ function buildResponsesBody(
     stream,
   };
   if (opts.stop) body.stop = opts.stop;
+  if (cfg.disableResponseStorage) body.store = false;
   const reasoningEffort = opts.reasoningEffort === null
     ? ''
     : (opts.reasoningEffort || cfg.reasoningEffort || '');
@@ -642,10 +765,20 @@ function toClaudeMessages(messages: ChatMessage[]) {
 }
 
 function toResponsesInput(messages: ChatMessage[]) {
+  // OpenAI Responses API 协议适配:
+  //   - tool 角色不被 Responses API 接受, 折叠回 user;
+  //   - system 在新版 Responses API (gpt-5.x 等) 上不会被算进
+  //     "input messages must contain the word 'json'" 校验范围,
+  //     必须改写成官方推荐的 'developer'。语义等价。
+  //   - 其它角色 (user / assistant / developer) 原样透传。
   const out = messages
     .filter((msg) => String(msg.content || '').trim())
     .map((msg) => ({
-      role: msg.role === 'tool' ? 'user' : msg.role,
+      role: msg.role === 'tool'
+        ? 'user'
+        : msg.role === 'system'
+          ? 'developer'
+          : msg.role,
       content: msg.content,
     }));
   return out.length ? out : [{ role: 'user', content: 'ping' }];
@@ -714,7 +847,7 @@ export async function chatCompleteJsonWithRetry<T = any>(
   parser: (raw: string) => T,
   taskName = 'json-task',
 ): Promise<T> {
-  const maxAttempts = 3;
+  const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts || 3));
   const role = opts.modelRole || 'structured';
   const cfg = resolveTextModelConfig(user, role);
   const model = opts.modelOverride || cfg.model;
@@ -1108,8 +1241,17 @@ async function streamJsonEvents(
           const evt: any = JSON.parse(payload);
           if (evt?.type === 'response.incomplete' || evt?.response?.status === 'incomplete') {
             const details = evt?.response?.incomplete_details || evt?.incomplete_details || {};
-            const reason = details?.reason ? `输出未完成：${details.reason}` : '输出未完成';
-            throw new Error(`LLM 流错误: ${reason}`);
+            const rawReason = details?.reason ? String(details.reason) : '';
+            const reason = rawReason ? `输出未完成：${rawReason}` : '输出未完成';
+            // 流式 incomplete 错误同样挂上 llmStatus/incompleteReason，让上层（路由 / chatStream
+            // 调用方）能像 chatComplete 那样按结构化字段判定要不要 retry-with-higher-budget，
+            // 而不是只能 string-match 错误文案。
+            const err: any = new Error(`LLM 流错误: ${reason}`);
+            err.llmStatus = 'incomplete';
+            err.incompleteReason = rawReason || 'unknown';
+            err.incompleteDetails = details || null;
+            err.usage = evt?.response?.usage || evt?.usage || null;
+            throw err;
           }
           if (evt?.error || evt?.type === 'error' || evt?.type === 'response.failed') {
             const err = evt?.error || evt?.response?.error || evt;

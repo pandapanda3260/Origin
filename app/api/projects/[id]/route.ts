@@ -98,6 +98,7 @@ function characterPatchFromAsset(character: any) {
 function applyProjectPutCharacterConsistency(current: any, body: any) {
   const patch = { ...(body || {}) };
   delete (patch as any).consistency;
+  delete (patch as any).allowStyleBibleRunOverwrite;
   if (!current) return patch;
 
   const nextProject: any = { ...current, ...patch };

@@ -110,6 +110,8 @@ export function chargeCredits(opts: {
   kind: CreditKind;
   reason: string;
   refId?: string;
+  chargeRefId?: string;
+  idempotencyKey?: string;
 }): { ledgerId: string; balanceAfter: number } {
   if (!Number.isInteger(opts.amount) || opts.amount <= 0) {
     throw new Error('amount 必须是正整数');
@@ -117,6 +119,18 @@ export function chargeCredits(opts: {
   const db = getDb();
   let out: { ledgerId: string; balanceAfter: number } | null = null;
   const txn = db.transaction(() => {
+    if (opts.chargeRefId) {
+      const existing = db
+        .prepare<{ ref: string }, any>(
+          'SELECT id, balance_after FROM credit_ledger WHERE charge_ref_id = @ref LIMIT 1',
+        )
+        .get({ ref: opts.chargeRefId });
+      if (existing) {
+        out = { ledgerId: String(existing.id), balanceAfter: Number(existing.balance_after || 0) };
+        return;
+      }
+    }
+
     const cur = getBalance(opts.userId);
     if (cur.totalCredits < opts.amount) {
       throw new InsufficientCreditsError(opts.amount, cur.totalCredits);
@@ -164,9 +178,21 @@ export function chargeCredits(opts: {
       subscription: subUse,
     });
     db.prepare(
-      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after, buckets_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(ledgerId, opts.userId, -opts.amount, opts.kind, opts.reason.slice(0, 200), opts.refId || null, newTotal, bucketsJson);
+      `INSERT INTO credit_ledger
+        (id, user_id, amount, kind, reason, ref_id, idempotency_key, charge_ref_id, balance_after, buckets_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      ledgerId,
+      opts.userId,
+      -opts.amount,
+      opts.kind,
+      opts.reason.slice(0, 200),
+      opts.refId || null,
+      opts.idempotencyKey || null,
+      opts.chargeRefId || null,
+      newTotal,
+      bucketsJson,
+    );
 
     out = { ledgerId, balanceAfter: newTotal };
   });
@@ -188,8 +214,10 @@ export function refundCredits(opts: {
   amount: number;
   reason: string;
   refId?: string;
+  refundRefId?: string;
+  idempotencyKey?: string;
   bucket?: 'subscription' | 'topup' | 'bonus';
-}) {
+}): { ledgerId: string | null; balanceAfter: number | null; alreadyApplied: boolean } | void {
   if (!Number.isInteger(opts.amount) || opts.amount <= 0) return;
   const db = getDb();
 
@@ -227,6 +255,21 @@ export function refundCredits(opts: {
   }
 
   const txn = db.transaction(() => {
+    if (opts.refundRefId) {
+      const existing = db
+        .prepare<{ ref: string }, any>(
+          'SELECT id, balance_after FROM credit_ledger WHERE refund_ref_id = @ref LIMIT 1',
+        )
+        .get({ ref: opts.refundRefId });
+      if (existing) {
+        return {
+          ledgerId: String(existing.id),
+          balanceAfter: Number(existing.balance_after || 0),
+          alreadyApplied: true,
+        };
+      }
+    }
+
     const cur = getBalance(opts.userId);
     const newSub = cur.subscriptionCredits + refund.subscription;
     const newTop = cur.topupCredits + refund.topup;
@@ -240,20 +283,25 @@ export function refundCredits(opts: {
        WHERE user_id = ?`,
     ).run(newSub, newTop, newBon, newTotal, opts.userId);
 
+    const ledgerId = randomUUID();
     db.prepare(
-      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after, buckets_json)
-       VALUES (?, ?, ?, 'refund', ?, ?, ?, ?)`,
+      `INSERT INTO credit_ledger
+        (id, user_id, amount, kind, reason, ref_id, idempotency_key, refund_ref_id, balance_after, buckets_json)
+       VALUES (?, ?, ?, 'refund', ?, ?, ?, ?, ?, ?)`,
     ).run(
-      randomUUID(),
+      ledgerId,
       opts.userId,
       opts.amount,
       opts.reason.slice(0, 200),
       opts.refId || null,
+      opts.idempotencyKey || null,
+      opts.refundRefId || null,
       newTotal,
       JSON.stringify(refund),
     );
+    return { ledgerId, balanceAfter: newTotal, alreadyApplied: false };
   });
-  txn.immediate();
+  return txn.immediate();
 }
 
 /**

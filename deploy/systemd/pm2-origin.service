@@ -1,0 +1,20 @@
+[Unit]
+Description=PM2 daemon for Origin process group
+After=network.target
+
+[Service]
+Type=forking
+User=origin
+Environment=PM2_HOME=/home/origin/.pm2
+EnvironmentFile=-/etc/origin/origin.env
+ExecStart=/usr/bin/pm2 resurrect
+ExecReload=/usr/bin/pm2 reload all
+ExecStop=/usr/bin/pm2 kill
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
