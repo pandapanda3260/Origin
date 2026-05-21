@@ -9,6 +9,10 @@ export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDeri
 export type ProviderKind =
   | 'openai_chat'
   | 'openai_responses'
+  | 'packy_messages'
+  | 'packy_images'
+  | 'code80_messages'
+  | 'code80_images'
   | 'zerail_messages'
   | 'zerail_responses'
   | 'zerail_images'
@@ -97,7 +101,7 @@ export function resolveTextModelConfig(
         baseUrl: env('CLAUDE_API_BASE') || env('TEXT_API_BASE') || 'https://gateway.zerail.com/v1',
         apiKey: key,
         model: env('CLAUDE_MODEL') || env('MODEL_PRIMARY_BRAIN') || 'claude-opus-4-7',
-        provider: 'zerail_messages',
+        provider: inferProvider(env('CLAUDE_PROVIDER') || 'zerail_messages', 'text'),
         endpoint: env('CLAUDE_API_ENDPOINT') || '/messages',
         role,
         source: 'env',
@@ -333,7 +337,7 @@ function inferDefaultCapabilities(provider: ProviderKind): ModelCapabilities {
       },
     };
   }
-  if (provider === 'zerail_images') {
+  if (provider === 'zerail_images' || provider === 'code80_images' || provider === 'packy_images') {
     // OpenAI GPT image models edit 官方上限 16; multipart 字段名需要 probe 实测
     // (image 重复 / image[] / image_files[] 都是候选)。
     return {
@@ -380,6 +384,10 @@ function inferProvider(provider: string, slot: ModelSlot): ProviderKind {
   const p = provider.toLowerCase();
   if (p.includes('seedream') || p.includes('volcengine')) return 'volcengine_seedream';
   if (p.includes('seedance')) return 'seedance';
+  if (p.includes('packy') && p.includes('image')) return 'packy_images';
+  if (p.includes('packy') && (p.includes('message') || p.includes('claude'))) return 'packy_messages';
+  if (p.includes('code80') && p.includes('image')) return 'code80_images';
+  if (p.includes('code80') && (p.includes('message') || p.includes('claude'))) return 'code80_messages';
   if (p.includes('image')) return 'zerail_images';
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
   if (p.includes('response')) return 'zerail_responses';
@@ -398,6 +406,7 @@ function defaultModel(slot: ModelSlot): string {
 function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind {
   const p = provider.toLowerCase();
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
+  if (p.includes('packy')) return 'openai_responses';
   if (p.includes('code80')) return 'openai_responses';
   if (p.includes('zerail') && p.includes('response')) return 'zerail_responses';
   return baseUrl.toLowerCase().includes('api.openai.com') ? 'openai_responses' : 'zerail_responses';
@@ -532,11 +541,11 @@ function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX
   else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
   else if (role === 'brain') names.push(`BRAIN_${suffix}`, `CLAUDE_${suffix}`);
 
-  if (provider === 'zerail_messages') names.push(`CLAUDE_${suffix}`);
+  if (provider === 'zerail_messages' || provider === 'code80_messages' || provider === 'packy_messages') names.push(`CLAUDE_${suffix}`);
   if (provider === 'openai_chat' || provider === 'openai_responses' || provider === 'zerail_responses') {
     names.push(`TEXT_${suffix}`, `OPENAI_${suffix}`);
   }
-  if (provider === 'zerail_images') names.push(`IMAGE_${suffix}`);
+  if (provider === 'zerail_images' || provider === 'code80_images' || provider === 'packy_images') names.push(`IMAGE_${suffix}`);
   if (provider === 'volcengine_seedream') names.push(`IMAGE_${suffix}`);
   if (provider === 'seedance') names.push(`VIDEO_${suffix}`);
 

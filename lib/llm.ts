@@ -186,7 +186,7 @@ async function chatCompleteOnce(
   messages: ChatMessage[],
   opts: LLMOptions,
 ): Promise<string> {
-  if (cfg.provider === 'zerail_messages') {
+  if (cfg.provider === 'zerail_messages' || cfg.provider === 'code80_messages' || cfg.provider === 'packy_messages') {
     return claudeMessagesComplete(cfg, messages, opts);
   }
   if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
@@ -1037,7 +1037,7 @@ export async function chatStream(
   }
   const budgetedOpts = applyTokenBudget(cfg, messages, opts, 'stream');
 
-  if (cfg.provider === 'zerail_messages') {
+  if (cfg.provider === 'zerail_messages' || cfg.provider === 'code80_messages' || cfg.provider === 'packy_messages') {
     return claudeMessagesStream(cfg, messages, budgetedOpts, onChunk);
   }
   if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
