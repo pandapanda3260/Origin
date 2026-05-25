@@ -397,7 +397,7 @@ async function generateRealImageBuffer(
     const NETWORK_BASE_DELAY_MS = envInt('IMAGE_GEN_NETWORK_RETRY_BASE_MS', 10_000, 1_000, 120_000);
     const NETWORK_MAX_DELAY_MS = envInt('IMAGE_GEN_NETWORK_RETRY_MAX_MS', 90_000, 1_000, 300_000);
     const RETRY_DEADLINE_MS = envInt('IMAGE_GEN_RETRY_DEADLINE_MS', 120_000, 10_000, 600_000);
-    const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
+    let retryDeadlineAt = 0;
     const fallbackAttemptFloor = !isFallback && fallbackConfigs.length ? fallbackAfter : 1;
     const MAX_ATTEMPTS = Math.max(
       fallbackAttemptFloor,
@@ -410,23 +410,24 @@ async function generateRealImageBuffer(
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       // 单次调用超时由平台 env 控制；未配置时保留原来的 240s。
-      const remainingBudget = retryDeadlineAt - Date.now();
-      if (remainingBudget <= 0) {
+      if (retryDeadlineAt > 0 && retryDeadlineAt - Date.now() <= 0) {
         throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
       }
       let attemptTimeoutMs = 0;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      const tA = Date.now();
+      let tA = Date.now();
       let releaseSubmitPermit: null | (() => void) = null;
       try {
         releaseSubmitPermit = await acquireImageSubmitPermit(
           `${input.kind}:${input.assetRef || 'unscoped'}:${cfg.provider}:attempt${attempt}`,
         );
+        if (!retryDeadlineAt) retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
         const submitRemainingBudget = retryDeadlineAt - Date.now();
         if (submitRemainingBudget <= 0) {
           throw new Error('图像生成失败：retry_deadline_exceeded，网络/限流重试超过总预算');
         }
         attemptTimeoutMs = Math.max(1000, Math.min(requestTimeoutMs, submitRemainingBudget));
+        tA = Date.now();
         const controller = new AbortController();
         timeoutId = setTimeout(() => controller.abort(), attemptTimeoutMs);
         let resp: Response;

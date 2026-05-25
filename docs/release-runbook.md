@@ -164,6 +164,8 @@ TS
 
 Do not print provider API keys or full `/etc/origin/origin.env` contents in release logs.
 
+For gpt-image-only production mode, also confirm the image route reports `fallbackConfigs=0` and watch `origin-worker` logs after restart. `seedream` should not appear in new image-generation attempts when `IMAGE_FALLBACK_ENABLED=false`.
+
 ## Rollback
 
 Use code rollback first when the database changes are additive:
