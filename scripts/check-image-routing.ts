@@ -28,24 +28,30 @@ function main() {
   const status = redactConfig(cfg);
   console.log(JSON.stringify(status, null, 2));
 
-  if (cfg.provider !== 'zerail_images' || !/gpt-image-2/i.test(cfg.model || '')) {
+  if (cfg.mode !== 'real' || !cfg.apiKey) {
     console.warn(
-      '[check-image-routing] image primary is not Zerail GPT-image-2. Set IMAGE_PROVIDER=zerail_images, IMAGE_API_KEY, and IMAGE_MODEL=gpt-image-2.',
+      '[check-image-routing] image primary is not configured. Set IMAGE_PROVIDER, IMAGE_API_BASE, IMAGE_API_KEY, and IMAGE_MODEL in the external env file.',
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  if (!cfg.baseUrl || !cfg.model || !cfg.provider || cfg.provider === 'fake') {
+    console.warn(
+      '[check-image-routing] image primary resolved to an incomplete provider/model/baseUrl tuple.',
     );
     process.exitCode = 2;
     return;
   }
 
   const fallback = cfg.fallbackConfigs?.[0];
-  if (!fallback || fallback.provider !== 'volcengine_seedream' || !fallback.apiKey) {
-    console.warn(
-      '[check-image-routing] Seedream fallback is not configured. Keep IMAGE_SEEDREAM_API_KEY or set IMAGE_FALLBACK_API_KEY.',
-    );
+  if (fallback && !fallback.apiKey) {
+    console.warn('[check-image-routing] image fallback exists but has no API key.');
     process.exitCode = 2;
     return;
   }
 
-  console.log('[check-image-routing] image primary/fallback routing is ready');
+  console.log('[check-image-routing] image routing is ready for the current external env');
 }
 
 main();

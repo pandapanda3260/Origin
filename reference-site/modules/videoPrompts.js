@@ -230,7 +230,7 @@ export function refreshPromptsPage() {
   _syncRefs();
   var needImages = $("promptsNeedImages");
   var ready = $("promptsReady");
-  if (!project || !project.imagesApproved || !project.shots || !project.shots.length) {
+  if (!project || !project.shots || !project.shots.length) {
     if (needImages) needImages.hidden = false;
     if (ready) ready.hidden = true;
     var vf = $("vpStoryboardFrames"); if (vf) vf.innerHTML = "";

@@ -142,6 +142,13 @@ export function markStoryboardVideoOutdated<T extends Record<string, any>>(
   at = new Date().toISOString(),
 ): T {
   if (!storyboard || typeof storyboard !== 'object') return storyboard;
+  if (!hasStoryboardVideoArtifact(storyboard)) {
+    const next = { ...storyboard };
+    delete next.videoIsCurrent;
+    delete next.videoInvalidatedAt;
+    delete next.videoInvalidatedReason;
+    return next;
+  }
   return {
     ...storyboard,
     videoIsCurrent: false,
@@ -164,8 +171,29 @@ export function markVideoTaskOutdated<T extends Record<string, any>>(
   };
 }
 
+export function hasStoryboardVideoArtifact(storyboard: any): boolean {
+  if (!storyboard || typeof storyboard !== 'object') return false;
+  return [
+    storyboard.videoUrl,
+    storyboard.videoTaskId,
+    storyboard.videoId,
+    storyboard.protectedVideoUrl,
+  ].some((value) => typeof value === 'string' ? value.trim() : !!value);
+}
+
+export function hasVideoTaskArtifact(videoTask: any): boolean {
+  if (!videoTask || typeof videoTask !== 'object') return false;
+  return [
+    videoTask.taskId,
+    videoTask.id,
+    videoTask.url,
+    videoTask.protectedUrl,
+    videoTask.providerTaskId,
+  ].some((value) => typeof value === 'string' ? value.trim() : !!value);
+}
+
 export function isCurrentVideoRecord(videoTask: any, storyboard: any): boolean {
-  if (videoTask && videoTask.isCurrent === false) return false;
-  if (storyboard && storyboard.videoIsCurrent === false) return false;
+  if (videoTask && videoTask.isCurrent === false && hasVideoTaskArtifact(videoTask)) return false;
+  if (storyboard && storyboard.videoIsCurrent === false && hasStoryboardVideoArtifact(storyboard)) return false;
   return true;
 }

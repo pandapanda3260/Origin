@@ -12,6 +12,7 @@ import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 import { computeShotPlanSourceHash, computeShotPlanSourceSnapshot } from '@/lib/project-dependency-state';
+import { normalizeTailFrameSignals } from '@/lib/shot-tail-frame-signals';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -96,7 +97,24 @@ export async function POST(req: NextRequest) {
       const json = await chatCompleteJsonWithRetry<{ shots: any[] }>(
         user,
         finalMessages,
-        { temperature: 0.5, maxTokens: 3500, modelRole: 'structured' },
+        {
+          temperature: 0.5,
+          maxTokens: 3500,
+          modelRole: 'structured',
+          tokenContext: {
+            projectId: projectId || null,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'shots.generate',
+            moduleKey: 'shots',
+            moduleLabel: '镜头规划',
+            featureKey: 'shot_plan_generate',
+            featureLabel: '镜头表生成',
+            callItemType: 'project',
+            callItemId: projectId || null,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         parseJsonLoose,
         'shots.generate',
       );
@@ -155,7 +173,12 @@ export async function POST(req: NextRequest) {
         dialogue,
         dialog: dialogue,
         stylePillar: String(s.keyInfo || s.stylePillar || '').slice(0, 30),
-        tailFrameSignals: normalizeTailFrameSignals(s, { framing, movement, dialogue, durationSec }),
+        tailFrameSignals: normalizeTailFrameSignals(s, {
+          shotType: framing,
+          camera: movement,
+          dialogue,
+          durationSec,
+        }),
       };
     });
 
@@ -190,6 +213,8 @@ export async function POST(req: NextRequest) {
       updateProjectForUser(projectId, user.id, {
         shots,
         shotsApproved: false,
+        imagesApproved: false,
+        videoPromptsApproved: false,
         storyboards,
         videoTasks: [],
         currentStep: 3,
@@ -233,38 +258,4 @@ function stripShotInternalFields(input: any) {
     if (!SHOT_INTERNAL_KEYS.has(key)) out[key] = input[key];
   }
   return out;
-}
-
-function clampSignal(v: any, dflt = 0) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.max(0, Math.min(5, Math.round(n)));
-}
-
-function normalizeTailFrameSignals(s: any, fallback: {
-  framing: string;
-  movement: string;
-  dialogue: string;
-  durationSec: number;
-}) {
-  const raw = s?.tailFrameSignals && typeof s.tailFrameSignals === 'object' ? s.tailFrameSignals : {};
-  const framing = fallback.framing;
-  const movement = fallback.movement;
-  const dialogue = fallback.dialogue || '';
-  const dialogueChars = dialogue.replace(/[：:\s「」『』""''，。！？、,.!?；;：:（）()[\]【】《》<>]/g, '').length;
-  const deterministicSimpleDialogue =
-    ['近景', '中近景', '特写', '大特写'].includes(framing) &&
-    /固定/.test(movement) &&
-    dialogueChars > 40;
-  return {
-    actionLandingNeed: clampSignal(raw.actionLandingNeed),
-    visualTransformationNeed: clampSignal(raw.visualTransformationNeed),
-    revealNeed: clampSignal(raw.revealNeed),
-    endingCompositionNeed: clampSignal(raw.endingCompositionNeed),
-    emotionPeakNeed: clampSignal(raw.emotionPeakNeed),
-    isSimpleStaticDialogue:
-      typeof raw.isSimpleStaticDialogue === 'boolean'
-        ? raw.isSimpleStaticDialogue
-        : deterministicSimpleDialogue,
-  };
 }

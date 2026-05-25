@@ -459,6 +459,8 @@ export function completeShotPlanGenerationPatch(project: any, opts: {
   let patch: Record<string, any> = {
     shots: opts.shots,
     shotsApproved: false,
+    imagesApproved: false,
+    videoPromptsApproved: false,
     storyboards: opts.storyboards,
     videoTasks: Array.isArray(opts.videoTasks) ? opts.videoTasks : [],
     currentStep: 3,

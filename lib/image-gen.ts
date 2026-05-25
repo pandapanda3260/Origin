@@ -20,6 +20,8 @@ import type { UserRow } from './db';
 import { fetchViaProxy } from './proxy-fetch';
 import { getDataDir } from './runtime-paths';
 import { DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT, getGlobalImageConcurrencyLimit } from './system-config';
+import { createAssetRecord, hashFile, localAssetUri } from './asset-library';
+import { getExternalEnvValue } from './env';
 
 export type ImageGenInput = {
   prompt: string;
@@ -58,6 +60,16 @@ export type ImageGenInput = {
    * 业务层若超出能力上限, 请在传进来之前自行截断 (或依靠 plan 的 imageNo 分配)。
    */
   referenceImagePaths?: string[];
+  assetLibrary?: {
+    batchId?: string;
+    stage?: string;
+    source?: 'generated' | 'uploaded' | 'toolbox' | 'edit_export' | 'imported';
+    shotUid?: string | null;
+    legacyShotId?: string | number | null;
+    versionGroupId?: string | null;
+    makeCurrent?: boolean;
+    predecessorVersionAssetId?: string | null;
+  };
 };
 
 export type ImageGenResult = {
@@ -74,10 +86,16 @@ const IMAGES_DIR = join(DATA_DIR, 'images');
 mkdirSync(IMAGES_DIR, { recursive: true });
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const raw = getExternalEnvValue(name) ?? getExternalEnvValue(`ORIGIN_${name}`) ?? process.env[name] ?? process.env[`ORIGIN_${name}`];
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function envBool(name: string, fallback: boolean): boolean {
+  const raw = getExternalEnvValue(name) ?? getExternalEnvValue(`ORIGIN_${name}`) ?? process.env[name] ?? process.env[`ORIGIN_${name}`];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  return !/^(0|false|off|no)$/i.test(String(raw).trim());
 }
 
 /**
@@ -91,6 +109,17 @@ export function collectImagePaths(input: ImageGenInput): string[] {
   }
   if (input.referenceImagePath) return [input.referenceImagePath];
   return [];
+}
+
+function imageCallTraceMeta(input: ImageGenInput, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    kind: input.kind,
+    assetRef: input.assetRef || null,
+    projectId: input.projectId || null,
+    correlationId: input.correlationId || null,
+    assetLibraryStage: input.assetLibrary?.stage || null,
+    ...extra,
+  };
 }
 
 function retryAfterMs(raw: string | null): number | null {
@@ -108,7 +137,7 @@ function jitter(ms: number): number {
 
 function isTransientNetworkError(err: any): boolean {
   const msg = String(err?.message || err || '');
-  return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted/i.test(msg);
+  return /socket hang up|secure TLS|TLS connection|ECONNRESET|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|fetch failed|network|aborted|ByteString|greater than 255|Invalid statusText/i.test(msg);
 }
 
 let imageSubmitActive = 0;
@@ -197,6 +226,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       fallbackUsed: true,
       traceName: input.kind,
       message: 'image fake fallback',
+      meta: imageCallTraceMeta(input, { fallbackUsed: true }),
     });
   } else {
     const generated = await generateRealImageBuffer(cfg, input, finalPrompt, w, h);
@@ -221,10 +251,35 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     bytes,
     width,
     height,
-    finalPrompt.slice(0, 4000),
+    finalPrompt.slice(0, 5000),
     input.style || null,
     input.correlationId || null,
   );
+
+  try {
+    createAssetRecord({
+      assetId: id,
+      ownerId: user.id,
+      projectId: input.projectId || null,
+      shotUid: input.assetLibrary?.shotUid || null,
+      legacyShotId: input.assetLibrary?.legacyShotId ?? legacyShotIdFromAssetRef(input.assetRef),
+      versionGroupId: input.assetLibrary?.versionGroupId || null,
+      batchId: input.assetLibrary?.batchId || null,
+      assetKind: 'image',
+      source: input.assetLibrary?.source || (String(input.assetRef || '').startsWith('toolbox/') ? 'toolbox' : 'generated'),
+      stage: input.assetLibrary?.stage || imageAssetStage(input.kind, input.assetRef),
+      fileUri: localAssetUri('images', user.id, filename),
+      thumbUri: `/api/images/file/${id}`,
+      fileHash: hashFile(fullPath),
+      byteSize: bytes,
+      width,
+      height,
+      predecessorVersionAssetId: input.assetLibrary?.predecessorVersionAssetId || null,
+      makeCurrent: input.assetLibrary?.makeCurrent ?? !!input.projectId,
+    });
+  } catch (error) {
+    console.warn('[image-gen] asset library indexing skipped:', id, error);
+  }
 
   return {
     id,
@@ -234,6 +289,34 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     bytes,
     mode,
   };
+}
+
+function legacyShotIdFromAssetRef(assetRef: string | undefined) {
+  const match = /storyboards\[(\d+)\]/.exec(String(assetRef || ''));
+  return match ? `shot_${match[1]}` : null;
+}
+
+function imageAssetStage(kind: ImageGenInput['kind'], assetRef: string | undefined) {
+  if (kind === 'character') return 'asset_character';
+  if (kind === 'scene') return 'asset_scene';
+  if (kind === 'prop') return 'asset_prop';
+  if (kind === 'storyboard') return 'storyboard';
+  const ref = String(assetRef || '');
+  if (/firstFrame/i.test(ref)) return 'first_frame';
+  if (/tailFrame/i.test(ref)) return 'tail_frame';
+  if (ref.startsWith('toolbox/')) return 'toolbox_image';
+  return 'image';
+}
+
+export function isCharacterImageInput(input: Pick<ImageGenInput, 'kind' | 'assetRef' | 'assetLibrary'>): boolean {
+  return input.kind === 'character'
+    || input.assetLibrary?.stage === 'asset_character'
+    || /(^|[.\s/])characters\[\d+\]/.test(String(input.assetRef || ''));
+}
+
+export function shouldAllowImageProviderFallback(input: Pick<ImageGenInput, 'kind' | 'assetRef' | 'assetLibrary'>): boolean {
+  if (!isCharacterImageInput(input)) return true;
+  return envBool('IMAGE_CHARACTER_FALLBACK_ENABLED', false);
 }
 
 function parseSize(s: string): [number, number] {
@@ -257,8 +340,12 @@ async function generateRealImageBuffer(
   initialWidth: number,
   initialHeight: number,
 ): Promise<RealImageBufferResult> {
-  const fallbackConfigs = (primaryCfg.fallbackConfigs || []).filter((cfg) => cfg.mode === 'real' && !!cfg.apiKey);
+  const rawFallbackConfigs = (primaryCfg.fallbackConfigs || []).filter((cfg) => cfg.mode === 'real' && !!cfg.apiKey);
+  const fallbackConfigs = shouldAllowImageProviderFallback(input) ? rawFallbackConfigs : [];
   const fallbackAfter = envInt('IMAGE_FALLBACK_AFTER_FAILURES', 2, 1, 10);
+  const characterPrimaryRetryAttempts = isCharacterImageInput(input)
+    ? envInt('IMAGE_CHARACTER_PRIMARY_RETRY_ATTEMPTS', 3, 1, 6)
+    : 1;
   const configs = [primaryCfg, ...fallbackConfigs];
   const allRefPaths = collectImagePaths(input).filter((p) => existsSync(p));
   let primaryFailures = 0;
@@ -314,6 +401,7 @@ async function generateRealImageBuffer(
     const fallbackAttemptFloor = !isFallback && fallbackConfigs.length ? fallbackAfter : 1;
     const MAX_ATTEMPTS = Math.max(
       fallbackAttemptFloor,
+      characterPrimaryRetryAttempts,
       TRANSIENT_MAX_ATTEMPTS,
       RATE_LIMIT_MAX_ATTEMPTS,
       NETWORK_MAX_ATTEMPTS,
@@ -481,7 +569,7 @@ async function generateRealImageBuffer(
           latencyMs: elapsed,
           fallbackUsed: isFallback,
           traceName: input.kind,
-          meta: { attempt, refCount: effectiveRefPaths.length, transport: imageTransport, fallbackUsed: isFallback },
+          meta: imageCallTraceMeta(input, { attempt, refCount: effectiveRefPaths.length, transport: imageTransport, fallbackUsed: isFallback }),
         });
         return { buffer: buf, width, height };
       } catch (e: any) {
@@ -502,16 +590,18 @@ async function generateRealImageBuffer(
           fallbackUsed: isFallback,
           traceName: input.kind,
           message: reason,
-          meta: { attempt, transient, fallbackUsed: isFallback },
+          meta: imageCallTraceMeta(input, { attempt, transient, fallbackUsed: isFallback }),
         });
         lastErr = e;
 
         if (!isFallback && fallbackConfigs.length) {
           primaryFailures += 1;
-          if (primaryFailures >= fallbackAfter) {
+          const shouldSwitchToFallback = primaryFailures >= fallbackAfter || aborted;
+          if (shouldSwitchToFallback) {
             const next = fallbackConfigs[0];
             console.warn(
-              `[image-gen] switching to fallback provider after ${primaryFailures} primary failure(s): ${next.provider}/${next.model}`,
+              `[image-gen] switching to fallback provider after ${primaryFailures} primary failure(s)` +
+                `${aborted ? ' due to primary timeout' : ''}: ${next.provider}/${next.model}`,
             );
             switchedToFallback = true;
             break;

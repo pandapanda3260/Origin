@@ -16,6 +16,7 @@ import {
 } from '@/lib/video-payload-decision';
 import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
+import { buildFirstFramePlanPreview, currentFirstFrameEditDraft, isFirstFrameEditDraftStale } from '@/lib/first-frame-edit-draft';
 import {
   beginShotPlanGeneration,
   computeShotPlanSourceHash,
@@ -55,7 +56,6 @@ function nextActionsForVideoPreflightReason(reason: string): string[] {
   if (reason === 'missing_video_prompt' || reason === 'video_prompt_failed') return ['regenerate_video_prompt'];
   if (reason === 'video_prompt_generating') return ['wait_video_prompt'];
   if (reason === 'tail_pending' || reason === 'tail_frame_pending' || reason === 'first_last_frame_tail_pending') return ['wait_tail_frame'];
-  if (reason === 'tail_stale' || reason === 'first_last_frame_tail_stale') return ['regenerate_tail_frame'];
   if (reason === 'tail_failed' || reason === 'tail_file_missing' || reason === 'tail_missing') return ['regenerate_tail_frame', 'switch_to_strict_first_frame'];
   if (reason === 'capability_unsupported' || reason === 'first_last_frame_capability_unsupported') return ['switch_video_model', 'switch_to_strict_first_frame'];
   if (reason === 'feature_disabled' || reason === 'first_last_frame_feature_disabled') return ['switch_to_strict_first_frame'];
@@ -73,7 +73,6 @@ function videoPreflightMessage(item: any): string {
   if (reason === 'video_prompt_failed') return `${groupLabel} 视频提示词生成失败，请先重新生成视频提示词。`;
   if (reason === 'video_prompt_generating') return `${groupLabel} 视频提示词仍在生成中，请等待完成。`;
   if (reason === 'tail_pending' || reason === 'tail_frame_pending' || reason === 'first_last_frame_tail_pending') return `${groupLabel} 尾帧仍在生成中，请等待尾帧完成后再生成视频。`;
-  if (reason === 'tail_stale' || reason === 'first_last_frame_tail_stale') return `${groupLabel} 首帧已更新，当前尾帧已过期，请重新生成尾帧。`;
   if (reason === 'tail_failed') return `${groupLabel} 尾帧生成失败，请重新生成尾帧或改用仅首帧模式。`;
   if (reason === 'tail_file_missing') return `${groupLabel} 尾帧文件不可解析，请重新生成尾帧或改用仅首帧模式。`;
   if (reason === 'tail_missing') return `${groupLabel} 缺少可用尾帧，已改用仅首帧模式。`;
@@ -148,7 +147,7 @@ function targetArtifactForBatch(batchType: string): TargetArtifact | null {
   if (batchType === 'storyboard_prompts') return 'storyboard_prompt';
   if (batchType === 'storyboard_images') return 'storyboard_image_generation';
   if (batchType === 'tail_frame_images') return 'storyboard_image';
-  if (batchType === 'video_prompts') return 'video_prompt';
+  if (batchType === 'video_prompts') return 'video_prompt_generation';
   if (batchType === 'video_segments' || batchType === 'videos') return 'video_segment';
   return null;
 }
@@ -343,6 +342,8 @@ export async function POST(req: NextRequest) {
   const projectId: string = (body.projectId || '').toString();
   const options: any = body.options || {};
   let batchOptions: any = options;
+  const applyEditDraft = body.applyEditDraft === true || options?.applyEditDraft === true;
+  const allowStaleEditDraft = body.allowStaleEditDraft === true || options?.allowStaleEditDraft === true;
   let videoPreflightWarnings: any[] = [];
   let shotPlanStartContext: null | { sourceHash: string; sourceSnapshot: ShotPlanSourceSnapshot } = null;
 
@@ -387,6 +388,43 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  if (batchType === 'storyboard_images' && applyEditDraft) {
+    const proj = getProjectByIdForUser(projectId, user.id);
+    if (!proj) return jsonError('项目不存在', 404);
+    for (const target of targets) {
+      const groupIdx = normalizeTargetGroupIdx(target);
+      if (groupIdx == null) continue;
+      const { draft } = currentFirstFrameEditDraft(proj as any, groupIdx);
+      if (!draft) {
+        return Response.json(
+          { error: 'no_edit_draft', code: 'no_edit_draft', detail: '当前片段没有已保存的首帧编辑草稿。' },
+          { status: 400 },
+        );
+      }
+      const currentHash = buildFirstFramePlanPreview({
+        project: proj as any,
+        groupIdx,
+        ownerId: user.id,
+        user,
+      }).sourceHash;
+      if (isFirstFrameEditDraftStale(draft.sourceHash, currentHash) && !allowStaleEditDraft) {
+        return Response.json(
+          {
+            error: 'stale_edit_draft',
+            code: 'stale_edit_draft',
+            groupIdx,
+          },
+          { status: 409 },
+        );
+      }
+    }
+    batchOptions = {
+      ...(batchOptions || {}),
+      applyEditDraft: true,
+      allowStaleEditDraft,
+    };
+  }
+
   if (batchType === 'shots') {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
@@ -403,6 +441,9 @@ export async function POST(req: NextRequest) {
   if (batchType === 'video_prompts') {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
+    if (!(proj as any).imagesApproved) {
+      return jsonError('请先确认分镜图，再生成视频提示词。', 409);
+    }
     const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
     targets.forEach((target: any, seq: number) => {
       const rawGroupIdx = target?.groupIdx ?? target?.storyboardIdx ?? target?.idx;

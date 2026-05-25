@@ -456,7 +456,7 @@ This character must keep the same identity, face/body/species, clothing, equipme
 
 建议修正：
 
-- `SP_VIDEO_PROMPT_REFINE` 当前写“英文提示词”，而主生成要求中文。这是独立 bug，应立即修正为中文结构化视频提示词口径，不能等 P0。
+- `SP_VIDEO_PROMPT_REFINE` 应保持中文结构化视频提示词口径，避免微调后把 prompt 改回英文。
 
 ### 6.7 视频生成阶段：Seedance 硬规则注入
 

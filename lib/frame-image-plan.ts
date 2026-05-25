@@ -147,6 +147,14 @@ export type FrameImagePlanSummary = {
     assetName?: string;
     reason?: FrameReferenceDroppedReason;
   }>;
+  appliedEditDraft?: boolean;
+  actualImageInput?: {
+    quality: string;
+    size: string;
+    style: string;
+    referenceImageCount: number;
+    draftFingerprint?: string;
+  };
   finalPromptHash: string;
   finalPromptLength: number;
   modelSnapshot: FrameImageModelSnapshot;
@@ -169,7 +177,7 @@ export type BuildFramePlanInput = {
   };
 };
 
-const MAX_FINAL_PROMPT_CHARS = 2200;
+const MAX_FINAL_PROMPT_CHARS = 5000;
 export const FRAME_IMAGE_REFERENCE_IMAGE_BUDGET = 4;
 const DEFAULT_FRAME_ASPECT_RATIO = '9:16';
 const FRAME_ASPECT_RATIOS = new Set(['16:9', '9:16', '1:1']);
@@ -413,7 +421,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     }), groupText);
   const usedChars = [...manualChars, ...matchedChars].slice(0, 6);
 
-  const characterLockRoster = buildCharacterLockRoster(project, charNames, 'en', groupText);
+  const characterLockRoster = buildCharacterLockRoster(project, charNames, 'zh', groupText);
   const characterLockText = sanitizeFillLightPositiveMentions(
     characterLockRoster ||
       usedChars
@@ -424,7 +432,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
             .join(', ');
           const ent =
             c.entityType === 'non-human'
-              ? ' NON-HUMAN anthropomorphic character, preserve species body'
+              ? ' 非人/拟人角色，必须保留原物种身体结构'
               : '';
           return `${nm}${ent}: ${truncate(desc, 180)}`;
         })
@@ -450,7 +458,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   const chosenScene = (manualScenes[0] || sceneSelection.scene) as any;
   const chosenSceneExcluded = isMaterialAssetExcluded(project, 'scene', chosenScene, groupIdx);
   const sceneLockTextRaw = chosenScene
-    ? `${chosenScene.name || chosenScene.location || 'Scene'}: ${truncate(
+    ? `${chosenScene.name || chosenScene.location || '场景'}: ${truncate(
         [
           chosenScene.description,
           chosenScene.location,
@@ -507,8 +515,8 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     styleBible.lighting,
     styleBible.texture,
     styleBible.editingRhythm,
-    styleBible.additionalPrompt && `Additional style prompt: ${styleBible.additionalPrompt}`,
-    (styleBible.negativePrompt || styleBible.videoNegativePrompt) && `Negative style constraints: ${styleBible.negativePrompt || styleBible.videoNegativePrompt}`,
+    styleBible.additionalPrompt && `附加风格提示：${styleBible.additionalPrompt}`,
+    (styleBible.negativePrompt || styleBible.videoNegativePrompt) && `负向风格约束：${styleBible.negativePrompt || styleBible.videoNegativePrompt}`,
     styleBible.era,
   ]);
 
@@ -529,7 +537,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       remoteUrl: input.selfFirstFrame.remoteUrl,
       localPath: input.selfFirstFrame.localPath,
       textFallback:
-        'Self first frame: composition/identity anchor for this segment — match camera angle, wardrobe, props, and lighting of the opening frame.',
+        'Self first frame: identity and continuity anchor for this segment — keep the same subject, wardrobe, location, and lighting family, but do not copy its exact pose, crop, or composition.',
       }
       : null;
 
@@ -566,7 +574,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       .join(', ');
     const ent =
       c.entityType === 'non-human'
-        ? ' (NON-HUMAN anthropomorphic character, preserve species body)'
+        ? '（非人/拟人角色，必须保留原物种身体结构）'
         : '';
     return {
       role: 'character',
@@ -734,6 +742,59 @@ function shotVisualForFramePrompt(shot: any): string {
   );
 }
 
+function tailSignalScore(signals: any, key: string): number {
+  const n = Number(signals?.[key]);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(5, Math.round(n)));
+}
+
+function buildTailFrameTargetLines(plan: FrameImageGenerationPlan): string[] {
+  const shot = plan.primaryShot || {};
+  const signals = shot?.tailFrameSignals && typeof shot.tailFrameSignals === 'object'
+    ? shot.tailFrameSignals
+    : {};
+  const visual = shotVisualForFramePrompt(shot);
+  const dialogue = clean(shot?.dialogue || shot?.scriptRef);
+  const keyInfo = clean(shot?.keyInfo);
+  const isSingleShotSegment = plan.shotIndices.length === 1;
+
+  const lines: string[] = [
+    '【尾帧目标】',
+    '这是本片段的结束瞬间，发生在 Image 1 / 首帧之后数秒。它不能是首帧的重画或近似重复。',
+    '- 呈现镜头动作推进后的完成状态。',
+  ];
+
+  if (visual) lines.push(`- 结束状态来源：${truncate(visual, 180)}`);
+  if (keyInfo) lines.push(`- 需要在尾帧中明确呈现的关键信息：${truncate(keyInfo, 80)}`);
+  if (dialogue && dialogue !== '——') {
+    lines.push(`- 台词/声音后的情绪落点：${truncate(dialogue, 120)}`);
+  }
+  if (isSingleShotSegment) {
+    lines.push('- 单镜头片段规则：首帧是该镜头的开始，尾帧是同一镜头动作/情绪落定后的结束状态。');
+  }
+
+  if (tailSignalScore(signals, 'actionLandingNeed') >= 3) {
+    lines.push('- 动作落点：改变可见的手部、身体或物体位置，体现动作已经推进或停稳。');
+  }
+  if (tailSignalScore(signals, 'visualTransformationNeed') >= 3) {
+    lines.push('- 视觉状态变化：体现物体状态、环境细节、光线、雾气、水面、碎屑或其他镜头专属视觉证据的变化。');
+  }
+  if (tailSignalScore(signals, 'revealNeed') >= 3) {
+    lines.push('- 揭示落点：让被揭示的重要信息比首帧更清楚。');
+  }
+  if (tailSignalScore(signals, 'emotionPeakNeed') >= 3) {
+    lines.push('- 情绪落点：呈现角色情绪反应已经发生后的状态，不要停留在首帧同一个表情瞬间。');
+  }
+
+  lines.push(
+    '- 相比 Image 1 必须有可见差异：至少改变一个有意义元素，如姿态、道具/物体位置、面部/情绪状态、前景/背景关系、距离/裁切或环境运动痕迹。',
+  );
+  lines.push(
+    '- 保持身份、服装、地点、光线类型和关键道具连续，但不要复制首帧的完全相同姿态、裁切或构图，除非镜头明确要求没有变化。',
+  );
+  return lines;
+}
+
 export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   const { frameType, shotIndices, primaryShot, primaryShotIdx, contextShots } = plan;
   const lines: string[] = [];
@@ -741,52 +802,57 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   // 1. Task + frame goal
   if (frameType === 'first_frame') {
     lines.push(
-      '【Task】Create ONE full-color cinematic video FIRST FRAME for an image-to-video generation pipeline.',
+      '【任务】生成一张用于图生视频流程的全彩电影感首帧。',
     );
     lines.push(
-      '【Frame goal】This is the exact opening frame (t=0) of the video segment. NOT a storyboard sheet, NOT a pencil sketch, NOT a comic panel, NOT a character model sheet.',
+      '【画面目标】这是视频片段 t=0 的准确开场画面。不是分镜表、不是铅笔稿、不是漫画格、不是角色设定三视图。',
     );
   } else {
     lines.push(
-      '【Task】Create ONE full-color cinematic video TAIL FRAME for an image-to-video generation pipeline.',
+      '【任务】生成一张用于图生视频流程的全彩电影感尾帧。',
     );
     lines.push(
-      '【Frame goal】This is the exact closing frame of the video segment, used to control how the video ends and hand over to the next segment. NOT a storyboard sheet, NOT a sketch.',
+      '【画面目标】这是视频片段的准确结束画面，用来控制本段如何收束并衔接下一段。不是分镜表，也不是草图。',
     );
   }
   lines.push(
-    'Photorealistic live-action cinematic frame, professional production design, natural color grading, realistic lighting, realistic material textures.',
+    '真人实拍质感的电影画面，专业美术置景，自然调色，真实光线，真实材质纹理。',
   );
   lines.push(
-    'No subtitles, no captions, no written text, no watermarks, no panel borders, no split-screen layout.',
+    '无字幕、无说明文字、无可读文字、无水印、无分格边框、无分屏布局。',
   );
 
   // 2. Primary shot + context
   lines.push('');
   lines.push(
     frameType === 'first_frame'
-      ? `【Primary shot】Use Shot ${primaryShotIdx + 1} as the opening beat.`
-      : `【Primary shot】Use Shot ${primaryShotIdx + 1} as the closing beat (this is the last shot of the segment).`,
+      ? `【主镜头】以镜头 ${primaryShotIdx + 1} 作为开场节拍。`
+      : `【主镜头】以镜头 ${primaryShotIdx + 1} 作为结束节拍（这是本片段的最后一个镜头）。`,
   );
   const pShotType = clean(primaryShot?.shotType || primaryShot?.framing);
   const pCamera = clean(primaryShot?.camera || primaryShot?.movement);
   const pVisual = shotVisualForFramePrompt(primaryShot);
   const pDialogue = clean(primaryShot?.dialogue || primaryShot?.scriptRef);
-  if (pShotType) lines.push(`- framing: ${pShotType}`);
-  if (pCamera) lines.push(`- camera: ${pCamera}`);
-  if (pVisual) lines.push(`- visual: ${pVisual}`);
-  if (pDialogue && pDialogue !== '——') lines.push(`- dialogue/audio cue: ${pDialogue}`);
+  if (pShotType) lines.push(`- 景别：${pShotType}`);
+  if (pCamera) lines.push(`- 运镜：${pCamera}`);
+  if (pVisual) lines.push(`- 画面：${pVisual}`);
+  if (pDialogue && pDialogue !== '——') lines.push(`- 台词/声音提示：${pDialogue}`);
+
+  if (frameType === 'tail_frame') {
+    lines.push('');
+    lines.push(...buildTailFrameTargetLines(plan));
+  }
 
   if (contextShots.length) {
     lines.push('');
     lines.push(
-      '【Context shots】Use only for action/emotion continuity; do NOT change the composition of the primary shot.',
+      '【上下文镜头】只用于动作和情绪连续性参考，不要改变主镜头构图。',
     );
     for (let i = 0; i < contextShots.length; i += 1) {
       const sh = contextShots[i];
       const idx = plan.contextShotIndices[i] + 1;
       const visual = shotVisualForFramePrompt(sh);
-      if (visual) lines.push(`- Shot ${idx}: ${truncate(visual, 160)}`);
+      if (visual) lines.push(`- 镜头 ${idx}：${truncate(visual, 160)}`);
     }
   }
 
@@ -794,19 +860,19 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
   if (imageRefs.length) {
     lines.push('');
-    lines.push('【Reference images】');
+    lines.push('【参考图】');
     for (const r of imageRefs) {
       const roleText =
         r.role === 'scene'
-          ? 'scene — lock space/materials/lighting/tone'
+          ? '场景 - 锁定空间、材质、光线和基调'
           : r.role === 'character'
-            ? `character (${r.assetName || ''}) — lock face/wardrobe/body type/species`
+            ? `角色（${r.assetName || ''}）- 锁定脸部、服装、体型和物种特征`
             : r.role === 'prop'
-              ? `prop (${r.assetName || ''}) — lock shape/color/material`
+              ? `道具（${r.assetName || ''}）- 锁定形状、颜色和材质`
               : r.role === 'prev_tail'
-                ? 'previous segment tail frame — continuity anchor'
+                ? '上一片段尾帧 - 连续性锚点'
                 : r.role === 'self_first_frame'
-                  ? 'this segment first frame — composition/identity anchor'
+                  ? '本片段首帧 - 身份和连续性锚点，不是构图复制目标'
                   : String(r.role);
       // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
       lines.push(`- Image ${r.imageNo} = ${roleText}`);
@@ -816,22 +882,22 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   // 4. Locks (text)
   if (plan.characterLockText) {
     lines.push('');
-    lines.push('【Character lock】');
+    lines.push('【角色锁定】');
     lines.push(plan.characterLockText);
   }
   if (plan.sceneLockText) {
     lines.push('');
-    lines.push('【Scene lock】');
+    lines.push('【场景锁定】');
     lines.push(plan.sceneLockText);
   }
   if (plan.propLockText) {
     lines.push('');
-    lines.push('【Prop lock】');
+    lines.push('【道具锁定】');
     lines.push(plan.propLockText);
   }
   if (plan.styleLock) {
     lines.push('');
-    lines.push('【Project style lock】');
+    lines.push('【项目风格锁定】');
     lines.push(plan.styleLock);
   }
 
@@ -843,31 +909,31 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
 
   // 6. Composition rules
   lines.push('');
-  lines.push('【Composition rules】');
-  lines.push(`- Target aspect ratio: ${plan.aspectRatio}. ${plan.compositionGuidance}`);
-  lines.push('- Use one coherent camera frame matching the primary shot framing/camera.');
+  lines.push('【构图规则】');
+  lines.push(`- 目标画幅比例：${plan.aspectRatio}。${plan.compositionGuidance}`);
+  lines.push('- 使用一个完整统一的镜头画面，匹配主镜头的景别和运镜意图。');
   lines.push(
-    '- Keep character identity, wardrobe, species/body type, scene materials, props and color palette consistent with the references.',
+    '- 角色身份、服装、物种/体型、场景材质、道具和色彩体系必须与参考保持一致。',
   );
   lines.push(
-    '- If any non-human/anthropomorphic character appears, preserve its species body and realistic scale; never turn it into an ordinary human.',
+    '- 如果出现非人/拟人角色，必须保留原物种身体结构和真实尺度，绝不能变成普通人类。',
   );
   if (frameType === 'first_frame') {
-    lines.push('- The image must be usable directly as the first frame for video generation.');
+    lines.push('- 这张图必须能直接作为视频生成的首帧使用。');
   } else {
-    lines.push('- The image must be usable directly as the closing frame for video generation.');
+    lines.push('- 这张图必须能直接作为视频生成的收束尾帧使用。');
     lines.push(
-      '- Maintain continuity with the opening frame: same location, lighting, wardrobe, and props unless the shot action explicitly changes them.',
+      '- 与首帧保持连续，同时呈现明显更晚的结束状态：地点、光线类型、服装和道具一致，但动作、情绪或物体状态已变化。',
     );
   }
 
   // 7. Hard prohibitions
   lines.push('');
-  lines.push('【Hard prohibitions】');
+  lines.push('【硬性禁止】');
   lines.push(
-    '- No subtitles, no captions, no written text, no watermarks, no panel borders, no split-screen layout, no multi-panel, no model sheet.',
+    '- 禁止字幕、说明文字、可读文字、水印、分格边框、分屏布局、多格图、角色设定表。',
   );
-  lines.push('- Respect any user negative constraints below.');
+  lines.push('- 必须遵守下方所有用户负向约束。');
 
   let out = sanitizeFillLightPositiveMentions(lines.join('\n'));
 

@@ -18,6 +18,7 @@ import {
   plannedDurationFromShots,
   type ReferenceManifestItem,
 } from './video-reference-manifest';
+import { styleBibleForShotPrompt, styleBibleForVideoPrompt } from './casting-profile';
 
 const COMMON_RULES = `你是 QD INFINITY 的 AI 创作引擎，专门服务于"AI 短视频自动生产"工作流。
 回答必须使用中文（专有名词可保留英文）。
@@ -356,6 +357,70 @@ export function buildFullCreateMessages(opts: {
 }
 
 /* =====================================================
+   2-c) 原文 / 小说片段改编成短视频剧本
+   ===================================================== */
+export const SP_SCRIPT_ADAPT_SOURCE = `${COMMON_RULES}
+
+【你的角色】专业短视频改编编剧，擅长把用户已有的小说、故事片段、对白稿或原文改写成可拍的短视频剧本。
+
+【任务】用户给你的不是一句话创意，而是一段已有原文。你要把它改写成五段式短视频剧本。
+
+【改编原则 - 必须遵守】
+  · 保留原文里的核心人物、关键场景、关键事件、关键对白，不要把原文重新发散成另一个故事
+  · 可以重组叙事节奏，让开场更有钩子，让冲突和反转更适合短视频
+  · 可以压缩冗余描写，但不能凭空替换主角、改掉主要关系或删掉关键事件
+  · 原文中有精彩对白时，应优先保留或短视频化改写，不要全部改成旁白总结
+  · 原文中已有清晰动作/神态/场景时，应转成可拍的画面描述
+
+【五段式结构 - 强制输出】
+  1. 铺垫：用原文中最有冲突或情绪张力的画面开场，前 3 秒给钩子
+  2. 升温：保留原文的关键推动事件，让人物关系和冲突更明确
+  3. 高潮：保留或强化原文最强冲突、反转、爆点或情绪爆发
+  4. 回落：让角色对高潮事件做出反应，承接原文的后果
+  5. 余韵：用一个能回味的画面收束，尽量呼应开场
+
+【输出格式 - 严格遵守】
+直接以"铺垫："开头，绝对不要解释你如何改编。格式：
+
+铺垫：（场景描述）角色名："对白内容。"
+
+升温：（场景描述）角色名："对白。"
+
+高潮：（场景描述）角色名："对白。"
+
+回落：（场景描述）角色名："对白。"
+
+余韵：（场景描述）角色名："对白。"
+
+【对白格式 - 强制规则】
+  · 每一句对白必须以"角色名 + 中文冒号 + 引号包裹的台词"形式出现
+  · 多角色对白时，直接按回车真换行，绝对不要打出 \\n 这两个字符的字面量
+  · 旁白/画外音也必须有归属：写"旁白："或"画外音："或具体角色名+"（旁白）"
+
+【绝对禁止】
+  · 不要把原文当成"一句话创意"重新脑补
+  · 不要输出原文摘要、分析、改编说明或 markdown 标题
+  · 不要输出 <think>、<step>、<phase> 等任何标签
+  · 不要输出"好的，我来改编"之类开场，直接给剧本正文`;
+
+export function buildAdaptSourceMessages(opts: {
+  sourceText: string;
+  durationSec?: number;
+  audience?: string;
+  creatorPersona?: any;
+}): ChatMessage[] {
+  const ctx: string[] = [];
+  if (opts.durationSec) ctx.push(`目标时长：${opts.durationSec} 秒`);
+  if (opts.audience) ctx.push(`目标人群：${opts.audience}`);
+  if (opts.creatorPersona) ctx.push(`创作者画像：${JSON.stringify(opts.creatorPersona)}`);
+  ctx.push(`原文内容（请改写为短视频剧本，保留核心人物、关键场景、关键事件和关键对白）：\n${opts.sourceText}`);
+  return [
+    { role: 'system', content: SP_SCRIPT_ADAPT_SOURCE },
+    { role: 'user', content: ctx.join('\n\n') },
+  ];
+}
+
+/* =====================================================
    3) 风格圣经提取（JSON）
    ===================================================== */
 export const SP_STYLE_BIBLE = `${COMMON_RULES}
@@ -375,23 +440,27 @@ export const SP_STYLE_BIBLE = `${COMMON_RULES}
     {"hex": "#十六进制颜色6", "name": "中文色名6"}
   ],
   "era": "时代与氛围（80-120字，详细描述：时代背景、地点环境、空间质感、时间段，如'当代城市海鲜自助餐厅打烊后的后场时段'）",
-	  "mood": "情绪基调（30-80字，描述整体情绪走向和节奏感，如'轻松诙谐、鲜活热闹、带有职场复盘喜剧感'）",
-	  "cameraStyle": "镜头风格（80-150字，详细描述：景别偏好、运镜方式、剪辑节奏、构图特点）",
-	  "lighting": "光线设计（40-100字，只写光源方向、软硬、明暗对比、轮廓光/补光，不重复整体风格）",
-	  "texture": "画面质感（30-80字，只写材质、颗粒、表面触感、空气感，不重复光线）",
-	  "editingRhythm": "剪辑节奏（30-80字，只写节奏、转场、停顿、快慢关系，不重复镜头景别）",
-	  "negativePrompt": "禁止项 / 负向约束（用分号分隔，写会破坏画面风格的一组禁止元素）",
-	  "additionalPrompt": "正向增强提示（用分号分隔，写需要额外强化的画面关键词）",
-	  "audio": "音频风格（预留字段，描述音乐/音效气质；如没有明确依据可留空）",
-	  "subtitleStyle": "字幕风格（预留字段，描述字体/位置/动效；如没有明确依据可留空）",
-	  "aspectRatio": "画幅比例（必须是 16:9 / 9:16 / 1:1 之一）",
-	  "compositionGuidance": "构图指导（80-150字，必须结合画幅比例说明主体、景别、运镜和空间调度）",
-	  "worldRules": "世界观规则（150-250字，详细描述：故事发生的世界规则、物理规则、人物设定基础、风格化程度。例：'故事发生在一家现实风格的海鲜自助餐厅内，空间、食材陈列、自助台、灯光和后厨秩序都遵循真实餐饮环境逻辑。海鲜以拟人化员工身份存在，能站立、说话、表达情绪，但仍保留各自食材的外形、质感和鲜度特征，不能完全变成人类。'）",
+  "mood": "情绪基调（30-80字，描述整体情绪走向和节奏感，如'轻松诙谐、鲜活热闹、带有职场复盘喜剧感'）",
+  "cameraStyle": "镜头风格（80-150字，详细描述：景别偏好、运镜方式、剪辑节奏、构图特点）",
+  "lighting": "光线设计（40-100字，只写光源方向、软硬、明暗对比、轮廓光/补光，不重复整体风格）",
+  "texture": "画面质感（30-80字，只写材质、颗粒、表面触感、空气感，不重复光线）",
+  "editingRhythm": "剪辑节奏（30-80字，只写节奏、转场、停顿、快慢关系，不重复镜头景别）",
+  "negativePrompt": "中文禁止项 / 负向约束（用分号分隔，写会破坏画面风格的一组禁止元素）",
+  "additionalPrompt": "中文正向增强提示（用分号分隔，写需要额外强化的画面关键词）",
+  "audio": "音频风格（预留字段，描述音乐/音效气质；如没有明确依据可留空）",
+  "subtitleStyle": "字幕风格（预留字段，描述字体/位置/动效；如没有明确依据可留空）",
+  "aspectRatio": "画幅比例（必须是 16:9 / 9:16 / 1:1 之一）",
+  "compositionGuidance": "构图指导（80-150字，必须结合画幅比例说明主体、景别、运镜和空间调度）",
+  "worldRules": "世界观规则（150-250字，详细描述：故事发生的世界规则、物理规则、人物设定基础、风格化程度。例：'故事发生在一家现实风格的海鲜自助餐厅内，空间、食材陈列、自助台、灯光和后厨秩序都遵循真实餐饮环境逻辑。海鲜以拟人化员工身份存在，能站立、说话、表达情绪，但仍保留各自食材的外形、质感和鲜度特征，不能完全变成人类。'）",
+  "castingProfile": {
+    "ethnicityType": "han_chinese / east_asian / caucasian / mixed / unspecified 之一"
+  },
   "characters": [
     {
       "name": "角色名（如：老周）",
       "appearance": "外貌描述（年龄、体型、神态、特征，30-60字，如'中年餐厅老板形象，神情干练，带点班主任威严'）",
-      "clothing": "服装描述（具体衣物、颜色、风格，20-40字，如'黑色T恤，深色防水围裙，手里拿着记账板'）"
+      "clothing": "服装描述（具体衣物、颜色、风格，20-40字，如'黑色T恤，深色防水围裙，手里拿着记账板'）",
+      "castingOverride": {"ethnicityType": "仅当该角色与全局 castingProfile 不一致时输出；否则不要输出"}
     }
   ]
 }
@@ -409,21 +478,26 @@ export const SP_STYLE_BIBLE = `${COMMON_RULES}
   · 每个角色都要给出 appearance 和 clothing 两个维度的**具体**描述
   · 描述要服务于画面绘制，避免笼统词（不要写"普通的衣服"，要写"黑色T恤、深色防水围裙"）
   · 至少 1 个角色，最多 6 个
+  · castingProfile 只输出 ethnicityType 枚举，不要输出英文 prompt、肤色描述或负向词
+  · ethnicityType 判断：中文/中国/国风/古装/修仙/东方玄幻语境默认 han_chinese；明确东亚但非中国语境用 east_asian；明确欧美白人角色用 caucasian；明确混血用 mixed；信息不足用 unspecified
+  · characters[].appearance 只写年龄、体型、神态、发型、职业气质等可见特征，不写中国人/欧美人/白人/东亚人/华人/外国人等人群身份
+  · characters[].castingOverride 只在该角色和全局 castingProfile 不一致时输出；中文项目中的外国客串要写 override，普通中国角色不要重复写 override
 
-	【约束】
-	  · era / cameraStyle / worldRules 必须**详细饱满**，因为这些描述会直接驱动后续画面生成
-	  · 视觉描述要紧扣剧本内容，避免泛泛而谈
-	  · 剧本是事实来源；风格模板只提供视觉约束，不得复制模板角色或世界观事实
-	  · 如果存在模板锚定字段，请基于这些字段生成其他字段，不要改变锚定字段本身；如果偏离，后处理会强制覆盖你的输出
-	  · 如果不存在模板锚定字段，可基于剧本和世界观上下文合理推断视觉方向，但不要凭空生成模板级硬约束
-	  · 世界观上下文只提供内容语境；当风格模板锚定字段存在时，世界观不得影响 colorPalette / cameraStyle / mood / lighting / texture / visualStyleDesc / negativePrompt / additionalPrompt
-	  · characters 只包含剧本中真实出现的角色；如果与世界观候选池匹配，可借用候选池视觉描述；禁止添加剧本未出现的候选角色
-	  · 字段边界：visualStyleDesc 写整体视觉，不写光线/质感细节；lighting 只写光源、方向、软硬和对比；texture 只写材质/颗粒/表面质感；editingRhythm 只写剪辑节奏和转场；negativePrompt 只写禁止项；additionalPrompt 只写正向增强提示
-	  · aspectRatio 必须影响 compositionGuidance：
-	    - 9:16：强调纵向主体、近景/中景占比更高、减少宽横幅构图、大横摇和多人横向铺陈
-	    - 16:9：适合横向叙事、大全景、横摇、跟拍、空间关系和群像调度
-	    - 1:1：强调中心构图、对称关系、主体聚焦、减少极宽景别
-	  · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要 "好的" 这种开场白）`;
+【约束】
+  · era / cameraStyle / worldRules 必须**详细饱满**，因为这些描述会直接驱动后续画面生成
+  · 视觉描述要紧扣剧本内容，避免泛泛而谈
+  · 剧本是事实来源；风格模板只提供视觉约束，不得复制模板角色或世界观事实
+  · 如果存在模板锚定字段，请基于这些字段生成其他字段，不要改变锚定字段本身；如果偏离，后处理会强制覆盖你的输出
+  · 如果不存在模板锚定字段，可基于剧本和世界观上下文合理推断视觉方向，但不要凭空生成模板级硬约束
+  · 世界观上下文只提供内容语境；当风格模板锚定字段存在时，世界观不得影响 colorPalette / cameraStyle / mood / lighting / texture / visualStyleDesc / negativePrompt / additionalPrompt
+  · characters 只包含剧本中真实出现的角色；如果与世界观候选池匹配，可借用候选池视觉描述；禁止添加剧本未出现的候选角色
+  · 字段边界：visualStyleDesc 写整体视觉，不写光线/质感细节；lighting 只写光源、方向、软硬和对比；texture 只写材质/颗粒/表面质感；editingRhythm 只写剪辑节奏和转场；negativePrompt 只写禁止项；additionalPrompt 只写正向增强提示
+  · negativePrompt / additionalPrompt / videoNegativePrompt 如出现，内容必须中文；允许保留 35mm、cinematic、live-action 等少量专有术语
+  · aspectRatio 必须影响 compositionGuidance：
+    - 9:16：强调纵向主体、近景/中景占比更高、减少宽横幅构图、大横摇和多人横向铺陈
+    - 16:9：适合横向叙事、大全景、横摇、跟拍、空间关系和群像调度
+    - 1:1：强调中心构图、对称关系、主体聚焦、减少极宽景别
+  · 不要输出任何 JSON 之外的内容（不要 markdown 围栏，不要 "好的" 这种开场白）`;
 
 export function buildStyleBibleMessages(scriptText: string, opts: {
   aspectRatio?: string;
@@ -474,12 +548,18 @@ export const SP_STYLE_BIBLE_CORE = `${STYLE_BIBLE_STAGE_COMMON}
   "visualStyleDesc": "30-50字，描述整体视觉，不写光线/质感细节",
   "era": "60-100字，描述时代、地点、空间质感、时间段",
   "mood": "25-45字，描述整体情绪走向和节奏感",
-  "worldRules": "100-160字，描述世界规则、人物存在方式、风格化程度"
+  "worldRules": "100-160字，描述世界规则、人物存在方式、风格化程度",
+  "castingProfile": {
+    "ethnicityType": "han_chinese / east_asian / caucasian / mixed / unspecified 之一"
+  }
 }
 
 【约束】
   · 这一段只做基础判断，不输出角色、色板、镜头、声音或字幕。
-  · worldRules 必须来自剧本和世界观上下文，不能添加剧本未出现的设定。`;
+  · worldRules 必须来自剧本和世界观上下文，不能添加剧本未出现的设定。
+  · castingProfile 是项目默认人物外观基准，只输出 ethnicityType 枚举，不要输出英文 prompt 或自由描述。
+  · 中文/中国/国风/古装/修仙/东方玄幻语境默认 han_chinese；如果故事整体明确发生在欧美/海外且主要角色多为外国人，输出 unspecified 或更具体类型。
+  · 中文短剧里只有个别外国角色时，全局仍用 han_chinese，例外角色由 characters 阶段写 castingOverride。`;
 
 export const SP_STYLE_BIBLE_CHARACTERS = `${STYLE_BIBLE_STAGE_COMMON}
 
@@ -489,8 +569,10 @@ export const SP_STYLE_BIBLE_CHARACTERS = `${STYLE_BIBLE_STAGE_COMMON}
   "characters": [
     {
       "name": "角色名",
+      "role": "在故事中的身份角色",
       "appearance": "25-45字，年龄/体型/神态/外形特征",
-      "clothing": "20-35字，具体衣物、颜色、材质或职业痕迹"
+      "clothing": "20-35字，具体衣物、颜色、材质或职业痕迹",
+      "castingOverride": {"ethnicityType": "仅当该角色与全局 castingProfile 不一致时输出；否则不要输出"}
     }
   ]
 }
@@ -498,7 +580,10 @@ export const SP_STYLE_BIBLE_CHARACTERS = `${STYLE_BIBLE_STAGE_COMMON}
 【约束】
   · 只包含剧本中有画面亮相的角色，旁白者不算。
   · 至少 1 个，最多 6 个。
-  · 可以借用世界观候选池的视觉描述，但禁止添加剧本未出现角色。`;
+  · 可以借用世界观候选池的视觉描述，但禁止添加剧本未出现角色。
+  · 已有草稿里的 castingProfile 是全局默认人物外观；普通继承全局的角色不要写 castingOverride。
+  · 只有剧本明确为外国人/欧美人/混血/外籍等与全局不一致的角色，才输出 castingOverride.ethnicityType。
+  · appearance 不要写中国人、欧美人、白人、东亚人、华人、外国人等人群身份；这些只由 castingProfile / castingOverride 表达。`;
 
 export const SP_STYLE_BIBLE_VISUAL = `${STYLE_BIBLE_STAGE_COMMON}
 
@@ -513,8 +598,8 @@ export const SP_STYLE_BIBLE_VISUAL = `${STYLE_BIBLE_STAGE_COMMON}
   "compositionGuidance": "50-90字，结合目标画幅描述主体位置、景别、运镜和空间调度",
   "lighting": "30-60字，只写光源方向、软硬、明暗对比、轮廓光/补光",
   "texture": "25-50字，只写材质、颗粒、表面触感、空气感",
-  "negativePrompt": "5-10个禁止项，用分号分隔",
-  "additionalPrompt": "5-10个正向增强关键词，用分号分隔"
+  "negativePrompt": "5-10个中文禁止项，用分号分隔",
+  "additionalPrompt": "5-10个中文正向增强关键词，用分号分隔"
 }
 
 【colorPalette 要求】
@@ -524,6 +609,7 @@ export const SP_STYLE_BIBLE_VISUAL = `${STYLE_BIBLE_STAGE_COMMON}
 
 【约束】
   · cameraStyle 与 compositionGuidance 必须互相一致。
+  · negativePrompt / additionalPrompt 必须中文；允许保留少量必要摄影或风格术语。
   · aspectRatio 不作为输出字段；但必须影响 compositionGuidance。`;
 
 export const SP_STYLE_BIBLE_VISUAL_PALETTE = `${STYLE_BIBLE_STAGE_COMMON}
@@ -547,14 +633,15 @@ export const SP_STYLE_BIBLE_VISUAL_PROMPTS = `${STYLE_BIBLE_STAGE_COMMON}
 【当前阶段】visual_prompts：只生成画面 prompt 约束。
 【输出严格 JSON】
 {
-  "negativePrompt": "5-10个禁止项，用分号分隔",
-  "additionalPrompt": "5-10个正向增强关键词，用分号分隔"
+  "negativePrompt": "5-10个中文禁止项，用分号分隔",
+  "additionalPrompt": "5-10个中文正向增强关键词，用分号分隔"
 }
 
 【约束】
   · 必须基于 core、characters、visual_palette 草稿一致地推断。
   · colorPalette 已存在，不要重新生成或复述色板。
   · negativePrompt 只列禁止项；additionalPrompt 只列正向增强。
+  · negativePrompt / additionalPrompt 必须中文；允许保留少量必要摄影或风格术语。
   · 不要输出 cameraStyle、compositionGuidance、lighting、texture 或 aspectRatio。`;
 
 export const SP_STYLE_BIBLE_VISUAL_LENS = `${STYLE_BIBLE_STAGE_COMMON}
@@ -875,13 +962,14 @@ const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
       "role": "在故事中的身份角色",
       "identity": "一句话身份定位",
       "entityType": "human 或 non-human",
-      "appearance": "外貌描述，30-60 字",
+      "appearance": "外貌描述，30-60 字；只写年龄/体型/神态/发型/职业气质等，不写中国人/欧美人/白人/东亚人/华人/外国人",
       "clothing": "服装描述，20-40 字",
+      "castingOverride": {"ethnicityType": "仅当该角色与风格圣经 castingProfile 不一致时输出；否则不要输出"},
       "equipment": "随身物品，无则空字符串",
       "temperament": "中文逗号分隔的 3-5 个气质标签",
       "actionTraits": "中文逗号分隔的 2-4 个动作特征",
       "tags": ["主角","男","50岁"],
-      "imagePrompt": "英文 35-70 词，只描述主体外貌、服装、姿态，不写风格/光线/背景/三视图"
+      "imagePrompt": "中文 35-70 字，只描述主体外貌、服装、姿态，不写风格/光线/背景/三视图，不写中国人/欧美人/白人/东亚人/华人/外国人等人群身份"
     }
   ]
 }
@@ -892,7 +980,11 @@ const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
   · role + identity 不能空。
   · entityType 必填：真人外形填 human，拟人化动物/海鲜/机甲/异形/AI 生物填 non-human。
   · 非人角色必须写真实物种/形态，不要画成人。
-  · imagePrompt 必须英文且不能为空。
+  · 风格圣经里的 castingProfile 是全局默认人物外观；普通继承全局的角色不要写 castingOverride。
+  · 只有剧本明确该角色是外国人/欧美人/混血/外籍等，且与全局 castingProfile 不一致时，才输出 castingOverride.ethnicityType。
+  · appearance 不写人群/民族/国籍外观，这些只由 castingProfile / castingOverride 表达。
+  · imagePrompt 必须中文且不能为空；允许保留少量必要专有术语，但不要整段英文。
+  · 即使看到 castingProfile，也不要在 imagePrompt 里写中国人 / 东亚人 / 白人 / 华裔 / 肤色等 casting 信息，系统会统一注入。
   · 不要输出任何 JSON 之外的内容。`;
 
 const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
@@ -912,11 +1004,11 @@ const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
       "description": "100 字以内的场景描述",
       "timeSetting": "清晨 / 白天 / 黄昏 / 夜晚 / 深夜 / 凌晨",
       "weather": "晴 / 多云 / 雨 / 雪 / 雾 / 室内",
-	      "lighting": "自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
-	      "atmosphere": "中文逗号分隔 3-6 个氛围词",
-	      "isMain": true,
-	      "tags": ["室内"],
-	      "imagePrompt": "英文 35-70 词，描述空间布局和陈设，不写风格/白底/光线"
+        "lighting": "自然光 / 暖色顶灯 / 冷蓝霓虹 / 烛光 / 屏幕光",
+        "atmosphere": "中文逗号分隔 3-6 个氛围词",
+        "isMain": true,
+        "tags": ["室内"],
+        "imagePrompt": "中文 35-70 字，描述空间布局和陈设，不写风格/白底/光线"
     }
   ]
 }
@@ -930,7 +1022,7 @@ const SP_ASSET_SCENES_EXTRACT = `${COMMON_RULES}
   · 不要为了单个镜头/过场/临时背景创建场景；只有真实影响镜头连续性的物理空间才输出。
   · 每个场景必须填齐 location / timeSetting / weather / lighting / atmosphere。
   · atmosphere 必须中文逗号分隔。
-  · imagePrompt 必须英文且不能为空。
+  · imagePrompt 必须中文且不能为空；允许保留少量必要专有术语，但不要整段英文。
   · 不要输出任何 JSON 之外的内容。`;
 
 const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
@@ -947,7 +1039,7 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
       "function": "在剧本里的作用",
       "ownership": "关联角色 id，例如 c1；公共道具填 null",
       "features": "外观/材质/颜色",
-      "imagePrompt": "英文 25-50 词，描述材质、颜色、形状、磨损"
+      "imagePrompt": "中文 25-50 字，描述材质、颜色、形状、磨损"
     }
   ]
 }
@@ -956,7 +1048,7 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
 
 【重点】
   · ownership 只能填用户给你的角色 id；不确定或公共道具填 null。
-  · imagePrompt 必须英文且不能为空。
+  · imagePrompt 必须中文且不能为空；允许保留少量必要专有术语，但不要整段英文。
   · 不要输出任何 JSON 之外的内容。`;
 
 export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any, worldTemplate?: any): ChatMessage[] {
@@ -1141,7 +1233,7 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
   · 如果全片只有一个场景，所有镜头都填这个场景
   · 如果资产里没有场景，sceneId / sceneName 可以填空字符串
 
-	【整体规则】
+  【整体规则】
   · idx 从 1 连续递增不跳号
   · 每个 duration 在 3-6 秒（铺垫 3-4 秒，主戏 4-5 秒，过渡 2-3 秒）
   · **镜头总数灵活，6-14 个都可以**，目标总时长**只是参考值**——如果剧本台词密集，拆成 12-14 个镜头也没问题（反而比少镜头挤爆台词更好）
@@ -1172,7 +1264,7 @@ export function buildShotsMessages(opts: {
   totalDurationSec?: number;
 }): ChatMessage[] {
   const parts = [`剧本：\n${opts.script}`];
-  if (opts.styleBible) parts.push(`风格圣经：${JSON.stringify(opts.styleBible)}`);
+  if (opts.styleBible) parts.push(`风格圣经：${JSON.stringify(styleBibleForShotPrompt(opts.styleBible))}`);
   if (opts.assets) parts.push(`资产：${JSON.stringify(opts.assets)}`);
   // 目标时长只是"参考节奏"——别拿它硬压镜头数或挤台词。
   // 用户如果说 60 秒，但剧本实际需要 80 秒才能把台词念完，按剧本来，不要砍。
@@ -1389,7 +1481,7 @@ export function buildVideoPromptMessages(opts: {
 
   // 3) 风格圣经精简
   if (opts.styleBible) {
-    const sb = opts.styleBible;
+    const sb = styleBibleForVideoPrompt(opts.styleBible);
     const sbCondensed = {
       visualStyle: sb.visualStyle || sb.vision,
       colorPalette: sb.colorPalette,

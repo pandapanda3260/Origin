@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { generateVideo } from '@/lib/video-gen';
+import { generateVideo, normalizeGenerateAudio } from '@/lib/video-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser } from '@/lib/projects-db';
 import { resolveLLMConfig } from '@/lib/llm';
@@ -20,12 +20,27 @@ import {
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { artifactUsageBlockedPayload, describeArtifactStatus } from '@/lib/sentinel';
+import {
+  AssetQuotaError,
+  assertCanStartAssetGeneration,
+  createGenerationBatch,
+  finishGenerationBatch,
+  recordGenerationFailure,
+} from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 function codedError(code: string, detail: string, status = 400) {
   return NextResponse.json({ code, detail }, { status });
+}
+
+function shotUidForGroup(project: any, groupIdx: number) {
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  const sb = storyboards[groupIdx] || {};
+  const shot = shots[groupIdx] || {};
+  return String(sb.shotUid || sb.shot_uid || sb.uid || sb.id || shot.shotUid || shot.shot_uid || shot.uid || shot.id || `shot_${groupIdx}`).trim();
 }
 
 /**
@@ -73,6 +88,8 @@ export async function POST(req: NextRequest) {
   let referenceImageRole: 'first_frame' | 'storyboard_sketch' | undefined;
   let seedanceImageMode: 'strict_first_frame' | 'reference_images' = submitMode === 'reference_images' ? 'reference_images' : 'strict_first_frame';
   let payloadModeReason: string | undefined;
+  let assetBatchId: string | null = null;
+  let assetShotUid: string | null = null;
 
   if (hasProjectContext) {
     const sentinel = describeArtifactStatus(project as any, {
@@ -94,6 +111,7 @@ export async function POST(req: NextRequest) {
     const storyboards = Array.isArray((project as any)?.storyboards) ? (project as any).storyboards : [];
     const sb = storyboards[groupIdx];
     if (!sb) return codedError('storyboard_not_found', `找不到片段 ${groupIdx + 1}。`, 404);
+    assetShotUid = shotUidForGroup(project, groupIdx);
     prompt = String(sb.videoPrompt || '').trim();
     if (!prompt) return codedError('missing_video_prompt', '缺少视频提示词，请先生成视频提示词。', 400);
 
@@ -137,6 +155,30 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    try {
+      assertCanStartAssetGeneration(user.id);
+    } catch (error: any) {
+      if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+      throw error;
+    }
+    assetBatchId = createGenerationBatch({
+      ownerId: user.id,
+      projectId: projectId || null,
+      shotUid: assetShotUid,
+      legacyShotId: hasProjectContext ? `shot_${groupIdx}` : null,
+      stage: projectId ? 'video_segment' : 'toolbox_video',
+      requestedCount: 1,
+      contextSnapshot: {
+        route: 'api_video_submit',
+        projectId: projectId || null,
+        groupIdx: hasProjectContext ? groupIdx : null,
+        submitMode,
+        payloadModeReason,
+        durationSec: body.durationSec || 4,
+        size: body.size || '1080x1920',
+      },
+      source: projectId ? 'project' : 'toolbox',
+    });
     if (projectId && project) {
       try {
         const cfg = resolveLLMConfig(user, 'video');
@@ -168,6 +210,7 @@ export async function POST(req: NextRequest) {
       prompt,
       size: body.size || '1080x1920',
       resolution: body.resolution || body.quality,
+      generateAudio: normalizeGenerateAudio(body.generateAudio ?? body.genAudio, true),
       durationSec: body.durationSec || 4,
       projectId: projectId || undefined,
       groupIdx: hasProjectContext ? groupIdx : undefined,
@@ -176,6 +219,14 @@ export async function POST(req: NextRequest) {
       seedanceImageMode,
       payloadModeReason,
       firstLastFrameMode,
+      assetLibrary: {
+        batchId: assetBatchId,
+        stage: projectId ? 'video_segment' : 'toolbox_video',
+        source: projectId ? 'generated' : 'toolbox',
+        shotUid: assetShotUid,
+        legacyShotId: hasProjectContext ? `shot_${groupIdx}` : null,
+        makeCurrent: !!projectId,
+      },
     });
     if (result.status === 'upstream_pending') {
       return jsonOk({
@@ -198,6 +249,15 @@ export async function POST(req: NextRequest) {
       mode: result.mode,
     });
   } catch (e: any) {
+    if (assetBatchId) {
+      recordGenerationFailure({
+        batchId: assetBatchId,
+        ownerId: user.id,
+        failureReason: 'provider_error',
+        errorMessage: e?.message || String(e),
+      });
+      finishGenerationBatch(assetBatchId, user.id, 'failed');
+    }
     const status = Number(e?.status || e?.statusCode || 502);
     return jsonError('视频生成失败：' + (e?.message || String(e)), Number.isFinite(status) ? status : 502);
   }

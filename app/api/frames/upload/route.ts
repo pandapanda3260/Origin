@@ -8,10 +8,10 @@ import { getDb } from '@/lib/db';
 import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
 import { getDataDir } from '@/lib/runtime-paths';
+import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
 import {
   computeFirstFrameSourceHash,
   computeTailFrameSourceHash,
-  markTailFrameStaleForFirstFrameChange,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
 } from '@/lib/frame-workflow-state';
@@ -98,7 +98,8 @@ export async function POST(req: NextRequest) {
     mkdirSync(dir, { recursive: true });
     const ext = guessExt(mime);
     const filename = `${id}.${ext}`;
-    writeFileSync(join(dir, filename), buf);
+    const fullPath = join(dir, filename);
+    writeFileSync(fullPath, buf);
 
     const isTail = frameType === 'tail_frame';
     const kindDb = isTail ? 'frame_tail' : 'frame_first';
@@ -109,6 +110,22 @@ export async function POST(req: NextRequest) {
       `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '[uploaded]', null)`,
     ).run(id, user.id, projectId, kindDb, assetRef, filename, mime, buf.length);
+    createAssetRecord({
+      assetId: id,
+      ownerId: user.id,
+      projectId,
+      legacyShotId: `shot_${groupIdx}`,
+      assetKind: 'image',
+      source: 'uploaded',
+      stage: isTail ? 'tail_frame' : 'first_frame',
+      fileUri: localAssetUri('images', user.id, filename),
+      thumbUri: `/api/images/file/${id}`,
+      fileHash: hashFile(fullPath),
+      byteSize: buf.length,
+      width: 0,
+      height: 0,
+      makeCurrent: true,
+    });
 
     const url = `/api/images/file/${id}`;
     const signed = buildSignedImageUrl(id, user.id);
@@ -201,9 +218,8 @@ export async function POST(req: NextRequest) {
             },
           },
         };
-      storyboards[groupIdx] = isTail
-        ? nextStoryboard
-        : markTailFrameStaleForFirstFrameChange(nextStoryboard, { staleAt: generatedAt });
+      // 用户原则: 首帧变化不连带 stale 尾帧, 用户自决重做。
+      storyboards[groupIdx] = nextStoryboard;
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'frame-upload');
       return { storyboards };
     });

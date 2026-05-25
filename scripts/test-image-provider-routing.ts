@@ -59,6 +59,8 @@ async function main() {
   assert.equal(cfg.provider, 'zerail_images');
   assert.equal(cfg.baseUrl, 'https://gateway.zerail.com/v1');
   assert.equal(cfg.model, 'gpt-image-2');
+  assert.equal(cfg.capabilities?.image?.multiRefImage, 16);
+  assert.equal(cfg.capabilities?.image?.transport, 'verified_openai_multipart_bracket');
   assert.equal(cfg.fallbackConfigs?.length, 1);
   assert.equal(cfg.fallbackConfigs?.[0]?.provider, 'volcengine_seedream');
   assert.equal(cfg.fallbackConfigs?.[0]?.model, 'doubao-seedream-4-5-251128');
@@ -74,7 +76,18 @@ async function main() {
   process.env.IMAGE_FALLBACK_ENABLED = 'false';
   const disabled = resolveSlotModelConfig(null, 'image');
   assert.equal(disabled.provider, 'zerail_images');
+  assert.equal(disabled.capabilities?.image?.multiRefImage, 16);
+  assert.equal(disabled.capabilities?.image?.transport, 'verified_openai_multipart_bracket');
   assert.equal(disabled.fallbackConfigs, undefined);
+
+  resetImageEnv();
+  process.env.IMAGE_PROVIDER = 'zerail_images';
+  process.env.IMAGE_API_KEY = 'zerail-test-key';
+  process.env.IMAGE_MODEL = 'gpt-image-2';
+  process.env.IMAGE_MULTI_REF_CAP = '4';
+  const overridden = resolveSlotModelConfig(null, 'image');
+  assert.equal(overridden.capabilities?.image?.multiRefImage, 4);
+  assert.equal(overridden.capabilities?.image?.transport, 'verified_openai_multipart_bracket');
 
   resetImageEnv();
   process.env.IMAGE_PROVIDER = 'volcengine_seedream';

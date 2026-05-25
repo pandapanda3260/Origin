@@ -5,6 +5,7 @@ import { sseResponse } from '@/lib/sse';
 import { getProjectByIdForUser } from '@/lib/projects-db';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
+import { styleBibleForShotPrompt } from '@/lib/casting-profile';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,21 +17,21 @@ export const dynamic = 'force-dynamic';
  * 期待：SSE 流式 chunk + 最终 done.imagePrompt
  */
 
-const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）提示词工程师。把"短视频镜头"翻译成英文提示词，最终会被画成**黑白铅笔分镜稿**（不是成片！不是照片！）。
+const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）提示词工程师。把"短视频镜头"整理成中文画面提示词，最终会被画成**黑白铅笔分镜稿**（不是成片！不是照片！）。
 
 【硬性要求】
-- 全英文输出，不要中文，不要 markdown，不要 ["..."] 围栏
-- 50-150 词
-- 描述对象就是一张分镜稿，所以只描写：①主体（人物名 + 服装外观 + 表情/姿态）②动作（只描述这一帧定格的动作）③ 构图与景别（wide shot / medium / close-up / over-shoulder）④ 机位（low angle / high angle / eye-level / POV）⑤ 光照方向（key light from left / backlit / overhead / silhouette）⑥ 关键道具与场景元素（counter, fish trays, apron, clipboard 等）
+- 中文为主输出，不要 markdown，不要 ["..."] 围栏
+- 80-220 字
+- 描述对象就是一张分镜稿，所以只描写：①主体（人物名 + 服装外观 + 表情/姿态）②动作（只描述这一帧定格的动作）③ 构图与景别（可保留 wide shot / medium / close-up / over-shoulder 等少量术语）④ 机位（可保留 low angle / high angle / eye-level / POV 等少量术语）⑤ 光照方向 ⑥ 关键道具与场景元素
 - 如果 assets/assetRefs 里给了角色描述，必须保留外观/服装一致性（同一角色多个镜头里穿同样的衣服）
 
 【禁止】
 - 不要写 "photorealistic / cinematic film / 35mm / film grain / hyper-real / 4K / vivid color / teal-orange / saturated"——这些会破坏手稿风
 - 不要写 "color palette / warm color tone"，分镜稿是黑白
-- 不要写"运镜动词"作为单独陈述（如 "the camera slowly pushes in"），改用"frame composition implies a slow push-in"或直接给静止构图
+- 不要写"运镜动词"作为单独陈述（如"镜头缓慢推进"），改成静止构图描述，例如"构图暗示纵深推进感"
 - 不要写台词或字幕
 - 不要写 "three-view" 或 "white background"（那是资产图，不是分镜图）
-- 不要解释，不要复述中文，不要写"Description:"前缀，直接输出 prompt 段落`;
+- 不要解释，不要复述输入，不要写"提示词："前缀，直接输出中文 prompt 段落`;
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
@@ -43,7 +44,7 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({} as any));
   const shot = body.shot || null;
-  const styleBible = body.styleBible || null;
+  const styleBible = styleBibleForShotPrompt(body.styleBible || null);
   const assets = body.assets || null;
   const assetRefs: any[] = Array.isArray(body.assetRefs) ? body.assetRefs : [];
   const idx: number = typeof body.idx === 'number' ? body.idx : 0;

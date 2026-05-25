@@ -1,3 +1,5 @@
+import { normalizeCastingProfile } from './casting-profile';
+
 export type StylePaletteItem = {
   hex?: string;
   name: string;
@@ -324,6 +326,10 @@ export function normalizeLLMStyleBibleOutput(styleBible: any) {
   if (Object.prototype.hasOwnProperty.call(raw, 'colorPalette')) {
     out.colorPalette = normalizePalette(raw.colorPalette);
   }
+  if (Object.prototype.hasOwnProperty.call(raw, 'castingProfile') || Object.prototype.hasOwnProperty.call(raw, 'casting_profile')) {
+    const profile = normalizeCastingProfile(raw.castingProfile || raw.casting_profile);
+    if (profile) out.castingProfile = profile;
+  }
   if (!scalarString(out.dialogueStyle)) {
     const dialogueStyle = normalizeRuleText(
       raw.dialogueStyle ?? raw.narrationStyle ?? raw.voiceoverStyle ?? raw.dialogueRules,
@@ -335,11 +341,13 @@ export function normalizeLLMStyleBibleOutput(styleBible: any) {
     out.characters = raw.characters
       .filter(isRecord)
       .map((ch) => {
-        const next: Record<string, string> = {};
+        const next: Record<string, any> = {};
         for (const key of ['name', 'role', 'appearance', 'clothing', 'description', 'desc', 'avatarUrl', 'imageUrl', 'referenceImageUrl']) {
           const value = scalarString(ch[key]);
           if (value) next[key] = value;
         }
+        const override = normalizeCastingProfile(ch.castingOverride || ch.casting_override);
+        if (override) next.castingOverride = override;
         return next;
       })
       .filter((ch) => Object.keys(ch).length > 0);

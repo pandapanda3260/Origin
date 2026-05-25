@@ -5,7 +5,6 @@ export type TailFrameReferenceStatus =
   | 'pending'
   | 'ready'
   | 'failed'
-  | 'stale'
   | 'file_missing';
 
 export type VideoPayloadMode = 'first_last_frame' | 'first_frame_multi_ref';
@@ -18,7 +17,6 @@ export type VideoPayloadDecisionReason =
   | 'tail_missing'
   | 'tail_pending'
   | 'tail_failed'
-  | 'tail_stale'
   | 'tail_file_missing'
   | 'feature_disabled'
   | 'capability_unsupported'
@@ -90,9 +88,11 @@ export function normalizeTailFrameReferenceStatus(opts: {
   tailFramePath?: string | null;
 }): TailFrameReferenceStatus {
   const raw = String(opts.status || '').trim().toLowerCase();
-  if (raw === 'missing' || raw === 'pending' || raw === 'ready' || raw === 'failed' || raw === 'stale' || raw === 'file_missing') {
+  if (raw === 'missing' || raw === 'pending' || raw === 'ready' || raw === 'failed' || raw === 'file_missing') {
     return raw;
   }
+  // 历史数据里残留的 'stale' 值 (旧自动标记逻辑产物) 不再当作独立状态。
+  // 落到 URL/path 判断, 文件能解析就当 ready, 不能就 file_missing。
   const hasUrl = !!String(opts.tailFrameUrl || '').trim();
   if (!hasUrl) return 'missing';
   return opts.tailFramePath ? 'ready' : 'file_missing';
@@ -247,7 +247,6 @@ export function resolveVideoPayloadDecision(opts: {
     pending: 'tail_pending',
     ready: 'tail_file_missing',
     failed: 'tail_failed',
-    stale: 'tail_stale',
     file_missing: 'tail_file_missing',
   };
   const reason = statusReason[tailStatus] || 'tail_file_missing';
@@ -266,16 +265,13 @@ export function resolveVideoPayloadDecision(opts: {
       submitMode,
       reason,
       `first_last_frame_${reason}`,
-      tailStatus === 'stale'
-        ? '首帧已更新，当前尾帧已过期，请重新生成尾帧后再使用首尾帧模式。'
-        : '尾帧不可用，请重新生成尾帧或切换到仅首帧模式。',
+      '尾帧不可用，请重新生成尾帧或切换到仅首帧模式。',
     );
   }
 
   const messageByReason: Record<VideoPayloadDecisionReason, string> = {
     tail_missing: '该片段没有尾帧，已使用仅首帧模式。',
     tail_failed: '尾帧生成失败，已使用仅首帧模式。',
-    tail_stale: '首帧已更新，当前尾帧已过期，已使用仅首帧模式。',
     tail_file_missing: '尾帧文件不可解析，已使用仅首帧模式。',
     tail_pending: '尾帧仍在生成中，请等待尾帧完成后再生成视频。',
     tail_ready: '',

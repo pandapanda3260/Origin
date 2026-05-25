@@ -16,6 +16,12 @@ import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
 import type { ChatMessage } from '@/lib/llm';
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
+import {
+  appendCharacterCastingPrompt,
+  normalizeCastingProfile,
+  styleBibleForCharacterAsset,
+  styleBibleForScenePrompt,
+} from '@/lib/casting-profile';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -90,10 +96,29 @@ export async function POST(req: NextRequest) {
     let parsed: any = { characters: [], environments: [], props: [] };
     try {
       writer.step('正在识别角色…');
+      const characterStyleBible = styleBibleForCharacterAsset(styleBible);
+      const sceneStyleBible = styleBibleForScenePrompt(styleBible);
       const characters = await chatCompleteJsonWithRetry(
         user,
-        applyKnowledge(buildAssetCharactersExtractMessages(finalScript, styleBible, worldTemplate)),
-        { temperature: 0.35, maxTokens: 10000, modelRole: 'structured' },
+        applyKnowledge(buildAssetCharactersExtractMessages(finalScript, characterStyleBible, worldTemplate)),
+        {
+          temperature: 0.35,
+          maxTokens: 10000,
+          modelRole: 'structured',
+          tokenContext: {
+            projectId: projectId || null,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'assets.extract',
+            moduleKey: 'assets',
+            moduleLabel: '资产生成',
+            featureKey: 'asset_character_extract',
+            featureLabel: '角色资产抽取',
+            callItemType: 'project',
+            callItemId: projectId || null,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         (raw) => {
           const json = parseJsonLoose(raw);
           return ensureArray(json.characters);
@@ -110,8 +135,25 @@ export async function POST(req: NextRequest) {
       const [environments, props] = await Promise.all([
         chatCompleteJsonWithRetry(
           user,
-          applyKnowledge(buildAssetScenesExtractMessages(finalScript, styleBible, characterRefs, worldTemplate)),
-          { temperature: 0.35, maxTokens: 5000, modelRole: 'structured' },
+          applyKnowledge(buildAssetScenesExtractMessages(finalScript, sceneStyleBible, characterRefs, worldTemplate)),
+          {
+            temperature: 0.35,
+            maxTokens: 5000,
+            modelRole: 'structured',
+            tokenContext: {
+              projectId: projectId || null,
+              projectTitleSnapshot: (proj as any)?.title || null,
+              requestPath: req.nextUrl.pathname,
+              routeName: 'assets.extract',
+              moduleKey: 'assets',
+              moduleLabel: '资产生成',
+              featureKey: 'asset_scene_extract',
+              featureLabel: '场景资产抽取',
+              callItemType: 'project',
+              callItemId: projectId || null,
+              callItemLabel: (proj as any)?.title || null,
+            },
+          },
           (raw) => {
             const json = parseJsonLoose(raw);
             return ensureArray(json.environments || json.scenes);
@@ -120,8 +162,25 @@ export async function POST(req: NextRequest) {
         ),
         chatCompleteJsonWithRetry(
           user,
-          applyKnowledge(buildAssetPropsExtractMessages(finalScript, styleBible, characterRefs, worldTemplate)),
-          { temperature: 0.35, maxTokens: 2500, modelRole: 'structured' },
+          applyKnowledge(buildAssetPropsExtractMessages(finalScript, sceneStyleBible, characterRefs, worldTemplate)),
+          {
+            temperature: 0.35,
+            maxTokens: 2500,
+            modelRole: 'structured',
+            tokenContext: {
+              projectId: projectId || null,
+              projectTitleSnapshot: (proj as any)?.title || null,
+              requestPath: req.nextUrl.pathname,
+              routeName: 'assets.extract',
+              moduleKey: 'assets',
+              moduleLabel: '资产生成',
+              featureKey: 'asset_prop_extract',
+              featureLabel: '道具资产抽取',
+              callItemType: 'project',
+              callItemId: projectId || null,
+              callItemLabel: (proj as any)?.title || null,
+            },
+          },
           (raw) => {
             const json = parseJsonLoose(raw);
             return ensureArray(json.props);
@@ -157,7 +216,8 @@ export async function POST(req: NextRequest) {
         temperament: c.temperament || '',
         actionTraits: c.actionTraits || '',
         tags: Array.isArray(c.tags) ? c.tags : [],
-        imagePrompt: c.imagePrompt || buildCharacterPrompt(c, styleBible),
+        castingOverride: normalizeCastingProfile(c.castingOverride || c.casting_override) || undefined,
+        imagePrompt: appendCharacterCastingPrompt(c.imagePrompt || buildCharacterPrompt(c, styleBible), c, styleBible, { script: finalScript }),
       };
     });
     let mainAssigned = false;
@@ -202,6 +262,26 @@ export async function POST(req: NextRequest) {
     }));
 
     parsed = sanitizePromptObject(parsed);
+    if (proj) {
+      parsed.characters = preserveGeneratedAssetFields(
+        'characters',
+        parsed.characters,
+        (proj as any)?.assets?.characters,
+        (proj as any)?.characters,
+      );
+      parsed.environments = preserveGeneratedAssetFields(
+        'scenes',
+        parsed.environments,
+        (proj as any)?.assets?.scenes,
+        (proj as any)?.environments,
+      );
+      parsed.props = preserveGeneratedAssetFields(
+        'props',
+        parsed.props,
+        (proj as any)?.assets?.props,
+        (proj as any)?.props,
+      );
+    }
 
     writer.step('已识别角色 ' + parsed.characters.length + ' 个');
     writer.step('已识别场景 ' + parsed.environments.length + ' 个');
@@ -289,6 +369,125 @@ export async function POST(req: NextRequest) {
 
 function ensureArray(v: any): any[] {
   return Array.isArray(v) ? v : [];
+}
+
+const GENERATED_ASSET_FIELDS = [
+  'imageUrl',
+  'rawUrl',
+  'realPhotoUrl',
+  'pencilUrl',
+  'assetId',
+  'imageAssetId',
+  'pencilAssetId',
+  'submittedImagePrompt',
+  'imageSafetyAudit',
+  'effectiveVisualDescription',
+  'reference',
+  'imageGeneratedAt',
+  'skippedStylize',
+];
+
+function nonEmptyAssetValue(value: any): boolean {
+  if (value == null) return false;
+  if (typeof value === 'string') return value.trim() !== '';
+  return true;
+}
+
+function hasGeneratedAssetUrl(item: any): boolean {
+  if (!item || typeof item !== 'object') return false;
+  return [
+    item.imageUrl,
+    item.rawUrl,
+    item.realPhotoUrl,
+    item.pencilUrl,
+    item.reference?.currentUrl,
+    item.reference?.lastKnownGoodUrl,
+  ].some(nonEmptyAssetValue);
+}
+
+function cloneAssetField(value: any): any {
+  if (!value || typeof value !== 'object') return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function normalizeAssetMatchKey(value: any): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[“”"']/g, '')
+    .replace(/\s+/g, '');
+}
+
+function assetMatchKeys(item: any): string[] {
+  if (!item || typeof item !== 'object') return [];
+  return [
+    item.characterId,
+    item.sceneId,
+    item.id,
+    item.name,
+  ].map(normalizeAssetMatchKey).filter(Boolean);
+}
+
+type PreserveAssetKind = 'characters' | 'scenes' | 'props';
+
+function normalizeCharacterEntityType(value: any): string {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return '';
+  if (text === 'non-human' || text === 'nonhuman' || text.includes('非人')) return 'non-human';
+  if (text === 'human' || text.includes('人物') || text.includes('人类')) return 'human';
+  return text;
+}
+
+function panelSchemaEntityType(value: any): string {
+  const schema = String(value?.schema || '').trim().toLowerCase();
+  if (!schema) return '';
+  if (schema.includes('non-human') || schema.includes('nonhuman')) return 'non-human';
+  if (schema.includes('human-character')) return 'human';
+  return '';
+}
+
+function canPreserveGeneratedAssetFields(kind: PreserveAssetKind, next: any, previous: any): boolean {
+  if (kind !== 'characters') return true;
+  const status = previous?.reference?.status;
+  if (status === 'failed' || status === 'missing') return false;
+  const nextEntity = normalizeCharacterEntityType(next?.entityType || next?.identityLock?.entityType);
+  const previousEntity = normalizeCharacterEntityType(previous?.entityType || previous?.identityLock?.entityType);
+  if (nextEntity && previousEntity && nextEntity !== previousEntity) return false;
+  const previousSchemaEntity = panelSchemaEntityType(previous?.panels);
+  if (nextEntity && previousSchemaEntity && nextEntity !== previousSchemaEntity) return false;
+  if (nextEntity === 'non-human' && !previousEntity && !previousSchemaEntity) return false;
+  return true;
+}
+
+function buildGeneratedAssetLookup(collections: any[][]): Map<string, any> {
+  const lookup = new Map<string, any>();
+  collections.forEach((collection) => {
+    ensureArray(collection).forEach((item) => {
+      if (!hasGeneratedAssetUrl(item)) return;
+      assetMatchKeys(item).forEach((key) => {
+        const existing = lookup.get(key);
+        if (!existing || !hasGeneratedAssetUrl(existing)) lookup.set(key, item);
+      });
+    });
+  });
+  return lookup;
+}
+
+function preserveGeneratedAssetFields(kind: PreserveAssetKind, nextItems: any[], ...previousCollections: any[][]): any[] {
+  const lookup = buildGeneratedAssetLookup(previousCollections);
+  return ensureArray(nextItems).map((item) => {
+    if (!item || typeof item !== 'object' || hasGeneratedAssetUrl(item)) return item;
+    const match = assetMatchKeys(item).map((key) => lookup.get(key)).find(Boolean);
+    if (!match) return item;
+    if (!canPreserveGeneratedAssetFields(kind, item, match)) return item;
+    const preserved = { ...item };
+    GENERATED_ASSET_FIELDS.forEach((field) => {
+      if (!nonEmptyAssetValue(preserved[field]) && nonEmptyAssetValue(match[field])) {
+        preserved[field] = cloneAssetField(match[field]);
+      }
+    });
+    return preserved;
+  });
 }
 
 function normalizeStyleBible(value: any): any | null {

@@ -1,6 +1,6 @@
 import type { UserRow } from './db';
 import { getJson } from './kv-db';
-import { loadExternalEnv } from './env';
+import { getExternalEnvValue, loadExternalEnv } from './env';
 import { recordObservabilityEvent } from './observability-events';
 import { MOCK_USER_SETTINGS } from '@/mocks/settings';
 
@@ -9,6 +9,7 @@ export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDeri
 export type ProviderKind =
   | 'openai_chat'
   | 'openai_responses'
+  | 'packy_responses'
   | 'packy_messages'
   | 'packy_images'
   | 'code80_messages'
@@ -319,7 +320,7 @@ function real(input: RealModelInput): ResolvedModelConfig {
 
 /**
  * 按 provider 推断默认能力。env IMAGE_MULTI_REF_CAP 可 override multiRefImage (1-16)。
- * transport 先用 'unverified_*', 跑过 scripts/probe-multi-ref-*.js 验证后手动改成 'verified_*'。
+ * OpenAI image edit 官方支持最多 16 张输入图; Seedream 官方文档写明最多 14 张。
  * 多图装配的实际格式依赖 probe 结论, 在 lib/image-gen.ts 按 transport 分支处理。
  */
 function inferDefaultCapabilities(provider: ProviderKind): ModelCapabilities {
@@ -338,12 +339,11 @@ function inferDefaultCapabilities(provider: ProviderKind): ModelCapabilities {
     };
   }
   if (provider === 'zerail_images' || provider === 'code80_images' || provider === 'packy_images') {
-    // OpenAI GPT image models edit 官方上限 16; multipart 字段名需要 probe 实测
-    // (image 重复 / image[] / image_files[] 都是候选)。
+    // OpenAI GPT image edit 官方上限 16, 多图 multipart 使用 image[] 字段。
     return {
       image: {
-        multiRefImage: envCapValid ?? 1,
-        transport: 'unverified_openai_multipart_repeat',
+        multiRefImage: envCapValid ?? 16,
+        transport: 'verified_openai_multipart_bracket',
       },
     };
   }
@@ -389,6 +389,7 @@ function inferProvider(provider: string, slot: ModelSlot): ProviderKind {
   if (p.includes('code80') && p.includes('image')) return 'code80_images';
   if (p.includes('code80') && (p.includes('message') || p.includes('claude'))) return 'code80_messages';
   if (p.includes('image')) return 'zerail_images';
+  if (p.includes('packy') && p.includes('response')) return 'packy_responses';
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
   if (p.includes('response')) return 'zerail_responses';
   if (p.includes('message') || p.includes('claude')) return 'zerail_messages';
@@ -405,10 +406,11 @@ function defaultModel(slot: ModelSlot): string {
 
 function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind {
   const p = provider.toLowerCase();
+  if (p.includes('packy')) return 'packy_responses';
   if (p.includes('openai') && p.includes('response')) return 'openai_responses';
-  if (p.includes('packy')) return 'openai_responses';
   if (p.includes('code80')) return 'openai_responses';
   if (p.includes('zerail') && p.includes('response')) return 'zerail_responses';
+  if (baseUrl.toLowerCase().includes('packyapi.com')) return 'packy_responses';
   return baseUrl.toLowerCase().includes('api.openai.com') ? 'openai_responses' : 'zerail_responses';
 }
 
@@ -542,7 +544,7 @@ function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX
   else if (role === 'brain') names.push(`BRAIN_${suffix}`, `CLAUDE_${suffix}`);
 
   if (provider === 'zerail_messages' || provider === 'code80_messages' || provider === 'packy_messages') names.push(`CLAUDE_${suffix}`);
-  if (provider === 'openai_chat' || provider === 'openai_responses' || provider === 'zerail_responses') {
+  if (provider === 'openai_chat' || provider === 'openai_responses' || provider === 'packy_responses' || provider === 'zerail_responses') {
     names.push(`TEXT_${suffix}`, `OPENAI_${suffix}`);
   }
   if (provider === 'zerail_images' || provider === 'code80_images' || provider === 'packy_images') names.push(`IMAGE_${suffix}`);
@@ -565,7 +567,7 @@ function fallbackCapacityForModel(model: string): Pick<ResolvedModelConfig, 'con
 }
 
 function env(name: string): string {
-  return (process.env[name] || '').trim();
+  return (getExternalEnvValue(name) ?? process.env[name] ?? '').trim();
 }
 
 function roleEnvPrefix(role: TextModelRole): string {

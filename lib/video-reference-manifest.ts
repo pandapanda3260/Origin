@@ -89,7 +89,7 @@ export type VideoGenerationPlan = {
     durationSec: number;
     plannedDurationSec?: number;
     subtitles: 'none';
-    audioMode: 'seedance_dialogue_audio';
+    audioMode: 'seedance_dialogue_audio' | 'none';
   };
   audit: {
     status?: 'submitting' | 'completed' | 'failed';

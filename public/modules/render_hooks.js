@@ -54,7 +54,7 @@ export function renderAssetCard(type, idx, status, payload) {
 
   if (status === "done" && payload.imgUrl) {
     if (loading) loading.hidden = true;
-    var updated = _updateCardImageInPlace(card, payload.imgUrl);
+    var updated = _updateCardImageInPlace(card, payload.imgUrl, payload.zoomUrl);
     return { ok: true, needFullRerender: !updated };
   }
 
@@ -298,9 +298,10 @@ export function renderVpCard(gIdx, status, payload) {
  * 就地更新卡片内所有 <img src> 和 [data-img]。如果分镜卡片还只有
  * placeholder，先原地替换成 <img>，避免首次出图时整块 grid 重建。
  */
-function _updateCardImageInPlace(card, imgUrl) {
+function _updateCardImageInPlace(card, imgUrl, zoomUrl) {
   var imgs = card.querySelectorAll("img");
   var zoomEls = card.querySelectorAll("[data-img]");
+  zoomUrl = zoomUrl || imgUrl;
 
   if (!imgs.length) {
     var sbPlaceholder = card.querySelector(".sb-sheet-placeholder");
@@ -333,7 +334,7 @@ function _updateCardImageInPlace(card, imgUrl) {
     hydrateProtectedImageElements(imgs[i]);
   }
   for (var j = 0; j < zoomEls.length; j++) {
-    zoomEls[j].dataset.img = imgUrl;
+    zoomEls[j].dataset.img = zoomUrl;
     hydrateProtectedImageElements(zoomEls[j]);
   }
   return true;

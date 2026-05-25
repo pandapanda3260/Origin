@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { UserRow } from './db';
 import { resolveLLMConfig } from './llm';
 import { postJsonWithProxySupport } from './proxy-fetch';
+import { getExternalEnvValue } from './env';
 
 export type TailFrameCaption = {
   status: 'ready';
@@ -70,10 +71,16 @@ export async function captionTailFrameForVideo(user: UserRow | null, imagePath: 
     '重点包括：最终构图、角色位置、动作结束状态、视线方向、主要道具、光照、空间关系。' +
     '不要编剧情，不要提到“图片/参考图/画面中有文字”，不要输出列表或 Markdown，120-220 字。';
   const dataUrl = imagePathToDataUrl(imagePath);
-  const timeoutMs = Number(process.env.IMAGE_CAPTION_TIMEOUT_MS || process.env.ORIGIN_IMAGE_CAPTION_TIMEOUT_MS || 120_000);
+  const timeoutMs = Number(
+    getExternalEnvValue('IMAGE_CAPTION_TIMEOUT_MS') ||
+      getExternalEnvValue('ORIGIN_IMAGE_CAPTION_TIMEOUT_MS') ||
+      process.env.IMAGE_CAPTION_TIMEOUT_MS ||
+      process.env.ORIGIN_IMAGE_CAPTION_TIMEOUT_MS ||
+      120_000,
+  );
   let text = '';
 
-  if (cfg.provider === 'openai_responses' || cfg.provider === 'zerail_responses') {
+  if (cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses' || cfg.provider === 'zerail_responses') {
     const body: any = {
       model: cfg.model,
       input: [
@@ -132,4 +139,3 @@ export async function captionTailFrameForVideo(user: UserRow | null, imagePath: 
     model: cfg.model,
   };
 }
-

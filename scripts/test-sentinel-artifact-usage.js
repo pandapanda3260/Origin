@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+require('./_ts-require-hook.js');
+
+process.env.RELAX_VIDEO_PROMPT_BLOCKERS = '0';
+
 const assert = require('node:assert/strict');
 const {
   describeArtifactStatus,
@@ -40,6 +44,12 @@ function projectFixture() {
     _staleFlags: {},
   };
   project.shotPlanStatus = 'ready';
+  project.shotPlanSourceSnapshot = computeShotPlanSourceSnapshot(project);
+  project.shotPlanSourceHash = computeShotPlanSourceHash(project);
+  return project;
+}
+
+function refreshShotPlanFingerprint(project) {
   project.shotPlanSourceSnapshot = computeShotPlanSourceSnapshot(project);
   project.shotPlanSourceHash = computeShotPlanSourceHash(project);
   return project;
@@ -103,6 +113,21 @@ function testVideoPromptStaleFlagBlocks() {
   assert.equal(decision.usability, 'BLOCKED', 'video_prompt stale flag blocks video segment');
   assert(decision.blockingReasons.includes('video_prompt_stale'), 'video prompt stale reason is blocking');
   assert.deepEqual(decision.staleFlagKeys, ['video_prompt_0'], 'decision records matched stale key');
+}
+
+function testStoryboardStaleDoesNotBlockVideoSegment() {
+  const project = {
+    ...projectFixture(),
+    _staleFlags: { storyboard_0: true },
+  };
+  const decision = describeArtifactStatus(project, {
+    projectId: project.id,
+    targetArtifact: 'video_segment',
+    groupIdx: 0,
+  });
+  assert(decision.reasons.includes('storyboard_stale'), 'storyboard stale reason is still reported');
+  assert(!decision.blockingReasons.includes('storyboard_stale'), 'storyboard stale does not block video segment generation');
+  assert.deepEqual(decision.staleFlagKeys, ['storyboard_0'], 'decision records matched stale key');
 }
 
 function testGroupShotPromptFlagsBlock() {
@@ -199,8 +224,9 @@ function testStoryboardImageGenerationStillBlocksStaleInputs() {
     targetArtifact: 'storyboard_image_generation',
     groupIdx: 0,
   });
-  assert.equal(storyboardDecision.usability, 'BLOCKED', 'first-frame generation still blocks stale storyboard slots');
-  assert(storyboardDecision.blockingReasons.includes('storyboard_stale'), 'storyboard stale reason is preserved');
+  assert.equal(storyboardDecision.usability, 'USABLE', 'first-frame generation can update stale storyboard slots');
+  assert(storyboardDecision.reasons.includes('storyboard_stale'), 'storyboard stale reason is still reported');
+  assert(!storyboardDecision.blockingReasons.includes('storyboard_stale'), 'storyboard stale is non-blocking for first-frame generation');
 }
 
 function testStoryboardImageGenerationStillBlocksShotPlanStates() {
@@ -233,6 +259,48 @@ function testVideoTaskOutdatedBlocks() {
   });
   assert.equal(decision.usability, 'BLOCKED', 'outdated video task blocks video segment use');
   assert(decision.blockingReasons.includes('video_task_outdated'), 'outdated reason is blocking');
+}
+
+function testVideoPromptRegenerationWithoutExistingVideoDoesNotBlock() {
+  const project = projectFixture();
+  project.shots[0] = { ...project.shots[0], visual: '门缓慢打开' };
+  project.storyboards[0] = { ...project.storyboards[0], videoPrompt: 'Camera follows the opening door.' };
+  project.videoTasks = [];
+  project.storyboards[0] = {
+    ...project.storyboards[0],
+    videoIsCurrent: false,
+    videoInvalidatedAt: '2026-05-20T13:00:08.500Z',
+    videoInvalidatedReason: 'video_prompt_regeneration',
+  };
+  refreshShotPlanFingerprint(project);
+  const decision = describeArtifactStatus(project, {
+    projectId: project.id,
+    targetArtifact: 'video_segment',
+    groupIdx: 0,
+  });
+  assert.equal(decision.usability, 'USABLE', 'prompt regeneration marker without an existing video does not block first video generation');
+  assert(!decision.blockingReasons.includes('storyboard_video_not_current'), 'empty storyboard video marker is ignored');
+}
+
+function testStoryboardVideoNotCurrentBlocksWhenVideoExists() {
+  const project = projectFixture();
+  project.shots[0] = { ...project.shots[0], visual: '门缓慢打开' };
+  project.storyboards[0] = {
+    ...project.storyboards[0],
+    videoPrompt: 'Camera follows the opening door.',
+    videoUrl: '/api/videos/file/v1',
+    videoTaskId: 'v1',
+    videoIsCurrent: false,
+    videoInvalidatedReason: 'video_prompt_regeneration',
+  };
+  refreshShotPlanFingerprint(project);
+  const decision = describeArtifactStatus(project, {
+    projectId: project.id,
+    targetArtifact: 'video_segment',
+    groupIdx: 0,
+  });
+  assert.equal(decision.usability, 'BLOCKED', 'stale storyboard video still blocks when a video exists');
+  assert(decision.blockingReasons.includes('storyboard_video_not_current'), 'storyboard stale reason is preserved');
 }
 
 function testPropagatedReasonsSurface() {
@@ -277,12 +345,15 @@ function testProjectArtifactStatusFiltering() {
 
 testShotPlanSubDecision();
 testVideoPromptStaleFlagBlocks();
+testStoryboardStaleDoesNotBlockVideoSegment();
 testGroupShotPromptFlagsBlock();
 testStoryboardImageFirstFrameBlocks();
 testStoryboardImageGenerationAllowsMissingFirstFrame();
 testStoryboardImageGenerationStillBlocksStaleInputs();
 testStoryboardImageGenerationStillBlocksShotPlanStates();
 testVideoTaskOutdatedBlocks();
+testVideoPromptRegenerationWithoutExistingVideoDoesNotBlock();
+testStoryboardVideoNotCurrentBlocksWhenVideoExists();
 testPropagatedReasonsSurface();
 testProjectArtifactStatusFiltering();
 

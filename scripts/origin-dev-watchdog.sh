@@ -144,14 +144,15 @@ stop_origin_dev() {
   fi
 }
 
-clean_next_cache() {
-  local target trash attempt err
+clean_next_cache_path() {
+  local target="$1"
+  local label="$2"
+  local trash attempt err
 
-  target="$PROJECT_DIR/.next"
-  log "cleaning Next dev cache: $PROJECT_DIR/.next"
+  log "cleaning Next dev cache: $target"
   [[ -e "$target" || -L "$target" ]] || return 0
 
-  trash="$PROJECT_DIR/.next.delete.$(date +%s).$$"
+  trash="$PROJECT_DIR/${label}.delete.$(date +%s).$$"
   if mv "$target" "$trash" 2>/dev/null; then
     rm -rf "$trash" >/dev/null 2>&1 || log "deferred old Next cache removal: $trash"
     return 0
@@ -160,11 +161,16 @@ clean_next_cache() {
   for attempt in 1 2 3; do
     err="$(rm -rf "$target" 2>&1 || true)"
     [[ ! -e "$target" && ! -L "$target" ]] && return 0
-    log "clean Next cache retry $attempt failed: ${err:-still exists}"
+    log "clean Next cache retry $attempt failed for $target: ${err:-still exists}"
     sleep 1
   done
 
-  log "could not fully clean Next dev cache; continuing with existing .next"
+  log "could not fully clean Next dev cache $target; continuing"
+}
+
+clean_next_cache() {
+  clean_next_cache_path "$PROJECT_DIR/.next" ".next"
+  clean_next_cache_path "$PROJECT_DIR/.next-dev" ".next-dev"
 }
 
 latest_auth_token() {

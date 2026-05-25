@@ -18,7 +18,9 @@ import {
   type ResolvedModelConfig,
   type TextModelRole,
 } from './model-routing';
-import { postJsonStreamRequest, postJsonWithProxySupport } from './proxy-fetch';
+import { fetchViaProxy, postJsonStreamRequest, postJsonWithProxySupport } from './proxy-fetch';
+import { recordTokenUsageEvent, type TokenUsageContext } from './token-usage';
+import { getExternalEnvValue } from './env';
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -39,6 +41,8 @@ export type LLMOptions = {
   traceAttempt?: number;
   traceMaxAttempts?: number;
   maxAttempts?: number;
+  // 仅用于后台 Token 统计的旁路 metadata；不得影响 prompt / 参数 / 返回结构。
+  tokenContext?: TokenUsageContext;
   // 覆盖默认模型选择（默认用 settings 里的 text 模型）
   modelOverride?: string;
 };
@@ -137,6 +141,7 @@ export async function chatComplete(
   messages: ChatMessage[],
   opts: LLMOptions = {},
 ): Promise<string> {
+  opts = withDefaultTokenContext(user, opts);
   const cfg = resolveTextModelConfig(user, selectTextRole(opts));
   if (cfg.mode === 'fake') {
     return fakeReply(messages, opts);
@@ -189,7 +194,7 @@ async function chatCompleteOnce(
   if (cfg.provider === 'zerail_messages' || cfg.provider === 'code80_messages' || cfg.provider === 'packy_messages') {
     return claudeMessagesComplete(cfg, messages, opts);
   }
-  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses') {
     return responsesComplete(cfg, messages, opts);
   }
   return openAIChatComplete(cfg, messages, opts);
@@ -244,6 +249,17 @@ async function observeTextModelCall<T>(
       fallbackUsed: !!cfg.fallbackOf,
       meta: modelUsageMeta(result),
     });
+    recordTokenUsageEvent({
+      cfg,
+      slot: cfg.role || opts.modelRole || 'text',
+      modelRole: opts.modelRole || cfg.role || null,
+      traceName: opts.traceName,
+      status: 'ok',
+      latencyMs: Date.now() - started,
+      usage: modelUsageMeta(result),
+      tokenContext: opts.tokenContext || null,
+      meta: tokenAttemptMeta(cfg, opts),
+    });
     return result;
   } catch (error: any) {
     const parsed = classifyModelCallError(error);
@@ -258,6 +274,19 @@ async function observeTextModelCall<T>(
       fallbackUsed: !!cfg.fallbackOf,
       message: parsed.message,
       meta: modelUsageMeta(error?.usage),
+    });
+    recordTokenUsageEvent({
+      cfg,
+      slot: cfg.role || opts.modelRole || 'text',
+      modelRole: opts.modelRole || cfg.role || null,
+      traceName: opts.traceName,
+      status: parsed.status,
+      statusCode: parsed.statusCode,
+      errorCode: parsed.errorCode,
+      latencyMs: Date.now() - started,
+      usage: modelUsageMeta(error?.usage),
+      tokenContext: opts.tokenContext || null,
+      meta: { ...tokenAttemptMeta(cfg, opts), message: parsed.message },
     });
     throw error;
   }
@@ -356,6 +385,161 @@ async function responsesComplete(
     `status=${status} incomplete_details=none usage=${formatUsageSummary(usage)}`,
   );
   return stripThinkBlocks(content);
+}
+
+// 用 background 模式跑 Responses API: 适用于长耗时 / 高 reasoning 任务,
+// 避免被中转站(gateway)的同步连接超时(常见 60-300s)掐断。
+// 协议:
+//   1) POST /responses { ..., background: true } → 立即返回 { id, status: 'queued'|'in_progress' }
+//   2) GET  /responses/{id} 轮询 → status 进入 'completed'|'failed'|'cancelled'|'incomplete' 才结束
+// 注意: background 模式要求服务端保存响应以便轮询, 因此和 cfg.disableResponseStorage 互斥, 这里
+// 强制忽略 disableResponseStorage(只对本任务, 不修改 cfg)。
+async function responsesBackgroundComplete(
+  cfg: ResolvedModelConfig,
+  messages: ChatMessage[],
+  opts: LLMOptions = {},
+): Promise<string> {
+  const submitBodyBase = buildResponsesBody(cfg, messages, opts, false);
+  const submitBody: any = { ...submitBodyBase, background: true };
+  delete submitBody.stream;
+  // background 模式必须 store=true, 不能让外面的 disableResponseStorage 影响
+  if ('store' in submitBody) delete submitBody.store;
+
+  const clamp = (raw: number | undefined, fallback: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, raw && Number.isFinite(raw) ? raw : fallback));
+  const submitTimeoutMs = clamp(positiveEnvInt('LLM_BACKGROUND_SUBMIT_TIMEOUT_MS'), 60_000, 5_000, 300_000);
+  const totalTimeoutMs = opts.requestTimeoutMs || LLM_REQUEST_TIMEOUT_MS;
+  const pollIntervalMs = clamp(positiveEnvInt('LLM_BACKGROUND_POLL_INTERVAL_MS'), 5_000, 1_000, 30_000);
+  const pollTimeoutMs = clamp(positiveEnvInt('LLM_BACKGROUND_POLL_TIMEOUT_MS'), 30_000, 5_000, 120_000);
+
+  const submitJson = await observeTextModelCall(cfg, opts, () => postJsonWithProxySupport(
+    `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
+    cfg.apiKey,
+    submitBody,
+    submitTimeoutMs,
+    `LLM background submit 超时（>${Math.round(submitTimeoutMs / 1000)}s 未确认入队）`,
+  ));
+
+  const responseId = String(submitJson?.id || '').trim();
+  if (!responseId) {
+    throw new Error('LLM background 提交未返回 response id');
+  }
+
+  console.info(
+    `[llm.responses.bg] submitted ${formatResponsesTrace(cfg, opts)} ` +
+      `id=${responseId} status=${String(submitJson?.status || 'unknown')}`,
+  );
+
+  const deadline = Date.now() + totalTimeoutMs;
+  let finalJson: any = submitJson;
+  let status = String(submitJson?.status || '').toLowerCase();
+  let pollCount = 0;
+
+  while (!['completed', 'failed', 'cancelled', 'incomplete'].includes(status)) {
+    if (Date.now() > deadline) {
+      throw new Error(
+        `LLM background 长时间未完成（>${Math.round(totalTimeoutMs / 1000)}s 未达终态）, response_id=${responseId}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    pollCount += 1;
+    try {
+      finalJson = await getJsonWithProxySupport(
+        `${cfg.baseUrl}${cfg.endpoint || '/responses'}/${responseId}`,
+        cfg.apiKey,
+        pollTimeoutMs,
+        `LLM background poll #${pollCount} 超时`,
+      );
+    } catch (pollErr: any) {
+      const msg = String(pollErr?.message || pollErr || '');
+      const recoverable =
+        msg.includes('超时') ||
+        /LLM\s+(5\d\d|429)/i.test(msg) ||
+        /timeout|abort|network|ECONNRESET|EAI_AGAIN/i.test(msg);
+      if (!recoverable) throw pollErr;
+      console.warn(
+        `[llm.responses.bg] poll #${pollCount} transient error, will retry: ${msg.slice(0, 200)}`,
+      );
+      continue;
+    }
+    status = String(finalJson?.status || '').toLowerCase();
+  }
+
+  const usage = summarizeResponsesUsage(finalJson);
+  const incompleteDetails = getResponsesIncompleteDetails(finalJson);
+
+  if (status === 'failed' || status === 'cancelled') {
+    const errMsg =
+      finalJson?.error?.message ||
+      finalJson?.error?.code ||
+      JSON.stringify(finalJson?.error || finalJson?.incomplete_details || {}).slice(0, 400);
+    console.warn(
+      `[llm.responses.bg] ${status} ${formatResponsesTrace(cfg, opts)} ` +
+        `id=${responseId} polls=${pollCount} err=${errMsg}`,
+    );
+    throw new Error(`LLM background ${status}: ${errMsg}`);
+  }
+
+  if (status === 'incomplete') {
+    const incompleteReason = getResponsesIncompleteReason(finalJson) || 'incomplete';
+    console.warn(
+      `[llm.responses.bg] incomplete ${formatResponsesTrace(cfg, opts)} ` +
+        `id=${responseId} polls=${pollCount} reason=${incompleteReason} ` +
+        `incomplete_details=${formatIncompleteDetails(incompleteDetails)} ` +
+        `usage=${formatUsageSummary(usage)}`,
+    );
+    throw outputIncompleteError(incompleteReason, opts, usage, incompleteDetails);
+  }
+
+  const content = extractResponsesText(finalJson);
+  if (!content) {
+    throw new Error(`LLM background 完成但缺 output_text, response_id=${responseId}`);
+  }
+  console.info(
+    `[llm.responses.bg] complete ${formatResponsesTrace(cfg, opts)} ` +
+      `id=${responseId} polls=${pollCount} status=${status} usage=${formatUsageSummary(usage)}`,
+  );
+  return stripThinkBlocks(content);
+}
+
+async function getJsonWithProxySupport(
+  url: string,
+  apiKey: string,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    const err = new Error(timeoutMessage);
+    err.name = 'AbortError';
+    controller.abort(err);
+  }, timeoutMs);
+  let resp: Response;
+  try {
+    resp = await fetchViaProxy(url, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    if (controller.signal.aborted || e?.name === 'AbortError') throw new Error(timeoutMessage);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    const friendly = text.slice(0, 500);
+    throw new Error(`LLM ${resp.status}: ${friendly}`);
+  }
+  const json = await resp.json();
+  if (json?.error) {
+    const friendly =
+      (typeof json.error === 'string' ? json.error : json.error?.message) ||
+      JSON.stringify(json.error).slice(0, 400);
+    throw new Error(`LLM 错误: ${friendly}`);
+  }
+  return json;
 }
 
 function summarizeResponsesUsage(json: any) {
@@ -628,7 +812,7 @@ function resolveReasoningReserve(cfg: ResolvedModelConfig, opts: LLMOptions): nu
   if (effort === 'low') return 1_500;
   if (effort === 'minimal' || effort === 'none' || effort === 'off') return 1_000;
   if (cfg.role === 'styleBible' || cfg.role === 'profileDerive') return 3_000;
-  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') return 2_000;
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses') return 2_000;
   return 1_000;
 }
 
@@ -679,12 +863,12 @@ function logTokenBudget(
 }
 
 function envFlag(name: string): boolean {
-  const value = String(process.env[name] || '').trim().toLowerCase();
+  const value = String(getExternalEnvValue(name) ?? process.env[name] ?? '').trim().toLowerCase();
   return value === '1' || value === 'true' || value === 'yes' || value === 'on';
 }
 
 function positiveEnvInt(name: string): number | undefined {
-  const n = Number(String(process.env[name] || '').trim());
+  const n = Number(String(getExternalEnvValue(name) ?? process.env[name] ?? '').trim());
   if (!Number.isFinite(n) || n <= 0) return undefined;
   return Math.round(n);
 }
@@ -908,6 +1092,97 @@ export async function chatCompleteJsonWithRetry<T = any>(
   throw lastErr || new Error(`${taskName} 调用失败（已重试 ${maxAttempts} 次）`);
 }
 
+/**
+ * 走 Responses API background 模式跑 JSON 任务: 提交 → 轮询 → 拿结果。
+ * 适用场景: 长耗时 / 高 reasoning 任务 (例如 shots-generate, 28k tokens + xhigh reasoning),
+ * 避免被中转站的同步连接超时(60-300s 常见)掐断。
+ *
+ * 行为约束:
+ *   - 只在 cfg.provider 是 Responses API 系 (zerail_responses / openai_responses / packy_responses)
+ *     时走 background; 其它 provider 自动回退到 chatCompleteJsonWithRetry, 保证向后兼容。
+ *   - 失败语义和 chatCompleteJsonWithRetry 对齐: 重试 output_incomplete, classifyJsonRetryError
+ *     不可重试 (e.g. timeout / 4xx) 直接抛。
+ *   - reasoningEffort / maxTokens / responseFormat 等行为复用同一套 LLMOptions。
+ */
+export async function chatCompleteJsonViaBackground<T = any>(
+  user: UserRow | null,
+  messages: ChatMessage[],
+  opts: LLMOptions = {},
+  parser: (raw: string) => T,
+  taskName = 'json-task-bg',
+): Promise<T> {
+  const role = opts.modelRole || 'structured';
+  const cfg = resolveTextModelConfig(user, role);
+
+  // 非 Responses API provider (Claude / Chat Completions) 没有 background 模式 — 自动回退。
+  const isResponsesProvider =
+    cfg.provider === 'zerail_responses' ||
+    cfg.provider === 'openai_responses' ||
+    cfg.provider === 'packy_responses';
+  if (!isResponsesProvider || cfg.mode === 'fake') {
+    return chatCompleteJsonWithRetry(user, messages, opts, parser, taskName);
+  }
+
+  const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts || 3));
+  let currentMaxTokens = resolveTaskMaxTokens(taskName, opts.maxTokens, 1);
+  let outputIncompleteRetried = false;
+  let lastErr: any = null;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const attempt = i + 1;
+    const t0 = Date.now();
+    const reasoningEffort = opts.reasoningEffort === null
+      ? 'off'
+      : (opts.reasoningEffort || cfg.reasoningEffort || 'default');
+    const requestTimeoutMs = resolveJsonRequestTimeoutMs(taskName, currentMaxTokens, reasoningEffort, opts.requestTimeoutMs, attempt);
+    const taskMeta = `role=${role},provider=${cfg.provider},model=${cfg.model},maxTokens=${currentMaxTokens},reasoning=${reasoningEffort},timeoutMs=${requestTimeoutMs}`;
+
+    try {
+      const finalOpts: LLMOptions = {
+        ...opts,
+        maxTokens: currentMaxTokens,
+        requestTimeoutMs,
+        responseFormat: 'json_object',
+        modelRole: opts.modelRole || 'structured',
+        traceName: taskName,
+        traceAttempt: attempt,
+        traceMaxAttempts: maxAttempts,
+      };
+      const budgetedOpts = applyTokenBudget(cfg, messages, finalOpts, 'complete');
+      const raw = await responsesBackgroundComplete(cfg, messages, budgetedOpts);
+      const parsed = parser(raw);
+      console.info(`[${taskName}] background attempt ${attempt}/${maxAttempts} ok in ${Date.now() - t0}ms (${taskMeta})`);
+      return parsed;
+    } catch (e: any) {
+      lastErr = e;
+      const decision = classifyJsonRetryError(e);
+      const elapsedMs = Date.now() - t0;
+      console.warn(
+        `[${taskName}] background attempt ${attempt}/${maxAttempts} failed in ${elapsedMs}ms ` +
+          `(reason=${decision.reason}, retryable=${decision.retryable}, ${taskMeta}, ` +
+          `incomplete_details=${formatIncompleteDetails(e?.incompleteDetails)}):`,
+        e?.message,
+      );
+      if (!decision.retryable) throw e;
+      if (i < maxAttempts - 1) {
+        if (decision.reason === 'output_incomplete') {
+          if (outputIncompleteRetried) throw e;
+          outputIncompleteRetried = true;
+          const nextMaxTokens = resolveRetryMaxTokens(taskName, currentMaxTokens);
+          console.warn(
+            `[${taskName}] retrying background output_incomplete with maxTokens ${currentMaxTokens} -> ${nextMaxTokens}`,
+          );
+          currentMaxTokens = nextMaxTokens;
+          await new Promise((r) => setTimeout(r, 500));
+          continue;
+        }
+        await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      }
+    }
+  }
+  throw lastErr || new Error(`${taskName} background 调用失败（已重试 ${maxAttempts} 次）`);
+}
+
 function resolveJsonRequestTimeoutMs(
   taskName: string,
   maxTokens: number,
@@ -1022,6 +1297,7 @@ export async function chatStream(
   opts: LLMOptions = {},
   onChunk: (text: string) => void,
 ): Promise<string> {
+  opts = withDefaultTokenContext(user, opts);
   const cfg = resolveTextModelConfig(user, selectTextRole(opts));
   if (cfg.mode === 'fake') {
     const text = fakeReply(messages, opts);
@@ -1038,12 +1314,37 @@ export async function chatStream(
   const budgetedOpts = applyTokenBudget(cfg, messages, opts, 'stream');
 
   if (cfg.provider === 'zerail_messages' || cfg.provider === 'code80_messages' || cfg.provider === 'packy_messages') {
-    return claudeMessagesStream(cfg, messages, budgetedOpts, onChunk);
+    return observeTextModelCall(cfg, budgetedOpts, () => claudeMessagesStream(cfg, messages, budgetedOpts, onChunk));
   }
-  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses') {
-    return responsesStream(cfg, messages, budgetedOpts, onChunk);
+  if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses') {
+    return observeTextModelCall(cfg, budgetedOpts, () => responsesStream(cfg, messages, budgetedOpts, onChunk));
   }
-  return openAIChatStream(cfg, messages, budgetedOpts, onChunk);
+  return observeTextModelCall(cfg, budgetedOpts, () => openAIChatStream(cfg, messages, budgetedOpts, onChunk));
+}
+
+function withDefaultTokenContext(user: UserRow | null, opts: LLMOptions): LLMOptions {
+  if (!user?.id) return opts;
+  const base: TokenUsageContext = {
+    ownerId: user.id,
+    usernameSnapshot: user.username || user.email || null,
+  };
+  return {
+    ...opts,
+    tokenContext: {
+      ...base,
+      ...(opts.tokenContext || {}),
+    },
+  };
+}
+
+function tokenAttemptMeta(cfg: ResolvedModelConfig, opts: LLMOptions): Record<string, unknown> {
+  const meta: Record<string, unknown> = {
+    fallbackUsed: !!cfg.fallbackOf,
+  };
+  if (cfg.fallbackOf) meta.fallbackOf = cfg.fallbackOf;
+  if (opts.traceAttempt != null) meta.traceAttempt = opts.traceAttempt;
+  if (opts.traceMaxAttempts != null) meta.traceMaxAttempts = opts.traceMaxAttempts;
+  return meta;
 }
 
 async function openAIChatStream(

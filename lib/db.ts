@@ -118,6 +118,10 @@ function bootstrap(db: Database.Database) {
       cover_url    TEXT,
       status       TEXT NOT NULL DEFAULT 'draft',
       data_json    TEXT NOT NULL DEFAULT '{}',
+      -- 乐观锁版本号：每次 updateProjectForUser / patchProjectForUser 成功写入时 +1。
+      -- 前端 PUT 携带 If-Match: "v<version>" 头，后端在事务内 compare-and-update；
+      -- 不匹配返回 409 stale_version，避免 batch executor 等"权威写"被前端 stale PUT 覆盖。
+      version      INTEGER NOT NULL DEFAULT 1,
       created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
@@ -155,6 +159,8 @@ function bootstrap(db: Database.Database) {
       ON style_bible_runs(status, next_retry_at, created_at);
     CREATE INDEX IF NOT EXISTS idx_style_bible_runs_run_id
       ON style_bible_runs(run_id);
+    CREATE INDEX IF NOT EXISTS idx_time_stats_style_bible_runs_created
+      ON style_bible_runs(created_at DESC);
 
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id     INTEGER PRIMARY KEY,
@@ -255,6 +261,19 @@ function bootstrap(db: Database.Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_continuity_cache_owner_project ON continuity_cache(owner_id, project_id, updated_at DESC);
 
+    CREATE TABLE IF NOT EXISTS first_frame_rewrite_calls (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id      INTEGER NOT NULL,
+      project_id   TEXT NOT NULL,
+      group_idx    INTEGER NOT NULL,
+      called_at    TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_first_frame_rewrite_calls_user_time
+      ON first_frame_rewrite_calls(user_id, called_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_first_frame_rewrite_calls_project_time
+      ON first_frame_rewrite_calls(user_id, project_id, called_at DESC);
+
     CREATE TABLE IF NOT EXISTS batch_tasks (
       id            TEXT PRIMARY KEY,
       batch_id      TEXT NOT NULL,
@@ -290,6 +309,8 @@ function bootstrap(db: Database.Database) {
       FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_batch_tasks_batch ON batch_tasks(batch_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_time_stats_batch_tasks_created
+      ON batch_tasks(created_at DESC);
 
     CREATE TABLE IF NOT EXISTS task_state_history (
       id          TEXT PRIMARY KEY,
@@ -305,6 +326,8 @@ function bootstrap(db: Database.Database) {
     );
     CREATE INDEX IF NOT EXISTS idx_task_state_history_task_time
       ON task_state_history(task_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_time_stats_task_state_terminal
+      ON task_state_history(task_id, to_state, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS scheduled_jobs (
       job_name          TEXT PRIMARY KEY,
@@ -377,6 +400,8 @@ function bootstrap(db: Database.Database) {
       FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_exports_owner ON exports(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_time_stats_exports_created
+      ON exports(created_at DESC);
 
     -- 阶段四：用户上传素材（剪辑工作台导入）
     CREATE TABLE IF NOT EXISTS uploads (
@@ -419,6 +444,187 @@ function bootstrap(db: Database.Database) {
       ON toolbox_items(owner_id, status, tool_type);
     CREATE INDEX IF NOT EXISTS idx_toolbox_items_parent
       ON toolbox_items(parent_item_id);
+
+    -- 素材库 v1：长期资产索引。真实文件型素材才进入 assets；
+    -- 生成中、失败槽位、部分成功记录进入 generation_batches / generation_failures。
+    CREATE TABLE IF NOT EXISTS asset_version_groups (
+      version_group_id TEXT PRIMARY KEY,
+      owner_id         INTEGER NOT NULL,
+      project_id       TEXT,
+      shot_uid         TEXT,
+      stage            TEXT NOT NULL,
+      current_asset_id TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_version_groups_slot
+      ON asset_version_groups(owner_id, project_id, shot_uid, stage, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_asset_version_groups_current
+      ON asset_version_groups(current_asset_id);
+
+    CREATE TABLE IF NOT EXISTS assets (
+      asset_id                TEXT PRIMARY KEY,
+      owner_id                INTEGER NOT NULL,
+      project_id              TEXT,
+      shot_uid                TEXT,
+      legacy_shot_id          TEXT,
+      version_group_id        TEXT NOT NULL,
+      batch_id                TEXT,
+      asset_kind              TEXT NOT NULL,
+      source                  TEXT NOT NULL,
+      stage                   TEXT NOT NULL,
+      file_uri                TEXT NOT NULL,
+      thumb_uri               TEXT,
+      file_hash               TEXT,
+      byte_size               INTEGER NOT NULL DEFAULT 0,
+      duration_ms             INTEGER,
+      width                   INTEGER,
+      height                  INTEGER,
+      version_index           INTEGER NOT NULL DEFAULT 1,
+      predecessor_version_asset_id TEXT,
+      lifecycle_status        TEXT NOT NULL DEFAULT 'active',
+      storage_tier            TEXT NOT NULL DEFAULT 'hot',
+      file_availability       TEXT NOT NULL DEFAULT 'present',
+      project_relation_status TEXT NOT NULL DEFAULT 'linked',
+      shot_relation_status    TEXT NOT NULL DEFAULT 'unknown',
+      purge_eligible_at       TEXT,
+      accessed_at             TEXT,
+      created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (version_group_id) REFERENCES asset_version_groups(version_group_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_assets_owner_created
+      ON assets(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_assets_owner_project
+      ON assets(owner_id, project_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_assets_version_group
+      ON assets(version_group_id, version_index DESC);
+    CREATE INDEX IF NOT EXISTS idx_assets_batch
+      ON assets(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_assets_stage_kind
+      ON assets(owner_id, stage, asset_kind, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_file_identity
+      ON assets(owner_id, COALESCE(project_id, ''), COALESCE(shot_uid, COALESCE(legacy_shot_id, '')), stage, COALESCE(file_hash, file_uri));
+
+    CREATE TABLE IF NOT EXISTS generation_batches (
+      batch_id         TEXT PRIMARY KEY,
+      owner_id         INTEGER NOT NULL,
+      project_id       TEXT,
+      shot_uid         TEXT,
+      legacy_shot_id   TEXT,
+      stage            TEXT NOT NULL,
+      status           TEXT NOT NULL DEFAULT 'running',
+      requested_count  INTEGER NOT NULL DEFAULT 1,
+      succeeded_count  INTEGER NOT NULL DEFAULT 0,
+      failed_count     INTEGER NOT NULL DEFAULT 0,
+      context_hash     TEXT,
+      context_snapshot TEXT NOT NULL DEFAULT '{}',
+      source           TEXT NOT NULL DEFAULT 'project',
+      error_message    TEXT,
+      started_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      heartbeat_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      completed_at     TEXT,
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_generation_batches_owner_time
+      ON generation_batches(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_generation_batches_project_slot
+      ON generation_batches(owner_id, project_id, shot_uid, stage, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_generation_batches_status_heartbeat
+      ON generation_batches(status, heartbeat_at);
+    DROP INDEX IF EXISTS idx_time_stats_generation_stage_source_created;
+    CREATE INDEX IF NOT EXISTS idx_time_stats_generation_stage_created
+      ON generation_batches(stage, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_batches_running_project_slot
+      ON generation_batches(owner_id, project_id, shot_uid, stage)
+      WHERE status = 'running'
+        AND project_id IS NOT NULL
+        AND shot_uid IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS generation_failures (
+      failure_id      TEXT PRIMARY KEY,
+      batch_id        TEXT NOT NULL,
+      owner_id        INTEGER NOT NULL,
+      slot_index      INTEGER NOT NULL DEFAULT 0,
+      failure_reason  TEXT NOT NULL DEFAULT 'unknown',
+      error_message   TEXT,
+      retryable       INTEGER NOT NULL DEFAULT 1,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (batch_id) REFERENCES generation_batches(batch_id) ON DELETE CASCADE,
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_generation_failures_batch
+      ON generation_failures(batch_id, slot_index);
+
+    CREATE TABLE IF NOT EXISTS asset_dependencies (
+      asset_id                  TEXT NOT NULL,
+      input_asset_id            TEXT NOT NULL,
+      dependency_role           TEXT NOT NULL,
+      dependency_order          INTEGER NOT NULL DEFAULT 0,
+      required_for_regeneration INTEGER NOT NULL DEFAULT 0,
+      created_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (asset_id, input_asset_id, dependency_role, dependency_order),
+      FOREIGN KEY (asset_id) REFERENCES assets(asset_id) ON DELETE CASCADE,
+      FOREIGN KEY (input_asset_id) REFERENCES assets(asset_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_dependencies_input
+      ON asset_dependencies(input_asset_id, dependency_role);
+
+    CREATE TABLE IF NOT EXISTS edit_projects (
+      edit_project_id TEXT PRIMARY KEY,
+      owner_id        INTEGER NOT NULL,
+      project_id      TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'draft',
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_edit_projects_owner_project
+      ON edit_projects(owner_id, project_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS edit_project_clips (
+      edit_project_id TEXT NOT NULL,
+      asset_id        TEXT NOT NULL,
+      position        INTEGER NOT NULL DEFAULT 0,
+      in_ms           INTEGER NOT NULL DEFAULT 0,
+      out_ms          INTEGER,
+      track           INTEGER NOT NULL DEFAULT 0,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (edit_project_id, asset_id, position, track),
+      FOREIGN KEY (edit_project_id) REFERENCES edit_projects(edit_project_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_edit_project_clips_asset
+      ON edit_project_clips(asset_id);
+
+    CREATE TABLE IF NOT EXISTS quota_usage (
+      owner_id          INTEGER PRIMARY KEY,
+      hot_image_count   INTEGER NOT NULL DEFAULT 0,
+      hot_image_bytes   INTEGER NOT NULL DEFAULT 0,
+      hot_video_count   INTEGER NOT NULL DEFAULT 0,
+      hot_video_bytes   INTEGER NOT NULL DEFAULT 0,
+      hot_total_bytes   INTEGER NOT NULL DEFAULT 0,
+      is_over_quota     INTEGER NOT NULL DEFAULT 0,
+      updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_audit_events (
+      id          TEXT PRIMARY KEY,
+      owner_id    INTEGER NOT NULL,
+      asset_id    TEXT,
+      event_type  TEXT NOT NULL,
+      actor       TEXT NOT NULL DEFAULT 'system',
+      meta_json   TEXT NOT NULL DEFAULT '{}',
+      created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_audit_events_asset
+      ON asset_audit_events(asset_id, created_at DESC);
 
     -- 用户世界观模板：风格圣经 + 角色/场景/道具等可复用设定
     CREATE TABLE IF NOT EXISTS world_templates (
@@ -698,6 +904,56 @@ function bootstrap(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_observability_events_slot_time
       ON observability_events(slot, created_at DESC);
 
+    CREATE TABLE IF NOT EXISTS token_usage_events (
+      id                     TEXT PRIMARY KEY,
+      created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      owner_id               INTEGER,
+      username_snapshot      TEXT,
+      project_id             TEXT,
+      project_title_snapshot TEXT,
+      request_path           TEXT,
+      route_name             TEXT,
+      trace_name             TEXT,
+      module_key             TEXT NOT NULL DEFAULT 'other',
+      module_label           TEXT NOT NULL DEFAULT '其它',
+      feature_key            TEXT NOT NULL DEFAULT 'unknown',
+      feature_label          TEXT NOT NULL DEFAULT '未知功能',
+      call_item_type         TEXT,
+      call_item_id           TEXT,
+      call_item_label        TEXT,
+      provider               TEXT,
+      model                  TEXT,
+      model_role             TEXT,
+      slot                   TEXT,
+      status                 TEXT NOT NULL,
+      status_code            INTEGER,
+      error_code             TEXT,
+      latency_ms             INTEGER,
+      input_tokens           INTEGER,
+      output_tokens          INTEGER,
+      reasoning_tokens       INTEGER,
+      cached_tokens          INTEGER,
+      total_tokens           INTEGER,
+      billable_tokens        INTEGER,
+      usage_source           TEXT NOT NULL DEFAULT 'missing',
+      prompt_hash            TEXT,
+      response_hash          TEXT,
+      batch_id               TEXT,
+      task_id                TEXT,
+      run_id                 TEXT,
+      correlation_id         TEXT,
+      meta_json              TEXT NOT NULL DEFAULT '{}',
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_usage_time
+      ON token_usage_events(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_owner_time
+      ON token_usage_events(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_category_time
+      ON token_usage_events(module_key, feature_key, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_model_time
+      ON token_usage_events(provider, model, created_at DESC);
+
     CREATE TABLE IF NOT EXISTS user_activity (
       user_id       INTEGER PRIMARY KEY,
       last_seen_at  TEXT NOT NULL,
@@ -743,6 +999,18 @@ function bootstrap(db: Database.Database) {
   migrateAdminFoundationColumns(db);
   migrateAdminGovernanceColumns(db);
   migrateOperationalLinkageColumns(db);
+  migrateProjectsVersionColumn(db);
+}
+
+// projects.version：乐观锁版本号迁移。老库没有这一列，给所有现存项目兜底成 1。
+// 新插入的项目走 schema DEFAULT 1。
+// addColumnIfMissing 的 ddl 参数约定要带列名（见其它 callsite），所以这里是 'version INTEGER ...'。
+function migrateProjectsVersionColumn(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'projects', 'version', 'version INTEGER NOT NULL DEFAULT 1');
+  } catch (e) {
+    console.warn('[db] migrateProjectsVersionColumn failed:', e);
+  }
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, column: string, ddl: string) {
@@ -822,6 +1090,56 @@ function migrateOperationalLinkageColumns(db: Database.Database) {
         ON observability_events(type, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_observability_events_slot_time
         ON observability_events(slot, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS token_usage_events (
+        id                     TEXT PRIMARY KEY,
+        created_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        owner_id               INTEGER,
+        username_snapshot      TEXT,
+        project_id             TEXT,
+        project_title_snapshot TEXT,
+        request_path           TEXT,
+        route_name             TEXT,
+        trace_name             TEXT,
+        module_key             TEXT NOT NULL DEFAULT 'other',
+        module_label           TEXT NOT NULL DEFAULT '其它',
+        feature_key            TEXT NOT NULL DEFAULT 'unknown',
+        feature_label          TEXT NOT NULL DEFAULT '未知功能',
+        call_item_type         TEXT,
+        call_item_id           TEXT,
+        call_item_label        TEXT,
+        provider               TEXT,
+        model                  TEXT,
+        model_role             TEXT,
+        slot                   TEXT,
+        status                 TEXT NOT NULL,
+        status_code            INTEGER,
+        error_code             TEXT,
+        latency_ms             INTEGER,
+        input_tokens           INTEGER,
+        output_tokens          INTEGER,
+        reasoning_tokens       INTEGER,
+        cached_tokens          INTEGER,
+        total_tokens           INTEGER,
+        billable_tokens        INTEGER,
+        usage_source           TEXT NOT NULL DEFAULT 'missing',
+        prompt_hash            TEXT,
+        response_hash          TEXT,
+        batch_id               TEXT,
+        task_id                TEXT,
+        run_id                 TEXT,
+        correlation_id         TEXT,
+        meta_json              TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_token_usage_time
+        ON token_usage_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_token_usage_owner_time
+        ON token_usage_events(owner_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_token_usage_category_time
+        ON token_usage_events(module_key, feature_key, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_token_usage_model_time
+        ON token_usage_events(provider, model, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS user_activity (
         user_id       INTEGER PRIMARY KEY,
@@ -1718,6 +2036,7 @@ export type ProjectRow = {
   cover_url: string | null;
   status: string;
   data_json: string;
+  version: number;
   created_at: string;
   updated_at: string;
 };

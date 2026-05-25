@@ -8,7 +8,7 @@ var _history = { image: [], video: [] };
 var _cursor = { image: null, video: null };
 var _selected = null;
 var _blobUrlCache = new Map();
-var _busy = false;
+var _busy = { image: false, video: false };
 var _pollTimers = { video: null };
 var _polling = { video: false };
 var _imageForm = { mode: 'text_to_image', ratio: '1:1', count: 1, refs: [], prompt: '' };
@@ -82,6 +82,18 @@ function _statusClass(item) {
   if (item.status === 'running') return 'is-running';
   if (item.result && item.result.deleted) return 'is-missing';
   return 'is-done';
+}
+
+function _isToolBusy(tool) {
+  return !!_busy[tool];
+}
+
+function _setToolBusy(tool, value) {
+  _busy[tool] = !!value;
+}
+
+function _isActiveToolBusy() {
+  return _isToolBusy(_activeTool);
 }
 
 function _summarizeItems(items) {
@@ -222,8 +234,8 @@ function _imageFormHtml() {
     '<label class="toolbox-field"><span>生成数量</span><select id="toolboxImageCount">' +
       [1, 2, 3, 4].map(function (n) { return '<option value="' + n + '"' + (_imageForm.count === n ? ' selected' : '') + '>' + n + '</option>'; }).join('') +
     '</select></label>' +
-    '<button type="button" class="toolbox-generate" data-toolbox-generate="image" ' + (_busy ? 'disabled' : '') + '>' +
-      '<span class="material-symbols-outlined">auto_awesome</span>' + (_busy && _activeTool === 'image' ? '生成中' : '生成图片') +
+    '<button type="button" class="toolbox-generate" data-toolbox-generate="image" ' + (_isToolBusy('image') ? 'disabled' : '') + '>' +
+      '<span class="material-symbols-outlined">auto_awesome</span>' + (_isToolBusy('image') ? '生成中' : '生成图片') +
     '</button>';
 }
 
@@ -254,8 +266,8 @@ function _videoFormHtml() {
       '<option value="720p"' + (_videoForm.resolution === '720p' ? ' selected' : '') + '>720p</option>' +
       '<option value="1080p"' + (_videoForm.resolution === '1080p' ? ' selected' : '') + '>1080p</option>' +
     '</select></label>' +
-    '<button type="button" class="toolbox-generate" data-toolbox-generate="video" ' + (_busy ? 'disabled' : '') + '>' +
-      '<span class="material-symbols-outlined">movie_creation</span>' + (_busy && _activeTool === 'video' ? '生成中' : '生成视频') +
+    '<button type="button" class="toolbox-generate" data-toolbox-generate="video" ' + (_isToolBusy('video') ? 'disabled' : '') + '>' +
+      '<span class="material-symbols-outlined">movie_creation</span>' + (_isToolBusy('video') ? '生成中' : '生成视频') +
     '</button>';
 }
 
@@ -566,7 +578,7 @@ async function _generateImage() {
   var prompt = String(_imageForm.prompt || '').trim();
   if (!prompt) throw new Error('请输入提示词');
   if (_imageForm.mode === 'image_to_image' && !_imageForm.refs.length) throw new Error('请先上传参考图');
-  _busy = true;
+  _setToolBusy('image', true);
   _render();
   try {
     var data = await _jsonFetch('/api/toolbox/image/generate', {
@@ -578,13 +590,14 @@ async function _generateImage() {
         inputRefs: _imageForm.mode === 'image_to_image' ? _imageForm.refs : [],
       }),
     });
-    _selected = data.items && data.items[0] || null;
+    var nextSelected = data.items && data.items[0] || null;
+    if (_activeTool === 'image') _selected = nextSelected;
     await _loadHistory('image', false);
-    if (_selected) _history.image = [_selected].concat((_history.image || []).filter(function (item) { return item.id !== _selected.id; }));
+    if (nextSelected) _history.image = [nextSelected].concat((_history.image || []).filter(function (item) { return item.id !== nextSelected.id; }));
     _toastForImageGeneration(data);
   } finally {
-    _busy = false;
-    _render();
+    _setToolBusy('image', false);
+    if (_activeView === 'image') _render();
   }
 }
 
@@ -596,7 +609,7 @@ async function _generateVideo() {
   if (_videoForm.mode === 'first_last_frame_video' && !_videoForm.tailRef) throw new Error('请先上传尾帧图');
   var refs = [Object.assign({}, _videoForm.firstRef, { role: 'first_frame' })];
   if (_videoForm.mode === 'first_last_frame_video') refs.push(Object.assign({}, _videoForm.tailRef, { role: 'tail_frame' }));
-  _busy = true;
+  _setToolBusy('video', true);
   _render();
   _startVideoStatusPolling();
   try {
@@ -616,22 +629,24 @@ async function _generateVideo() {
         inputRefs: refs,
       }),
     });
-    _selected = data.item || null;
+    var nextSelected = data.item || null;
+    if (_activeTool === 'video') _selected = nextSelected;
     await _loadHistory('video', false);
-    if (_selected) _history.video = [_selected].concat((_history.video || []).filter(function (item) { return item.id !== _selected.id; }));
+    if (nextSelected) _history.video = [nextSelected].concat((_history.video || []).filter(function (item) { return item.id !== nextSelected.id; }));
     if (_hasRunning('video')) _startVideoStatusPolling();
     else _stopVideoStatusPolling();
-    _toastForVideoGeneration(_selected);
+    _toastForVideoGeneration(nextSelected);
   } finally {
-    _busy = false;
-    _render();
+    _setToolBusy('video', false);
+    if (_activeView === 'video') _render();
   }
 }
 
 async function _enhanceSelected() {
   if (!_selected) return;
   var isVideoEnhance = _selected.toolType === 'video';
-  _busy = true;
+  var busyTool = isVideoEnhance ? 'video' : 'image';
+  _setToolBusy(busyTool, true);
   _render();
   if (isVideoEnhance) _startVideoStatusPolling();
   try {
@@ -639,15 +654,16 @@ async function _enhanceSelected() {
       method: 'POST',
       body: JSON.stringify({}),
     });
-    _selected = data.item || _selected;
-    await _loadHistory(_activeTool, false);
-    if (_selected) _history[_activeTool] = [_selected].concat((_history[_activeTool] || []).filter(function (item) { return item.id !== _selected.id; }));
+    var nextSelected = data.item || _selected;
+    if (_activeTool === busyTool) _selected = nextSelected;
+    await _loadHistory(busyTool, false);
+    if (nextSelected) _history[busyTool] = [nextSelected].concat((_history[busyTool] || []).filter(function (item) { return item.id !== nextSelected.id; }));
     if (isVideoEnhance && _hasRunning('video')) _startVideoStatusPolling();
     else if (isVideoEnhance) _stopVideoStatusPolling();
-    _toastForEnhance(_selected);
+    _toastForEnhance(nextSelected);
   } finally {
-    _busy = false;
-    _render();
+    _setToolBusy(busyTool, false);
+    if (_activeView === busyTool) _render();
   }
 }
 
@@ -737,24 +753,25 @@ export function _initToolboxEvents() {
       return;
     }
     var gen = ev.target.closest('[data-toolbox-generate]');
-    if (gen && !_busy) {
+    if (gen) {
       var which = gen.getAttribute('data-toolbox-generate');
+      if (_isToolBusy(which === 'video' ? 'video' : 'image')) return;
       (which === 'video' ? _generateVideo() : _generateImage()).catch(function (e) {
-        _busy = false;
+        _setToolBusy(which === 'video' ? 'video' : 'image', false);
         _render();
         _toast(e.message || '生成失败', 'error');
       });
       return;
     }
-    if (ev.target.closest('[data-toolbox-enhance]') && !_busy) {
+    if (ev.target.closest('[data-toolbox-enhance]') && !_isActiveToolBusy()) {
       _enhanceSelected().catch(function (e) {
-        _busy = false;
+        _setToolBusy(_activeTool, false);
         _render();
         _toast(e.message || '重绘失败', 'error');
       });
       return;
     }
-    if (ev.target.closest('[data-toolbox-delete]') && !_busy) {
+    if (ev.target.closest('[data-toolbox-delete]') && !_isActiveToolBusy()) {
       _deleteSelected().catch(function (e) { _toast(e.message || '删除失败', 'error'); });
       return;
     }

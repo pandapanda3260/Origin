@@ -15,11 +15,12 @@ import {
   generateVideo,
   VideoGenerationError,
   classifyVideoFailureStage,
+  normalizeGenerateAudio,
   normalizeSeedanceResolution,
   type VideoReferenceImage,
   type VideoGenInput,
 } from './video-gen';
-import { chatComplete, chatCompleteJsonWithRetry, parseJsonLoose, resolveLLMConfig } from './llm';
+import { chatComplete, chatCompleteJsonViaBackground, chatCompleteJsonWithRetry, parseJsonLoose, resolveLLMConfig } from './llm';
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
 import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 import {
@@ -49,6 +50,12 @@ import {
 } from './character-panels';
 import { deriveCharacterReferenceUpdate } from './character-reference-update';
 import { buildAssetStyleLock, type AssetStyleType } from './asset-style-lock';
+import {
+  appendCharacterCastingPrompt,
+  styleBibleForScenePrompt,
+  styleBibleForShotPrompt,
+  styleBibleForVideoPrompt,
+} from './casting-profile';
 import type { CharacterReferencePanel } from './panel-selection';
 import {
   ensureProjectConsistency,
@@ -90,6 +97,17 @@ import { dataPath } from './runtime-paths';
 import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl, checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
 import { pickSceneForShots } from './scene-selection';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit } from './frame-image-plan';
+import {
+  applyFirstFrameDraftToPlan,
+  computeFirstFrameEditSourceHash,
+  currentFirstFrameEditDraft,
+  firstFrameDraftFingerprint,
+  isFirstFrameEditDraftStale,
+  validateAndNormalizeFirstFrameDraft,
+  MissingFirstFrameDraftException,
+  StaleFirstFrameDraftException,
+  FirstFrameDraftValidationException,
+} from './first-frame-edit-draft';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
 import { resolveTargetEndStrategy, resolveVideoModelCapability } from './video-provider-capabilities';
 import { captionTailFrameForVideo, hashImageFileContent, type TailFrameCaption } from './image-caption';
@@ -98,10 +116,10 @@ import {
   computeShotPlanSourceHash,
   computeShotPlanSourceSnapshot,
 } from './project-dependency-state';
+import { normalizeTailFrameSignals } from './shot-tail-frame-signals';
 import {
   computeFirstFrameSourceHash,
   computeTailFrameSourceHash,
-  markTailFrameStaleForFirstFrameChange,
   makeSingleShotStoryboardSlots,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
@@ -126,6 +144,25 @@ function envFlag(name: string, fallback: boolean) {
   if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
   if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
   return fallback;
+}
+
+function resolveFrameImageQualityForCall(
+  configuredQuality: string | undefined,
+  context: { frameType: 'first_frame' | 'tail_frame'; projectId: string; groupIdx: number },
+): NonNullable<ImageGenInput['quality']> {
+  const plannedQuality = (configuredQuality || 'medium') as NonNullable<ImageGenInput['quality']>;
+  if (envFlag('IMAGE_QUALITY_STRICT', false)) return plannedQuality;
+  const actualQuality = 'medium' as NonNullable<ImageGenInput['quality']>;
+  if (plannedQuality !== actualQuality) {
+    console.warn('[frame-image-quality-gate] IMAGE_QUALITY_STRICT is off; keeping actual image quality at medium', {
+      frameType: context.frameType,
+      projectId: context.projectId,
+      groupIdx: context.groupIdx,
+      plannedQuality,
+      actualQuality,
+    });
+  }
+  return actualQuality;
 }
 
 function shouldDeferSeedanceProviderPolling() {
@@ -246,7 +283,7 @@ function referenceDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem
 }
 
 function collectRuntimeHardConstraints(prompt: string): Array<{ id: string; text: string; source: 'runtime' }> {
-  const lines = String(prompt || '').match(/HARD USER NEGATIVE CONSTRAINT:[^\n]+/g) || [];
+  const lines = String(prompt || '').match(/(?:HARD USER NEGATIVE CONSTRAINT|硬性负向约束)[^\n]+/g) || [];
   return lines.map((text, idx) => ({
     id: `runtime_hard_${idx + 1}`,
     text,
@@ -460,6 +497,7 @@ function buildVideoPlanSnapshot(opts: {
   prompt: string;
   userRatio: string;
   resolution?: string;
+  generateAudio?: boolean;
   durationSec: number;
   plannedDurationSec?: number;
   videoWarnings: any[];
@@ -509,7 +547,7 @@ function buildVideoPlanSnapshot(opts: {
       durationSec: opts.durationSec,
       plannedDurationSec: opts.plannedDurationSec,
       subtitles: 'none',
-      audioMode: 'seedance_dialogue_audio',
+      audioMode: opts.generateAudio === false ? 'none' : 'seedance_dialogue_audio',
     },
     audit: {
       status: opts.status,
@@ -556,6 +594,7 @@ function warnVideoPlanAuditPayloadMismatch(opts: {
  * 出来的局部冲突。如果 styleBible 缺失就返回空串，不强加约束。
  */
 function buildSceneStyleLock(styleBible: any): string {
+  styleBible = styleBibleForScenePrompt(styleBible);
   if (!styleBible || typeof styleBible !== 'object') return '';
   const parts: string[] = [];
   // 视觉风格关键词（治愈系 / 王家卫怀旧 等）
@@ -654,10 +693,12 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   if (!item) throw new Error(`找不到 ${cat}[${idx}]`);
 
   ctx.progress({ stage: 'building_prompt' });
-  const reusablePrompt = sanitizeFillLightPositiveMentions(item.imagePrompt || buildAssetPrompt(item, type, (proj as any).styleBible));
+  const rawStyleBible = (proj as any).styleBible || {};
+  const reusablePrompt = sanitizeFillLightPositiveMentions(item.imagePrompt || buildAssetPrompt(item, type, rawStyleBible));
   let prompt = reusablePrompt;
   const assetStyleType = type as AssetStyleType;
-  const styleLockContext = buildAssetStyleLock((proj as any).styleBible || {}, assetStyleType);
+  const styleBibleForAsset = type === 'char' ? rawStyleBible : styleBibleForScenePrompt(rawStyleBible);
+  const styleLockContext = buildAssetStyleLock(styleBibleForAsset, assetStyleType);
 
   // 场景元数据注入：原网站效果之所以好看，是因为它把"时段/天气/灯光/氛围/位置"
   // 这些场景级参数也喂进了图像 prompt（不光显示在卡上）。我们的 LLM 现在会抽
@@ -702,6 +743,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
         prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image, override conflicting hints above) ===\n${charMeta.join('\n')}`;
       }
     }
+    prompt = appendCharacterCastingPrompt(prompt, item, rawStyleBible, { script: (proj as any).script || (proj as any).scriptDraft || '' });
     if (styleLockContext.prompt) {
       prompt = `${prompt}\n\n${styleLockContext.prompt}`;
     }
@@ -767,7 +809,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     }
   }
   const eventReferenceUpdate = type === 'char'
-    ? deriveCharacterReferenceUpdate(item, result, panelResult, entityType, styleReferenceMeta)
+    ? deriveCharacterReferenceUpdate(item, result, panelResult, entityType, styleReferenceMeta, undefined, findCharacterLock(proj, item)?.referenceLock)
     : null;
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
@@ -784,8 +826,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       imageSafetyAudit: result.safetyAudit,
       effectiveVisualDescription: result.visualAnchorDescription,
     };
+    const assetReferenceLock = type === 'char' ? findCharacterLock(fresh, baseAsset)?.referenceLock : undefined;
     const charAssetUpdate = type === 'char'
-      ? deriveCharacterReferenceUpdate(baseAsset, result, panelResult, entityType, styleReferenceMeta)
+      ? deriveCharacterReferenceUpdate(baseAsset, result, panelResult, entityType, styleReferenceMeta, undefined, assetReferenceLock)
       : null;
     let nextAsset = charAssetUpdate ? charAssetUpdate.nextAsset : {
       ...baseAsset,
@@ -820,8 +863,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       imageSafetyAudit: result.safetyAudit,
       effectiveVisualDescription: result.visualAnchorDescription,
     };
+    const topReferenceLock = type === 'char' ? findCharacterLock(fresh, baseTop)?.referenceLock : undefined;
     const charTopUpdate = type === 'char'
-      ? deriveCharacterReferenceUpdate(baseTop, result, panelResult, entityType, styleReferenceMeta)
+      ? deriveCharacterReferenceUpdate(baseTop, result, panelResult, entityType, styleReferenceMeta, undefined, topReferenceLock)
       : null;
     let nextTop = charTopUpdate ? charTopUpdate.nextAsset : {
       ...baseTop,
@@ -883,7 +927,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       mode: result.mode,
       width: result.width,
       height: result.height,
-      referenceStatus: eventReferenceUpdate ? (eventReferenceUpdate.accepted ? 'ready' : 'failed') : undefined,
+      referenceStatus: eventReferenceUpdate?.referenceStatus,
       lastAttemptUrl: eventReferenceUpdate && !eventReferenceUpdate.accepted ? result.url : undefined,
       lastError: eventReferenceUpdate && !eventReferenceUpdate.accepted ? eventReferenceUpdate.lastError : undefined,
       panels: eventReferenceUpdate?.accepted && panelResult?.ok ? panelResult.panels : undefined,
@@ -901,28 +945,28 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
 /* ============================================================
    2. storyboard_prompts executor —— 把单个镜头描述转成图像生成提示词
    ============================================================ */
-const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）提示词工程师。把"短视频镜头"翻译成英文提示词，最终会被画成**黑白铅笔分镜稿**（不是成片！不是照片！）。
+const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）提示词工程师。把"短视频镜头"整理成中文画面提示词，最终会被画成**黑白铅笔分镜稿**（不是成片！不是照片！）。
 
 【硬性要求】
-- 全英文输出，不要中文，不要 markdown，不要 ["..."] 围栏
-- 50-150 词
-- 描述对象就是一张分镜稿，所以只描写：①主体（人物名 + 服装外观 + 表情/姿态）②动作（只描述这一帧定格的动作）③ 构图与景别（wide shot / medium / close-up / over-shoulder）④ 机位（low angle / high angle / eye-level / POV）⑤ 光照方向（key light from left / backlit / overhead / silhouette）⑥ 关键道具与场景元素（counter, fish trays, apron, clipboard 等）
+- 中文为主输出，不要 markdown，不要 ["..."] 围栏
+- 80-220 字
+- 描述对象就是一张分镜稿，所以只描写：①主体（人物名 + 服装外观 + 表情/姿态）②动作（只描述这一帧定格的动作）③ 构图与景别（可保留 wide shot / medium / close-up / over-shoulder 等少量术语）④ 机位（可保留 low angle / high angle / eye-level / POV 等少量术语）⑤ 光照方向 ⑥ 关键道具与场景元素
 - 如果给了角色描述，必须保留外观/服装一致性（同一角色多个镜头里穿同样的衣服）
 
 【非人/拟人角色规则 —— 极其重要】
-- 如果角色被标记为 "非人/拟人"（NON-HUMAN），或者画面描述里出现了拟人化的海鲜 / 动物 / 机甲 / AI 生物（例如"帝王蟹队长 / 龙虾 / 生蚝 / 三文鱼 / 扇贝 / 章鱼 / 机甲战士"等），**必须保留它们的物种本体**（anthropomorphic king crab with carapace and pincers / anthropomorphic lobster / anthropomorphic salmon / anthropomorphic oyster shell with tiny limbs ...）。
+- 如果角色被标记为 "非人/拟人"（NON-HUMAN），或者画面描述里出现了拟人化的海鲜 / 动物 / 机甲 / AI 生物（例如"帝王蟹队长 / 龙虾 / 生蚝 / 三文鱼 / 扇贝 / 章鱼 / 机甲战士"等），**必须保留它们的物种本体**，例如帝王蟹要有蟹壳和蟹钳，龙虾要有虾壳和触须，生蚝要保留贝壳形态。
 - **绝对禁止把这些非人角色画成穿围裙的真人员工**。如果同一画面里同时有人类老板和拟人海鲜，那么人类只画给定的人类角色，其余成员必须是对应物种的拟人形态（壳、鳃、触手、眼柄、钳等清晰可辨）。
-- 对于群像（"一排员工 / 一群成员 / 后厨工会"等），必须按画面描述里点名的物种逐个画出（例："a king crab raising large pincers in the center, behind it a lobster, an oyster shell, a salmon, a scallop standing in a row" —— 不要写成"a row of human workers in aprons"）。
-- **体型必须接近现实物种 + 至多到人类肩膀高**：拟人海鲜是"小员工尺寸"，不是巨型怪兽。请在描述里显式写 "human-shoulder-height anthropomorphic king crab"、"small lobster-sized anthropomorphic lobster standing on hind legs"、"hand-sized anthropomorphic oyster" 之类，并明确标注 "smaller than the human character" / "the human boss is the tallest figure in the frame"。绝不能让蟹钳比人脸还大、海鲜覆盖整个画面；如果一定要给中近景，描述时也要保持人类比海鲜更高的比例。
+- 对于群像（"一排员工 / 一群成员 / 后厨工会"等），必须按画面描述里点名的物种逐个画出，例如画面中心是举起大钳的帝王蟹，后方依次是龙虾、生蚝、三文鱼、扇贝，不要写成一排穿围裙的人类员工。
+- **体型必须接近现实物种 + 至多到人类肩膀高**：拟人海鲜是"小员工尺寸"，不是巨型怪兽。请在描述里显式写"帝王蟹约到人类肩膀高"、"小龙虾尺寸的拟人龙虾后肢站立"、"手掌大小的拟人生蚝"，并明确"比人类角色更矮 / 人类老板是画面里最高的角色"。绝不能让蟹钳比人脸还大、海鲜覆盖整个画面；如果一定要给中近景，描述时也要保持人类比海鲜更高的比例。
 
 【禁止】
 - 不要写 "photorealistic / cinematic film / 35mm / film grain / hyper-real / 4K / vivid color / teal-orange / saturated"——这些会破坏手稿风
 - 不要写 "color palette / warm color tone"，分镜稿是黑白
-- 不要写"运镜动词"作为单独陈述（如 "the camera slowly pushes in"），改用"frame composition implies a slow push-in"或直接给静止构图
+- 不要写"运镜动词"作为单独陈述（如"镜头缓慢推进"），改成静止构图描述，例如"构图暗示纵深推进感"
 - 不要写台词或字幕
 - 不要写 "three-view" 或 "white background"（那是资产图，不是分镜图）
-- 不要把任何拟人化的非人角色降级成"a human worker / employee / staff member in apron"
-- 不要解释，不要复述中文，不要写"Description:"前缀，直接输出 prompt 段落`;
+- 不要把任何拟人化的非人角色降级成真人员工
+- 不要解释，不要复述输入，不要写"提示词："前缀，直接输出中文 prompt 段落`;
 
 registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
   const proj = getProjectByIdForUser(ctx.projectId, ctx.user.id);
@@ -933,7 +977,7 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
   if (!shot) throw new Error(`找不到 shots[${idx}]`);
 
   ctx.progress({ stage: 'building_prompt' });
-  const styleBible = (proj as any).styleBible || {};
+  const styleBible = styleBibleForShotPrompt((proj as any).styleBible || {});
   const styleHint = joinPromptValues([
     styleBible.vision || styleBible.visualStyle,
     styleBible.colorPalette,
@@ -1004,7 +1048,26 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
       { role: 'system', content: SP_SHOT_TO_IMG_PROMPT },
       { role: 'user', content: userMsg },
     ],
-    { temperature: 0.5, maxTokens: 600, modelRole: 'structured' },
+    {
+      temperature: 0.5,
+      maxTokens: 600,
+      modelRole: 'structured',
+      traceName: 'storyboard.image_prompt',
+      tokenContext: {
+        projectId: ctx.projectId,
+        requestPath: 'batch_executor:storyboard_image_generation',
+        routeName: 'batch.storyboard-image-generation',
+        moduleKey: 'assets',
+        moduleLabel: '资产生成',
+        featureKey: 'storyboard_image_prompt',
+        featureLabel: '分镜图提示词生成',
+        callItemType: 'batch_task',
+        callItemId: ctx.taskId,
+        callItemLabel: `镜头 ${shot.idx ?? idx + 1}`,
+        batchId: ctx.batchId,
+        taskId: ctx.taskId,
+      },
+    },
   );
   const cleaned = sanitizeFillLightPositiveMentions(prompt.trim().replace(/^["'`]+|["'`]+$/g, ''));
   if (!cleaned) throw new Error('AI 没有返回提示词');
@@ -1065,7 +1128,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     // P0: 用结构化的 FrameImageGenerationPlan 统一组织首帧输入。
     //   - prompt / 参考图清单 / 资产锁 / 模型能力快照都通过 plan 产出;
     //   - P3a: multiRefImageCap 从 provider capabilities.image.multiRefImage 读;
-    //     env IMAGE_MULTI_REF_CAP 可覆盖默认值; probe 验证前默认 1 (行为不变)。
+    //     env IMAGE_MULTI_REF_CAP 可覆盖默认值; OpenAI image edit 默认按官方 16 张能力建模。
     const imgCfg = resolveLLMConfig(ctx.user, 'image');
     const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
     const plan = buildFrameImageGenerationPlan({
@@ -1082,14 +1145,66 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         multiRefImageCap: capMulti,
       },
     });
-    const basePrompt = plan.finalPrompt;
-    const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
+    let finalPlan = plan;
+    let appliedEditDraft = false;
+    let appliedDraftForFingerprint: any = null;
+    if (ctx.options?.applyEditDraft === true) {
+      const { draft } = currentFirstFrameEditDraft(proj, groupIdx);
+      if (!draft) {
+        throw new MissingFirstFrameDraftException('草稿在生成开始前被删除，请重新检查后再试。');
+      }
+      const currentSourceHash = computeFirstFrameEditSourceHash(proj, ctx.user.id, groupIdx, plan);
+      if (isFirstFrameEditDraftStale(draft.sourceHash, currentSourceHash) && ctx.options?.allowStaleEditDraft !== true) {
+        throw new StaleFirstFrameDraftException();
+      }
+      try {
+        validateAndNormalizeFirstFrameDraft({
+          project: proj,
+          groupIdx,
+          userId: ctx.user.id,
+          input: draft,
+          plan,
+        });
+      } catch (err) {
+        if (err instanceof FirstFrameDraftValidationException) {
+          throw new Error(err.errors.map((item) => item.message).join('; ') || '首帧草稿校验失败');
+        }
+        throw err;
+      }
+      finalPlan = applyFirstFrameDraftToPlan({
+        project: proj,
+        userId: ctx.user.id,
+        plan,
+        draft,
+      });
+      appliedEditDraft = true;
+      appliedDraftForFingerprint = draft;
+    }
+    const basePrompt = finalPlan.finalPrompt;
+    const imageRefs = finalPlan.referenceManifest.filter((r) => r.delivery === 'image');
     const referenceImagePaths = imageRefs
       .map((r) => r.localPath)
       .filter((p): p is string => typeof p === 'string' && p.length > 0);
     const referenceImagePath = referenceImagePaths[0];
-    const planSummary = summarizePlanForAudit(plan);
     const frameImageSize = frameImageSizeForAspectRatio(proj);
+    const imageQuality = resolveFrameImageQualityForCall(imgCfg.imageQuality, {
+      frameType: 'first_frame',
+      projectId: ctx.projectId,
+      groupIdx,
+    });
+    const imageStyle = 'photographic' as const;
+    const firstFrameSourceHashForInput = computeFirstFrameSourceHash(proj, ctx.user.id, groupIdx);
+    const planSummary = {
+      ...summarizePlanForAudit(finalPlan),
+      appliedEditDraft,
+      actualImageInput: {
+        quality: imageQuality,
+        size: frameImageSize,
+        style: imageStyle,
+        referenceImageCount: referenceImagePaths.length,
+        draftFingerprint: firstFrameDraftFingerprint(firstFrameSourceHashForInput, appliedDraftForFingerprint),
+      },
+    };
 
     ctx.progress({
       stage: 'calling_image_api',
@@ -1100,11 +1215,11 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const result = await generateImageWithModerationRecovery(ctx.user, {
       prompt: basePrompt,
       size: frameImageSize,
-      style: 'photographic',
+      style: imageStyle,
       kind: 'storyboard',
       projectId: ctx.projectId,
       assetRef: `storyboards[${groupIdx}].firstFrame`,
-      quality: 'medium',
+      quality: imageQuality,
       referenceImagePath,
       referenceImagePaths,
     });
@@ -1113,7 +1228,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     // firstFramePrompt / firstFrameMode / firstFrameSafetyAudit / firstFramePlanSummary
     // 并行输出, 方便 P2 尾帧以同一形状落到 frames.tail。旧字段保留做兼容。
     const generatedAt = nowIso();
-    const firstFrameSourceHash = computeFirstFrameSourceHash(proj, ctx.user.id, groupIdx);
+    const firstFrameSourceHash = firstFrameSourceHashForInput;
     const frameFirst = {
       url: result.url,
       prompt: result.submittedPrompt,
@@ -1172,11 +1287,11 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         firstFramePlanSummary: planSummary,
         frames: { ...(prev.frames || {}), first: frameFirst },
       };
-      storyboards[groupIdx] = markTailFrameStaleForFirstFrameChange(nextStoryboard, { staleAt: generatedAt });
-      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-      if (videoTasks.length > groupIdx) delete videoTasks[groupIdx];
-      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'storyboard-image-writeback');
-      return { storyboards, videoTasks };
+      storyboards[groupIdx] = nextStoryboard;
+      // 用户原则: 首帧变了, 尾帧 / 已生成视频任务都保留, 用户自己决定要不要重做。
+      // 不再自动 stale 尾帧, 也不再删除 videoTasks[groupIdx]。
+      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-writeback');
+      return { storyboards };
     });
 
     recordBatchKnowledgeAudit({
@@ -1188,7 +1303,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         groupIdx,
         shotIndices,
         mode: 'structured_v1',
-        referenceCount: plan.referenceManifest.length,
+        referenceCount: finalPlan.referenceManifest.length,
         imageReferenceCount: imageRefs.length,
         planSummary,
       },
@@ -1231,17 +1346,17 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     };
   }
 
-  // 单组 prompt 长度上限（中转站对超长 prompt 不稳定，1200 字符是安全线）
-  const MAX_PROMPT_CHARS = 1200;
+  // 单组 prompt 长度上限（临时抬高，优先保留更多镜头信息，真实 provider 限制交给接口返回）
+  const MAX_PROMPT_CHARS = 5000;
   // 把组内所有镜头压成精简描述：每段最多 350 字符
   const truncate = (s: string, n: number) => (s.length > n ? s.slice(0, n) + '…' : s);
   const promptSections: string[] = groupShots.map((sh: any, i: number) => {
     const idx = shotIndices[i] + 1;
     const _shotType = sh.shotType || sh.framing || '';
     const _camera = sh.camera || sh.movement || '';
-    const englishPrompt = sanitizeFillLightPositiveMentions((sh.imagePrompt || '').trim());
+    const framePrompt = sanitizeFillLightPositiveMentions((sh.imagePrompt || '').trim());
     const _visual = sanitizeFillLightPositiveMentions(sh.visual || sh.description || sh.desc || '');
-    const body = englishPrompt || _visual;
+    const body = framePrompt || _visual;
     const head = `Frame ${idx}` + (_shotType ? ` (${_shotType}${_camera ? ', ' + _camera : ''})` : '');
     return `${head}: ${truncate(body, 350)}`;
   });
@@ -1382,10 +1497,10 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
       shotIndices: freshShotIndices,
     };
-    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    if (videoTasks.length > groupIdx) delete videoTasks[groupIdx];
-    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'legacy-storyboard-image-writeback');
-    return { storyboards, videoTasks };
+    // 用户原则: 首帧变化 (含 legacy_pencil 路径) 不再连带删除 videoTasks[groupIdx],
+    // 由用户自己决定要不要重做视频。
+    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'legacy-storyboard-image-writeback');
+    return { storyboards };
   });
 
   recordBatchKnowledgeAudit({
@@ -1494,8 +1609,24 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     .map((r) => r.localPath)
     .filter((p): p is string => typeof p === 'string' && p.length > 0);
   const referenceImagePath = referenceImagePaths[0];
-  const planSummary = summarizePlanForAudit(plan);
   const frameImageSize = frameImageSizeForAspectRatio(proj);
+  const imageQuality = resolveFrameImageQualityForCall(imgCfg.imageQuality, {
+    frameType: 'tail_frame',
+    projectId: ctx.projectId,
+    groupIdx,
+  });
+  const imageStyle = 'photographic' as const;
+  const tailFrameSourceHashForInput = computeTailFrameSourceHash(proj, ctx.user.id, groupIdx);
+  const planSummary = {
+    ...summarizePlanForAudit(plan),
+    actualImageInput: {
+      quality: imageQuality,
+      size: frameImageSize,
+      style: imageStyle,
+      referenceImageCount: referenceImagePaths.length,
+      draftFingerprint: firstFrameDraftFingerprint(tailFrameSourceHashForInput, null),
+    },
+  };
 
   ctx.progress({
     stage: 'calling_image_api',
@@ -1507,17 +1638,17 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   const result = await generateImageWithModerationRecovery(ctx.user, {
     prompt: basePrompt,
     size: frameImageSize,
-    style: 'photographic',
+    style: imageStyle,
     kind: 'storyboard',
     projectId: ctx.projectId,
     assetRef: `storyboards[${groupIdx}].tailFrame`,
-    quality: 'medium',
+    quality: imageQuality,
     referenceImagePath,
     referenceImagePaths,
   });
 
   const generatedAt = nowIso();
-  const tailFrameSourceHash = computeTailFrameSourceHash(proj, ctx.user.id, groupIdx);
+  const tailFrameSourceHash = tailFrameSourceHashForInput;
   const frameTail = {
     url: result.url,
     prompt: result.submittedPrompt,
@@ -1768,6 +1899,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
   const userRatio = normalizeVideoRatio((ctx.options as any)?.ratio, proj);
   const videoResolution = normalizeSeedanceResolution((ctx.options as any)?.resolution || (ctx.options as any)?.quality);
+  const generateAudio = normalizeGenerateAudio((ctx.options as any)?.generateAudio ?? (ctx.options as any)?.genAudio, true);
 
   // 用户反馈："前面有场景彩色图和人物角色彩色图，不能单一参考分镜图"
   // —— 之前只把黑白分镜草图当 i2v 主参考，前面"资产"步骤生成的彩色场景图和
@@ -2136,6 +2268,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     prompt,
     ratio: userRatio,
     resolution: videoResolution,
+    generateAudio,
     durationSec,
     projectId: ctx.projectId,
     groupIdx,
@@ -2196,6 +2329,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     prompt,
 	    userRatio,
       resolution: videoResolution,
+      generateAudio,
 	    durationSec,
 	    plannedDurationSec,
 	    videoWarnings,
@@ -2255,6 +2389,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       durationSec,
       plannedDurationSec,
       resolution: videoResolution,
+      generateAudio,
       ratio: userRatio,
       promptHash: hashString(prompt),
       finalPromptHash: hashString(plannedFinalPrompt),
@@ -2325,6 +2460,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		      prompt,
 				      userRatio,
               resolution: videoResolution,
+              generateAudio,
 				      durationSec,
 			      plannedDurationSec,
 			      videoWarnings: [
@@ -2415,6 +2551,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 			    prompt,
 				    userRatio,
             resolution: videoResolution,
+            generateAudio,
 				    durationSec: result.durationSec,
 			    plannedDurationSec,
 			    videoWarnings: [
@@ -2569,14 +2706,35 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'writing', percent: 45, hint: 'AI 正在生成镜头表（这一步比较慢，请耐心等）…' });
 
-  // 用带重试的 JSON 调用：镜头表是大段 JSON，模型偶尔会截断或多嘴
+  // 用 background 模式跑: shots-generate 推理重 + 输出长, 同步通道易被中转站
+  // 60-300s 超时掐断 (504)。background 模式 submit + poll, 单次 HTTP 连接不会长留,
+  // 中转站超时无法触达。chatCompleteJsonViaBackground 在 provider 不是 Responses API
+  // 系时会自动回退到 chatCompleteJsonWithRetry, 行为对其它 provider 透明。
   let parsed: any;
   try {
-    parsed = await chatCompleteJsonWithRetry(
+    parsed = await chatCompleteJsonViaBackground(
       ctx.user,
       messages,
       // 镜头表可能很长（10+ 镜头），给足 token
-      { temperature: 0.6, maxTokens: 4000, modelRole: 'structured' },
+      {
+        temperature: 0.6,
+        maxTokens: 4000,
+        modelRole: 'structured',
+        tokenContext: {
+          projectId: ctx.projectId,
+          requestPath: 'batch_executor:shots_generate',
+          routeName: 'batch.shots-generate',
+          moduleKey: 'shots',
+          moduleLabel: '镜头规划',
+          featureKey: 'batch_shots_generate',
+          featureLabel: '批量镜头表生成',
+          callItemType: 'batch_task',
+          callItemId: ctx.taskId,
+          callItemLabel: '批量镜头表生成',
+          batchId: ctx.batchId,
+          taskId: ctx.taskId,
+        },
+      },
       (raw) => parseJsonLoose(raw),
       'shots-generate',
     );
@@ -2652,6 +2810,10 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
     const rawShotType = cleanStr(sh.shotType, sh.framing) || '中景';
     const rawCamera = cleanStr(sh.camera, sh.movement) || '固定镜头';
+    const shotType = upgradeShotType(rawShotType);
+    const camera = upgradeCamera(rawCamera);
+    const duration = Math.max(2, Math.min(12, Number.isFinite(dur) ? dur : 4));
+    const finalDialogue = dialogue || '——';
     const rawEmotion = cleanStr(sh.emotion);
     const pickedScene = pickSceneForShots({
       assets: sceneSelectionAssets,
@@ -2682,17 +2844,23 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
       sceneId,
       sceneName,
       scene: sceneName,
-      duration: Math.max(2, Math.min(12, Number.isFinite(dur) ? dur : 4)),
-      shotType: upgradeShotType(rawShotType),
-      camera: upgradeCamera(rawCamera),
+      duration,
+      shotType,
+      camera,
       visual,
-      dialogue: dialogue || '——',
+      dialogue: finalDialogue,
       keyInfo,
       audio,
       emotion: EMOTIONS.includes(rawEmotion) ? rawEmotion : 'rising',
       intensity,
       scriptRef: cleanStr(sh.scriptRef),
       characters,
+      tailFrameSignals: normalizeTailFrameSignals(sh, {
+        shotType,
+        camera,
+        dialogue: finalDialogue,
+        durationSec: duration,
+      }),
     };
   });
 
@@ -2770,7 +2938,7 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 });
 
 /* ============================================================
-   6. video_prompts executor —— 给一个分镜组生成视频生成模型用的英文 prompt
+   6. video_prompts executor —— 给一个分镜组生成视频生成模型用的中文 prompt
    ============================================================
    前端 generateAllVideoPrompts 启动 batchType: 'video_prompts'，
    targets 里每条带 { groupIdx, shotIndices, totalGroups }。
@@ -2789,7 +2957,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     mode: 'single-shot-strict',
     explicitShotIndices: ctx.target.shotIndices,
   });
-  const promptDecision = assertArtifactUsable(proj as any, ctx, 'video_prompt', { groupIdx, shotIndices });
+  const promptDecision = assertArtifactUsable(proj as any, ctx, 'video_prompt_generation', { groupIdx, shotIndices });
   const promptGate = consistencyFromDecision(promptDecision);
 		  const promptRunId = ctx.batchId;
 	  const promptStartedAt = nowIso();
@@ -2851,21 +3019,33 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    throw error;
 	  }
 
-		  const groupShots = shotIndices.map((i) => shots[i]);
-	  const promptGroupShots = sanitizePromptObject(groupShots);
+  const groupShots = shotIndices.map((i) => shots[i]);
+  const promptGroupShots = sanitizePromptObject(groupShots);
 	  const styleBible = (proj as any).styleBible || {};
-	  const assets = (proj as any).assets || {};
-	  const promptStyleBible = sanitizePromptObject(styleBible);
-	  const promptAssets = sanitizePromptObject(assets);
-	  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
+  const assets = (proj as any).assets || {};
+	  const promptStyleBible = sanitizePromptObject(styleBibleForVideoPrompt(styleBible));
+  const promptAssets = sanitizePromptObject(assets);
+  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
+  const referenceBuild = buildVideoReferenceManifest({
+    project: proj,
+    assets,
+    shots,
+    groupShotIndices: shotIndices,
+    groupIdx,
+    ownerId: ctx.user.id,
+    storyboardImageUrl: resolveStoryboardFirstFrameUrl(sb) || null,
+  });
+  const referenceManifest = referenceBuild.manifest;
+  const droppedReferences = referenceBuild.droppedReferences;
 
   ctx.progress({ stage: 'preparing', percent: 10, hint: '准备镜头与资产上下文…' });
 
-	  const messages = buildVideoPromptMessages({
-	    shots: promptGroupShots,
-	    styleBible: promptStyleBible,
-	    assets: promptAssets,
-	    narrations,
+  const messages = buildVideoPromptMessages({
+    shots: promptGroupShots,
+    styleBible: promptStyleBible,
+    assets: promptAssets,
+    narrations,
+    referenceManifest,
     groupIdx,
     totalGroups,
   });
@@ -2894,62 +3074,76 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
       .replace(/[ \t]+/g, ' ')
       .replace(/[ \t]*([，。；：])[ \t]*/g, '$1');
 
-	  let prompt = '';
-	  let attempt = 0;
-	  const NETWORK_MAX_ATTEMPTS = envInt('VIDEO_PROMPT_NETWORK_MAX_ATTEMPTS', 4, 1, 8);
-	  const MAX_ATTEMPTS = Math.max(VIDEO_PROMPT_MAX_ATTEMPTS, NETWORK_MAX_ATTEMPTS);
-	  const RETRY_DEADLINE_MS = envInt('VIDEO_PROMPT_RETRY_DEADLINE_MS', 90_000, 10_000, 600_000);
-	  const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
+  let prompt = '';
+  let attempt = 0;
+  const NETWORK_MAX_ATTEMPTS = envInt('VIDEO_PROMPT_NETWORK_MAX_ATTEMPTS', 4, 1, 8);
+  const MAX_ATTEMPTS = Math.max(VIDEO_PROMPT_MAX_ATTEMPTS, NETWORK_MAX_ATTEMPTS);
+  const RETRY_DEADLINE_MS = envInt('VIDEO_PROMPT_RETRY_DEADLINE_MS', 90_000, 10_000, 600_000);
+  const retryDeadlineAt = Date.now() + RETRY_DEADLINE_MS;
 
-	  while (attempt < MAX_ATTEMPTS) {
-	    attempt++;
-	    try {
-	      const remaining = retryDeadlineAt - Date.now();
-	      if (remaining <= 0) {
-	        throw new Error('retry_deadline_exceeded：视频提示词网络/模型重试超过总预算');
-	      }
-	      // 第二次重试时压低 temperature 并在 user message 末尾追加强提示
-	      const retryMessages = buildVideoPromptAttemptMessages(messages, attempt);
-	      const temp = videoPromptTemperatureForAttempt(attempt);
+  while (attempt < MAX_ATTEMPTS) {
+    attempt++;
+    try {
+      const remaining = retryDeadlineAt - Date.now();
+      if (remaining <= 0) {
+        throw new Error('retry_deadline_exceeded：视频提示词网络/模型重试超过总预算');
+      }
+      // 第二次重试时压低 temperature 并在 user message 末尾追加强提示
+      const retryMessages = buildVideoPromptAttemptMessages(messages, attempt);
+      const temp = videoPromptTemperatureForAttempt(attempt);
       prompt = await chatComplete(
         ctx.user,
         retryMessages,
         {
           temperature: temp,
           modelRole: 'structured',
-	          traceName: 'video-prompts',
-	          traceAttempt: attempt,
-	          traceMaxAttempts: MAX_ATTEMPTS,
-	          requestTimeoutMs: Math.min(remaining, 600_000),
-	        },
-	      );
-	      if (!looksLikeOldFormat(prompt)) break;
-	      console.warn(`[video_prompts] attempt ${attempt} produced old format, retrying…`);
-	    } catch (e: any) {
-	      const isNetwork = isTransientNetworkError(e);
-	      const maxAttemptsForThisError = isNetwork ? NETWORK_MAX_ATTEMPTS : VIDEO_PROMPT_MAX_ATTEMPTS;
-	      if (attempt >= maxAttemptsForThisError) {
-	        throw new Error('视频提示词生成失败：' + (e?.message || String(e)));
-	      }
-	      const delay = isNetwork
-	        ? Math.min(60_000, 10_000 * Math.pow(2, attempt - 1))
-	        : 1500 * attempt;
-	      if (Date.now() + delay > retryDeadlineAt) {
-	        throw new Error('视频提示词生成失败：retry_deadline_exceeded；最后错误：' + (e?.message || String(e)));
-	      }
-	      console.warn(
-	        `[video_prompts] attempt ${attempt}/${maxAttemptsForThisError} failed, ` +
-	          `retrying in ${Math.round(delay / 1000)}s: ${e?.message || String(e)}`,
-	      );
-	      await sleep(delay);
-	    }
-	  }
+          traceName: 'video-prompts',
+          traceAttempt: attempt,
+          traceMaxAttempts: MAX_ATTEMPTS,
+          requestTimeoutMs: Math.min(remaining, 600_000),
+          tokenContext: {
+            projectId: ctx.projectId,
+            requestPath: 'batch_executor:video_prompts',
+            routeName: 'batch.video-prompts',
+            moduleKey: 'video_prompt',
+            moduleLabel: '视频提示词',
+            featureKey: 'batch_video_prompt_generate',
+            featureLabel: '批量视频提示词生成',
+            callItemType: 'batch_task',
+            callItemId: ctx.taskId,
+            callItemLabel: `分镜组 ${groupIdx + 1}`,
+            batchId: ctx.batchId,
+            taskId: ctx.taskId,
+          },
+        },
+      );
+      if (!looksLikeOldFormat(prompt)) break;
+      console.warn(`[video_prompts] attempt ${attempt} produced old format, retrying…`);
+    } catch (e: any) {
+      const isNetwork = isTransientNetworkError(e);
+      const maxAttemptsForThisError = isNetwork ? NETWORK_MAX_ATTEMPTS : VIDEO_PROMPT_MAX_ATTEMPTS;
+      if (attempt >= maxAttemptsForThisError) {
+        throw new Error('视频提示词生成失败：' + (e?.message || String(e)));
+      }
+      const delay = isNetwork
+        ? Math.min(60_000, 10_000 * Math.pow(2, attempt - 1))
+        : 1500 * attempt;
+      if (Date.now() + delay > retryDeadlineAt) {
+        throw new Error('视频提示词生成失败：retry_deadline_exceeded；最后错误：' + (e?.message || String(e)));
+      }
+      console.warn(
+        `[video_prompts] attempt ${attempt}/${maxAttemptsForThisError} failed, ` +
+          `retrying in ${Math.round(delay / 1000)}s: ${e?.message || String(e)}`,
+      );
+      await sleep(delay);
+    }
+  }
 
   let cleaned = prompt.trim().replace(/^["'`]+|["'`]+$/g, '');
   if (!cleaned) throw new Error('AI 没有返回提示词');
-	  // 即使 LLM 漏写了"参考图X"，最后再做一次纯文本清洗（不破坏其他内容）
-	  cleaned = stripRefMarkers(cleaned);
-	  cleaned = sanitizeFillLightPositiveMentions(cleaned);
+  // 即使 LLM 漏写了"参考图X"，最后再做一次纯文本清洗（不破坏其他内容）
+  cleaned = stripRefMarkers(cleaned);
+  cleaned = sanitizeFillLightPositiveMentions(cleaned);
   if (looksLikeOldFormat(cleaned)) {
     // 两次都失败：抛错让前端显示"重试"按钮，比保存一份乱码好
     throw new Error('AI 输出格式不符（旧英文格式或仍含参考图编号），请点击重新生成（已自动重试 2 次仍失败）');
@@ -2994,29 +3188,31 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	          `run=${promptRunId} currentRun=${prev.videoPromptRunId}`,
 	      );
 	      return null;
-	    }
-		    storyboards[groupIdx] = {
-		      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration'),
-		      idx: groupIdx,
-		      shotIdx: groupIdx + 1,
-		      videoPrompt: cleaned,
-		      videoPromptStatus: 'ready',
-		      videoPromptRunId: promptRunId,
-		      videoPromptUpdatedAt: nowIso(),
-		      videoPromptLastError: undefined,
-		      videoPromptFailedAt: undefined,
-		      narrationsUsed: narrations,
-		      shotIndices: freshShotIndices,
-		      consistency: {
-		        ...(prev.consistency || {}),
-		        videoPrompt: {
-		          characterUsages: promptGate.characterUsages,
-		          score: promptGate.score,
-		          level: promptGate.level,
-		          warnings: promptGate.warnings,
-		        },
-		      },
-		    };
+    }
+    storyboards[groupIdx] = {
+      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration'),
+      idx: groupIdx,
+      shotIdx: groupIdx + 1,
+      videoPrompt: cleaned,
+      videoPromptStatus: 'ready',
+      videoPromptRunId: promptRunId,
+      videoPromptUpdatedAt: nowIso(),
+      videoPromptLastError: undefined,
+      videoPromptFailedAt: undefined,
+      narrationsUsed: narrations,
+      videoReferenceManifest: referenceManifest,
+      videoReferenceDropped: droppedReferences,
+      shotIndices: freshShotIndices,
+      consistency: {
+        ...(prev.consistency || {}),
+        videoPrompt: {
+          characterUsages: promptGate.characterUsages,
+          score: promptGate.score,
+          level: promptGate.level,
+          warnings: promptGate.warnings,
+        },
+      },
+    };
 	    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
 	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
 	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
@@ -3045,6 +3241,8 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     storedStatus: patchedSb.videoPromptStatus || null,
     storedRunId: patchedSb.videoPromptRunId || null,
     promptSummary: summarizePromptForTrace(cleaned),
+    referenceCount: referenceManifest.length,
+    droppedReferenceCount: droppedReferences.length,
   }, writeApplied ? 'info' : 'warn');
   if (!writeApplied) {
     const error = new Error(
@@ -3060,15 +3258,25 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
   }
 
   return {
-    patch: { type: 'video_prompt', idx: groupIdx, value: cleaned },
+    patch: {
+      type: 'video_prompt',
+      idx: groupIdx,
+      value: cleaned,
+      videoReferenceManifest: referenceManifest,
+      videoReferenceDropped: droppedReferences,
+    },
     extra: {
       groupIdx,
-	      videoPrompt: cleaned,
-	      videoPromptStatus: 'ready',
-	      videoPromptRunId: promptRunId,
-	      narrationsUsed: narrations,
-	      shotIndices,
-	      invalidateVideo: true,
+      videoPrompt: cleaned,
+      videoPromptStatus: 'ready',
+      videoPromptRunId: promptRunId,
+      narrationsUsed: narrations,
+      referenceManifest,
+      droppedReferences,
+      videoReferenceManifest: referenceManifest,
+      videoReferenceDropped: droppedReferences,
+      shotIndices,
+      invalidateVideo: true,
     },
   };
 });

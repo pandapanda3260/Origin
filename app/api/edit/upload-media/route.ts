@@ -6,6 +6,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { getDataDir } from '@/lib/runtime-paths';
+import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -58,13 +59,29 @@ export async function POST(req: NextRequest) {
     mkdirSync(dir, { recursive: true });
     const ext = guessExt(mime);
     const filename = `${id}.${ext}`;
-    writeFileSync(join(dir, filename), buf);
+    const fullPath = join(dir, filename);
+    writeFileSync(fullPath, buf);
 
     const db = getDb();
     db.prepare(
       `INSERT INTO uploads (id, owner_id, project_id, kind, filename, mime, size_bytes)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(id, user.id, projectId, kind, filename, mime, buf.length);
+    if (kind === 'image' || kind === 'video') {
+      createAssetRecord({
+        assetId: id,
+        ownerId: user.id,
+        projectId,
+        assetKind: kind,
+        source: 'uploaded',
+        stage: kind === 'image' ? 'edit_upload_image' : 'edit_upload_video',
+        fileUri: localAssetUri('uploads', user.id, filename),
+        thumbUri: `/api/edit/media/${id}`,
+        fileHash: hashFile(fullPath),
+        byteSize: buf.length,
+        makeCurrent: false,
+      });
+    }
 
     return jsonOk({
       ok: true,

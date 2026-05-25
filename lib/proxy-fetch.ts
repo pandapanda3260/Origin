@@ -5,6 +5,8 @@ import { connect as tlsConnect } from 'node:tls';
 const DEFAULT_PROXY_HOSTS = [
   'api.openai.com',
   'gateway.zerail.com',
+  'api-slb.packyapi.com',
+  'packyapi.com',
   'ark.cn-beijing.volces.com',
 ];
 
@@ -220,7 +222,7 @@ function fetchViaHttpProxy(url: string, proxyUrl: string, request: PreparedProxy
           const stream = incomingMessageToWebStream(resp, signal);
           resolve(new Response(stream, {
             status: resp.statusCode || 500,
-            statusText: resp.statusMessage || '',
+            statusText: sanitizeProxyStatusText(resp.statusMessage),
             headers: headersFromNodeHeaders(resp.headers),
           }));
         });
@@ -232,6 +234,14 @@ function fetchViaHttpProxy(url: string, proxyUrl: string, request: PreparedProxy
     connectReq.on('error', fail);
     connectReq.end();
   });
+}
+
+export function sanitizeProxyStatusText(value: unknown): string {
+  const text = String(value || '');
+  const enabled = String(process.env.PROXY_STATUSTEXT_SANITIZE_ENABLED || 'true').toLowerCase() !== 'false'
+    && process.env.PROXY_STATUSTEXT_SANITIZE_ENABLED !== '0';
+  if (!enabled) return text;
+  return text.replace(/[^\x20-\x7E\t]/g, '');
 }
 
 async function prepareProxyRequest(url: string, init: ProxyFetchInit): Promise<PreparedProxyRequest> {

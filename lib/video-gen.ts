@@ -40,6 +40,8 @@ import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '.
 import { DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT, getGlobalVideoConcurrencyLimit, isVideoGenerationEnabled } from './system-config';
 import { getDataDir } from './runtime-paths';
 import type { ProviderTaskAdapter, ProviderTaskRow, ProviderPollResult } from './provider-recovery';
+import { createAssetRecord, finishGenerationBatch, hashFile, localAssetUri } from './asset-library';
+import { getExternalEnvValue } from './env';
 
 export type VideoGenInput = {
   prompt: string;
@@ -50,6 +52,8 @@ export type VideoGenInput = {
   ratio?: string;
   /** Seedance 清晰度。旧路径没传时默认 720p，避免改变历史任务语义。 */
   resolution?: SeedanceResolution | string;
+  /** 是否让视频模型同时生成声音。默认开启；前端关闭时显式传 false。 */
+  generateAudio?: boolean;
   durationSec?: number;
   projectId?: string;
   groupIdx?: number;
@@ -145,17 +149,79 @@ export type VideoGenInput = {
     /** 透传到 audit.modeReason，典型值：tail_ready */
     modeReason?: string;
   };
+  assetLibrary?: {
+    batchId?: string;
+    stage?: string;
+    source?: 'generated' | 'uploaded' | 'toolbox' | 'edit_export' | 'imported';
+    shotUid?: string | null;
+    legacyShotId?: string | number | null;
+    versionGroupId?: string | null;
+    makeCurrent?: boolean;
+    predecessorVersionAssetId?: string | null;
+  };
 };
 
 export type { VideoReferenceImage };
 
 export type SeedanceResolution = '720p' | '1080p';
 
+function recordCompletedVideoAsset(opts: {
+  user: UserRow;
+  input: VideoGenInput;
+  taskId: string;
+  filename: string;
+  fullPath: string;
+  coverUrl: string | null;
+  durationSec: number;
+}) {
+  try {
+    const stat = statSync(opts.fullPath);
+    createAssetRecord({
+      assetId: opts.taskId,
+      ownerId: opts.user.id,
+      projectId: opts.input.projectId || null,
+      shotUid: opts.input.assetLibrary?.shotUid || null,
+      legacyShotId: opts.input.assetLibrary?.legacyShotId ?? (
+        Number.isInteger(opts.input.groupIdx) ? `shot_${opts.input.groupIdx}` : null
+      ),
+      versionGroupId: opts.input.assetLibrary?.versionGroupId || null,
+      batchId: opts.input.assetLibrary?.batchId || null,
+      assetKind: 'video',
+      source: opts.input.assetLibrary?.source || (opts.input.projectId ? 'generated' : 'toolbox'),
+      stage: opts.input.assetLibrary?.stage || (opts.input.projectId ? 'video_segment' : 'toolbox_video'),
+      fileUri: localAssetUri('videos', opts.user.id, opts.filename),
+      thumbUri: opts.coverUrl,
+      fileHash: hashFile(opts.fullPath),
+      byteSize: stat.size,
+      durationMs: Math.round(opts.durationSec * 1000),
+      predecessorVersionAssetId: opts.input.assetLibrary?.predecessorVersionAssetId || null,
+      makeCurrent: opts.input.assetLibrary?.makeCurrent ?? !!opts.input.projectId,
+    });
+    if (opts.input.assetLibrary?.batchId) {
+      finishGenerationBatch(opts.input.assetLibrary.batchId, opts.user.id);
+    }
+  } catch (error) {
+    console.warn('[video-gen] asset library indexing skipped:', opts.taskId, error);
+  }
+}
+
 export function normalizeSeedanceResolution(value?: unknown, fallback: SeedanceResolution = '720p'): SeedanceResolution {
   const raw = String(value || '').trim().toLowerCase();
   if (!raw) return fallback;
   if (raw === '720p' || raw === '1080p') return raw;
   throw new Error(`Seedance 不支持的视频清晰度：${String(value)}。当前仅支持 720p / 1080p。`);
+}
+
+export function normalizeGenerateAudio(value?: unknown, fallback = true): boolean {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'string') {
+    const raw = value.trim().toLowerCase();
+    if (!raw) return fallback;
+    if (['0', 'false', 'off', 'no', 'disabled'].includes(raw)) return false;
+    if (['1', 'true', 'on', 'yes', 'enabled'].includes(raw)) return true;
+    return fallback;
+  }
+  return value !== false;
 }
 
 /**
@@ -505,14 +571,14 @@ export class VideoGenerationError extends Error {
 }
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const raw = getExternalEnvValue(name) ?? getExternalEnvValue(`ORIGIN_${name}`) ?? process.env[name] ?? process.env[`ORIGIN_${name}`];
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
 function envFloat(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
+  const raw = getExternalEnvValue(name) ?? getExternalEnvValue(`ORIGIN_${name}`) ?? process.env[name] ?? process.env[`ORIGIN_${name}`];
   const n = Number(raw);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
@@ -641,7 +707,8 @@ export async function generateVideo(
   );
   const size = (sizeArgPresent && !input.ratio ? input.size! : sizeFromRatio) as '1080x1920' | '1920x1080' | '1024x1024';
   const seedanceResolution = normalizeSeedanceResolution(input.resolution);
-  console.log(`[video-gen] resolved ratio=${aspectRatio} size=${size} dur=${dur}s resolution=${seedanceResolution} model=${cfg.model}`);
+  const generateAudio = normalizeGenerateAudio(input.generateAudio, true);
+  console.log(`[video-gen] resolved ratio=${aspectRatio} size=${size} dur=${dur}s resolution=${seedanceResolution} audio=${generateAudio ? 'on' : 'off'} model=${cfg.model}`);
 
   let mode: 'real' | 'fake' = 'real';
   let videoAudit: VideoGenCompletedResult['videoAudit'] | undefined;
@@ -829,7 +896,7 @@ export async function generateVideo(
           durationSec: dur,
           resolution: seedanceResolution,
           watermark: false,
-          generateAudio: false,
+          generateAudio,
           returnLastFrame: capability.supportsReturnLastFrame,
         });
 
@@ -1025,6 +1092,15 @@ export async function generateVideo(
 
         onProgress?.(100, '完成');
         const protectedUrl = `/api/videos/file/${taskId}`;
+        recordCompletedVideoAsset({
+          user,
+          input,
+          taskId,
+          filename,
+          fullPath,
+          coverUrl,
+          durationSec: dur,
+        });
         return {
           taskId,
           status: 'completed',
@@ -1250,7 +1326,7 @@ export async function generateVideo(
           duration: dur,
           resolution: seedanceResolution,
           watermark: false,
-          generate_audio: false,
+          generate_audio: generateAudio,
         });
         submit = await withVideoSubmitSlot('[seedance submit]', () => retryFetch(
           `${cfg.baseUrl}/contents/generations/tasks`,
@@ -1310,7 +1386,7 @@ export async function generateVideo(
             duration: dur,
             resolution: seedanceResolution,
             watermark: false,
-            generate_audio: false,
+            generate_audio: generateAudio,
           });
           submit = await withVideoSubmitSlot('[seedance submit first-frame fallback]', () => retryFetch(
             `${cfg.baseUrl}/contents/generations/tasks`,
@@ -1535,6 +1611,15 @@ export async function generateVideo(
   onProgress?.(100, '完成');
 
   const protectedUrl = `/api/videos/file/${taskId}`;
+  recordCompletedVideoAsset({
+    user,
+    input,
+    taskId,
+    filename,
+    fullPath,
+    coverUrl,
+    durationSec: dur,
+  });
 
   return {
     taskId,
@@ -1619,7 +1704,9 @@ export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<V
   if (!canvasMod?.createCanvas || !canvasMod?.loadImage) {
     throw new Error('视频参考图提交前压缩失败：@napi-rs/canvas 不可用');
   }
-  const image = await canvasMod.loadImage(source);
+  // Loading some PNGs as Buffer can trip over embedded C2PA SVG metadata.
+  // Loading by file path lets canvas decode the actual raster image stream.
+  const image = await canvasMod.loadImage(imagePath);
   const originalWidth = Math.max(1, Number(image.width || 1));
   const originalHeight = Math.max(1, Number(image.height || 1));
   const maxEdge = envInt('VIDEO_SUBMIT_IMAGE_MAX_EDGE', 1280, 512, 2048);
@@ -1664,7 +1751,7 @@ export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<V
  *       { type: 'image_url', image_url: { url }, role: 'last_frame' },
  *     ],
  *     ratio, duration, resolution,         // top-level (NOT in prompt)
- *     watermark: false, generate_audio: false,
+ *     watermark: false, generate_audio: true,
  *     return_last_frame: true,             // ask provider to echo its final frame
  *   }
  *
@@ -1692,7 +1779,7 @@ export async function buildSeedanceFirstLastFrameBody(opts: {
     durationSec,
     resolution = '720p',
     watermark = false,
-    generateAudio = false,
+    generateAudio = true,
     returnLastFrame = true,
   } = opts;
   const firstImage = await buildVideoSubmitImageDataUrl(firstFramePath);

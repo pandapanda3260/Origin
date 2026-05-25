@@ -6,6 +6,13 @@ import { generateImage } from '@/lib/image-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { chargeToolboxCredits, refundToolboxCredits, toolboxCreditPrice } from '@/lib/toolbox-billing';
 import { createToolboxItem, serializeToolboxItem, updateToolboxItem } from '@/lib/toolbox-db';
+import {
+  AssetQuotaError,
+  assertCanStartAssetGeneration,
+  createGenerationBatch,
+  finishGenerationBatch,
+  recordGenerationFailure,
+} from '@/lib/asset-library';
 import { TOOLBOX_IMAGE_GENERATION_MAX_COUNT, TOOLBOX_IMAGE_REFERENCE_MAX_COUNT } from '@/lib/toolbox-limits';
 import { assertToolboxImageRefPath } from '@/lib/toolbox-media';
 import {
@@ -46,6 +53,12 @@ export async function POST(req: NextRequest) {
   const balance = getBalance(user.id);
   if (balance.totalCredits < totalCost) {
     return jsonError(`积分不足：本次需 ${totalCost} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
+  }
+  try {
+    assertCanStartAssetGeneration(user.id);
+  } catch (error: any) {
+    if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+    throw error;
   }
 
   let referencePath: string | null = null;
@@ -89,6 +102,19 @@ export async function POST(req: NextRequest) {
       resultRefType: 'image',
       resultRefId: null,
     });
+    const batchId = createGenerationBatch({
+      ownerId: user.id,
+      stage: 'toolbox_image',
+      requestedCount: 1,
+      contextSnapshot: {
+        route: 'api_toolbox_image_generate',
+        itemId,
+        mode,
+        ratio,
+        imageSize,
+      },
+      source: 'toolbox',
+    });
     try {
       const result = await generateImage(user, {
         prompt,
@@ -98,7 +124,14 @@ export async function POST(req: NextRequest) {
         kind: 'other',
         assetRef: `toolbox/${itemId}`,
         referenceImagePath: referencePath || undefined,
+        assetLibrary: {
+          batchId,
+          stage: 'toolbox_image',
+          source: 'toolbox',
+          makeCurrent: false,
+        },
       });
+      finishGenerationBatch(batchId, user.id);
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'completed',
         resultRefId: result.id,
@@ -107,6 +140,13 @@ export async function POST(req: NextRequest) {
       items.push(serializeToolboxItem(updated || item));
     } catch (error: any) {
       const message = String(error?.message || error || '图片生成失败').slice(0, 1000);
+      recordGenerationFailure({
+        batchId,
+        ownerId: user.id,
+        failureReason: 'provider_error',
+        errorMessage: message,
+      });
+      finishGenerationBatch(batchId, user.id, 'failed');
       refundToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'failed',

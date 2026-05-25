@@ -24,10 +24,10 @@
 | `SP_RETAG_EMOTIONS` `lib/prompts.ts:414` | 剧本情绪标记；`retag-emotions`、剧本生成后自动打标 | `chatCompleteJsonWithRetry`，`modelRole: structured` | 将剧本切为五段式情绪曲线，输出 `emotions` JSON；字段含 `emotion/intensity/pacing/paragraphStart/paragraphEnd/note`；严格 5 段、固定英文枚举。 |
 | `SP_ASSET_CHARACTERS_EXTRACT` `lib/prompts.ts:613` | 资产抽取第 1 步：角色；`app/api/assets/extract/route.ts` | `chatCompleteJsonWithRetry`，`modelRole: structured` | 只抽角色；输出 3-5 个角色 JSON；必填 `role/identity/entityType/appearance/clothing/equipment/temperament/actionTraits/imagePrompt`；非人角色必须保留真实物种/形态。 |
 | `SP_ASSET_SCENES_EXTRACT` `lib/prompts.ts:646` | 资产抽取第 2 步：场景；`app/api/assets/extract/route.ts` | `chatCompleteJsonWithRetry`，`modelRole: structured` | 只抽环境；输出 2-3 个场景，至少 1 主 1 副；场景必须带 `location/timeSetting/weather/lighting/atmosphere/baseSceneRef/imagePrompt`。 |
-| `SP_ASSET_PROPS_EXTRACT` `lib/prompts.ts:680` | 资产抽取第 3 步：道具；`app/api/assets/extract/route.ts` | `chatCompleteJsonWithRetry`，`modelRole: structured` | 只抽道具；输出 2-5 个道具；`ownership` 只能引用已识别角色 id 或 null；imagePrompt 英文且不能为空。 |
+| `SP_ASSET_PROPS_EXTRACT` `lib/prompts.ts:680` | 资产抽取第 3 步：道具；`app/api/assets/extract/route.ts` | `chatCompleteJsonWithRetry`，`modelRole: structured` | 只抽道具；输出 2-5 个道具；`ownership` 只能引用已识别角色 id 或 null；imagePrompt 必须是中文且不能为空。 |
 | `SP_SHOTS_GENERATE` `lib/prompts.ts:737` | 镜头表生成；`app/api/shots/generate/route.ts`、`lib/batch-executors.ts` | `chatCompleteJsonWithRetry`，`modelRole: structured` | 资深导演拆镜；输出 6-14 个镜头 JSON；`duration` 是导演计划秒数；台词字数按约 4 字/秒匹配 duration；固定镜头占比 ≥40%、相邻同情绪运镜兼容、景别/运镜枚举、visual 细节、scriptRef 原文定位。 |
 | `SP_VIDEO_PROMPT_GENERATE` `lib/prompts.ts:904` | 按 storyboard group 生成视频模型 prompt；`video-prompt/generate`、`video_prompts` batch | `chatStream` 或 `chatComplete`，`modelRole: brain/structured` | 中文视频提示词工程；必须输出 `运镜系统/角色/场景/计划时间段/基调/约束/音障`；时间段逐段匹配 shot.duration 累计时间轴；禁止英文 shot/camera 键值对和参考图编号；台词逐字完整保留。 |
-| `SP_VIDEO_PROMPT_REFINE` `lib/prompts.ts:1129` | 单个视频提示词微调；`app/api/video-prompt/refine/route.ts` | `chatStream`，`modelRole: brain` | 按用户修改意图微调现有视频提示词；不能改时间轴、运镜、角色 ID、参考图编号；直接输出新 prompt。注意：此处写着“英文提示词”，但主生成 prompt 要求中文，存在口径不一致。 |
+| `SP_VIDEO_PROMPT_REFINE` `lib/prompts.ts:1129` | 单个视频提示词微调；`app/api/video-prompt/refine/route.ts` | `chatStream`，`modelRole: brain` | 按用户修改意图微调现有中文视频提示词；不能改时间轴、运镜、角色 ID、参考图编号；直接输出新 prompt。 |
 | `SP_AGENT_CHAT` `lib/prompts.ts:1148` | Creative Agent 项目对话；`app/api/agent/chat/route.ts` | `chatStream`，`modelRole: brain` | 了解当前项目状态，基于用户引用元素给出建议或补丁；回复 ≤200 字；可追加 `[PATCH] target=... action=... payload=<JSON>` 协议。 |
 
 ## 内联 System Prompts
@@ -35,9 +35,9 @@
 | System prompt | 位置 | 作用环节/入口 | 调用方式 | 系统提示词内容摘要 |
 |---|---|---|---|---|
 | `SP_PATCH` | `app/api/agent/patch-script/route.ts:10` | Agent 直接改剧本 | `chatComplete`，`modelRole: brain` | 剧本编辑助手；输入原剧本+修改意图，返回完整剧本；保持五段式和总时长；不解释、不用 Markdown。 |
-| `SP_REBUILD` | `app/api/assets/rebuild-prompt/route.ts:16` | 单卡资产重新生成 imagePrompt | `chatComplete`，`modelRole: brain` | AI 图像生成提示词工程师；为白底写实参考图重写 60-150 词英文 imagePrompt；只描述主体；禁止写风格/光线/背景/三视图/六宫格等，由后端统一加。 |
+| `SP_REBUILD` | `app/api/assets/rebuild-prompt/route.ts:16` | 单卡资产重新生成 imagePrompt | `chatComplete`，`modelRole: brain` | AI 图像生成提示词工程师；为白底写实参考图重写 80-220 字中文 imagePrompt；只描述主体；禁止写风格/光线/背景/三视图/六宫格等，由后端统一加。 |
 | `SP_CHECK` | `app/api/assets/check-equipment-change/route.ts:9` | 角色装备/服装连续性检查 | `chatCompleteJsonWithRetry`，`modelRole: structured` | 连续性检查官；对比 before/after 服装装备是否有视觉关键变化；输出 `{changed, items[]}` 严格 JSON。 |
-| `SP_SHOT_TO_IMG_PROMPT` | `app/api/storyboard/convert-prompt/route.ts:16` | 单镜头流式转分镜图英文 prompt | `chatStream`，`modelRole: brain` | 分镜手稿提示词工程师；输出 50-150 词英文；描述主体、动作、构图、机位、光照、关键道具/场景；禁止照片级、彩色、运镜动词、台词字幕、三视图/白底。 |
+| `SP_SHOT_TO_IMG_PROMPT` | `app/api/storyboard/convert-prompt/route.ts:16` | 单镜头流式转中文分镜图 prompt | `chatStream`，`modelRole: brain` | 分镜手稿提示词工程师；输出 80-220 字中文；描述主体、动作、构图、机位、光照、关键道具/场景；禁止照片级、彩色、运镜动词、台词字幕、三视图/白底。 |
 | `SP_REBUILD` | `app/api/prompt/rebuild/route.ts:9` | 通用草稿 prompt 重写 | `chatComplete`，`modelRole: brain` | AI 视频/图像生成提示词工程师；把草稿重写得更精准、更结构化；保持语种；视频不超过 800 词、图像不超过 200 词；不解释。 |
 | `SP_CONTINUE` | `app/api/script/workflow/continue/route.ts:10` | 剧本续写 | `chatStream`，`modelRole: brain` | 短视频编剧助理；在剧本末尾续写 3-5 句，保持人物/风格/五段式节奏；返回完整剧本（原文+续写）。 |
 | `SP_EXPAND` | `app/api/script/workflow/expand/route.ts:10` | 剧本扩充 | `chatStream`，`modelRole: brain` | 短视频编剧助理；把现有剧本加细节、对白、镜头建议；保持五段式和总时长；中文纯文本；禁止 XML/Markdown/方括号注释。 |
@@ -45,7 +45,7 @@
 | `SP_PERSONA_DERIVE` | `app/api/profile/chat/route.ts:15` | 从偏好对话提炼画像 | `chatComplete`，`modelRole: profileDerive`，`responseFormat: json_object` | 根据最近对话历史提炼 `visualStyle/narrativeStyle/cameraStyle/moodStyle/promptHabits` 严格 JSON；证据不足填空字符串。 |
 | `SP_EDIT_ANALYZE` | `app/api/edit/analyze/route.ts:28` | 剪辑工作台 AI 分析 | `chatStream`，`modelRole: structured`，JSON | 后期剪辑顾问；输出故事弧线、BGM 类别、逐 segment 标签；segments 必须与输入 1:1 对应；要求五段式弧线、情绪强度、关键动作、角色名。 |
 | `SP_GENERATE_EDL` | `app/api/edit/generate-edl/route.ts:20` | 剪辑工作台生成 EDL | `chatStream`，`modelRole: structured`，JSON | 工业级 AI 剪辑师；按 Walter Murch 剪辑六原则生成 EDL；含对白片段必须完整保留 `in=0/out=durationSec`；默认 cut，非 cut 全片最多 1 处；输出 `{edl,duration,narrative,pacingPlan}`。 |
-| `SP_SHOT_TO_IMG_PROMPT` | `lib/batch-executors.ts:355` | 批量 `storyboard_prompts`：镜头转分镜图 prompt | `chatComplete`，`modelRole: structured` | 与单镜头转换类似，但增加强非人/拟人角色规则：必须保留物种本体，禁止画成真人员工；群像按点名物种逐个画；体型必须接近现实物种且小于/不高于人类角色。 |
+| `SP_SHOT_TO_IMG_PROMPT` | `lib/batch-executors.ts:355` | 批量 `storyboard_prompts`：镜头转中文分镜图 prompt | `chatComplete`，`modelRole: structured` | 与单镜头转换类似，输出中文分镜图 prompt；批量版同步包含强非人/拟人角色规则：必须保留物种本体，禁止画成真人员工；群像按点名物种逐个画；体型必须接近现实物种且小于/不高于人类角色。 |
 | 无 system prompt | `app/api/settings/test/route.ts:58` | 文本模型连通性测试 | `chatComplete`，`modelRole: brain/structured` | 只发 user 消息 `ping，回复 pong 即可。`，没有 system role。 |
 
 ## 非 `role=system` 但实际会拼入模型 Prompt 的硬规则
@@ -84,5 +84,5 @@
 
 | 问题 | 位置 | 建议 |
 |---|---|---|
-| `SP_VIDEO_PROMPT_REFINE` 写“输出同样结构的英文提示词”，但 `SP_VIDEO_PROMPT_GENERATE` 明确要求中文提示词。 | `lib/prompts.ts:1129` | 统一为中文结构化视频提示词，避免微调后把 prompt 改回英文。 |
+| 用户可编辑 prompt 的语种要求需要保持一致。 | `lib/prompts.ts`、`app/api/storyboard/convert-prompt/route.ts`、`lib/batch-executors.ts` | 资产 imagePrompt、分镜图 prompt、视频 prompt 统一以中文生成；系统字段、JSON key、固定枚举和 provider 硬规则可保留英文。 |
 | 单条分镜 prompt 与批量分镜 prompt 有两份 `SP_SHOT_TO_IMG_PROMPT`，批量版多了非人/拟人物种保护。 | `app/api/storyboard/convert-prompt/route.ts:16` vs `lib/batch-executors.ts:355` | 建议抽到同一处，并把非人规则同步给单条生成。 |

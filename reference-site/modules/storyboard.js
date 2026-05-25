@@ -326,7 +326,7 @@ export function refreshImagesPage() {
   var needShots = $("imagesNeedShots");
   var ready = $("imagesReady");
   var actionBar = $("imagesActionBar");
-  if (!project || !project.shotsApproved || !project.shots || !project.shots.length) {
+  if (!project || !project.shots || !project.shots.length) {
     if (needShots) needShots.hidden = false;
     if (ready) ready.hidden = true;
     if (actionBar) actionBar.hidden = true;
@@ -1216,7 +1216,7 @@ export function handleConvertAction(e) {
   } else if (action === "edit-convert") {
     if (!project || !project.shots[idx]) return;
     var current = project.shots[idx].imagePrompt || "";
-    var newPrompt = prompt("手动编辑图片提示词 (English):", current);
+    var newPrompt = prompt("手动编辑中文图片提示词:", current);
     if (newPrompt !== null && newPrompt.trim()) {
       project.shots[idx].imagePrompt = newPrompt.trim();
       project.shots[idx].imagePromptGenerated = true;

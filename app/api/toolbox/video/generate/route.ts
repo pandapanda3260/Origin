@@ -13,6 +13,13 @@ import {
   updateToolboxItem,
 } from '@/lib/toolbox-db';
 import { TOOLBOX_VIDEO_RUNNING_LIMIT } from '@/lib/toolbox-limits';
+import {
+  AssetQuotaError,
+  assertCanStartAssetGeneration,
+  createGenerationBatch,
+  finishGenerationBatch,
+  recordGenerationFailure,
+} from '@/lib/asset-library';
 import { assertToolboxImageRefPath } from '@/lib/toolbox-media';
 import {
   buildToolboxVideoPrompt,
@@ -71,6 +78,12 @@ export async function POST(req: NextRequest) {
   if (balance.totalCredits < creditAmount) {
     return jsonError(`积分不足：本次需 ${creditAmount} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
   }
+  try {
+    assertCanStartAssetGeneration(user.id);
+  } catch (error: any) {
+    if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+    throw error;
+  }
 
   const itemId = randomUUID();
   const videoTaskId = randomUUID();
@@ -101,6 +114,22 @@ export async function POST(req: NextRequest) {
     resultRefType: 'video',
     resultRefId: videoTaskId,
   });
+  const batchId = createGenerationBatch({
+    batchId: itemId,
+    ownerId: user.id,
+    stage: 'toolbox_video',
+    requestedCount: 1,
+    contextSnapshot: {
+      route: 'api_toolbox_video_generate',
+      itemId,
+      videoTaskId,
+      mode,
+      ratio,
+      resolution,
+      durationSec: storedParams.durationSec,
+    },
+    source: 'toolbox',
+  });
 
   try {
     const result = await generateVideo(user, {
@@ -119,8 +148,21 @@ export async function POST(req: NextRequest) {
           modeReason: 'toolbox_first_last_frame',
         }
         : undefined,
+      assetLibrary: {
+        batchId,
+        stage: 'toolbox_video',
+        source: 'toolbox',
+        makeCurrent: false,
+      },
     });
     if (result.status === 'failed') {
+      recordGenerationFailure({
+        batchId,
+        ownerId: user.id,
+        failureReason: 'provider_error',
+        errorMessage: '视频生成失败',
+      });
+      finishGenerationBatch(batchId, user.id, 'failed');
       refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'failed',
@@ -129,6 +171,7 @@ export async function POST(req: NextRequest) {
       return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
     }
     if (result.status === 'completed') {
+      finishGenerationBatch(batchId, user.id);
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'completed',
         errorMessage: null,
@@ -138,6 +181,13 @@ export async function POST(req: NextRequest) {
     return jsonOk({ ok: true, item: serializeToolboxItem(item) });
   } catch (error: any) {
     const message = String(error?.message || error || '视频生成失败').slice(0, 1000);
+    recordGenerationFailure({
+      batchId,
+      ownerId: user.id,
+      failureReason: 'provider_error',
+      errorMessage: message,
+    });
+    finishGenerationBatch(batchId, user.id, 'failed');
     refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
     const updated = updateToolboxItem(item.id, user.id, {
       status: 'failed',

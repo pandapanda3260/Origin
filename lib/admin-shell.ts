@@ -26,6 +26,8 @@ const NAV_GROUPS = [
     items: [
       { href: '/admin/users', label: '用户管理', icon: 'users' },
       { href: '/admin/billing', label: '财务积分', icon: 'coin' },
+      { href: '/admin/token-stats', label: 'Token 统计', icon: 'activity' },
+      { href: '/admin/time-stats', label: '时间统计', icon: 'activity' },
       { href: '/admin/search', label: '客服检索', icon: 'search' },
       { href: '/admin/tasks', label: '任务管理', icon: 'task' },
     ],

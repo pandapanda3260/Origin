@@ -1,19 +1,38 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { deleteProjectForUser, getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { deleteProjectForUser, getProjectByIdForUser, StaleProjectVersionError, updateProjectForUser } from '@/lib/projects-db';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { attachVideoPromptReadiness } from '@/lib/video-prompt-state';
 import { mutateCharacterLock } from '@/lib/character-consistency';
+import { attachAssetLibraryCurrentToProject } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
+  const perfDiag = process.env.PERF_DIAG === '1';
+  const t0 = perfDiag ? performance.now() : 0;
   const user = await getCurrentUser(req);
+  const tAuth = perfDiag ? performance.now() : 0;
   if (!user) return jsonError('unauthorized', 401);
   const proj = getProjectByIdForUser(params.id, user.id);
+  const tDb = perfDiag ? performance.now() : 0;
   if (!proj) return jsonError('项目不存在', 404);
-  return jsonOk(attachVideoPromptReadiness(proj as any));
+  const withAsset = attachAssetLibraryCurrentToProject(proj as any, user.id);
+  const tAsset = perfDiag ? performance.now() : 0;
+  const result = attachVideoPromptReadiness(withAsset);
+  if (perfDiag) {
+    const tEnd = performance.now();
+    const fmt = (n: number) => n.toFixed(0);
+    console.log(
+      `[perf-diag] WIP GET /api/projects/${params.id} uid=${user.id} total=${fmt(tEnd - t0)}ms`
+        + ` auth=${fmt(tAuth - t0)}ms`
+        + ` getProject=${fmt(tDb - tAuth)}ms`
+        + ` attachAssetLib=${fmt(tAsset - tDb)}ms`
+        + ` attachVideoReadiness=${fmt(tEnd - tAsset)}ms`,
+    );
+  }
+  return jsonOk(result);
 }
 
 function cleanText(value: any): string {
@@ -142,13 +161,49 @@ function applyProjectPutCharacterConsistency(current: any, body: any) {
   return changed ? { ...patch, consistency: consistencyProject.consistency } : patch;
 }
 
+// `If-Match` 头格式约定：`v<int>`（兼容前端 project.js `_serverSave` 的发送格式）。
+// 不带头 / 解析失败 → 返回 undefined（回退到老的"无版本校验"语义，兼容老客户端）。
+function parseIfMatchVersion(req: NextRequest): number | undefined {
+  const raw = req.headers.get('if-match');
+  if (!raw) return undefined;
+  const m = String(raw).trim().match(/^"?v(\d+)"?$/i);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
 export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
   const body = await req.json().catch(() => ({} as any));
   const current = getProjectByIdForUser(params.id, user.id);
   if (!current) return jsonError('项目不存在', 404);
-  const proj = updateProjectForUser(params.id, user.id, applyProjectPutCharacterConsistency(current as any, body));
+  // 乐观锁：前端 If-Match 落后于服务器 version 时返回 409 stale_version。
+  // 这条挡的核心场景：batch executor / 单镜头路由刚把镜头状态权威写到 DB，
+  // 前端内存里还停在旧快照，debounced saveProject 拿着旧 storyboards 来 PUT。
+  // 老前端 / 老客户端不发 If-Match → expectedVersion=undefined → 走原本的覆盖语义，不破坏现状。
+  const expectedVersion = parseIfMatchVersion(req);
+  let proj: any;
+  try {
+    proj = updateProjectForUser(
+      params.id,
+      user.id,
+      applyProjectPutCharacterConsistency(current as any, body),
+      typeof expectedVersion === 'number' ? { expectedVersion } : undefined,
+    );
+  } catch (e: any) {
+    if (e instanceof StaleProjectVersionError) {
+      return NextResponse.json(
+        {
+          error: 'stale_version',
+          serverVersion: e.serverVersion,
+          clientVersion: e.clientVersion,
+        },
+        { status: 409 },
+      );
+    }
+    throw e;
+  }
   if (!proj) return jsonError('项目不存在', 404);
   return jsonOk(attachVideoPromptReadiness(proj as any));
 }

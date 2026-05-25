@@ -4,7 +4,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream } from '@/lib/llm';
 import { buildVideoPromptMessages } from '@/lib/prompts';
-import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import {
   VIDEO_REFERENCE_IMAGE_BUDGET,
   type ReferenceManifestItem,
@@ -18,6 +18,11 @@ import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 import { logVideoPromptTrace, summarizePromptForTrace } from '@/lib/video-prompt-observability';
 import { describeArtifactStatus } from '@/lib/sentinel';
+import type { SSEWriter } from '@/lib/sse';
+import {
+  validateCharacterConsistencyForGroup,
+  type CharacterConsistencyGateResult,
+} from '@/lib/character-consistency-gate';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -62,6 +67,491 @@ function sentinelBlockMessage(decision: ReturnType<typeof describeArtifactStatus
   return decision.consistency?.blockers?.map((b) => b.message).filter(Boolean).join('；') ||
     decision.blockingReasons.join('、') ||
     'artifact_usage_blocked';
+}
+
+type SinglePromptFailureMeta = {
+  errorCode: string;
+  failureStage: string;
+  reason?: string;
+};
+
+type MarkVideoPromptFailedArgs = {
+  projectId: string;
+  userId: number;
+  groupIdx: number;
+  promptRunId: string;
+  errorMessage: string;
+  errorCode: string;
+  failureStage: string;
+  reason: string;
+};
+
+type VideoPromptStateWriteResult = {
+  applied: boolean;
+  skippedReason?: string;
+  storedRunId?: string | null;
+  storedStatus?: string | null;
+  previousRunId?: string | null;
+  previousStatus?: string | null;
+  project?: any | null;
+  shotIndices?: number[];
+};
+
+type MarkVideoPromptGeneratingArgs = {
+  projectId: string;
+  userId: number;
+  groupIdx: number;
+  promptRunId: string;
+  shotIndices: number[];
+};
+
+type WriteVideoPromptReadyArgs = {
+  projectId: string;
+  userId: number;
+  groupIdx: number;
+  promptRunId: string;
+  prompt: string;
+  shotIndices: number[];
+  gate: CharacterConsistencyGateResult;
+  referenceManifest: ReferenceManifestItem[];
+  droppedReferences: any[];
+};
+
+function failSingleVideoPrompt(writer: SSEWriter, error: string, meta: SinglePromptFailureMeta) {
+  writer.fail({
+    error,
+    errorCode: meta.errorCode,
+    failureStage: meta.failureStage,
+    reason: meta.reason,
+  });
+}
+
+function readStoredVideoPromptState(project: any, groupIdx: number) {
+  const sb = Array.isArray(project?.storyboards) ? project.storyboards[groupIdx] || null : null;
+  return {
+    storedRunId: sb?.videoPromptRunId || null,
+    storedStatus: sb?.videoPromptStatus || null,
+  };
+}
+
+function markVideoPromptGeneratingSameTx(args: MarkVideoPromptGeneratingArgs): VideoPromptStateWriteResult {
+  const { projectId, userId, groupIdx, promptRunId } = args;
+  let previousRunId: string | null = null;
+  let previousStatus: string | null = null;
+  let resolvedShotIndices = Array.isArray(args.shotIndices) ? [...args.shotIndices] : [];
+  try {
+    const markedProject = patchProjectForUser(projectId, userId, (fresh) => {
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      const prev = storyboards[groupIdx] || {};
+      previousRunId = prev?.videoPromptRunId || null;
+      previousStatus = prev?.videoPromptStatus || null;
+      resolvedShotIndices = storyboardShotIndices(fresh as any, groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: resolvedShotIndices,
+      });
+      const now = new Date().toISOString();
+      storyboards[groupIdx] = {
+        ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', now),
+        idx: groupIdx,
+        shotIdx: groupIdx + 1,
+        shotIndices: resolvedShotIndices,
+        videoPromptStatus: 'generating',
+        videoPromptRunId: promptRunId,
+        videoPromptStartedAt: now,
+        videoPromptLastError: undefined,
+        videoPromptFailedAt: undefined,
+      };
+      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+      if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+        videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
+      }
+      maybeAssertStoryboardsAlignedWithShots({ ...(fresh as any), storyboards, videoTasks }, 'video-prompt-generating');
+      return { storyboards, videoTasks };
+    });
+    if (!markedProject) {
+      logVideoPromptTrace('single_prompt_status_marked', {
+        projectId,
+        groupIdx,
+        previousStatus,
+        previousRunId,
+        newRunId: promptRunId,
+        applied: false,
+        reason: 'project_missing',
+        storedStatus: null,
+        storedRunId: null,
+      }, 'warn');
+      return {
+        applied: false,
+        skippedReason: 'project_missing',
+        storedRunId: null,
+        storedStatus: null,
+        previousRunId,
+        previousStatus,
+        project: null,
+        shotIndices: resolvedShotIndices,
+      };
+    }
+    const markedSb = Array.isArray((markedProject as any)?.storyboards)
+      ? (markedProject as any).storyboards[groupIdx] || {}
+      : {};
+    const applied = markedSb.videoPromptStatus === 'generating' && markedSb.videoPromptRunId === promptRunId;
+    logVideoPromptTrace('single_prompt_status_marked', {
+      projectId,
+      groupIdx,
+      previousStatus,
+      previousRunId,
+      newRunId: promptRunId,
+      applied,
+      storedStatus: markedSb.videoPromptStatus || null,
+      storedRunId: markedSb.videoPromptRunId || null,
+    }, applied ? 'info' : 'warn');
+    return {
+      applied,
+      skippedReason: applied ? undefined : 'write_not_applied',
+      storedRunId: markedSb.videoPromptRunId || null,
+      storedStatus: markedSb.videoPromptStatus || null,
+      previousRunId,
+      previousStatus,
+      project: markedProject,
+      shotIndices: resolvedShotIndices,
+    };
+  } catch (error: any) {
+    logVideoPromptTrace('single_prompt_status_marked', {
+      projectId,
+      groupIdx,
+      previousStatus,
+      previousRunId,
+      newRunId: promptRunId,
+      applied: false,
+      reason: 'mark_exception',
+      error: (error?.message || String(error)).slice(0, 500),
+    }, 'error');
+    return {
+      applied: false,
+      skippedReason: 'mark_exception',
+      previousRunId,
+      previousStatus,
+      shotIndices: resolvedShotIndices,
+    };
+  }
+}
+
+function maybeMarkVideoPromptFailedSameRun(args: MarkVideoPromptFailedArgs): VideoPromptStateWriteResult & { marked: boolean } {
+  try {
+    return markVideoPromptFailedSameRunUnsafe(args);
+  } catch (error: any) {
+    logVideoPromptTrace('single_prompt_failure_mark_skipped', {
+      projectId: args.projectId,
+      groupIdx: args.groupIdx,
+      incomingRunId: args.promptRunId,
+      storedRunId: null,
+      reason: 'mark_exception',
+      errorCode: args.errorCode,
+      failureStage: args.failureStage,
+      failedMarked: false,
+      error: (error?.message || String(error)).slice(0, 500),
+    }, 'error');
+    return {
+      applied: false,
+      marked: false,
+      skippedReason: 'mark_exception',
+      storedRunId: null,
+      storedStatus: null,
+      project: null,
+    };
+  }
+}
+
+function markVideoPromptFailedSameRunUnsafe(args: MarkVideoPromptFailedArgs): VideoPromptStateWriteResult & { marked: boolean } {
+  const { projectId, userId, groupIdx, promptRunId, errorMessage, errorCode, failureStage, reason } = args;
+  let decision: VideoPromptStateWriteResult & { marked: boolean } = {
+    applied: false,
+    marked: false,
+    skippedReason: 'project_missing',
+    storedRunId: null,
+    storedStatus: null,
+  };
+  const failedProject = patchProjectForUser(projectId, userId, (fresh) => {
+    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+    const prev = storyboards[groupIdx];
+    if (!prev) {
+      decision = {
+        applied: false,
+        marked: false,
+        skippedReason: 'slot_missing',
+        storedRunId: null,
+        storedStatus: null,
+      };
+      return {};
+    }
+
+    if (prev.videoPromptRunId && prev.videoPromptRunId !== promptRunId) {
+      decision = {
+        applied: false,
+        marked: false,
+        skippedReason: 'run_taken_by_other',
+        storedRunId: prev.videoPromptRunId || null,
+        storedStatus: prev.videoPromptStatus || null,
+      };
+      return {};
+    }
+
+    const failedShotIndices = storyboardShotIndices(fresh as any, groupIdx, prev, { mode: 'single-shot-strict' });
+    const now = new Date().toISOString();
+    storyboards[groupIdx] = {
+      ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
+      idx: groupIdx,
+      shotIdx: groupIdx + 1,
+      shotIndices: failedShotIndices,
+      videoPromptStatus: 'failed',
+      videoPromptRunId: promptRunId,
+      videoPromptFailedAt: now,
+      videoPromptLastError: errorMessage.slice(0, 500),
+    };
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
+    }
+    maybeAssertStoryboardsAlignedWithShots({ ...(fresh as any), storyboards, videoTasks }, 'video-prompt-failed');
+    decision = {
+      applied: true,
+      marked: true,
+      storedRunId: promptRunId,
+      storedStatus: 'failed',
+      shotIndices: failedShotIndices,
+    };
+    return { storyboards, videoTasks };
+  });
+  if (!failedProject) {
+    logVideoPromptTrace('single_prompt_failure_mark_skipped', {
+      projectId,
+      groupIdx,
+      incomingRunId: promptRunId,
+      storedRunId: null,
+      reason: 'project_missing',
+      errorCode,
+      failureStage,
+      failedMarked: false,
+    }, 'warn');
+    return decision;
+  }
+  const failedSb = Array.isArray((failedProject as any)?.storyboards)
+    ? (failedProject as any).storyboards[groupIdx] || {}
+    : {};
+  const applied = failedSb.videoPromptStatus === 'failed' && failedSb.videoPromptRunId === promptRunId;
+  if (!applied && decision.skippedReason) {
+    logVideoPromptTrace('single_prompt_failure_mark_skipped', {
+      projectId,
+      groupIdx,
+      incomingRunId: promptRunId,
+      storedRunId: failedSb.videoPromptRunId || decision.storedRunId || null,
+      storedStatus: failedSb.videoPromptStatus || decision.storedStatus || null,
+      reason: decision.skippedReason,
+      errorCode,
+      failureStage,
+      failedMarked: false,
+    }, decision.skippedReason === 'run_taken_by_other' ? 'warn' : 'error');
+    return {
+      ...decision,
+      applied: false,
+      marked: false,
+      storedRunId: failedSb.videoPromptRunId || decision.storedRunId || null,
+      storedStatus: failedSb.videoPromptStatus || decision.storedStatus || null,
+      project: failedProject,
+    };
+  }
+  logVideoPromptTrace('single_prompt_failure_marked', {
+    projectId,
+    groupIdx,
+    runId: promptRunId,
+    incomingRunId: promptRunId,
+    storedRunId: failedSb.videoPromptRunId || null,
+    storedStatus: failedSb.videoPromptStatus || null,
+    reason,
+    errorCode,
+    failureStage,
+    failedMarked: applied,
+    applied,
+    error: errorMessage.slice(0, 500),
+  }, applied ? 'warn' : 'error');
+  return {
+    ...decision,
+    applied,
+    marked: applied,
+    skippedReason: applied ? undefined : 'write_not_applied',
+    storedRunId: failedSb.videoPromptRunId || null,
+    storedStatus: failedSb.videoPromptStatus || null,
+    project: failedProject,
+  };
+}
+
+function writeVideoPromptReadySameRun(args: WriteVideoPromptReadyArgs): VideoPromptStateWriteResult {
+  const {
+    projectId,
+    userId,
+    groupIdx,
+    promptRunId,
+    prompt,
+    gate,
+    referenceManifest,
+    droppedReferences,
+  } = args;
+  let decision: VideoPromptStateWriteResult = {
+    applied: false,
+    skippedReason: 'project_missing',
+    storedRunId: null,
+    storedStatus: null,
+  };
+  const readyProject = patchProjectForUser(projectId, userId, (fresh) => {
+    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+    const currentSb = storyboards[groupIdx];
+    if (!currentSb) {
+      decision = {
+        applied: false,
+        skippedReason: 'slot_missing',
+        storedRunId: null,
+        storedStatus: null,
+      };
+      return {};
+    }
+    if (currentSb.videoPromptRunId && currentSb.videoPromptRunId !== promptRunId) {
+      decision = {
+        applied: false,
+        skippedReason: 'run_taken_by_other',
+        storedRunId: currentSb.videoPromptRunId || null,
+        storedStatus: currentSb.videoPromptStatus || null,
+      };
+      return {};
+    }
+    const resolvedShotIndices = storyboardShotIndices(fresh as any, groupIdx, currentSb, {
+      mode: 'single-shot-strict',
+      explicitShotIndices: args.shotIndices,
+    });
+    const now = new Date().toISOString();
+    const patch: any = {
+      idx: groupIdx,
+      shotIdx: groupIdx + 1,
+      shotIndices: resolvedShotIndices,
+      videoPrompt: prompt,
+      videoPromptStatus: 'ready',
+      videoPromptRunId: promptRunId,
+      videoPromptUpdatedAt: now,
+      videoPromptLastError: undefined,
+      videoPromptFailedAt: undefined,
+      _vpCache: null,
+      videoReferenceManifest: referenceManifest,
+      videoReferenceDropped: droppedReferences,
+      consistency: {
+        ...(currentSb.consistency || {}),
+        videoPrompt: {
+          characterUsages: gate.characterUsages,
+          score: gate.score,
+          level: gate.level,
+          warnings: gate.warnings,
+        },
+      },
+    };
+    storyboards[groupIdx] = {
+      ...markStoryboardVideoOutdated(currentSb, 'video_prompt_regeneration', now),
+      ...patch,
+    };
+    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
+    }
+    maybeAssertStoryboardsAlignedWithShots({ ...(fresh as any), storyboards, videoTasks }, 'video-prompt-ready');
+    decision = {
+      applied: true,
+      storedRunId: promptRunId,
+      storedStatus: 'ready',
+      shotIndices: resolvedShotIndices,
+    };
+    return { storyboards, videoTasks };
+  });
+  const readySb = Array.isArray((readyProject as any)?.storyboards)
+    ? (readyProject as any).storyboards[groupIdx] || {}
+    : {};
+  const applied =
+    readySb.videoPromptStatus === 'ready' &&
+    readySb.videoPromptRunId === promptRunId &&
+    String(readySb.videoPrompt || '').trim() === prompt;
+  return {
+    ...decision,
+    applied,
+    skippedReason: applied ? undefined : (decision.skippedReason || 'write_not_applied'),
+    storedRunId: readySb.videoPromptRunId || decision.storedRunId || null,
+    storedStatus: readySb.videoPromptStatus || decision.storedStatus || null,
+    project: readyProject,
+    shotIndices: decision.shotIndices,
+  };
+}
+
+function videoPromptGateMessage(gate: Pick<CharacterConsistencyGateResult, 'blockers' | 'warnings'>) {
+  return gate.blockers?.map((b) => b.message).filter(Boolean).join('；') ||
+    gate.warnings?.map((w) => w.message).filter(Boolean).join('；') ||
+    '角色一致性检查未通过';
+}
+
+function evaluateVideoPromptConsistencyGate(project: any, groupIdx: number, shotIndices: number[]): CharacterConsistencyGateResult {
+  try {
+    return validateCharacterConsistencyForGroup(project, {
+      groupIdx,
+      shotIndices,
+      target: 'videoPrompt',
+    });
+  } catch (error: any) {
+    const errMessage = error?.message || String(error);
+    try {
+      console.error('[consistency_gate_error]', JSON.stringify({ groupIdx, target: 'videoPrompt', message: errMessage }));
+    } catch {
+      console.error('[consistency_gate_error]', { groupIdx, target: 'videoPrompt', message: errMessage });
+    }
+    if (process.env.RELAX_VIDEO_PROMPT_BLOCKERS !== '0') {
+      try {
+        console.warn('[relaxed_block]', JSON.stringify({
+          target: 'video_prompt_generation',
+          reason: 'critical_reference_missing',
+          groupIdx,
+          key: 'consistency_gate_error',
+        }));
+      } catch {
+        console.warn('[relaxed_block]', {
+          target: 'video_prompt_generation',
+          reason: 'critical_reference_missing',
+          groupIdx,
+          key: 'consistency_gate_error',
+        });
+      }
+      return {
+        target: 'videoPrompt',
+        groupIdx,
+        allowed: true,
+        score: 60,
+        level: 'yellow',
+        blockers: [],
+        warnings: [{
+          code: 'reference_missing',
+          subReason: 'consistency_gate_error',
+          message: `[已放行] 角色一致性检查异常：${errMessage}`,
+        }],
+        characterUsages: [],
+      };
+    }
+    return {
+      target: 'videoPrompt',
+      groupIdx,
+      allowed: false,
+      score: 0,
+      level: 'red',
+      blockers: [{
+        code: 'critical_reference_missing',
+        subReason: 'consistency_gate_error',
+        message: errMessage,
+      }],
+      warnings: [],
+      characterUsages: [],
+    };
+  }
 }
 
 function buildReferenceManifestFromRequest(body: any, groupIdx: number): ReferenceManifestItem[] {
@@ -184,64 +674,89 @@ export async function POST(req: NextRequest) {
   return sseResponse(async (writer) => {
     writer.step(`正在生成第 ${groupIdx + 1}/${totalGroups} 组提示词…`);
     let projectForKnowledge: any = null;
+    let markedGenerating = false;
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
-        projectForKnowledge = proj;
-        const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
-        const sb = storyboards[groupIdx] || {};
+        if (!(proj as any).imagesApproved) {
+          failSingleVideoPrompt(writer, '请先确认分镜图，再生成视频提示词。', {
+            errorCode: 'VIDEO_PROMPT_IMAGES_NOT_APPROVED',
+            failureStage: 'preflight',
+            reason: 'images_not_approved',
+          });
+          return;
+        }
+        const sb = Array.isArray((proj as any).storyboards) ? ((proj as any).storyboards[groupIdx] || {}) : {};
         shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
           mode: 'single-shot-strict',
           explicitShotIndices: shotIndices,
         });
         const sentinel = describeArtifactStatus(proj as any, {
           projectId,
-          targetArtifact: 'video_prompt',
+          targetArtifact: 'video_prompt_generation',
           groupIdx,
           shotIndices,
           consumerOperation: 'video_prompt_generate',
         });
         if (sentinel.usability === 'BLOCKED') {
-          writer.error(`视频提示词生成前检查未通过：${sentinelBlockMessage(sentinel)}`);
+          failSingleVideoPrompt(writer, `视频提示词生成前检查未通过：${sentinelBlockMessage(sentinel)}`, {
+            errorCode: 'VIDEO_PROMPT_PREFLIGHT_BLOCKED',
+            failureStage: 'preflight',
+            reason: 'sentinel_blocked',
+          });
           return;
         }
-        const now = new Date().toISOString();
-        const previousStatus = sb?.videoPromptStatus || null;
-        const previousRunId = sb?.videoPromptRunId || null;
-        storyboards[groupIdx] = {
-          ...markStoryboardVideoOutdated(storyboards[groupIdx] || {}, 'video_prompt_regeneration', now),
-          idx: groupIdx,
-          shotIdx: groupIdx + 1,
-          shotIndices,
-          videoPromptStatus: 'generating',
-          videoPromptRunId: promptRunId,
-          videoPromptStartedAt: now,
-          videoPromptLastError: undefined,
-          videoPromptFailedAt: undefined,
-        };
-        const videoTasks = Array.isArray((proj as any).videoTasks) ? [...(proj as any).videoTasks] : [];
-        if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-          videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
-        }
-        maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-generating');
-        const markedProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
-        const markedSb = Array.isArray((markedProject as any)?.storyboards)
-          ? (markedProject as any).storyboards[groupIdx] || {}
-          : {};
-        logVideoPromptTrace('single_prompt_status_marked', {
+        const markResult = markVideoPromptGeneratingSameTx({
           projectId,
+          userId: user.id,
           groupIdx,
-          previousStatus,
-          previousRunId,
-          newRunId: promptRunId,
-          applied: markedSb.videoPromptStatus === 'generating' && markedSb.videoPromptRunId === promptRunId,
-          storedStatus: markedSb.videoPromptStatus || null,
-          storedRunId: markedSb.videoPromptRunId || null,
+          promptRunId,
+          shotIndices,
         });
+        if (!markResult.applied) {
+          failSingleVideoPrompt(writer, '视频提示词生成任务没有成功写入项目，请重试。', {
+            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+            failureStage: 'persist',
+            reason: markResult.skippedReason || 'generating_mark_not_applied',
+          });
+          return;
+        }
+        markedGenerating = true;
+        shotIndices = markResult.shotIndices || shotIndices;
+        projectForKnowledge = markResult.project || proj;
+      } else {
+        failSingleVideoPrompt(writer, '视频提示词生成失败：项目不存在', {
+          errorCode: 'VIDEO_PROMPT_PROJECT_NOT_FOUND',
+          failureStage: 'preflight',
+          reason: 'project_missing',
+        });
+        return;
       }
     }
 
-    const originalMessages = buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups });
+    let originalMessages: ReturnType<typeof buildVideoPromptMessages>;
+    try {
+      originalMessages = buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups });
+    } catch (e: any) {
+      if (projectId && markedGenerating) {
+        maybeMarkVideoPromptFailedSameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          errorMessage: e?.message || String(e),
+          errorCode: 'VIDEO_PROMPT_PROMPT_BUILD_FAILED',
+          failureStage: 'prompt_build',
+          reason: 'prompt_build_failed',
+        });
+      }
+      failSingleVideoPrompt(writer, '视频提示词生成准备失败：' + (e?.message || String(e)), {
+        errorCode: 'VIDEO_PROMPT_PROMPT_BUILD_FAILED',
+        failureStage: 'prompt_build',
+        reason: 'prompt_build_failed',
+      });
+      return;
+    }
     let finalMessages = originalMessages;
     let knowledgeContext: KnowledgeContextForStage | null = null;
     if (projectId && projectForKnowledge) {
@@ -297,6 +812,20 @@ export async function POST(req: NextRequest) {
               modelRole: 'structured',
               traceName: 'video-prompts',
               traceAttempt: streamAttempt,
+              tokenContext: {
+                projectId: projectId || null,
+                projectTitleSnapshot: (projectForKnowledge as any)?.title || null,
+                requestPath: req.nextUrl.pathname,
+                routeName: 'video-prompt.generate',
+                moduleKey: 'video_prompt',
+                moduleLabel: '视频提示词',
+                featureKey: 'video_prompt_generate',
+                featureLabel: '视频提示词生成',
+                callItemType: 'storyboard_group',
+                callItemId: groupIdx == null ? null : String(groupIdx),
+                callItemLabel: `分镜组 ${groupIdx + 1}`,
+                runId: promptRunId,
+              },
             },
             (delta) => {
               prompt += delta;
@@ -335,155 +864,271 @@ export async function POST(req: NextRequest) {
         }
       }
     } catch (e: any) {
-      if (projectId) {
-        const proj = getProjectByIdForUser(projectId, user.id);
-        if (proj) {
-          const storyboards = Array.isArray((proj as any).storyboards) ? [...(proj as any).storyboards] : [];
-          const prev = storyboards[groupIdx] || {};
-          const failedShotIndices = storyboardShotIndices(proj as any, groupIdx, prev, { mode: 'single-shot-strict' });
-          if (!prev.videoPromptRunId || prev.videoPromptRunId === promptRunId) {
-            const now = new Date().toISOString();
-            storyboards[groupIdx] = {
-              ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
-              idx: groupIdx,
-              shotIdx: groupIdx + 1,
-              shotIndices: failedShotIndices,
-              videoPromptStatus: 'failed',
-              videoPromptRunId: promptRunId,
-              videoPromptFailedAt: now,
-              videoPromptLastError: (e?.message || String(e)).slice(0, 500),
-            };
-            const videoTasks = Array.isArray((proj as any).videoTasks) ? [...(proj as any).videoTasks] : [];
-            if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-              videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
-            }
-            maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-failed');
-            const failedProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
-            const failedSb = Array.isArray((failedProject as any)?.storyboards)
-              ? (failedProject as any).storyboards[groupIdx] || {}
-              : {};
-            logVideoPromptTrace('single_prompt_failure_marked', {
-              projectId,
-              groupIdx,
-              runId: promptRunId,
-              applied: failedSb.videoPromptStatus === 'failed' && failedSb.videoPromptRunId === promptRunId,
-              storedStatus: failedSb.videoPromptStatus || null,
-              storedRunId: failedSb.videoPromptRunId || null,
-              error: (e?.message || String(e)).slice(0, 500),
-            }, 'warn');
-          }
-        }
+      if (projectId && markedGenerating) {
+        maybeMarkVideoPromptFailedSameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          errorMessage: e?.message || String(e),
+          errorCode: 'VIDEO_PROMPT_LLM_FAILED',
+          failureStage: 'llm',
+          reason: 'llm_failed',
+        });
       }
-      writer.error('视频提示词生成失败：' + (e?.message || String(e)));
+      failSingleVideoPrompt(writer, '视频提示词生成失败：' + (e?.message || String(e)), {
+        errorCode: 'VIDEO_PROMPT_LLM_FAILED',
+        failureStage: 'llm',
+        reason: 'llm_failed',
+      });
+      return;
+    }
+
+    const cleanedPrompt = prompt.trim();
+    if (!cleanedPrompt) {
+      const emptyMessage = 'AI 没有返回提示词';
+      if (projectId && markedGenerating) {
+        maybeMarkVideoPromptFailedSameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          errorMessage: emptyMessage,
+          errorCode: 'VIDEO_PROMPT_EMPTY_RESULT',
+          failureStage: 'llm',
+          reason: 'empty_result',
+        });
+      }
+      failSingleVideoPrompt(writer, '视频提示词生成失败：' + emptyMessage, {
+        errorCode: 'VIDEO_PROMPT_EMPTY_RESULT',
+        failureStage: 'llm',
+        reason: 'empty_result',
+      });
       return;
     }
 
     // 写回到对应 storyboard group 的 videoPrompt + shotIndices
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
-      if (proj) {
-        const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
-        const sb = storyboards[groupIdx] || {};
-        shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
-          mode: 'single-shot-strict',
-          explicitShotIndices: shotIndices,
-        });
-        const sentinel = describeArtifactStatus(proj as any, {
+      if (!proj) {
+        logVideoPromptTrace('single_prompt_writeback_rejected', {
           projectId,
-          targetArtifact: 'video_prompt',
           groupIdx,
-          shotIndices,
-          consumerOperation: 'video_prompt_generate_writeback',
+          incomingRunId: promptRunId,
+          storedRunId: null,
+          storedStatus: null,
+          reason: 'project_missing',
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          failedMarked: false,
+        }, 'warn');
+        failSingleVideoPrompt(writer, '视频提示词生成结果无法写回：项目不存在', {
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          reason: 'project_missing',
         });
-        if (sentinel.usability === 'BLOCKED') {
-          writer.error(`视频提示词生成结果已过期：${sentinelBlockMessage(sentinel)}`);
-          return;
-        }
-        const gate = sentinel.consistency;
-        if (!gate) {
-          writer.error('视频提示词生成结果无法写回：角色一致性检查结果缺失');
-          return;
-        }
-        const patch: any = {
-          idx: groupIdx,
-          shotIdx: groupIdx + 1,
+        return;
+      }
+
+      const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
+      const currentSb = storyboards[groupIdx];
+      if (!currentSb) {
+        logVideoPromptTrace('single_prompt_writeback_rejected', {
+          projectId,
+          groupIdx,
+          incomingRunId: promptRunId,
+          storedRunId: null,
+          storedStatus: null,
+          reason: 'slot_missing',
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          failedMarked: false,
+        }, 'warn');
+        failSingleVideoPrompt(writer, '视频提示词生成结果无法写回：当前槽位不存在', {
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          reason: 'slot_missing',
+        });
+        return;
+      }
+
+      shotIndices = storyboardShotIndices(proj as any, groupIdx, currentSb, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: shotIndices,
+      });
+      if (currentSb.videoPromptRunId && currentSb.videoPromptRunId !== promptRunId) {
+        logVideoPromptTrace('single_prompt_writeback_rejected', {
+          projectId,
+          groupIdx,
+          incomingRunId: promptRunId,
+          storedRunId: currentSb.videoPromptRunId || null,
+          storedStatus: currentSb.videoPromptStatus || null,
+          reason: 'run_taken_by_other',
+          errorCode: 'VIDEO_PROMPT_RUN_MISMATCH',
+          failureStage: 'persist',
+          failedMarked: false,
+        }, 'warn');
+        failSingleVideoPrompt(writer, '视频提示词生成结果已过期：该片段已有更新的生成任务', {
+          errorCode: 'VIDEO_PROMPT_RUN_MISMATCH',
+          failureStage: 'persist',
+          reason: 'run_taken_by_other',
+        });
+        return;
+      }
+
+      const gate = evaluateVideoPromptConsistencyGate(proj as any, groupIdx, shotIndices);
+      if (!gate.allowed) {
+        const gateMessage = videoPromptGateMessage(gate);
+        const failureMark = maybeMarkVideoPromptFailedSameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          errorMessage: gateMessage,
+          errorCode: 'VIDEO_PROMPT_CONSISTENCY_GATE_FAILED',
+          failureStage: 'consistency',
+          reason: 'consistency_gate_failed',
+        });
+        const stored = readStoredVideoPromptState(failureMark.project || proj, groupIdx);
+        logVideoPromptTrace('single_prompt_writeback_rejected', {
+          projectId,
+          groupIdx,
+          incomingRunId: promptRunId,
+          storedRunId: stored.storedRunId,
+          storedStatus: stored.storedStatus,
+          reason: 'consistency_gate_failed',
+          errorCode: 'VIDEO_PROMPT_CONSISTENCY_GATE_FAILED',
+          failureStage: 'consistency',
+          failedMarked: failureMark.marked,
+          gateAllowed: false,
+          blockingReasons: gate.blockers.map((b) => b.message),
+        }, 'warn');
+        failSingleVideoPrompt(writer, `视频提示词生成结果未通过角色一致性检查：${gateMessage}`, {
+          errorCode: 'VIDEO_PROMPT_CONSISTENCY_GATE_FAILED',
+          failureStage: 'consistency',
+          reason: 'consistency_gate_failed',
+        });
+        return;
+      }
+
+      try {
+        const readyResult = writeVideoPromptReadySameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          prompt: cleanedPrompt,
           shotIndices,
-          videoPrompt: prompt,
-          videoPromptStatus: 'ready',
-          videoPromptRunId: promptRunId,
-          videoPromptUpdatedAt: new Date().toISOString(),
-          videoPromptLastError: undefined,
-          videoPromptFailedAt: undefined,
-          _vpCache: null,
-          videoReferenceManifest: referenceManifest,
-          videoReferenceDropped: droppedReferences,
-          consistency: {
-            ...((storyboards[groupIdx] || {}).consistency || {}),
-            videoPrompt: {
-              characterUsages: gate.characterUsages,
-              score: gate.score,
-              level: gate.level,
-              warnings: gate.warnings,
-            },
-          },
-        };
-        if (storyboards[groupIdx]) {
-          if (storyboards[groupIdx].videoPromptRunId && storyboards[groupIdx].videoPromptRunId !== promptRunId) {
-            logVideoPromptTrace('single_prompt_writeback_rejected', {
-              projectId,
-              groupIdx,
-              incomingRunId: promptRunId,
-              currentRunId: storyboards[groupIdx].videoPromptRunId,
-              currentStatus: storyboards[groupIdx].videoPromptStatus || null,
-              reason: 'run_mismatch',
-            }, 'warn');
-            writer.error('视频提示词生成结果已过期：该片段已有更新的生成任务');
-            return;
-          }
-          storyboards[groupIdx] = {
-            ...markStoryboardVideoOutdated(storyboards[groupIdx], 'video_prompt_regeneration'),
-            ...patch,
-          };
-        } else {
-          writer.error('视频提示词生成结果无法写回：当前槽位不存在');
-          return;
-        }
-        const videoTasks = Array.isArray((proj as any).videoTasks) ? [...(proj as any).videoTasks] : [];
-        if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-          videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration');
-        }
-        maybeAssertStoryboardsAlignedWithShots({ ...(proj as any), storyboards, videoTasks }, 'video-prompt-ready');
-        const readyProject = updateProjectForUser(projectId, user.id, { storyboards, videoTasks });
-        const readySb = Array.isArray((readyProject as any)?.storyboards)
-          ? (readyProject as any).storyboards[groupIdx] || {}
-          : {};
-        const readyApplied =
-          readySb.videoPromptStatus === 'ready' &&
-          readySb.videoPromptRunId === promptRunId &&
-          String(readySb.videoPrompt || '').trim() === prompt;
+          gate,
+          referenceManifest,
+          droppedReferences,
+        });
         logVideoPromptTrace('single_prompt_writeback_result', {
           projectId,
           groupIdx,
           incomingRunId: promptRunId,
-          applied: readyApplied,
-          storedStatus: readySb.videoPromptStatus || null,
-          storedRunId: readySb.videoPromptRunId || null,
-          promptSummary: summarizePromptForTrace(prompt),
-        }, readyApplied ? 'info' : 'warn');
-        if (!readyApplied) {
-          writer.error('视频提示词生成完成，但结果没有成功写回项目，请重试。');
+          applied: readyResult.applied,
+          storedStatus: readyResult.storedStatus || null,
+          storedRunId: readyResult.storedRunId || null,
+          reason: readyResult.skippedReason || null,
+          promptSummary: summarizePromptForTrace(cleanedPrompt),
+          gateAllowed: gate.allowed,
+          blockingReasons: gate.blockers.map((b) => b.message),
+        }, readyResult.applied ? 'info' : 'warn');
+        if (!readyResult.applied) {
+          if (readyResult.skippedReason === 'run_taken_by_other') {
+            logVideoPromptTrace('single_prompt_writeback_rejected', {
+              projectId,
+              groupIdx,
+              incomingRunId: promptRunId,
+              storedRunId: readyResult.storedRunId || null,
+              storedStatus: readyResult.storedStatus || null,
+              reason: 'run_taken_by_other',
+              errorCode: 'VIDEO_PROMPT_RUN_MISMATCH',
+              failureStage: 'persist',
+              failedMarked: false,
+              gateAllowed: gate.allowed,
+              blockingReasons: gate.blockers.map((b) => b.message),
+            }, 'warn');
+            failSingleVideoPrompt(writer, '视频提示词生成结果已过期：该片段已有更新的生成任务', {
+              errorCode: 'VIDEO_PROMPT_RUN_MISMATCH',
+              failureStage: 'persist',
+              reason: 'run_taken_by_other',
+            });
+            return;
+          }
+          const failureMark = maybeMarkVideoPromptFailedSameRun({
+            projectId,
+            userId: user.id,
+            groupIdx,
+            promptRunId,
+            errorMessage: '视频提示词生成完成，但结果没有成功写回项目，请重试。',
+            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+            failureStage: 'persist',
+            reason: readyResult.skippedReason || 'writeback_not_applied',
+          });
+          logVideoPromptTrace('single_prompt_writeback_rejected', {
+            projectId,
+            groupIdx,
+            incomingRunId: promptRunId,
+            storedRunId: readyResult.storedRunId || null,
+            storedStatus: readyResult.storedStatus || null,
+            reason: readyResult.skippedReason || 'writeback_not_applied',
+            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+            failureStage: 'persist',
+            failedMarked: failureMark.marked,
+            gateAllowed: gate.allowed,
+            blockingReasons: gate.blockers.map((b) => b.message),
+          }, 'warn');
+          failSingleVideoPrompt(writer, '视频提示词生成完成，但结果没有成功写回项目，请重试。', {
+            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+            failureStage: 'persist',
+            reason: readyResult.skippedReason || 'writeback_not_applied',
+          });
           return;
         }
-        try {
-          if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext, runId: promptRunId });
-        } catch (error) {
-          console.warn('[video-prompt/generate] knowledge context audit skipped:', error);
-        }
+        shotIndices = readyResult.shotIndices || shotIndices;
+      } catch (error: any) {
+        const errorMessage = error?.message || String(error);
+        const failureMark = maybeMarkVideoPromptFailedSameRun({
+          projectId,
+          userId: user.id,
+          groupIdx,
+          promptRunId,
+          errorMessage,
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          reason: 'writeback_exception',
+        });
+        logVideoPromptTrace('single_prompt_writeback_result', {
+          projectId,
+          groupIdx,
+          incomingRunId: promptRunId,
+          applied: false,
+          reason: 'writeback_exception',
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          failedMarked: failureMark.marked,
+          gateAllowed: gate.allowed,
+          blockingReasons: gate.blockers.map((b) => b.message),
+          error: errorMessage.slice(0, 500),
+        }, 'error');
+        failSingleVideoPrompt(writer, '视频提示词生成完成，但保存失败，请重试。', {
+          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+          failureStage: 'persist',
+          reason: 'writeback_exception',
+        });
+        return;
+      }
+      try {
+        if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext, runId: promptRunId });
+      } catch (error) {
+        console.warn('[video-prompt/generate] knowledge context audit skipped:', error);
       }
     }
 
     writer.done({
-      videoPrompt: prompt,
+      videoPrompt: cleanedPrompt,
       narrationsUsed: narrations,
       referenceManifest,
       droppedReferences,

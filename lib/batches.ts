@@ -331,6 +331,18 @@ function _markFailedAssetImageState(opts: {
   };
 }
 
+type VideoPromptFailureCleanupExtra = {
+  groupIdx: number;
+  videoPromptRunId: string;
+  failureApplied: boolean;
+  skippedReason?: string;
+  storedRunId?: string | null;
+  storedStatus?: string | null;
+  videoPromptStatus?: 'failed';
+  videoPromptLastError?: string;
+  invalidateVideo?: true;
+};
+
 function _markFailedVideoPromptState(opts: {
   batchType: string;
   batchId: string;
@@ -338,19 +350,37 @@ function _markFailedVideoPromptState(opts: {
   user: UserRow;
   target: BatchTaskTarget;
   message: string;
-}): null | { groupIdx: number; videoPromptStatus: 'failed'; videoPromptLastError: string; invalidateVideo: true } {
+}): null | VideoPromptFailureCleanupExtra {
   if (opts.batchType !== 'video_prompts') return null;
   const groupIdx = _targetGroupIdx(opts.target);
   if (groupIdx == null || !opts.projectId) return null;
   const videoPromptLastError = (opts.message || '生成失败').slice(0, 500);
   const now = _nowIso();
+  let decision: VideoPromptFailureCleanupExtra = {
+    groupIdx,
+    videoPromptRunId: opts.batchId,
+    failureApplied: false,
+    skippedReason: 'project_missing',
+    storedRunId: null,
+    storedStatus: null,
+  };
 
   try {
-    patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
-      if (!fresh) return null;
+    const patchedProject = patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
+      if (!fresh) return {};
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) return null;
+      if (groupIdx >= shots.length) {
+        decision = {
+          groupIdx,
+          videoPromptRunId: opts.batchId,
+          failureApplied: false,
+          skippedReason: 'slot_missing',
+          storedRunId: null,
+          storedStatus: null,
+        };
+        return {};
+      }
       const prev = storyboards[groupIdx] || {};
       const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
       if (prev.videoPromptRunId && prev.videoPromptRunId !== opts.batchId) {
@@ -358,7 +388,15 @@ function _markFailedVideoPromptState(opts: {
           `[batch] ignored stale video_prompt failure project=${opts.projectId} group=${groupIdx} ` +
             `batch=${opts.batchId} currentRun=${prev.videoPromptRunId}`,
         );
-        return null;
+        decision = {
+          groupIdx,
+          videoPromptRunId: opts.batchId,
+          failureApplied: false,
+          skippedReason: 'run_taken_by_other',
+          storedRunId: prev.videoPromptRunId || null,
+          storedStatus: prev.videoPromptStatus || null,
+        };
+        return {};
       }
       storyboards[groupIdx] = {
         ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
@@ -376,13 +414,44 @@ function _markFailedVideoPromptState(opts: {
         videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
       }
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-failure-cleanup');
+      decision = {
+        groupIdx,
+        videoPromptRunId: opts.batchId,
+        failureApplied: true,
+        videoPromptStatus: 'failed',
+        videoPromptLastError,
+        invalidateVideo: true,
+        storedRunId: opts.batchId,
+        storedStatus: 'failed',
+      };
       return { storyboards, videoTasks };
     });
+    const sb = Array.isArray((patchedProject as any)?.storyboards)
+      ? (patchedProject as any).storyboards[groupIdx] || null
+      : null;
+    if (sb) {
+      const applied = sb.videoPromptStatus === 'failed' && sb.videoPromptRunId === opts.batchId;
+      decision = {
+        ...decision,
+        failureApplied: applied,
+        skippedReason: applied ? undefined : (decision.skippedReason || 'write_not_applied'),
+        storedRunId: sb.videoPromptRunId || decision.storedRunId || null,
+        storedStatus: sb.videoPromptStatus || decision.storedStatus || null,
+        videoPromptStatus: applied ? 'failed' : decision.videoPromptStatus,
+        videoPromptLastError: applied ? videoPromptLastError : decision.videoPromptLastError,
+        invalidateVideo: applied ? true : decision.invalidateVideo,
+      };
+    }
   } catch (cleanupErr) {
     console.error('[batch] failed to mark video prompt failure state:', opts.projectId, groupIdx, cleanupErr);
+    decision = {
+      ...decision,
+      failureApplied: false,
+      skippedReason: 'cleanup_exception',
+    };
   }
 
-  return { groupIdx, videoPromptStatus: 'failed', videoPromptLastError, invalidateVideo: true };
+  return decision;
 }
 
 function _markFailedShotPlanState(opts: {
@@ -1447,6 +1516,8 @@ export async function runBatch(opts: {
           _emit(opts.batchId, 'task_cancelled', { taskId: t.id, targetSeq: t.seq, target, reason: msg });
           return;
         }
+        const failureStage = typeof e?.failureStage === 'string' ? e.failureStage : undefined;
+        const errorCode = typeof e?.errorCode === 'string' ? e.errorCode : undefined;
         const cleanupExtra = _clearFailedStoryboardImageState({
           batchType: opts.batchType,
           projectId: opts.projectId,
@@ -1488,12 +1559,22 @@ export async function runBatch(opts: {
           user: opts.user,
           message: msg,
         });
-        const failureStage = typeof e?.failureStage === 'string' ? e.failureStage : undefined;
-        const errorCode = typeof e?.errorCode === 'string' ? e.errorCode : undefined;
+        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || shotPlanCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
+        if (extra && failureStage) (extra as any).failureStage = failureStage;
+        if (extra && errorCode) (extra as any).errorCode = errorCode;
+        if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
         const failureResultPayload: Record<string, any> = {};
         if (failureStage) failureResultPayload.failureStage = failureStage;
         if (errorCode) failureResultPayload.errorCode = errorCode;
         if (e?.imageSafetyAudit) failureResultPayload.imageSafetyAudit = e.imageSafetyAudit;
+        if (extra) {
+          failureResultPayload.extra = extra;
+          for (const key of ['groupIdx', 'videoPromptRunId', 'failureApplied', 'skippedReason', 'storedRunId', 'storedStatus']) {
+            if (Object.prototype.hasOwnProperty.call(extra, key)) {
+              failureResultPayload[key] = (extra as any)[key];
+            }
+          }
+        }
         const failureResult = Object.keys(failureResultPayload).length
           ? JSON.stringify(failureResultPayload)
           : '{}';
@@ -1513,10 +1594,6 @@ export async function runBatch(opts: {
         });
         failed++;
         db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
-        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || shotPlanCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
-        if (extra && failureStage) (extra as any).failureStage = failureStage;
-        if (extra && errorCode) (extra as any).errorCode = errorCode;
-        if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
         _emit(opts.batchId, 'task_failed', {
           taskId: t.id,
           targetSeq: t.seq,

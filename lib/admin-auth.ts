@@ -18,6 +18,7 @@ export const ADMIN_ACTION_CATEGORIES = [
   'content',
   'config',
   'storage',
+  'observability',
   'audit',
   'admin_self',
 ] as const;

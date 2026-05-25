@@ -194,7 +194,21 @@ export async function POST(req: NextRequest) {
     ? ((proj as any)?.script || '').toString()
     : (body.script || body.scriptText || '').toString();
   if (!finalScript) return jsonError(projectId ? '请先完成剧本' : '当前没有剧本可分析', 400);
-  if (projectId && (proj as any)?.scriptApproved !== true) return jsonError('请先确认剧本', 400);
+  // 此前要求 scriptApproved===true 才能抽取风格圣经；调整后不阻拦，仅在 server log 记录降级事件。
+  // 用户可以在剧本未"确认"的情况下进入下游分析；finalScript 自身存在性是真实数据 gate，已在上面校验。
+  if (projectId && (proj as any)?.scriptApproved !== true && process.env.RELAX_VIDEO_PROMPT_BLOCKERS !== '0') {
+    try {
+      console.warn('[relaxed_block]', JSON.stringify({
+        target: 'style_bible_extract',
+        code: 'script_not_approved',
+        projectId,
+      }));
+    } catch {
+      console.warn('[relaxed_block] style_bible_extract script_not_approved', { projectId });
+    }
+  } else if (projectId && (proj as any)?.scriptApproved !== true) {
+    return jsonError('请先确认剧本', 400);
+  }
 
   const runId = randomUUID();
   const startedAt = new Date().toISOString();
@@ -359,7 +373,25 @@ export async function POST(req: NextRequest) {
     styleBible = await chatCompleteJsonWithRetry(
       user,
       finalMessages,
-      { temperature: 0.4, maxTokens: 5000, modelRole: 'styleBible' },
+      {
+        temperature: 0.4,
+        maxTokens: 5000,
+        modelRole: 'styleBible',
+        tokenContext: {
+          projectId,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'script.workflow.extract-style-bible',
+          moduleKey: 'style',
+          moduleLabel: '风格页面',
+          featureKey: 'style_bible_extract',
+          featureLabel: '风格圣经生成',
+          callItemType: 'style_bible_run',
+          callItemId: runId,
+          callItemLabel: (proj as any)?.title || null,
+          runId,
+        },
+      },
       (raw) => parseJsonLoose(raw),
       'styleBible',
     );

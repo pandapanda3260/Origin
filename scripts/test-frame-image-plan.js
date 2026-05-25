@@ -6,11 +6,11 @@
  *     的 1-based 连续编号 (仅 delivery='image' 才有), 与 renderer 里 "Image N"
  *     和 image[] 数组下标严格对齐;
  *   - multiRefImageCap 控制有多少候选走 image, 其余走 text_only 兜底;
- *   - finalPrompt 含固定结构段 (Task/Frame goal/Primary shot/Composition rules/
- *     Hard prohibitions 等); 相同输入 promptHash 一致;
+ *   - finalPrompt 含固定结构段（任务/画面目标/主镜头/构图规则/
+ *     硬性禁止等）；相同输入 promptHash 一致;
  *   - tail_frame: primaryShot = 组内最末 shot, selfFirstFrame 作为 slot 1 锚点;
  *   - shotConstraintText 覆盖 visual/description/desc/dialogue/scriptRef/keyInfo/
- *     imagePrompt 字段, 用户在其中任一字段写 "不要补光灯" 都会触发 HARD NEGATIVE
+ *     imagePrompt 字段, 用户在其中任一字段写 "不要补光灯" 都会触发硬性负向约束
  *     兜底注入;
  *   - 未知 frameType 抛错。
  *
@@ -363,20 +363,20 @@ async function testFirstFrameFullyResolved() {
   // finalPrompt 必含 8 段关键标题
   const p = plan.finalPrompt;
   for (const marker of [
-    '【Task】',
-    '【Frame goal】',
-    '【Primary shot】',
-    '【Reference images】',
-    '【Composition rules】',
-    '【Hard prohibitions】',
-    '【Project style lock】',
+    '【任务】',
+    '【画面目标】',
+    '【主镜头】',
+    '【参考图】',
+    '【构图规则】',
+    '【硬性禁止】',
+    '【项目风格锁定】',
   ]) {
     assert(p.includes(marker), `finalPrompt should contain ${marker}`);
   }
   // reference 描述中应点名 character 的 assetName
-  assert(p.includes('Image 1 = character'), 'Image 1 = character line present');
-  assert(!p.includes('Image 2 = scene'), 'scene slot is over_capacity so not shown as Image 2');
-  assert(p.includes('Target aspect ratio: 9:16'), 'prompt should include target aspect ratio');
+  assert(p.includes('Image 1 = 角色'), 'Image 1 = 角色 line present');
+  assert(!p.includes('Image 2 = 场景'), 'scene slot is over_capacity so not shown as Image 2');
+  assert(p.includes('目标画幅比例：9:16'), 'prompt should include target aspect ratio');
 
   // summary
   const summary = mod.summarizePlanForAudit(plan);
@@ -385,6 +385,37 @@ async function testFirstFrameFullyResolved() {
   assertEqual(summary.textOnlyReferences.length, 2, 'summary text_only = 2');
   assertEqual(summary.droppedReferences.length, 0, 'summary dropped = 0');
   assert(typeof summary.finalPromptHash === 'string' && summary.finalPromptHash.length === 64, 'hash is sha256');
+}
+
+async function testDegradedCharacterReferenceStillUsable() {
+  const scene = makeFixtureScene();
+  const project = makeFixtureProject();
+  const charUrl = '/api/images/file/00000000-0000-0000-0000-0000000000a1';
+  project.assets.characters[0].reference = {
+    status: 'degraded',
+    currentUrl: charUrl,
+    lastKnownGoodUrl: charUrl,
+  };
+  const mod = loadAll({
+    imageGen: makeImageGenStub({
+      [charUrl]: '/local/alice.png',
+      [scene.imageUrl]: '/local/scene.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000b1': '/local/lantern.png',
+    }),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0, 1],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: MODEL_SNAPSHOT_CAP1,
+  });
+  const characterRef = plan.referenceManifest.find((r) => r.role === 'character');
+  assert(characterRef, 'character ref should be present');
+  assertEqual(characterRef.delivery, 'image', 'degraded character reference remains image-usable');
+  assertEqual(characterRef.localPath, '/local/alice.png', 'degraded character localPath resolved');
 }
 
 async function testImagePromptPriorityAndBlankFallback() {
@@ -405,7 +436,7 @@ async function testImagePromptPriorityAndBlankFallback() {
     modelSnapshot: MODEL_SNAPSHOT_CAP1,
   });
   assert(
-    firstPlan.finalPrompt.includes('- visual: User-directed opening frame: Alice raises the brass lantern to eye level.'),
+    firstPlan.finalPrompt.includes('- 画面：User-directed opening frame: Alice raises the brass lantern to eye level.'),
     'first_frame primary visual should prefer shot.imagePrompt over shot.visual',
   );
 
@@ -420,7 +451,7 @@ async function testImagePromptPriorityAndBlankFallback() {
     modelSnapshot: MODEL_SNAPSHOT_CAP1,
   });
   assert(
-    blankPlan.finalPrompt.includes('- visual: Alice stands at the doorway, rain pouring behind her'),
+    blankPlan.finalPrompt.includes('- 画面：Alice stands at the doorway, rain pouring behind her'),
     'blank imagePrompt should fall back to shot.visual',
   );
 
@@ -435,7 +466,7 @@ async function testImagePromptPriorityAndBlankFallback() {
     modelSnapshot: MODEL_SNAPSHOT_CAP1,
   });
   assert(
-    tailPlan.finalPrompt.includes('- visual: User-directed closing frame: Alice lowers the lantern beside a soaked warning sign.'),
+    tailPlan.finalPrompt.includes('- 画面：User-directed closing frame: Alice lowers the lantern beside a soaked warning sign.'),
     'tail_frame primary visual should prefer shot.imagePrompt over shot.visual',
   );
 }
@@ -496,11 +527,11 @@ async function testNoImagesAvailable() {
   const reasons = plan.referenceManifest.map((r) => r.droppedReason);
   assertEqual(reasons, ['no_image_available', 'no_image_available'], 'reason = no_image_available');
 
-  // prompt 不含 【Reference images】 段
-  assert(!plan.finalPrompt.includes('【Reference images】'), 'no image refs → no Reference images section');
+  // prompt 不含 【参考图】 段
+  assert(!plan.finalPrompt.includes('【参考图】'), 'no image refs → no Reference images section');
   // 但 character lock / prop lock 段仍然存在 (text fallback)
-  assert(plan.finalPrompt.includes('【Character lock】'), 'character lock present as text');
-  assert(plan.finalPrompt.includes('【Prop lock】'), 'prop lock present as text');
+  assert(plan.finalPrompt.includes('【角色锁定】'), 'character lock present as text');
+  assert(plan.finalPrompt.includes('【道具锁定】'), 'prop lock present as text');
 }
 
 async function testTailFramePlanBasic() {
@@ -526,11 +557,13 @@ async function testTailFramePlanBasic() {
   const roles = plan.referenceManifest.map((r) => r.role);
   assert(!roles.includes('self_first_frame'), 'no selfFirstFrame input → no self_first_frame slot');
   assertEqual(roles[0], 'character', 'without self_first_frame, slot 1 is primary character');
-  // prompt 必含 closing + continuity 语言
-  assert(plan.finalPrompt.includes('closing beat'), 'tail prompt mentions closing beat');
-  assert(plan.finalPrompt.includes('Maintain continuity with the opening frame'), 'tail prompt enforces continuity with opening frame');
+  // prompt 必含尾帧目标 + 连续性语言
+  assert(plan.finalPrompt.includes('结束节拍'), 'tail prompt mentions closing beat');
+  assert(plan.finalPrompt.includes('【尾帧目标】'), 'tail prompt includes explicit tail frame target');
+  assert(plan.finalPrompt.includes('不能是首帧的重画或近似重复'), 'tail prompt forbids redrawing the opening frame');
+  assert(plan.finalPrompt.includes('保持身份、服装、地点'), 'tail target keeps identity continuity while avoiding a copy');
   // context shot 段按绝对 index 引用
-  assert(plan.finalPrompt.includes('Shot 1:'), 'context shot 1 rendered by absolute index');
+  assert(plan.finalPrompt.includes('镜头 1：'), 'context shot 1 rendered by absolute index');
 }
 
 async function testTailFrameWithSelfFirstFrame() {
@@ -567,13 +600,15 @@ async function testTailFrameWithSelfFirstFrame() {
   assertEqual(summary.sentReferences.length, 1, 'exactly 1 image sent');
   assertEqual(summary.sentReferences[0].role, 'self_first_frame', 'the sent ref is self_first_frame');
   assertEqual(summary.frameType, 'tail_frame', 'summary frameType');
-  // prompt 应描述 Image 1 = this segment first frame
-  assert(plan.finalPrompt.includes('Image 1 = this segment first frame'), 'prompt labels Image 1 as this segment first frame');
+  // prompt 应描述 Image 1 = 本片段首帧
+  assert(plan.finalPrompt.includes('Image 1 = 本片段首帧'), 'prompt labels Image 1 as this segment first frame');
+  assert(plan.finalPrompt.includes('不是构图复制目标'), 'self first frame is not treated as a composition copy target');
+  assert(plan.finalPrompt.includes('相比 Image 1 必须有可见差异'), 'tail prompt requires visible difference from first frame');
 }
 
 async function testShotFieldsTriggerHardConstraint() {
   // shotConstraintText 要覆盖所有用户可能写剧本约束的字段; 在任一字段写
-  // "不要补光灯" 都应命中 enforceHardVisualConstraints 并注入 HARD NEGATIVE。
+  // "不要补光灯" 都应命中 enforceHardVisualConstraints 并注入硬性负向约束。
   const fields = [
     'visual',
     'description',
@@ -606,8 +641,8 @@ async function testShotFieldsTriggerHardConstraint() {
       modelSnapshot: MODEL_SNAPSHOT_CAP1,
     });
     assert(
-      /HARD USER NEGATIVE CONSTRAINT: no fill lights/i.test(plan.finalPrompt),
-      `finalPrompt should contain HARD NEGATIVE when constraint written in shot.${field}`,
+      /硬性负向约束：禁止补光灯/.test(plan.finalPrompt),
+      `finalPrompt should contain hard negative constraint when constraint written in shot.${field}`,
     );
   }
 }
@@ -656,8 +691,8 @@ async function testImageNoContinuity() {
 
   // prompt 的 "Image N" 必须连续从 1 编, 不能跳号
   const p = plan.finalPrompt;
-  assert(p.includes('Image 1 = character'), 'prompt labels Image 1 = character');
-  assert(p.includes('Image 2 = prop'), 'prompt labels Image 2 = prop');
+  assert(p.includes('Image 1 = 角色'), 'prompt labels Image 1 = character');
+  assert(p.includes('Image 2 = 道具'), 'prompt labels Image 2 = prop');
   assert(!p.includes('Image 3 '), 'no Image 3 should appear (only 2 images sent)');
 
   // summary 里 sentReferences 带 imageNo
@@ -697,7 +732,7 @@ async function testPlanCapThreeAllImages() {
   assertEqual(manifest.map((r) => r.delivery), ['image', 'image', 'image'], 'all 3 go as image at cap=3');
   assertEqual(manifest.map((r) => r.imageNo), [1, 2, 3], 'imageNo 1/2/3 contiguous');
   assertEqual(manifest.map((r) => r.slot), [1, 2, 3], 'slot 1/2/3 contiguous too');
-  for (const marker of ['Image 1 = character', 'Image 2 = scene', 'Image 3 = prop']) {
+  for (const marker of ['Image 1 = 角色', 'Image 2 = 场景', 'Image 3 = 道具']) {
     assert(plan.finalPrompt.includes(marker), `prompt should mention ${marker}`);
   }
   const summary = mod.summarizePlanForAudit(plan);
@@ -883,12 +918,13 @@ async function testTailFrameUnknownTypeRejected() {
 async function main() {
   const tests = [
     ['first_frame fully-resolved plan', testFirstFrameFullyResolved],
+    ['degraded character reference remains usable', testDegradedCharacterReferenceStillUsable],
     ['imagePrompt priority and blank fallback', testImagePromptPriorityAndBlankFallback],
     ['prompt determinism', testPromptDeterminism],
     ['no images available → text_only', testNoImagesAvailable],
     ['tail_frame plan basic (no self_first_frame)', testTailFramePlanBasic],
     ['tail_frame with self_first_frame slot 1', testTailFrameWithSelfFirstFrame],
-    ['shot constraint fields all trigger HARD NEGATIVE', testShotFieldsTriggerHardConstraint],
+    ['shot constraint fields all trigger hard negative constraint', testShotFieldsTriggerHardConstraint],
     ['imageNo continuity when scene skipped', testImageNoContinuity],
     ['plan cap=3 → all 3 candidates as image, imageNo 1/2/3', testPlanCapThreeAllImages],
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],

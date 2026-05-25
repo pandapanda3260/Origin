@@ -80,6 +80,14 @@ export function isExportEnabled(): boolean {
   return readBooleanConfig('export_enabled', true);
 }
 
+export function isProjectCreatePayloadWhitelistEnabled(): boolean {
+  return readBooleanConfig('project_create_payload_whitelist_enabled', true);
+}
+
+export function isScriptConsultDbHistoryOnlyEnabled(): boolean {
+  return readBooleanConfig('script_consult_db_history_only_enabled', true);
+}
+
 function readNumericConfig(key: string, fallback: number, min: number, max: number): number {
   const raw = readSystemConfig<any>(key, fallback);
   const value = typeof raw === 'number'

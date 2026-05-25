@@ -195,6 +195,40 @@ export function hasActiveComposeRun(editData: any) {
   return runs.some((r: any) => r?.status === 'running');
 }
 
+export function markExportFailureInEditData(editData: any, args: {
+  exportTaskId: string;
+  errorCode?: string;
+  errorMessage?: string;
+}) {
+  const taskId = String(args.exportTaskId || '').trim();
+  const next = { ...(editData || {}) };
+  if (!taskId) return next;
+
+  if (String(next.exportTaskId || '') === taskId && !next.exportUrl) {
+    next.exportTaskId = '';
+  }
+
+  const runs: ComposeRun[] = Array.isArray(next.composeRuns) ? next.composeRuns.map((r: any) => ({ ...r })) : [];
+  let changed = false;
+  const ts = nowIso();
+  for (let i = 0; i < runs.length; i += 1) {
+    const run = runs[i];
+    if (!run || String(run.exportTaskId || '') !== taskId || run.status !== 'running') continue;
+    runs[i] = {
+      ...run,
+      status: 'failed',
+      phase: 'export',
+      recoverableFrom: 'export',
+      errorCode: args.errorCode || 'EXPORT_FAILED',
+      errorMessage: args.errorMessage || '导出失败',
+      updatedAt: ts,
+    };
+    changed = true;
+  }
+  if (changed) next.composeRuns = pruneComposeRuns(runs);
+  return next;
+}
+
 export function pruneComposeRuns(runs: any[]) {
   return (Array.isArray(runs) ? runs : [])
     .filter(Boolean)

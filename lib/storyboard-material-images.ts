@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getDb } from './db';
 import { getDataDir } from './runtime-paths';
+import { createAssetRecord, hashFile, localAssetUri } from './asset-library';
 import {
   materialRoleToImageKind,
   normalizeStoryboardMaterialRole,
@@ -409,6 +410,26 @@ export async function storeStoryboardMaterialImage(opts: {
   if (result.type === 'existing') {
     safeUnlink(fullPath);
     return existingImageResponse(result.row, assetRef);
+  }
+  try {
+    createAssetRecord({
+      assetId: imageId,
+      ownerId: opts.ownerId,
+      projectId: opts.projectId,
+      legacyShotId: `shot_${opts.groupIdx}`,
+      assetKind: 'image',
+      source: 'uploaded',
+      stage: role === 'character' ? 'asset_character' : role === 'scene' ? 'asset_scene' : 'asset_prop',
+      fileUri: localAssetUri('images', opts.ownerId, filename),
+      thumbUri: `/api/images/file/${imageId}?w=256`,
+      fileHash: hashFile(fullPath),
+      byteSize: processed.buffer.length,
+      width: processed.width,
+      height: processed.height,
+      makeCurrent: false,
+    });
+  } catch (error) {
+    console.warn('[storyboard-material] asset library indexing skipped:', imageId, error);
   }
 
   return {

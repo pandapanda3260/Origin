@@ -5,6 +5,8 @@ export const MOCK_CLIENT_CONFIG = {
     enableAdmin: true,
     enableBilling: true,
     enableMaintenance: false,
+    projectActivationGuard: true,
+    scriptConsultGuard: true,
   },
   ui: {
     bannerEnabled: true,

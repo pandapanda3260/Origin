@@ -1306,7 +1306,7 @@ function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOvervi
     _syncVideoRefs();
     var needVP = $("batchNeedPrompts");
     var ready = $("batchReady");
-    if (!project || !project.videoPromptsApproved || !project.storyboards) {
+    if (!project || !project.storyboards || !project.storyboards.length) {
       if (needVP) needVP.hidden = false;
       if (ready) ready.hidden = true;
       var bcl = $("batchClipList"); if (bcl) bcl.innerHTML = "";

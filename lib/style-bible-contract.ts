@@ -6,6 +6,7 @@ import {
   type StyleConstraints,
 } from './style-template-constraints';
 import type { StyleBibleStageName } from './prompts';
+import { normalizeCastingProfile } from './casting-profile';
 
 export type StyleBibleValidationResult = {
   ok: boolean;
@@ -14,7 +15,7 @@ export type StyleBibleValidationResult = {
 };
 
 export const STYLE_BIBLE_STAGE_FIELDS: Record<StyleBibleStageName, string[]> = {
-  core: ['visualStyle', 'visualStyleDesc', 'era', 'mood', 'worldRules'],
+  core: ['visualStyle', 'visualStyleDesc', 'era', 'mood', 'worldRules', 'castingProfile'],
   characters: ['characters'],
   visual: [
     'colorPalette',
@@ -84,6 +85,10 @@ export function validateStyleBibleStage(stage: StyleBibleStageName, value: any):
       validateCharacters(data.characters, missing, invalid);
       continue;
     }
+    if (field === 'castingProfile') {
+      validateCastingProfile(data.castingProfile, missing, invalid);
+      continue;
+    }
     if (field === 'colorPalette') {
       validateColorPalette(data.colorPalette, missing, invalid);
       continue;
@@ -107,6 +112,10 @@ export function validateFinalStyleBible(value: any): StyleBibleValidationResult 
       validateCharacters(data.characters, missing, invalid);
       continue;
     }
+    if (field === 'castingProfile') {
+      validateCastingProfile(data.castingProfile, missing, invalid);
+      continue;
+    }
     if (field === 'colorPalette') {
       validateColorPalette(data.colorPalette, missing, invalid);
       continue;
@@ -119,6 +128,19 @@ export function validateFinalStyleBible(value: any): StyleBibleValidationResult 
   }
 
   return { ok: missing.length === 0 && invalid.length === 0, missing, invalid };
+}
+
+function validateCastingProfile(value: any, missing: string[], invalid: string[]) {
+  if (!value) {
+    missing.push('castingProfile');
+    return;
+  }
+  const profile = normalizeCastingProfile(value);
+  if (!profile) {
+    invalid.push('castingProfile');
+    return;
+  }
+  if (!profile.ethnicityType) invalid.push('castingProfile.ethnicityType');
 }
 
 export function normalizeAspectRatio(value: any): '16:9' | '9:16' | '1:1' | null {

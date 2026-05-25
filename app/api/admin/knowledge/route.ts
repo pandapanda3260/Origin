@@ -350,13 +350,13 @@ function summarizeStageTarget(stageTarget: Record<string, unknown>) {
   return out;
 }
 
-export const POST = withAdminAudit(async function mutateKnowledge(_req: NextRequest, audit) {
+export const POST = withAdminAudit(async function mutateKnowledge(req: NextRequest, audit) {
   const body = audit.body || {};
   const action = String(body.action || '').trim();
   if (!['save_draft', 'preview', 'publish', 'rollback'].includes(action)) return jsonError('unsupported action', 400);
 
   if (action === 'save_draft') return handleSaveDraft(audit);
-  if (action === 'preview') return handlePreview(audit);
+  if (action === 'preview') return handlePreview(audit, req);
   if (action === 'publish') return handlePublish(audit);
   return handleRollback(audit);
 }, 'knowledge.mutate', {
@@ -475,7 +475,7 @@ function handleSaveDraft(audit: any) {
   return jsonOk({ success: true, action: 'save_draft', card: readCard(id) });
 }
 
-async function handlePreview(audit: any) {
+async function handlePreview(audit: any, req: NextRequest) {
   const body = audit.body || {};
   const cardId = String(body.cardId || body.id || '').trim();
   const projectId = String(body.projectId || '').trim();
@@ -526,6 +526,25 @@ async function handlePreview(audit: any) {
       modelRole: 'structured',
       traceName: 'admin.knowledge.preview',
       requestTimeoutMs: 60_000,
+      tokenContext: {
+        projectId,
+        projectTitleSnapshot: project.title || null,
+        requestPath: req.nextUrl.pathname,
+        routeName: 'admin.knowledge.preview',
+        moduleKey: 'knowledge',
+        moduleLabel: '知识库',
+        featureKey: 'knowledge_preview',
+        featureLabel: '知识卡预览',
+        callItemType: 'knowledge_card',
+        callItemId: cardId,
+        callItemLabel: card.title || cardId,
+        runId: audit.idempotencyKey || null,
+        meta: {
+          adminId: audit.admin?.id || null,
+          adminUsername: audit.admin?.username || null,
+          previewProjectOwnerId: project.ownerId || null,
+        },
+      },
     });
   }
 

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { sanitizeFillLightPositiveMentions } from './content-sanitize';
+import { normalizeCastingProfile } from './casting-profile';
 
 export type AssetStyleType = 'char' | 'scene' | 'prop';
 
@@ -15,6 +16,7 @@ export const ASSET_STYLE_FIELDS: Record<AssetStyleType, string[]> = {
     'texture',
     'additionalPrompt',
     'negativePrompt',
+    'castingProfile',
   ],
   scene: [
     'visualStyle',
@@ -182,6 +184,7 @@ function normalizeSignatureValue(key: string, value: any): any {
       .sort((a, b) => `${a.hex}|${a.name}`.localeCompare(`${b.hex}|${b.name}`));
   }
   if (key === 'negativePrompt') return normalizeNegativePrompt(value);
+  if (key === 'castingProfile') return normalizeCastingProfile(value)?.ethnicityType || '';
   return cleanText(value);
 }
 

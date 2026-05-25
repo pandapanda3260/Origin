@@ -159,27 +159,62 @@ function targetSnapshot(project: any, groupIdx: number, target: CharacterConsist
   return project?.storyboards?.[groupIdx]?.consistency?.videoPrompt;
 }
 
-function pushAssetReferenceFindings(project: any, text: string, findings: {
-  warnings: CharacterConsistencyFinding[];
-  blockers: CharacterConsistencyFinding[];
+function isRelaxedTarget(target: CharacterConsistencyTarget): boolean {
+  if (target !== 'videoPrompt') return false;
+  return process.env.RELAX_VIDEO_PROMPT_BLOCKERS !== '0';
+}
+
+function logRelaxedBlock(payload: {
+  target: CharacterConsistencyTarget;
+  code: string;
+  groupIdx: number;
+  characterId?: string;
+  characterName?: string;
+  subReason?: string;
 }) {
+  try {
+    console.warn('[relaxed_block]', JSON.stringify(payload));
+  } catch {
+    console.warn('[relaxed_block]', payload);
+  }
+}
+
+function pushAssetReferenceFindings(
+  project: any,
+  text: string,
+  findings: {
+    warnings: CharacterConsistencyFinding[];
+    blockers: CharacterConsistencyFinding[];
+  },
+  ctx: { target: CharacterConsistencyTarget; groupIdx: number },
+) {
   const props = Array.isArray(project?.assets?.props) ? project.assets.props : [];
+  const relax = isRelaxedTarget(ctx.target);
   for (const prop of props) {
     const name = normalizeText(prop?.name || prop?.propName);
     if (!name || !text.includes(name)) continue;
     const reference = resolveAssetReferenceState(prop);
     if (isBlockingReferenceStatus(reference.status)) {
-      findings.blockers.push({
+      const finding: CharacterConsistencyFinding = {
         code: 'critical_reference_missing',
         subReason: `prop:${reference.status}`,
-        message: `关键道具 ${name} 的参考图状态为 ${reference.status}，不能静默进入高成本生成。`,
-      });
-    } else if (reference.status === 'degraded') {
-      findings.warnings.push({
-        code: 'reference_missing',
-        subReason: 'prop:degraded',
-        message: `关键道具 ${name} 正在使用 last known good reference，当前参考状态为 degraded。`,
-      });
+        message: `道具 ${name} 暂无可用参考图，建议先生成后再启动视频。`,
+      };
+      if (relax) {
+        logRelaxedBlock({
+          target: ctx.target,
+          code: 'critical_reference_missing',
+          groupIdx: ctx.groupIdx,
+          subReason: finding.subReason,
+        });
+        findings.warnings.push({
+          ...finding,
+          code: 'reference_missing',
+          message: `[已放行] ${finding.message}`,
+        });
+      } else {
+        findings.blockers.push(finding);
+      }
     }
   }
 }
@@ -234,24 +269,51 @@ export function validateCharacterConsistencyForGroup(
     versions: versionSnapshot(lock, deps),
   }));
 
+  const relaxBlockers = isRelaxedTarget(opts.target);
   for (const lock of usedLocks) {
     if (lock.status !== 'locked') {
-      blockers.push({
+      const finding: CharacterConsistencyFinding = {
         code: 'character_status_not_locked',
         characterId: lock.characterId,
         characterName: lock.canonicalName,
         subReason: lock.status,
         message: `${lock.canonicalName} 当前状态为 ${lock.status}，必须确认 locked 后才能生成 ${opts.target}。`,
-      });
+      };
+      if (relaxBlockers) {
+        logRelaxedBlock({
+          target: opts.target,
+          code: 'character_status_not_locked',
+          groupIdx: opts.groupIdx,
+          characterId: lock.characterId,
+          characterName: lock.canonicalName,
+          subReason: lock.status,
+        });
+        warnings.push({ ...finding, message: `[已放行] ${finding.message}` });
+      } else {
+        blockers.push(finding);
+      }
     }
     if (lock.identityLock.entityType === 'non-human' && !lock.identityLock.species) {
-      blockers.push({
+      const finding: CharacterConsistencyFinding = {
         code: 'nonhuman_species_missing',
         characterId: lock.characterId,
         characterName: lock.canonicalName,
         subReason: 'species_missing',
         message: `${lock.canonicalName} 是非人角色，但缺少 species，容易被真人化。`,
-      });
+      };
+      if (relaxBlockers) {
+        logRelaxedBlock({
+          target: opts.target,
+          code: 'nonhuman_species_missing',
+          groupIdx: opts.groupIdx,
+          characterId: lock.characterId,
+          characterName: lock.canonicalName,
+          subReason: 'species_missing',
+        });
+        warnings.push({ ...finding, message: `[已放行] ${finding.message}` });
+      } else {
+        blockers.push(finding);
+      }
     }
     if (opts.target === 'videoSegment' && lock.referenceLock.referenceStatus !== 'ready') {
       if (lock.referenceLock.referenceStatus === 'missing' || lock.referenceLock.referenceStatus === 'failed') {
@@ -274,7 +336,7 @@ export function validateCharacterConsistencyForGroup(
     }
   }
 
-  pushAssetReferenceFindings(project, text, { warnings, blockers });
+  pushAssetReferenceFindings(project, text, { warnings, blockers }, { target: opts.target, groupIdx: opts.groupIdx });
 
   const prevSnapshot = opts.snapshot || targetSnapshot(project, opts.groupIdx, opts.target);
   const previousUsages: CharacterUsageSnapshot[] = Array.isArray(prevSnapshot?.characterUsages)

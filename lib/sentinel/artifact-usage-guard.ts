@@ -7,7 +7,12 @@ import {
   type ShotPlanStaleReason,
 } from '../project-dependency-state';
 import { storyboardShotIndices } from '../frame-workflow-state';
-import { deriveFirstFrameReadiness, deriveVideoPromptReadiness } from '../video-prompt-state';
+import {
+  deriveFirstFrameReadiness,
+  deriveVideoPromptReadiness,
+  hasStoryboardVideoArtifact,
+  hasVideoTaskArtifact,
+} from '../video-prompt-state';
 import {
   validateCharacterConsistencyForGroup,
   type CharacterConsistencyGateResult,
@@ -18,6 +23,7 @@ export type TargetArtifact =
   | 'storyboard_prompt'
   | 'storyboard_image_generation'
   | 'storyboard_image'
+  | 'video_prompt_generation'
   | 'video_prompt'
   | 'video_segment';
 
@@ -299,6 +305,80 @@ function pushFlagDecision(
   opts.staleFlagKeys.push(opts.key);
 }
 
+function pushNonBlockingFlagDecision(
+  opts: {
+    staleFlags: Record<string, any>;
+    key: string;
+    reason: ArtifactUsageReason;
+    reasons: string[];
+    staleFlagKeys: string[];
+  },
+) {
+  if (opts.staleFlags[opts.key] !== true) return;
+  opts.reasons.push(opts.reason);
+  opts.staleFlagKeys.push(opts.key);
+}
+
+const RELAX_UPSTREAM_STALE_TARGETS: TargetArtifact[] = [
+  'storyboard_prompt',
+  'storyboard_image_generation',
+  'storyboard_image',
+  'video_prompt_generation',
+];
+
+function shouldRelaxUpstreamStale(target: TargetArtifact): boolean {
+  if (!RELAX_UPSTREAM_STALE_TARGETS.includes(target)) return false;
+  return process.env.RELAX_VIDEO_PROMPT_BLOCKERS !== '0';
+}
+
+function logRelaxedStaleBlock(payload: {
+  target: TargetArtifact;
+  reason: ArtifactUsageReason;
+  groupIdx: number | null;
+  key: string;
+}) {
+  try {
+    console.warn('[relaxed_block]', JSON.stringify(payload));
+  } catch {
+    console.warn('[relaxed_block]', payload);
+  }
+}
+
+function pushStaleFlagWithRelax(
+  opts: {
+    staleFlags: Record<string, any>;
+    key: string;
+    reason: ArtifactUsageReason;
+    reasons: string[];
+    blockingReasons: string[];
+    staleFlagKeys: string[];
+    target: TargetArtifact;
+    groupIdx: number | null;
+    relax: boolean;
+  },
+) {
+  if (opts.staleFlags[opts.key] !== true) return;
+  if (opts.relax) {
+    pushNonBlockingFlagDecision({
+      staleFlags: opts.staleFlags,
+      key: opts.key,
+      reason: opts.reason,
+      reasons: opts.reasons,
+      staleFlagKeys: opts.staleFlagKeys,
+    });
+    logRelaxedStaleBlock({ target: opts.target, reason: opts.reason, groupIdx: opts.groupIdx, key: opts.key });
+  } else {
+    pushFlagDecision({
+      staleFlags: opts.staleFlags,
+      key: opts.key,
+      reason: opts.reason,
+      reasons: opts.reasons,
+      blockingReasons: opts.blockingReasons,
+      staleFlagKeys: opts.staleFlagKeys,
+    });
+  }
+}
+
 function repairActionsFor(target: TargetArtifact, groupIdx: number | null, shotPlan: ShotPlanSubDecision): RepairAction[] {
   const actions: RepairAction[] = [];
   if (!shotPlan.usable) {
@@ -311,7 +391,7 @@ function repairActionsFor(target: TargetArtifact, groupIdx: number | null, shotP
     actions.push({ kind: 'regenerate_storyboard_prompts', batchType: 'storyboard_prompts', groupIdx: groupIdx ?? undefined, autoStartAllowed: false });
   } else if (target === 'storyboard_image_generation' || target === 'storyboard_image') {
     actions.push({ kind: 'regenerate_storyboard_images', batchType: 'storyboard_images', groupIdx: groupIdx ?? undefined, autoStartAllowed: false });
-  } else if (target === 'video_prompt') {
+  } else if (target === 'video_prompt_generation' || target === 'video_prompt') {
     actions.push({ kind: 'regenerate_video_prompts', batchType: 'video_prompts', groupIdx: groupIdx ?? undefined, autoStartAllowed: false });
   } else if (target === 'video_segment') {
     actions.push({ kind: 'regenerate_video_segments', batchType: 'video_segments', groupIdx: groupIdx ?? undefined, autoStartAllowed: false });
@@ -330,15 +410,20 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
   let generation = shotPlan.generation;
   let consistency: ArtifactUsageDecision['consistency'];
 
+  const relaxUpstreamStale = shouldRelaxUpstreamStale(target);
+
   const checkShotPromptFlags = () => {
     for (const shotIdx of groupShotIdxs(project, groupIdx, input.shotIndices)) {
-      pushFlagDecision({
+      pushStaleFlagWithRelax({
         staleFlags,
         key: `shot_prompt_${shotIdx}`,
         reason: 'shot_prompt_stale',
         reasons,
         blockingReasons,
         staleFlagKeys,
+        target,
+        groupIdx,
+        relax: relaxUpstreamStale,
       });
     }
   };
@@ -348,12 +433,46 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
   }
 
   if (target === 'storyboard_image_generation' && groupIdx != null) {
-    pushFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, blockingReasons, staleFlagKeys });
+    pushNonBlockingFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, staleFlagKeys });
     checkShotPromptFlags();
   }
 
   if (target === 'storyboard_image' && groupIdx != null) {
-    pushFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, blockingReasons, staleFlagKeys });
+    pushStaleFlagWithRelax({
+      staleFlags,
+      key: `storyboard_${groupIdx}`,
+      reason: 'storyboard_stale',
+      reasons,
+      blockingReasons,
+      staleFlagKeys,
+      target,
+      groupIdx,
+      relax: relaxUpstreamStale,
+    });
+    checkShotPromptFlags();
+    const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+    const firstFrame = deriveFirstFrameReadiness(storyboards[groupIdx], groupIdx);
+    if (!firstFrame.canStart) {
+      const reason: ArtifactUsageReason = firstFrame.status === 'failed'
+        ? 'first_frame_failed'
+        : 'first_frame_missing';
+      reasons.push(reason);
+      blockingReasons.push(reason);
+    }
+  }
+
+  if (target === 'video_prompt_generation' && groupIdx != null) {
+    pushStaleFlagWithRelax({
+      staleFlags,
+      key: `storyboard_${groupIdx}`,
+      reason: 'storyboard_stale',
+      reasons,
+      blockingReasons,
+      staleFlagKeys,
+      target,
+      groupIdx,
+      relax: relaxUpstreamStale,
+    });
     checkShotPromptFlags();
     const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
     const firstFrame = deriveFirstFrameReadiness(storyboards[groupIdx], groupIdx);
@@ -367,7 +486,7 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
   }
 
   if ((target === 'video_prompt' || target === 'video_segment') && groupIdx != null) {
-    pushFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, blockingReasons, staleFlagKeys });
+    pushNonBlockingFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, staleFlagKeys });
     pushFlagDecision({ staleFlags, key: `video_prompt_${groupIdx}`, reason: 'video_prompt_stale', reasons, blockingReasons, staleFlagKeys });
     checkShotPromptFlags();
 
@@ -389,7 +508,9 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
       reasons.push(reason);
       blockingReasons.push(reason);
     }
+  }
 
+  if ((target === 'video_prompt_generation' || target === 'video_prompt' || target === 'video_segment') && groupIdx != null) {
     let gate: CharacterConsistencyGateResult;
     try {
       gate = validateCharacterConsistencyForGroup(project, {
@@ -398,20 +519,47 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
         target: target === 'video_segment' ? 'videoSegment' : 'videoPrompt',
       });
     } catch (error: any) {
-      gate = {
-        target: target === 'video_segment' ? 'videoSegment' : 'videoPrompt',
-        groupIdx,
-        allowed: false,
-        score: 0,
-        level: 'red',
-        blockers: [{
-          code: 'critical_reference_missing',
-          subReason: 'consistency_gate_error',
-          message: error?.message || String(error),
-        }],
-        warnings: [],
-        characterUsages: [],
-      };
+      const gateTarget = target === 'video_segment' ? 'videoSegment' : 'videoPrompt';
+      const relaxGateError = gateTarget === 'videoPrompt'
+        && process.env.RELAX_VIDEO_PROMPT_BLOCKERS !== '0';
+      const errMessage = error?.message || String(error);
+      try {
+        console.error('[consistency_gate_error]', JSON.stringify({ groupIdx, target: gateTarget, message: errMessage }));
+      } catch {
+        console.error('[consistency_gate_error]', { groupIdx, target: gateTarget, message: errMessage });
+      }
+      if (relaxGateError) {
+        logRelaxedStaleBlock({ target, reason: 'critical_reference_missing', groupIdx, key: 'consistency_gate_error' });
+        gate = {
+          target: gateTarget,
+          groupIdx,
+          allowed: true,
+          score: 60,
+          level: 'yellow',
+          blockers: [],
+          warnings: [{
+            code: 'reference_missing',
+            subReason: 'consistency_gate_error',
+            message: `[已放行] 角色一致性检查异常：${errMessage}`,
+          }],
+          characterUsages: [],
+        };
+      } else {
+        gate = {
+          target: gateTarget,
+          groupIdx,
+          allowed: false,
+          score: 0,
+          level: 'red',
+          blockers: [{
+            code: 'critical_reference_missing',
+            subReason: 'consistency_gate_error',
+            message: errMessage,
+          }],
+          warnings: [],
+          characterUsages: [],
+        };
+      }
     }
     consistency = {
       allowed: gate.allowed,
@@ -437,17 +585,18 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
     }
 
     if (target === 'video_segment') {
+      const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
       const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
       const task = videoTasks[groupIdx] || {};
-      if (task?.outdated === true) {
+      if (task?.outdated === true && hasVideoTaskArtifact(task)) {
         reasons.push('video_task_outdated');
         blockingReasons.push('video_task_outdated');
       }
-      if (task?.isCurrent === false) {
+      if (task?.isCurrent === false && hasVideoTaskArtifact(task)) {
         reasons.push('video_task_stale');
         blockingReasons.push('video_task_stale');
       }
-      if (storyboards[groupIdx]?.videoIsCurrent === false) {
+      if (storyboards[groupIdx]?.videoIsCurrent === false && hasStoryboardVideoArtifact(storyboards[groupIdx])) {
         reasons.push('storyboard_video_not_current');
         blockingReasons.push('storyboard_video_not_current');
       }

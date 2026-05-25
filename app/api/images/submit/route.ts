@@ -2,9 +2,26 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { generateImage } from '@/lib/image-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
+import {
+  AssetQuotaError,
+  assertCanStartAssetGeneration,
+  createGenerationBatch,
+  finishGenerationBatch,
+  recordGenerationFailure,
+} from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+function stageForImage(kind: string, assetRef: string | undefined) {
+  if (kind === 'character') return 'asset_character';
+  if (kind === 'scene') return 'asset_scene';
+  if (kind === 'prop') return 'asset_prop';
+  if (kind === 'storyboard') return 'storyboard';
+  if (/firstFrame/i.test(String(assetRef || ''))) return 'first_frame';
+  if (/tailFrame/i.test(String(assetRef || ''))) return 'tail_frame';
+  return 'image';
+}
 
 /**
  * 单图同步生成入口（不走 batch）。
@@ -33,6 +50,27 @@ export async function POST(req: NextRequest) {
   // 角色非人/真人区分（从 body.entityType 显式传入；不传默认 human）
   const entityType: 'human' | 'non-human' | undefined =
     kind === 'character' ? (body.entityType === 'non-human' ? 'non-human' : 'human') : undefined;
+  try {
+    assertCanStartAssetGeneration(user.id);
+  } catch (error: any) {
+    if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+    throw error;
+  }
+  const batchId = createGenerationBatch({
+    ownerId: user.id,
+    projectId: projectId || null,
+    stage: stageForImage(kind, assetRef),
+    requestedCount: 1,
+    contextSnapshot: {
+      route: 'api_images_submit',
+      kind,
+      assetRef: assetRef || null,
+      size,
+      style,
+      quality,
+    },
+    source: projectId ? 'project' : 'toolbox',
+  });
 
   try {
     const result = await generateImage(user, {
@@ -44,7 +82,14 @@ export async function POST(req: NextRequest) {
       quality,
       projectId,
       assetRef,
+      assetLibrary: {
+        batchId,
+        stage: stageForImage(kind, assetRef),
+        source: projectId ? 'generated' : 'toolbox',
+        makeCurrent: !!projectId,
+      },
     } as any);
+    finishGenerationBatch(batchId, user.id);
     return jsonOk({
       ok: true,
       taskId: result.id,
@@ -54,6 +99,13 @@ export async function POST(req: NextRequest) {
       mode: result.mode,
     });
   } catch (e: any) {
+    recordGenerationFailure({
+      batchId,
+      ownerId: user.id,
+      failureReason: 'provider_error',
+      errorMessage: e?.message || String(e),
+    });
+    finishGenerationBatch(batchId, user.id, 'failed');
     return jsonError('图像生成失败：' + (e?.message || String(e)), 502);
   }
 }

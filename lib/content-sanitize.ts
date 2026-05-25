@@ -294,7 +294,7 @@ export function sanitizeFillLightPositiveMentions(text: string): string {
     protectedConstraints.push(m);
     return token;
   };
-  out = out.replace(/HARD USER NEGATIVE CONSTRAINT:[^\n]*/gi, protect);
+  out = out.replace(/(?:HARD USER NEGATIVE CONSTRAINT|硬性负向约束)[^\n]*/gi, protect);
   out = out.replace(
     /(不要|禁止|不能|不需要|别|去掉|移除|无|没有)[^。；，,\n]{0,24}补光灯/g,
     protect,
@@ -355,7 +355,7 @@ export function enforceNoFillLightConstraint(text: string): string {
     protectedConstraints.push(m);
     return token;
   };
-  out = out.replace(/HARD USER NEGATIVE CONSTRAINT:[^\n]*/gi, protectConstraint);
+  out = out.replace(/(?:HARD USER NEGATIVE CONSTRAINT|硬性负向约束)[^\n]*/gi, protectConstraint);
   out = out.replace(
     /(不要|禁止|不能|不需要|别|去掉|移除|无|没有)[^。；，,\n]{0,18}补光灯/g,
     protectConstraint,
@@ -364,9 +364,9 @@ export function enforceNoFillLightConstraint(text: string): string {
   protectedConstraints.forEach((value, idx) => {
     out = out.replace(`__NO_FILL_LIGHT_CONSTRAINT_${idx}__`, value);
   });
-  if (!/HARD USER NEGATIVE CONSTRAINT: no fill lights/i.test(out)) {
+  if (!/(HARD USER NEGATIVE CONSTRAINT: no fill lights|硬性负向约束：禁止补光灯)/i.test(out)) {
     out +=
-      '\n\nHARD USER NEGATIVE CONSTRAINT: no fill lights, ring lights, LED fill lamps, studio fill lights, or phone-mounted fill-light rigs. If phones appear, they are ordinary phones or selfie sticks only, not lighting equipment.';
+      '\n\n硬性负向约束：禁止补光灯、环形灯、LED 补光灯、影棚补光灯或手机补光灯支架。如果画面出现手机，只能是普通手机或自拍杆，不能作为照明设备。';
   }
   return out;
 }

@@ -238,29 +238,6 @@ async function testSingleShotSlotFactoryAndInvariant() {
   mod.assertStoryboardsAlignedWithShots(project, 'factory');
 }
 
-async function testTailFrameStaleMarkPreservesExistingStaleAt() {
-  const mod = loadFrameWorkflowState();
-  const existingStaleAt = '2026-05-19T10:00:00.000Z';
-  const attemptedRefreshAt = '2026-05-19T10:05:00.000Z';
-  const next = mod.markTailFrameStaleForFirstFrameChange({
-    tailFrameUrl: '/api/images/file/tail',
-    tailFrameIntent: 'requested',
-    tailFrameReferenceStatus: 'stale',
-    tailFrameStaleAt: existingStaleAt,
-    tailFrameStaleReason: 'first_frame_changed',
-    frames: {
-      tail: {
-        url: '/api/images/file/tail',
-        referenceStatus: 'stale',
-        staleAt: existingStaleAt,
-        staleReason: 'first_frame_changed',
-      },
-    },
-  }, { staleAt: attemptedRefreshAt });
-  assertEqual(next.tailFrameStaleAt, existingStaleAt, 'repeated stale mark keeps original storyboard staleAt');
-  assertEqual(next.frames.tail.staleAt, existingStaleAt, 'repeated stale mark keeps original frame staleAt');
-}
-
 async function main() {
   const tests = [
     ['migration archives multi-shot and moves single-shot task', testMigrationArchivesMultiShotAndMovesSingleShotTask],
@@ -270,7 +247,6 @@ async function main() {
     ['migration is idempotent after v3', testMigrationIsIdempotentAfterV3],
     ['strict resolver rejects wrong slot', testStrictShotResolverRejectsWrongSlot],
     ['single-shot slot factory and invariant', testSingleShotSlotFactoryAndInvariant],
-    ['tail stale marker preserves existing staleAt', testTailFrameStaleMarkPreservesExistingStaleAt],
   ];
   let pass = 0;
   for (const [name, fn] of tests) {

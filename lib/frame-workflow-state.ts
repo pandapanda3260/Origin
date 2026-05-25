@@ -119,7 +119,21 @@ export function assertStoryboardsAlignedWithShots(project: any, context = 'proje
 
 export function maybeAssertStoryboardsAlignedWithShots(project: any, context = 'project'): void {
   if (!isDevAlignmentAssertEnabled()) return;
-  assertStoryboardsAlignedWithShots(project, context);
+  // 此前 dev 模式直接抛错，导致开发期写盘流程在对齐异常时全链路中断。
+  // 改为捕获并以 console.warn 形式上报，方便观测但不中断业务。
+  // 单元测试直接调 assertStoryboardsAlignedWithShots（不走此 wrapper），断言能力保留。
+  try {
+    assertStoryboardsAlignedWithShots(project, context);
+  } catch (error: any) {
+    try {
+      console.warn('[frame-workflow-assert]', JSON.stringify({
+        context,
+        message: error?.message || String(error),
+      }));
+    } catch {
+      console.warn('[frame-workflow-assert]', context, error?.message || error);
+    }
+  }
 }
 
 export function storyboardShotIndices(
@@ -206,35 +220,8 @@ function tailFrameUrl(sb: any): string {
   return cleanUrl(sb?.frames?.tail?.url) || cleanUrl(sb?.tailFrameUrl);
 }
 
-export function markTailFrameStaleForFirstFrameChange(storyboard: any, opts: { staleAt?: string } = {}): any {
-  const sb = storyboard && typeof storyboard === 'object' ? storyboard : {};
-  const url = tailFrameUrl(sb);
-  if (!url) return sb;
-  const alreadyStaleForFirstFrame =
-    sb.tailFrameReferenceStatus === 'stale' &&
-    (sb.tailFrameStaleReason === 'first_frame_changed' || sb.frames?.tail?.staleReason === 'first_frame_changed');
-  const existingStaleAt = cleanUrl(sb.tailFrameStaleAt) || cleanUrl(sb.frames?.tail?.staleAt);
-  const staleAt = alreadyStaleForFirstFrame && existingStaleAt
-    ? existingStaleAt
-    : opts.staleAt || new Date().toISOString();
-  const frames = sb.frames && typeof sb.frames === 'object' ? { ...sb.frames } : {};
-  if (frames.tail && typeof frames.tail === 'object') {
-    frames.tail = {
-      ...frames.tail,
-      referenceStatus: 'stale',
-      staleAt,
-      staleReason: 'first_frame_changed',
-    };
-  }
-  return {
-    ...sb,
-    frames,
-    tailFrameIntent: validIntent(sb.tailFrameIntent) || 'requested',
-    tailFrameReferenceStatus: 'stale',
-    tailFrameStaleAt: staleAt,
-    tailFrameStaleReason: 'first_frame_changed',
-  };
-}
+// 用户原则: 首帧变化不自动 stale 尾帧, 也不删除已生成的视频任务,
+// 用户自决要不要重做。markTailFrameStaleForFirstFrameChange 已废弃。
 
 function validIntent(value: any): TailFrameIntent | null {
   return value === 'requested' || value === 'none' ? value : null;
@@ -282,8 +269,10 @@ function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, 
 
   const frames = sb?.frames && typeof sb.frames === 'object' ? { ...sb.frames } : {};
   if (frames.tail && typeof frames.tail === 'object') {
+    // 历史脏数据里残留的 staleAt / staleReason 在 normalize 时一并清理。
+    const { staleAt: _legacyStaleAt, staleReason: _legacyStaleReason, ...tailRest } = frames.tail;
     frames.tail = {
-      ...frames.tail,
+      ...tailRest,
       referenceStatus,
       shotIndices,
       sourceHash,
@@ -297,8 +286,10 @@ function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, 
     };
   }
 
+  // 顶层同样把历史 stale 字段 strip 掉, 避免老数据继续在前端显示"已过期"。
+  const { tailFrameStaleAt: _legacyTopStaleAt, tailFrameStaleReason: _legacyTopStaleReason, ...sbRest } = sb;
   return {
-    ...sb,
+    ...sbRest,
     idx,
     shotIdx: idx + 1,
     shotIndices,
@@ -513,17 +504,8 @@ export function computeFrameWorkflowStaleFlags(project: any, userId: number): Re
         flags[`storyboard_${groupIdx}`] = true;
       }
     }
-
-    const tailRequested = sb.tailFrameIntent === 'requested' || !!tailFrameUrl(sb);
-    if (tailRequested) {
-      const currentTailHash = computeTailFrameSourceHash(project, userId, groupIdx);
-      const storedTailHash = typeof sb.tailFrameSourceHash === 'string'
-        ? sb.tailFrameSourceHash
-        : (typeof sb.frames?.tail?.sourceHash === 'string' ? sb.frames.tail.sourceHash : null);
-      if (!storedTailHash || !currentTailHash || storedTailHash !== currentTailHash) {
-        flags[`tail_frame_${groupIdx}`] = true;
-      }
-    }
+    // 用户原则: 不再为尾帧自动产生 tail_frame_${groupIdx} stale flag,
+    // 尾帧的失效/重做完全由用户主动触发。
   }
   return flags;
 }

@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { syncEditProjectClips } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -281,6 +282,11 @@ export async function POST(req: NextRequest) {
   if (storyboards) patch.storyboards = storyboards;
 
   updateProjectForUser(projectId, user.id, patch);
+  try {
+    syncEditProjectClips({ ownerId: user.id, projectId, timeline: edl.timeline || [] });
+  } catch (clipError) {
+    console.warn('[edit/timeline] pinned clip sync skipped:', clipError);
+  }
 
   // readiness 用最新 storyboards 计算
   const finalProj = storyboards ? { ...proj, storyboards } : proj;

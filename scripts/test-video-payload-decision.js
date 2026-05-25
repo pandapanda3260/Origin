@@ -40,7 +40,10 @@ function testNormalizeStatus() {
   eq(normalizeTailFrameReferenceStatus({}), 'missing', 'empty status = missing');
   eq(normalizeTailFrameReferenceStatus({ tailFrameUrl: '/x', tailFramePath: '/tmp/tail.png' }), 'ready', 'legacy url+path = ready');
   eq(normalizeTailFrameReferenceStatus({ tailFrameUrl: '/x' }), 'file_missing', 'legacy url without path = file_missing');
-  eq(normalizeTailFrameReferenceStatus({ status: 'stale', tailFrameUrl: '/x', tailFramePath: '/tmp/tail.png' }), 'stale', 'explicit stale wins');
+  // 历史脏数据里的 'stale' 状态被剥离: 旧 status='stale' 但 url+path 都正常时落回 ready,
+  // 这是"系统不再自动 stale 尾帧"原则的一部分, 让旧数据自然消化。
+  eq(normalizeTailFrameReferenceStatus({ status: 'stale', tailFrameUrl: '/x', tailFramePath: '/tmp/tail.png' }), 'ready', 'legacy stale + url + path = ready');
+  eq(normalizeTailFrameReferenceStatus({ status: 'stale', tailFrameUrl: '/x' }), 'file_missing', 'legacy stale without path = file_missing');
 }
 
 function testAutoMatrix() {
@@ -49,7 +52,6 @@ function testAutoMatrix() {
     ['pending', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_pending', hardFail: true, failureCode: 'tail_frame_pending' }],
     ['ready', '/tmp/tail.png', { payloadMode: 'first_last_frame', reason: 'tail_ready', hardFail: false, hasFirstLast: true }],
     ['failed', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_failed', hardFail: false, warningReason: 'tail_failed' }],
-    ['stale', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_stale', hardFail: false, warningReason: 'tail_stale' }],
     ['file_missing', '', { payloadMode: 'first_frame_multi_ref', reason: 'tail_file_missing', hardFail: false, warningReason: 'tail_file_missing' }],
   ];
   for (const [status, tailFramePath, expected] of cases) {
@@ -87,7 +89,6 @@ function testExplicitFirstLastMatrix() {
     ['missing', null, 'first_last_frame_tail_missing'],
     ['pending', '/tmp/tail.png', 'first_last_frame_tail_pending'],
     ['failed', '/tmp/tail.png', 'first_last_frame_tail_failed'],
-    ['stale', '/tmp/tail.png', 'first_last_frame_tail_stale'],
     ['file_missing', '', 'first_last_frame_tail_file_missing'],
   ];
   for (const [status, tailFramePath, failureCode] of cases) {

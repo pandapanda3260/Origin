@@ -78,6 +78,7 @@ async function mountOnlineEditor() {
     return;
   }
   if (_connectStarted || _vevFrame || _isVevDemoReady) return;
+  _setConnectionStatus('pending', '连接中');
   _setOnlineEditorControlsReady(false);
   console.log('[OnlineEditor] mount start');
   _connectStarted = true;
@@ -120,6 +121,7 @@ async function mountOnlineEditor() {
   } catch (err) {
     console.error('[OnlineEditor] 初始化失败:', err);
     _connectStarted = false;
+    _setConnectionStatus('error', '连接失败');
     _showSetupGuide('连接 VevDemo 服务失败: ' + err.message, 'load_failed');
   }
 }
@@ -138,6 +140,16 @@ async function _loadVevDemoConfig() {
 function _getConfiguredIframeUrl(config) {
   if (!config) return '';
   return config.iframeProjectUrl || config.iframeUrl || config.iframeBaseUrl || '';
+}
+
+function _setConnectionStatus(variant, label) {
+  const chip = document.getElementById('oeConnectionStatus');
+  const text = document.getElementById('oeConnectionStatusText');
+  if (!chip || !text) return;
+  const safeVariant = ['pending', 'ready', 'error', 'muted'].includes(variant) ? variant : 'pending';
+  chip.classList.remove('oe-status-chip--pending', 'oe-status-chip--ready', 'oe-status-chip--error', 'oe-status-chip--muted');
+  chip.classList.add(`oe-status-chip--${safeVariant}`);
+  text.textContent = label || '连接中';
 }
 
 /**
@@ -260,23 +272,18 @@ function _renderExportStatusCard() {
     const disabled = action.disabled ? 'disabled aria-disabled="true"' : '';
     const extraClass = action.primary
       ? 'bg-white/90 text-black hover:bg-white'
-      : 'border border-white/10 bg-white/5 text-white/70 hover:bg-white/10';
-    return `<button type="button" data-oe-export-action="${action.action}" class="px-2.5 py-1 rounded-lg text-[10px] font-medium transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${extraClass}" ${disabled}>${_escapeOnlineEditorHtml(action.label)}</button>`;
+      : 'bg-white/5 text-white/70 hover:bg-white/10';
+    return `<button type="button" data-oe-export-action="${action.action}" class="h-5 shrink-0 rounded px-2 text-[10px] font-semibold leading-none transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${extraClass}" ${disabled}>${_escapeOnlineEditorHtml(action.label)}</button>`;
   }).join('');
 
   slot.innerHTML = `
-    <div class="w-[280px] rounded-xl border ${view.borderClass} ${view.bgClass} px-3 py-2 shadow-lg shadow-black/20 backdrop-blur-xl">
-      <div class="flex items-start gap-2">
-        <div class="mt-0.5 ${view.textClass}">${busyHtml}</div>
-        <div class="min-w-0 flex-1">
-          <div class="flex items-center justify-between gap-2">
-            <p class="truncate text-[11px] font-semibold ${view.titleClass}">${_escapeOnlineEditorHtml(view.title)}</p>
-            ${view.badge ? `<span class="shrink-0 rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] text-white/45">${_escapeOnlineEditorHtml(view.badge)}</span>` : ''}
-          </div>
-          <p class="mt-0.5 line-clamp-2 text-[10px] leading-snug text-white/45">${_escapeOnlineEditorHtml(view.detail)}</p>
-          ${actionsHtml ? `<div class="mt-2 flex flex-wrap items-center gap-1.5">${actionsHtml}</div>` : ''}
-        </div>
+    <div class="inline-flex h-7 max-w-full items-center gap-2 rounded-md border ${view.borderClass} ${view.bgClass} px-2 shadow-sm shadow-black/20">
+      <div class="shrink-0 ${view.textClass}">${busyHtml}</div>
+      <div class="min-w-0 truncate text-[11px] font-semibold text-white/80" title="${_escapeOnlineEditorHtml(view.detail)}">
+        ${_escapeOnlineEditorHtml(view.title)}
       </div>
+      ${view.badge ? `<span class="shrink-0 rounded bg-white/5 px-1.5 py-0.5 text-[9px] font-semibold text-white/45">${_escapeOnlineEditorHtml(view.badge)}</span>` : ''}
+      ${actionsHtml ? `<div class="flex shrink-0 items-center gap-1">${actionsHtml}</div>` : ''}
     </div>
   `;
   _bindExportStatusCardActions(slot);
@@ -749,17 +756,19 @@ function _createVevDemoFrame(url) {
     clearFrameTimers();
     _vevFrame = null;
     _connectStarted = false;
+    _setConnectionStatus('error', '连接失败');
     _scheduleVevDemoAutoRetry(url, message);
   };
 
   // 创建加载指示器
+  _setConnectionStatus('pending', '加载中');
   const loadingOverlay = document.createElement('div');
   loadingOverlay.id = 'oeVevLoadingOverlay';
-  loadingOverlay.className = 'flex flex-col items-center justify-center h-full bg-[#0a0e14]';
+  loadingOverlay.className = 'oe-editor-empty-state';
   loadingOverlay.innerHTML = `
-    <div class="animate-spin w-12 h-12 border-3 border-cyan-500 border-t-transparent rounded-full mb-4"></div>
-    <p class="text-white/60 text-sm">正在连接视频剪辑服务...</p>
-    <p class="text-white/40 text-xs mt-2">${url}</p>
+    <span class="material-symbols-outlined animate-spin">progress_activity</span>
+    <h2>正在连接</h2>
+    <p title="${_escapeOnlineEditorHtml(url)}">视频剪辑服务加载中。</p>
   `;
   container.appendChild(loadingOverlay);
 
@@ -787,6 +796,7 @@ function _createVevDemoFrame(url) {
     iframeLoaded = true;
     if (loadTimer) clearTimeout(loadTimer);
     console.log('[OnlineEditor] VevDemo iframe 加载完成');
+    _setConnectionStatus('pending', '等待就绪');
     frame.style.display = 'block';
     const overlay = document.getElementById('oeVevLoadingOverlay');
     if (overlay) overlay.remove();
@@ -872,6 +882,7 @@ async function _retryVevDemoConnection(options) {
   _isVevDemoReady = false;
   _hasVevDemoMessage = false;
   _connectStarted = false;
+  _setConnectionStatus('pending', manual ? '重试连接' : '连接中');
   _setOnlineEditorControlsReady(false);
 
   try {
@@ -904,6 +915,7 @@ function _destroyVevDemoFrame() {
     _vevFrame = null;
   }
   _isVevDemoReady = false;
+  _setConnectionStatus('muted', '未连接');
   _setOnlineEditorControlsReady(false);
   _connectStarted = false;
   _hasVevDemoMessage = false;
@@ -1030,6 +1042,7 @@ function _handleVevMessage(event) {
 function _onVevDemoReady(data) {
   _isVevDemoReady = true;
   _resetVevDemoAutoRetryState();
+  _setConnectionStatus('ready', '已连接');
   _setOnlineEditorControlsReady(true);
   const diagnostic = document.getElementById('oeVevDiagnostic');
   if (diagnostic) diagnostic.remove();
@@ -1641,104 +1654,70 @@ function _showSetupGuide(message, state, missingKeys) {
     disabled: {
       title: '在线精修剪辑器未启用',
       intro: message || '当前环境关闭了在线精修入口，请在 Origin 配置中启用后再使用。',
-      iconBg: 'bg-white/10',
-      iconText: 'text-white/50',
+      icon: 'power_settings_new',
+      statusVariant: 'muted',
+      statusText: '未启用',
     },
     missing_config: {
       title: '视频剪辑服务未配置',
-      intro: message || '请按照以下步骤配置 VevDemo 服务',
-      iconBg: 'bg-cyan-500/20',
-      iconText: 'text-cyan-500',
+      intro: message || '请先配置 VevDemo 服务。',
+      icon: 'settings_alert',
+      statusVariant: 'error',
+      statusText: '未配置',
     },
     load_failed: {
       title: '视频剪辑服务加载失败',
-      intro: message || '请检查 VevDemo 服务、iframe 地址与 CSP frame-src 配置',
-      iconBg: 'bg-amber-500/20',
-      iconText: 'text-amber-300',
+      intro: message || '请检查 VevDemo 服务、iframe 地址与 CSP frame-src 配置。',
+      icon: 'sync_problem',
+      statusVariant: 'error',
+      statusText: '连接失败',
     },
     tab_only: {
       title: '在线精修配置为新标签页模式',
       intro: message || '当前配置为新标签页打开，请从剪辑页入口进入 VevDemo。',
-      iconBg: 'bg-white/10',
-      iconText: 'text-white/50',
+      icon: 'open_in_new',
+      statusVariant: 'muted',
+      statusText: '新标签页',
     },
   };
   const copy = stateMap[state] || stateMap.missing_config;
+  _setConnectionStatus(copy.statusVariant, copy.statusText);
   const introSuffix = (state === 'disabled' || state === 'missing_config')
     ? ' 修改配置后请刷新页面。'
     : '';
   const introText = `${copy.intro}${introSuffix}`;
   const missingHtml = missingKeys.length
-    ? `<p class="mt-2 text-[11px] text-amber-200/80">缺少配置项：${missingKeys.map(_escapeOnlineEditorHtml).join(', ')}</p>`
+    ? `<p>缺少配置项：${missingKeys.map(_escapeOnlineEditorHtml).join(', ')}</p>`
     : '';
-  const guideHidden = (state === 'disabled' || state === 'tab_only') ? 'hidden' : '';
   let actionHtml = '';
   if (state === 'disabled' || state === 'tab_only') {
     actionHtml = `
-      <button type="button" data-goto="edit" class="mt-6 px-6 py-2 bg-white/10 text-white font-medium rounded-lg hover:bg-white/15 transition-colors">
+      <button type="button" data-goto="edit" class="oe-sync-btn">
+        <span class="material-symbols-outlined">arrow_back</span>
         返回剪辑页
       </button>`;
   } else if (state === 'load_failed') {
     actionHtml = `
-      <button type="button" data-oe-retry-connect class="mt-6 px-6 py-2 bg-cyan-500 text-black font-medium rounded-lg hover:bg-cyan-400 transition-colors">
+      <button type="button" data-oe-retry-connect class="oe-sync-btn">
+        <span class="material-symbols-outlined">refresh</span>
         重试连接
       </button>`;
   } else {
     actionHtml = `
-      <button onclick="location.reload()" class="mt-6 px-6 py-2 bg-cyan-500 text-black font-medium rounded-lg hover:bg-cyan-400 transition-colors">
+      <button type="button" data-oe-reload-config class="oe-sync-btn">
+        <span class="material-symbols-outlined">refresh</span>
         重新读取配置
       </button>`;
   }
 
   container.innerHTML = `
-    <div class="flex flex-col items-center justify-center h-full bg-[#0a0e14] p-8">
-      <div class="max-w-md text-center">
-        <div class="w-16 h-16 mx-auto mb-6 rounded-full ${copy.iconBg} flex items-center justify-center">
-          <svg class="w-8 h-8 ${copy.iconText}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-          </svg>
-        </div>
-        <h2 class="text-xl font-semibold text-white mb-3">${copy.title}</h2>
-        <p class="text-white/60 text-sm mb-6">${_escapeOnlineEditorHtml(introText)}</p>
-        ${missingHtml}
-        
-        <div class="bg-white/5 rounded-lg p-4 text-left text-sm text-white/80 space-y-3 ${guideHidden}">
-          <div class="flex items-start gap-3">
-            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">1</span>
-            <div>
-              <p class="font-medium">克隆 VevDemo 仓库</p>
-              <code class="text-cyan-400 text-xs">git clone https://github.com/volcengine/vevdemo.git</code>
-            </div>
-          </div>
-          <div class="flex items-start gap-3">
-            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">2</span>
-            <div>
-              <p class="font-medium">配置后端环境变量</p>
-              <code class="text-cyan-400 text-xs">cd vevdemo/nodejs && cp .env.example .env</code>
-              <p class="text-white/50 text-xs mt-1">填入 VOLC_ACCESS_KEY, VOLC_SECRET_KEY</p>
-            </div>
-          </div>
-          <div class="flex items-start gap-3">
-            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">3</span>
-            <div>
-              <p class="font-medium">启动服务</p>
-              <code class="text-cyan-400 text-xs">npm run dev</code>
-              <p class="text-white/50 text-xs mt-1">VevDemo Editor（前端）: 8084 | VevDemo API（后端）: 3002</p>
-            </div>
-          </div>
-          <div class="flex items-start gap-3">
-            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-cyan-500 text-black text-xs flex items-center justify-center font-bold">4</span>
-            <div>
-              <p class="font-medium">配置 Origin 环境变量</p>
-              <code class="text-cyan-400 text-xs">VEVDEMO_EDITOR_URL=http://127.0.0.1:8084</code>
-              <p class="text-white/50 text-xs mt-1">VEVDEMO_API_URL=http://127.0.0.1:3002</p>
-            </div>
-          </div>
-        </div>
-        
-        ${actionHtml}
-      </div>
-	    </div>
+    <div class="oe-editor-empty-state">
+      <span class="material-symbols-outlined">${copy.icon}</span>
+      <h2>${_escapeOnlineEditorHtml(copy.title)}</h2>
+      <p>${_escapeOnlineEditorHtml(introText)}</p>
+      ${missingHtml}
+      <div class="mt-4">${actionHtml}</div>
+    </div>
 	  `;
 
   const retryButton = container.querySelector('[data-oe-retry-connect]');
@@ -1746,6 +1725,13 @@ function _showSetupGuide(message, state, missingKeys) {
     retryButton.addEventListener('click', (event) => {
       event.preventDefault();
       _retryVevDemoConnection({ manual: true });
+    });
+  }
+  const reloadButton = container.querySelector('[data-oe-reload-config]');
+  if (reloadButton) {
+    reloadButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      location.reload();
     });
   }
 }
@@ -1877,7 +1863,7 @@ function _setOnlineEditorControlsReady(ready) {
   if (!syncBtn) return;
   syncBtn.hidden = !ready;
   syncBtn.disabled = !ready;
-  if (!ready) syncBtn.textContent = '同步素材';
+  _renderSyncMaterialsButtonLabel(false);
   syncBtn.onclick = ready
     ? (event) => {
         event.preventDefault();
@@ -1890,7 +1876,16 @@ function _setSyncMaterialsBusy(busy) {
   const syncBtn = document.getElementById('oeBtnSyncMaterials');
   if (!syncBtn) return;
   syncBtn.disabled = !!busy;
-  syncBtn.textContent = busy ? '同步中...' : '同步素材';
+  _renderSyncMaterialsButtonLabel(busy);
+}
+
+function _renderSyncMaterialsButtonLabel(busy) {
+  const syncBtn = document.getElementById('oeBtnSyncMaterials');
+  if (!syncBtn) return;
+  syncBtn.innerHTML = `
+    <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">sync</span>
+    <span>${busy ? '同步中' : '同步素材'}</span>
+  `;
 }
 
 // ============================================================================

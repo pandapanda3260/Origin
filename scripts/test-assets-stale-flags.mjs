@@ -4,11 +4,19 @@ globalThis.localStorage = {
   getItem() { return ''; },
   removeItem() {},
 };
-globalThis.window = {};
-globalThis.document = {};
+globalThis.window = {
+  addEventListener() {},
+  removeEventListener() {},
+};
+globalThis.document = {
+  addEventListener() {},
+  removeEventListener() {},
+};
 
-const { _applyServerStaleFlagsToProject, deriveAssetCardState } = await import('../public/modules/assets.js');
+const { _applyServerStaleFlagsToProject, deriveAssetCardState, syncAssetsProject } = await import('../public/modules/assets.js');
 
+// The asset page no longer auto-syncs style-driven asset stale badges.
+// This helper still backs managed-prefix mirroring for downstream stale families.
 {
   const project = {
     _staleFlags: {
@@ -87,7 +95,23 @@ const { _applyServerStaleFlagsToProject, deriveAssetCardState } = await import('
   assert.equal(state.mainImageUrl, '/old.png', 'failed attempt should not replace main reference image');
   assert.equal(state.failedAttemptUrl, '/failed.png');
   assert.equal(state.statusLabel, '生成失败');
-  assert.match(state.statusMessage, /背景不够纯白|切片/);
+  assert.equal(state.statusMessage, '本次生成结果不可用，请重新生成');
+}
+
+{
+  const state = deriveAssetCardState({
+    imageUrl: '/fallback.png',
+    reference: {
+      status: 'degraded',
+      currentUrl: '/fallback.png',
+      lastKnownGoodUrl: '/fallback.png',
+    },
+  });
+  assert.equal(state.status, 'degraded');
+  assert.equal(state.mainImageUrl, '/fallback.png');
+  assert.equal(state.failedAttemptUrl, '');
+  assert.equal(state.statusLabel, '可用（比例兜底）');
+  assert.match(state.statusMessage, /比例兜底/);
 }
 
 {
@@ -101,7 +125,47 @@ const { _applyServerStaleFlagsToProject, deriveAssetCardState } = await import('
   assert.equal(state.status, 'failed');
   assert.equal(state.mainImageUrl, '');
   assert.equal(state.failedAttemptUrl, '/failed.png');
-  assert.match(state.statusMessage, /not enough usable panels/);
+  assert.equal(state.statusMessage, '本次生成结果不可用，请重新生成');
+}
+
+{
+  syncAssetsProject({
+    characters: [{ imageUrl: '/legacy-human.png', panels: { schema: 'human-character-sheet-v1' } }],
+    consistency: { characters: [] },
+  });
+  const state = deriveAssetCardState({
+    name: '活螃蟹',
+    entityType: 'non-human',
+    reference: {
+      status: 'failed',
+      lastAttemptUrl: '/crab-attempt.png',
+      lastError: { reason: 'character_panel_split_failed', message: 'not enough usable panels' },
+    },
+  }, 0);
+  assert.equal(state.status, 'failed');
+  assert.equal(state.mainImageUrl, '', 'non-human character must not use legacy human top-level fallback');
+  assert.equal(state.previewImageUrl, '/crab-attempt.png');
+}
+
+{
+  syncAssetsProject({
+    characters: [{ imageUrl: '/legacy-human.png', panels: { schema: 'human-character-sheet-v1' } }],
+    consistency: { characters: [] },
+  });
+  const state = deriveAssetCardState({ entityType: 'human' }, 0);
+  assert.equal(state.mainImageUrl, '/legacy-human.png', 'human character may still use compatible legacy fallback');
+}
+
+{
+  syncAssetsProject(null);
+  const state = deriveAssetCardState({
+    entityType: 'non-human',
+    imageUrl: '/wrong-human.png',
+    panels: { schema: 'human-character-sheet-v1' },
+    reference: { status: 'ready', currentUrl: '/wrong-human.png' },
+  }, 0);
+  assert.equal(state.status, 'missing');
+  assert.equal(state.mainImageUrl, '', 'non-human asset must not render its own mismatched human sheet');
 }
 
 console.log('[test-assets-stale-flags] all assertions passed');

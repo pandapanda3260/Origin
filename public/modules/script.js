@@ -1,14 +1,29 @@
 import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders } from './utils.js';
+import { emptyScriptConsultState, isEmptyScriptConsultState } from './script_consult_state.js';
 
 var _ctx = {};
 var project = null;
 
 export function initScript(ctx) { _ctx = ctx; }
-export function syncScriptProject(p) { project = p; }
+export function syncScriptProject(p) {
+  var prevId = project && project.id;
+  var nextId = p && p.id;
+  if (_scriptConsultGuardEnabled() && prevId !== nextId) {
+    _abortActiveScriptRequest("project_changed");
+    _clearScriptTransientInput();
+    _pendingSourceChoice = false;
+    _scriptProjectEpoch++;
+  }
+  project = p;
+}
 
 var _scriptGenerating = false;
 var _emotionTagInflight = {};
 var _emotionAutoTried = {};
+var _pendingSourceChoice = false;
+var _scriptRequestSeq = 0;
+var _scriptProjectEpoch = 0;
+var _activeScriptRequest = null;
 
 export function isScriptGenerating() {
   return _scriptGenerating;
@@ -30,7 +45,7 @@ export function emotionBadgeHtml(emotion, intensity) {
 
 export function chatClearWelcome() {
   var w = $("chatWelcome");
-  if (w && w.parentNode) w.parentNode.removeChild(w);
+  if (w) w.hidden = true;
 }
 
 export function chatAddMsg(type, html) {
@@ -94,8 +109,10 @@ export function typewriter(element, text, chunkSize, delayMs) {
 }
 
 export function chatAutoResize(textarea) {
+  if (!textarea) return;
   textarea.style.height = "auto";
-  textarea.style.height = Math.min(textarea.scrollHeight, 110) + "px";
+  var nextHeight = Math.max(31, Math.min(textarea.scrollHeight || 31, 110));
+  textarea.style.height = nextHeight + "px";
 }
 
 function _scrollChatToBottom() {
@@ -106,6 +123,76 @@ function _scrollChatToBottom() {
 function _scriptMessageContainer() {
   var box = $("chatMessages");
   return box ? (box.querySelector(".max-w-2xl") || box) : null;
+}
+
+function _clearScriptTransientInput() {
+  var input = $("ideaInput");
+  if (input) {
+    input.value = "";
+    chatAutoResize(input);
+  }
+}
+
+function _scriptConsultGuardEnabled() {
+  return !_ctx.isFeatureEnabled || _ctx.isFeatureEnabled("scriptConsultGuard", true);
+}
+
+function _newScriptRequestGuard(originId, label) {
+  var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  var guard = {
+    id: ++_scriptRequestSeq,
+    label: label || "script",
+    originId: originId || "",
+    projectEpoch: _scriptProjectEpoch,
+    controller: controller,
+  };
+  _activeScriptRequest = guard;
+  return guard;
+}
+
+function _isScriptRequestCurrent(guard) {
+  if (!_scriptConsultGuardEnabled()) return true;
+  return !!(
+    guard &&
+    _activeScriptRequest === guard &&
+    guard.projectEpoch === _scriptProjectEpoch &&
+    project &&
+    project.id === guard.originId &&
+    !(guard.controller && guard.controller.signal && guard.controller.signal.aborted)
+  );
+}
+
+function _finishScriptRequest(guard) {
+  if (_activeScriptRequest === guard) _activeScriptRequest = null;
+}
+
+function _abortActiveScriptRequest(reason) {
+  if (!_scriptConsultGuardEnabled()) return;
+  if (_activeScriptRequest && _activeScriptRequest.controller) {
+    try { _activeScriptRequest.controller.abort(reason || "aborted"); } catch (_) {}
+  }
+  _activeScriptRequest = null;
+  _scriptGenerating = false;
+  var btn = $("btnGenScript");
+  if (btn) btn.disabled = false;
+  chatRemoveDots();
+}
+
+function _clearConsultDomForEmptyProject() {
+  var box = $("chatMessages");
+  if (!box) return;
+  var innerWrap = box.querySelector(".max-w-2xl") || box;
+  var msgs = innerWrap.querySelectorAll(".chat-msg:not(#scriptResultCard)");
+  msgs.forEach(function (m) { if (m.parentNode) m.parentNode.removeChild(m); });
+  delete box.dataset.consultVersion;
+  var resultCard = $("scriptResultCard");
+  if (resultCard) resultCard.hidden = true;
+  var displayText = $("scriptDisplayText");
+  if (displayText) displayText.textContent = "";
+  var editArea = $("scriptOutput");
+  if (editArea) editArea.value = "";
+  _hideScriptConfirmArea();
+  _syncScriptWelcomeVisibility();
 }
 
 function _moveScriptResultToEnd() {
@@ -126,6 +213,36 @@ function _showScriptConfirmArea() {
 function _hideScriptConfirmArea() {
   var confirmArea = $("scriptConfirmArea");
   if (confirmArea) confirmArea.hidden = true;
+}
+
+function _hasScriptConsultMessages() {
+  var sc = (project && project.scriptConsult) || {};
+  return Array.isArray(sc.messages) && sc.messages.length > 0;
+}
+
+function _hasRenderedScriptConversation() {
+  var box = $("chatMessages");
+  if (!box) return false;
+  var innerWrap = box.querySelector(".max-w-2xl") || box;
+  return !!innerWrap.querySelector(".chat-msg:not(#scriptResultCard)");
+}
+
+function _syncScriptWelcomeVisibility() {
+  var welcome = $("chatWelcome");
+  if (!welcome) return;
+  var hasScriptText = !!(project && String(project.script || project.scriptDraft || "").trim());
+  var resultCard = $("scriptResultCard");
+  var importCard = $("scriptImportDraftCard");
+  var hasVisibleDraftCard = !!(
+    (resultCard && !resultCard.hidden) ||
+    (importCard && !importCard.hidden)
+  );
+  welcome.hidden = !!(
+    hasScriptText ||
+    hasVisibleDraftCard ||
+    _hasScriptConsultMessages() ||
+    _hasRenderedScriptConversation()
+  );
 }
 
 export function refreshScriptPage() {
@@ -153,6 +270,8 @@ export function refreshScriptPage() {
     if (displayText) displayText.textContent = "";
     if (editArea) editArea.value = "";
   }
+  refreshScriptImportDraft();
+  _syncScriptWelcomeVisibility();
 
   renderEmotionSegments();
   renderScriptAnalysis();
@@ -160,7 +279,7 @@ export function refreshScriptPage() {
   var ideaInput = $("ideaInput");
   if (ideaInput && project && !project.script) ideaInput.value = project.idea || "";
   _updateScriptInputPlaceholder();
-  refreshScriptImportDraft();
+  chatAutoResize(ideaInput);
 }
 
 function _pendingImportedDraft() {
@@ -179,10 +298,12 @@ export function refreshScriptImportDraft() {
   if (!draft) {
     card.hidden = true;
     textarea.value = "";
+    _syncScriptWelcomeVisibility();
     return;
   }
   card.hidden = false;
   if (textarea.value !== draft) textarea.value = draft;
+  _syncScriptWelcomeVisibility();
 }
 
 async function _setImportedDraft(text) {
@@ -789,6 +910,13 @@ export async function runScriptAnalysis() {
 
 export async function handleScriptInput() {
   if (_scriptGenerating) return;
+  if (_pendingSourceChoice && !document.querySelector(".source-choice-card")) {
+    _pendingSourceChoice = false;
+  }
+  if (_pendingSourceChoice) {
+    showToast("请先选择这段内容的处理方式", "warn");
+    return;
+  }
   var idea = $("ideaInput").value.trim();
   if (!idea) { showToast("请输入内容", "warn"); return; }
   if (!project) _ctx.createNewProject && _ctx.createNewProject();
@@ -798,9 +926,100 @@ export async function handleScriptInput() {
     // 已有剧本 → 走改本
     await reviseScript(idea);
   } else {
-    // 还没剧本 → 多轮咨询（后端 run_consult_turn 判断信息够不够，够就给大纲 + ready）
-    await _consultTurn(idea);
+    var sourceClass = _classifySourceTextInput(idea);
+    if (sourceClass === "high") {
+      await generateScript(idea, { fromSource: true });
+    } else if (sourceClass === "low") {
+      _promptSourceOrConsult(idea);
+    } else {
+      // 还没剧本 → 多轮咨询（后端 run_consult_turn 判断信息够不够，够就给大纲 + ready）
+      await _consultTurn(idea);
+    }
   }
+}
+
+function _classifySourceTextInput(text) {
+  text = (text || "").trim();
+  if (!text) return "none";
+  var len = text.length;
+  var quotePairs = _countRegexMatches(text, /[“"][^”"]{2,}[”"]/g);
+  var stageDirections = _countRegexMatches(text, /（[^）]{4,}）|\([^)]{4,}\)/g);
+  var paragraphCount = text.split(/\n+/).map(function (line) { return line.trim(); }).filter(function (line) { return line.length >= 12; }).length;
+  var validDialogueLines = _countSourceDialogueLines(text);
+  var hasStrongMarkers = /(第[一二三四五六七八九十百\d]+[章节幕场]|内景|外景|转场|画外音)/.test(text);
+  if (hasStrongMarkers && len >= 120) return "high";
+  if (quotePairs >= 3 && len >= 200) return "high";
+  if (stageDirections >= 2 && len >= 200) return "high";
+  if (validDialogueLines >= 3 && len >= 220) return "high";
+  if (len >= 800) return "low";
+  if (len >= 400 && paragraphCount >= 6) return "low";
+  if (len >= 500 && paragraphCount >= 3 && (quotePairs >= 1 || validDialogueLines >= 1 || /突然|随后|沉默|看着|走进/.test(text))) return "low";
+  return "none";
+}
+
+function _countRegexMatches(text, regex) {
+  var matches = text.match(regex);
+  return matches ? matches.length : 0;
+}
+
+function _countSourceDialogueLines(text) {
+  var metaPrefix = /^(需求|目标|人设|主题|风格|背景|时长|平台|受众|备注|要求)\s*$/;
+  var lines = String(text || "").split(/\n+/);
+  var count = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    var match = line.match(/^([^：:\n]{1,12})[：:](.+)$/);
+    if (!match) continue;
+    var speaker = match[1].trim();
+    var body = match[2].trim();
+    if (metaPrefix.test(speaker)) continue;
+    if (/需求|说明|段落|大纲|设定|限制|参考/.test(speaker)) continue;
+    if (body.length < 6) continue;
+    if (/[。！？!?」』”"]$/.test(body) || /[“"][^”"]{2,}[”"]/.test(body)) count++;
+  }
+  return count;
+}
+
+function _promptSourceOrConsult(idea) {
+  _pendingSourceChoice = true;
+  var input = $("ideaInput");
+  if (input) {
+    input.value = "";
+    chatAutoResize(input);
+  }
+  var msg = chatAddMsg("status",
+    '<div class="source-choice-card">' +
+      '<div class="source-choice-card__title">这段内容比较长，像是已有原文/小说片段。</div>' +
+      '<div class="source-choice-card__text">你想怎么处理？</div>' +
+      '<div class="source-choice-card__actions">' +
+        '<button type="button" class="source-choice-card__btn source-choice-card__btn--primary" data-source-choice="adapt">直接生成剧本草稿</button>' +
+        '<button type="button" class="source-choice-card__btn" data-source-choice="consult">继续走创意咨询</button>' +
+      '</div>' +
+    '</div>');
+  var card = msg && msg.querySelector(".source-choice-card");
+  if (!card) {
+    _pendingSourceChoice = false;
+    _consultTurn(idea);
+    return;
+  }
+  card.addEventListener("click", function (e) {
+    var btn = e.target.closest && e.target.closest("[data-source-choice]");
+    if (!btn) return;
+    if (_scriptGenerating || btn.disabled || card.dataset.locked === "1") return;
+    card.dataset.locked = "1";
+    var buttons = card.querySelectorAll("button");
+    buttons.forEach(function (button) { button.disabled = true; });
+    _pendingSourceChoice = false;
+    var choice = btn.dataset.sourceChoice;
+    var wrapper = msg;
+    if (wrapper && wrapper.parentNode) wrapper.parentNode.removeChild(wrapper);
+    if (choice === "adapt") {
+      generateScript(idea, { fromSource: true }).catch(function () { /* handled inside generateScript */ });
+    } else {
+      _consultTurn(idea).catch(function () { /* handled inside _consultTurn */ });
+    }
+  });
 }
 
 // ── 多轮咨询：发一轮消息（用户侧） ────────────────────────────────────
@@ -814,14 +1033,16 @@ export async function handleScriptInput() {
 //
 // 业务态（对话历史、ready 标记、confirmedAt）**不在前端存**——后端 project.json
 // 是权威，刷新后 `refreshScriptPage` 从 `project.scriptConsult.messages` 回放。
-async function _consultTurn(userMsg) {
+async function _consultTurn(userMsg, options) {
+  options = options || {};
   var originId = project ? project.id : null;
   if (!originId) return;
+  var guard = _newScriptRequestGuard(originId, "consult_turn");
   _scriptGenerating = true;
   $("btnGenScript").disabled = true;
   $("ideaInput").value = "";
   chatAutoResize($("ideaInput"));
-  chatAddMsg("user", escapeHtml(userMsg));
+  if (!options.skipUserBubble) chatAddMsg("user", escapeHtml(userMsg));
 
   var aiMsg = chatAddMsg("ai", "");
   var bubble = aiMsg && aiMsg.querySelector(".chat-bubble--ai");
@@ -832,11 +1053,14 @@ async function _consultTurn(userMsg) {
       message: userMsg,
       creatorProfile: _ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null,
     }, null, function (evt) {
+      if (!_isScriptRequestCurrent(guard)) return;
       if (evt.type === "ai_chunk") {
         if (bubble) bubble.textContent += evt.content || "";
         _scrollChatToBottom();
       }
-    });
+    }, guard.controller ? { signal: guard.controller.signal } : null);
+
+    if (!_isScriptRequestCurrent(guard)) return;
 
     // done 时 bubble 文本就是流式累加后的纯文本；后端已在 done payload 里
     // 给出剥干净 ready 标记的 aiMessage，用它做权威显示，避免前端自己再截标记。
@@ -847,13 +1071,17 @@ async function _consultTurn(userMsg) {
       _appendConfirmDraftButton(bubble);
     }
   } catch (e) {
+    if (!_isScriptRequestCurrent(guard) || (e && e.name === "AbortError")) return;
     var errText = ((e && e.message) || e).toString().slice(0, 150);
     if (bubble) bubble.textContent = "";
     chatAddMsg("status", '<span class="chat-status-err">咨询失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
-    _scriptGenerating = false;
-    $("btnGenScript").disabled = false;
+    if (_isScriptRequestCurrent(guard)) {
+      _scriptGenerating = false;
+      $("btnGenScript").disabled = false;
+    }
+    _finishScriptRequest(guard);
   }
 }
 
@@ -892,6 +1120,7 @@ function _ensureConfirmDraftDelegation() {
 async function _consultConfirm() {
   if (!project) return;
   var originId = project.id;
+  var guard = _newScriptRequestGuard(originId, "consult_confirm");
 
   _scriptGenerating = true;
   $("btnGenScript").disabled = true;
@@ -932,6 +1161,7 @@ async function _consultConfirm() {
       durationSec: (project && project.scriptTargetDurationSec) || null,
       creatorProfile: _ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null,
     }, null, function (evt) {
+      if (!_isScriptRequestCurrent(guard)) return;
       if (evt.type === "script_chunk") {
         var raw = evt.content || "";
         var clean = consumeStreamStepTags(raw, _stepState, function (hint) {
@@ -940,7 +1170,9 @@ async function _consultConfirm() {
         if (displayText) displayText.textContent += clean;
         if (!_userScrolledUp) _scrollChatToBottom();
       }
-    });
+    }, guard.controller ? { signal: guard.controller.signal } : null);
+
+    if (!_isScriptRequestCurrent(guard)) return;
 
 	    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
 		      proj.script = resp.script || "";
@@ -970,6 +1202,7 @@ async function _consultConfirm() {
 	      renderScriptAnalysis();
 		    }
   } catch (e) {
+    if (!_isScriptRequestCurrent(guard) || (e && e.name === "AbortError")) return;
     if (stepEl) stepEl.hidden = true;
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
@@ -978,10 +1211,13 @@ async function _consultConfirm() {
     chatAddMsg("status", '<span class="chat-status-err">生成失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
-    _scriptGenerating = false;
-    $("btnGenScript").disabled = false;
+    if (_isScriptRequestCurrent(guard)) {
+      _scriptGenerating = false;
+      $("btnGenScript").disabled = false;
+      if (displayText) displayText.classList.remove("streaming-wave");
+    }
+    _finishScriptRequest(guard);
     if (chatBox) chatBox.removeEventListener("scroll", _onUserScroll);
-    if (displayText) displayText.classList.remove("streaming-wave");
   }
 }
 
@@ -998,7 +1234,10 @@ function _replayScriptConsultHistory() {
   if (project.script) return;  // 已走到正式剧本就不再回放咨询
   var sc = project.scriptConsult || {};
   var msgs = Array.isArray(sc.messages) ? sc.messages : [];
-  if (!msgs.length) return;
+  if (!msgs.length) {
+    if (_scriptConsultGuardEnabled() && isEmptyScriptConsultState(sc)) _clearConsultDomForEmptyProject();
+    return;
+  }
 
   var box = $("chatMessages");
   if (!box) return;
@@ -1047,19 +1286,59 @@ function _replayScriptConsultHistory() {
 function _clearScriptConsultState(originId) {
   if (!originId) return;
   _ctx.safeWriteBack(originId, function (proj) {
-    proj.scriptConsult = { messages: [], startedAt: null, confirmedAt: null };
+    proj.scriptConsult = emptyScriptConsultState();
   });
 }
 
-export async function generateScript(idea) {
+function _appendSourceAdaptHint(userMsgEl, onRewind) {
+  var bubble = userMsgEl && userMsgEl.querySelector(".chat-bubble--user");
+  if (!bubble) return null;
+  var hint = document.createElement("div");
+  hint.className = "source-adapt-hint";
+  hint.innerHTML = '已识别为原文，正在直接生成 · <button type="button" class="source-adapt-hint__rewind">改走咨询</button>';
+  bubble.appendChild(hint);
+  var btn = hint.querySelector(".source-adapt-hint__rewind");
+  if (btn) {
+    btn.addEventListener("click", function () {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      onRewind && onRewind(hint);
+    });
+  }
+  return hint;
+}
+
+function _removeSourceAdaptHint(hintEl) {
+  if (hintEl && hintEl.parentNode) hintEl.parentNode.removeChild(hintEl);
+}
+
+function _cleanupScriptGenerateAbortUI(opts) {
+  opts = opts || {};
+  if (opts.stepEl) { opts.stepEl.hidden = true; opts.stepEl.textContent = ""; }
+  if (opts.displayText) {
+    opts.displayText.textContent = "";
+    opts.displayText.style.pointerEvents = "";
+    opts.displayText.classList.remove("streaming-wave");
+  }
+  if (opts.editBtn) opts.editBtn.hidden = false;
+  if (opts.expandBtn) opts.expandBtn.hidden = false;
+  if (opts.resultCard && opts.hideResultCard) opts.resultCard.hidden = true;
+  _removeSourceAdaptHint(opts.hintEl);
+}
+
+export async function generateScript(idea, options) {
+  options = options || {};
+  var fromSource = !!options.fromSource;
   if (!idea) {
     idea = $("ideaInput").value.trim();
     if (!idea) { showToast("请输入创意", "warn"); return; }
   }
   if (!project) _ctx.createNewProject && _ctx.createNewProject();
   var originId = project.id;
-  project.idea = idea;
-  project.name = idea.slice(0, 20);
+  if (!fromSource) {
+    project.idea = idea;
+    project.name = idea.slice(0, 20);
+  }
   // 时长解析已下沉到后端 services/script_core.parse_duration_from_idea。
   // 后端 run_full_create 里，当 body 没传 durationSec 时会自动从 idea 里嗅，
   // 嗅出来的值通过 done 事件的 resp.durationSec 回传给前端，下方 safeWriteBack
@@ -1075,13 +1354,14 @@ export async function generateScript(idea) {
   $("btnGenScript").disabled = true;
   $("ideaInput").value = "";
   chatAutoResize($("ideaInput"));
-  chatAddMsg("user", escapeHtml(idea));
+  var userMsgEl = chatAddMsg("user", escapeHtml(idea));
 
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
   var editBtn = $("btnEditScript");
   var expandBtn = $("btnExpandScript");
   var resultCard = $("scriptResultCard");
+  var hideResultOnAbort = !!(fromSource && resultCard && resultCard.hidden && !(project && project.script));
   resultCard.hidden = false;
   _moveScriptResultToEnd();
   if (displayText) { displayText.textContent = ""; displayText.style.pointerEvents = "none"; displayText.classList.add("streaming-wave"); }
@@ -1104,14 +1384,26 @@ export async function generateScript(idea) {
   var _scriptStepState = { buf: "" };
   var stepEl = $("scriptStreamStep");
   if (stepEl) { stepEl.hidden = true; stepEl.textContent = ""; }
+  var abortController = fromSource && typeof AbortController !== "undefined" ? new AbortController() : null;
+  var sourceAbortToConsult = false;
+  var sourceHintEl = null;
+  if (fromSource && userMsgEl) {
+    sourceHintEl = _appendSourceAdaptHint(userMsgEl, function () {
+      sourceAbortToConsult = true;
+      _removeSourceAdaptHint(sourceHintEl);
+      if (abortController) abortController.abort();
+    });
+  }
   try {
-    var resp = await apiPostStream("/api/script/workflow/full-create", {
+    var requestBody = {
       projectId: project.id,
-      mode: "generate",
-      idea: idea,
+      mode: fromSource ? "adapt" : "generate",
       durationSec: project.scriptTargetDurationSec || null,
       creatorProfile: _ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null,
-    }, null, function (evt) {
+    };
+    if (fromSource) requestBody.sourceText = idea;
+    else requestBody.idea = idea;
+    var resp = await apiPostStream("/api/script/workflow/full-create", requestBody, null, function (evt) {
       if (evt.type === "script_chunk") {
         var raw = evt.content || "";
         var clean = consumeStreamStepTags(raw, _scriptStepState, function (hint) {
@@ -1120,7 +1412,7 @@ export async function generateScript(idea) {
         if (displayText) displayText.textContent += clean;
         if (!_userScrolledUp) _scrollChatToBottom();
       }
-    });
+    }, abortController ? { signal: abortController.signal } : null);
 
 		    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
 		      proj.script = resp.script || "";
@@ -1128,6 +1420,10 @@ export async function generateScript(idea) {
 		      proj.scriptApproved = false;
 	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
 	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
+      if (fromSource && resp.oneSentenceBrief) {
+        proj.idea = resp.oneSentenceBrief;
+        proj.name = resp.oneSentenceBrief.slice(0, 20) || proj.name;
+      }
 	      proj.assets = null;
       proj.assetsApproved = false;
       proj.shots = [];
@@ -1146,14 +1442,31 @@ export async function generateScript(idea) {
 		      chatRemoveDots();
       _showScriptConfirmArea();
       chatAddMsg("status", '<span class="chat-status-ok">剧本草稿已生成。请确认剧本后，到「风格制定」页选择画幅和模板，再生成风格圣经。</span>');
+      _removeSourceAdaptHint(sourceHintEl);
 		      renderEmotionSegments();
 	      renderScriptAnalysis();
 		    }
   } catch (e) {
+    if (e && e.name === "AbortError") {
+      _cleanupScriptGenerateAbortUI({
+        stepEl: stepEl,
+        displayText: displayText,
+        editBtn: editBtn,
+        expandBtn: expandBtn,
+        resultCard: resultCard,
+        hideResultCard: hideResultOnAbort,
+        hintEl: sourceHintEl,
+      });
+      if (sourceAbortToConsult) {
+        await _consultTurn(idea, { skipUserBubble: true });
+      }
+      return;
+    }
     if (stepEl) stepEl.hidden = true;
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
+    _removeSourceAdaptHint(sourceHintEl);
     var errText = ((e && e.message) || e).toString().slice(0, 150);
     chatAddMsg("status", '<span class="chat-status-err">生成失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
@@ -1212,7 +1525,7 @@ export function startNewScript() {
     proj.shotsApproved = false;
     proj.idea = "";
     // 新一轮创作 → 咨询历史也清掉，避免下一轮看到上次的对话
-    proj.scriptConsult = { messages: [], startedAt: null, confirmedAt: null };
+    proj.scriptConsult = emptyScriptConsultState();
   });
   var chatBox = $("chatMessages");
   if (chatBox) {
@@ -1260,31 +1573,25 @@ export async function extractStyleBible(options) {
         throw new Error(_styleBibleErrorText(resp, "未知错误"));
       }
     }
-    chatRemoveDots();
-		    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-	      _applyStyleBibleResponse(proj, resp);
-	      if (proj.assets) {
+			    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+		      _applyStyleBibleResponse(proj, resp);
+		      if (proj.assets) {
 	        if (!proj._staleFlags) proj._staleFlags = {};
 	        proj._staleFlags["assets"] = true;
 	      }
-		    });
-		    if (isCurrent) {
-		      if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
-		      chatAddMsg("status", '<span class="chat-status-ok">风格已重新提取，请到「风格制定」页检查</span>');
-		      _showScriptConfirmArea();
-		    }
-		  } catch (e) {
+			    });
+			    if (isCurrent) {
+			      if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
+			    }
+			  } catch (e) {
     if (e && e.status === 409) throw e;
-	  chatRemoveDots();
     var errText = ((e && e.message) || e).toString().slice(0, 150);
     _ctx.safeWriteBack(originId, function (proj) {
       proj.styleBibleStatus = "failed";
       proj.styleBibleError = errText;
     });
-		    _showScriptConfirmArea();
-		    chatAddMsg("status", '<span class="chat-status-err">风格提取失败: ' + escapeHtml(errText) + '，请到「风格制定」页重试</span>');
     throw e;
-		  }
+			  }
 }
 
 export async function confirmScript() {
@@ -1315,6 +1622,9 @@ export async function confirmScript() {
       projectId: originId,
       script: finalScript,
     });
+    if (_ctx.reloadProjectFromServer) {
+      await _ctx.reloadProjectFromServer();
+    }
   } catch (e) {
     // 后端拒绝（脚本空 / 项目不存在等）——回滚本地 scriptApproved
     _ctx.safeWriteBack(originId, function (proj) { proj.scriptApproved = false; });

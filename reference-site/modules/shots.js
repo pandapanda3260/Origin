@@ -38,11 +38,21 @@ function emotionBadgeHtml(emotion, intensity) { return _ctx.emotionBadgeHtml ? _
 /* ================================================================
    Shots page
    ================================================================ */
+function _hasAnyAssetData() {
+  if (!project || !project.assets) return false;
+  var assets = project.assets;
+  return !!(
+    (Array.isArray(assets.characters) && assets.characters.length) ||
+    (Array.isArray(assets.scenes) && assets.scenes.length) ||
+    (Array.isArray(assets.props) && assets.props.length)
+  );
+}
+
 export function refreshShotsPage() {
   _syncRefs();
   var needScript = $("shotsNeedScript");
   var ready = $("shotsReady");
-  if (!project || !project.assetsApproved) {
+  if (!project || !_hasAnyAssetData()) {
     if (needScript) needScript.hidden = false;
     if (ready) ready.hidden = true;
     var wrap = $("shotListWrap");
@@ -308,8 +318,8 @@ export async function generateShots(opts) {
   var existingBatchId = (opts && opts.resumeBatchId) || null;
 
   if (!existingBatchId) {
-    if (!project || !project.assetsApproved) {
-      showToast("请先完成资产库确认", "warn");
+    if (!project || !_hasAnyAssetData()) {
+      showToast("请先完成资产分析", "warn");
       return;
     }
   }

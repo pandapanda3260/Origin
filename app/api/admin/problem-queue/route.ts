@@ -5,6 +5,7 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { ADMIN_THRESHOLDS, hoursAgoIso, minutesAgoIso } from '@/lib/admin-thresholds';
 import { getModelRoutingStatus } from '@/lib/model-routing';
+import { modelMetricsSnapshot } from '@/lib/observability-events';
 import { refundTaskLedger, transitionTaskStatus } from '@/lib/durable-tasks';
 import { costForBatchType, finalizeBatchFromTasks, taskChargeRef } from '@/lib/batch-task-accounting';
 import {
@@ -167,17 +168,29 @@ export async function GET(req: NextRequest) {
   const abnormalAccounts = [...negativeBalances, ...refundAnomalies, ...failureRows].slice(0, 50);
 
   const status = getModelRoutingStatus(null);
+  const modelMetrics = modelMetricsSnapshot(10);
   const keyPoolAlerts = (['brain', 'structured', 'styleBible', 'profileDerive', 'continuity', 'image', 'video'] as const)
     .map((slot) => {
       const cfg = status[slot];
+      const metric = aggregateSlotMetrics(modelMetrics.rows.filter((row: any) => String(row.slot || '') === slot));
+      const metricAlert = metric.failed > 0 || metric.rateLimited > 0 || metric.fallbackUsed > 0;
       return {
         slot,
         mode: cfg.mode,
         source: cfg.source,
         provider: cfg.provider,
         model: cfg.model,
-        alert: cfg.mode !== 'real',
-        reason: cfg.mode !== 'real' ? 'not_configured_or_fallback' : '',
+        metrics: metric,
+        alert: cfg.mode !== 'real' || metricAlert,
+        reason: cfg.mode !== 'real'
+          ? 'not_configured_or_fallback'
+          : metric.fallbackUsed > 0
+            ? `fallback_used:${metric.fallbackUsed}`
+            : metric.rateLimited > 0
+              ? `rate_limited:${metric.rateLimited}`
+              : metric.failed > 0
+                ? `failed:${metric.failed}`
+                : '',
       };
     })
     .filter((item) => item.alert);
@@ -191,6 +204,14 @@ export async function GET(req: NextRequest) {
     keyPoolAlerts,
     generatedAt: new Date().toISOString(),
   });
+}
+
+function aggregateSlotMetrics(rows: any[]) {
+  return {
+    failed: rows.reduce((sum, row) => sum + Number(row.failed || 0), 0),
+    rateLimited: rows.reduce((sum, row) => sum + Number(row.rateLimited || 0), 0),
+    fallbackUsed: rows.reduce((sum, row) => sum + Number(row.fallbackUsed || 0), 0),
+  };
 }
 
 function bulkFailure(taskId: string, reason: BulkRequeueFailureReason, detail?: string) {

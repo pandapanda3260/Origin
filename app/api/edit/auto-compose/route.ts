@@ -8,6 +8,7 @@ import {
   computeSegmentFingerprint,
   createComposeRun,
   hasActiveComposeRun,
+  markExportFailureInEditData,
   pushEdlHistory,
   updateComposeRun,
   upsertComposeRun,
@@ -81,15 +82,35 @@ function failRun(args: {
   code: string;
   message: string;
   recoverableFrom: RecoverableFrom;
+  exportTaskId?: string;
 }) {
   if (args.runId) {
-    patchRun(args.projectId, args.userId, args.runId, {
-      status: 'failed',
-      phase: args.phase,
-      recoverableFrom: args.recoverableFrom,
-      errorCode: args.code,
-      errorMessage: args.message,
+    patchProjectForUser(args.projectId, args.userId, (current) => {
+      let editData = { ...(current.editData || {}) };
+      if (args.exportTaskId) {
+        editData = markExportFailureInEditData(editData, {
+          exportTaskId: args.exportTaskId,
+          errorCode: args.code,
+          errorMessage: args.message,
+        });
+      }
+      const updated = updateComposeRun(editData, args.runId!, {
+        status: 'failed',
+        phase: args.phase,
+        recoverableFrom: args.recoverableFrom,
+        errorCode: args.code,
+        errorMessage: args.message,
+      });
+      return { editData: updated.editData };
     });
+  } else if (args.exportTaskId) {
+    patchProjectForUser(args.projectId, args.userId, (current) => ({
+      editData: markExportFailureInEditData(current.editData || {}, {
+        exportTaskId: args.exportTaskId!,
+        errorCode: args.code,
+        errorMessage: args.message,
+      }),
+    }));
   }
   args.writer.fail({
     phase: args.phase,
@@ -532,6 +553,7 @@ export async function POST(req: NextRequest) {
           code: 'EXPORT_TASK_MISSING',
           message: '导出任务记录消失',
           recoverableFrom: 'export',
+          exportTaskId,
         });
         return;
       }
@@ -574,6 +596,7 @@ export async function POST(req: NextRequest) {
           code: 'EXPORT_FAILED',
           message: row.error_msg || '导出失败',
           recoverableFrom: 'export',
+          exportTaskId,
         });
         return;
       }
@@ -589,6 +612,7 @@ export async function POST(req: NextRequest) {
       code: 'EXPORT_TIMEOUT',
       message: '导出超时，请稍后重试',
       recoverableFrom: 'export',
+      exportTaskId,
     });
   });
 }

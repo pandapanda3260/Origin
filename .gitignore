@@ -20,3 +20,4 @@ reference-site/__pycache__/
 .claude/
 .playwright-mcp/
 tsconfig.tsbuildinfo
+tmp/

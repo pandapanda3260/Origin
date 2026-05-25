@@ -31,11 +31,14 @@ function loadVideoGen() {
     if (id.startsWith('node:')) return require(id);
     if (id === '@napi-rs/canvas') return require(id);
     if (id === './llm') return { resolveLLMConfig: () => ({}) };
+    if (id === './model-routing') return { recordModelCallEvent: () => {} };
     if (id === './db') return { getDb: () => ({ prepare: () => ({ run() {}, get() {} }) }) };
     if (id === './ffmpeg') return { makeBlackVideo: async () => {}, extractCover: async () => {} };
     if (id === './image-gen') return { generateImage: async () => ({}) };
     if (id === './signed-asset-url') return { buildSignedVideoUrl: () => ({ url: '/video' }) };
     if (id === './projects-db') return { patchProjectForUser: () => null };
+    if (id === './asset-library') return {};
+    if (id === './env') return { getExternalEnvValue: () => undefined };
     if (id === './panel-selection') return {};
     if (id === './proxy-fetch') return { fetchViaProxy: async () => ({ ok: true, json: async () => ({}) }) };
     if (id === './video-prompt-runtime') {
@@ -137,6 +140,10 @@ async function run() {
     assert(mod.normalizeSeedanceResolution() === '720p', 'missing quality defaults to 720p');
     assert(mod.normalizeSeedanceResolution('1080p') === '1080p', '1080p is accepted');
     assert(mod.normalizeSeedanceResolution('720p') === '720p', '720p is accepted');
+    assert(mod.normalizeGenerateAudio() === true, 'missing audio switch defaults to audio on');
+    assert(mod.normalizeGenerateAudio(false) === false, 'false disables audio');
+    assert(mod.normalizeGenerateAudio('0') === false, 'string 0 disables audio');
+    assert(mod.normalizeGenerateAudio('1') === true, 'string 1 enables audio');
     let badResolutionRejected = false;
     try {
       mod.normalizeSeedanceResolution('4k');
@@ -199,10 +206,23 @@ async function run() {
       resolution: '1080p',
     });
     assert(body.resolution === '1080p', 'first-last body uses requested 1080p resolution');
+    assert(body.generate_audio === true, 'first-last body defaults to audio generation on');
     assert(body.content[1].image_url.url.startsWith('data:image/jpeg;base64,'), 'first frame body image is compressed jpeg');
     assert(body.content[2].image_url.url.startsWith('data:image/jpeg;base64,'), 'last frame body image is compressed jpeg');
     assert(body.__submittedImages.first.width === 640, 'first frame audit metadata is attached');
     assert(body.__submittedImages.last.submittedBytes < body.__submittedImages.last.originalBytes, 'last frame metadata records compression');
+
+    const silentBody = await mod.buildSeedanceFirstLastFrameBody({
+      model: 'doubao-seedance-2-0-260128',
+      prompt: 'test prompt',
+      firstFramePath: sourcePath,
+      lastFramePath: sourcePath,
+      ratio: '16:9',
+      durationSec: 5,
+      resolution: '1080p',
+      generateAudio: false,
+    });
+    assert(silentBody.generate_audio === false, 'first-last body respects audio off');
     console.log('✓ video submit image compression');
   } finally {
     if (prevMaxEdge == null) delete process.env.VIDEO_SUBMIT_IMAGE_MAX_EDGE;

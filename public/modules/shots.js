@@ -35,6 +35,7 @@ function _syncRefs() {
 }
 
 function saveProject() { if (_ctx.saveProject) return _ctx.saveProject(); }
+function flushServerSave() { if (_ctx.flushServerSave) return _ctx.flushServerSave(); return saveProject(); }
 function _safeWriteBack(id, fn, serverVersion) { return _ctx.safeWriteBack ? _ctx.safeWriteBack(id, fn, serverVersion) : false; }
 function switchPage(p) { if (_ctx.switchPage) _ctx.switchPage(p); }
 function formatCreatorProfileForApi() { return _ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null; }
@@ -96,6 +97,16 @@ function _shotPlanReasonLabel(reason) {
   return map[reason] || reason || "上游变化";
 }
 
+function _hasAnyAssetData() {
+  if (!project || !project.assets) return false;
+  var assets = project.assets;
+  return !!(
+    (Array.isArray(assets.characters) && assets.characters.length) ||
+    (Array.isArray(assets.scenes) && assets.scenes.length) ||
+    (Array.isArray(assets.props) && assets.props.length)
+  );
+}
+
 function _getShotPlanActionState() {
   var hasShots = !!(project && Array.isArray(project.shots) && project.shots.length);
   var status = (project && project.shotPlanStatus) || "";
@@ -103,11 +114,11 @@ function _getShotPlanActionState() {
   var reasons = project && Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
   var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
 
-  if (!project || !project.assetsApproved) {
+  if (!project || !_hasAnyAssetData()) {
     return {
       label: "生成镜头计划",
       disabled: true,
-      hint: "请先完成资产库确认",
+      hint: "请先完成资产分析",
     };
   }
   if (status === "generating") {
@@ -406,10 +417,12 @@ export function refreshShotsPage() {
   var needScript = $("shotsNeedScript");
   var ready = $("shotsReady");
   var topActions = $("shotsTopActions");
-  if (!project || !project.assetsApproved) {
+  if (!project || !_hasAnyAssetData()) {
     if (needScript) needScript.hidden = false;
     if (ready) ready.hidden = true;
     if (topActions) topActions.hidden = true;
+    var actionBar = $("imagesActionBar");
+    if (actionBar) actionBar.hidden = true;
     var wrap = $("shotListWrap");
     if (wrap) wrap.innerHTML = "";
     var ca = $("shotsConfirmArea");
@@ -447,10 +460,12 @@ export function renderShotList() {
     var emptySummaryMeta = $("shotSummaryMeta");
     if (emptySummaryMeta) emptySummaryMeta.textContent = "";
     var ca = $("shotsConfirmArea"); if (ca) ca.hidden = true;
+    var emptyActionBar = $("imagesActionBar"); if (emptyActionBar) emptyActionBar.hidden = true;
     _refreshShotPlanActionState();
     return;
   }
   _refreshShotPlanActionState();
+  var actionBar = $("imagesActionBar"); if (actionBar) actionBar.hidden = false;
 
   var shotPlanStatus = project.shotPlanStatus || "";
   var shotPlanNeedsAttention = shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown" || shotPlanStatus === "generating" || shotPlanStatus === "failed" || (project._staleFlags && project._staleFlags.shotPlan);
@@ -482,13 +497,6 @@ export function renderShotList() {
     wrap.appendChild(spb);
   }
 
-  var hasShotStale = project.shots.some(function (_, si) { return _isStale("shot_" + si); });
-  if (hasShotStale) {
-    var _ssb = document.createElement("div");
-    _ssb.className = "upstream-stale-banner mx-8";
-    _ssb.innerHTML = '<span class="material-symbols-outlined">warning</span>剧本/资产已修改，分镜可能需要重新生成以保持一致性';
-    wrap.appendChild(_ssb);
-  }
 
   var totalSec = 0;
   project.shots.forEach(function (s) { totalSec += (s.duration || 4); });
@@ -547,7 +555,7 @@ export function renderShotList() {
           '</div>' +
         '</div>' +
         '<div class="shot-material-slot" id="shotMaterialSlot_' + idx + '" data-shot-idx="' + idx + '">' +
-          '<div class="shot-material-slot-empty">确认镜头表后显示生成素材区</div>' +
+          '<div class="shot-material-slot-empty">生成镜头计划后显示生成素材区</div>' +
         '</div>' +
         '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />' +
       '</div>' +
@@ -577,7 +585,10 @@ export function renderShotList() {
     });
   });
 
-  var ca2 = $("shotsConfirmArea"); if (ca2) ca2.hidden = false;
+  // 注：此前这里有 `shotsConfirmArea.hidden = true` 的越权 hide，会在镜头计划
+  // 生成完成后把"分镜图已确认"按钮藏掉。该容器的显隐由 storyboard.js
+  // 的 _syncMergedStoryboardConfirmState 独立管理（通过 checkImagesConfirm 触发），
+  // 这里不再越权操作。renderShotList 内当 shots 为空时仍会在 line 462 隐藏（合理）。
   _renderScriptRefPanel();
   _shotParaMap = _buildShotScriptMapping();
   _bindShotHoverHighlight();
@@ -724,8 +735,8 @@ export async function generateShots(opts) {
   var existingBatchId = (opts && opts.resumeBatchId) || null;
 
   if (!existingBatchId) {
-    if (!project || !project.assetsApproved) {
-      showToast("请先完成资产库确认", "warn");
+    if (!project || !_hasAnyAssetData()) {
+      showToast("请先完成资产分析", "warn");
       return;
     }
   }
@@ -773,6 +784,7 @@ export async function generateShots(opts) {
   }
 
   var finished = false;
+  var finishingFromServer = null;
   var pollTimer = null;
   function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
   function finish() {
@@ -781,6 +793,63 @@ export async function generateShots(opts) {
     _stopPoll();
     if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
     _refreshShotPlanActionState();
+  }
+
+  function _completedShotsFromSnapshot(snap) {
+    var tasks = snap && Array.isArray(snap.tasks) ? snap.tasks : [];
+    for (var i = 0; i < tasks.length; i++) {
+      var result = tasks[i] && tasks[i].result;
+      var patch = result && result.patch;
+      if (patch && patch.type === "shots" && Array.isArray(patch.value) && patch.value.length) {
+        return patch.value;
+      }
+    }
+    return null;
+  }
+
+  async function _finishAfterServerSync(snap) {
+    if (finished) return;
+    if (finishingFromServer) return finishingFromServer;
+    finishingFromServer = (async function () {
+      var serverShots = null;
+      try {
+        var resp = await fetch("/api/projects/" + encodeURIComponent(originId), { headers: getAuthHeaders() });
+        if (resp.ok) {
+          var p = await resp.json();
+          if (p && p.id === originId && Array.isArray(p.shots)) {
+            serverShots = p.shots;
+            _safeWriteBack(originId, function (proj) { _applyShotPlanServerProjectSnapshot(proj, p); });
+          }
+        }
+      } catch (e) {
+        console.warn("[Shots] reload after completion failed:", e);
+      }
+
+      if (!serverShots || !serverShots.length) {
+        serverShots = _completedShotsFromSnapshot(snap);
+        if (serverShots && serverShots.length) {
+          _safeWriteBack(originId, function (proj) {
+            proj.shots = serverShots;
+            proj.shotsApproved = false;
+            proj.imagesApproved = false;
+            proj.videoPromptsApproved = false;
+            proj.storyboards = _makeSingleShotStoryboards(serverShots);
+            proj.videoTasks = [];
+            proj.currentStep = Math.max(proj.currentStep || 0, 3);
+            proj.frameWorkflowSchemaVersion = 3;
+          });
+        }
+      }
+
+      if (serverShots && serverShots.length) {
+        _setShotsProgress(100, "镜头设计完成", "共生成 " + serverShots.length + " 个镜头");
+        setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 1200);
+        renderShotList();
+        showToast("镜头设计完成：共 " + serverShots.length + " 个镜头", "success");
+      }
+      finish();
+    })();
+    return finishingFromServer;
   }
 
   // 兜底轮询：每 5 秒主动 GET /api/batch/<id> 拿权威状态。
@@ -795,20 +864,7 @@ export async function generateShots(opts) {
       if (!snap || finished) return;
       if (snap.status === "completed") {
         console.log("[Shots] poll detected batch completed → reload project");
-        try {
-          var resp = await fetch("/api/projects/" + encodeURIComponent(originId), { headers: getAuthHeaders() });
-          if (resp.ok) {
-            var p = await resp.json();
-            if (p && p.id === originId && Array.isArray(p.shots)) {
-              _safeWriteBack(originId, function (proj) { _applyShotPlanServerProjectSnapshot(proj, p); });
-              _setShotsProgress(100, "镜头设计完成", "共生成 " + p.shots.length + " 个镜头");
-              setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 2000);
-              renderShotList();
-              showToast("镜头设计完成：共 " + p.shots.length + " 个镜头", "success");
-            }
-          }
-        } catch (e) { console.warn("[Shots] reload after poll failed:", e); }
-        finish();
+        await _finishAfterServerSync(snap);
       } else if (snap.status === "failed" || snap.status === "cancelled" || snap.status === "partial") {
         var taskErr = "";
         if (Array.isArray(snap.tasks)) {
@@ -898,7 +954,10 @@ export async function generateShots(opts) {
         isCurrent = _safeWriteBack(originId, function (proj) {
           proj.shots = arr;
           proj.shotsApproved = false;
+          proj.imagesApproved = false;
+          proj.videoPromptsApproved = false;
           proj.storyboards = _makeSingleShotStoryboards(arr);
+          proj.videoTasks = [];
           proj.frameWorkflowSchemaVersion = 3;
         }, data && data.serverVersion);
       }
@@ -917,6 +976,7 @@ export async function generateShots(opts) {
         );
         setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 2000);
         renderShotList();
+        finish();
       }
     },
     onTaskFailed: function (data) {
@@ -929,7 +989,15 @@ export async function generateShots(opts) {
       }
       showToast("镜头设计失败: " + _diagnoseApiError(errText), "error");
     },
-    onBatchCompleted: function () { finish(); },
+    onBatchCompleted: async function (data) {
+      var snap = null;
+      try {
+        snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
+      } catch (e) {
+        console.warn("[Shots] completion snapshot reload failed:", e);
+      }
+      await _finishAfterServerSync(snap || data);
+    },
     onClose: function () {
       if (pollTimer) console.warn("[Shots] SSE closed; polling fallback remains active");
     },
@@ -945,9 +1013,9 @@ export function attachShotsBatch(batchId) {
 
 export function saveShotEdits() {
   _syncRefs();
-  if (!project || !project.shots) return;
+  if (!project || !project.shots) return false;
   var wrap = $("shotListWrap");
-  if (!wrap) return;
+  if (!wrap) return false;
   var changed = [];
   wrap.querySelectorAll(".sc-card[data-shot-idx]").forEach(function (card) {
     var idx = parseInt(card.dataset.shotIdx, 10);
@@ -962,19 +1030,37 @@ export function saveShotEdits() {
     if (shotChanged) changed.push(idx);
   });
   if (changed.length) changed.forEach(function (idx) { _markDownstreamStale("shot", { idx: idx }); });
-  saveProject();
+  if (changed.length) saveProject();
+  return changed.length > 0;
 }
 
-export function confirmShots() {
+export async function acceptShotPlanForStoryboard() {
   _syncRefs();
-  if (!project || !project.shots || !project.shots.length) { showToast("请先生成分镜", "warn"); return; }
-  saveShotEdits();
+  if (!project || !project.shots || !project.shots.length) {
+    showToast("请先生成镜头计划", "warn");
+    return false;
+  }
+  var changed = saveShotEdits();
+
+  if (!changed && project.shotsApproved === true && Number(project.currentStep || 0) >= 4) {
+    return true;
+  }
+
+  var prevShotsApproved = project.shotsApproved;
+  var prevCurrentStep = project.currentStep;
   project.shotsApproved = true;
-  project.currentStep = Math.max(project.currentStep, 4);
-  saveProject();
-  switchPage("images");
-  _scrollToStoryboardWorkbench();
-  showToast("镜头表已确认，已切到分镜工作区", "success");
+  project.currentStep = Math.max(project.currentStep || 0, 4);
+
+  try {
+    var saved = await flushServerSave();
+    if (saved && saved.ok === false) throw new Error("project save rejected");
+    return true;
+  } catch (e) {
+    project.shotsApproved = prevShotsApproved;
+    project.currentStep = prevCurrentStep;
+    showToast("保存镜头表失败，请稍后重试", "error");
+    return false;
+  }
 }
 
 export function handleShotAction(e) {

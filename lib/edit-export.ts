@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import type { UserRow } from './db';
 import { getDb } from './db';
 import { addBgm, burnSubtitles, concatClips, mixTransitionSfx, probeDurationSec } from './ffmpeg';
@@ -12,6 +12,7 @@ import { recordKnowledgeContextBestEffort } from './knowledge/context-db';
 import { getDataDir } from './runtime-paths';
 import { isExportEnabled } from './system-config';
 import { projectHiddenContentReferences } from './content-flags';
+import { createAssetRecord, hashFile, localAssetUri } from './asset-library';
 
 const DATA_DIR = getDataDir();
 const EXPORTS_DIR = join(DATA_DIR, 'exports');
@@ -245,6 +246,7 @@ export function markExportTaskIgnored(args: {
         amount: CREDIT_PRICES.export,
         reason: `edit.export.cancelled:${String(args.reason || 'replaced').slice(0, 120)}`,
         refId: taskId,
+        refundRefId: `export:${taskId}`,
       });
     } catch (e) {
       console.error('[export] cancel refund failed:', taskId, e);
@@ -317,6 +319,7 @@ export async function startEditExport(args: {
         amount: CREDIT_PRICES.export,
         reason: `edit.export.failed:${reason}`,
         refId: exportId,
+        refundRefId: `export:${exportId}`,
       });
     } catch (refErr) {
       console.error('[export] refund failed:', exportId, refErr);
@@ -531,6 +534,24 @@ async function doExport(opts: {
     ).run(exportId);
     if (updateInfo.changes > 0) {
       try {
+        createAssetRecord({
+          assetId: exportId,
+          ownerId: userId,
+          projectId,
+          assetKind: 'video',
+          source: 'edit_export',
+          stage: 'edit_export',
+          fileUri: localAssetUri('exports', userId, basename(outputPath) || `${exportId}.mp4`),
+          thumbUri: null,
+          fileHash: hashFile(outputPath),
+          byteSize: stat.size,
+          durationMs: undefined,
+          makeCurrent: false,
+        });
+      } catch (assetErr) {
+        console.warn('[export] asset library indexing skipped:', exportId, assetErr);
+      }
+      try {
         patchProjectForUser(projectId, userId, (current) => {
           const editData = { ...(current.editData || {}) };
           const currentTaskId = String(editData.exportTaskId || '');
@@ -559,7 +580,7 @@ async function doExport(opts: {
     if (cur?.status === 'cancelled') return;
     const updateInfo = db.prepare(
       `UPDATE exports SET status='failed', error_msg=?,
-       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status != 'cancelled'`,
+       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
     ).run(msg.slice(0, 1000), exportId);
     if (updateInfo.changes > 0) {
       try {

@@ -3,7 +3,7 @@
  */
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,
-  getAuthToken, getAuthHeaders, checkAuth, fetchAssetSignedUrl } from './modules/utils.js';
+  getAuthToken, getAuthHeaders, checkAuth, fetchAssetSignedUrl } from './modules/utils.js?v=102';
 import { appStore } from './modules/store.js';
 import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js';
 import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from './modules/edit.js';
@@ -20,14 +20,15 @@ import { initEpisodes, syncEpisodesProject,
   _renderEpisodeTabs, _openNewEpisodeDialog, _createNewEpisode } from './modules/episodes.js';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
-  syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments } from './modules/videoTasks.js';
+  syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
+  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
   refineVideoPrompt, handleVideoPromptAction,
   getVpSelectedGroup, setVpSelectedGroup } from './modules/videoPrompts.js';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
-  generateShots, saveShotEdits, confirmShots, handleShotAction,
+  generateShots, acceptShotPlanForStoryboard, handleShotAction,
   _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
@@ -35,7 +36,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches } from './modules/storyboard.js';
+  reattachStoryboardBatches, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=117';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -54,7 +55,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js';
+  _openLightbox } from './modules/assets.js?v=107';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
 import { mountPixelCard } from './modules/pixel_card.js';
@@ -164,6 +165,10 @@ var _scriptEditInitialText = "";
   var _coreNavigationBound = false;
   var onlineEditorConfig = null;
   var _onlineEditorConfigPromise = null;
+  var _createProjectInFlight = false;
+  var _lastMaybeCreatedProject = null;
+  var CLIENT_FEATURES = {};
+  var _clientConfigPollTimer = null;
 
   /* ================================================================
      持久化：设置
@@ -550,7 +555,7 @@ var _scriptEditInitialText = "";
 
     var hideIds = [
       "assetsContent", "shotsConfirmArea",
-      "imagesConfirmArea", "imagesActionBar",
+      "imagesActionBar",
     ];
     hideIds.forEach(function (id) {
       var el = $(id);
@@ -865,15 +870,36 @@ var _scriptEditInitialText = "";
 
   async function _loadClientConfig() {
     try {
-      var resp = await fetch("/api/config/client", { headers: _getAuthHeaders() });
+      var resp = await fetch("/api/config/client", { headers: _getAuthHeaders(), cache: "no-store" });
       if (!resp.ok) return;
       var cfg = await resp.json();
+      if (cfg && cfg.features && typeof cfg.features === "object") CLIENT_FEATURES = cfg.features;
       if (cfg && typeof cfg.maxProjects === "number") MAX_PROJECTS = cfg.maxProjects;
       if (cfg && typeof cfg.maxConcurrent === "number") MAX_CONCURRENT = cfg.maxConcurrent;
       if (cfg && typeof cfg.maxTasksTotal === "number") MAX_TASKS_TOTAL = cfg.maxTasksTotal;
     } catch (e) {
       console.warn("[ClientConfig] fetch failed, keeping defaults:", e);
     }
+  }
+
+  function _startClientConfigPoll() {
+    if (_clientConfigPollTimer) return;
+    _clientConfigPollTimer = setInterval(function () {
+      _loadClientConfig();
+    }, 60000);
+  }
+
+  function _clientFeatureEnabled(key, fallback) {
+    if (!CLIENT_FEATURES || typeof CLIENT_FEATURES !== "object") return fallback !== false;
+    if (Object.prototype.hasOwnProperty.call(CLIENT_FEATURES, key)) return CLIENT_FEATURES[key] !== false;
+    return fallback !== false;
+  }
+
+  function _newClientRequestId() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+    } catch (_) {}
+    return "cr_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
   }
 
   /**
@@ -893,6 +919,45 @@ var _scriptEditInitialText = "";
    * 返回 true = 成功，false = 失败（配额 / 网络）。
    */
   async function createNewProject(name) {
+    if (_createProjectInFlight) {
+      showToast("正在创建任务，请稍候", "info");
+      return false;
+    }
+    _createProjectInFlight = true;
+    try {
+      return await _createNewProjectLocked(name);
+    } finally {
+      _createProjectInFlight = false;
+    }
+  }
+
+  async function _recoverMaybeCreatedProject(name) {
+    var marker = _lastMaybeCreatedProject;
+    if (!marker || Date.now() - marker.at > 60000) {
+      _lastMaybeCreatedProject = null;
+      return false;
+    }
+    var list = await getProjectListFromServer();
+    var expected = String(name || marker.name || "新项目");
+    var hit = (list || []).find(function (item) {
+      return item && marker.clientRequestId && item.clientRequestId === marker.clientRequestId;
+    });
+    if (!hit) {
+      hit = (list || []).find(function (item) {
+        if (!item || !(item.name === expected || item.title === expected)) return false;
+        var createdMs = Date.parse(item.createdAt || "");
+        return Number.isFinite(createdMs) ? createdMs >= marker.at - 60000 : true;
+      });
+    }
+    if (!hit || !hit.id) return false;
+    _lastMaybeCreatedProject = null;
+    showToast("检测到刚才的任务已创建，正在打开", "info");
+    await _activateProjectContext(hit.id, { resetViewState: true, refreshPages: true, showSkeleton: true });
+    return true;
+  }
+
+  async function _createNewProjectLocked(name) {
+    if (await _recoverMaybeCreatedProject(name)) return true;
     // Phase 5.9：配额检查以服务器列表为准，不再读 localStorage。
     // 历史症状：管理员等 legacy 用户的 `sw_project_list` 残留 10 条老元数据
     // 但服务器端 `data/projects/<uid>/` 为空，前端误判"已满 10 个"挡掉新建。
@@ -916,8 +981,10 @@ var _scriptEditInitialText = "";
     }
 
     var epId = "ep_" + Date.now();
+    var clientRequestId = _newClientRequestId();
     var draft = {
       id: "proj_" + Date.now(),
+      clientRequestId: clientRequestId,
       name: name || "新项目",
       createdAt: Date.now(),
       currentStep: 1,
@@ -968,9 +1035,13 @@ var _scriptEditInitialText = "";
         console.warn("[createNewProject] POST /api/projects quota 409:", quotaErr);
       } else {
         console.warn("[createNewProject] POST /api/projects non-2xx:", resp.status);
+        if (resp.status >= 500) {
+          _lastMaybeCreatedProject = { name: name || "新项目", clientRequestId: clientRequestId, at: Date.now() };
+        }
       }
     } catch (e) {
       console.warn("[createNewProject] POST /api/projects failed:", e);
+      _lastMaybeCreatedProject = { name: name || "新项目", clientRequestId: clientRequestId, at: Date.now() };
     }
 
     // Phase 5.9：后端配额拒绝优先级高——前端 UX 检查可能因为 list 不一致漏判。
@@ -983,18 +1054,24 @@ var _scriptEditInitialText = "";
       return false;
     }
 
-    project = serverProj;
-    try { localStorage.setItem(_uPrefix + "sw_last_project_id", project.id); } catch (_) {}
-
-    syncEditProject(project);
-    syncTasksProject(project);
-    syncVideoTasksProject(project);
-    syncVideoPromptsProject(project);
-    syncShotsProject(project);
-    syncStoryboardProject(project);
-    syncScriptProject(project);
-    syncAssetsProject(project);
-    addProjectToList(project);
+    if (_clientFeatureEnabled("projectActivationGuard", true)) {
+      addProjectToList(serverProj);
+      var activated = await _activateProjectContext(serverProj.id, {
+        resetViewState: true,
+        refreshPages: true,
+        showSkeleton: true,
+      });
+      if (!activated || !project || project.id !== serverProj.id) {
+        showToast("任务已创建，但打开失败，请刷新后重试", "warn");
+        return false;
+      }
+    } else {
+      project = serverProj;
+      try { localStorage.setItem(_uPrefix + "sw_last_project_id", project.id); } catch (_) {}
+      _syncProjectModules(project);
+      addProjectToList(project);
+      refreshAllPages();
+    }
     _ovProjectTasks = _ovProjectTasks.filter(function (t) { return t && t.projectId !== project.id; });
     _ovProjectTasks.unshift(_ovProjectTaskFromSummary({ id: project.id, name: project.name, title: project.title, createdAt: project.createdAt, updatedAt: project.updatedAt, status: project.status }, project));
     _ovInvalidateProjectTasks(true);
@@ -2441,6 +2518,49 @@ var _scriptEditInitialText = "";
     _ovTaskState.selectedId = tasks.length ? tasks[0].id : "";
   }
 
+  function _ovHasUsableStyleBible(proj) {
+    if (!proj || !proj.styleBible || !_styleBibleHasContent(proj.styleBible)) return false;
+    if (proj.styleBibleStatus === "ready") return true;
+    if (!proj.styleBibleStatus) return true;
+    return false;
+  }
+
+  function _ovProjectCanEnterEdit(proj) {
+    if (!proj) return false;
+    var readiness = proj.editData && proj.editData.readiness;
+    if (readiness && readiness.canEnterEdit === true) return true;
+    var timeline = proj.editData && proj.editData.edl && Array.isArray(proj.editData.edl.timeline)
+      ? proj.editData.edl.timeline
+      : [];
+    if (timeline.length > 0) return true;
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    return sbs.some(function (sb) { return sb && sb.importedToEdit === true; });
+  }
+
+  function _ovContinuePageForProject(proj) {
+    if (!proj || !proj.script || !proj.scriptApproved) return "script";
+    if (!_ovHasUsableStyleBible(proj)) return "style";
+    if (!proj.assetsApproved) return "assets";
+    if (!proj.shotsApproved) return "shots";
+    if (!proj.imagesApproved) return "images";
+    if (!proj.videoPromptsApproved) return "prompts";
+    if (_ovProjectCanEnterEdit(proj)) return "edit";
+    return "batch";
+  }
+
+  function _ovContinuePageLabel(page) {
+    return {
+      script: "剧本",
+      style: "风格",
+      assets: "资产",
+      shots: "镜头",
+      images: "分镜",
+      prompts: "提示词",
+      batch: "片段",
+      edit: "剪辑",
+    }[page] || "流程";
+  }
+
   function _ovRenderTabs(counts) {
     var map = { ovTabAll: counts.all, ovTabRunning: counts.running, ovTabDone: counts.done, ovTabFailed: counts.failed, ovTabPending: counts.pending };
     Object.keys(map).forEach(function (id) { var el = $(id); if (el) el.textContent = map[id]; });
@@ -2469,6 +2589,7 @@ var _scriptEditInitialText = "";
           '<button type="button" class="vtd-title-edit-btn" data-ov-action="rename" title="编辑标题" aria-label="编辑标题"' + renameDisabled + '><span class="material-symbols-outlined">edit</span></button>' +
         '</div>';
     var activating = _ovTaskState.activatingId === t.id;
+    var continueDisabled = t.projectId ? "" : " disabled";
     return '' +
       '<article class="vtd-task-card' + (selected ? ' is-selected' : '') + (activating ? ' is-activating' : '') + '" data-task-id="' + escapeHtml(t.id) + '">' +
         '<button type="button" class="vtd-select-dot" data-ov-action="select" aria-label="选择任务"></button>' +
@@ -2486,6 +2607,9 @@ var _scriptEditInitialText = "";
           '</div>' +
         '</div>' +
         '<div class="vtd-task-status-actions">' +
+          '<button type="button" class="vtd-continue-btn" data-ov-action="continue" title="继续制作到当前流程进度"' + continueDisabled + '>' +
+            '<span class="material-symbols-outlined">play_arrow</span><span>继续制作</span>' +
+          '</button>' +
           '<span class="vtd-type-pill">' + escapeHtml(t.type || "视频生成任务") + '</span>' +
           '<span class="vtd-status ' + statusClass + '">' + escapeHtml(_ovStatusLabel(t)) + '</span>' +
           '<div class="vtd-icon-actions">' +
@@ -2878,6 +3002,37 @@ var _scriptEditInitialText = "";
     }
   }
 
+  async function _ovContinueTask(task) {
+    if (!task || !task.projectId || _ovProjectTaskNavigating) return;
+    _ovProjectTaskNavigating = true;
+    try {
+      _ovTaskState.activatingId = task.id;
+      _ovRenderDashboard();
+      var activated = await _activateProjectContext(task.projectId, {
+        silent: true,
+        navigateToOverview: false,
+        showSkeleton: true,
+        refreshPages: true,
+        resetViewState: false,
+      });
+      if (!activated || !project || project.id !== task.projectId) {
+        showToast("无法打开该项目，请刷新后重试", "error");
+        return;
+      }
+      _ovSyncCurrentProjectTaskSnapshot();
+      var targetPage = _ovContinuePageForProject(project);
+      switchPage(targetPage, { user: true });
+      showToast("继续制作：已进入「" + _ovContinuePageLabel(targetPage) + "」", "ok");
+    } catch (e) {
+      console.warn("[OverviewContinueTask] failed:", e);
+      showToast((e && e.message) || "继续制作失败", "error");
+    } finally {
+      _ovProjectTaskNavigating = false;
+      if (_ovTaskState.activatingId === task.id) _ovTaskState.activatingId = "";
+      refreshOverview();
+    }
+  }
+
   async function _ovDeleteProjectTask(task) {
     if (!task || !task.projectId || _ovProjectTaskDeleting) return;
     var title = task.title || "未命名任务";
@@ -3069,6 +3224,11 @@ var _scriptEditInitialText = "";
       if (action === "retry") {
         e.preventDefault();
         _ovRetryTask(task);
+        return;
+      }
+      if (action === "continue") {
+        e.preventDefault();
+        _ovContinueTask(task);
         return;
       }
       if (action === "delete") {
@@ -3479,8 +3639,7 @@ var _scriptEditInitialText = "";
 	    return '<div class="style-bible-field' + (editable ? ' is-editable' : '') + (displayValue ? '' : ' style-bible-empty') + '"' +
 	      (editable ? ' data-style-field="' + escapeHtml(field) + '" data-style-label="' + escapeHtml(label) + '"' : '') + '>' +
 	        '<span class="style-bible-field-label">' + escapeHtml(label) + '</span>' +
-	        escapeHtml(displayValue || "待补充") +
-	        (editable ? '<span class="material-symbols-outlined style-bible-edit-icon">edit</span>' : '') +
+	        '<span class="style-bible-field-value" data-role="value">' + escapeHtml(displayValue || "待补充") + '</span>' +
 	      '</div>';
 	  }
 
@@ -3491,9 +3650,8 @@ var _scriptEditInitialText = "";
 	        (compact ? '' : '<span class="material-symbols-outlined style-usage-rule-icon">' + escapeHtml(icon || "notes") + '</span>') +
 	        '<span class="style-usage-rule-copy">' +
 	          '<strong>' + escapeHtml(label) + '</strong>' +
-	          '<span>' + escapeHtml(displayValue || "待补充") + '</span>' +
+	          '<span class="style-usage-rule-value" data-role="value">' + escapeHtml(displayValue || "待补充") + '</span>' +
 	        '</span>' +
-	        '<span class="material-symbols-outlined style-bible-edit-icon">edit</span>' +
 	      '</article>';
 	  }
 
@@ -3543,7 +3701,6 @@ var _scriptEditInitialText = "";
               '</div>';
             }).join("") +
           '</div>' +
-          '<span class="material-symbols-outlined style-bible-edit-icon">edit</span>' +
         '</div>';
       }
     }
@@ -3557,24 +3714,105 @@ var _scriptEditInitialText = "";
     return String(normalized[field] || "").trim();
   }
 
-	  function _editStyleBibleField(field, label) {
-	    if (!project) return;
+	  function _commitStyleBibleFieldValue(field, label, next) {
+	    if (!project) return false;
 	    var cur = _styleBiblePromptValue(field);
-	    var next = window.prompt("编辑「" + label + "」\n\n保存后，下游画面/视频提示词会标记为需重新生成", cur);
-    if (next === null) return;
-    next = next.trim();
-    if (next === cur) return;
+	    next = String(next == null ? "" : next).trim();
+	    if (next === cur) return false;
 	    if (!project.styleBible || typeof project.styleBible !== "object") project.styleBible = {};
 	    project.styleBible[field] = field === "colorPalette" ? _stylePaletteItemsFromValue(next) : next;
 	    project.styleBible.updatedAt = new Date().toISOString();
 	    project.styleBibleManuallyEditedAt = project.styleBible.updatedAt;
 	    project.styleBibleSource = "manual";
 	    _markDownstreamStale("style_bible", {});
-    saveProject();
-    _renderStylePageBiblePanel();
-    refreshStylePage();
-    showToast("已保存「" + label + "」；下游画面/视频提示词已标记为需重新生成", "success");
-  }
+	    saveProject();
+	    _renderStylePageBiblePanel();
+	    refreshStylePage();
+	    showToast("已保存「" + label + "」；下游画面/视频提示词已标记为需重新生成", "success");
+	    return true;
+	  }
+
+	  function _editStyleBibleField(field, label) {
+	    // colorPalette 走原来的弹窗（"name:#hex" 语法不适合 inline）
+	    if (!project) return;
+	    var cur = _styleBiblePromptValue(field);
+	    var next = window.prompt("编辑「" + label + "」\n\n保存后，下游画面/视频提示词会标记为需重新生成", cur);
+	    if (next === null) return;
+	    _commitStyleBibleFieldValue(field, label, next);
+	  }
+
+	  function _activateStyleBibleFieldInlineEdit(fieldEl) {
+	    if (!fieldEl) return;
+	    var field = fieldEl.getAttribute("data-style-field");
+	    var label = fieldEl.getAttribute("data-style-label") || "";
+	    if (!field) return;
+	    // 色彩调板：name:#hex 语法用 prompt 更清晰
+	    if (field === "colorPalette") {
+	      _editStyleBibleField(field, label);
+	      return;
+	    }
+	    var valueEl = fieldEl.querySelector('[data-role="value"]');
+	    if (!valueEl) return;
+	    if (valueEl.isContentEditable) return; // 已在编辑
+
+	    var originalRaw = _styleBiblePromptValue(field);
+	    var wasEmpty = fieldEl.classList.contains("style-bible-empty");
+	    // 清掉「待补充」占位
+	    if (wasEmpty) valueEl.textContent = "";
+	    fieldEl.classList.add("is-editing");
+	    valueEl.setAttribute("contenteditable", "true");
+	    valueEl.setAttribute("spellcheck", "false");
+	    valueEl.focus();
+	    try {
+	      var range = document.createRange();
+	      range.selectNodeContents(valueEl);
+	      var sel = window.getSelection();
+	      sel.removeAllRanges();
+	      sel.addRange(range);
+	    } catch (e) {}
+
+	    var state = { settled: false, cancelled: false };
+	    function teardown() {
+	      valueEl.removeAttribute("contenteditable");
+	      valueEl.removeAttribute("spellcheck");
+	      fieldEl.classList.remove("is-editing");
+	    }
+	    function settle() {
+	      if (state.settled) return;
+	      state.settled = true;
+	      valueEl.removeEventListener("blur", onBlur);
+	      valueEl.removeEventListener("keydown", onKeydown);
+
+	      if (state.cancelled) {
+	        teardown();
+	        valueEl.textContent = originalRaw || "待补充";
+	        if (!originalRaw) fieldEl.classList.add("style-bible-empty");
+	        else fieldEl.classList.remove("style-bible-empty");
+	        return;
+	      }
+	      var next = (valueEl.textContent || "").trim();
+	      if (next === originalRaw) {
+	        teardown();
+	        valueEl.textContent = next || "待补充";
+	        if (!next) fieldEl.classList.add("style-bible-empty");
+	        else fieldEl.classList.remove("style-bible-empty");
+	        return;
+	      }
+	      // _commitStyleBibleFieldValue 会触发整面板重渲染，先 teardown 一下避免遗留 class
+	      teardown();
+	      _commitStyleBibleFieldValue(field, label, next);
+	    }
+	    function onBlur() { settle(); }
+	    function onKeydown(ev) {
+	      if (ev.key === "Escape") {
+	        ev.preventDefault();
+	        state.cancelled = true;
+	        valueEl.blur();
+	      }
+	    }
+	    valueEl.addEventListener("blur", onBlur);
+	    valueEl.addEventListener("keydown", onKeydown);
+	  }
 
 	  function _bindStyleBibleEditableFields(root) {
 	    if (!root) return;
@@ -3582,7 +3820,10 @@ var _scriptEditInitialText = "";
 	    for (var i = 0; i < editables.length; i++) {
 	      editables[i].addEventListener("click", function (ev) {
 	        var target = ev.currentTarget;
-	        _editStyleBibleField(target.getAttribute("data-style-field"), target.getAttribute("data-style-label") || "");
+	        // 已在编辑中：让点击穿透到 contenteditable，正常移动光标
+	        var valueEl = target.querySelector('[data-role="value"]');
+	        if (valueEl && valueEl.isContentEditable) return;
+	        _activateStyleBibleFieldInlineEdit(target);
 	      });
 	    }
 	  }
@@ -3625,9 +3866,7 @@ var _scriptEditInitialText = "";
 		    if (!_isStyleBibleGeneratingForStylePage() && freshnessReasons.length) {
 		      html += '<div class="upstream-stale-banner style-bible-section--wide">' +
 		        '<span class="material-symbols-outlined">warning</span>' +
-		        '<div><strong>风格圣经可能已过期</strong>' +
-		        '<ul>' + freshnessReasons.map(function (reason) { return '<li>' + escapeHtml(reason) + '</li>'; }).join("") + '</ul>' +
-		        '<p>点击「重新生成风格圣经」以应用最新配置。</p></div>' +
+		        '<div><p>' + escapeHtml(freshnessReasons.join("、")) + '，请点击「重新生成风格圣经」</p></div>' +
 	      '</div>';
 	    }
 	    html += _styleBibleSectionHtml("视觉", [
@@ -5957,6 +6196,7 @@ var _scriptEditInitialText = "";
       flushServerSave: () => _flushServerSave(),
       safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
       getStoryboardGroups: () => getStoryboardGroups(),
+      agentInsertRef: (type, label, data) => agentInsertRef(type, label, data),
       isStale: (key) => _isStale(key),
       clearStale: (key) => _clearStale(key),
 	      checkAndSuggest: (stage) => _checkAndSuggest(stage),
@@ -6005,6 +6245,7 @@ var _scriptEditInitialText = "";
     initShots({
       getProject: () => project,
       saveProject: () => saveProject(),
+      flushServerSave: () => _flushServerSave(),
       safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
@@ -6018,6 +6259,7 @@ var _scriptEditInitialText = "";
     initStoryboard({
       getProject: () => project,
       saveProject: () => saveProject(),
+      flushServerSave: () => _flushServerSave(),
       safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
@@ -6034,6 +6276,7 @@ var _scriptEditInitialText = "";
       emotionBadgeHtml: (emotion, intensity) => emotionBadgeHtml(emotion, intensity),
       sleep: (ms) => sleep(ms),
       invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
+      acceptShotPlanForStoryboard: () => acceptShotPlanForStoryboard(),
     });
     syncStoryboardProject(project);
     initScript({
@@ -6048,9 +6291,31 @@ var _scriptEditInitialText = "";
       checkAndSuggest: (stage) => _checkAndSuggest(stage),
       toastErrorWithActions: (msg) => _toastErrorWithActions(msg),
       getAuthToken: () => getAuthToken(),
+      isFeatureEnabled: (key, fallback) => _clientFeatureEnabled(key, fallback),
       uPrefix: _uPrefix,
       createNewProject: () => createNewProject(),
       triggerExtractAssets: () => extractAssets(),
+      reloadProjectFromServer: async () => {
+        if (!project || !project.id) return false;
+        try {
+          var p = await loadProjectData(project.id);
+          if (!p || !p.id || p.id !== project.id) return false;
+          project = p;
+          syncEditProject(project);
+          syncTasksProject(project);
+          syncVideoTasksProject(project);
+          syncVideoPromptsProject(project);
+          syncShotsProject(project);
+          syncStoryboardProject(project);
+          syncScriptProject(project);
+          syncAssetsProject(project);
+          syncEpisodesProject(project);
+          return true;
+        } catch (e) {
+          console.warn("[reloadProjectFromServer] failed:", e);
+          return false;
+        }
+      },
     });
     syncScriptProject(project);
     syncAssetsProject(project);
@@ -6076,6 +6341,7 @@ var _scriptEditInitialText = "";
       setHistoryAsCurrent: (item, hi) => _setHistoryAsCurrent(item, hi),
       agentInsertRef: (type, label, data) => agentInsertRef(type, label, data),
       refreshOverview: () => refreshOverview(),
+      refreshStoryboardMaterialPanels: (opts) => refreshStoryboardMaterialPanels(opts),
       getPreviousEpisodeAssets: () => _getPreviousEpisodeAssets(),
       getProjectList: () => getProjectList(),
       refreshScriptPage: () => refreshScriptPage(),
@@ -6130,6 +6396,7 @@ var _scriptEditInitialText = "";
     try { _installErrorHub({ toastOnUncaught: false }); } catch (e) { console.warn("[Init] errorHub failed:", e); }
     // Phase 5.7：拉一次服务器侧常量配置，覆盖本地默认 MAX_* 值
     try { _loadClientConfig(); } catch (e) { console.warn("[Init] loadClientConfig failed:", e); }
+    try { _startClientConfigPoll(); } catch (e) { console.warn("[Init] clientConfigPoll failed:", e); }
     try { loadBillingSummary(); } catch (e) { console.warn("[Init] loadBillingSummary failed:", e); }
     try { handleBillingReturnFromUrl(); } catch (e) { console.warn("[Init] handleBillingReturnFromUrl failed:", e); }
     try { _startMaintenanceBannerPoll(); } catch (e) { console.warn("[Init] maintenanceBanner failed:", e); }
@@ -6299,7 +6566,7 @@ var _scriptEditInitialText = "";
 
     /* Shots page */
     $("btnGenShots").addEventListener("click", generateShots);
-    $("btnConfirmShots").addEventListener("click", confirmShots);
+    $("btnConfirmShots").addEventListener("click", confirmImages);
     var slw = $("shotListWrap");
     if (slw) slw.addEventListener("click", handleShotAction);
     if (slw) slw.addEventListener("click", handleImageAction);
@@ -6307,8 +6574,6 @@ var _scriptEditInitialText = "";
     /* Images page — unified storyboard generation */
     var _btnGenAll = $("btnGenAllImages");
     if (_btnGenAll) _btnGenAll.addEventListener("click", generateAllImages);
-    var _btnConfirmImg = $("btnConfirmImages");
-    if (_btnConfirmImg) _btnConfirmImg.addEventListener("click", confirmImages);
     var imgGrid = $("imageGrid");
     if (imgGrid) imgGrid.addEventListener("click", handleImageAction);
 
@@ -6329,25 +6594,10 @@ var _scriptEditInitialText = "";
     var vpList = $("videoPromptList");
     if (vpList) vpList.addEventListener("click", handleVideoPromptAction);
 
-    var vpRefAgentBtn = $("vpBtnRefAgent");
-    if (vpRefAgentBtn) vpRefAgentBtn.addEventListener("click", function () {
-      var gIdx = getVpSelectedGroup();
-      var sb = project && project.storyboards && project.storyboards[gIdx];
-      agentInsertRef("视频提示词", "片段" + (gIdx + 1), { groupIdx: gIdx, prompt: (sb && sb.videoPrompt) || "" });
-    });
-    var vpRegenBtn = $("vpBtnRegenSingle");
-    if (vpRegenBtn) vpRegenBtn.addEventListener("click", function () {
-      if (!project || !project.storyboards) return;
-      var gIdx = getVpSelectedGroup();
-      generateGroupVideoPrompt(gIdx);
-    });
-    var vpCopyBtn = $("vpBtnCopy");
-    if (vpCopyBtn) vpCopyBtn.addEventListener("click", function () {
-      var sb = project && project.storyboards && project.storyboards[getVpSelectedGroup()];
-      if (sb && sb.videoPrompt) {
-        navigator.clipboard.writeText(sb.videoPrompt).then(function () { showToast("提示词已复制", "ok"); });
-      } else { showToast("当前没有可复制的提示词", "warn"); }
-    });
+    // @ / 重新生成 / 复制 这三个按钮已移到左侧每张镜头卡片右下角，事件由
+    // videoPrompts.js _renderVpStoryboardFrames 在 frame 创建时直接绑（带 ev.stopPropagation
+    // 避免触发卡片本身的选中冒泡），agentInsertRef 通过 initVideoPrompts 的 ctx 透传过去。
+    // 这里不再绑定 vpBtn{RefAgent,RegenSingle,Copy}——对应 DOM 已从 workspace.html 删除。
     var vpRefineBtn = $("vpBtnRefine");
     if (vpRefineBtn) vpRefineBtn.addEventListener("click", function () {
       var input = $("vpRefineInput");
@@ -6366,7 +6616,7 @@ var _scriptEditInitialText = "";
     }
 
     /* Segment generation page */
-    $("btnStartBatch").addEventListener("click", startBatchGeneration);
+    $("btnStartBatch").addEventListener("click", confirmSegmentsAndEnterEdit);
     var btnGenerateAllSegments = $("btnGenerateAllSegments");
     if (btnGenerateAllSegments) btnGenerateAllSegments.addEventListener("click", startBatchGeneration);
     var btnImportAllSegments = $("btnImportAllSegments");

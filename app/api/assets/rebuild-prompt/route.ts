@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { chatComplete } from '@/lib/llm';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { sanitizeFillLightPositiveMentions, sanitizePromptObject } from '@/lib/content-sanitize';
+import { appendCharacterCastingPrompt, omitCastingProfileFromStyleBible } from '@/lib/casting-profile';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,12 +15,13 @@ export const dynamic = 'force-dynamic';
  * forceStyleSuffix 打架（"warm lighting" vs "neutral studio lighting"），
  * 导致出图风格漂移。
  */
-const SP_REBUILD = `你是 AI 图像生成提示词工程师，专为"白底+写实摄影"参考图（角色四宫格 / 场景单图 / 道具白底产品图）写英文 prompt。
+const SP_REBUILD = `你是 AI 图像生成提示词工程师，专为"白底+写实摄影"参考图（角色四宫格 / 场景单图 / 道具白底产品图）写中文 prompt。
 
-【任务】根据用户给的资产数据，重写一段 60-150 词的英文 imagePrompt。
+【任务】根据用户给的资产数据，重写一段 80-220 字的中文 imagePrompt。
 
 【硬性要求】
-- 全英文，纯文本，**不要** markdown 围栏 / 不要"prompt:"前缀 / 不要解释。
+- 中文为主，纯文本，**不要** markdown 围栏 / 不要"prompt:"前缀 / 不要解释。
+- 允许保留少量必要专有术语、模型名、比例或焦段，但不要整段英文。
 - 只描述"主体本身"——长什么样、穿什么、什么形态、什么动作、什么材质、什么陈设。
 - **绝不要写**：cinematic / illustration / anime / cartoon / warm lighting / studio backdrop / white background / three-view / model sheet / multi-panel layout / split-screen / grid——这些都由后台统一加。
 - **绝不要写**画面构图 / 镜头机位 / 光线方向（场景级元数据 timeSetting/atmosphere 由后台拼到 prompt 末尾，不在你这里写）。
@@ -30,7 +32,8 @@ const SP_REBUILD = `你是 AI 图像生成提示词工程师，专为"白底+写
 - 默认不要写可读文字、招牌字、标签或 logo；除非用户资产数据里明确要求出现某几个字。若明确要求，必须保留那些 exact words，不要添加任何额外文字。
 
 【角色特别注意】
-- 描述外貌（年龄/性别/体型/面孔/发型/肤色）+ 服装（颜色/材质/版型）+ 手持物。
+- 描述外貌（年龄/性别/体型/发型/神态/姿态）+ 服装（颜色/材质/版型）+ 手持物。
+- 不写中国人/欧美人/白人/东亚人/华人/外国人等人群身份，也不写 ethnicity、race、Chinese face、Caucasian face、skin tone；人物 casting 由系统统一注入。
 - 不要写"facing camera / standing pose / neutral expression"——这些由后台四宫格 layout 统一指定。
 
 直接输出 prompt 段落。`;
@@ -42,7 +45,8 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const target: string = (body.targetType || body.kind || body.type || 'character').toString();
   const item: any = sanitizePromptObject(body.item || body);
-  const styleBible: any = sanitizePromptObject(body.styleBible || null);
+  const rawStyleBible: any = sanitizePromptObject(body.styleBible || null);
+  const styleBible: any = omitCastingProfileFromStyleBible(rawStyleBible);
 
   if (!item) return jsonError('缺 item 字段', 400);
 
@@ -66,7 +70,10 @@ export async function POST(req: NextRequest) {
     return jsonError('提示词生成失败：' + (e?.message || String(e)), 502);
   }
 
-  const cleaned = sanitizeFillLightPositiveMentions(prompt.trim().replace(/^["'`]|["'`]$/g, ''));
+  let cleaned = sanitizeFillLightPositiveMentions(prompt.trim().replace(/^["'`]|["'`]$/g, ''));
+  if (target === 'char' || target === 'character') {
+    cleaned = sanitizeFillLightPositiveMentions(appendCharacterCastingPrompt(cleaned, item, rawStyleBible));
+  }
   // 同时返回 prompt 和 imagePrompt 两个字段，前端两种调用方式都能拿到
   return jsonOk({ prompt: cleaned, imagePrompt: cleaned });
 }

@@ -87,7 +87,25 @@ export async function POST(req: NextRequest) {
       await chatStream(
         user,
         finalMessages,
-        { temperature: 0.5, maxTokens: 1500, modelRole: 'structured' },
+        {
+          temperature: 0.5,
+          maxTokens: 1500,
+          modelRole: 'structured',
+          traceName: 'video-prompt.refine',
+          tokenContext: {
+            projectId: projectId || null,
+            projectTitleSnapshot: (project as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'video-prompt.refine',
+            moduleKey: 'video_prompt',
+            moduleLabel: '视频提示词',
+            featureKey: 'video_prompt_refine',
+            featureLabel: '视频提示词微调',
+            callItemType: 'storyboard_group',
+            callItemId: groupIdx == null ? null : String(groupIdx),
+            callItemLabel: groupIdx == null ? null : `分镜组 ${groupIdx + 1}`,
+          },
+        },
         (delta) => {
           buf += delta;
           writer.chunk(delta);

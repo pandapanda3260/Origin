@@ -84,7 +84,7 @@
 
 ### 真 AI 视频提示词
 
-- **按 group 流式生成英文提示词**（`/api/video-prompt/generate`）
+- **按 group 流式生成中文结构化视频提示词**（`/api/video-prompt/generate`）
 - 结构化为 `[CAMERA] / [STYLE] / [CONSTRAINTS] / [AUDIO]` 四段
 - **微调单个 group 提示词**：`/api/video-prompt/refine`
 - **解析 + 敏感词扫描**：`/api/prompt/parse` 和 `/scan-sensitive`

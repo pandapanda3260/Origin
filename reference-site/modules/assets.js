@@ -44,7 +44,8 @@ export function refreshAssetsPage() {
   var need = $("assetsNeedScript");
   var ready = $("assetsReady");
   var content = $("assetsContent");
-  if (!project || !project.scriptApproved) {
+  var hasScript = !!(project && (project.finalScript || project.script));
+  if (!project || !hasScript) {
     need.hidden = false;
     if (ready) ready.hidden = true;
     if (content) content.hidden = true;

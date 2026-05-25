@@ -4,6 +4,9 @@ import { sseResponse } from '@/lib/sse';
 import { chatStream } from '@/lib/llm';
 import { buildConsultMessages } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { normalizeScriptConsultState } from '@/lib/script-consult-state';
+import { isScriptConsultDbHistoryOnlyEnabled } from '@/lib/system-config';
+import { consultMessageHash, selectConsultTurnHistory } from '@/lib/script-consult-turn-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,19 +22,56 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const userMsg: string = (body.message || body.userMsg || body.text || '').toString();
   const projectId: string | undefined = body.projectId;
+  const requestId = req.headers.get('x-request-id') || `consult_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const dbHistoryOnly = isScriptConsultDbHistoryOnlyEnabled();
 
   if (!userMsg.trim()) {
     return new Response(JSON.stringify({ detail: '消息不能为空' }), { status: 400 });
   }
 
-  // 取项目里已有的咨询历史（如果有）
   let history: { role: 'user' | 'assistant'; content: string }[] = [];
+  let requestHistoryForWrite: { role: 'user' | 'assistant'; content: string; readyToDraft?: boolean }[] = [];
+  let requestHistorySource: 'db_existing_plus_current_turn' | 'request_history_plus_current_turn' = 'db_existing_plus_current_turn';
+  let requestIncludedHistory = Array.isArray(body.messages) || Array.isArray(body.history);
+
+  // 取项目里已有的咨询历史（如果有）；默认请求体里的 history/messages 不参与写入。
   if (projectId) {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (proj) {
-      const consult = (proj as any).scriptConsult || {};
-      history = Array.isArray(consult.messages) ? consult.messages : [];
+      const consult = normalizeScriptConsultState((proj as any).scriptConsult);
+      const selection = selectConsultTurnHistory(consult.messages as any, body, dbHistoryOnly);
+      history = selection.history as any;
+      requestHistoryForWrite = selection.requestHistory;
+      requestHistorySource = selection.source;
+      requestIncludedHistory = selection.requestIncludedHistory;
     }
+  } else {
+    const selection = selectConsultTurnHistory([], body, dbHistoryOnly);
+    history = selection.history as any;
+    requestHistoryForWrite = selection.requestHistory;
+    requestHistorySource = selection.source;
+    requestIncludedHistory = selection.requestIncludedHistory;
+  }
+
+  if (requestIncludedHistory && dbHistoryOnly) {
+    console.warn('[scriptConsult.turn] ignored request history payload', {
+      userId: user.id,
+      projectId: projectId || null,
+      requestId,
+      keys: ['messages', 'history'].filter((key) => Array.isArray((body as any)[key])),
+      requestHistoryCount: requestHistoryForWrite.length,
+      firstMessageLength: requestHistoryForWrite[0]?.content?.length || 0,
+      firstMessageHash: requestHistoryForWrite[0] ? consultMessageHash(requestHistoryForWrite[0].content) : null,
+    });
+  } else if (requestHistorySource === 'request_history_plus_current_turn') {
+    console.warn('[scriptConsult.turn] using request history payload because db-only guard is disabled', {
+      userId: user.id,
+      projectId: projectId || null,
+      requestId,
+      requestHistoryCount: requestHistoryForWrite.length,
+      firstMessageLength: requestHistoryForWrite[0]?.content?.length || 0,
+      firstMessageHash: requestHistoryForWrite[0] ? consultMessageHash(requestHistoryForWrite[0].content) : null,
+    });
   }
 
   return sseResponse(async (writer) => {
@@ -55,9 +95,12 @@ export async function POST(req: NextRequest) {
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
-        const existing = (proj as any).scriptConsult || { messages: [] };
+        const existing = normalizeScriptConsultState((proj as any).scriptConsult);
+        const selection = selectConsultTurnHistory(existing.messages as any, body, dbHistoryOnly);
+        const baseMessages = selection.history;
+        const beforeCount = baseMessages.length;
         const newMessages = [
-          ...(existing.messages || []),
+          ...(baseMessages || []),
           { role: 'user' as const, content: userMsg },
           // 把 readyToDraft 落到消息本身，刷新后前端回放能正确判断"是否挂确认按钮"
           // （否则只能依赖 sc.ready 兜底，多轮后追问可能误判）
@@ -68,9 +111,24 @@ export async function POST(req: NextRequest) {
         updateProjectForUser(projectId, user.id, {
           scriptConsult: {
             messages: newMessages,
-            outline: ready ? outline : (existing.outline || ''),
+            outline: ready ? outline : (beforeCount > 0 ? existing.outline : ''),
             ready,
+            startedAt: existing.startedAt || new Date().toISOString(),
+            confirmedAt: existing.confirmedAt || null,
           },
+        });
+        console.info('[scriptConsult.turn] wrote messages', {
+          userId: user.id,
+          projectId,
+          requestId,
+          source: selection.source,
+          dbHistoryOnly,
+          countBefore: beforeCount,
+          countAfter: newMessages.length,
+          userMessageLength: userMsg.length,
+          userMessageHash: consultMessageHash(userMsg),
+          assistantMessageLength: replyMain.length,
+          assistantMessageHash: consultMessageHash(replyMain),
         });
       }
     }

@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream, chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import {
+  buildAdaptSourceMessages,
   buildFullCreateMessages,
   buildRetagMessages,
   buildReviseMessages,
@@ -34,6 +35,7 @@ export async function POST(req: NextRequest) {
   const projectId: string | undefined = body.projectId;
   const mode: string = (body.mode || 'create').toString();
   const oneSentence: string = (body.oneSentence || body.idea || body.text || '').toString();
+  const sourceText: string = (body.sourceText || '').toString().trim();
   const baseScript: string = (body.script || '').toString();
   const instruction: string = (body.instruction || '').toString();
   const durationSec: number | undefined = body.durationSec || body.targetDurationSec;
@@ -41,15 +43,20 @@ export async function POST(req: NextRequest) {
 
   return sseResponse(async (writer) => {
     const isRevise = mode === 'revise';
-    writer.step(isRevise ? '正在按你的指令修改剧本…' : '正在生成剧本…');
+    // mode="adapt" is an audit hint from the client; routing is decided by sourceText.
+    const isAdapt = !isRevise && sourceText.length > 0;
+    writer.step(isRevise ? '正在按你的指令修改剧本…' : isAdapt ? '正在把原文改编成剧本…' : '正在生成剧本…');
     const persona = user ? (getJson('user_profiles', user.id, null) as any) : null;
     const proj = projectId ? getProjectByIdForUser(projectId, user.id) : null;
     const finalSentence = oneSentence || (proj as any)?.oneSentence || '';
     const finalBaseScript = baseScript || (proj as any)?.script || (proj as any)?.scriptDraft || '';
+    const oneSentenceBrief = isAdapt ? makeSourceTextBrief(sourceText) : finalSentence;
 
     if (isRevise) {
       if (!finalBaseScript) { writer.error('当前没有剧本可修改，请先生成'); return; }
       if (!instruction) { writer.error('请输入修改指令'); return; }
+    } else if (isAdapt) {
+      if (sourceText.length < 100) { writer.error('原文内容过短，请补充或改用创意描述'); return; }
     } else if (!finalSentence) {
       writer.error('请先填写一句话创意');
       return;
@@ -62,7 +69,7 @@ export async function POST(req: NextRequest) {
         userId: user.id,
         amount: CREDIT_PRICES.text * 2,
         kind: 'text',
-        reason: isRevise ? 'script.revise' : 'script.full-create',
+        reason: isRevise ? 'script.revise' : isAdapt ? 'script.adapt' : 'script.full-create',
         refId: projectId,
       });
     } catch (e: any) {
@@ -81,6 +88,13 @@ export async function POST(req: NextRequest) {
           instruction,
           durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
         })
+      : isAdapt
+      ? buildAdaptSourceMessages({
+          sourceText,
+          durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
+          audience,
+          creatorPersona: persona,
+        })
       : buildFullCreateMessages({
           oneSentence: finalSentence,
           durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
@@ -88,7 +102,25 @@ export async function POST(req: NextRequest) {
           creatorPersona: persona,
         });
     try {
-      await chatStream(user, messages, { temperature: isRevise ? 0.6 : 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
+      await chatStream(user, messages, {
+        temperature: isRevise ? 0.6 : 0.8,
+        maxTokens: 3000,
+        modelRole: 'brain',
+        traceName: isRevise ? 'script.revise' : isAdapt ? 'script.adapt' : 'script.full_create',
+        tokenContext: {
+          projectId: projectId || null,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'script.workflow.full-create',
+          moduleKey: 'script',
+          moduleLabel: '剧本页面',
+          featureKey: isRevise ? 'script_revise' : isAdapt ? 'script_adapt' : 'script_full_create',
+          featureLabel: isRevise ? '剧本改写' : isAdapt ? '源文本改编' : '完整剧本生成',
+          callItemType: 'project',
+          callItemId: projectId || null,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      }, (delta) => {
         scriptText += delta;
         writer.scriptChunk(delta);
       });
@@ -114,7 +146,24 @@ export async function POST(req: NextRequest) {
       const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
         user,
         buildRetagMessages(scriptText, durationSec || (proj as any)?.scriptTargetDurationSec),
-        { temperature: 0.4, maxTokens: 1200, modelRole: 'structured' },
+        {
+          temperature: 0.4,
+          maxTokens: 1200,
+          modelRole: 'structured',
+          tokenContext: {
+            projectId: projectId || null,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'script.workflow.full-create',
+            moduleKey: 'script',
+            moduleLabel: '剧本页面',
+            featureKey: 'emotion_tagging',
+            featureLabel: '情绪标签生成',
+            callItemType: 'project',
+            callItemId: projectId || null,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         (raw) => parseJsonLoose<{ emotions: any[] }>(raw),
         'emotions',
       );
@@ -133,7 +182,7 @@ export async function POST(req: NextRequest) {
         currentStep: 1,
       };
       // 修改模式不要覆盖 oneSentence —— 原创意要保留
-      if (!isRevise) writePayload.oneSentence = finalSentence;
+      if (!isRevise) writePayload.oneSentence = oneSentenceBrief;
       try {
         updateProjectForUser(projectId, user.id, writePayload);
       } catch (e: any) {
@@ -154,10 +203,11 @@ export async function POST(req: NextRequest) {
           },
           stage: 'script_create',
           stageTarget: {
-            mode: isRevise ? 'revise' : 'create',
+            mode: isRevise ? 'revise' : isAdapt ? 'adapt' : 'create',
             durationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
             audience: audience || null,
-            oneSentenceHash: finalSentence ? shortKnowledgeHash(finalSentence) : null,
+            oneSentenceHash: oneSentenceBrief ? shortKnowledgeHash(oneSentenceBrief) : null,
+            sourceTextHash: isAdapt ? shortKnowledgeHash(sourceText) : null,
             baseScriptHash: isRevise && finalBaseScript ? shortKnowledgeHash(finalBaseScript) : null,
             instructionHash: isRevise && instruction ? shortKnowledgeHash(instruction) : null,
             scriptHash: shortKnowledgeHash(scriptText),
@@ -176,7 +226,9 @@ export async function POST(req: NextRequest) {
       emotionSegments: emotions,
       emotions,
       durationSec: durationSec || (proj as any)?.scriptTargetDurationSec || null,
-      title: extractTitle(scriptText, finalSentence),
+      title: extractTitle(scriptText, isAdapt ? oneSentenceBrief : finalSentence),
+      generationMode: isRevise ? 'revise' : isAdapt ? 'adapt' : 'create',
+      oneSentenceBrief: isAdapt ? oneSentenceBrief : undefined,
     });
   });
 }
@@ -185,6 +237,20 @@ function extractTitle(script: string, fallback: string): string {
   const firstLine = (script || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
   if (firstLine.length > 0 && firstLine.length <= 40) return firstLine.replace(/^#+\s*/, '');
   return (fallback || '未命名项目').slice(0, 40);
+}
+
+function makeSourceTextBrief(sourceText: string): string {
+  const cleaned = (sourceText || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^(请|帮我|麻烦你)?(把|将)?(下面|以下|这段|这些)?(原文|小说|内容|文字|故事)?(改成|改写成?|整理成|生成)?(短视频)?(剧本|脚本)?[：:，,\s-]*/i, '')
+    .trim();
+  const brief = cleaned.slice(0, 180);
+  return brief ? `原文改编：${brief}${cleaned.length > 180 ? '…' : ''}` : '原文改编';
 }
 
 /**

@@ -505,7 +505,6 @@ export function syncEditProject(p) {
     if (!el) return;
     if (!readiness) {
       el.innerHTML =
-        '暂时还没有任何片段在剪辑工作台。<br/>' +
         '在「片段生成」页任意一条生成成功的视频卡片上，点「导入剪辑工作台」即可。';
       return;
     }
@@ -513,7 +512,7 @@ export function syncEditProject(p) {
     var total = readiness.totalCount | 0;
     if (ready >= 1) {
       el.innerHTML =
-        '你已经有 <span class="text-white/90 font-medium">' + ready + '</span> 条视频就绪。' +
+        '你已经有 <span class="text-on-background font-semibold">' + ready + '</span> 条视频就绪。' +
         '<br/>回「片段生成」页，在想用的视频卡片上点「导入剪辑工作台」即可开剪。';
     } else if (total >= 1) {
       el.innerHTML =
@@ -3249,6 +3248,7 @@ export function syncEditProject(p) {
       } else {
         showToast("一键成片失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
       }
+      await _resyncEditDataFromServer();
       _syncEditExportButtonState();
     }
     _editActionEnd("btnEditAutoCompose", "editCardAutoCompose", "一键成片");

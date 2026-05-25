@@ -13,6 +13,7 @@ import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
+import { syncEditProjectClips } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -91,7 +92,27 @@ export async function POST(req: NextRequest) {
       await chatStream(
         user,
         messages,
-        { temperature: 0.5, responseFormat: 'json_object', maxTokens: edlMaxTokens, modelRole: 'structured', reasoningEffort: 'none' },
+        {
+          temperature: 0.5,
+          responseFormat: 'json_object',
+          maxTokens: edlMaxTokens,
+          modelRole: 'structured',
+          reasoningEffort: 'none',
+          traceName: 'edit.generate-edl',
+          tokenContext: {
+            projectId,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'edit.generate-edl',
+            moduleKey: 'edit_export',
+            moduleLabel: '剪辑导出',
+            featureKey: 'edl_generate',
+            featureLabel: '剪辑 EDL 生成',
+            callItemType: 'project',
+            callItemId: projectId,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         (delta) => { raw += delta; writer.chunk(delta); },
       );
     } catch (e: any) {
@@ -131,6 +152,11 @@ export async function POST(req: NextRequest) {
       const patch: any = { editData };
       if (sbsTouched) patch.storyboards = sbs;
       updateProjectForUser(projectId, user.id, patch);
+      try {
+        syncEditProjectClips({ ownerId: user.id, projectId, timeline: result.timeline || [] });
+      } catch (clipError) {
+        console.warn('[edit/generate-edl] pinned clip sync skipped:', clipError);
+      }
       if (knowledgeContext) {
         recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext });
       }

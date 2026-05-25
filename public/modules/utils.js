@@ -97,22 +97,22 @@ export async function apiGet(path) {
 export function friendlyModelError(rawMsg) {
   const msg = String(rawMsg || '').trim();
   try { if (msg) console.debug('[friendlyModelError] raw:', msg); } catch (_e) {}
-  if (
-    msg &&
-    (
-      msg.indexOf('Responses 输出不完整') >= 0 ||
-      msg.indexOf('max_output_tokens') >= 0 ||
-      msg.indexOf('reason=') >= 0 ||
-      msg.indexOf('资产抽取失败') >= 0
-    )
-  ) {
-    return msg.slice(0, 300);
-  }
-  return '生成失败，请稍后重试';
+  // 历史实现是一个非常窄的白名单：只有 4 个关键词（Responses 输出不完整 /
+  // max_output_tokens / reason= / 资产抽取失败）能透传，其它一律归零成
+  // "生成失败，请稍后重试"。后果是单镜头/批量真实失败时（LLM 5xx、网络抖、上游
+  // 断流、auth、provider 限流……）videoPromptLastError 写的是这条空话，
+  // 看不出根因，没法分类排障。
+  //
+  // 现在默认透传后端真实文案。后端 writer.error 已经带 prefix（如
+  // "视频提示词生成失败：..."），适合直接给用户看。300 字截断防止超长 stack 撑爆 toast。
+  if (!msg) return '生成失败，请稍后重试';
+  return msg.slice(0, 300);
 }
 
-export async function apiPostStream(path, body, onChunk, onEvent) {
-  const resp = await fetch(path, { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify(body) });
+export async function apiPostStream(path, body, onChunk, onEvent, options) {
+  const fetchOptions = { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify(body) };
+  if (options && options.signal) fetchOptions.signal = options.signal;
+  const resp = await fetch(path, fetchOptions);
   checkAuth(resp);
   if (!resp.ok) {
     const text = await resp.text();
@@ -133,7 +133,13 @@ export async function apiPostStream(path, body, onChunk, onEvent) {
       }
       if (evt.type === 'chunk' && onChunk) onChunk(evt.content || '');
       else if (evt.type === 'done') finalData = evt;
-      else if (evt.type === 'error') throw new Error(friendlyModelError(evt.error));
+      else if (evt.type === 'error') {
+        const err = new Error(friendlyModelError(evt.error));
+        err.payload = evt;
+        err.errorCode = evt.errorCode || '';
+        err.failureStage = evt.failureStage || '';
+        throw err;
+      }
     } catch (parseErr) {
       if (parseErr.message && !parseErr.message.startsWith('Unexpected')) throw parseErr;
     }
@@ -165,6 +171,11 @@ const _INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
 const _INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
 const _protectedImageBlobCache = new Map();
 const _protectedImageBlobPendingCache = new Map();
+const _IMAGE_PERF_ENDPOINT = '/api/telemetry/image-perf';
+const _IMAGE_PERF_MAX_BATCH = 50;
+const _IMAGE_PERF_MAX_PAYLOAD_BYTES = 48 * 1024;
+const _IMAGE_VARIANT_DISPLAY_W = 1024;
+const _IMAGE_VARIANT_THUMB_W = 512;
 
 /* UI redesign note is not applicable here.
  * Phase A performance optimization: reuse sufficiently fresh signed image URLs
@@ -197,6 +208,47 @@ function _canDirectLoadProtectedImage(url) {
   var safeMarginSec = _imageSignedUrlSafeMarginSec(remainingSec);
   if (!Number.isFinite(safeMarginSec)) return false;
   return remainingSec > safeMarginSec;
+}
+
+function _imageThumbFrontendEnabled() {
+  try {
+    if (window.__ORIGIN_DISABLE_IMAGE_THUMBS__ === true) return false;
+    if (window.IMAGE_THUMB_ENABLED === false) return false;
+  } catch (_e) {}
+  return true;
+}
+
+export function imageVariantUrl(url, opts) {
+  url = String(url || '').trim();
+  opts = opts || {};
+  if (!url) return '';
+  if (!_isProtectedImageUrl(url)) return url;
+  try {
+    var parsed = new URL(url, window.location.origin);
+    var w = Number.parseInt(String(opts.w || ''), 10);
+    if (!_imageThumbFrontendEnabled() || !Number.isFinite(w) || w <= 0) {
+      parsed.searchParams.delete('w');
+    } else {
+      parsed.searchParams.set('w', String(w));
+    }
+    if (parsed.origin === window.location.origin) return parsed.pathname + parsed.search + parsed.hash;
+    return parsed.toString();
+  } catch (_e) {
+    return url;
+  }
+}
+
+function _variantFieldKey(prefix, key) {
+  prefix = String(prefix || '');
+  if (!prefix) return key;
+  return prefix + key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+function _applyImageVariantFields(obj, baseUrl, prefix) {
+  if (!obj || !baseUrl) return;
+  obj[_variantFieldKey(prefix, 'originalUrl')] = imageVariantUrl(baseUrl, { w: 0 });
+  obj[_variantFieldKey(prefix, 'displayUrl')] = imageVariantUrl(baseUrl, { w: _IMAGE_VARIANT_DISPLAY_W });
+  obj[_variantFieldKey(prefix, 'thumbUrl')] = imageVariantUrl(baseUrl, { w: _IMAGE_VARIANT_THUMB_W });
 }
 
 export async function fetchAssetSignedUrl(assetId, ttl) {
@@ -282,6 +334,154 @@ export async function fetchVideoSignedUrl(videoUrl, ttl) {
   return url || videoUrl;
 }
 
+function _initImagePerfTelemetry() {
+  if (typeof window === 'undefined' || !window.performance || !window.PerformanceObserver) return;
+  if (window.__originImagePerfTelemetryStarted) return;
+  window.__originImagePerfTelemetryStarted = true;
+
+  var queue = [];
+  var seen = new Set();
+  var sessionId = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+
+  function sanitizeResourceUrl(raw) {
+    try {
+      var u = new URL(raw, window.location.origin);
+      u.searchParams.delete('sig');
+      u.searchParams.delete('token');
+      return u.pathname + (u.search || '');
+    } catch (_) {
+      return String(raw || '').slice(0, 240);
+    }
+  }
+
+  function isImageFileEntry(entry) {
+    try {
+      var u = new URL(entry.name, window.location.origin);
+      return u.pathname.indexOf('/api/images/file/') === 0;
+    } catch (_) {
+      return String(entry && entry.name || '').indexOf('/api/images/file/') >= 0;
+    }
+  }
+
+  function entryKey(entry) {
+    return [
+      entry.name || '',
+      Math.round(entry.startTime || 0),
+      Math.round(entry.responseEnd || 0)
+    ].join('|');
+  }
+
+  function compactEntry(entry) {
+    return {
+      name: sanitizeResourceUrl(entry.name),
+      initiatorType: entry.initiatorType || '',
+      startTime: Math.round(entry.startTime || 0),
+      duration: Math.round(entry.duration || 0),
+      responseEnd: Math.round(entry.responseEnd || 0),
+      transferSize: Math.round(entry.transferSize || 0),
+      encodedBodySize: Math.round(entry.encodedBodySize || 0),
+      decodedBodySize: Math.round(entry.decodedBodySize || 0),
+    };
+  }
+
+  function currentVisibleImageCount() {
+    try {
+      var count = 0;
+      document.querySelectorAll('img').forEach(function (img) {
+        var src = img.currentSrc || img.src || '';
+        if (src.indexOf('/api/images/file/') < 0 && src.indexOf('blob:') !== 0) return;
+        var rect = img.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        if (rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth) count += 1;
+      });
+      return count;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function payloadFor(entries) {
+    return {
+      sessionId: sessionId,
+      href: sanitizeResourceUrl(window.location.href),
+      path: window.location.pathname || '',
+      sentAt: new Date().toISOString(),
+      viewport: {
+        width: window.innerWidth || 0,
+        height: window.innerHeight || 0,
+        dpr: window.devicePixelRatio || 1,
+        visibleImageCount: currentVisibleImageCount(),
+      },
+      entries: entries,
+    };
+  }
+
+  function sendPayload(payload) {
+    var body = JSON.stringify(payload);
+    if (body.length > _IMAGE_PERF_MAX_PAYLOAD_BYTES && payload.entries && payload.entries.length > 1) {
+      var mid = Math.ceil(payload.entries.length / 2);
+      sendPayload(Object.assign({}, payload, { entries: payload.entries.slice(0, mid) }));
+      sendPayload(Object.assign({}, payload, { entries: payload.entries.slice(mid) }));
+      return;
+    }
+    try {
+      if (navigator.sendBeacon) {
+        var blob = new Blob([body], { type: 'application/json' });
+        if (navigator.sendBeacon(_IMAGE_PERF_ENDPOINT, blob)) return;
+      }
+    } catch (_) {}
+    try {
+      fetch(_IMAGE_PERF_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        keepalive: true,
+      }).catch(function () {});
+    } catch (_) {}
+  }
+
+  function flush() {
+    if (!queue.length) return;
+    var batch = queue.splice(0, _IMAGE_PERF_MAX_BATCH);
+    sendPayload(payloadFor(batch));
+    if (queue.length) setTimeout(flush, 0);
+  }
+
+  function collect(entries) {
+    entries.forEach(function (entry) {
+      if (!entry || !isImageFileEntry(entry)) return;
+      if ((entry.responseEnd || 0) <= 0) return;
+      var key = entryKey(entry);
+      if (seen.has(key)) return;
+      seen.add(key);
+      queue.push(compactEntry(entry));
+    });
+    if (queue.length >= _IMAGE_PERF_MAX_BATCH) flush();
+  }
+
+  try {
+    var observer = new PerformanceObserver(function (list) {
+      collect(list.getEntries());
+    });
+    observer.observe({ type: 'resource', buffered: true });
+  } catch (e) {
+    try {
+      var fallbackObserver = new PerformanceObserver(function (list) {
+        collect(list.getEntries());
+      });
+      fallbackObserver.observe({ entryTypes: ['resource'] });
+    } catch (_) {}
+  }
+
+  window.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') flush();
+  });
+  window.addEventListener('pagehide', flush);
+  setInterval(flush, 15000);
+}
+
+_initImagePerfTelemetry();
+
 async function _applyResolvedUrl(obj, assetKey, urlKeys) {
   if (!obj || !assetKey || !urlKeys || !urlKeys.length) return;
   var assetId = (obj[assetKey] || '').trim();
@@ -315,6 +515,20 @@ async function _applySignedUrlForStoredImage(obj, urlKeys) {
     }
     obj[key] = url;
   }));
+}
+
+async function _hydrateImageAssetUrls(obj, assetKey, urlKeys, variantPrefix) {
+  if (!obj || !urlKeys || !urlKeys.length) return;
+  await _applyResolvedUrl(obj, assetKey, urlKeys);
+  await _applySignedUrlForStoredImage(obj, urlKeys);
+  var baseUrl = '';
+  for (var i = 0; i < urlKeys.length; i += 1) {
+    if (obj[urlKeys[i]]) {
+      baseUrl = obj[urlKeys[i]];
+      break;
+    }
+  }
+  _applyImageVariantFields(obj, baseUrl, variantPrefix || '');
 }
 
 async function _applySignedUrlForStoredVideo(obj, urlKeys) {
@@ -353,19 +567,16 @@ function _hydrateAssetCollection(assets, jobs) {
   if (!assets || !jobs) return;
   (assets.characters || []).forEach(function (ch) {
     if (!ch) return;
-    jobs.push(_applyResolvedUrl(ch, 'assetId', ['realPhotoUrl', 'imageUrl', 'rawUrl']));
-    jobs.push(_applyResolvedUrl(ch, 'pencilAssetId', ['pencilUrl']));
-    jobs.push(_applySignedUrlForStoredImage(ch, ['realPhotoUrl', 'imageUrl', 'rawUrl', 'pencilUrl']));
+    jobs.push(_hydrateImageAssetUrls(ch, 'assetId', ['realPhotoUrl', 'imageUrl', 'rawUrl'], ''));
+    jobs.push(_hydrateImageAssetUrls(ch, 'pencilAssetId', ['pencilUrl'], 'pencil'));
   });
   (assets.scenes || []).forEach(function (it) {
     if (!it) return;
-    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
-    jobs.push(_applySignedUrlForStoredImage(it, ['imageUrl', 'rawUrl']));
+    jobs.push(_hydrateImageAssetUrls(it, 'assetId', ['imageUrl', 'rawUrl'], ''));
   });
   (assets.props || []).forEach(function (it) {
     if (!it) return;
-    jobs.push(_applyResolvedUrl(it, 'assetId', ['imageUrl', 'rawUrl']));
-    jobs.push(_applySignedUrlForStoredImage(it, ['imageUrl', 'rawUrl']));
+    jobs.push(_hydrateImageAssetUrls(it, 'assetId', ['imageUrl', 'rawUrl'], ''));
   });
 }
 
@@ -443,12 +654,56 @@ async function _resolveProtectedImageBlobUrl(url) {
   return task;
 }
 
+export function markImageMissing(node) {
+  if (!node) return;
+  var frame = node.closest && node.closest('.ffe-image-frame');
+  var target = frame || node;
+  if (target && target.classList) {
+    target.classList.add('is-image-missing');
+    target.setAttribute('data-image-missing', 'true');
+  }
+
+  var disableTarget = node.closest && node.closest('[data-image-missing-disable="true"]');
+  if (disableTarget) {
+    var wasDisabled = 'disabled' in disableTarget ? disableTarget.disabled === true : false;
+    if (!wasDisabled && 'disabled' in disableTarget) {
+      disableTarget.setAttribute('data-image-missing-toggled', 'true');
+      disableTarget.disabled = true;
+    }
+    disableTarget.setAttribute('aria-disabled', 'true');
+    disableTarget.setAttribute('data-image-missing', 'true');
+  }
+}
+
+function clearImageMissing(node) {
+  if (!node) return;
+  var frame = node.closest && node.closest('.ffe-image-frame');
+  var target = frame || node;
+  if (target && target.classList) {
+    target.classList.remove('is-image-missing');
+    target.removeAttribute('data-image-missing');
+  }
+  var enableTarget = node.closest && node.closest('[data-image-missing-disable="true"]');
+  if (enableTarget && enableTarget.getAttribute('data-image-missing') === 'true') {
+    enableTarget.removeAttribute('data-image-missing');
+    enableTarget.removeAttribute('aria-disabled');
+    if (enableTarget.getAttribute('data-image-missing-toggled') === 'true') {
+      enableTarget.removeAttribute('data-image-missing-toggled');
+      if ('disabled' in enableTarget) enableTarget.disabled = false;
+    }
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.__originMarkImageMissing = markImageMissing;
+}
+
 export function hydrateProtectedImageElements(root) {
   root = root || document;
   var nodes = [];
-  if (root.matches && (root.matches('img[src]') || root.matches('[data-img]'))) nodes.push(root);
+  if (root.matches && (root.matches('img[src]') || root.matches('[data-img]') || root.matches('[data-original-img]'))) nodes.push(root);
   if (root.querySelectorAll) {
-    root.querySelectorAll('img[src], [data-img]').forEach(function (node) { nodes.push(node); });
+    root.querySelectorAll('img[src], [data-img], [data-original-img]').forEach(function (node) { nodes.push(node); });
   }
 
   nodes.forEach(function (node) {
@@ -456,8 +711,10 @@ export function hydrateProtectedImageElements(root) {
     if (imgUrl && _isProtectedImageUrl(imgUrl) && !_canDirectLoadProtectedImage(imgUrl)) {
       _resolveProtectedImageBlobUrl(imgUrl).then(function (blobUrl) {
         node.setAttribute('src', blobUrl);
+        clearImageMissing(node);
       }).catch(function (e) {
         try { console.warn('[image] protected image hydrate failed:', imgUrl, e); } catch (_e) {}
+        markImageMissing(node);
       });
     }
 
@@ -465,8 +722,21 @@ export function hydrateProtectedImageElements(root) {
     if (dataImg && _isProtectedImageUrl(dataImg) && !_canDirectLoadProtectedImage(dataImg)) {
       _resolveProtectedImageBlobUrl(dataImg).then(function (blobUrl) {
         node.setAttribute('data-img', blobUrl);
+        clearImageMissing(node);
       }).catch(function (e) {
         try { console.warn('[image] protected data-img hydrate failed:', dataImg, e); } catch (_e) {}
+        markImageMissing(node);
+      });
+    }
+
+    var originalImg = node.getAttribute && node.getAttribute('data-original-img');
+    if (originalImg && _isProtectedImageUrl(originalImg) && !_canDirectLoadProtectedImage(originalImg)) {
+      _resolveProtectedImageBlobUrl(originalImg).then(function (blobUrl) {
+        node.setAttribute('data-original-img', blobUrl);
+        clearImageMissing(node);
+      }).catch(function (e) {
+        try { console.warn('[image] protected original image hydrate failed:', originalImg, e); } catch (_e) {}
+        markImageMissing(node);
       });
     }
   });

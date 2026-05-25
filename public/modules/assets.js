@@ -1,10 +1,11 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl } from './utils.js?v=102';
 import { loadProjectData } from './project.js';
 import { subscribeBatch, subscribeTask } from './backend_stream.js';
 import { renderAssetCard } from './render_hooks.js';
 import { attachShotsBatch } from './shots.js';
 import { reattachStoryboardBatches } from './storyboard.js';
 import { showBillingPaywall } from './billing.js';
+import { invalidateAllMaterialPanels } from './material_image_panel.js?v=103';
 
 const _getAuthHeaders = getAuthHeaders;
 
@@ -15,16 +16,161 @@ export function initAssets(ctx) { _ctx = ctx; }
 export function syncAssetsProject(p) { project = p; }
 export function resetLibraryState() { _libActiveProject = null; _libActiveTab = "all"; }
 
+function _invalidateMaterialPanelsAfterAssetChange() {
+  invalidateAllMaterialPanels();
+  if (_ctx.refreshStoryboardMaterialPanels) {
+    try { _ctx.refreshStoryboardMaterialPanels({ force: true }); }
+    catch (e) { console.warn("[MaterialPanel] refresh after asset change failed:", e); }
+  }
+}
+
+function _saveAssetsProject() {
+  _invalidateMaterialPanelsAfterAssetChange();
+  return _ctx.saveProject ? _ctx.saveProject() : undefined;
+}
+
 var _assetsExtracting = false;
 var _assetImagesGenerating = false;
 var _assetGenStatus = {};
 var _pendingAssetRerender = false;
-var _assetStyleStaleSyncing = false;
-var _assetStyleStaleSyncKey = "";
 var _libActiveProject = null;
 var _libActiveTab = "all";
 var ASSET_ENTRANCE_ANIM_MS = 1400;
 var _assetEntranceClearTimer = null;
+var ASSET_CARD_DISPLAY_W = 1024;
+var ASSET_CARD_THUMB_W = 512;
+var ASSET_LIGHTBOX_W = 1600;
+
+function _assetVariant(url, width) {
+  return imageVariantUrl(url || "", { w: width });
+}
+
+function _assetOriginal(url) {
+  return imageVariantUrl(url || "", { w: 0 });
+}
+
+function _attrOriginal(url) {
+  return url ? ' data-original-img="' + escapeHtml(url) + '"' : '';
+}
+
+function _firstAssetUrl() {
+  for (var i = 0; i < arguments.length; i++) {
+    var url = (arguments[i] || "").toString().trim();
+    if (url) return url;
+  }
+  return "";
+}
+
+function _normalizeCharacterEntityType(value) {
+  var text = String(value || "").trim().toLowerCase();
+  if (!text) return "";
+  if (text === "non-human" || text === "nonhuman" || text.indexOf("非人") >= 0) return "non-human";
+  if (text === "human" || text.indexOf("人物") >= 0 || text.indexOf("人类") >= 0) return "human";
+  return text;
+}
+
+function _panelSchemaEntityType(panels) {
+  var schema = String((panels && panels.schema) || "").trim().toLowerCase();
+  if (!schema) return "";
+  if (schema.indexOf("non-human") >= 0 || schema.indexOf("nonhuman") >= 0) return "non-human";
+  if (schema.indexOf("human-character") >= 0) return "human";
+  return "";
+}
+
+function _characterIdentityKeys(item) {
+  item = item || {};
+  return [item.characterId, item.id, item.name].filter(Boolean).map(function (value) {
+    return String(value).trim().toLowerCase().replace(/[“”"']/g, "").replace(/\s+/g, "");
+  }).filter(Boolean);
+}
+
+function _hasSharedCharacterKey(left, right) {
+  var leftKeys = _characterIdentityKeys(left);
+  var rightKeys = _characterIdentityKeys(right);
+  if (!leftKeys.length || !rightKeys.length) return false;
+  return leftKeys.some(function (key) { return rightKeys.indexOf(key) >= 0; });
+}
+
+function _canUseCharacterFallback(current, fallback, options) {
+  if (!fallback || typeof fallback !== "object") return false;
+  options = options || {};
+  var currentEntity = _normalizeCharacterEntityType(current && current.entityType);
+  var fallbackEntity = _normalizeCharacterEntityType(fallback.entityType);
+  var fallbackSchemaEntity = _panelSchemaEntityType(fallback.panels);
+
+  if (currentEntity && fallbackEntity && currentEntity !== fallbackEntity) return false;
+  if (currentEntity && fallbackSchemaEntity && currentEntity !== fallbackSchemaEntity) return false;
+  if (currentEntity === "non-human" && !fallbackEntity && !fallbackSchemaEntity) {
+    // 非人角色没有显式实体/切片 schema 证据时，不从 legacy mirror 或 consistency lock 里猜旧图。
+    return false;
+  }
+  if (fallbackSchemaEntity === "human" && currentEntity === "non-human") return false;
+  if (fallbackSchemaEntity === "non-human" && currentEntity === "human") return false;
+
+  if (options.requireIdentityMatch && !_hasSharedCharacterKey(current, fallback)) return false;
+  return true;
+}
+
+function _characterFallbackImageUrl(item, idx) {
+  item = item || {};
+  var reference = (item.reference && typeof item.reference === "object") ? item.reference : {};
+  var ownReferenceUrl = _firstAssetUrl(reference.lastKnownGoodUrl, reference.currentUrl);
+  if (ownReferenceUrl && _canUseCharacterFallback(item, item, { requireIdentityMatch: false })) return ownReferenceUrl;
+
+  var topChar = project && Array.isArray(project.characters) && typeof idx === "number"
+    ? project.characters[idx]
+    : null;
+  var topReference = topChar && typeof topChar.reference === "object" ? topChar.reference : {};
+  var topPanels = topChar && typeof topChar.panels === "object" ? topChar.panels : {};
+  var topUrl = topChar ? _firstAssetUrl(
+    topChar.originalUrl,
+    topChar.realPhotoUrl,
+    topChar.rawUrl,
+    topChar.imageUrl,
+    topChar.pencilUrl,
+    topReference.lastKnownGoodUrl,
+    topReference.currentUrl,
+    topPanels.sheetUrl,
+  ) : "";
+  if (topUrl && _canUseCharacterFallback(item, topChar, { requireIdentityMatch: false })) return topUrl;
+
+  var keys = [item.characterId, item.id, item.name].filter(Boolean).map(function (v) { return String(v); });
+  var locks = project && project.consistency && Array.isArray(project.consistency.characters)
+    ? project.consistency.characters
+    : [];
+  for (var lockIdx = 0; lockIdx < locks.length; lockIdx++) {
+    var lock = locks[lockIdx] || {};
+    var matches = keys.indexOf(String(lock.characterId || "")) >= 0
+      || keys.indexOf(String(lock.canonicalName || "")) >= 0;
+    if (!matches && !keys.length && typeof idx === "number") matches = lockIdx === idx;
+    if (!matches) continue;
+    var referenceLock = lock.referenceLock || {};
+    var lockFallback = {
+      characterId: lock.characterId || lock.sourceAssetId,
+      id: lock.sourceAssetId || lock.characterId,
+      name: lock.canonicalName,
+      entityType: lock.identityLock && lock.identityLock.entityType,
+    };
+    if (!_canUseCharacterFallback(item, lockFallback, { requireIdentityMatch: true })) continue;
+    var lockUrl = _firstAssetUrl(
+      referenceLock.sheetUrl,
+      referenceLock.headshotUrl,
+      referenceLock.frontUrl,
+      referenceLock.sideUrl,
+      referenceLock.backUrl,
+    );
+    if (lockUrl) return lockUrl;
+  }
+
+  return "";
+}
+
+function _characterOwnImageUrl(item) {
+  item = item || {};
+  var ownUrl = _firstAssetUrl(item.originalUrl, item.realPhotoUrl, item.rawUrl, item.imageUrl);
+  if (!ownUrl) return "";
+  return _canUseCharacterFallback(item, item, { requireIdentityMatch: false }) ? ownUrl : "";
+}
 
 function _getVideoTasksForLibrary() {
   var state = _ctx.getVideoState ? _ctx.getVideoState() : null;
@@ -77,7 +223,9 @@ export function refreshAssetsPage() {
   var content = $("assetsContent");
   var saveTplBtn = $("btnSaveWorldTemplate");
   var knowledgeBtn = $("btnKnowledgeSnapshot");
-  if (!project || !project.scriptApproved) {
+  var hasScript = !!(project && (project.finalScript || project.script));
+  if (!project || !hasScript) {
+    // 真实数据不存在（无项目 / 无剧本）时仍显示 need 状态，避免空页面误导用户
     need.hidden = false;
     if (ready) ready.hidden = true;
     if (content) content.hidden = true;
@@ -98,7 +246,6 @@ export function refreshAssetsPage() {
       content.insertBefore(_sb, content.firstChild);
     }
     renderAssets();
-    _syncAssetStyleStaleFlags();
     _showAssetActions();
     checkAssetsConfirm();
     _updateStylizeBadge();
@@ -255,7 +402,6 @@ export function renderAssets(options) {
   $("assetSceneCount").textContent = project.assets.scenes.length;
   $("assetPropCount").textContent = project.assets.props.length;
 
-  _injectAssetStaleBadges();
   if (preserveScroll) {
     requestAnimationFrame(function () {
       if (!pageEl || pageEl.hidden) return;
@@ -263,31 +409,6 @@ export function renderAssets(options) {
       pageEl.scrollLeft = prevScrollLeft;
     });
   }
-}
-
-function _injectAssetStaleBadges() {
-  if (!project || !project.assets) return;
-  ["scene", "prop"].forEach(function (tp) {
-    var list = tp === "scene" ? project.assets.scenes : project.assets.props;
-    if (!list) return;
-    var gridId = tp === "scene" ? "assetSceneGrid" : "assetPropGrid";
-    var container = $(gridId);
-    if (!container) return;
-    list.forEach(function (_, i) {
-      if (_ctx.isStale("asset_img_" + tp + "_" + i)) {
-        var cardEl = container.querySelector('[data-type="' + tp + '"][data-idx="' + i + '"]');
-        if (cardEl && !cardEl.querySelector(".stale-badge")) {
-          var badge = document.createElement("span");
-          badge.className = "stale-badge";
-          badge.title = "该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成";
-          badge.textContent = "需更新";
-          badge.style.cssText = "position:absolute;top:8px;left:8px;z-index:5;";
-          cardEl.style.position = "relative";
-          cardEl.appendChild(badge);
-        }
-      }
-    });
-  });
 }
 
 export function _applyServerStaleFlagsToProject(targetProject, prefixes, serverFlags) {
@@ -321,53 +442,6 @@ export function _applyServerStaleFlagsToProject(targetProject, prefixes, serverF
   return changed;
 }
 
-function _styleBibleSyncFingerprint() {
-  try {
-    return JSON.stringify(project && project.styleBible ? project.styleBible : {});
-  } catch (_e) {
-    return "";
-  }
-}
-
-function _assetStyleSyncKey() {
-  if (!project || !project.assets) return "";
-  return [
-    project.id || "",
-    project.styleBibleGeneratedAt || "",
-    project.styleBibleManuallyEditedAt || "",
-    project.styleBibleSourceHash || "",
-    project.styleBibleSource || "",
-    _styleBibleSyncFingerprint(),
-    (project.assets.characters || []).length,
-    (project.assets.scenes || []).length,
-    (project.assets.props || []).length
-  ].join("|");
-}
-
-function _syncAssetStyleStaleFlags() {
-  if (!project || !project.assets || _assetStyleStaleSyncing) return;
-  var key = _assetStyleSyncKey();
-  if (!key || key === _assetStyleStaleSyncKey) return;
-  _assetStyleStaleSyncing = true;
-  _assetStyleStaleSyncKey = key;
-  var body = project.id
-    ? { projectId: project.id }
-    : { project: { styleBible: project.styleBible, shots: project.shots, storyboards: project.storyboards, assets: project.assets } };
-  apiPost("/api/orchestration/compute-stale", body).then(function (resp) {
-    var staleFlags = resp && resp.staleFlags;
-    if (!staleFlags) return;
-    var changed = _applyServerStaleFlagsToProject(project, "asset_img_", staleFlags);
-    if (changed) {
-      _ctx.saveProject();
-      renderAssets();
-    }
-  }).catch(function (e) {
-    console.warn("[AssetStyleStale] sync failed:", e);
-  }).finally(function () {
-    _assetStyleStaleSyncing = false;
-  });
-}
-
 export function renderAssetGrid(containerId, items, type, placeholderIcon) {
   var container = $(containerId);
   if (!container) return;
@@ -387,34 +461,44 @@ export function renderAssetGrid(containerId, items, type, placeholderIcon) {
   hydrateProtectedImageElements(container);
 }
 
-function _characterReferenceFailureMessage(lastError) {
-  if (!lastError || typeof lastError !== "object") {
-    return "本次角色图未通过参考图切片，未用于后续镜头/视频引用";
-  }
-  if (lastError.message) {
-    return "参考图切片失败：" + String(lastError.message);
-  }
-  if (lastError.cropMethod === "percent-fallback") {
-    return "模型背景不够纯白或 panel 边界不可靠，未用于后续镜头/视频引用";
-  }
-  if (Array.isArray(lastError.unusablePanels) && lastError.unusablePanels.length) {
-    return "部分角色视图切片不可用（" + lastError.unusablePanels.join("、") + "），未用于后续镜头/视频引用";
-  }
-  return "本次角色图未通过参考图切片，未用于后续镜头/视频引用";
+function _characterReferenceFailureMessage(_lastError) {
+  return "本次生成结果不可用，请重新生成";
 }
 
-export function deriveAssetCardState(item) {
+export function deriveAssetCardState(item, idx) {
   item = item || {};
   var reference = (item.reference && typeof item.reference === "object") ? item.reference : {};
-  var mainImageUrl = item.realPhotoUrl || item.rawUrl || item.imageUrl || "";
+  var mainOriginalUrl = _characterOwnImageUrl(item) || _characterFallbackImageUrl(item, idx) || "";
+  var mainImageUrl = item.displayUrl || _assetVariant(mainOriginalUrl, ASSET_CARD_DISPLAY_W);
+  var thumbnailUrl = item.thumbUrl || _assetVariant(mainOriginalUrl, ASSET_CARD_THUMB_W);
+  var zoomUrl = _assetVariant(item.originalUrl || mainOriginalUrl, ASSET_LIGHTBOX_W);
   var failed = reference.status === "failed";
+  var degraded = reference.status === "degraded" && !!mainImageUrl;
+  var failedAttemptUrl = failed ? (reference.lastAttemptUrl || "") : "";
+  var failedReason = reference.lastError && reference.lastError.reason ? String(reference.lastError.reason) : "";
+  var canPreviewFailedAttempt = failed && failedAttemptUrl && failedReason === "character_panel_split_failed";
+  var failedAttemptDisplayUrl = _assetVariant(failedAttemptUrl, ASSET_CARD_DISPLAY_W);
+  var failedAttemptThumbUrl = _assetVariant(failedAttemptUrl, ASSET_CARD_THUMB_W);
+  var failedAttemptZoomUrl = _assetVariant(failedAttemptUrl, ASSET_LIGHTBOX_W);
+  var failedAttemptOriginalUrl = _assetOriginal(failedAttemptUrl);
   return {
-    status: failed ? "failed" : (mainImageUrl ? "ready" : "missing"),
+    status: failed ? "failed" : (degraded ? "degraded" : (mainImageUrl ? "ready" : "missing")),
+    originalUrl: _assetOriginal(mainOriginalUrl),
     mainImageUrl: mainImageUrl,
-    thumbnailUrl: mainImageUrl,
-    failedAttemptUrl: failed ? (reference.lastAttemptUrl || "") : "",
-    statusLabel: failed ? "生成失败" : (mainImageUrl ? "已完成" : "待生成"),
-    statusMessage: failed ? _characterReferenceFailureMessage(reference.lastError) : "",
+    thumbnailUrl: thumbnailUrl,
+    zoomUrl: zoomUrl,
+    previewMode: canPreviewFailedAttempt ? "failed_attempt" : (mainImageUrl ? "accepted" : "missing"),
+    previewImageUrl: canPreviewFailedAttempt ? failedAttemptDisplayUrl : mainImageUrl,
+    previewThumbUrl: canPreviewFailedAttempt ? failedAttemptThumbUrl : thumbnailUrl,
+    previewZoomUrl: canPreviewFailedAttempt ? failedAttemptZoomUrl : zoomUrl,
+    previewOriginalUrl: canPreviewFailedAttempt ? failedAttemptOriginalUrl : _assetOriginal(mainOriginalUrl),
+    failedAttemptUrl: failedAttemptUrl,
+    failedAttemptThumbUrl: failedAttemptThumbUrl,
+    failedAttemptZoomUrl: failedAttemptZoomUrl,
+    statusLabel: failed ? "生成失败" : (degraded ? "可用（比例兜底）" : (mainImageUrl ? "已完成" : "待生成")),
+    statusMessage: failed
+      ? _characterReferenceFailureMessage(reference.lastError)
+      : (degraded ? "生成完成，采用比例兜底切片，可用于后续镜头/视频引用" : ""),
   };
 }
 
@@ -425,12 +509,18 @@ function _renderCharCards(container, items) {
     card.dataset.type = "char";
     card.dataset.idx = idx;
 
-    var cardState = deriveAssetCardState(item);
-    var imgSrc = cardState.mainImageUrl || '';
+    var cardState = deriveAssetCardState(item, idx);
+    var imgSrc = cardState.previewImageUrl || '';
+    var thumbSrc = cardState.previewThumbUrl || imgSrc;
+    var zoomSrc = cardState.previewZoomUrl || imgSrc;
+    var originalSrc = cardState.previewOriginalUrl || _assetOriginal(imgSrc);
+    var previewBadgeHtml = cardState.previewMode === "failed_attempt"
+      ? '<div class="absolute left-3 top-3 z-10 rounded-full bg-on-surface-variant/15 px-2.5 py-1 text-[10px] font-bold tracking-wide text-on-surface-variant/70 shadow-sm">未通过切片</div>'
+      : '';
 
     var imgHtml = '';
     if (imgSrc) {
-      imgHtml = '<img src="' + escapeHtml(imgSrc) + '" alt="' + escapeHtml(item.name) + '" class="w-full h-full object-cover object-[left_top] transform group-hover:scale-105 transition-transform duration-700" />';
+      imgHtml = '<img src="' + escapeHtml(imgSrc) + '" alt="' + escapeHtml(item.name) + '" loading="lazy" decoding="async" class="w-full h-full object-cover object-[left_top] transform group-hover:scale-105 transition-transform duration-700" />';
     } else {
       imgHtml = '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-5xl text-on-surface-variant/15">person</span></div>';
     }
@@ -478,26 +568,28 @@ function _renderCharCards(container, items) {
       ? '<button type="button" class="inline-flex items-center px-2 py-0.5 text-[10px] font-medium rounded-full border border-dashed border-outline-variant/40 text-on-surface-variant/50 hover:text-on-surface-variant hover:border-outline-variant/80 transition-colors" data-action="add-char-tag" title="标注为非当下角色（回忆/照片等）或群体角色">+ 标签</button>'
       : '';
 
-    var isAssetStale = _ctx.isStale("asset_img_char_" + idx);
     var statusHtml = '';
     if (cardState.status === "failed") {
-      var staleFailedTag = isAssetStale ? '<span class="stale-badge" title="该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成">需更新</span>' : '';
       var failedPreview = cardState.failedAttemptUrl
-        ? '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-red-400/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(cardState.failedAttemptUrl) + '">' +
-            '<img src="' + escapeHtml(cardState.failedAttemptUrl) + '" class="w-full h-full object-cover object-[left_top] opacity-85" />' +
+        ? '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-outline-variant/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(cardState.failedAttemptZoomUrl) + '"' + _attrOriginal(_assetOriginal(cardState.failedAttemptUrl)) + '>' +
+            '<img src="' + escapeHtml(cardState.failedAttemptThumbUrl) + '" loading="lazy" decoding="async" class="w-full h-full object-cover object-[left_top] opacity-85" />' +
           '</div>'
-        : '<div class="w-full aspect-square rounded-lg bg-red-500/5 border border-red-500/20 flex items-center justify-center text-red-400 text-[11px] font-bold">无失败图预览</div>';
+        : '<div class="w-full aspect-square rounded-lg bg-surface-container border border-outline-variant/20 flex items-center justify-center text-on-surface-variant/60 text-[11px] font-bold">无失败图预览</div>';
       statusHtml =
-        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">参考图</span><span class="text-[10px] font-bold text-red-500">' + escapeHtml(cardState.statusLabel) + staleFailedTag + '</span></div>' +
+        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">参考图</span><span class="text-[10px] font-bold text-on-surface-variant/70">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
         failedPreview +
-        '<p class="mt-2 text-[11px] leading-relaxed text-red-500/80">' + escapeHtml(cardState.statusMessage) + '</p>';
+        '<p class="mt-2 text-[11px] leading-relaxed text-on-surface-variant/60">' + escapeHtml(cardState.statusMessage) + '</p>';
     } else if (imgSrc) {
-      var staleTag = isAssetStale ? '<span class="stale-badge" title="该资产图基于的风格圣经或风格锁版本与当前不一致，可按需重新生成">需更新</span>' : '';
+      var statusTone = cardState.status === "degraded" ? "text-amber-500" : "text-primary";
+      var degradedHint = cardState.statusMessage
+        ? '<p class="mt-2 text-[11px] leading-relaxed text-amber-500/80">' + escapeHtml(cardState.statusMessage) + '</p>'
+        : '';
       statusHtml =
-        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">三视图</span><span class="text-[10px] font-bold text-primary">已完成' + staleTag + '</span></div>' +
-        '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '">' +
-          '<img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover object-[right_center]" />' +
-        '</div>';
+        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">三视图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
+        '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
+          '<img src="' + escapeHtml(thumbSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover object-[right_center]" />' +
+        '</div>' +
+        degradedHint;
     } else {
       statusHtml =
         '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">参考图</span><span class="text-[10px] font-bold text-on-surface-variant/40">待生成</span></div>';
@@ -505,8 +597,9 @@ function _renderCharCards(container, items) {
 
     card.innerHTML =
       '<div class="flex flex-col md:flex-row h-full min-h-[360px]">' +
-        '<div class="w-full md:w-[45%] relative h-72 md:h-auto overflow-hidden rounded-lg cursor-pointer" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '">' +
+        '<div class="w-full md:w-[45%] relative h-72 md:h-auto overflow-hidden rounded-lg cursor-pointer" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
           imgHtml +
+          previewBadgeHtml +
           '<div class="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-black/20"><span class="material-symbols-outlined text-white text-3xl drop-shadow-lg">zoom_in</span></div>' +
           '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-[#0B1320]/40 backdrop-blur-sm z-10"' + (_assetGenStatus["char_" + idx] ? '' : ' hidden') + '>' +
             '<div class="text-center"><div class="inline-block w-7 h-7 border-2 border-white/20 border-t-white rounded-full animate-spin mb-3"></div><p class="text-white font-bold text-[10px] tracking-widest uppercase">生成中…</p></div>' +
@@ -547,9 +640,12 @@ function _renderSceneCards(container, items) {
     card.dataset.type = "scene";
     card.dataset.idx = idx;
 
-    var imgSrc = item.rawUrl || item.imageUrl || '';
+    var originalSrc = item.originalUrl || item.rawUrl || item.imageUrl || '';
+    var imgSrc = item.displayUrl || _assetVariant(originalSrc, ASSET_CARD_DISPLAY_W);
+    var zoomSrc = _assetVariant(originalSrc, ASSET_LIGHTBOX_W);
+    var originalCleanSrc = _assetOriginal(originalSrc);
     var isMain = !!item.isMain || idx === 0;
-    var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"' : '';
+    var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
     var imageClass = imgSrc ? ' cursor-pointer' : '';
     var imgHtml = imgSrc
       ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" />'
@@ -558,6 +654,10 @@ function _renderSceneCards(container, items) {
     var metaTags = '';
     if (item.timeSetting) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</span>';
     if (item.atmosphere) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</span>';
+    var sceneDescText = item.description ? item.description.slice(0, 120) : '暂无场景描述';
+    var sceneDescClass = item.description
+      ? 'asset-desc-text text-[11px] text-on-surface-variant/60 mt-1.5 leading-relaxed max-h-10 overflow-hidden cursor-text hover:text-on-surface-variant transition-colors'
+      : 'asset-desc-text text-[11px] text-on-surface-variant/35 mt-1.5 leading-relaxed max-h-10 overflow-hidden cursor-text hover:text-on-surface-variant transition-colors';
 
     card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500";
     card.innerHTML =
@@ -575,10 +675,13 @@ function _renderSceneCards(container, items) {
         '<div class="flex items-start justify-between gap-3">' +
           '<div class="min-w-0">' +
             '<h4 class="text-base font-bold tracking-tight text-on-background truncate">' + escapeHtml(item.name || '场景') + '</h4>' +
-            (item.description ? '<p class="text-[11px] text-on-surface-variant/60 mt-1.5 leading-relaxed max-h-10 overflow-hidden">' + escapeHtml(item.description.slice(0, 120)) + '</p>' : '') +
+            '<div class="asset-desc-wrap" data-action="edit-asset">' +
+              '<p class="' + sceneDescClass + '">' + escapeHtml(sceneDescText) + '</p>' +
+              '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
+            '</div>' +
           '</div>' +
           '<div class="flex gap-1.5 shrink-0">' +
-            (imgSrc ? '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><span class="material-symbols-outlined text-on-surface text-sm">zoom_in</span></button>' : '') +
+            (imgSrc ? '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><span class="material-symbols-outlined text-on-surface text-sm">zoom_in</span></button>' : '') +
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-sm">alternate_email</span></button>' +
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="regen-asset" title="重新生成"><span class="material-symbols-outlined text-on-surface text-sm">refresh</span></button>' +
             _ctx.historyBtnHtml(item, "chip") +
@@ -598,12 +701,19 @@ function _renderPropCards(container, items) {
     card.dataset.type = "prop";
     card.dataset.idx = idx;
 
-    var imgSrc = item.rawUrl || item.imageUrl || '';
+    var originalSrc = item.originalUrl || item.rawUrl || item.imageUrl || '';
+    var imgSrc = item.thumbUrl || _assetVariant(originalSrc, ASSET_CARD_THUMB_W);
+    var zoomSrc = _assetVariant(originalSrc, ASSET_LIGHTBOX_W);
+    var originalCleanSrc = _assetOriginal(originalSrc);
     var thumbHtml = imgSrc
-      ? '<div class="asset-prop-thumb rounded-2xl overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all shrink-0" data-action="zoom-img" data-img="' + escapeHtml(imgSrc) + '"><img src="' + escapeHtml(imgSrc) + '" class="w-full h-full object-cover" /></div>'
+      ? '<div class="asset-prop-thumb rounded-2xl overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all shrink-0" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover" /></div>'
       : '<div class="asset-prop-thumb rounded-2xl bg-surface-container flex items-center justify-center border border-outline-variant/10 shrink-0"><span class="material-symbols-outlined text-on-surface-variant/20 text-3xl">handyman</span></div>';
 
     var typeLabel = item.propType || '道具';
+    var propDescText = item.description ? item.description.slice(0, 80) : '暂无道具描述';
+    var propDescClass = item.description
+      ? 'asset-desc-text text-[11px] text-on-surface-variant/50 mt-1 line-clamp-2 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors'
+      : 'asset-desc-text text-[11px] text-on-surface-variant/35 mt-1 line-clamp-2 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors';
 
     var tagsHtml = '';
     var tags = [];
@@ -638,7 +748,10 @@ function _renderPropCards(container, items) {
         '<div class="flex-1 min-w-0">' +
           '<span class="text-[9px] font-bold text-primary tracking-widest uppercase">' + escapeHtml(typeLabel) + '</span>' +
           '<h5 class="text-base font-bold mt-1 text-on-background">' + escapeHtml(item.name) + '</h5>' +
-          (item.description ? '<p class="text-[11px] text-on-surface-variant/50 mt-1 line-clamp-2 leading-relaxed">' + escapeHtml(item.description.slice(0, 80)) + '</p>' : '') +
+          '<div class="asset-desc-wrap" data-action="edit-asset">' +
+            '<p class="' + propDescClass + '">' + escapeHtml(propDescText) + '</p>' +
+            '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
+          '</div>' +
           tagsHtml +
           '<div class="flex flex-wrap items-center gap-1">' + carriesTagHtml + warnHtml + '</div>' +
         '</div>' +
@@ -751,14 +864,21 @@ export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
     if (project && project._generatingAssets && project._generatingAssets[key]) {
       delete project._generatingAssets[key];
       if (!Object.keys(project._generatingAssets).length) delete project._generatingAssets;
-      _ctx.saveProject();
+      _saveAssetsProject();
     }
   }
   if (status === "done") {
     console.log("[updateAssetCardImage] " + type + "#" + idx + " DONE url=" + (imgUrl || "").slice(0, 80));
   }
 
-  var result = renderAssetCard(type, idx, status, { imgUrl: imgUrl, loadingText: loadingText });
+  var renderUrl = imgUrl;
+  var zoomUrl = "";
+  if (status === "done" && imgUrl) {
+    var displayWidth = type === "prop" ? ASSET_CARD_THUMB_W : ASSET_CARD_DISPLAY_W;
+    renderUrl = _assetVariant(imgUrl, displayWidth);
+    zoomUrl = _assetVariant(imgUrl, ASSET_LIGHTBOX_W);
+  }
+  var result = renderAssetCard(type, idx, status, { imgUrl: renderUrl, zoomUrl: zoomUrl, loadingText: loadingText });
   if (!result.ok) {
     console.warn("[updateAssetCardImage] grid/card not in DOM, will re-render on re-enter");
     if (status === "done" || status === "error") _pendingAssetRerender = true;
@@ -778,7 +898,6 @@ function _rerenderAssetGrid(type) {
   var items = type === "char" ? project.assets.characters : type === "scene" ? project.assets.scenes : project.assets.props;
   var icon = type === "char" ? "&#128100;" : type === "scene" ? "&#127968;" : "&#128295;";
   renderAssetGrid(gridId, items, type, icon);
-  _injectAssetStaleBadges();
   if (preserveScroll) {
     requestAnimationFrame(function () {
       if (!pageEl || pageEl.hidden) return;
@@ -800,9 +919,11 @@ function _assetDisplayUrl(type, item) {
   if (!item) return "";
   if (type === "char") {
     if (item.reference && item.reference.status === "failed") return "";
-    return item.imageUrl || item.pencilUrl || item.realPhotoUrl || item.rawUrl || "";
+    var charOriginal = item.originalUrl || item.imageUrl || item.pencilUrl || item.realPhotoUrl || item.rawUrl || "";
+    return item.displayUrl || _assetVariant(charOriginal, ASSET_CARD_DISPLAY_W);
   }
-  return item.imageUrl || item.rawUrl || "";
+  var original = item.originalUrl || item.imageUrl || item.rawUrl || "";
+  return item.displayUrl || _assetVariant(original, ASSET_CARD_DISPLAY_W);
 }
 
 function _syncGeneratedAssetCardsFromProject() {
@@ -904,7 +1025,7 @@ export async function generateSingleAssetImage(type, idx) {
   if (_ctx.flushServerSave) {
     await _ctx.flushServerSave();
   } else if (_ctx.saveProject) {
-    await _ctx.saveProject();
+    await _saveAssetsProject();
   }
 
   updateAssetCardImage(type, idx, "loading");
@@ -1467,7 +1588,7 @@ function _attachAssetImageBatch(opts) {
         item.reference = Object.assign({}, item.reference || {}, {
           currentUrl: displayUrl,
           lastKnownGoodUrl: displayUrl,
-          status: "ready",
+          status: extra.referenceStatus || "ready",
           updatedAt: new Date().toISOString(),
           styleBibleSignature: extra.styleBibleSignature,
           styleLockVersion: extra.styleLockVersion,
@@ -1477,7 +1598,13 @@ function _attachAssetImageBatch(opts) {
         if (extra.fetchStatus) item.fetchStatus = extra.fetchStatus;
         delete item.imageLastError;
         delete item.imageFailedAt;
-	        if (item.reference) delete item.reference.lastError;
+        if (item.reference) {
+          delete item.reference.lastError;
+          delete item.reference.lastAttemptUrl;
+          delete item.reference.lastFailedAt;
+        }
+        delete item.panelsError;
+        delete item.panelsErrorAt;
         if (proj._staleFlags) delete proj._staleFlags["asset_img_" + type + "_" + idx];
       }, data && data.serverVersion);
 
@@ -1571,6 +1698,8 @@ export async function reattachActiveBatches(originId) {
     // 发现后台还有 shots 在跑就直接调 shots.js 的 attachShotsBatch，
     // 由它重挂 SSE 订阅、驱动镜头页进度条。
     if (bt === "shots") {
+      var shotBatchStatus = b.status || (b.snapshot && b.snapshot.status) || "";
+      if (shotBatchStatus !== "queued" && shotBatchStatus !== "running") return;
       try { attachShotsBatch(b.batchId); }
       catch (e) { console.warn("[Reattach] attachShotsBatch failed:", e); }
       reattachedCount++;
@@ -1910,7 +2039,7 @@ export function confirmAssets() {
       function () {
         project.assetsApproved = true;
         project.currentStep = Math.max(project.currentStep, 3);
-        _ctx.saveProject();
+        _saveAssetsProject();
         _ctx.checkAndSuggest("assetConfirm");
         _ctx.switchPage("shots");
       }
@@ -1920,7 +2049,7 @@ export function confirmAssets() {
 
   project.assetsApproved = true;
   project.currentStep = Math.max(project.currentStep, 3);
-  _ctx.saveProject();
+  _saveAssetsProject();
   _ctx.checkAndSuggest("assetConfirm");
   _ctx.switchPage("shots");
 }
@@ -1932,7 +2061,8 @@ export function handleAssetAction(e) {
 
   if (action === "zoom-img") {
     var imgUrl = btn.dataset.img;
-    if (imgUrl) _openLightbox(imgUrl);
+    var originalUrl = btn.dataset.originalImg || "";
+    if (imgUrl) _openLightbox(imgUrl, "", originalUrl);
     return;
   }
 
@@ -1958,7 +2088,7 @@ export function handleAssetAction(e) {
   if (action === "show-history") {
     _ctx.openHistoryPopover(btn, item, function (hi) {
       if (_ctx.setHistoryAsCurrent(item, hi)) {
-        _ctx.saveProject();
+        _saveAssetsProject();
         refreshAssetsPage();
         showToast("已恢复到历史版本", "ok");
       }
@@ -2007,7 +2137,7 @@ export function handleAssetAction(e) {
         }
         item._descEdited = true;
         _ctx.markDownstreamStale("asset", { type: type, idx: idx, name: item.name || "" });
-        _ctx.saveProject();
+        _saveAssetsProject();
         textEl.textContent = newVal;
         _autoSyncUpstream(type, idx);
       };
@@ -2026,7 +2156,7 @@ export function handleAssetAction(e) {
       delete item.via;
     }
     _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-    _ctx.saveProject();
+    _saveAssetsProject();
     renderAssetsUI();
     showToast("出现方式已更新", "ok");
   } else if (action === "edit-char-crowd") {
@@ -2043,7 +2173,7 @@ export function handleAssetAction(e) {
       delete item.crowdSize;
     }
     _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-    _ctx.saveProject();
+    _saveAssetsProject();
     renderAssetsUI();
     showToast("群体规模已更新", "ok");
   } else if (action === "add-char-tag") {
@@ -2059,7 +2189,7 @@ export function handleAssetAction(e) {
       item.appearanceMode = 'referenced';
       item.via = viaAdd;
       _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-      _ctx.saveProject();
+      _saveAssetsProject();
       renderAssetsUI();
       showToast("已标注为非当下角色", "ok");
     } else if (choice === "2") {
@@ -2070,7 +2200,7 @@ export function handleAssetAction(e) {
       item.isCrowd = true;
       item.crowdSize = sizeAdd;
       _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-      _ctx.saveProject();
+      _saveAssetsProject();
       renderAssetsUI();
       showToast("已标注为群体角色", "ok");
     }
@@ -2108,7 +2238,7 @@ export function handleAssetAction(e) {
     }
     item._descEdited = true;
     _ctx.markDownstreamStale("asset", { type: "prop", idx: idx, name: item.name || "" });
-    _ctx.saveProject();
+    _saveAssetsProject();
     renderAssetsUI();
     showToast(list.length ? "载体承载已更新" : "已改回普通道具", "ok");
   } else if (action === "show-carry-warning") {
@@ -2175,7 +2305,7 @@ function _showCharMenu(anchor, type, idx) {
           delete project._staleFlags["asset_img_char_" + _ci];
         }
       }
-      _ctx.saveProject();
+      _saveAssetsProject();
       renderAssets();
       _showAssetActions();
       if (project.styleBible && _ctx.refreshStylePage) _ctx.refreshStylePage();
@@ -2332,7 +2462,7 @@ async function _uploadCharImage(charIdx, file) {
       ch.imageUrl = uploadedUrl;
       ch.pencilUrl = uploadedUrl;
       delete ch._pencilFailed;
-      _ctx.saveProject();
+      _saveAssetsProject();
       updateAssetCardImage("char", charIdx, "done", displayUrl);
       renderAssets();
       showToast("角色图上传成功，已保存为当前参考图", "success");
@@ -2396,11 +2526,17 @@ async function _uploadCharImage(charIdx, file) {
   }
 }
 
-export function _openLightbox(imgUrl, title) {
+export function _openLightbox(imgUrl, title, originalUrl) {
   var existing = document.getElementById("assetLightbox");
   if (existing) existing.remove();
 
   var safeTitle = String(title || "").trim();
+  var safeOriginalUrl = String(originalUrl || "").trim();
+  var originalLinkHtml = safeOriginalUrl
+    ? '<a class="asset-lightbox-original" href="' + escapeHtml(safeOriginalUrl) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="查看原图" style="position:absolute;right:58px;top:12px;width:34px;height:34px;border-radius:999px;background:rgba(255,255,255,.12);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);">' +
+        '<span class="material-symbols-outlined" style="font-size:18px;">open_in_new</span>' +
+      '</a>'
+    : '';
   var headerHtml = safeTitle
     ? '<div class="asset-lightbox-header" style="position:absolute;top:-52px;left:50%;transform:translateX(-50%);z-index:10010;width:100vw;height:42px;display:flex;align-items:center;justify-content:center;pointer-events:none;" onclick="event.stopPropagation()">' +
         '<div class="asset-lightbox-caption" style="width:auto;max-width:min(80vw,960px);padding:0 52px;border:0;background:transparent;color:#fff;font-size:16px;font-weight:900;line-height:1.45;text-align:center;box-shadow:none;text-shadow:0 2px 4px rgba(0,0,0,.95),0 8px 24px rgba(0,0,0,.72);">' + escapeHtml(safeTitle) + '</div>' +
@@ -2414,13 +2550,22 @@ export function _openLightbox(imgUrl, title) {
   overlay.innerHTML =
     '<div class="asset-lightbox-dialog" onclick="event.stopPropagation()">' +
       headerHtml +
-      '<img src="' + escapeHtml(imgUrl) + '" class="asset-lightbox-image" />' +
+      '<div class="ffe-image-frame ffe-image-frame--preview asset-lightbox-image-frame">' +
+        '<img src="' + escapeHtml(imgUrl) + '" alt="" class="asset-lightbox-image" decoding="async" onerror="window.__originMarkImageMissing && window.__originMarkImageMissing(this)" />' +
+        '<div class="ffe-image-fallback" role="img" aria-label="图片不可用">' +
+          '<span class="material-symbols-outlined">broken_image</span>' +
+          '<strong>图片暂不可用</strong>' +
+          '<span>原图链接失效或文件不可访问</span>' +
+        '</div>' +
+      '</div>' +
+      originalLinkHtml +
       '<button class="asset-lightbox-close" onclick="this.closest(\'#assetLightbox\').remove()">' +
         '<span class="material-symbols-outlined">close</span>' +
       '</button>' +
     '</div>';
   overlay.addEventListener("click", function () { overlay.remove(); });
   document.body.appendChild(overlay);
+  hydrateProtectedImageElements(overlay);
 }
 
 /* getAssetReferenceImages 与 _assetMatchKeywords 已迁移到后端
@@ -3162,7 +3307,7 @@ export function _applyWorldTemplate(tpl) {
     project.videoPromptsApproved = false;
   }
 
-  _ctx.saveProject();
+  _saveAssetsProject();
 
   var charCount = (tpl.characters || []).length;
   showToast("已导入世界观模板：世界观来源已记录，" + charCount + " 个角色已追加到资产库", "success");
@@ -3179,7 +3324,7 @@ export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
   if (selectedId && tplId && selectedId === tplId) {
     project.selectedWorldTemplateId = null;
     project.worldTemplateSnapshot = null;
-    _ctx.saveProject();
+    _saveAssetsProject();
     if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     showToast("已清除关联世界观", "info");
     return;
@@ -3189,7 +3334,7 @@ export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
   var worldSnapshot = snapshotWorldTemplate(full || tpl);
   project.selectedWorldTemplateId = worldSnapshot.id || full.id || tpl.id || null;
   project.worldTemplateSnapshot = worldSnapshot;
-  _ctx.saveProject();
+  _saveAssetsProject();
   if (_ctx.refreshStylePage) _ctx.refreshStylePage();
   showToast("已关联世界观「" + ((full && full.name) || "未命名") + "」。它会作为资产候选池和内容规则参考。", "success");
 }
@@ -3206,7 +3351,7 @@ export async function _applyStyleTemplateFromStylePage(tpl) {
   if (selectedId && tplId && selectedId === tplId) {
     project.selectedStyleTemplateId = null;
     project.styleTemplateSnapshot = null;
-    _ctx.saveProject();
+    _saveAssetsProject();
     if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     showToast("已清除风格模板选择", "info");
     return;
@@ -3214,7 +3359,7 @@ export async function _applyStyleTemplateFromStylePage(tpl) {
 
   project.selectedStyleTemplateId = tpl.id || null;
   project.styleTemplateSnapshot = JSON.parse(JSON.stringify(tpl));
-  _ctx.saveProject();
+  _saveAssetsProject();
   if (_ctx.refreshStylePage) _ctx.refreshStylePage();
   showToast("已选择风格模板「" + ((tpl && tpl.name) || "未命名") + "」。它会参与生成风格圣经。", "success");
 }
@@ -3823,7 +3968,7 @@ export function _syncAssetToStyleBible(type, idx) {
   }).then(function (resp) {
     if (resp.styleBible) {
       project.styleBible = resp.styleBible;
-      _ctx.saveProject();
+      _saveAssetsProject();
       if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     }
   }).catch(function (e) {
@@ -3878,7 +4023,7 @@ export async function _autoSyncUpstream(type, idx, oldDesc) {
 
     if (resp.script && resp.script !== project.script) {
       project.script = resp.script;
-      _ctx.saveProject();
+      _saveAssetsProject();
       _ctx.refreshScriptPage();
       showToast("剧本中「" + assetName + "」的描述已自动更新", "ok");
     }
@@ -3939,7 +4084,7 @@ export async function _checkEquipmentChange(charIdx, oldDescText) {
     removeBtn.addEventListener("click", function () {
       removed.sort(function (a, b) { return b.idx - a.idx; });
       removed.forEach(function (r) { project.assets.props.splice(r.idx, 1); });
-      _ctx.saveProject();
+      _saveAssetsProject();
       refreshAssetsPage();
       showToast("已移除 " + removed.length + " 个旧道具", "ok");
       removeBtn.textContent = "已移除 ✓";
@@ -3962,7 +4107,7 @@ export async function _checkEquipmentChange(charIdx, oldDescText) {
           _descEdited: true,
         });
       });
-      _ctx.saveProject();
+      _saveAssetsProject();
       refreshAssetsPage();
       showToast("已添加 " + added.length + " 个新道具，请补充描述后生成参考图", "ok");
       addBtn.textContent = "已添加 ✓";
@@ -4000,7 +4145,7 @@ export function _removeObsoleteAssets(items) {
   if (Object.keys(sceneIdxToRemove).length && project.assets.scenes) {
     project.assets.scenes = project.assets.scenes.filter(function (_, i) { return !sceneIdxToRemove[i]; });
   }
-  _ctx.saveProject();
+  _saveAssetsProject();
   renderAssets();
   _showAssetActions();
 }
@@ -4088,11 +4233,11 @@ export function _markDownstreamStale(scope, detail) {
         if (resp.staleFlags[k]) project._staleFlags[k] = true;
       });
     }
-    _ctx.saveProject();
+    _saveAssetsProject();
   }).catch(function (e) {
     console.warn("[Stale] backend compute failed, using fallback:", e);
     _markDownstreamStaleFallback(scope, detail);
-    _ctx.saveProject();
+    _saveAssetsProject();
   });
 }
 
@@ -4145,6 +4290,6 @@ export function _isStale(key) {
 export function _clearStale(key) {
   if (project && project._staleFlags) {
     delete project._staleFlags[key];
-    _ctx.saveProject();
+    _saveAssetsProject();
   }
 }

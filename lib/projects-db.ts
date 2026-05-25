@@ -15,24 +15,32 @@
  *     返回 patch 对象；这样多个 batch task 并发时每个都基于最新状态计算。
  */
 import { randomUUID } from 'node:crypto';
-import { existsSync, unlinkSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
 import { getDb, type ProjectRow } from './db';
 import {
   buildFrameWorkflowNormalizationPatch,
-  markTailFrameStaleForFirstFrameChange,
   maybeAssertStoryboardsAlignedWithShots,
 } from './frame-workflow-state';
 import { buildShotPlanDependencyPatch } from './project-dependency-state';
-import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 import { maybeMarkStyleBibleStale } from './script-style-state';
-import { dataPath } from './runtime-paths';
+import { markExportFailureInEditData } from './edit-auto-compose-state';
+import {
+  emptyScriptConsultState,
+  isEmptyScriptConsultState,
+  normalizeScriptConsultState,
+} from './script-consult-state';
+import { isProjectCreatePayloadWhitelistEnabled } from './system-config';
 
 const STYLE_ASPECT_DEFAULT_VERSION = '2026-05-14-9x16';
 
 const EMPTY_DATA = {
+  currentStep: 1,
+  idea: '',
+  script: '',
   oneSentence: '',
+  scriptTargetDurationSec: null as any,
+  scriptApproved: false,
   scriptDraft: '',
+  emotionSegments: null as any,
   scriptAnalysis: null as any,
   styleBible: { vision: '', narrative: '', camera: '', mood: '', promptHabits: '' },
   styleOptions: { aspectRatio: '9:16', aspectRatioDefaultVersion: STYLE_ASPECT_DEFAULT_VERSION },
@@ -54,12 +62,21 @@ const EMPTY_DATA = {
   characters: [] as any[],
   environments: [] as any[],
   props: [] as any[],
+  assets: null as any,
+  assetsApproved: false,
   shots: [] as any[],
+  shotsApproved: false,
   storyboards: [] as any[],
+  imagesApproved: false,
   videoPrompts: [] as any[],
+  videoPromptsApproved: false,
   videoTasks: [] as any[],
+  narrations: [] as any[],
+  editData: null as any,
   episodes: [] as any[],
+  currentEpisodeIdx: 0,
   preferences: null as any,
+  scriptConsult: emptyScriptConsultState(),
 };
 
 function normalizeProjectStyleDefaults(data: any) {
@@ -145,6 +162,7 @@ function rowToPublic(r: ProjectRow) {
     ...EMPTY_DATA,
     ...data,
   });
+  normalized.scriptConsult = normalizeScriptConsultState(normalized.scriptConsult);
   return {
     id: r.id,
     ownerId: r.owner_id,
@@ -157,10 +175,15 @@ function rowToPublic(r: ProjectRow) {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     ...normalized,
+    // version 放在 ...normalized 之后：data_json 里偶尔可能留下脏 version 字段，
+    // 一律以列里的值为准。前端用它构造 If-Match 头。
+    version: Number(r.version) || 1,
   };
 }
 
 function rowToSummary(r: ProjectRow) {
+  let data: any = {};
+  try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
   return {
     id: r.id,
     name: r.title,
@@ -170,6 +193,7 @@ function rowToSummary(r: ProjectRow) {
     status: r.status,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    clientRequestId: data?.clientRequestId,
   };
 }
 
@@ -187,6 +211,25 @@ function buildExportedEdlVersionBackfillPatch(project: any) {
   };
 }
 
+function buildFailedExportTaskCleanupPatch(project: any, userId: number) {
+  const editData = project?.editData;
+  const taskId = String(editData?.exportTaskId || '').trim();
+  if (!editData || !taskId || editData.exportUrl) return null;
+  const row = getDb()
+    .prepare<{ id: string; uid: number }, any>('SELECT status, error_msg FROM exports WHERE id = @id AND owner_id = @uid')
+    .get({ id: taskId, uid: userId });
+  const status = String(row?.status || '');
+  const failed = !row || status === 'failed' || status === 'timeout' || status === 'cancelled';
+  if (!failed) return null;
+  return {
+    editData: markExportFailureInEditData(editData, {
+      exportTaskId: taskId,
+      errorCode: row ? 'EXPORT_FAILED' : 'EXPORT_TASK_MISSING',
+      errorMessage: row?.error_msg || status || '导出任务记录消失',
+    }),
+  };
+}
+
 export function listProjectsByUser(userId: number) {
   const db = getDb();
   const rows = db
@@ -198,22 +241,32 @@ export function listProjectsByUser(userId: number) {
 }
 
 export function getProjectByIdForUser(id: string, userId: number) {
+  const perfDiag = process.env.PERF_DIAG === '1';
+  const t0 = perfDiag ? performance.now() : 0;
   const db = getDb();
   const row = db
     .prepare<{ id: string; uid: number }, ProjectRow>(
       'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
     )
     .get({ id, uid: userId });
+  const tSelect = perfDiag ? performance.now() : 0;
   if (!row) return null;
   const project = rowToPublic(row);
+  const tRowToPublic = perfDiag ? performance.now() : 0;
   const normalizationPatch = buildFrameWorkflowNormalizationPatch(project, userId);
+  const tNorm = perfDiag ? performance.now() : 0;
+  const normalizedProject = { ...project, ...(normalizationPatch || {}) };
   const backfillPatch = buildExportedEdlVersionBackfillPatch({
-    ...project,
-    ...(normalizationPatch || {}),
+    ...normalizedProject,
   });
-  const combinedPatch = normalizationPatch || backfillPatch
-    ? { ...(normalizationPatch || {}), ...(backfillPatch || {}) }
+  const tBackfill = perfDiag ? performance.now() : 0;
+  const backfilledProject = { ...normalizedProject, ...(backfillPatch || {}) };
+  const staleExportPatch = buildFailedExportTaskCleanupPatch(backfilledProject, userId);
+  const tStaleExport = perfDiag ? performance.now() : 0;
+  const combinedPatch = normalizationPatch || backfillPatch || staleExportPatch
+    ? { ...(normalizationPatch || {}), ...(backfillPatch || {}), ...(staleExportPatch || {}) }
     : null;
+  let tUpdate = tStaleExport;
   if (combinedPatch) {
     const applied = applyPatchToRow(row, combinedPatch);
     db.prepare(
@@ -222,10 +275,40 @@ export function getProjectByIdForUser(id: string, userId: number) {
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ? AND owner_id = ?`,
     ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
+    tUpdate = perfDiag ? performance.now() : tUpdate;
+    if (perfDiag) {
+      const fmt = (n: number) => n.toFixed(0);
+      console.log(
+        `[perf-diag] WIP getProjectByIdForUser id=${id} uid=${userId} total=${fmt(tUpdate - t0)}ms`
+          + ` select=${fmt(tSelect - t0)}ms`
+          + ` rowToPublic=${fmt(tRowToPublic - tSelect)}ms`
+          + ` normalizationPatch=${fmt(tNorm - tRowToPublic)}ms`
+          + ` backfillPatch=${fmt(tBackfill - tNorm)}ms`
+          + ` staleExportPatch=${fmt(tStaleExport - tBackfill)}ms`
+          + ` update=${fmt(tUpdate - tStaleExport)}ms`
+          + ` patches=${[
+              normalizationPatch ? 'norm' : '',
+              backfillPatch ? 'backfill' : '',
+              staleExportPatch ? 'staleExport' : '',
+            ].filter(Boolean).join('+') || 'none'}`,
+      );
+    }
     return {
       ...project,
       ...combinedPatch,
     };
+  }
+  if (perfDiag) {
+    const fmt = (n: number) => n.toFixed(0);
+    console.log(
+      `[perf-diag] WIP getProjectByIdForUser id=${id} uid=${userId} total=${fmt(tStaleExport - t0)}ms`
+        + ` select=${fmt(tSelect - t0)}ms`
+        + ` rowToPublic=${fmt(tRowToPublic - tSelect)}ms`
+        + ` normalizationPatch=${fmt(tNorm - tRowToPublic)}ms`
+        + ` backfillPatch=${fmt(tBackfill - tNorm)}ms`
+        + ` staleExportPatch=${fmt(tStaleExport - tBackfill)}ms`
+        + ` update=0ms patches=none`,
+    );
   }
   return project;
 }
@@ -236,12 +319,14 @@ export function createProjectForUser(userId: number, payload: any = {}) {
   // 原站前端可能用 name 或 title 任一字段创建项目
   const title = (payload.name || payload.title || '未命名项目').toString().slice(0, 200);
   const description = (payload.description || '').toString().slice(0, 1000);
-  const oneSentence = (payload.oneSentence || payload.idea || '').toString().slice(0, 2000);
-  const data = {
-    ...EMPTY_DATA,
-    ...(payload || {}),
-    oneSentence,
-  };
+  const data = isProjectCreatePayloadWhitelistEnabled()
+    ? buildNewProjectData(userId, id, payload)
+    : {
+        ...EMPTY_DATA,
+        ...(payload || {}),
+        oneSentence: (payload.oneSentence || payload.idea || '').toString().slice(0, 2000),
+        scriptConsult: emptyScriptConsultState(),
+      };
   // 把 name/title/description/coverUrl/status/id 这些"列字段"从 data_json 里去掉，避免重复
   delete data.id;
   delete data.name;
@@ -256,6 +341,138 @@ export function createProjectForUser(userId: number, payload: any = {}) {
     'INSERT INTO projects (id, owner_id, title, description, status, data_json) VALUES (?, ?, ?, ?, ?, ?)',
   ).run(id, userId, title, description, 'draft', JSON.stringify(data));
   return getProjectByIdForUser(id, userId)!;
+}
+
+const NEW_PROJECT_ALLOWED_PAYLOAD_KEYS = new Set([
+  'id',
+  'name',
+  'title',
+  'description',
+  'coverUrl',
+  'status',
+  'createdAt',
+  'updatedAt',
+  'ownerId',
+  'currentStep',
+  'idea',
+  'oneSentence',
+  'scriptTargetDurationSec',
+  'styleOptions',
+  'aspectRatio',
+  'selectedWorldTemplateId',
+  'worldTemplateSnapshot',
+  'selectedStyleTemplateId',
+  'styleTemplateSnapshot',
+  'preferences',
+  'episodes',
+  'currentEpisodeIdx',
+  'clientRequestId',
+]);
+
+function finiteDuration(value: any): number | null {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(60 * 60, Math.round(n));
+}
+
+function cleanId(value: any): string | null {
+  const text = String(value ?? '').trim();
+  if (!text || text.length > 200) return null;
+  return text;
+}
+
+function cleanPlainObject(value: any): any | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function buildEmptyEpisode(payload: any) {
+  const first = Array.isArray(payload?.episodes) ? payload.episodes[0] : null;
+  return {
+    id: cleanId(first?.id) || `ep_${Date.now()}`,
+    title: String(first?.title || '第 1 集').slice(0, 80),
+    idea: '',
+    script: '',
+    scriptDraft: '',
+    scriptTargetDurationSec: null,
+    scriptApproved: false,
+    emotionSegments: null,
+    assets: null,
+    assetsApproved: false,
+    shots: [],
+    shotsApproved: false,
+    storyboards: [],
+    imagesApproved: false,
+    videoPrompts: [],
+    videoPromptsApproved: false,
+    narrations: [],
+    currentStep: 1,
+  };
+}
+
+function isEffectivelyEmptyCreateValue(key: string, value: any): boolean {
+  if (value == null) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (typeof value === 'boolean') return value === false;
+  if (Array.isArray(value)) return value.length === 0;
+  if (key === 'scriptConsult') return isEmptyScriptConsultState(value);
+  if (typeof value === 'object') return Object.keys(value).length === 0;
+  return false;
+}
+
+function warnDiscardedCreateFields(userId: number, projectId: string, payload: any) {
+  if (!payload || typeof payload !== 'object') return;
+  const discardedKeys = Object.keys(payload).filter((key) => (
+    !NEW_PROJECT_ALLOWED_PAYLOAD_KEYS.has(key) && !isEffectivelyEmptyCreateValue(key, payload[key])
+  ));
+  if (!discardedKeys.length) return;
+  console.warn('[projects.create] discarded payload fields', {
+    userId,
+    projectId,
+    discardedKeys,
+    source: 'createProjectForUser',
+    policyVersion: 'project-create-whitelist-v1',
+  });
+}
+
+function buildNewProjectData(userId: number, projectId: string, payload: any = {}) {
+  warnDiscardedCreateFields(userId, projectId, payload);
+  const styleOptions = cleanPlainObject(payload.styleOptions) || {};
+  if (payload.aspectRatio && !styleOptions.aspectRatio) styleOptions.aspectRatio = String(payload.aspectRatio).slice(0, 20);
+  const oneSentence = (payload.oneSentence || payload.idea || '').toString().slice(0, 2000);
+  return {
+    ...EMPTY_DATA,
+    currentStep: 1,
+    idea: '',
+    oneSentence,
+    script: '',
+    scriptDraft: '',
+    scriptTargetDurationSec: finiteDuration(payload.scriptTargetDurationSec),
+    scriptApproved: false,
+    emotionSegments: null,
+    scriptAnalysis: null,
+    styleOptions: normalizeProjectStyleDefaults({ styleOptions }).styleOptions,
+    selectedWorldTemplateId: cleanId(payload.selectedWorldTemplateId),
+    worldTemplateSnapshot: cleanPlainObject(payload.worldTemplateSnapshot),
+    selectedStyleTemplateId: cleanId(payload.selectedStyleTemplateId),
+    styleTemplateSnapshot: cleanPlainObject(payload.styleTemplateSnapshot),
+    scriptConsult: emptyScriptConsultState(),
+    assets: null,
+    assetsApproved: false,
+    shots: [],
+    shotsApproved: false,
+    storyboards: [],
+    imagesApproved: false,
+    videoPrompts: [],
+    videoPromptsApproved: false,
+    videoTasks: [],
+    narrations: [],
+    editData: null,
+    episodes: [buildEmptyEpisode(payload)],
+    currentEpisodeIdx: 0,
+    preferences: cleanPlainObject(payload.preferences),
+    clientRequestId: cleanId(payload.clientRequestId),
+  };
 }
 
 function applyPatchToRow(existing: ProjectRow, patch: any): {
@@ -304,6 +521,8 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
   }
   delete newData.allowEmptyAssetUrls;
   delete newData.allowStyleBibleRunOverwrite;
+  // version 是真表列、不进 data_json；防止前端误传 { version: 9999 } 之类污染 JSON。
+  delete newData.version;
 
   return {
     title,
@@ -311,40 +530,6 @@ function applyPatchToRow(existing: ProjectRow, patch: any): {
     coverUrl,
     status,
     dataJson: JSON.stringify(newData),
-  };
-}
-
-function applyPutFirstFrameChangeGuard(current: any, patch: any): any {
-  if (!Array.isArray(patch?.storyboards)) return patch;
-  const currentStoryboards = Array.isArray(current?.storyboards) ? current.storyboards : [];
-  const nextStoryboards = [...patch.storyboards];
-  const nextVideoTasks = Array.isArray(patch?.videoTasks)
-    ? [...patch.videoTasks]
-    : (Array.isArray(current?.videoTasks) ? [...current.videoTasks] : []);
-  let storyboardsChanged = false;
-  let videoTasksChanged = false;
-
-  for (let groupIdx = 0; groupIdx < nextStoryboards.length; groupIdx += 1) {
-    const oldFirstFrameUrl = resolveStoryboardFirstFrameUrl(currentStoryboards[groupIdx] || {});
-    const newFirstFrameUrl = resolveStoryboardFirstFrameUrl(nextStoryboards[groupIdx] || {});
-    if (oldFirstFrameUrl === newFirstFrameUrl) continue;
-
-    const nextStoryboard = markTailFrameStaleForFirstFrameChange(nextStoryboards[groupIdx] || {});
-    if (nextStoryboard !== nextStoryboards[groupIdx]) {
-      nextStoryboards[groupIdx] = nextStoryboard;
-      storyboardsChanged = true;
-    }
-    if (nextVideoTasks[groupIdx]) {
-      delete nextVideoTasks[groupIdx];
-      videoTasksChanged = true;
-    }
-  }
-
-  if (!storyboardsChanged && !videoTasksChanged) return patch;
-  return {
-    ...patch,
-    ...(storyboardsChanged ? { storyboards: nextStoryboards } : {}),
-    ...(videoTasksChanged ? { videoTasks: nextVideoTasks } : {}),
   };
 }
 
@@ -364,7 +549,27 @@ function applyPutShotPlanDependencyGuard(current: any, patch: any): any {
  * 注意：如果 patch 里的某个键是数组（如 storyboards），这里仍然是整体替换，
  *      和其他并发 writer 的数组修改之间仍然可能冲突——这类场景请用 patchProjectForUser。
  */
-export function updateProjectForUser(id: string, userId: number, patch: any) {
+/**
+ * 乐观锁失败：前端 If-Match 头里带的 version 已经落后于服务器当前 version。
+ * 调用方（路由层）应该 catch 这个错误，返回 409 让前端拉新快照。
+ */
+export class StaleProjectVersionError extends Error {
+  readonly serverVersion: number;
+  readonly clientVersion: number;
+  constructor(serverVersion: number, clientVersion: number) {
+    super(`stale_version: server=${serverVersion} client=${clientVersion}`);
+    this.name = 'StaleProjectVersionError';
+    this.serverVersion = serverVersion;
+    this.clientVersion = clientVersion;
+  }
+}
+
+export function updateProjectForUser(
+  id: string,
+  userId: number,
+  patch: any,
+  opts?: { expectedVersion?: number },
+) {
   const db = getDb();
   let hit = false;
   const txn = db.transaction(() => {
@@ -375,12 +580,19 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
       .get({ id, uid: userId });
     if (!existing) return;
     hit = true;
+    // 乐观锁校验：调用方（PUT 路由）提供了 expectedVersion 时，必须和 DB 当前 version 一致。
+    // 内部 patchProjectForUser / executor 写回不提供 expectedVersion，从而不被锁住。
+    if (typeof opts?.expectedVersion === 'number') {
+      const serverVersion = Number(existing.version) || 1;
+      if (serverVersion !== opts.expectedVersion) {
+        throw new StaleProjectVersionError(serverVersion, opts.expectedVersion);
+      }
+    }
     const current = rowToPublic(existing);
     const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
     const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
     const rawPatch = patch || {};
-    const firstFrameGuardedPatch = applyPutFirstFrameChangeGuard(normalizedCurrent, rawPatch);
-    const guardedPatch = applyPutShotPlanDependencyGuard(normalizedCurrent, firstFrameGuardedPatch);
+    const guardedPatch = applyPutShotPlanDependencyGuard(normalizedCurrent, rawPatch);
     const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...guardedPatch } : guardedPatch;
     const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
       Object.prototype.hasOwnProperty.call(combinedPatch, key)
@@ -395,6 +607,7 @@ export function updateProjectForUser(id: string, userId: number, patch: any) {
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
+           version = version + 1,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ? AND owner_id = ?`,
     ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
@@ -435,6 +648,7 @@ export function patchProjectForUser(
     const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
     const patch = patcher(normalizedCurrent) || {};
     const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...patch } : patch;
+    if (Object.keys(combinedPatch).length === 0) return;
     const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
       Object.prototype.hasOwnProperty.call(combinedPatch, key)
     ));
@@ -448,6 +662,7 @@ export function patchProjectForUser(
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
+           version = version + 1,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ? AND owner_id = ?`,
     ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
@@ -465,27 +680,6 @@ export function deleteProjectForUser(id: string, userId: number) {
     .get({ id, uid: userId });
   if (!existing) return false;
 
-  const imageRows = db
-    .prepare<{ uid: number; pid: string }, any>(
-      `SELECT filename, style, asset_ref FROM images WHERE owner_id = @uid AND project_id = @pid`,
-    )
-    .all({ uid: userId, pid: id });
-  const videoRows = db
-    .prepare<{ uid: number; pid: string }, any>(
-      `SELECT id, filename FROM video_tasks WHERE owner_id = @uid AND project_id = @pid`,
-    )
-    .all({ uid: userId, pid: id });
-  const uploadRows = db
-    .prepare<{ uid: number; pid: string }, any>(
-      `SELECT filename FROM uploads WHERE owner_id = @uid AND project_id = @pid`,
-    )
-    .all({ uid: userId, pid: id });
-  const exportRows = db
-    .prepare<{ uid: number; pid: string }, any>(
-      `SELECT id, filename FROM exports WHERE owner_id = @uid AND project_id = @pid`,
-    )
-    .all({ uid: userId, pid: id });
-
   let deleted = false;
   const txn = db.transaction(() => {
     db.prepare(
@@ -496,10 +690,23 @@ export function deleteProjectForUser(id: string, userId: number) {
     db.prepare('DELETE FROM continuity_cache WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM style_bible_runs WHERE owner_id = ? AND project_id = ?').run(userId, id);
     db.prepare('DELETE FROM script_library_items WHERE owner_id = ? AND project_id = ?').run(userId, id);
-    db.prepare('DELETE FROM images WHERE owner_id = ? AND project_id = ?').run(userId, id);
-    db.prepare('DELETE FROM video_tasks WHERE owner_id = ? AND project_id = ?').run(userId, id);
-    db.prepare('DELETE FROM uploads WHERE owner_id = ? AND project_id = ?').run(userId, id);
-    db.prepare('DELETE FROM exports WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    // Deleting a project removes the project container only. Generated/uploaded media is
+    // retained for the asset library, downloads, and edit reuse.
+    db.prepare('UPDATE images SET project_id = NULL WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('UPDATE video_tasks SET project_id = NULL WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare('UPDATE uploads SET project_id = NULL WHERE owner_id = ? AND project_id = ?').run(userId, id);
+    db.prepare(
+      `UPDATE assets
+          SET project_relation_status = 'orphaned_project',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE owner_id = ? AND project_id = ?`,
+    ).run(userId, id);
+    db.prepare(
+      `UPDATE edit_projects
+          SET status = 'deleted',
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE owner_id = ? AND project_id = ?`,
+    ).run(userId, id);
     db.prepare('DELETE FROM project_knowledge_contexts WHERE owner_id = ? AND project_id = ?').run(userId, id);
     // Keep derived world templates: they may be reused by other projects. Only sever provenance.
     db.prepare('UPDATE world_templates SET source_project_id = NULL WHERE owner_id = ? AND source_project_id = ?').run(userId, id);
@@ -507,52 +714,5 @@ export function deleteProjectForUser(id: string, userId: number) {
     deleted = info.changes > 0;
   });
   txn.immediate();
-  if (!deleted) return false;
-
-  const files = new Set<string>();
-  const addFile = (bucket: string, filename: any) => {
-    const name = String(filename || '').trim();
-    if (!name) return;
-    files.add(`${bucket}\u0000${name}`);
-  };
-
-  for (const row of imageRows) {
-    const isVideoCover = row?.style === 'video-cover' || String(row?.asset_ref || '').startsWith('video-cover/');
-    addFile(isVideoCover ? 'videos' : 'images', row?.filename);
-  }
-  for (const row of videoRows) {
-    addFile('videos', row?.filename);
-    addFile('videos', row?.id ? `${row.id}.cover.png` : '');
-  }
-  for (const row of uploadRows) addFile('uploads', row?.filename);
-  for (const row of exportRows) {
-    addFile('exports', row?.filename);
-    if (row?.id) {
-      addFile('exports', `${row.id}.concat.mp4`);
-      addFile('exports', `${row.id}.subbed.mp4`);
-      addFile('exports', `${row.id}.sfx.mp4`);
-      addFile('exports', `${row.id}.srt`);
-    }
-  }
-
-  for (const key of files) {
-    const [bucket, filename] = key.split('\u0000');
-    unlinkProjectDataFile(bucket, userId, filename);
-  }
-
-  return true;
-}
-
-function unlinkProjectDataFile(bucket: string, userId: number, filename: string) {
-  const base = resolve(dataPath(bucket, String(userId)));
-  const target = resolve(base, filename);
-  if (target === base || !target.startsWith(base + sep)) {
-    console.warn('[ProjectDelete] Skip unsafe file path:', bucket, filename);
-    return;
-  }
-  try {
-    if (existsSync(target)) unlinkSync(target);
-  } catch (e) {
-    console.warn('[ProjectDelete] Failed to remove file:', target, e);
-  }
+  return deleted;
 }

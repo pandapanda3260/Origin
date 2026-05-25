@@ -152,7 +152,7 @@ export type MutateCharacterLockResult<TProject extends Record<string, any> = Rec
 };
 
 const SCHEMA: ProjectConsistency['schema'] = 'origin-consistency-v1';
-const READY_QUALITY_THRESHOLD = 0.65;
+export const READY_QUALITY_THRESHOLD = 0.65;
 
 const DEFAULT_META: ProjectConsistencyMeta = {
   needsRoleSync: false,

@@ -13,6 +13,7 @@ import { reapOrphanExports } from './exports-reap';
 import { recoverOrphanedOnlineEditorDownloads, requeuePendingOnlineEditorDownloads, startOnlineEditorDownloadWorker } from './online-editor-downloads';
 import { recoverRunningVideoTasks, startVideoRecoveryLoop } from './video-gen';
 import { startProviderPollingLoop } from './provider-polling-worker';
+import { startVideoPromptReaperLoop } from './video-prompt-reaper';
 
 installConsoleHook();
 
@@ -63,6 +64,11 @@ if (!isNextProductionBuild() && (recoveryEnabled || reapOnStart) && !(globalThis
   if (recoveryEnabled) {
     try { startVideoRecoveryLoop(); } catch (e) { console.error('[init] startVideoRecoveryLoop:', e); }
   }
+}
+
+const videoPromptReaperEnabled = envFlag('VIDEO_PROMPT_REAPER_ENABLED', recoveryEnabled || reapOnStart);
+if (!isNextProductionBuild() && videoPromptReaperEnabled) {
+  try { startVideoPromptReaperLoop(); } catch (e) { console.error('[init] startVideoPromptReaperLoop:', e); }
 }
 
 export const __EXECUTORS_INITIALIZED__ = true;

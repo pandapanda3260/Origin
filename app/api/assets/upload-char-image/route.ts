@@ -9,6 +9,7 @@ import { patchProjectForUser } from '@/lib/projects-db';
 import { buildSignedImageUrl } from '@/lib/signed-asset-url';
 import { mutateCharacterLock } from '@/lib/character-consistency';
 import { getDataDir } from '@/lib/runtime-paths';
+import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -82,7 +83,8 @@ export async function POST(req: NextRequest) {
     mkdirSync(dir, { recursive: true });
     const ext = guessExt(mime);
     const filename = `${id}.${ext}`;
-    writeFileSync(join(dir, filename), buf);
+    const fullPath = join(dir, filename);
+    writeFileSync(fullPath, buf);
 
     const db = getDb();
     db.prepare(
@@ -97,6 +99,21 @@ export async function POST(req: NextRequest) {
       mime,
       buf.length,
     );
+    createAssetRecord({
+      assetId: id,
+      ownerId: user.id,
+      projectId: projectId || null,
+      assetKind: 'image',
+      source: 'uploaded',
+      stage: 'asset_character',
+      fileUri: localAssetUri('images', user.id, filename),
+      thumbUri: `/api/images/file/${id}`,
+      fileHash: hashFile(fullPath),
+      byteSize: buf.length,
+      width: 0,
+      height: 0,
+      makeCurrent: !!projectId,
+    });
 
     const url = `/api/images/file/${id}`;
     const signed = buildSignedImageUrl(id, user.id);
