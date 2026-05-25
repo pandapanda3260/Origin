@@ -128,6 +128,42 @@ Then validate through the public domain and admin pages:
 - `/admin/time-stats`
 - one protected image URL with thumbnail query, for example `/api/images/file/<id>?w=256`
 
+Also verify the runtime model routing after every env or key change. This catches stale production provider settings before users submit real generation jobs:
+
+```bash
+cd /opt/origin
+set -a && . /etc/origin/origin.env && set +a
+./node_modules/.bin/tsx - <<'TS'
+import { chatComplete } from "./lib/llm";
+import { getModelRoutingStatus } from "./lib/model-routing";
+
+const status = getModelRoutingStatus(null);
+for (const slot of ["brain", "structured", "image", "video"]) {
+  const cfg = status[slot];
+  const host = new URL(cfg.baseUrl).host;
+  console.log(`${slot} provider=${cfg.provider} model=${cfg.model} host=${host}`);
+}
+
+for (const role of ["structured", "brain"]) {
+  const started = Date.now();
+  const reply = await chatComplete(null, [
+    { role: "system", content: "Reply with exactly: pong" },
+    { role: "user", content: "health check" },
+  ], {
+    modelRole: role,
+    temperature: 0,
+    maxTokens: 32,
+    requestTimeoutMs: 45000,
+    traceName: `prod-smoke-${role}`,
+    reasoningEffort: role === "structured" ? "none" : undefined,
+  });
+  console.log(`${role} ok latencyMs=${Date.now() - started} reply=${reply.trim().slice(0, 80)}`);
+}
+TS
+```
+
+Do not print provider API keys or full `/etc/origin/origin.env` contents in release logs.
+
 ## Rollback
 
 Use code rollback first when the database changes are additive:

@@ -31,6 +31,7 @@ Release branch: `codex/release-20260525`. Deploy the final reviewed HEAD commit 
 - Production may continue to rely on defaults for optional tuning keys. Required secrets and provider credentials remain in `/etc/origin/origin.env`; do not print them in logs or release notes.
 - Confirm `ORIGIN_DATA_DIR` and `DB_PATH` remain outside `/opt/origin` before swapping directories.
 - Preserve `/opt/origin/vevdemo-1.0.6` in the new release directory before swapping. It is an ignored runtime bundle and is required by the online editor material registration health check.
+- Post-deploy model routing must be checked against the intended provider hosts. On 2026-05-25 production initially still pointed text/image routing at the old Code80 host; the AI/model keys were resynced from the local external env and verified with `structured` and `brain` smoke calls.
 
 ## Verification
 
