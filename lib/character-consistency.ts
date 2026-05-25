@@ -432,15 +432,26 @@ function referenceQualityBucket(lock: CharacterReferenceLock): CharacterReferenc
 }
 
 function normalizeReferenceLock(input: Partial<CharacterReferenceLock> | undefined, fallback: CharacterReferenceLock): CharacterReferenceLock {
+  const replaceWithSheetOnlyDegraded = !!(
+    input &&
+    input.referenceStatus === 'degraded' &&
+    cleanText(input.sheetUrl) &&
+    !cleanText(input.headshotUrl) &&
+    !cleanText(input.frontUrl) &&
+    !cleanText(input.sideUrl) &&
+    !cleanText(input.backUrl)
+  );
   const next: CharacterReferenceLock = {
     sheetUrl: cleanText(input?.sheetUrl ?? fallback.sheetUrl) || undefined,
-    headshotUrl: cleanText(input?.headshotUrl ?? fallback.headshotUrl) || undefined,
-    frontUrl: cleanText(input?.frontUrl ?? fallback.frontUrl) || undefined,
-    sideUrl: cleanText(input?.sideUrl ?? fallback.sideUrl) || undefined,
-    backUrl: cleanText(input?.backUrl ?? fallback.backUrl) || undefined,
-    sourceImageId: cleanText(input?.sourceImageId ?? fallback.sourceImageId) || undefined,
+    headshotUrl: replaceWithSheetOnlyDegraded ? undefined : cleanText(input?.headshotUrl ?? fallback.headshotUrl) || undefined,
+    frontUrl: replaceWithSheetOnlyDegraded ? undefined : cleanText(input?.frontUrl ?? fallback.frontUrl) || undefined,
+    sideUrl: replaceWithSheetOnlyDegraded ? undefined : cleanText(input?.sideUrl ?? fallback.sideUrl) || undefined,
+    backUrl: replaceWithSheetOnlyDegraded ? undefined : cleanText(input?.backUrl ?? fallback.backUrl) || undefined,
+    sourceImageId: cleanText(input?.sourceImageId ?? (replaceWithSheetOnlyDegraded ? undefined : fallback.sourceImageId)) || undefined,
     referenceStatus: input?.referenceStatus || fallback.referenceStatus || 'missing',
-    qualityScore: Number.isFinite(Number(input?.qualityScore)) ? Number(input?.qualityScore) : fallback.qualityScore,
+    qualityScore: replaceWithSheetOnlyDegraded && !Number.isFinite(Number(input?.qualityScore))
+      ? undefined
+      : Number.isFinite(Number(input?.qualityScore)) ? Number(input?.qualityScore) : fallback.qualityScore,
   };
   const hasAnyRef = !!(next.sheetUrl || next.headshotUrl || next.frontUrl || next.sideUrl || next.backUrl || next.sourceImageId);
   if (!hasAnyRef) next.referenceStatus = next.referenceStatus === 'failed' ? 'failed' : 'missing';

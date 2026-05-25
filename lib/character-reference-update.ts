@@ -100,9 +100,12 @@ export function isAcceptedCharacterPanelResult(
 
 function classifyCharacterPanelResult(
   result: SplitCharacterPanelsResult | null | undefined,
-  _entityType: CharacterEntityType,
-): 'ready' | 'failed' {
-  return result?.ok === true ? 'ready' : 'failed';
+  entityType: CharacterEntityType,
+): CharacterReferenceStatus {
+  if (!result) return 'failed';
+  if (result.ok === true) return 'ready';
+  if (entityType === 'non-human') return 'degraded';
+  return 'failed';
 }
 
 function cleanReferenceSuccess(reference: any) {
@@ -132,16 +135,6 @@ function firstCleanUrl(...values: unknown[]): string | undefined {
 function hasAnyPanelUrl(value: any): boolean {
   if (!value || typeof value !== 'object') return false;
   return ['sheetUrl', 'headshotUrl', 'frontUrl', 'sideUrl', 'backUrl'].some((key) => hasUrl(value[key]));
-}
-
-function canUseGeneratedSheetAsDegradedNonHumanReference(
-  result: SplitCharacterPanelsResult | null | undefined,
-  entityType: CharacterEntityType,
-  generated: GeneratedImageLike,
-): result is Extract<SplitCharacterPanelsResult, { ok: false }> {
-  if (entityType !== 'non-human') return false;
-  if (result?.ok !== false || !hasUrl(generated.url)) return false;
-  return /not enough usable panels/i.test(result.error || '');
 }
 
 function normalizeEntityType(value: unknown): CharacterEntityType | undefined {
@@ -256,8 +249,7 @@ export function deriveCharacterReferenceUpdate(
 ): CharacterReferenceUpdate {
   const previous = prevAsset && typeof prevAsset === 'object' ? prevAsset : {};
   const referenceStatus = classifyCharacterPanelResult(panelResult, entityType);
-  const accepted = referenceStatus !== 'failed';
-  if (accepted) {
+  if (referenceStatus === 'ready') {
     const okPanelResult = panelResult as Extract<SplitCharacterPanelsResult, { ok: true }>;
     const withPanels = applyCharacterPanelResult(previous, okPanelResult, nowIso);
     const reference = cleanReferenceSuccess({
@@ -303,7 +295,7 @@ export function deriveCharacterReferenceUpdate(
   }
 
   const lastError = buildSplitFailureError(panelResult, entityType);
-  if (canUseGeneratedSheetAsDegradedNonHumanReference(panelResult, entityType, generated)) {
+  if (referenceStatus === 'degraded') {
     const reference = {
       ...(previous.reference || {}),
       currentUrl: generated.url,
@@ -326,6 +318,7 @@ export function deriveCharacterReferenceUpdate(
       reference,
       imageGeneratedAt: nowIso,
     };
+    delete nextAsset.panels;
     delete nextAsset.imageLastError;
     delete nextAsset.imageFailedAt;
     delete nextAsset.panelsError;
@@ -338,7 +331,6 @@ export function deriveCharacterReferenceUpdate(
         sheetUrl: generated.url,
         sourceImageId: generated.id,
         referenceStatus: 'degraded',
-        qualityScore: 0,
       },
       lastError,
     };

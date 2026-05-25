@@ -207,11 +207,15 @@ assertFailurePreservesOldGood(null, 'missing panel result');
     name: '活螃蟹',
     entityType: 'non-human',
     reference: {},
+    panels: {
+      sheetUrl: '/api/images/file/stale-crab-sheet',
+      frontUrl: '/api/images/file/stale-crab-front',
+    },
   };
   const update = deriveCharacterReferenceUpdate(
     crab,
     { url: '/api/images/file/new-crab-sheet', id: 'new-crab-id' },
-    { ok: false, error: 'not enough usable panels (0/3)' },
+    { ok: false, error: 'split finished but panel quality was unusable' },
     'non-human',
     styleMeta,
     now,
@@ -222,8 +226,102 @@ assertFailurePreservesOldGood(null, 'missing panel result');
   assert.equal(update.nextAsset.reference.status, 'degraded');
   assert.equal(update.nextAsset.reference.currentUrl, '/api/images/file/new-crab-sheet');
   assert.equal(update.nextAsset.reference.lastKnownGoodUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.nextAsset.reference.lastAttemptUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.nextAsset.reference.lastError.reason, 'character_panel_split_failed');
+  assert.equal(update.nextAsset.reference.lastError.message, 'split finished but panel quality was unusable');
+  assert.equal(update.nextAsset.panels, undefined, 'degraded sheet must not keep stale split panels');
   assert.equal(update.referenceLock?.referenceStatus, 'degraded');
   assert.equal(update.referenceLock?.sheetUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.referenceLock?.sourceImageId, 'new-crab-id');
+  assert.equal(update.referenceLock?.qualityScore, undefined);
+  assert.equal(update.lastError?.message, 'split finished but panel quality was unusable');
+}
+
+{
+  const update = deriveCharacterReferenceUpdate(
+    {
+      characterId: 'crab-ready-1',
+      name: '活螃蟹',
+      entityType: 'non-human',
+      reference: { status: 'degraded' },
+    },
+    { url: '/api/images/file/new-crab-ready-sheet', id: 'new-crab-ready-id' },
+    okPanel({
+      schema: 'non-human-character-sheet-v1',
+      sourceImageId: 'nonhuman-source',
+      sheetUrl: '/api/images/file/nonhuman-sheet',
+      headshotUrl: undefined,
+      frontUrl: '/api/images/file/nonhuman-front',
+      sideUrl: '/api/images/file/nonhuman-side',
+      backUrl: '/api/images/file/nonhuman-back',
+      confidence: 0.88,
+      quality: {
+        front: quality(true),
+        side: quality(true),
+        back: quality(true),
+      },
+    }),
+    'non-human',
+    styleMeta,
+    now,
+  );
+  assert.equal(update.accepted, true, 'non-human successful split should be ready');
+  assert.equal(update.referenceStatus, 'ready');
+  assert.equal(update.nextAsset.reference.status, 'ready');
+  assert.equal(update.nextAsset.reference.currentUrl, '/api/images/file/new-crab-ready-sheet');
+  assert.equal(update.nextAsset.panels.schema, 'non-human-character-sheet-v1');
+  assert.equal(update.nextAsset.panels.frontUrl, '/api/images/file/nonhuman-front');
+  assert.equal(update.referenceLock?.referenceStatus, 'ready');
+  assert.equal(update.referenceLock?.sheetUrl, '/api/images/file/nonhuman-sheet');
+  assert.equal(update.referenceLock?.frontUrl, '/api/images/file/nonhuman-front');
+  assert.equal(update.referenceLock?.qualityScore, 0.88);
+}
+
+{
+  const oldReadyCrab = {
+    characterId: 'crab-old-ready',
+    name: '活螃蟹',
+    entityType: 'non-human',
+    imageUrl: '/api/images/file/old-crab-sheet',
+    rawUrl: '/api/images/file/old-crab-sheet',
+    realPhotoUrl: '/api/images/file/old-crab-sheet',
+    pencilUrl: '/api/images/file/old-crab-sheet',
+    reference: {
+      currentUrl: '/api/images/file/old-crab-sheet',
+      lastKnownGoodUrl: '/api/images/file/old-crab-sheet',
+      status: 'ready',
+    },
+    panels: {
+      schema: 'non-human-character-sheet-v1',
+      sheetUrl: '/api/images/file/old-crab-sheet',
+      frontUrl: '/api/images/file/old-crab-front',
+      sideUrl: '/api/images/file/old-crab-side',
+      backUrl: '/api/images/file/old-crab-back',
+      confidence: 0.92,
+    },
+  };
+  const update = deriveCharacterReferenceUpdate(
+    oldReadyCrab,
+    { url: '/api/images/file/new-crab-sheet-2', id: 'new-crab-id-2' },
+    { ok: false, error: 'not enough usable panels (0/3)' },
+    'non-human',
+    styleMeta,
+    now,
+  );
+  assert.equal(update.accepted, true, 'non-human regeneration should honor the new sheet even when old ready panels exist');
+  assert.equal(update.referenceStatus, 'degraded');
+  assert.equal(update.nextAsset.imageUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.rawUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.realPhotoUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.pencilUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.reference.status, 'degraded');
+  assert.equal(update.nextAsset.reference.currentUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.reference.lastKnownGoodUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.nextAsset.panels, undefined, 'new degraded non-human sheet should drop old panel URLs');
+  assert.equal(update.referenceLock?.referenceStatus, 'degraded');
+  assert.equal(update.referenceLock?.sheetUrl, '/api/images/file/new-crab-sheet-2');
+  assert.equal(update.referenceLock?.frontUrl, undefined);
+  assert.equal(update.referenceLock?.qualityScore, undefined);
 }
 
 {
@@ -449,6 +547,81 @@ assertFailurePreservesOldGood(null, 'missing panel result');
 }
 
 {
+  const project = {
+    assets: { characters: [{ characterId: 'char-1', name: '角色A' }], scenes: [], props: [] },
+    consistency: {
+      schema: 'origin-consistency-v1',
+      updatedAt: now,
+      meta: { needsRoleSync: false, roleSyncReasons: [], resolverCaseVersion: 1 },
+      characters: [{
+        characterId: 'char-1',
+        canonicalName: '角色A',
+        aliases: ['角色A'],
+        versions: {
+          identityVersion: 1,
+          visualVersion: 1,
+          performanceVersion: 1,
+          voiceVersion: 1,
+          resolverVersion: 1,
+          referenceVersion: 1,
+        },
+        status: 'locked',
+        identityLock: { role: '角色A', identity: '角色A', entityType: 'non-human', species: '螃蟹' },
+        visualLock: {
+          appearance: '',
+          clothing: '',
+          equipment: '',
+          negativeRules: [],
+          signatureColors: [],
+          canonicalPrompt: '',
+          visualSignatureHash: '',
+        },
+        performanceLock: {
+          temperament: '',
+          actionTraits: '',
+          gestureRules: [],
+          performanceSignatureHash: '',
+        },
+        voiceLock: {
+          confidence: 0.5,
+          negativeRules: [],
+          voiceSignatureHash: '',
+        },
+        referenceLock: {
+          sheetUrl: '/old-sheet.png',
+          frontUrl: '/old-front.png',
+          sideUrl: '/old-side.png',
+          backUrl: '/old-back.png',
+          sourceImageId: 'old-source',
+          referenceStatus: 'ready',
+          qualityScore: 0.92,
+        },
+      }],
+    },
+  };
+  const result = mutateCharacterLock(
+    project,
+    'char-1',
+    {
+      referenceLock: {
+        sheetUrl: '/new-sheet.png',
+        sourceImageId: 'new-source',
+        referenceStatus: 'degraded',
+      },
+    },
+    { source: 'asset_image', now },
+  );
+  const lock = result.project.consistency.characters[0].referenceLock;
+  assert.equal(lock.referenceStatus, 'degraded');
+  assert.equal(lock.sheetUrl, '/new-sheet.png');
+  assert.equal(lock.frontUrl, undefined, 'sheet-only degraded lock must not retain stale front panel');
+  assert.equal(lock.sideUrl, undefined, 'sheet-only degraded lock must not retain stale side panel');
+  assert.equal(lock.backUrl, undefined, 'sheet-only degraded lock must not retain stale back panel');
+  assert.equal(lock.sourceImageId, 'new-source');
+  assert.equal(lock.qualityScore, undefined, 'sheet-only degraded lock should not keep stale qualityScore');
+}
+
+{
   const failedCharacter = {
     name: '角色A',
     imageUrl: '/api/images/file/bad-sheet',
@@ -488,6 +661,49 @@ assertFailurePreservesOldGood(null, 'missing panel result');
   assert.equal(charRefs.length, 1, 'failed character may remain as text fallback context');
   assert.equal(charRefs[0].delivery, 'text_only', 'failed character image must not be delivered as image reference');
   assert.equal(charRefs[0].droppedReason, 'no_image_available');
+}
+
+{
+  const ownerId = 1;
+  const sheetUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000cb01');
+  const degradedNonHuman = {
+    name: '活螃蟹',
+    entityType: 'non-human',
+    imageUrl: sheetUrl,
+    rawUrl: sheetUrl,
+    realPhotoUrl: sheetUrl,
+    pencilUrl: sheetUrl,
+    reference: {
+      status: 'degraded',
+      currentUrl: sheetUrl,
+      lastKnownGoodUrl: sheetUrl,
+    },
+  };
+  const project = {
+    assets: { characters: [degradedNonHuman], scenes: [], props: [] },
+    shots: [{ visual: '活螃蟹 full body enters', description: '活螃蟹 enters', characters: ['活螃蟹'] }],
+  };
+  const selectedPanels = selectCharacterReferencePanels({
+    project,
+    ownerId,
+    groupShotIndices: [0],
+    maxSlots: 3,
+  });
+  assert.equal(selectedPanels.length, 1, 'degraded non-human sheet should be selected as sheet fallback');
+  assert.equal(selectedPanels[0].panel, 'sheet');
+
+  const plan = buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0],
+    ownerId,
+    frameType: 'first_frame',
+    modelSnapshot: { provider: 'test', model: 'test', multiRefImageCap: 4 },
+    resolveLocalPath: () => '/tmp/degraded-non-human.png',
+  });
+  const charRefs = plan.referenceManifest.filter((ref) => ref.role === 'character');
+  assert.equal(charRefs.length, 1, 'degraded non-human should appear in reference manifest');
+  assert.equal(charRefs[0].delivery, 'image', 'degraded non-human sheet should be delivered as image reference');
 }
 
 {

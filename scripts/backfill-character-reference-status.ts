@@ -1,13 +1,15 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getDb } from '../lib/db';
-import { READY_QUALITY_THRESHOLD } from '../lib/character-consistency';
+import { mutateCharacterLock, READY_QUALITY_THRESHOLD } from '../lib/character-consistency';
 import { READY_PANEL_CONFIDENCE } from '../lib/character-reference-update';
-import { getDataDir } from '../lib/runtime-paths';
+import { dataPath, getDataDir } from '../lib/runtime-paths';
 
 type Mode = 'dry-run' | 'apply';
+type Operation = 'preserve-last-good' | 'non-human-failed-last-attempt';
 
 type Candidate = {
+  operation: Operation;
   projectId: string;
   title: string;
   idx: number;
@@ -17,10 +19,14 @@ type Candidate = {
   qualityScore: number | null;
   recoveryUrl: string | null;
   reason: string;
+  lastErrorReason?: string | null;
 };
 
 const args = new Set(process.argv.slice(2));
-const mode: Mode = args.has('--apply') ? 'apply' : 'dry-run';
+const mode: Mode = args.has('--apply') || args.has('--write') ? 'apply' : 'dry-run';
+const operation: Operation = args.has('--non-human-failed-last-attempt')
+  ? 'non-human-failed-last-attempt'
+  : 'preserve-last-good';
 const projectId = valueArg('--projectId');
 const now = new Date().toISOString();
 
@@ -37,6 +43,11 @@ function hasText(value: unknown): boolean {
 function hasPanelUrl(value: any): boolean {
   if (!value || typeof value !== 'object') return false;
   return ['sheetUrl', 'headshotUrl', 'frontUrl', 'sideUrl', 'backUrl'].some((key) => hasText(value[key]));
+}
+
+function imageIdFromUrl(url: unknown): string | undefined {
+  const match = /\/api\/images\/file\/([^/?#]+)/.exec(String(url || ''));
+  return match?.[1];
 }
 
 function normalizeEntityType(value: any): string {
@@ -101,6 +112,31 @@ function hasOldGoodReference(character: any, lock: any): boolean {
     || hasText(reference.currentUrl)
     || hasPanelUrl(character?.panels)
     || hasPanelUrl(referenceLock);
+}
+
+function hasCurrentReferenceImage(character: any): boolean {
+  const reference = character?.reference || {};
+  return hasText(reference.currentUrl)
+    || hasText(reference.lastKnownGoodUrl)
+    || hasText(character?.imageUrl)
+    || hasText(character?.rawUrl)
+    || hasText(character?.realPhotoUrl)
+    || hasText(character?.pencilUrl)
+    || hasPanelUrl(character?.panels);
+}
+
+function nonHumanFailedLastAttemptCandidate(character: any, lock: any): { url: string; reason: string; lastErrorReason?: string | null } | null {
+  if (!character?.reference || character.reference.status !== 'failed') return null;
+  const entityType = normalizeEntityType(character?.entityType || lock?.identityLock?.entityType);
+  if (entityType !== 'non-human') return null;
+  if (hasCurrentReferenceImage(character)) return null;
+  const url = String(character.reference.lastAttemptUrl || '').trim();
+  if (!url) return null;
+  return {
+    url,
+    reason: 'non_human_failed_last_attempt_sheet',
+    lastErrorReason: character.reference.lastError?.reason || character.reference.lastError?.message || null,
+  };
 }
 
 function recoveryUrl(character: any, lock: any): string | null {
@@ -189,6 +225,54 @@ function recoverCharacter(character: any, lock: any, candidate: Omit<Candidate, 
   return true;
 }
 
+function recoverNonHumanFailedLastAttemptCharacter(character: any, url: string): boolean {
+  if (!character || typeof character !== 'object') return false;
+  character.imageUrl = url;
+  character.rawUrl = url;
+  character.realPhotoUrl = url;
+  character.pencilUrl = url;
+  character.skippedStylize = true;
+  character.reference = {
+    ...(character.reference || {}),
+    status: 'degraded',
+    currentUrl: url,
+    lastKnownGoodUrl: url,
+    lastAttemptUrl: url,
+    updatedAt: now,
+    recoveredAt: now,
+    recoveryMeta: {
+      reason: 'non_human_failed_last_attempt_backfill',
+      previousStatus: 'failed',
+      recoveryUrl: url,
+    },
+  };
+  delete character.reference.lastFailedAt;
+  delete character.panels;
+  delete character.panelsError;
+  delete character.panelsErrorAt;
+  delete character.imageLastError;
+  delete character.imageFailedAt;
+  return true;
+}
+
+function characterKey(character: any, idx: number): string {
+  return String(character?.characterId || character?.id || character?.name || character?.role || `characters[${idx}]`);
+}
+
+function sqlString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function backupSqliteDatabase(): string | null {
+  const sourcePath = process.env.DB_PATH || dataPath('qd.sqlite');
+  if (!existsSync(sourcePath)) return null;
+  const backupDir = join(getDataDir(), 'backups');
+  mkdirSync(backupDir, { recursive: true });
+  const backupPath = join(backupDir, `qd.sqlite.character-reference-backfill-${now.replace(/[:.]/g, '-')}.bak`);
+  db.exec(`VACUUM INTO ${sqlString(backupPath)}`);
+  return backupPath;
+}
+
 const db = getDb();
 const rows = db.prepare(
   `SELECT id, title, data_json
@@ -213,8 +297,48 @@ for (const row of rows) {
 
   for (let idx = 0; idx < Math.max(chars.length, topChars.length); idx += 1) {
     const character = chars[idx] || topChars[idx];
-    if (!character?.reference) continue;
     const lock = findLock(project, character);
+    if (operation === 'non-human-failed-last-attempt') {
+      const decision = nonHumanFailedLastAttemptCandidate(character, lock);
+      if (!decision) continue;
+      const candidate: Candidate = {
+        operation,
+        projectId: row.id,
+        title: row.title,
+        idx,
+        name: String(character.name || character.role || character.id || `characters[${idx}]`),
+        previousStatus: String(character.reference.status || ''),
+        recoveredStatus: 'degraded',
+        qualityScore: null,
+        recoveryUrl: decision.url,
+        reason: decision.reason,
+        lastErrorReason: decision.lastErrorReason,
+      };
+      candidates.push(candidate);
+
+      const assetChanged = recoverNonHumanFailedLastAttemptCharacter(chars[idx], decision.url);
+      const topChanged = recoverNonHumanFailedLastAttemptCharacter(topChars[idx], decision.url);
+      if (assetChanged || topChanged) {
+        const sourceCharacter = chars[idx] || topChars[idx] || character;
+        const mutation = mutateCharacterLock(
+          project,
+          characterKey(sourceCharacter, idx),
+          {
+            referenceLock: {
+              sheetUrl: decision.url,
+              sourceImageId: imageIdFromUrl(decision.url),
+              referenceStatus: 'degraded',
+            },
+          },
+          { source: 'migration', now },
+        );
+        project.consistency = mutation.project.consistency;
+        changed = true;
+      }
+      continue;
+    }
+
+    if (!character?.reference) continue;
     if (!canReuseReferenceForCharacter(character, lock)) continue;
     const statusRecoverable = character.reference.status === 'failed' && !character.reference.recoveredAt && hasOldGoodReference(character, lock);
     const urlRecoverable = needsRecoveredUrl(character, lock);
@@ -223,6 +347,7 @@ for (const row of rows) {
     const decision = recoverStatus(lock, character);
     const url = recoveryUrl(character, lock);
     const candidate: Candidate = {
+      operation,
       projectId: row.id,
       title: row.title,
       idx,
@@ -254,13 +379,14 @@ if (mode === 'apply' && updates.length) {
   const backupDir = join(getDataDir(), 'backups');
   mkdirSync(backupDir, { recursive: true });
   const backupPath = join(backupDir, `character-reference-backfill-${now.replace(/[:.]/g, '-')}.json`);
+  const sqliteBackupPath = backupSqliteDatabase();
   writeFileSync(backupPath, JSON.stringify({ createdAt: now, candidates, updates: updates.map((item) => ({ id: item.id, title: item.title, before: JSON.parse(item.before) })) }, null, 2));
   const update = db.prepare("UPDATE projects SET data_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?");
   const tx = db.transaction(() => {
     for (const item of updates) update.run(item.after, item.id);
   });
   tx();
-  console.log(JSON.stringify({ mode, candidates: candidates.length, updatedProjects: updates.length, backupPath, details: candidates }, null, 2));
+  console.log(JSON.stringify({ mode, operation, candidates: candidates.length, updatedProjects: updates.length, backupPath, sqliteBackupPath, details: candidates }, null, 2));
 } else {
-  console.log(JSON.stringify({ mode, candidates: candidates.length, updatedProjects: updates.length, details: candidates }, null, 2));
+  console.log(JSON.stringify({ mode, operation, candidates: candidates.length, updatedProjects: updates.length, details: candidates }, null, 2));
 }
