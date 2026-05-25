@@ -134,6 +134,16 @@ function hasAnyPanelUrl(value: any): boolean {
   return ['sheetUrl', 'headshotUrl', 'frontUrl', 'sideUrl', 'backUrl'].some((key) => hasUrl(value[key]));
 }
 
+function canUseGeneratedSheetAsDegradedNonHumanReference(
+  result: SplitCharacterPanelsResult | null | undefined,
+  entityType: CharacterEntityType,
+  generated: GeneratedImageLike,
+): result is Extract<SplitCharacterPanelsResult, { ok: false }> {
+  if (entityType !== 'non-human') return false;
+  if (result?.ok !== false || !hasUrl(generated.url)) return false;
+  return /not enough usable panels/i.test(result.error || '');
+}
+
 function normalizeEntityType(value: unknown): CharacterEntityType | undefined {
   const text = cleanText(value).toLowerCase();
   if (!text) return undefined;
@@ -293,6 +303,47 @@ export function deriveCharacterReferenceUpdate(
   }
 
   const lastError = buildSplitFailureError(panelResult, entityType);
+  if (canUseGeneratedSheetAsDegradedNonHumanReference(panelResult, entityType, generated)) {
+    const reference = {
+      ...(previous.reference || {}),
+      currentUrl: generated.url,
+      lastKnownGoodUrl: generated.url,
+      status: 'degraded',
+      updatedAt: nowIso,
+      styleBibleSignature: styleMeta.styleBibleSignature,
+      styleLockVersion: styleMeta.styleLockVersion,
+      resolvedBackdropColor: styleMeta.resolvedBackdropColor,
+      lastAttemptUrl: generated.url,
+      lastError,
+    };
+    const nextAsset = {
+      ...previous,
+      imageUrl: generated.url,
+      rawUrl: generated.url,
+      realPhotoUrl: generated.url,
+      pencilUrl: generated.url,
+      skippedStylize: true,
+      reference,
+      imageGeneratedAt: nowIso,
+    };
+    delete nextAsset.imageLastError;
+    delete nextAsset.imageFailedAt;
+    delete nextAsset.panelsError;
+    delete nextAsset.panelsErrorAt;
+    return {
+      accepted: true,
+      referenceStatus: 'degraded',
+      nextAsset,
+      referenceLock: {
+        sheetUrl: generated.url,
+        sourceImageId: generated.id,
+        referenceStatus: 'degraded',
+        qualityScore: 0,
+      },
+      lastError,
+    };
+  }
+
   const previousReusable = canReusePreviousCharacterReference(previous, entityType);
   const lockReusable = reusableReferenceLock(previousReferenceLock);
   const preservedUrl = previousReusable ? oldGoodReferenceUrl(previous, lockReusable) : undefined;

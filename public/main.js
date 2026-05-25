@@ -5998,7 +5998,15 @@ var _scriptEditInitialText = "";
 
   function _suggestBeforeAssetConfirm() {
     var chars = (project.assets && project.assets.characters) || [];
-    var noPencil = chars.filter(function (c) { return !c.pencilUrl; });
+    var hasStyleReference = function (c) {
+      return !!(
+        c.pencilUrl || c.imageUrl || c.rawUrl || c.realPhotoUrl ||
+        (c.reference && (c.reference.currentUrl || c.reference.lastKnownGoodUrl)) ||
+        (c.referenceLock && c.referenceLock.sheetUrl) ||
+        (c.panels && (c.panels.sheetUrl || c.panels.frontUrl || c.panels.sideUrl || c.panels.backUrl))
+      );
+    };
+    var noPencil = chars.filter(function (c) { return !hasStyleReference(c); });
     if (noPencil.length) {
       showToast(
         noPencil.length + " 个角色尚未生成风格参考图，可能影响后续视频参考图质量",

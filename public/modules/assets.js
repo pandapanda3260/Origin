@@ -2024,9 +2024,17 @@ export function confirmAssets() {
   if (!project || !project.assets) { showToast("请先分析资产", "warn"); return; }
 
   var chars = project.assets.characters || [];
+  var hasStyleReference = function (c) {
+    return !!(
+      c.pencilUrl || c.imageUrl || c.rawUrl || c.realPhotoUrl ||
+      (c.reference && (c.reference.currentUrl || c.reference.lastKnownGoodUrl)) ||
+      (c.referenceLock && c.referenceLock.sheetUrl) ||
+      (c.panels && (c.panels.sheetUrl || c.panels.frontUrl || c.panels.sideUrl || c.panels.backUrl))
+    );
+  };
   var missingPencil = [];
   for (var ci = 0; ci < chars.length; ci++) {
-    if (chars[ci].realPhotoUrl && !chars[ci].pencilUrl) {
+    if (!hasStyleReference(chars[ci])) {
       missingPencil.push(chars[ci].name || "角色 #" + (ci + 1));
     }
   }

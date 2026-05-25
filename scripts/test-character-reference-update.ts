@@ -202,6 +202,31 @@ assertReady(okPanel({
 assertFailurePreservesOldGood(null, 'missing panel result');
 
 {
+  const crab = {
+    characterId: 'crab-1',
+    name: '活螃蟹',
+    entityType: 'non-human',
+    reference: {},
+  };
+  const update = deriveCharacterReferenceUpdate(
+    crab,
+    { url: '/api/images/file/new-crab-sheet', id: 'new-crab-id' },
+    { ok: false, error: 'not enough usable panels (0/3)' },
+    'non-human',
+    styleMeta,
+    now,
+  );
+  assert.equal(update.accepted, true, 'non-human generated sheet remains usable when strict panel split fails');
+  assert.equal(update.referenceStatus, 'degraded');
+  assert.equal(update.nextAsset.pencilUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.nextAsset.reference.status, 'degraded');
+  assert.equal(update.nextAsset.reference.currentUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.nextAsset.reference.lastKnownGoodUrl, '/api/images/file/new-crab-sheet');
+  assert.equal(update.referenceLock?.referenceStatus, 'degraded');
+  assert.equal(update.referenceLock?.sheetUrl, '/api/images/file/new-crab-sheet');
+}
+
+{
   const degradedPrevious = {
     ...previous,
     reference: {
