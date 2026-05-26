@@ -30,6 +30,7 @@ async function main() {
     cancelBatchForUser,
     createBatch,
     getBatchSnapshot,
+    recoverStaleBatches,
     registerExecutor,
     resolveTaskStartTransitionConflict,
   } = await import('../lib/batches');
@@ -237,6 +238,42 @@ async function main() {
   const upstreamSnap = getBatchSnapshot(upstreamRun.batchId);
   assert.equal(upstreamSnap.status, 'running');
   assert.equal(upstreamSnap.tasks[0].status, 'upstream_pending');
+  db.prepare(
+    `UPDATE batches
+        SET runner_id = NULL,
+            runner_heartbeat_at = '2020-01-01T00:00:00.000Z'
+      WHERE id = ?`,
+  ).run(upstreamRun.batchId);
+  db.prepare(
+    `UPDATE batch_tasks
+        SET runner_id = NULL,
+            lease_expires_at = '2020-01-01T00:00:00.000Z',
+            heartbeat_at = '2020-01-01T00:00:00.000Z'
+      WHERE batch_id = ?`,
+  ).run(upstreamRun.batchId);
+  recoverStaleBatches(10);
+  const recoveredUpstreamSnap = getBatchSnapshot(upstreamRun.batchId);
+  assert.equal(recoveredUpstreamSnap.status, 'running');
+  assert.equal(recoveredUpstreamSnap.tasks[0].status, 'upstream_pending');
+
+  const videoPendingBatchId = 'batch-video-upstream-active';
+  db.prepare(
+    `INSERT INTO batches (id, owner_id, project_id, batch_type, status, total)
+     VALUES (?, ?, 'project-video-upstream-active', 'video_segments', 'running', 1)`,
+  ).run(videoPendingBatchId, user.id);
+  db.prepare(
+    `INSERT INTO batch_tasks
+      (id, batch_id, seq, task_type, status, target_json)
+     VALUES ('task-video-upstream-active', ?, 0, 'video_segments', 'upstream_pending', '{"groupIdx":0}')`,
+  ).run(videoPendingBatchId);
+  const upstreamReused = createBatch({
+    user,
+    batchType: 'video_segments',
+    projectId: 'project-video-upstream-active',
+    targets: [{ groupIdx: 0 }],
+  });
+  assert.equal(upstreamReused.reused, true);
+  assert.equal(upstreamReused.batchId, videoPendingBatchId);
 
   const raceBatchId = 'batch-cancel-race-unit';
   db.prepare(

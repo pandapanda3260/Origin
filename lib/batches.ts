@@ -520,7 +520,7 @@ function _findActiveGroupBatchOverlap(db: any, opts: {
          AND b.project_id = ?
          AND b.batch_type = ?
          AND b.status IN ('queued', 'running')
-         AND bt.status IN ('queued', 'running')
+         AND bt.status IN ('queued', 'running', 'retry_pending', 'upstream_pending')
          AND CAST(${groupExpr} AS INTEGER) IN (${placeholders})
        ORDER BY b.created_at DESC, bt.seq ASC`,
     )
@@ -937,6 +937,20 @@ function claimBatchForRecovery(batchId: string) {
       return null;
     }
 
+    const pendingOnly = db
+      .prepare<{ bid: string }, any>(
+        `SELECT
+           SUM(CASE WHEN status IN ('queued','running','retry_pending') THEN 1 ELSE 0 END) AS runner_owned,
+           SUM(CASE WHEN status='upstream_pending' THEN 1 ELSE 0 END) AS upstream_pending
+         FROM batch_tasks
+         WHERE batch_id = @bid`,
+      )
+      .get({ bid: batchId }) || {};
+    if (Number(pendingOnly.runner_owned || 0) === 0 && Number(pendingOnly.upstream_pending || 0) > 0) {
+      db.exec('COMMIT');
+      return null;
+    }
+
     const runningTasks = db
       .prepare<{ bid: string }, any>(
         "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
@@ -1089,7 +1103,7 @@ function moveReleasedExpiredTasksToNeedsReview(limit = 100) {
       `SELECT bt.id, bt.status, bt.batch_id, b.batch_type
          FROM batch_tasks bt
          JOIN batches b ON b.id = bt.batch_id
-        WHERE bt.status IN ('running', 'upstream_pending')
+        WHERE bt.status = 'running'
           AND (bt.runner_id IS NULL OR bt.runner_id = '')
           AND bt.lease_expires_at IS NOT NULL
           AND bt.lease_expires_at < @now
