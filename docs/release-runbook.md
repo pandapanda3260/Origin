@@ -17,6 +17,14 @@ npm run verify:release:local
 
 `npm run lint` is not a release gate yet: the script exists, but this repository has no ESLint config or ESLint dependency, so `next lint` prompts for interactive setup.
 
+Production hosts must have a CJK font installed for edit-export hard subtitles. On Ubuntu, install and cache `fonts-noto-cjk` before exporting Chinese captions:
+
+```bash
+apt-get install -y fonts-noto-cjk
+fc-cache -f
+fc-match "Noto Sans CJK SC"
+```
+
 ## Database and storage
 
 Before production rollout, run a SQLite backup on the target server:

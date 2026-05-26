@@ -15,6 +15,16 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
+const SUBTITLE_FONT_STACK = [
+  'Noto Sans CJK SC',
+  'Noto Sans CJK',
+  'Source Han Sans SC',
+  'PingFang SC',
+  'Hiragino Sans GB',
+  'Microsoft YaHei',
+  'WenQuanYi Micro Hei',
+  'sans-serif',
+].map((name) => `"${name}"`).join(', ');
 
 function run(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -328,7 +338,7 @@ function parseSrt(srt: string): SrtCue[] {
  * 编译时没带 libass / freetype，所以那条路在很多机器上会静默失败。
  *
  * 新版改成 **PNG overlay**：
- *   1) 用 @napi-rs/canvas 把每条字幕用 PingFang SC 渲成透明背景 PNG（白字 + 黑色描边）
+ *   1) 用 @napi-rs/canvas 把每条字幕按 CJK 字体栈渲成透明背景 PNG（白字 + 黑色描边）
  *   2) 把 PNG 作为额外输入喂给 ffmpeg
  *   3) 链式 overlay，配合 `enable='between(t,start,end)'` 让每条字幕只在自己时段显示
  *
@@ -381,7 +391,7 @@ export async function burnSubtitles(opts: {
       const c = limited[i];
       const canvas = createCanvas(subWidth, subHeight);
       const ctx = canvas.getContext('2d');
-      ctx.font = `bold ${fontSize}px "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
+      ctx.font = `bold ${fontSize}px ${SUBTITLE_FONT_STACK}`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       const x = subWidth / 2;
