@@ -54,6 +54,7 @@
     "test:batch-durable": "tsx scripts/test-batch-durable-integration.ts",
     "test:online-editor-expiry": "tsx scripts/test-online-editor-expiry.ts",
     "test:provider-recovery": "tsx scripts/test-provider-recovery.ts",
+    "test:edit-export-concat": "tsx scripts/test-edit-export-concat.ts",
     "prompt-eval:collect": "node scripts/prompt-sample-collect.mjs",
     "prompt-eval:report": "node scripts/prompt-eval.mjs",
     "start": "next start -p 3000",

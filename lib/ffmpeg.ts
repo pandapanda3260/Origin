@@ -81,17 +81,19 @@ const XFADE_MAP: Record<string, string> = {
   wiperight: 'wiperight',
   slideleft: 'slideleft',
   slideright: 'slideright',
-  // cut 用极短 xfade（40ms）模拟硬切——给观众 1-2 帧的过渡防"咔哒帧"，但视觉上仍是切镜
-  cut: 'fade',
 };
 
-/** 转场默认时长（秒）；cut 设极短 0.04，其它给观众"看得到"的时长 */
+/** 转场默认时长（秒）；cut 不做 xfade，其它给观众"看得到"的时长 */
 function defaultTransDuration(t: string): number {
   const k = (t || 'cut').toLowerCase();
-  if (k === 'cut') return 0.04;
+  if (k === 'cut') return 0;
   if (k === 'dissolve') return 1.0;  // 柔和过渡，给情绪转折足够呼吸
   if (k === 'wipe' || k === 'wipeleft' || k === 'wiperight') return 0.7;
   return 0.8;                         // fade
+}
+
+function normalizeTransitionType(value: unknown): string {
+  return String(value || 'cut').trim().toLowerCase();
 }
 
 /**
@@ -110,7 +112,8 @@ function defaultTransDuration(t: string): number {
  *   - 所有片段重编码到 1920x1080（横屏 16:9），统一 30fps、aac 48k
  *   - 视频不足分辨率时居中加黑边
  *   - 无音轨自动补静音轨
- *   - 有任何非 cut 转场时走 xfade/acrossfade 链；全 cut 走效率更高的 concat filter
+ *   - cut 边界走 concat，真实转场才走 xfade/acrossfade。这样避免旧 ffmpeg
+ *     在混合 cut + xfade 长链下把视频轨截短。
  */
 export async function concatClips(opts: {
   inputPaths?: string[];
@@ -141,7 +144,7 @@ export async function concatClips(opts: {
   // 看有没有任何非 cut 转场（第 0 段的 transitionIn 不算）
   const useXfade = clips.some((c, i) => {
     if (i === 0) return false;
-    const t = String((c as any).transitionIn || 'cut').toLowerCase();
+    const t = normalizeTransitionType((c as any).transitionIn);
     return t !== 'cut';
   });
 
@@ -164,7 +167,7 @@ export async function concatClips(opts: {
     const vChain = [
       `[${i}:v]`,
       useTrim ? `trim=${trimVArgs},setpts=PTS-STARTPTS,` : `setpts=PTS-STARTPTS,`,
-      `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS},format=yuv420p[v${i}]`,
+      `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${FPS},settb=AVTB,format=yuv420p[v${i}]`,
     ].join('');
     parts.push(vChain);
 
@@ -189,14 +192,24 @@ export async function concatClips(opts: {
     const concatInputs = clips.map((_, i) => `[v${i}][a${i}]`).join('');
     parts.push(`${concatInputs}concat=n=${clips.length}:v=1:a=1[outv][outa]`);
   } else {
-    // ── 2b) 有转场 → xfade / acrossfade 链 ──
-    // 算每个 xfade 的 offset：前面已渲完的总长 - 当前转场长度
+    // ── 2b) 混合时间线：cut 仍用 concat，真实转场才用 xfade / acrossfade ──
+    // 算每个 xfade 的 offset：前面已渲完的总长 - 当前转场长度。
     let lastV = `[v0]`;
     let lastA = `[a0]`;
     let cumDur = segDurs[0];
 
     for (let i = 1; i < clips.length; i++) {
-      const tType = String((clips[i] as any).transitionIn || 'cut').toLowerCase();
+      const tType = normalizeTransitionType((clips[i] as any).transitionIn);
+      if (tType === 'cut') {
+        const outV = i === clips.length - 1 ? `[outv]` : `[cv${i}]`;
+        const outA = i === clips.length - 1 ? `[outa]` : `[ca${i}]`;
+        parts.push(`${lastV}${lastA}[v${i}][a${i}]concat=n=2:v=1:a=1${outV}${outA}`);
+        lastV = outV;
+        lastA = outA;
+        cumDur += segDurs[i];
+        continue;
+      }
+
       const tDur = Math.max(0.04, Number((clips[i] as any).transitionInDuration) || defaultTransDuration(tType));
       const xtype = XFADE_MAP[tType] || 'fade';
       const offset = Math.max(0, cumDur - tDur);
@@ -224,6 +237,68 @@ export async function concatClips(opts: {
     opts.outputPath,
   );
   await run(args);
+}
+
+export type MediaStreamDurations = {
+  formatSec: number;
+  videoSec: number;
+  audioSec: number;
+};
+
+function finitePositiveSeconds(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+export function probeMediaStreamDurations(path: string): Promise<MediaStreamDurations> {
+  return new Promise((resolve) => {
+    const probe = process.env.FFPROBE_PATH || 'ffprobe';
+    const child = spawn(probe, [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-show_entries', 'stream=codec_type,duration',
+      '-of', 'json',
+      path,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.on('error', () => resolve({ formatSec: 0, videoSec: 0, audioSec: 0 }));
+    child.on('close', () => {
+      try {
+        const parsed = JSON.parse(out || '{}');
+        const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+        const video = streams.find((s: any) => s?.codec_type === 'video');
+        const audio = streams.find((s: any) => s?.codec_type === 'audio');
+        resolve({
+          formatSec: finitePositiveSeconds(parsed?.format?.duration),
+          videoSec: finitePositiveSeconds(video?.duration),
+          audioSec: finitePositiveSeconds(audio?.duration),
+        });
+      } catch {
+        resolve({ formatSec: 0, videoSec: 0, audioSec: 0 });
+      }
+    });
+  });
+}
+
+export async function assertAudioVideoDurationAligned(path: string, opts: {
+  label?: string;
+  maxDriftSec?: number;
+} = {}): Promise<MediaStreamDurations> {
+  const durations = await probeMediaStreamDurations(path);
+  const label = opts.label ? `${opts.label}: ` : '';
+  if (!durations.videoSec) {
+    throw new Error(`${label}导出文件缺少有效视频轨`);
+  }
+  if (!durations.audioSec) return durations;
+  const maxDriftSec = opts.maxDriftSec ?? 0.75;
+  const drift = Math.abs(durations.videoSec - durations.audioSec);
+  if (drift > maxDriftSec) {
+    throw new Error(
+      `${label}导出音视频时长不一致：video=${durations.videoSec.toFixed(3)}s audio=${durations.audioSec.toFixed(3)}s drift=${drift.toFixed(3)}s`,
+    );
+  }
+  return durations;
 }
 
 /** 用 ffprobe 检查文件是否含音轨。失败时保守返回 false（按无音轨处理）。 */

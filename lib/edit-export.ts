@@ -3,7 +3,14 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync,
 import { basename, join } from 'node:path';
 import type { UserRow } from './db';
 import { getDb } from './db';
-import { addBgm, burnSubtitles, concatClips, mixTransitionSfx, probeDurationSec } from './ffmpeg';
+import {
+  addBgm,
+  assertAudioVideoDurationAligned,
+  burnSubtitles,
+  concatClips,
+  mixTransitionSfx,
+  probeDurationSec,
+} from './ffmpeg';
 import { storyboardShotIndices } from './frame-workflow-state';
 import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from './credits';
 import { patchProjectForUser } from './projects-db';
@@ -445,7 +452,7 @@ async function doExport(opts: {
       const segDur = outSec - inSec;
 
       const tType = i === 0 ? 'cut' : (it.transitionInType || 'cut').toLowerCase();
-      const tDur = tType === 'cut' ? 0.04
+      const tDur = tType === 'cut' ? 0
                  : tType === 'dissolve' ? 1.0
                  : (tType === 'wipe' || tType === 'wipeleft' || tType === 'wiperight') ? 0.7
                  : 0.8;
@@ -464,6 +471,22 @@ async function doExport(opts: {
 
     const concatPath = join(EXPORTS_DIR, String(userId), `${exportId}.concat.mp4`);
     await concatClips({ clips, outputPath: concatPath });
+    try {
+      await assertAudioVideoDurationAligned(concatPath, { label: `export ${exportId} concat` });
+    } catch (e) {
+      const hasRealTransition = clips.some((c, i) => i > 0 && String(c.transitionIn || 'cut').toLowerCase() !== 'cut');
+      if (!hasRealTransition) throw e;
+      console.warn('[export] concat duration mismatch, retrying with hard cuts:', exportId, (e as any)?.message || e);
+      await concatClips({
+        clips: clips.map((c, i) => ({
+          ...c,
+          transitionIn: 'cut',
+          transitionInDuration: 0,
+        })),
+        outputPath: concatPath,
+      });
+      await assertAudioVideoDurationAligned(concatPath, { label: `export ${exportId} concat fallback` });
+    }
     setProg(50);
     if (isCancelled()) return;
 
@@ -516,6 +539,8 @@ async function doExport(opts: {
     } else {
       renameSync(withSfx, outputPath);
     }
+
+    await assertAudioVideoDurationAligned(outputPath, { label: `export ${exportId} final` });
 
     for (const f of [
       concatPath,
