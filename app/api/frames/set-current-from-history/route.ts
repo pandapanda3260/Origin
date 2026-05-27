@@ -24,6 +24,23 @@ function currentFrameUrl(sb: any): string {
   return cleanUrl(sb?.frames?.first?.url || sb?.firstFrameUrl || sb?.imageUrl || sb?.rawUrl || sb?.url);
 }
 
+function historySubmittedPrompt(item: any, fallback: unknown): string {
+  return String(item?.submittedPrompt ?? item?.prompt ?? fallback ?? '').trim();
+}
+
+function historyBasePrompt(item: any, fallback: unknown): string {
+  return String(item?.firstFrameBasePrompt ?? item?.originalPrompt ?? item?.prompt ?? fallback ?? '').trim();
+}
+
+function currentBasePrompt(sb: any): string {
+  return String(
+    sb?.firstFrameBasePrompt?.content
+    || sb?.originalFirstFramePrompt
+    || sb?.frames?.first?.originalPrompt
+    || '',
+  ).trim();
+}
+
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
@@ -55,13 +72,18 @@ export async function POST(req: NextRequest) {
 
     const now = new Date().toISOString();
     const previousUrl = currentFrameUrl(prev);
+    const previousBasePrompt = currentBasePrompt(prev);
+    const previousSubmittedPrompt = prev.firstFramePrompt || prev.frames?.first?.prompt || prev.imagePrompt || '';
     const previousHistoryItem = previousUrl
       ? {
           url: previousUrl,
+          ...(prev.rawUrl && prev.rawUrl !== previousUrl ? { rawUrl: prev.rawUrl } : {}),
           at: now,
           source: prev.firstFrameMode || prev.firstFrame?.source || 'current_before_history_restore',
+          mode: prev.firstFrameMode || prev.frames?.first?.mode || 'structured_v1',
           sourceHash: prev.firstFrameSourceHash || prev.frames?.first?.sourceHash || null,
-          prompt: prev.firstFramePrompt || prev.frames?.first?.prompt || '',
+          firstFrameBasePrompt: previousBasePrompt,
+          submittedPrompt: previousSubmittedPrompt,
           planSummary: prev.firstFramePlanSummary || prev.frames?.first?.planSummary || null,
         }
       : null;
@@ -71,6 +93,9 @@ export async function POST(req: NextRequest) {
     ].slice(0, 30);
     const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
     const sourceHash = typeof historyItem.sourceHash === 'string' ? historyItem.sourceHash : null;
+    const basePrompt = historyBasePrompt(historyItem, currentBasePrompt(prev));
+    const submittedPrompt = historySubmittedPrompt(historyItem, prev.firstFramePrompt || prev.frames?.first?.prompt || '');
+    const rawUrl = cleanUrl(historyItem.rawUrl) || historyUrl;
     const nextStoryboard = {
       ...prev,
       idx: groupIdx,
@@ -78,11 +103,20 @@ export async function POST(req: NextRequest) {
       shotIndices,
       url: historyUrl,
       imageUrl: historyUrl,
-      rawUrl: historyUrl,
+      rawUrl,
       firstFrameUrl: historyUrl,
       firstFrameMode: historyItem.mode || prev.firstFrameMode || 'history_restore',
       firstFrameSourceHash: sourceHash,
-      firstFramePrompt: historyItem.prompt || prev.firstFramePrompt || '',
+      firstFramePrompt: submittedPrompt,
+      imagePrompt: submittedPrompt,
+      originalFirstFramePrompt: basePrompt,
+      firstFrameBasePrompt: {
+        content: basePrompt,
+        sourceHash,
+        updatedAt: now,
+        updatedBy: user.id,
+        origin: 'history_restore',
+      },
       firstFramePlanSummary: historyItem.planSummary || prev.firstFramePlanSummary || null,
       firstFrameLastError: undefined,
       firstFrameFailedAt: undefined,
@@ -107,11 +141,13 @@ export async function POST(req: NextRequest) {
           generatedAt: historyItem.at || now,
           sourceHash,
           shotIndices,
-          prompt: historyItem.prompt || prev.frames?.first?.prompt || '',
+          prompt: submittedPrompt,
+          originalPrompt: basePrompt,
           planSummary: historyItem.planSummary || prev.frames?.first?.planSummary || null,
         },
       },
     };
+    delete nextStoryboard.firstFrameEditDraft;
     // 用户原则: 切首帧历史版本不连带 stale 尾帧, 也不删除已生成的 videoTasks。
     storyboards[groupIdx] = nextStoryboard;
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'first-frame-history-restore');

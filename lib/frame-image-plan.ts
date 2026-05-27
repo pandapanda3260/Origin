@@ -22,13 +22,6 @@
 
 import { createHash } from 'node:crypto';
 import {
-  enforceHardVisualConstraints,
-  enforceNoFillLightConstraint,
-  hasFillLightPositiveMention,
-  hasNoFillLightConstraint,
-  sanitizeFillLightPositiveMentions,
-} from './content-sanitize';
-import {
   buildCharacterLockRoster,
   buildObservedDriftGuardrails,
   clean,
@@ -110,8 +103,8 @@ export type FrameImageGenerationPlan = {
   characterLockText: string;
   sceneLockText: string;
   propLockText: string;
-  /** 本组所有 shot 的原始文本拼接 (visual/description/dialogue 等, 已 sanitize)。
-   *  用作 renderer 硬约束扫描源, 确保 shot.visual 里的 "不要补光灯" 等用户约束能被命中。 */
+  /** 本组所有 shot 的原始文本拼接 (visual/description/dialogue 等)。
+   *  用作 renderer 的用户原文约束区, 不做专项词汇改写。 */
   shotConstraintText: string;
   referenceManifest: FrameReference[];
   /** renderer 产出的最终 prompt, 提交前仍可能被 safe-image-gen 的审核恢复二次改写。 */
@@ -371,30 +364,27 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         .join(' '),
     )
     .join(' ');
-  const groupText = sanitizeFillLightPositiveMentions(rawGroupText);
+  const groupText = rawGroupText;
 
-  // shot 文本单独拼一遍, 作为硬约束扫描源。和 groupText 的区别: 这里只含用户真正
+  // shot 文本单独拼一遍, 作为用户原文约束记录。和 groupText 的区别: 这里只含用户真正
   // 写进剧本/镜头表的字段 (visual/description/dialogue/keyInfo/imagePrompt 等),
-  // 不含 characters 数组这类元数据。覆盖面要尽量大, 避免用户把 "不要补光灯" 之类
-  // 硬约束写到某个字段却没被 enforceHardVisualConstraints 命中。
-  const shotConstraintText = sanitizeFillLightPositiveMentions(
-    groupShots
-      .map((sh: any) =>
-        [
-          sh?.visual,
-          sh?.description,
-          sh?.desc,
-          sh?.dialogue,
-          sh?.scriptRef,
-          sh?.keyInfo,
-          sh?.imagePrompt,
-        ]
-          .filter(Boolean)
-          .join(' '),
-      )
-      .filter(Boolean)
-      .join('\n'),
-  );
+  // 不含 characters 数组这类元数据，避免资产名污染用户原始画面约束。
+  const shotConstraintText = groupShots
+    .map((sh: any) =>
+      [
+        sh?.visual,
+        sh?.description,
+        sh?.desc,
+        sh?.dialogue,
+        sh?.scriptRef,
+        sh?.keyInfo,
+        sh?.imagePrompt,
+      ]
+        .filter(Boolean)
+        .join(' '),
+    )
+    .filter(Boolean)
+    .join('\n');
 
   // ---- characters ----
   const charNames = new Set<string>();
@@ -422,22 +412,20 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   const usedChars = [...manualChars, ...matchedChars].slice(0, 6);
 
   const characterLockRoster = buildCharacterLockRoster(project, charNames, 'zh', groupText);
-  const characterLockText = sanitizeFillLightPositiveMentions(
-    characterLockRoster ||
-      usedChars
-        .map((c: any) => {
-          const nm = c.name || c.role;
-          const desc = [c.identity, c.appearance || c.description || c.detail, c.clothing, c.equipment]
-            .filter(Boolean)
-            .join(', ');
-          const ent =
-            c.entityType === 'non-human'
-              ? ' 非人/拟人角色，必须保留原物种身体结构'
-              : '';
-          return `${nm}${ent}: ${truncate(desc, 180)}`;
-        })
-        .join('\n'),
-  );
+  const characterLockText = characterLockRoster ||
+    usedChars
+      .map((c: any) => {
+        const nm = c.name || c.role;
+        const desc = [c.identity, c.appearance || c.description || c.detail, c.clothing, c.equipment]
+          .filter(Boolean)
+          .join(', ');
+        const ent =
+          c.entityType === 'non-human'
+            ? ' 非人/拟人角色，必须保留原物种身体结构'
+            : '';
+        return `${nm}${ent}: ${truncate(desc, 180)}`;
+      })
+      .join('\n');
 
   // ---- scene ----
   const sceneSelection = pickSceneForShots(
@@ -472,36 +460,32 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         220,
       )}`
     : '';
-  const sceneLockText = sanitizeFillLightPositiveMentions(sceneLockTextRaw);
+  const sceneLockText = sceneLockTextRaw;
 
   // ---- props ----
   const allProps: any[] = (project?.assets?.props || []) as any[];
   const availableProps = allProps.filter((p: any, idx: number) => {
     if (isMaterialAssetExcluded(project, 'prop', p, groupIdx, idx)) return false;
     const nm = p?.name || p?.propName;
-    return !!nm && !hasFillLightPositiveMention(nm);
+    return !!nm;
   });
   const manualProps = availableProps.filter((p: any) => isStoryboardMaterialForGroup(p, groupIdx, 'prop'));
   const matchedProps = orderPropsByFirstOccurrence(availableProps
     .filter((p: any) => {
       if (isStoryboardMaterialForGroup(p, groupIdx, 'prop')) return false;
       const nm = p?.name || p?.propName;
-      return groupText.includes(sanitizeFillLightPositiveMentions(nm));
+      return groupText.includes(nm);
     }), groupText);
   const usedProps = [...manualProps, ...matchedProps].slice(0, 6);
-  const propLockText = sanitizeFillLightPositiveMentions(
-    usedProps
-      .map(
-        (p: any) =>
-          `${sanitizeFillLightPositiveMentions(p.name || p.propName)}: ${truncate(
-            sanitizeFillLightPositiveMentions(
-              [p.description, p.features, p.propType].filter(Boolean).join(', '),
-            ),
-            140,
-          )}`,
-      )
-      .join('\n'),
-  );
+  const propLockText = usedProps
+    .map(
+      (p: any) =>
+        `${p.name || p.propName}: ${truncate(
+          [p.description, p.features, p.propType].filter(Boolean).join(', '),
+          140,
+        )}`,
+    )
+    .join('\n');
 
   // ---- style bible ----
   const styleBible = project?.styleBible || {};
@@ -592,10 +576,8 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       assetId: p.propId || p.id || nm,
       assetName: nm,
       remoteUrl: assetImageUrl(p) || undefined,
-      textFallback: `${sanitizeFillLightPositiveMentions(nm)}: ${truncate(
-        sanitizeFillLightPositiveMentions(
-          [p.description, p.features, p.propType].filter(Boolean).join(', '),
-        ),
+      textFallback: `${nm}: ${truncate(
+        [p.description, p.features, p.propType].filter(Boolean).join(', '),
         140,
       )}`,
     };
@@ -907,6 +889,12 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
     lines.push(plan.driftGuardrails.replace(/^\n+/, ''));
   }
 
+  if (plan.shotConstraintText) {
+    lines.push('');
+    lines.push('【用户原文约束】');
+    lines.push(truncate(plan.shotConstraintText, 900));
+  }
+
   // 6. Composition rules
   lines.push('');
   lines.push('【构图规则】');
@@ -933,23 +921,11 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   lines.push(
     '- 禁止字幕、说明文字、可读文字、水印、分格边框、分屏布局、多格图、角色设定表。',
   );
-  lines.push('- 必须遵守下方所有用户负向约束。');
+  lines.push('- 必须遵守上方所有用户负向约束。');
 
-  let out = sanitizeFillLightPositiveMentions(lines.join('\n'));
-
-  const constraintSource = [
-    plan.shotConstraintText,
-    plan.characterLockText,
-    plan.sceneLockText,
-    plan.propLockText,
-    plan.styleLock,
-    plan.driftGuardrails,
-  ].join('\n');
-  const noFillLight = hasNoFillLightConstraint(constraintSource);
-  out = enforceHardVisualConstraints(out, constraintSource);
+  let out = lines.join('\n');
   if (out.length > MAX_FINAL_PROMPT_CHARS) {
     out = out.slice(0, MAX_FINAL_PROMPT_CHARS) + '…';
-    if (noFillLight) out = enforceNoFillLightConstraint(out);
   }
   return out;
 }

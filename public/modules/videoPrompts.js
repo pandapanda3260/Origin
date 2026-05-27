@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning } from './utils.js';
 import { attachDiagnostic } from './diagnostic.js';
 import { renderVpCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
@@ -14,6 +14,10 @@ const _VP_CACHE_VERSION = 2;
 const _VP_EMPTY_CACHE = { version: _VP_CACHE_VERSION, text: '', segments: [], motionTags: [], sensitiveHits: [] };
 let _vpInflight = {};
 let _vpWarnedOnce = false;
+let _vpAutoSaveTimer = null;
+let _vpAutoSaveSeq = 0;
+let _vpFlushPromises = {};
+let _vpParseTimers = {};
 
 const _HL_CLASS = {
   motion: 'font-bold border-b border-primary/30',
@@ -81,9 +85,12 @@ function _isStillOwnerOfShot(gIdx, ourRunId) {
 async function _reloadVideoPromptProjectFromServer() {
   if (!_ctx.reloadProjectFromServer) return false;
   try {
+    await _vpFlushAutoSave(_vpSelectedGroup);
     var ok = await _ctx.reloadProjectFromServer();
     _syncRefs();
-    try { renderVideoPromptList(); } catch (_renderErr) {}
+    var storyboards = project && Array.isArray(project.storyboards) ? project.storyboards : [];
+    if (_vpSelectedGroup >= storyboards.length) _vpSelectedGroup = 0;
+    try { renderVideoPromptList({ force: true }); } catch (_renderErr) {}
     try { _renderVpStoryboardFrames(); } catch (_framesErr) {}
     return ok !== false;
   } catch (e) {
@@ -476,20 +483,80 @@ export function setVpSelectedGroup(idx) { _vpSelectedGroup = idx; }
 /* ================================================================
    VP Cache
    ================================================================ */
+function _vpHasDraft(sb) {
+  return !!(sb && sb.videoPromptEditDraft && Object.prototype.hasOwnProperty.call(sb.videoPromptEditDraft, 'content'));
+}
+
+function _vpHasUsableDraft(sb) {
+  return !!(_vpHasDraft(sb) && String(sb.videoPromptEditDraft.content == null ? '' : sb.videoPromptEditDraft.content).trim());
+}
+
+function _vpCurrentText(sb) {
+  if (_vpHasDraft(sb)) return String(sb.videoPromptEditDraft.content == null ? '' : sb.videoPromptEditDraft.content);
+  return String((sb && sb.videoPrompt) || '');
+}
+
+function _vpCurrentSource(sb) {
+  return _vpHasDraft(sb) ? 'draft' : 'prompt';
+}
+
+function _vpDraftFingerprint(sb) {
+  return (sb && sb.videoPromptEditDraft && sb.videoPromptEditDraft.savedDraftFingerprint) || '';
+}
+
+function _vpIsSavedDraftChanged(err) {
+  var payload = err && err.payload;
+  var code = payload && (payload.code || payload.errorCode);
+  return code === 'saved_draft_changed';
+}
+
+function _vpEnsureLocalDraft(gIdx, content) {
+  if (!project.storyboards) project.storyboards = [];
+  if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+  var sb = project.storyboards[gIdx];
+  var existing = sb.videoPromptEditDraft || {};
+  sb.videoPromptEditDraft = {
+    content: String(content == null ? '' : content),
+    sourceHash: Object.prototype.hasOwnProperty.call(existing, 'sourceHash') ? existing.sourceHash : (sb.videoPromptSourceHash || null),
+    savedDraftFingerprint: existing.savedDraftFingerprint || '',
+    updatedAt: new Date().toISOString(),
+  };
+  return sb.videoPromptEditDraft;
+}
+
+function _vpSetDraftStatus(text, tone) {
+  var el = $("vpDraftStatus");
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = "text-[11px] font-medium " + (
+    tone === 'error' ? 'text-error' :
+    tone === 'ok' ? 'text-green-700' :
+    'text-on-surface-variant/70'
+  );
+}
+
+function _vpCacheKey(sb, text) {
+  var key = sb._vpKey || (sb._vpKey = 'vp_' + Math.random().toString(36).slice(2, 10));
+  var raw = String(text || '');
+  var h = 0;
+  for (var i = 0; i < raw.length; i++) h = ((h << 5) - h + raw.charCodeAt(i)) | 0;
+  return key + ':' + raw.length + ':' + h;
+}
+
 export function vpCacheValid(cache, text) {
   return !!(cache && cache.version === _VP_CACHE_VERSION && cache.text === text);
 }
 
 export function vpGetCache(sb) {
   if (!sb) return _VP_EMPTY_CACHE;
-  var text = sb.videoPrompt || '';
+  var text = _vpCurrentText(sb);
   if (vpCacheValid(sb._vpCache, text)) return sb._vpCache;
   return _VP_EMPTY_CACHE;
 }
 
-export async function vpFetchAndCache(sb) {
+export async function vpFetchAndCache(sb, textOverride) {
   if (!sb) return _VP_EMPTY_CACHE;
-  var text = sb.videoPrompt || '';
+  var text = textOverride == null ? _vpCurrentText(sb) : String(textOverride || '');
   if (vpCacheValid(sb._vpCache, text)) return sb._vpCache;
   if (!text) {
     sb._vpCache = { version: _VP_CACHE_VERSION, text: '', segments: [], motionTags: [], sensitiveHits: [] };
@@ -525,12 +592,16 @@ export async function vpFetchAndCache(sb) {
 
 function _vpEnsureCache(sb, onReady) {
   if (!sb) return _VP_EMPTY_CACHE;
-  var text = sb.videoPrompt || '';
+  var text = _vpCurrentText(sb);
   if (vpCacheValid(sb._vpCache, text)) return sb._vpCache;
-  var key = sb._vpKey || (sb._vpKey = 'vp_' + Math.random().toString(36).slice(2, 10));
+  var key = _vpCacheKey(sb, text);
   if (!_vpInflight[key]) {
-    _vpInflight[key] = vpFetchAndCache(sb)
-      .then(function (cache) { delete _vpInflight[key]; if (typeof onReady === 'function') onReady(cache); return cache; })
+    _vpInflight[key] = vpFetchAndCache(sb, text)
+      .then(function (cache) {
+        delete _vpInflight[key];
+        if (cache && cache.text === _vpCurrentText(sb) && typeof onReady === 'function') onReady(cache);
+        return cache;
+      })
       .catch(function (err) { delete _vpInflight[key]; throw err; });
   } else if (typeof onReady === 'function') {
     _vpInflight[key].then(onReady);
@@ -538,117 +609,188 @@ function _vpEnsureCache(sb, onReady) {
   return sb._vpCache || _VP_EMPTY_CACHE;
 }
 
-async function _vpRebuildFromSegments(segments) {
-  try {
-    var resp = await apiPost('/api/prompt/rebuild', { segments: segments });
-    return (resp.text || '').trim();
-  } catch (e) {
-    console.warn('[VpRebuild] failed, using local fallback:', e);
-    return (segments || []).map(function (s) {
-      if (!s.time) return s.text || '';
-      return '(' + s.time + ') ' + (s.text || '');
-    }).join('\n');
-  }
-}
-
-/* ================================================================
-   Highlight / render helpers
-   ================================================================ */
-function _highlightLargePrompt(text, highlights, sensitiveHits) {
-  if (!text) return '';
-  var src = text.replace(/<[^>]*>/g, '');
-  var ranges = (highlights || []).slice().sort(function (a, b) { return a.start - b.start; });
-  var parts = [];
-  var cursor = 0;
-  ranges.forEach(function (r) {
-    if (!r || r.start < cursor || r.end <= r.start || r.end > src.length) return;
-    if (r.start > cursor) parts.push({ text: src.slice(cursor, r.start), kind: null });
-    parts.push({ text: src.slice(r.start, r.end), kind: r.kind });
-    cursor = r.end;
-  });
-  if (cursor < src.length) parts.push({ text: src.slice(cursor), kind: null });
-
-  var html = parts.map(function (p) {
-    var esc = escapeHtml(p.text);
-    if (!p.kind) return esc;
-    var cls = _HL_CLASS[p.kind];
-    if (!cls) return esc;
-    if (p.kind === 'bracket') {
-      var inner = esc.replace(/^\[|\]$/g, '');
-      return '<span class="' + cls + '">' + inner + '</span>';
-    }
-    return '<span class="' + cls + '">' + esc + '</span>';
-  }).join('');
-
-  if (sensitiveHits && sensitiveHits.length) {
-    var seen = {};
-    var senWords = [];
-    sensitiveHits.forEach(function (h) {
-      if (!h || !h.word || seen[h.word]) return;
-      seen[h.word] = true;
-      senWords.push(h.word);
+function _vpScheduleParse(gIdx) {
+  clearTimeout(_vpParseTimers[gIdx]);
+  _vpParseTimers[gIdx] = setTimeout(function () {
+    var sb = project && project.storyboards && project.storyboards[gIdx];
+    if (!sb) return;
+    _vpEnsureCache(sb, function () {
+      if (gIdx === _vpSelectedGroup) updateVideoPromptChrome(gIdx);
     });
-    senWords.sort(function (a, b) { return b.length - a.length; });
-    if (senWords.length) {
-      var escRe = function (s) { return s.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'); };
-      var senRe = new RegExp('(' + senWords.map(escRe).join('|') + ')', 'g');
-      var pieces = html.split(/(<[^>]*>)/);
-      html = pieces.map(function (piece) {
-        if (!piece || piece.charAt(0) === '<') return piece;
-        return piece.replace(senRe, '<span class="vp-sensitive-word bg-error/15 text-error border-b-2 border-error/40 px-0.5 rounded-sm cursor-help" title="可能触发视频API审核">$1</span>');
-      }).join('');
-    }
-  }
-  return html;
+    if (gIdx === _vpSelectedGroup) updateVideoPromptChrome(gIdx);
+  }, 450);
 }
 
-function _makeSegmentEditable(pEl, gIdx, segIdx, segments) {
-  if (pEl.dataset.editing === "1") return;
-  pEl.dataset.editing = "1";
-  var rawText = segments[segIdx].text;
-  pEl.textContent = rawText;
-  pEl.contentEditable = "true";
-  // 进编辑态：保持和展示态同字号（text-base / font-normal），只追加焦点环和编辑底色
-  pEl.classList.add("outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-3", "bg-white/60", "whitespace-pre-wrap");
-  pEl.focus();
-  var range = document.createRange();
-  range.selectNodeContents(pEl);
-  range.collapse(false);
-  var sel = window.getSelection();
-  sel.removeAllRanges();
-  sel.addRange(range);
+async function _vpSaveDraftNow(gIdx, content, opts) {
+  opts = opts || {};
+  _syncRefs();
+  if (!project || !project.id || !project.storyboards || !project.storyboards[gIdx]) return null;
+  var sb = project.storyboards[gIdx];
+  var expected = opts.force ? '' : _vpDraftFingerprint(sb);
+  var resp = await apiPost('/api/video-prompt/edit-draft', {
+    projectId: project.id,
+    groupIdx: gIdx,
+    draft: { content: String(content == null ? '' : content) },
+    expectedSavedDraftFingerprint: expected,
+    force: opts.force === true,
+  }, 'PUT');
+  if (project && project.storyboards && project.storyboards[gIdx] && resp && resp.draft) {
+    project.storyboards[gIdx].videoPromptEditDraft = resp.draft;
+  }
+  return resp;
+}
 
-  async function save() {
-    pEl.removeEventListener("blur", save);
-    pEl.removeEventListener("keydown", onKey);
-    var newText = pEl.textContent.trim();
-    if (newText && newText !== rawText) {
-      segments[segIdx].text = newText;
-      var fullPrompt = await _vpRebuildFromSegments(segments);
-      _syncRefs();
-	      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-	      project.storyboards[gIdx].videoPrompt = fullPrompt;
-	      project.storyboards[gIdx].videoPromptStatus = "ready";
-	      project.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	      delete project.storyboards[gIdx].videoPromptFailedAt;
-	      delete project.storyboards[gIdx].videoPromptLastError;
-	      _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
-      if (project.storyboards[gIdx]._vpCache) project.storyboards[gIdx]._vpCache = null;
-      saveProject();
-      showToast("提示词已更新", "ok");
+function _vpScheduleAutoSave(gIdx) {
+  clearTimeout(_vpAutoSaveTimer);
+  _vpSetDraftStatus('正在保存…');
+  _vpAutoSaveTimer = setTimeout(function () {
+    _vpFlushAutoSave(gIdx).catch(function (e) {
+      console.warn('[VideoPromptDraft] autosave failed:', e);
+    });
+  }, 650);
+}
+
+export async function _vpFlushAutoSave(gIdx) {
+  _syncRefs();
+  if (!project || !project.storyboards) return true;
+  var idx = Number.isInteger(gIdx) ? gIdx : _vpSelectedGroup;
+  if (_vpFlushPromises[idx]) {
+    return _vpFlushPromises[idx].then(function (result) {
+      var sbAfter = project && project.storyboards && project.storyboards[idx];
+      if (result && sbAfter && _vpHasDraft(sbAfter) && sbAfter._vpDraftLastSavedContent !== _vpCurrentText(sbAfter)) {
+        return _vpFlushAutoSave(idx);
+      }
+      return result;
+    });
+  }
+  _vpFlushPromises[idx] = _vpFlushAutoSaveOnce(idx).finally(function () {
+    delete _vpFlushPromises[idx];
+  });
+  return _vpFlushPromises[idx];
+}
+
+async function _vpFlushAutoSaveOnce(idx) {
+  var sb = project.storyboards[idx];
+  if (!sb || !_vpHasDraft(sb)) return true;
+  clearTimeout(_vpAutoSaveTimer);
+  var content = _vpCurrentText(sb);
+  if (sb._vpDraftLastSavedContent === content && _vpDraftFingerprint(sb)) {
+    _vpSetDraftStatus('草稿已保存', 'ok');
+    return true;
+  }
+  var seq = ++_vpAutoSaveSeq;
+  sb._vpDraftSaveSeq = seq;
+  _vpSetDraftStatus('正在保存…');
+  try {
+    var resp = await _vpSaveDraftNow(idx, content, { force: false });
+    _vpApplySavedDraftResponse(idx, content, seq, resp);
+    return true;
+  } catch (e) {
+    if (_vpIsSavedDraftChanged(e)) {
+      var overwrite = await showConfirm(
+        '草稿已在其他位置修改',
+        '当前视频提示词草稿被其他窗口或设备更新过。是否用本页正在编辑的内容覆盖它？',
+        '覆盖保存',
+        '先不覆盖',
+      );
+      if (!overwrite) {
+        _vpSetDraftStatus('草稿未覆盖');
+        return false;
+      }
+      try {
+        var forcedResp = await _vpSaveDraftNow(idx, content, { force: true });
+        _vpApplySavedDraftResponse(idx, content, seq, forcedResp);
+        return true;
+      } catch (retryErr) {
+        e = retryErr;
+      }
     }
-    pEl.dataset.editing = "0";
-    pEl.contentEditable = "false";
-    pEl.classList.remove("outline-none", "ring-2", "ring-primary/30", "rounded-lg", "p-3", "bg-white/60", "whitespace-pre-wrap");
-    renderVideoPromptList();
+    _vpSetDraftStatus('草稿保存失败', 'error');
+    showToast('视频提示词草稿保存失败：' + _diagnoseApiError(((e && e.message) || e).toString()), 'error');
+    return false;
   }
+}
 
-  function onKey(ev) {
-    if (ev.key === "Escape") { pEl.textContent = rawText; pEl.blur(); }
-    if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) pEl.blur();
+function _vpApplySavedDraftResponse(idx, content, seq, resp) {
+  if (project && project.storyboards && project.storyboards[idx]) {
+    var currentSb = project.storyboards[idx];
+    if (currentSb._vpDraftSaveSeq === seq) {
+      currentSb._vpDraftLastSavedContent = content;
+      _vpSetDraftStatus('草稿已保存', 'ok');
+    }
+    if (resp && resp.draft) currentSb.videoPromptEditDraft = resp.draft;
   }
-  pEl.addEventListener("blur", save);
-  pEl.addEventListener("keydown", onKey);
+}
+
+export async function flushVideoPromptAutoSave() {
+  return _vpFlushAutoSave(_vpSelectedGroup);
+}
+
+async function _vpCommitDraft(gIdx, opts) {
+  opts = opts || {};
+  _syncRefs();
+  if (!project || !project.id || !project.storyboards || !project.storyboards[gIdx]) return true;
+  var sb = project.storyboards[gIdx];
+  if (!_vpHasDraft(sb)) return true;
+  if (!_vpHasUsableDraft(sb)) {
+    showToast('视频提示词草稿为空，不能确认使用', 'warn');
+    return false;
+  }
+  var flushed = await _vpFlushAutoSave(gIdx);
+  if (!flushed && !opts.force) return false;
+  var current = project.storyboards[gIdx] || sb;
+  if (!_vpHasDraft(current)) return true;
+  if (!_vpHasUsableDraft(current)) {
+    showToast('视频提示词草稿为空，不能确认使用', 'warn');
+    return false;
+  }
+  try {
+    var resp = await apiPost('/api/video-prompt/commit-draft', {
+      projectId: project.id,
+      groupIdx: gIdx,
+      expectedSavedDraftFingerprint: _vpDraftFingerprint(current),
+      force: opts.force === true,
+    });
+    if (project && project.storyboards && project.storyboards[gIdx]) {
+      project.storyboards[gIdx].videoPrompt = resp.videoPrompt || _vpCurrentText(project.storyboards[gIdx]);
+      project.storyboards[gIdx].videoPromptSourceHash = resp.videoPromptSourceHash || null;
+      project.storyboards[gIdx].videoPromptRunId = resp.videoPromptRunId || project.storyboards[gIdx].videoPromptRunId;
+      project.storyboards[gIdx].videoPromptStatus = 'ready';
+      project.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
+      delete project.storyboards[gIdx].videoPromptEditDraft;
+      delete project.storyboards[gIdx].videoPromptFailedAt;
+      delete project.storyboards[gIdx].videoPromptLastError;
+      project.storyboards[gIdx]._vpCache = null;
+      _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
+      _clearStale("video_prompt_" + gIdx);
+    }
+    return true;
+  } catch (e) {
+    if (_vpIsSavedDraftChanged(e) && !opts.force) {
+      var overwrite = await showConfirm(
+        '草稿已在其他位置修改',
+        '当前视频提示词草稿被其他窗口或设备更新过。是否用本页正在编辑的内容覆盖并继续确认使用？',
+        '覆盖并确认',
+        '先不覆盖',
+      );
+      if (overwrite) return _vpCommitDraft(gIdx, { force: true });
+      return false;
+    }
+    showToast('提交视频提示词草稿失败：' + _diagnoseApiError(((e && e.message) || e).toString()), 'error');
+    return false;
+  }
+}
+
+async function _vpCommitAllDrafts() {
+  if (!project || !project.storyboards) return true;
+  await _vpFlushAutoSave(_vpSelectedGroup);
+  for (var i = 0; i < project.storyboards.length; i++) {
+    if (_vpHasDraft(project.storyboards[i])) {
+      var ok = await _vpCommitDraft(i);
+      if (!ok) return false;
+    }
+  }
+  return true;
 }
 
 /* ================================================================
@@ -803,7 +945,7 @@ function _renderVpStoryboardFrames() {
     if (_refBtn) _refBtn.addEventListener('click', function (ev) {
       ev.stopPropagation();
       var sbR = project && project.storyboards && project.storyboards[gIdx];
-      agentInsertRef('视频提示词', '片段' + (gIdx + 1), { groupIdx: gIdx, prompt: (sbR && sbR.videoPrompt) || '' });
+      agentInsertRef('视频提示词', '片段' + (gIdx + 1), { groupIdx: gIdx, prompt: _vpCurrentText(sbR || {}) });
     });
     var _regenBtn = frame.querySelector('[data-action="vp-frame-regen"]');
     if (_regenBtn) _regenBtn.addEventListener('click', function (ev) {
@@ -815,17 +957,19 @@ function _renderVpStoryboardFrames() {
     if (_copyBtn) _copyBtn.addEventListener('click', function (ev) {
       ev.stopPropagation();
       var sbC = project && project.storyboards && project.storyboards[gIdx];
-      if (sbC && sbC.videoPrompt) {
-        navigator.clipboard.writeText(sbC.videoPrompt).then(function () { showToast('提示词已复制', 'ok'); });
+      var text = _vpCurrentText(sbC || {});
+      if (text) {
+        navigator.clipboard.writeText(text).then(function () { showToast('提示词已复制', 'ok'); });
       } else {
         showToast('当前没有可复制的提示词', 'warn');
       }
     });
 
-    frame.addEventListener("click", function () {
+    frame.addEventListener("click", async function () {
+      await _vpFlushAutoSave(_vpSelectedGroup);
       _vpSelectedGroup = gIdx;
       _renderVpStoryboardFrames();
-      renderVideoPromptList();
+      renderVideoPromptList({ force: true });
     });
 
     container.appendChild(frame);
@@ -833,11 +977,10 @@ function _renderVpStoryboardFrames() {
   hydrateProtectedImageElements(container);
 }
 
-export function renderVideoPromptList() {
+export function renderVideoPromptList(opts) {
   _syncRefs();
   var list = $("videoPromptList");
   if (!list || !project || !project.shots) return;
-  list.innerHTML = "";
   var groups = getStoryboardGroups();
   if (!project.storyboards) project.storyboards = [];
   var gIdx = _vpSelectedGroup;
@@ -847,98 +990,88 @@ export function renderVideoPromptList() {
   var sb = project.storyboards[gIdx] || {};
   project.storyboards[gIdx] = sb;
 
-  var parsed = _vpEnsureCache(sb, function () { renderVideoPromptList(); });
-
-  var tagsEl = $("vpPromptTags");
-  if (tagsEl) {
-    var tags = parsed.motionTags || [];
-    tagsEl.innerHTML = tags.map(function (t) {
-      return '<span class="bg-surface-container-highest px-4 py-1.5 rounded-full text-[10px] font-bold text-on-surface-variant">' + escapeHtml(t) + '</span>';
-    }).join('');
-    if (!tags.length) {
-      tagsEl.innerHTML = '<span class="text-[10px] text-on-surface-variant/40 italic">生成提示词后自动生成关键词标签</span>';
-    }
+  var active = document.activeElement;
+  if (!(opts && opts.force) && active && active.id === "vpPromptTextarea" && parseInt(active.dataset.gidx || "-1", 10) === gIdx) {
+    updateVideoPromptChrome(gIdx);
+    return;
   }
 
+  var displayText = _vpCurrentText(sb);
+  _vpEnsureCache(sb, function () {
+    if (gIdx === _vpSelectedGroup) updateVideoPromptChrome(gIdx);
+  });
+
+  list.innerHTML = "";
   var card = document.createElement("div");
   card.className = "vp-card vp-card--shell flex flex-col h-full";
   card.dataset.groupIdx = gIdx;
 
-	  if (sb.videoPrompt) {
-	    if (sb.videoPromptStatus === "generating" || sb.videoPromptStatus === "failed") {
-	      var statusBanner = document.createElement("div");
-	      statusBanner.className = sb.videoPromptStatus === "failed"
-	        ? "flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-error/8 border border-error/15 text-error text-xs font-medium"
-	        : "flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-primary/8 border border-primary/15 text-primary text-xs font-medium";
-	      statusBanner.innerHTML =
-	        '<span class="material-symbols-outlined text-sm shrink-0">' + (sb.videoPromptStatus === "failed" ? "error" : "hourglass_top") + '</span>' +
-	        '<span class="flex-1 min-w-0">' +
-	        (sb.videoPromptStatus === "failed"
-	          ? '本轮视频提示词生成失败，旧提示词仅供查看，不能继续生成视频。'
-	          : '正在生成新视频提示词，旧提示词仅供查看。') +
-	        '</span>' +
-	        '<button type="button" class="vp-status-banner-close material-symbols-outlined text-sm shrink-0 opacity-60 hover:opacity-100 cursor-pointer bg-transparent border-0 p-0 leading-none" aria-label="关闭">close</button>';
-	      var _closeBtn = statusBanner.querySelector('.vp-status-banner-close');
-	      if (_closeBtn) {
-	        _closeBtn.addEventListener('click', function (ev) {
-	          ev.stopPropagation();
-	          statusBanner.remove();
-	        });
-	      }
-	      card.appendChild(statusBanner);
-	    }
+  var chrome = document.createElement("div");
+  chrome.id = "vpPromptChrome";
+  card.appendChild(chrome);
 
-    var sensitiveHits = parsed.sensitiveHits || [];
-    if (sensitiveHits.length) {
-      var senWords = sensitiveHits.map(function (h) { return h.word; });
-      var senBanner = document.createElement("div");
-      senBanner.className = "flex items-center gap-3 px-4 py-3 mb-3 rounded-xl bg-error/8 border border-error/15";
-      senBanner.innerHTML =
-        '<span class="material-symbols-outlined text-error text-base shrink-0">shield</span>' +
-        '<span class="flex-1 text-xs text-error font-medium">检测到 ' + sensitiveHits.length + ' 个可能触发审核的词汇：' +
-          '<span class="font-bold">' + escapeHtml(senWords.join('、')) + '</span></span>' +
-        '<button type="button" class="shrink-0 px-4 py-1.5 bg-error text-on-error rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="fix-sensitive" data-gidx="' + gIdx + '">一键替换</button>';
-      card.appendChild(senBanner);
-    }
-
-    var segments = parsed.segments || [];
+  if (displayText || _vpHasDraft(sb) || !sb.videoPrompt) {
     var glassPanel = document.createElement("div");
-    // 用户反馈："右面按钮啥的都变形了 字体也特别大"——参考原站的紧凑排版：
-    //   · padding p-10 → p-6（40 → 24px）
-    //   · 段间距 space-y-8 → space-y-5（32 → 20px）
-    glassPanel.className = "bg-white/40 backdrop-blur-[40px] rounded-[24px] p-6 border-b-2 border-primary-fixed-dim/30 shadow-sm relative overflow-y-auto no-scrollbar flex-grow";
-    glassPanel.innerHTML = '<div class="absolute -right-20 -top-20 w-64 h-64 bg-primary-container/20 blur-[100px] rounded-full pointer-events-none"></div>';
-
-    var segContainer = document.createElement("div");
-    segContainer.className = "relative z-10 space-y-5";
-
-    segments.forEach(function (seg, sIdx) {
-      var segDiv = document.createElement("div");
-      segDiv.className = "group/line";
-
-      if (seg.time) {
-        // 段名/时间码徽章：原站是浅灰圆角 pill，不是黑底白字 mono code 块。
-        // 把"运镜系统/角色/场景/0-Xs..."这些做成温和的标签风格。
-        var header = document.createElement("div");
-        header.className = "flex items-center gap-3 mb-2";
-        header.innerHTML =
-          '<span class="text-[11px] font-semibold bg-surface-container-highest/80 text-on-surface-variant px-2.5 py-0.5 rounded-full">' + escapeHtml(seg.time) + '</span>' +
-          '<div class="h-[1px] flex-grow bg-outline-variant/20"></div>' +
-          '<span class="material-symbols-outlined text-xs text-outline/40 opacity-0 group-hover/line:opacity-100 transition-opacity cursor-pointer">edit</span>';
-        segDiv.appendChild(header);
-      }
-
-      var p = document.createElement("p");
-      // 正文字号与右侧「视频提示词」标题保持一致，避免提示词区域显得过重。
-      p.className = "vp-seg-text text-xs font-normal text-on-background leading-relaxed cursor-text hover:bg-white/30 rounded-lg transition-colors px-2 py-1 -mx-2";
-      p.innerHTML = _highlightLargePrompt(seg.text, seg.highlights, sensitiveHits);
-      p.title = "点击编辑";
-      p.addEventListener("click", function () { _makeSegmentEditable(p, gIdx, sIdx, segments); });
-      segDiv.appendChild(p);
-      segContainer.appendChild(segDiv);
+    glassPanel.className = "bg-white/40 backdrop-blur-[40px] rounded-[24px] p-5 border-b-2 border-primary-fixed-dim/30 shadow-sm relative overflow-hidden flex-grow flex flex-col gap-3";
+    glassPanel.innerHTML =
+      '<div class="flex items-center justify-between gap-3 relative z-10">' +
+        '<div class="flex items-center gap-2 min-w-0">' +
+          '<span class="material-symbols-outlined text-base text-primary">edit_note</span>' +
+          '<span class="text-xs font-bold text-on-background">' + (_vpCurrentSource(sb) === 'draft' ? '视频提示词草稿' : '视频提示词') + '</span>' +
+        '</div>' +
+        '<div class="flex items-center gap-2 shrink-0">' +
+          '<button type="button" class="px-3 py-1.5 rounded-full bg-surface text-[10px] font-bold text-on-surface-variant hover:bg-surface-container-highest" data-action="copy-vp">复制</button>' +
+          '<button type="button" class="px-3 py-1.5 rounded-full bg-surface text-[10px] font-bold text-on-surface-variant hover:bg-surface-container-highest" data-action="restore-vp-backup"' + (sb.videoPromptBackup && sb.videoPromptBackup.content ? '' : ' disabled') + '>恢复</button>' +
+	          '<button type="button" class="px-3 py-1.5 rounded-full bg-primary text-on-primary text-[10px] font-bold hover:opacity-90" data-action="commit-vp-draft"' + (_vpHasUsableDraft(sb) ? '' : ' disabled') + '>确认使用</button>' +
+        '</div>' +
+      '</div>';
+    var textarea = document.createElement("textarea");
+    textarea.id = "vpPromptTextarea";
+    textarea.dataset.gidx = String(gIdx);
+    // 默认状态：背景与边框均为透明，textarea 直接融入外层 glassPanel 的玻璃质感面板。
+    // 焦点状态（用户点击开始编辑时）：浮出白色底色和实边框，提示进入编辑模式。
+    textarea.className = "relative z-10 w-full flex-grow min-h-[420px] resize-none bg-transparent border border-transparent rounded-2xl p-4 text-xs leading-relaxed text-on-background outline-none transition-colors duration-150 focus:bg-white/65 focus:border-outline-variant/40 focus:ring-2 focus:ring-primary/10";
+    textarea.value = displayText;
+    textarea.placeholder = "视频提示词会显示在这里，可直接编辑。";
+    function syncTextareaDraftAfterInput() {
+      var text = textarea.value;
+      _vpEnsureLocalDraft(gIdx, text);
+      if (project.storyboards[gIdx]) project.storyboards[gIdx]._vpCache = null;
+      var commitBtn = card.querySelector('[data-action="commit-vp-draft"]');
+      if (commitBtn) commitBtn.disabled = !String(text || '').trim();
+      updateVideoPromptChrome(gIdx);
+      checkVideoPromptsConfirm();
+    }
+    textarea.addEventListener("compositionstart", function () {
+      textarea.dataset.composing = "1";
+      clearTimeout(_vpAutoSaveTimer);
+      clearTimeout(_vpParseTimers[gIdx]);
     });
-
-    glassPanel.appendChild(segContainer);
+    textarea.addEventListener("compositionend", function () {
+      textarea.dataset.composing = "0";
+      syncTextareaDraftAfterInput();
+      if (textarea.dataset.flushAfterComposition === "1") {
+        delete textarea.dataset.flushAfterComposition;
+        _vpFlushAutoSave(gIdx).catch(function (e) { console.warn('[VideoPromptDraft] composition flush failed:', e); });
+      } else {
+        _vpScheduleAutoSave(gIdx);
+        _vpScheduleParse(gIdx);
+      }
+    });
+    textarea.addEventListener("input", function () {
+      syncTextareaDraftAfterInput();
+      if (textarea.dataset.composing === "1") return;
+      _vpScheduleAutoSave(gIdx);
+      _vpScheduleParse(gIdx);
+    });
+    textarea.addEventListener("blur", function () {
+      if (textarea.dataset.composing === "1") {
+        textarea.dataset.flushAfterComposition = "1";
+        return;
+      }
+      _vpFlushAutoSave(gIdx).catch(function (e) { console.warn('[VideoPromptDraft] blur flush failed:', e); });
+    });
+    glassPanel.appendChild(textarea);
     card.appendChild(glassPanel);
   } else {
     var emptyAction = _videoPromptUiState(sb);
@@ -949,6 +1082,7 @@ export function renderVideoPromptList() {
       '</div>';
   }
   list.appendChild(card);
+  updateVideoPromptChrome(gIdx);
 }
 
 export function updateVpCard(gIdx, status, promptText, errMsg) {
@@ -962,6 +1096,94 @@ export function updateVpCard(gIdx, status, promptText, errMsg) {
     _renderVpStoryboardFrames();
   }
   _updateVideoPromptBulkButtonLabel();
+}
+
+function _vpDraftNoticeHtml(sb, gIdx) {
+  var parts = [];
+  if (_vpHasDraft(sb)) {
+    var staleDraft = sb.videoPromptEditDraft &&
+      sb.videoPromptEditDraft.sourceHash &&
+      sb.videoPromptSourceHash &&
+      sb.videoPromptEditDraft.sourceHash !== sb.videoPromptSourceHash;
+    parts.push(
+      '<div class="flex items-center gap-2 px-4 py-3 mb-3 rounded-xl ' +
+      (staleDraft ? 'bg-warning/10 border border-warning/20 text-warning' : 'bg-primary/8 border border-primary/15 text-primary') +
+      ' text-xs font-medium">' +
+      '<span class="material-symbols-outlined text-sm shrink-0">' + (staleDraft ? 'sync_problem' : 'edit_note') + '</span>' +
+      '<span class="flex-1 min-w-0">' + (staleDraft ? '上游信息已变化，当前草稿基于旧版本；确认使用后会按当前上下文保存。' : '当前显示的是草稿，生成视频或确认使用前会先保存并提交。') + '</span>' +
+      '<span id="vpDraftStatus" class="text-[11px] text-on-surface-variant/70 font-medium"></span>' +
+      '</div>'
+    );
+  }
+  if (project && project._staleFlags && project._staleFlags["video_prompt_" + gIdx]) {
+    parts.push(
+      '<div class="flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-warning/10 border border-warning/20 text-warning text-xs font-medium">' +
+      '<span class="material-symbols-outlined text-sm shrink-0">update</span>' +
+      '<span class="flex-1 min-w-0">上游信息已变化，当前正式视频提示词可能需要重新生成或重新确认。</span>' +
+      '</div>'
+    );
+  }
+  return parts.join('');
+}
+
+function _vpStatusBannerHtml(sb) {
+  if (!sb || !sb.videoPrompt || (sb.videoPromptStatus !== "generating" && sb.videoPromptStatus !== "failed")) return '';
+  var failed = sb.videoPromptStatus === "failed";
+  return '' +
+    '<div class="' + (failed
+      ? "flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-error/8 border border-error/15 text-error text-xs font-medium"
+      : "flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-primary/8 border border-primary/15 text-primary text-xs font-medium") + '">' +
+    '<span class="material-symbols-outlined text-sm shrink-0">' + (failed ? "error" : "hourglass_top") + '</span>' +
+    '<span class="flex-1 min-w-0">' +
+    (failed ? '本轮视频提示词生成失败，旧提示词仅供查看，不能继续生成视频。' : '正在生成新视频提示词，旧提示词仅供查看。') +
+    '</span>' +
+    '</div>';
+}
+
+function _vpSensitiveBannerHtml(parsed, parsePending, gIdx) {
+  if (parsePending) {
+    return '<div class="flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-surface-container-highest/60 border border-outline-variant/30 text-on-surface-variant text-xs font-medium">' +
+      '<span class="material-symbols-outlined text-sm shrink-0">search</span><span>扫描中…</span></div>';
+  }
+  var sensitiveHits = (parsed && parsed.sensitiveHits) || [];
+  if (!sensitiveHits.length) return '';
+  var senWords = sensitiveHits.map(function (h) { return h.word; });
+  return '' +
+    '<div class="flex items-center gap-3 px-4 py-3 mb-3 rounded-xl bg-error/8 border border-error/15">' +
+    '<span class="material-symbols-outlined text-error text-base shrink-0">shield</span>' +
+    '<span class="flex-1 text-xs text-error font-medium">检测到 ' + sensitiveHits.length + ' 个可能触发审核的词汇：' +
+    '<span class="font-bold">' + escapeHtml(senWords.join('、')) + '</span></span>' +
+    '<button type="button" class="shrink-0 px-4 py-1.5 bg-error text-on-error rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="fix-sensitive" data-gidx="' + gIdx + '">一键替换</button>' +
+    '</div>';
+}
+
+export function updateVideoPromptChrome(gIdx) {
+  _syncRefs();
+  if (!project || !project.storyboards || !project.storyboards[gIdx]) return;
+  var sb = project.storyboards[gIdx];
+  var text = _vpCurrentText(sb);
+  var parsed = vpGetCache(sb);
+  var parsePending = !!(text && !vpCacheValid(sb._vpCache, text));
+  var tagsEl = $("vpPromptTags");
+  if (tagsEl) {
+    if (parsePending) {
+      tagsEl.innerHTML = '<span class="text-[10px] text-on-surface-variant/50 italic">扫描中…</span>';
+    } else {
+      var tags = parsed.motionTags || [];
+      tagsEl.innerHTML = tags.map(function (t) {
+        return '<span class="bg-surface-container-highest px-4 py-1.5 rounded-full text-[10px] font-bold text-on-surface-variant">' + escapeHtml(t) + '</span>';
+      }).join('');
+      if (!tags.length) tagsEl.innerHTML = '<span class="text-[10px] text-on-surface-variant/40 italic">生成提示词后自动生成关键词标签</span>';
+    }
+  }
+  var chrome = $("vpPromptChrome");
+  if (chrome) {
+    chrome.innerHTML = _vpDraftNoticeHtml(sb, gIdx) + _vpStatusBannerHtml(sb) + _vpSensitiveBannerHtml(parsed, parsePending, gIdx);
+  }
+  if (_vpHasDraft(sb)) {
+    var statusEl = $("vpDraftStatus");
+    if (statusEl && !statusEl.textContent) _vpSetDraftStatus(sb._vpDraftLastSavedContent === text ? '草稿已保存' : '');
+  }
 }
 
 export function checkVideoPromptsConfirm() {
@@ -1096,12 +1318,15 @@ export async function generateGroupVideoPrompt(gIdx) {
     var isCurrent = _safeWriteBack(originId, function (proj) {
 	      if (!proj.storyboards) proj.storyboards = [];
 	      if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-	      proj.storyboards[gIdx].videoPrompt = cleaned;
-	      proj.storyboards[gIdx].videoPromptStatus = "ready";
-	      proj.storyboards[gIdx].videoPromptRunId = (resp.videoPromptRunId || promptRunId);
-	      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	      delete proj.storyboards[gIdx].videoPromptFailedAt;
-	      delete proj.storyboards[gIdx].videoPromptLastError;
+		      proj.storyboards[gIdx].videoPrompt = cleaned;
+			      proj.storyboards[gIdx].videoPromptStatus = "ready";
+			      proj.storyboards[gIdx].videoPromptRunId = (resp.videoPromptRunId || promptRunId);
+			      if (resp.videoPromptSourceHash) proj.storyboards[gIdx].videoPromptSourceHash = resp.videoPromptSourceHash;
+			      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
+		      delete proj.storyboards[gIdx].videoPromptEditDraft;
+		      delete proj.storyboards[gIdx].videoPromptFailedAt;
+		      delete proj.storyboards[gIdx].videoPromptLastError;
+		      proj.storyboards[gIdx]._vpCache = null;
 	      _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
 	      proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
 	      if (Array.isArray(resp.referenceManifest)) proj.storyboards[gIdx].videoReferenceManifest = resp.referenceManifest;
@@ -1194,6 +1419,7 @@ export async function generateAllVideoPrompts(opts) {
       targets: targets,
       options: { creatorProfile: formatCreatorProfileForApi() },
     });
+    showConsistencyAggregateWarning(startResp);
   } catch (e) {
     console.error('[generateAllVideoPrompts] /api/batch/start failed:', e);
     var preflightPayload = _getVideoPromptPreflightPayload(e);
@@ -1351,12 +1577,15 @@ export async function generateAllVideoPrompts(opts) {
     var isCurrent = _safeWriteBack(originId, function (proj) {
 	      if (!proj.storyboards) proj.storyboards = [];
 	      if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-	      proj.storyboards[gIdx].videoPrompt = cleaned;
-	      proj.storyboards[gIdx].videoPromptStatus = "ready";
-	      if (incomingRunId) proj.storyboards[gIdx].videoPromptRunId = incomingRunId;
-	      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	      delete proj.storyboards[gIdx].videoPromptFailedAt;
-	      delete proj.storyboards[gIdx].videoPromptLastError;
+		      proj.storyboards[gIdx].videoPrompt = cleaned;
+		      proj.storyboards[gIdx].videoPromptStatus = "ready";
+			      if (incomingRunId) proj.storyboards[gIdx].videoPromptRunId = incomingRunId;
+			      if (extraData && extraData.videoPromptSourceHash) proj.storyboards[gIdx].videoPromptSourceHash = extraData.videoPromptSourceHash;
+			      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
+		      delete proj.storyboards[gIdx].videoPromptEditDraft;
+		      delete proj.storyboards[gIdx].videoPromptFailedAt;
+		      delete proj.storyboards[gIdx].videoPromptLastError;
+		      proj.storyboards[gIdx]._vpCache = null;
 	      _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
       if (Array.isArray(narrationsUsed)) proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
       if (referenceManifest !== null) proj.storyboards[gIdx].videoReferenceManifest = referenceManifest;
@@ -1504,8 +1733,11 @@ export async function generateAllVideoPrompts(opts) {
 
 export async function confirmVideoPrompts() {
   _syncRefs();
-	  if (!project || !project.storyboards) return;
-	  var groups = getStoryboardGroups();
+		  if (!project || !project.storyboards) return;
+  var committed = await _vpCommitAllDrafts();
+  if (!committed) return;
+  _syncRefs();
+		  var groups = getStoryboardGroups();
 	  var missing = groups.filter(function (_, i) { return !_isVideoPromptReady(project.storyboards[i]); });
 	  if (missing.length) { showToast("还有 " + missing.length + " 条视频提示词未就绪", "warn"); return; }
   project.videoPromptsApproved = true;
@@ -1528,11 +1760,9 @@ function _formatRefineViolations(resp) {
 
 async function _handleRefineRejected(gIdx, resp, previousPrompt) {
   if (project && project.storyboards && project.storyboards[gIdx]) {
-    project.storyboards[gIdx].videoPrompt = previousPrompt;
-    project.storyboards[gIdx].videoPromptStatus = "ready";
     project.storyboards[gIdx].lastRefineViolations = Array.isArray(resp && resp.violations) ? resp.violations : [];
   }
-  renderVideoPromptList();
+  renderVideoPromptList({ force: true });
   _renderVpStoryboardFrames();
   checkVideoPromptsConfirm();
   await showConfirm(
@@ -1546,11 +1776,11 @@ async function _handleRefineRejected(gIdx, resp, previousPrompt) {
 export async function refineVideoPrompt(instruction) {
   _syncRefs();
   var gIdx = _vpSelectedGroup;
-  if (!project || !project.storyboards || !project.storyboards[gIdx] || !project.storyboards[gIdx].videoPrompt) {
+  var currentPrompt = project && project.storyboards && project.storyboards[gIdx] ? _vpCurrentText(project.storyboards[gIdx]) : "";
+  if (!project || !project.storyboards || !project.storyboards[gIdx] || !currentPrompt) {
     showToast("当前片段还没有提示词，请先生成", "warn"); return;
   }
   var originId = project.id;
-  var currentPrompt = project.storyboards[gIdx].videoPrompt;
   var input = $("vpRefineInput");
   var btn = $("vpBtnRefine");
   if (btn) btn.disabled = true;
@@ -1568,21 +1798,18 @@ export async function refineVideoPrompt(instruction) {
       await _handleRefineRejected(gIdx, resp, resp.previousPrompt || currentPrompt);
     } else {
       var refined = (resp.videoPrompt || "").trim().replace(/^["'`]|["'`]$/g, "");
-      var isCurrent = _safeWriteBack(originId, function (proj) {
-        if (proj.storyboards && proj.storyboards[gIdx]) {
-	          proj.storyboards[gIdx].videoPrompt = refined;
-	          proj.storyboards[gIdx].videoPromptStatus = "ready";
-	          proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	          delete proj.storyboards[gIdx].videoPromptFailedAt;
-	          delete proj.storyboards[gIdx].videoPromptLastError;
-	          _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
-        }
-      });
-      if (isCurrent) {
-        renderVideoPromptList();
+      if (!refined) { showToast("AI 返回为空，修改失败", "error"); return; }
+      if (project && project.id === originId) {
+        _vpEnsureLocalDraft(gIdx, refined);
+        if (project.storyboards[gIdx]) project.storyboards[gIdx]._vpCache = null;
+        await _vpSaveDraftNow(gIdx, refined, { force: true });
+        var ta = $("vpPromptTextarea");
+        if (ta && parseInt(ta.dataset.gidx || "-1", 10) === gIdx) ta.value = refined;
+        _vpScheduleParse(gIdx);
+        updateVideoPromptChrome(gIdx);
         _renderVpStoryboardFrames();
         checkVideoPromptsConfirm();
-        showToast("提示词已更新", "ok");
+        showToast("提示词草稿已更新", "ok");
       }
     }
   } catch (e) {
@@ -1592,7 +1819,7 @@ export async function refineVideoPrompt(instruction) {
   if (input) { input.disabled = false; input.value = ""; }
 }
 
-export function handleVideoPromptAction(e) {
+export async function handleVideoPromptAction(e) {
   _syncRefs();
   var btn = e.target.closest("[data-action]");
   if (!btn) return;
@@ -1604,23 +1831,50 @@ export function handleVideoPromptAction(e) {
   if (action === "regen-vp") {
     if (_videoPromptsGenerating) { showToast("正在批量生成中，请稍候", "warn"); return; }
     generateGroupVideoPrompt(gIdx).then(function () { checkVideoPromptsConfirm(); });
-  } else if (action === "edit-vp") {
-    var current = (project.storyboards[gIdx] && project.storyboards[gIdx].videoPrompt) || "";
-    var newPrompt = prompt("编辑视频提示词:", current);
-    if (newPrompt !== null && newPrompt.trim()) {
-	      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-	      project.storyboards[gIdx].videoPrompt = newPrompt.trim();
-	      project.storyboards[gIdx].videoPromptStatus = "ready";
-	      project.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	      delete project.storyboards[gIdx].videoPromptFailedAt;
-	      delete project.storyboards[gIdx].videoPromptLastError;
-	      _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
-      _clearStale("video_prompt_" + gIdx);
-      saveProject();
-      renderVideoPromptList();
+  } else if (action === "copy-vp") {
+    var copyText = _vpCurrentText(project.storyboards[gIdx] || {});
+    if (copyText) navigator.clipboard.writeText(copyText).then(function () { showToast('提示词已复制', 'ok'); });
+    else showToast('当前没有可复制的提示词', 'warn');
+  } else if (action === "commit-vp-draft") {
+    var okCommit = await _vpCommitDraft(gIdx);
+    if (okCommit) {
+      renderVideoPromptList({ force: true });
       _renderVpStoryboardFrames();
       checkVideoPromptsConfirm();
+      showToast('视频提示词已确认使用', 'ok');
     }
+  } else if (action === "restore-vp-backup") {
+    var okRestore = await showConfirm('恢复视频提示词', '将用备份提示词替换当前正式提示词，并清空当前草稿。', '恢复', '取消');
+    if (!okRestore) return;
+    try {
+      await _vpFlushAutoSave(gIdx);
+      var resp = await apiPost('/api/video-prompt/restore-backup', {
+        projectId: project.id,
+        groupIdx: gIdx,
+      });
+      if (project.storyboards && project.storyboards[gIdx]) {
+        project.storyboards[gIdx].videoPrompt = resp.videoPrompt || '';
+        project.storyboards[gIdx].videoPromptSourceHash = resp.videoPromptSourceHash || null;
+        project.storyboards[gIdx].videoPromptRunId = resp.videoPromptRunId || project.storyboards[gIdx].videoPromptRunId;
+        project.storyboards[gIdx].videoPromptStatus = 'ready';
+        project.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
+        delete project.storyboards[gIdx].videoPromptEditDraft;
+        delete project.storyboards[gIdx].videoPromptFailedAt;
+        delete project.storyboards[gIdx].videoPromptLastError;
+        project.storyboards[gIdx]._vpCache = null;
+        _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
+        _clearStale("video_prompt_" + gIdx);
+      }
+      renderVideoPromptList({ force: true });
+      _renderVpStoryboardFrames();
+      checkVideoPromptsConfirm();
+      showToast('已恢复备份提示词', 'ok');
+    } catch (err) {
+      showToast('恢复失败：' + _diagnoseApiError(((err && err.message) || err).toString()), 'error');
+    }
+  } else if (action === "edit-vp") {
+    var ta = $("vpPromptTextarea");
+    if (ta) ta.focus();
   } else if (action === "fix-sensitive") {
     _aiFixSensitiveWords(gIdx);
   } else if (action === "delete-vp") {
@@ -1642,10 +1896,10 @@ export function handleVideoPromptAction(e) {
 
 async function _aiFixSensitiveWords(gIdx) {
   _syncRefs();
-  if (!project || !project.storyboards || !project.storyboards[gIdx] || !project.storyboards[gIdx].videoPrompt) {
+  var currentPrompt = project && project.storyboards && project.storyboards[gIdx] ? _vpCurrentText(project.storyboards[gIdx]) : "";
+  if (!project || !project.storyboards || !project.storyboards[gIdx] || !currentPrompt) {
     showToast("当前片段还没有提示词", "warn"); return;
   }
-  var currentPrompt = project.storyboards[gIdx].videoPrompt;
   var hits = [];
   try {
     var scan = await apiPost('/api/prompt/scan-sensitive', { text: currentPrompt });
@@ -1678,19 +1932,14 @@ async function _aiFixSensitiveWords(gIdx) {
     }
     var refined = (resp.videoPrompt || "").trim().replace(/^["'`]|["'`]$/g, "");
     if (!refined) { showToast("AI 返回为空，替换失败", "error"); return; }
-    var isCurrent = _safeWriteBack(originId, function (proj) {
-      if (proj.storyboards && proj.storyboards[gIdx]) {
-	        proj.storyboards[gIdx].videoPrompt = refined;
-	        proj.storyboards[gIdx].videoPromptStatus = "ready";
-	        proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-	        delete proj.storyboards[gIdx].videoPromptFailedAt;
-	        delete proj.storyboards[gIdx].videoPromptLastError;
-	        _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
-        if (proj.storyboards[gIdx]._vpCache) proj.storyboards[gIdx]._vpCache = null;
-      }
-    });
-    if (isCurrent) {
-      renderVideoPromptList();
+    if (project && project.id === originId) {
+      _vpEnsureLocalDraft(gIdx, refined);
+      if (project.storyboards[gIdx]) project.storyboards[gIdx]._vpCache = null;
+      await _vpSaveDraftNow(gIdx, refined, { force: true });
+      var ta = $("vpPromptTextarea");
+      if (ta && parseInt(ta.dataset.gidx || "-1", 10) === gIdx) ta.value = refined;
+      _vpScheduleParse(gIdx);
+      updateVideoPromptChrome(gIdx);
       _renderVpStoryboardFrames();
       checkVideoPromptsConfirm();
       var remainingHits = [];

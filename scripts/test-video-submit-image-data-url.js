@@ -60,6 +60,7 @@ function loadVideoGen() {
     if (id === './video-reference-manifest') {
       return { hashString: (s) => String(s).length.toString(16), resolveGenerationDurationSec: (opts) => opts.plannedDurationSec || 5 };
     }
+    if (id === './video-prompt-lifecycle') return { buildVideoPromptSnapshot: () => ({}) };
     if (id === './video-prompt-state') return {};
     if (id === './frame-workflow-state') {
       return {
@@ -171,22 +172,18 @@ async function run() {
     }
     assert(narrowRejected, '998x3328 image is rejected by aspect ratio validation');
 
-    let tinyRejected = false;
-    try {
-      mod.assertSeedanceSubmitImage({
-        dataUrl: 'data:image/jpeg;base64,',
-        mime: 'image/jpeg',
-        width: 1280,
-        height: 853,
-        originalWidth: 1280,
-        originalHeight: 853,
-        originalBytes: 12_000,
-        submittedBytes: 12_000,
-      }, 'near-zero jpeg');
-    } catch (err) {
-      tinyRejected = /过低|低质量/.test(String(err && err.message || err));
-    }
-    assert(tinyRejected, 'near-zero jpeg is rejected');
+    const tinyWarnings = mod.assertSeedanceSubmitImage({
+      dataUrl: 'data:image/jpeg;base64,',
+      mime: 'image/jpeg',
+      width: 1280,
+      height: 853,
+      originalWidth: 1280,
+      originalHeight: 853,
+      originalBytes: 12_000,
+      submittedBytes: 12_000,
+      warnings: [],
+    }, 'near-zero jpeg');
+    assert(tinyWarnings.some((item) => item.code === 'low_jpeg_bytes_per_pixel'), 'near-zero jpeg is surfaced as a warning');
 
     let bodyRejected = false;
     try {

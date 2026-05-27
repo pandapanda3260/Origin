@@ -465,7 +465,27 @@ export function syncEditProject(p) {
       }
     }
 
-    _sendTimelineOp({ op: "import-group", groupIdx: groupIdx });
+    if (_editState.edl && Array.isArray(_editState.edl.timeline)) {
+      var dur2 = _sumGroupDuration(groupIdx);
+      _editState.edl.timeline.forEach(function (entry) {
+        if (!entry || entry.groupIdx !== groupIdx) return;
+        entry.videoUrl = sb.videoUrl;
+        entry.protectedUrl = _segPersistedVideoUrl(sb);
+        entry._originVideoUrl = _segPersistedVideoUrl(sb);
+        if (!entry.inPoint || Number(entry.inPoint) === 0) {
+          entry.duration = dur2;
+          entry.outPoint = dur2;
+        }
+      });
+      if (!project.editData) project.editData = {};
+      project.editData.edl = _editState.edl; // arch-guard:allow-editdata 乐观更新（后端权威落盘）
+    }
+
+    _sendTimelineOp({ op: "import-group", groupIdx: groupIdx }).then(function (resp) {
+      if (resp && _ctx.getActivePage && _ctx.getActivePage() === "edit") {
+        try { refreshEditPage(); } catch (_e) {}
+      }
+    });
 
     if (_ctx.getActivePage && _ctx.getActivePage() === "edit") {
       try { refreshEditPage(); } catch (_e) {}
@@ -1343,7 +1363,7 @@ export function syncEditProject(p) {
   function _segVideoUrl(seg, segIdx) {
     var gIdx = seg.groupIdx != null ? seg.groupIdx : segIdx;
     var orig = _editState.segments.find(function (s) { return s.groupIdx === gIdx; });
-    return (orig && orig.videoUrl) || seg.videoUrl || "";
+    return seg.videoUrl || (orig && orig.videoUrl) || "";
   }
 
   /* ── Double-buffer playback engine ── */
@@ -1779,7 +1799,6 @@ export function syncEditProject(p) {
         vid.removeEventListener('loadedmetadata', _h); doVidSeek();
       });
       _showVid(vid);
-      _seekThenPlay(vid, targetTime);
     }
 
     _prebufferNext(segIdx);
@@ -1787,6 +1806,10 @@ export function syncEditProject(p) {
     _editState.isPlaying = true;
     if (_tickCache.playBtnSpan) _tickCache.playBtnSpan.textContent = "pause";
     _highlightActiveSeg(segIdx);
+
+    if (vid) {
+      _seekThenPlay(vid, targetTime);
+    }
 
     // BGM 跟着 globalTime 起播：如果选了 BGM 就 sync 播放，让用户在剪辑工作台
     // 听到的就是导出后的 BGM；没选就静音。
@@ -1843,16 +1866,43 @@ export function syncEditProject(p) {
   function _seekThenPlay(vid, seekTime) {
     if (!vid) return;
     var hasSeek = typeof seekTime === "number" && isFinite(seekTime);
+    var settled = false;
+    var onVideoError = null;
+
+    var cleanup = function () {
+      if (onVideoError) {
+        vid.removeEventListener("error", onVideoError);
+        onVideoError = null;
+      }
+    };
+
+    var failPlayback = function (err) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      console.warn("[EditPlay] video failed:", err);
+      if (_editState.isPlaying) _editPause();
+      showToast("视频播放失败: " + ((err && err.message) || "视频加载失败"), "warn");
+    };
+
+    onVideoError = function () {
+      var mediaErr = vid.error;
+      var msg = mediaErr && mediaErr.message ? mediaErr.message : "视频加载失败";
+      failPlayback(new Error(msg));
+    };
+    vid.addEventListener("error", onVideoError, { once: true });
 
     var _doPlay = function () {
       vid.play().catch(function (err) {
         if (err && err.name === "NotAllowedError" && !vid.muted) {
           vid.muted = true;
-          vid.play().then(function () { vid.muted = false; }).catch(function () {});
+          vid.play().then(function () { settled = true; cleanup(); vid.muted = false; }).catch(failPlayback);
           return;
         }
-        console.warn("[EditPlay] play failed:", err);
-        showToast("视频播放失败: " + ((err && err.message) || "未知错误"), "warn");
+        failPlayback(err);
+      }).then(function () {
+        settled = true;
+        cleanup();
       });
     };
 

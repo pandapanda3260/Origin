@@ -355,6 +355,7 @@ function bootstrap(db: Database.Database) {
       prompt        TEXT NOT NULL DEFAULT '',
       provider      TEXT NOT NULL DEFAULT 'openai',  -- openai | seedance | keling | fake
       provider_task TEXT,                      -- 远端任务 id（用于轮询）
+      video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
       status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
       progress      INTEGER NOT NULL DEFAULT 0,      -- 0-100
       filename      TEXT,                            -- data/videos/<owner>/<filename>
@@ -1000,6 +1001,7 @@ function bootstrap(db: Database.Database) {
   migrateAdminGovernanceColumns(db);
   migrateOperationalLinkageColumns(db);
   migrateProjectsVersionColumn(db);
+  migrateVideoPromptSnapshotColumn(db);
 }
 
 // projects.version：乐观锁版本号迁移。老库没有这一列，给所有现存项目兜底成 1。
@@ -1010,6 +1012,14 @@ function migrateProjectsVersionColumn(db: Database.Database) {
     addColumnIfMissing(db, 'projects', 'version', 'version INTEGER NOT NULL DEFAULT 1');
   } catch (e) {
     console.warn('[db] migrateProjectsVersionColumn failed:', e);
+  }
+}
+
+function migrateVideoPromptSnapshotColumn(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'video_tasks', 'video_prompt_snapshot_json', "video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}'");
+  } catch (e) {
+    console.warn('[db] migrateVideoPromptSnapshotColumn failed:', e);
   }
 }
 

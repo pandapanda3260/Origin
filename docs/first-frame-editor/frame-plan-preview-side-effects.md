@@ -5,7 +5,7 @@ Phase 0 checklist for the first-frame edit console. The preview path must explai
 ## Preview Must Not
 
 - Call an image or text generation provider.
-- Write `projects.data_json` or any project audit fields.
+- Write image/video generation output fields or project audit fields.
 - Create, update, or claim `batches` / `batch_tasks`.
 - Write knowledge-context audit rows.
 - Charge credits or write billing ledger rows.
@@ -22,10 +22,15 @@ Phase 0 checklist for the first-frame edit console. The preview path must explai
 - Resolve local image paths for reference-manifest preview.
 - Run read-only batch preflight for `storyboard_images`.
 
+## Allowed Prompt-State Write
+
+- `GET /api/frames/plan` and `GET /api/frames/material-panels?groupIdx=...` may lazily reconcile missing or system-owned `firstFrameBasePrompt` / `firstFrameBackup`.
+- Reconcile must only write those prompt-state fields. It must not change `imageHistory`, `frames.first`, `firstFrameUrl`, video task state, billing, provider audit, or batch rows.
+- List-style material-panel requests without `groupIdx` stay read-only and must not reconcile every storyboard slot.
+
 ## Isolation Plan
 
 - Keep preview behind `GET /api/frames/plan`.
-- Use a helper that only returns `{ plan, planSummary, modelSnapshot, sourceHash }`.
-- Do not call `recordBatchKnowledgeAudit`, `createBatch`, `patchProjectForUser`, or `generateImageWithModerationRecovery`.
+- Use reconcile helpers that return `{ plan, planSummary, modelSnapshot, sourceHash, firstFrameBasePrompt, firstFrameBackup, stale }`.
+- Do not call `recordBatchKnowledgeAudit`, `createBatch`, or `generateImageWithModerationRecovery`.
 - If later caching is needed, cache only the preview response by `projectId + groupIdx + sourceHash` for a short TTL and never treat cache hits as generation attempts.
-

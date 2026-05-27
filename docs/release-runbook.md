@@ -37,6 +37,18 @@ The current schema bootstrap is additive for this release. It creates asset-libr
 
 Current production also contains an ignored runtime bundle at `/opt/origin/vevdemo-1.0.6`. It is intentionally not in the git archive, but `/api/health` checks its Node dependency `vevdemo-1.0.6/nodejs/node_modules/@volcengine/openapi` when online editor integration is enabled. Preserve or recopy this directory into every new `/opt/origin-next-*` release before swapping directories.
 
+This update adds the additive SQLite column `video_tasks.video_prompt_snapshot_json` and project JSON fields for video prompt draft/backup lifecycle. The column is bootstrapped automatically on app startup, but run the backfills after the new code is built and before opening traffic if old video prompt history must remain restorable:
+
+```bash
+cd /opt/origin-next-<release-id>
+set -a && . /etc/origin/origin.env && set +a
+npm run backup:sqlite
+./node_modules/.bin/tsx scripts/backfill-video-prompt-lifecycle.ts
+./node_modules/.bin/tsx scripts/backfill-video-prompt-snapshots.ts
+```
+
+Both backfills are intended to be additive/idempotent. Keep the SQLite backup from immediately before the run until post-release smoke tests pass.
+
 Before restart, also run the read-only duplicate-key preflight on the production SQLite database. The storyboard-material image unique index is intentionally strict and deployment should pause if any count is non-zero:
 
 ```bash

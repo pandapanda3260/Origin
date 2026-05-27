@@ -6,6 +6,7 @@ const materialPanelSource = readFileSync(new URL('../public/modules/material_ima
 const styles = readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
 const assetsSource = readFileSync(new URL('../public/modules/assets.js', import.meta.url), 'utf8');
 const utilsSource = readFileSync(new URL('../public/modules/utils.js', import.meta.url), 'utf8');
+const shotsSource = readFileSync(new URL('../public/modules/shots.js', import.meta.url), 'utf8');
 
 assert.match(
   source,
@@ -33,7 +34,7 @@ assert.match(
 
 assert.match(
   source,
-  /_ffePanelHtml\('提示词展示区域'[\s\S]*?_ffeFieldMetaHtml\('promptOverride'/,
+  /_ffePanelHtml\('提示词展示区域'[\s\S]*?_ffeFieldMetaHtml\('content'/,
   'positive prompt panel must wrap its save-status badge in the field-meta container (counter + status)',
 );
 
@@ -63,7 +64,7 @@ assert.match(
 
 assert.match(
   source,
-  /data-ffe-field="promptOverride" maxlength="' \+ FFE_PROMPT_OVERRIDE_MAX_CHARS \+ '"/,
+  /data-ffe-field="content" maxlength="' \+ FFE_PROMPT_OVERRIDE_MAX_CHARS \+ '"/,
   'positive prompt textarea must enforce the shared prompt override maxlength',
 );
 
@@ -81,14 +82,73 @@ assert.match(
 
 assert.match(
   source,
-  /function _ffeUpdateDirtyState\(\)[\s\S]*?_ffeSetFieldCounter\('promptOverride'\)[\s\S]*?_ffeSetFieldCounter\('negativePromptOverride'\)/,
+  /function _ffeUpdateDirtyState\(\)[\s\S]*?_ffeSetFieldCounter\('content'\)[\s\S]*?_ffeSetFieldCounter\('negativePromptOverride'\)/,
   'dirty-state refresh must also refresh both field counters so the displayed length stays in sync with the DOM',
 );
 
 assert.match(
   source,
-  /function _ffeCollectDraft\(\)[\s\S]*?auto\.touched[\s\S]*?promptOverride/,
+  /function _ffeCollectDraft\(\)[\s\S]*?auto\.touched[\s\S]*?content/,
   'prompt override collection must rely on explicit field touch state, not final-prompt text equality',
+);
+
+const framePromptStart = source.indexOf('function _framePromptForPanel(kind, sb, group) {');
+const framePromptEnd = source.indexOf('\nfunction _framePlanSummaryForPanel', framePromptStart);
+assert.ok(framePromptStart >= 0 && framePromptEnd > framePromptStart, 'storyboard frame prompt helper must be present');
+const framePromptForPanelSource = source.slice(framePromptStart, framePromptEnd);
+
+assert.match(
+  framePromptForPanelSource,
+  /var firstFramePlanPrompt = \(cardPromptState && cardPromptState\.plan && cardPromptState\.plan\.finalPrompt\)[\s\S]*?\|\| \(sb\.plan && sb\.plan\.finalPrompt\);/,
+  'first-frame card description must read plan.finalPrompt as the final fallback when it is available on the storyboard item',
+);
+
+assert.match(
+  framePromptForPanelSource,
+  /: \[\s*\{ text: firstFrameDraftPrompt, source: '首帧草稿提示词' \},\s*\{ text: firstFrameBasePrompt, source: '首帧当前正式提示词' \},\s*\{ text: firstFramePlanPrompt, source: '首帧实时计划提示词' \},\s*\]/,
+  'first-frame card description must prefer draft content, then base prompt content, then plan finalPrompt',
+);
+
+assert.doesNotMatch(
+  framePromptForPanelSource,
+  /promptOverride|sb\.firstFramePrompt|sb\.imagePrompt|sb\.originalFirstFramePrompt|originalFirstFramePrompt/,
+  'first-frame card description must not fall back to legacy draft or generated prompt fields',
+);
+
+assert.match(
+  source,
+  /function _sbFirstFramePromptEditorHtml\(gIdx, text\)[\s\S]*?<textarea class="sb-frame-text-box sb-frame-prompt-editor"[\s\S]*?data-sb-first-prompt-field="content"[\s\S]*?rows="18"/,
+  'first-frame card description must render as an editable 18-row textarea bound to draft content',
+);
+
+assert.match(
+  source,
+  /var promptDisplay = isTail \? _sbPromptShort\(promptText, 220\) : promptText;/,
+  'first-frame card description must keep the full prompt instead of applying the old short-text ellipsis',
+);
+
+assert.match(
+  source,
+  /async function _sbRunFirstFrameCardPromptSave\(gIdx, options\)[\s\S]*?apiPost\('\/api\/frames\/edit-draft'[\s\S]*?expectedSavedDraftFingerprint/,
+  'first-frame card inline edits must save through the same edit-draft endpoint with saved-draft fingerprint protection',
+);
+
+assert.match(
+  source,
+  /function _sbHydrateFirstFramePromptEditors\(root\)[\s\S]*?_sbEnsureFirstFrameCardPromptState\(gIdx\)[\s\S]*?currentEl\.value = nextText/,
+  'first-frame card prompt editors must hydrate plan/base prompt automatically, not only after focus',
+);
+
+assert.match(
+  source,
+  /hydrateProtectedImageElements\(bindRoot\);[\s\S]*?requestAnimationFrame\(function \(\) \{ _sbHydrateFirstFramePromptEditors\(bindRoot\); \}\);/,
+  'storyboard render must schedule first-frame prompt hydration after card DOM is mounted',
+);
+
+assert.match(
+  shotsSource,
+  /if \(saved && saved\.ok === false\) \{[\s\S]*?if \(saved\.stale === true && !changed\) \{[\s\S]*?return true;[\s\S]*?throw new Error\("project save rejected"\);/,
+  'shot-plan acceptance must not fail generation startup on harmless stale-version sync after first-frame draft autosave',
 );
 
 assert.match(
@@ -183,8 +243,20 @@ assert.match(
 
 assert.match(
   source,
-  /function _ffeModalHtml\(payload, gIdx\)[\s\S]*?var generateBlock = _firstFrameEditor\.generateBlock[\s\S]*?ffe-alert-stack/,
-  'first-frame modal alert stack must render generateBlock messages inline',
+  /function _ffeImageAlertHtml\(payload\)[\s\S]*?_firstFrameEditor\.generateBlock[\s\S]*?_ffeIsImageStale\(payload\)/,
+  'unified image alert must aggregate generateBlock, notices, legacy and stale messages near the image preview',
+);
+
+assert.match(
+  source,
+  /data-ffe-action="dismiss-image-alert"/,
+  'unified image alert items must expose a dismiss-image-alert action for the close button',
+);
+
+assert.doesNotMatch(
+  source,
+  /ffe-alert-stack/,
+  'top-level ffe-alert-stack must no longer be rendered — image alerts unified under the preview',
 );
 
 assert.match(
@@ -213,32 +285,44 @@ assert.match(
 
 assert.match(
   source,
-  /async function _generateFirstFrameFromEditor[\s\S]*?skipPreflight: true[\s\S]*?skipPreflight: true/,
-  'modal regenerate must pass skipPreflight on both initial start and stale retry starts',
+  /async function _generateFirstFrameFromEditor[\s\S]*?generateStoryboardSheet\(gIdx, \{[\s\S]*?skipPreflight: true/,
+  'modal regenerate must pass skipPreflight when starting generation from the editor',
 );
 
 assert.match(
   source,
-  /async function _generateFirstFrameFromEditor[\s\S]*?onStartError: function \(err\)[\s\S]*?onStartError: function \(err\)/,
-  'modal regenerate must attach start-error handlers to both initial start and stale retry starts',
+  /async function _generateFirstFrameFromEditor[\s\S]*?_firstFrameEditor\.generating = true;[\s\S]*?_ffeSetGeneratingPreviewText\('生成首帧中…'\);[\s\S]*?_renderFirstFrameEditor\(_firstFrameEditor\.payload, gIdx\);/,
+  'modal regenerate must immediately re-render the first-frame preview into a generating state',
 );
 
 assert.match(
   source,
-  /async function _generateFirstFrameFromEditor[\s\S]*?onStartError: function \(err\)[\s\S]*?renderImageGrid\(\)[\s\S]*?onStartError: function \(err\)[\s\S]*?renderImageGrid\(\)/,
-  'modal regenerate start-error handlers must reset the storyboard grid to avoid stale loading cards',
+  /generateStoryboardSheet\(gIdx, \{[\s\S]*?onLoadingText: _ffeSetGeneratingPreviewText/,
+  'modal regenerate must forward storyboard generation progress text into the open editor preview',
+);
+
+assert.match(
+  source,
+  /_ffeModalHtml\(payload, gIdx\)[\s\S]*?var generatingPreview = !!_firstFrameEditor\.generating[\s\S]*?ffe-image-generating[\s\S]*?data-ffe-generating-text/,
+  'first-frame image preview must render an inline generating overlay while modal regeneration is active',
+);
+
+assert.match(
+  source,
+  /async function _generateFirstFrameFromEditor[\s\S]*?onStartError: function \(err\)/,
+  'modal regenerate must attach a start-error handler',
+);
+
+assert.match(
+  source,
+  /async function _generateFirstFrameFromEditor[\s\S]*?onStartError: function \(err\)[\s\S]*?renderImageGrid\(\)/,
+  'modal regenerate start-error handler must reset the storyboard grid to avoid stale loading cards',
 );
 
 assert.doesNotMatch(
   source,
-  /retryStale[\s\S]{0,300}_generateFirstFrameFromEditor\(\s*true/,
-  'stale edit-draft retry must not recursively re-enter _generateFirstFrameFromEditor while generating',
-);
-
-assert.match(
-  source,
-  /if \(retryStale\)\s*\{[\s\S]*?generateStoryboardSheet\(gIdx/,
-  'stale edit-draft retry must start a second storyboard generation request in the same flow',
+  /retryStale|allowStaleEditDraft|stale_edit_draft/,
+  'sourceHash staleness must not trigger a second editor generation path',
 );
 
 assert.match(
@@ -309,8 +393,8 @@ assert.doesNotMatch(
 
 assert.match(
   source,
-  /var notices = Array\.isArray\(payload\.notices\)[\s\S]*?notice\.message \|\| notice\.code[\s\S]*?ffe-warning/,
-  'first-frame editor must surface plan notices through the warning banner stack',
+  /function _ffeImageAlertHtml\(payload\)[\s\S]*?var notices = Array\.isArray\(payload && payload\.notices\)[\s\S]*?notice\.message \|\| notice\.code/,
+  'unified image alert must surface plan notices alongside generateBlock and stale messages',
 );
 
 assert.doesNotMatch(
@@ -563,6 +647,18 @@ assert.match(
   styles,
   /\.ffe-image-fallback\s*\{[\s\S]*?position:\s*absolute[\s\S]*?flex-direction:\s*column[\s\S]*?justify-content:\s*center[\s\S]*?\}/,
   'first-frame missing-image fallback must be centered and vertically stacked',
+);
+
+assert.match(
+  styles,
+  /\.ffe-image-generating\s*\{[\s\S]*?position:\s*absolute[\s\S]*?backdrop-filter:\s*blur\(2px\)[\s\S]*?\}[\s\S]*?\.ffe-image-generating-spinner\s*\{[\s\S]*?animation:\s*ffe-spin/,
+  'first-frame generating overlay must visibly cover the preview image with a spinner',
+);
+
+assert.match(
+  styles,
+  /\.sb-frame-prompt-editor\s*\{[\s\S]*?max-height:\s*calc\(18 \* 1\.75em \+ 14px\)[\s\S]*?overflow-y:\s*auto[\s\S]*?resize:\s*none/,
+  'first-frame card prompt editor must cap visible content at 18 lines and scroll overflow',
 );
 
 assert.match(

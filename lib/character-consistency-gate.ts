@@ -72,9 +72,9 @@ const WARNING_CAP: Record<CharacterConsistencyWarningCode, number> = {
   stale_nonblocking: 25,
 };
 
-// Warning-only problems should bottom out at 40 (red but still explainable in UI).
+// Warning-only problems should bottom out at 75 (yellow, never a red stop sign).
 // Hard blockers are handled separately by allowed=false and are the only one-vote veto.
-const TARGET_WARNING_TOTAL_CAP = 60;
+const TARGET_WARNING_TOTAL_CAP = 25;
 
 function normalizeText(value: any): string {
   return String(value ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim();

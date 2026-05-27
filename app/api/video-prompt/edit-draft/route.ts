@@ -3,12 +3,10 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import {
-  currentFirstFrameEditDraft,
-  firstFrameDraftFingerprint,
-  reconcileFirstFramePromptStateInPatch,
-  validateAndNormalizeFirstFrameDraft,
-  FirstFrameDraftValidationException,
-} from '@/lib/first-frame-edit-draft';
+  computeVideoPromptSourceHash,
+  normalizeVideoPromptEditDraftInput,
+  videoPromptDraftFingerprint,
+} from '@/lib/video-prompt-lifecycle';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -17,17 +15,6 @@ function parseGroupIdx(value: unknown): number | null {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) return null;
   return n;
-}
-
-function validationResponse(errors: Array<{ field: string; message: string }>) {
-  return Response.json(
-    {
-      error: errors[0]?.message || 'validation_failed',
-      code: 'validation_failed',
-      errors,
-    },
-    { status: 422 },
-  );
 }
 
 class SavedDraftChangedException extends Error {
@@ -54,6 +41,11 @@ function savedDraftChangedResponse(err: SavedDraftChangedException) {
   );
 }
 
+function actualDraftFingerprint(existingDraft: any, sourceHash: string | null) {
+  if (existingDraft?.savedDraftFingerprint) return String(existingDraft.savedDraftFingerprint);
+  return videoPromptDraftFingerprint(sourceHash, existingDraft || '');
+}
+
 export async function PUT(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
@@ -61,7 +53,7 @@ export async function PUT(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const projectId = String(body?.projectId || '').trim();
   const groupIdx = parseGroupIdx(body?.groupIdx);
-  const input = body?.draft || {};
+  const input = body?.draft ?? body?.content ?? body?.videoPrompt ?? body?.prompt ?? '';
   const expectedSavedDraftFingerprint = String(body?.expectedSavedDraftFingerprint || '').trim();
   const force = body?.force === true;
 
@@ -74,57 +66,39 @@ export async function PUT(req: NextRequest) {
   try {
     let draft: any = null;
     let sourceHash: string | null = null;
-    let savedDraftFingerprint = '';
     const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
-      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user, groupIdx });
-      sourceHash = promptState.sourceHash;
-      const { draft: currentDraft } = currentFirstFrameEditDraft(fresh, groupIdx);
-      const actualSavedDraftFingerprint = firstFrameDraftFingerprint(currentDraft);
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      const prev = storyboards[groupIdx];
+      if (!prev) throw new Error(`片段 ${groupIdx + 1} 不存在`);
+
+      const existingDraft = prev.videoPromptEditDraft || null;
+      sourceHash = typeof existingDraft?.sourceHash === 'string'
+        ? existingDraft.sourceHash
+        : computeVideoPromptSourceHash({ project: fresh, groupIdx, ownerId: user.id });
+      const actualSavedDraftFingerprint = actualDraftFingerprint(existingDraft, sourceHash);
       if (expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint && !force) {
         throw new SavedDraftChangedException(expectedSavedDraftFingerprint, actualSavedDraftFingerprint);
       }
-      if (force && expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint) {
-        console.warn('[first-frame-edit-draft] force overwrite after saved draft changed', {
-          userId: user.id,
-          projectId,
-          groupIdx,
-          expectedSavedDraftFingerprint,
-          actualSavedDraftFingerprint,
-        });
-      }
-      draft = validateAndNormalizeFirstFrameDraft({
-        project: fresh,
-        groupIdx,
-        userId: user.id,
-        input,
-        plan: promptState.plan,
-      });
-      savedDraftFingerprint = firstFrameDraftFingerprint(draft);
-      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const prev = storyboards[groupIdx] || {};
+
+      draft = normalizeVideoPromptEditDraftInput(input, sourceHash);
       storyboards[groupIdx] = {
         ...prev,
-        ...(promptState.slotPatch || {}),
-        firstFrameEditDraft: draft,
+        videoPromptEditDraft: draft,
       };
       return { storyboards };
     });
+
     return jsonOk({
       draft,
       sourceHash,
-      savedDraftFingerprint,
-      baselineFingerprint: savedDraftFingerprint,
-      firstFrameBasePrompt: (updated as any)?.storyboards?.[groupIdx]?.firstFrameBasePrompt || null,
-      firstFrameBackup: (updated as any)?.storyboards?.[groupIdx]?.firstFrameBackup || null,
+      savedDraftFingerprint: draft?.savedDraftFingerprint || '',
+      baselineFingerprint: draft?.savedDraftFingerprint || '',
       projectUpdatedAt: (updated as any)?.updatedAt || null,
     });
   } catch (err: any) {
     if (err instanceof SavedDraftChangedException) return savedDraftChangedResponse(err);
-    if (err instanceof FirstFrameDraftValidationException) {
-      return validationResponse(err.errors);
-    }
-    return jsonError(err?.message || '保存草稿失败', 500);
+    return jsonError(err?.message || '保存视频提示词草稿失败', 500);
   }
 }
 
@@ -149,52 +123,39 @@ export async function DELETE(req: NextRequest) {
     let savedDraftFingerprint = '';
     const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
-      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user, groupIdx });
-      sourceHash = promptState.sourceHash;
-      const { draft: currentDraft } = currentFirstFrameEditDraft(fresh, groupIdx);
-      const actualSavedDraftFingerprint = firstFrameDraftFingerprint(currentDraft);
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      const prev = storyboards[groupIdx];
+      if (!prev) throw new Error(`片段 ${groupIdx + 1} 不存在`);
+
+      const existingDraft = prev.videoPromptEditDraft || null;
+      sourceHash = typeof existingDraft?.sourceHash === 'string'
+        ? existingDraft.sourceHash
+        : computeVideoPromptSourceHash({ project: fresh, groupIdx, ownerId: user.id });
+      const actualSavedDraftFingerprint = actualDraftFingerprint(existingDraft, sourceHash);
       if (expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint && !force) {
         throw new SavedDraftChangedException(expectedSavedDraftFingerprint, actualSavedDraftFingerprint);
       }
-      if (force && expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint) {
-        console.warn('[first-frame-edit-draft] force delete after saved draft changed', {
-          userId: user.id,
-          projectId,
-          groupIdx,
-          expectedSavedDraftFingerprint,
-          actualSavedDraftFingerprint,
-        });
+
+      if (!existingDraft) {
+        savedDraftFingerprint = videoPromptDraftFingerprint(sourceHash, '');
+        return {};
       }
-      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const prev = storyboards[groupIdx] || {};
-      const backup = promptState.firstFrameBackup;
-      const next = {
-        ...prev,
-        ...(promptState.slotPatch || {}),
-        firstFrameBasePrompt: {
-          content: backup.content,
-          sourceHash: backup.sourceHash,
-          updatedAt: new Date().toISOString(),
-          updatedBy: user.id,
-          origin: 'backup_restore',
-        },
-      };
-      delete next.firstFrameEditDraft;
+      const next = { ...prev };
+      delete next.videoPromptEditDraft;
       storyboards[groupIdx] = next;
-      savedDraftFingerprint = firstFrameDraftFingerprint(null);
+      savedDraftFingerprint = videoPromptDraftFingerprint(sourceHash, '');
       return { storyboards };
     });
+
     return jsonOk({
       ok: true,
       sourceHash,
       savedDraftFingerprint,
       baselineFingerprint: savedDraftFingerprint,
-      firstFrameBasePrompt: (updated as any)?.storyboards?.[groupIdx]?.firstFrameBasePrompt || null,
-      firstFrameBackup: (updated as any)?.storyboards?.[groupIdx]?.firstFrameBackup || null,
       projectUpdatedAt: (updated as any)?.updatedAt || null,
     });
   } catch (err: any) {
     if (err instanceof SavedDraftChangedException) return savedDraftChangedResponse(err);
-    return jsonError(err?.message || '删除草稿失败', 500);
+    return jsonError(err?.message || '删除视频提示词草稿失败', 500);
   }
 }

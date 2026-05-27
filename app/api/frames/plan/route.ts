@@ -6,12 +6,12 @@ import { getProjectByIdForUser } from '@/lib/projects-db';
 import {
   availableFirstFrameAssets,
   buildFirstFrameMaterialPanel,
-  buildFirstFramePlanPreview,
   currentFirstFrameEditDraft,
   effectiveFirstFrameReferences,
   firstFrameDraftFingerprint,
   isFirstFrameEditDraftStale,
   LEGACY_STYLE_RULE_NOTICE_MESSAGE,
+  reconcileFirstFramePromptState,
 } from '@/lib/first-frame-edit-draft';
 
 export const runtime = 'nodejs';
@@ -52,7 +52,7 @@ export async function GET(req: NextRequest) {
   if (legacyUnsupported) {
     const { draft } = currentFirstFrameEditDraft(project, groupIdx);
     const sourceHash = sb.firstFrameSourceHash || sb.frames?.first?.sourceHash || null;
-    const savedDraftFingerprint = firstFrameDraftFingerprint(sourceHash, draft);
+    const savedDraftFingerprint = firstFrameDraftFingerprint(draft);
     return jsonOk({
       projectId,
       groupIdx,
@@ -73,27 +73,29 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  const preview = buildFirstFramePlanPreview({
-    project,
-    groupIdx,
-    ownerId: user.id,
-    user,
-  });
-  const { draft, didMigrate } = currentFirstFrameEditDraft(project, groupIdx);
-  const savedDraftFingerprint = firstFrameDraftFingerprint(preview.sourceHash, draft);
-  const effectiveReferences = effectiveFirstFrameReferences(project, user.id, preview.plan, draft);
+  const promptState = reconcileFirstFramePromptState({ projectId, user, groupIdx });
+  if (!promptState) return jsonError('项目不存在', 404);
+  const activeProject = getProjectByIdForUser(projectId, user.id) || project;
+  const activeStoryboards = Array.isArray((activeProject as any).storyboards) ? (activeProject as any).storyboards : [];
+  const activeSb = activeStoryboards[groupIdx] || {};
+  const activeCurrentUrl = firstFrameUrl(activeSb);
+  const activeImageHistory = Array.isArray(activeSb.imageHistory) ? activeSb.imageHistory : [];
+  const preview = promptState;
+  const { draft, didMigrate } = currentFirstFrameEditDraft(activeProject, groupIdx);
+  const savedDraftFingerprint = firstFrameDraftFingerprint(draft);
+  const effectiveReferences = effectiveFirstFrameReferences(activeProject, user.id, preview.plan, draft);
   const firstFrameMaterialPanel = buildFirstFrameMaterialPanel({
-    project,
+    project: activeProject,
     userId: user.id,
     plan: preview.plan,
     draft,
     sourceHash: preview.sourceHash,
   });
-  const preflight = batchPreflightPayload(project, projectId, 'storyboard_images', [{
+  const preflight = batchPreflightPayload(activeProject, projectId, 'storyboard_images', [{
     groupIdx,
     idx: groupIdx,
     shotIndices: preview.shotIndices,
-  }]);
+  }], { consumerOperation: 'frames_plan' });
 
   return jsonOk({
     projectId,
@@ -111,15 +113,18 @@ export async function GET(req: NextRequest) {
     savedDraftFingerprint,
     baselineFingerprint: savedDraftFingerprint,
     draftStale: !!(draft && isFirstFrameEditDraftStale(draft.sourceHash, preview.sourceHash)),
+    firstFrameBasePrompt: promptState.firstFrameBasePrompt,
+    firstFrameBackup: promptState.firstFrameBackup,
+    firstFrameBasePromptStale: promptState.firstFrameBasePromptStale,
     currentFrame: {
-      url: currentUrl,
-      mode: sb.firstFrameMode || sb.frames?.first?.mode || '',
-      status: sb.firstFrame?.status || sb.frames?.first?.status || (currentUrl ? 'ready' : 'missing'),
-      sourceHash: sb.firstFrameSourceHash || sb.frames?.first?.sourceHash || null,
-      prompt: sb.firstFramePrompt || sb.frames?.first?.prompt || '',
-      planSummary: sb.firstFramePlanSummary || sb.frames?.first?.planSummary || null,
+      url: activeCurrentUrl,
+      mode: activeSb.firstFrameMode || activeSb.frames?.first?.mode || '',
+      status: activeSb.firstFrame?.status || activeSb.frames?.first?.status || (activeCurrentUrl ? 'ready' : 'missing'),
+      sourceHash: activeSb.firstFrameSourceHash || activeSb.frames?.first?.sourceHash || null,
+      prompt: activeSb.firstFramePrompt || activeSb.frames?.first?.prompt || '',
+      planSummary: activeSb.firstFramePlanSummary || activeSb.frames?.first?.planSummary || null,
     },
-    imageHistory,
+    imageHistory: activeImageHistory,
     plan: {
       finalPrompt: preview.plan.finalPrompt,
       planSummary: preview.planSummary,
@@ -139,7 +144,7 @@ export async function GET(req: NextRequest) {
       firstFrameMaterialPanel,
     },
     firstFrameMaterialPanel,
-    availableAssets: availableFirstFrameAssets(project),
+    availableAssets: availableFirstFrameAssets(activeProject),
     preflight,
   });
 }

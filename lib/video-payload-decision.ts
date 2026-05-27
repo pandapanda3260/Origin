@@ -98,10 +98,6 @@ export function normalizeTailFrameReferenceStatus(opts: {
   return opts.tailFramePath ? 'ready' : 'file_missing';
 }
 
-function warning(reason: VideoPayloadDecisionReason, message: string): VideoPayloadDecisionWarning {
-  return { key: 'first_last_mode_degraded', level: 'info', reason, message };
-}
-
 function hardFail(
   submitMode: VideoSubmitMode,
   reason: VideoPayloadDecisionReason,
@@ -152,22 +148,7 @@ export function resolveVideoPayloadDecision(opts: {
   });
 
   if (submitMode === 'reference_images') {
-    const hasTailSignal =
-      opts.tailIntentRequested ||
-      !!String(opts.tailFrameUrl || '').trim() ||
-      !!String(opts.tailReferenceStatus || '').trim();
-    return strictDecision(
-      submitMode,
-      'reference_images',
-      hasTailSignal
-        ? {
-            key: 'target_end_not_used',
-            level: 'info',
-            reason: 'reference_images_mode',
-            message: '当前为多参考图模式，尾帧不会作为 last_frame 参与本次视频生成。',
-          }
-        : undefined,
-    );
+    return strictDecision(submitMode, 'reference_images');
   }
 
   if (!firstFramePath) {
@@ -185,46 +166,14 @@ export function resolveVideoPayloadDecision(opts: {
 
   const explicitFirstLast = submitMode === 'first_last_frame';
   if (!opts.capabilityFirstLastSupported) {
-    if (explicitFirstLast) {
-      return hardFail(
-        submitMode,
-        'capability_unsupported',
-        'first_last_frame_capability_unsupported',
-        '当前视频模型不支持首尾帧模式，请切换到 Seedance 2.0 或改用 auto / strict_first_frame。',
-      );
-    }
-    return strictDecision(
-      submitMode,
-      'capability_unsupported',
-      warning('capability_unsupported', '当前视频模型未标记支持首尾帧，已使用仅首帧模式。'),
-    );
+    return strictDecision(submitMode, 'capability_unsupported');
   }
 
   if (!opts.firstLastFeatureEnabled) {
-    if (explicitFirstLast) {
-      return hardFail(
-        submitMode,
-        'feature_disabled',
-        'first_last_frame_feature_disabled',
-        '首尾帧视频模式已被系统管理员禁用，请使用 auto 或 strict_first_frame 模式。',
-      );
-    }
-    return strictDecision(
-      submitMode,
-      'feature_disabled',
-      warning('feature_disabled', '首尾帧视频模式未开启，已使用仅首帧模式。'),
-    );
+    return strictDecision(submitMode, 'feature_disabled');
   }
 
   if (!opts.tailIntentRequested) {
-    if (explicitFirstLast) {
-      return hardFail(
-        submitMode,
-        'no_tail_intent',
-        'first_last_frame_requires_tail_intent',
-        '该片段尚未确认使用尾帧，请先生成或确认尾帧后再使用首尾帧模式。',
-      );
-    }
     return strictDecision(submitMode, 'no_tail_intent');
   }
 
@@ -260,27 +209,5 @@ export function resolveVideoPayloadDecision(opts: {
     );
   }
 
-  if (explicitFirstLast) {
-    return hardFail(
-      submitMode,
-      reason,
-      `first_last_frame_${reason}`,
-      '尾帧不可用，请重新生成尾帧或切换到仅首帧模式。',
-    );
-  }
-
-  const messageByReason: Record<VideoPayloadDecisionReason, string> = {
-    tail_missing: '该片段没有尾帧，已使用仅首帧模式。',
-    tail_failed: '尾帧生成失败，已使用仅首帧模式。',
-    tail_file_missing: '尾帧文件不可解析，已使用仅首帧模式。',
-    tail_pending: '尾帧仍在生成中，请等待尾帧完成后再生成视频。',
-    tail_ready: '',
-    strict_first_frame: '',
-    reference_images: '',
-    no_tail_intent: '',
-    feature_disabled: '',
-    capability_unsupported: '',
-    first_frame_missing: '',
-  };
-  return strictDecision(submitMode, reason, warning(reason, messageByReason[reason] || '尾帧不可用，已使用仅首帧模式。'));
+  return strictDecision(submitMode, reason);
 }

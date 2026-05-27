@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { sanitizeFillLightPositiveMentions } from './content-sanitize';
 import { normalizeCastingProfile } from './casting-profile';
 
 export type AssetStyleType = 'char' | 'scene' | 'prop';
@@ -271,14 +270,14 @@ export function buildAssetStyleLock(styleBible: any, type: AssetStyleType): Asse
 
   return {
     prompt: meaningful
-      ? sanitizeFillLightPositiveMentions([
+      ? [
         type === 'char'
           ? '=== PROJECT CHARACTER STYLE LOCK (must match current project style bible) ==='
           : type === 'scene'
             ? '=== PROJECT STYLE BIBLE LOCK (every scene image in this project MUST share this exact look) ==='
             : '=== PROJECT PROP STYLE LOCK (must match current project style bible) ===',
         ...parts,
-      ].join('\n'))
+      ].join('\n')
       : '',
     signature,
     signatureType: type,

@@ -47,12 +47,12 @@ import {
     assistantMessage: 'ok',
     draftPatch: {
       styleRuleOverrides: { op: 'add', value: ['更冷的色调'] },
-      promptOverride: { op: 'set', value: '冷蓝色夜景，背景更克制' },
+      content: { op: 'set', value: '冷蓝色夜景，背景更克制' },
     },
   }));
 
   assert.equal(Object.prototype.hasOwnProperty.call(parsed.draftPatch || {}, 'styleRuleOverrides'), false);
-  assert.deepEqual(parsed.draftPatch?.promptOverride, { op: 'set', value: '冷蓝色夜景，背景更克制' });
+  assert.deepEqual(parsed.draftPatch?.content, { op: 'set', value: '冷蓝色夜景，背景更克制' });
   assert.equal(parsed.parserWarnings?.some((item) => item.code === 'style_rules_ignored'), true);
 }
 
@@ -61,12 +61,12 @@ import {
     assistantMessage: 'ok',
     nextDraft: {
       styleRuleOverrides: ['更冷的色调'],
-      promptOverride: '冷蓝色夜景，背景更克制',
+      content: '冷蓝色夜景，背景更克制',
     },
   }));
 
   assert.equal(Object.prototype.hasOwnProperty.call(parsed.draftPatch || {}, 'styleRuleOverrides'), false);
-  assert.deepEqual(parsed.draftPatch?.promptOverride, { op: 'set', value: '冷蓝色夜景，背景更克制' });
+  assert.deepEqual(parsed.draftPatch?.content, { op: 'set', value: '冷蓝色夜景，背景更克制' });
   assert.equal(parsed.parserWarnings?.some((item) => item.code === 'style_rules_ignored'), true);
 }
 

@@ -68,6 +68,7 @@ run_isolated npm run test:responses-input-role-mapping
 run_isolated npm run test:project-dependency-state
 run_isolated npm run test:video-payload-decision
 run_isolated npm run test:video-reference-manifest
+run_isolated npm run test:video-prompt-lifecycle
 run_isolated npm run test:video-prompt-dialogue-regression
 run_isolated npm run test:visual-reference-state
 run_isolated npm run test:provider-recovery

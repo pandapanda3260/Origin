@@ -40,7 +40,7 @@ const ReferencePatchSchema = z.discriminatedUnion('op', [
 ]);
 
 export const RewriteDraftOperationsSchema = z.object({
-  promptOverride: PromptPatchSchema.optional(),
+  content: PromptPatchSchema.optional(),
   negativePromptOverride: NegativePromptPatchSchema.optional(),
   referenceOverrides: ReferencePatchSchema.optional(),
 }).strict();
@@ -81,10 +81,12 @@ function removeForbiddenPatchKeys(value: any): FirstFrameDraftWarning[] {
 function legacyDraftPatchToOperations(input: any) {
   const source = input && typeof input === 'object' ? input : {};
   const operations: Record<string, any> = {};
-  if (Object.prototype.hasOwnProperty.call(source, 'promptOverride')) {
-    operations.promptOverride = source.promptOverride == null
+  const hasContent = Object.prototype.hasOwnProperty.call(source, 'content');
+  if (hasContent || Object.prototype.hasOwnProperty.call(source, 'promptOverride')) {
+    const promptSource = hasContent ? source.content : source.promptOverride;
+    operations.content = promptSource == null
       ? { op: 'clear' }
-      : { op: 'set', value: String(source.promptOverride || '') };
+      : { op: 'set', value: String(promptSource || '') };
   }
   if (Object.prototype.hasOwnProperty.call(source, 'negativePromptOverride')) {
     operations.negativePromptOverride = source.negativePromptOverride == null
@@ -114,15 +116,15 @@ export function normalizeFirstFrameRewriteOperations(input: any) {
   const source = input && typeof input === 'object' ? { ...input } : {};
   const out: Record<string, any> = {};
 
-  const prompt = source.promptOverride;
+  const prompt = Object.prototype.hasOwnProperty.call(source, 'content') ? source.content : source.promptOverride;
   if (prompt && typeof prompt === 'object' && prompt.op) {
-    out.promptOverride = prompt.op === 'set' && Array.isArray(prompt.value)
+    out.content = prompt.op === 'set' && Array.isArray(prompt.value)
       ? { op: 'set', value: prompt.value.join(' ') }
       : prompt;
   } else if (typeof prompt === 'string') {
-    out.promptOverride = { op: 'set', value: prompt };
+    out.content = { op: 'set', value: prompt };
   } else if (prompt === null) {
-    out.promptOverride = { op: 'clear' };
+    out.content = { op: 'clear' };
   }
 
   const negative = source.negativePromptOverride;

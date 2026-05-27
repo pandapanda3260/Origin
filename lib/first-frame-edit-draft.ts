@@ -14,6 +14,7 @@ import {
   storyboardShotIndices,
 } from './frame-workflow-state';
 import { listAssetLibraryItems } from './asset-library';
+import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 
 export type FirstFrameEditAssetRole = 'character' | 'scene' | 'prop';
 export type FirstFrameMaterialTileRole = 'scene' | 'char' | 'prop';
@@ -107,6 +108,7 @@ export type FirstFrameMaterialPanel = {
 
 export type FirstFrameEditDraft = {
   sourceHash: string | null;
+  content?: string;
   promptOverride?: string;
   referenceOverrides?: {
     excluded?: FirstFrameReferenceOverride[];
@@ -125,7 +127,7 @@ export type FirstFrameDraftValidationError = {
 };
 
 export type FirstFrameDraftWarningField =
-  | 'promptOverride'
+  | 'content'
   | 'negativePromptOverride'
   | 'referenceOverrides'
   | 'firstFrameReferenceSelection';
@@ -139,7 +141,7 @@ export type FirstFrameDraftWarning = {
 };
 
 export type FirstFrameDraftFingerprintPayload = {
-  promptOverride?: string;
+  content?: string;
   referenceOverrides?: {
     excluded?: FirstFrameReferenceOverride[];
     added?: FirstFrameReferenceAdd[];
@@ -163,6 +165,35 @@ export type FirstFramePlanNotice = {
 export type FirstFrameEditDraftState = {
   draft: FirstFrameEditDraft | null;
   didMigrate: boolean;
+};
+
+export type FirstFrameBasePromptOrigin = 'system' | 'draft_commit' | 'backup_restore' | 'history_restore';
+
+export type FirstFrameBasePromptState = {
+  content: string;
+  sourceHash: string | null;
+  updatedAt: string;
+  updatedBy: number;
+  origin: FirstFrameBasePromptOrigin;
+};
+
+export type FirstFrameBackupState = {
+  content: string;
+  sourceHash: string | null;
+  createdAt: string;
+};
+
+export type FirstFramePromptReconcileState = {
+  plan: FrameImageGenerationPlan;
+  planSummary: FrameImagePlanSummary;
+  sourceHash: string | null;
+  shotIndices: number[];
+  modelSnapshot: FrameImageGenerationPlan['modelSnapshot'];
+  firstFrameBasePrompt: FirstFrameBasePromptState;
+  firstFrameBackup: FirstFrameBackupState;
+  firstFrameBasePromptStale: boolean;
+  firstFrameDraftStale: boolean;
+  slotPatch: Record<string, any> | null;
 };
 
 export class FirstFrameDraftValidationException extends Error {
@@ -207,6 +238,13 @@ function cleanText(value: unknown, limit: number): string {
 
 function cleanDraftTextForSave(value: unknown): string {
   return String(value ?? '').replace(/\s+\n/g, '\n').trim();
+}
+
+function draftContentValue(draft: any): unknown {
+  if (draft && typeof draft === 'object' && Object.prototype.hasOwnProperty.call(draft, 'content')) {
+    return draft.content;
+  }
+  return draft?.promptOverride;
 }
 
 function hashText(value: string) {
@@ -500,8 +538,8 @@ function uniqByKey<T>(items: T[], keyFn: (item: T) => string): T[] {
 export function normalizeFirstFrameDraftForFingerprint(input: any): FirstFrameDraftFingerprintPayload {
   const draft = input && typeof input === 'object' ? input : {};
   const out: FirstFrameDraftFingerprintPayload = {};
-  const prompt = cleanText(draft.promptOverride, MAX_PROMPT_OVERRIDE_CHARS);
-  if (prompt) out.promptOverride = prompt;
+  const prompt = cleanText(draftContentValue(draft), MAX_PROMPT_OVERRIDE_CHARS);
+  if (prompt) out.content = prompt;
 
   const negative = cleanText(draft.negativePromptOverride, MAX_NEGATIVE_PROMPT_CHARS);
   if (negative) out.negativePromptOverride = negative;
@@ -551,9 +589,8 @@ export function normalizeFirstFrameDraftForFingerprint(input: any): FirstFrameDr
   return out;
 }
 
-export function firstFrameDraftFingerprint(sourceHash: string | null | undefined, draft: any): string {
+export function firstFrameDraftFingerprint(draft: any): string {
   return hashText(stableJson({
-    sourceHash: sourceHash || null,
     draft: normalizeFirstFrameDraftForFingerprint(draft),
   }));
 }
@@ -598,11 +635,11 @@ function dedupeFrameReferences(refs: FrameReference[]): FrameReference[] {
 }
 
 function normalizeDraftInput(input: any, sourceHash: string | null, userId: number): FirstFrameEditDraft {
-  const promptOverride = cleanDraftTextForSave(input?.promptOverride);
+  const content = cleanDraftTextForSave(draftContentValue(input));
   const negativePromptOverride = cleanDraftTextForSave(input?.negativePromptOverride);
   const textErrors: FirstFrameDraftValidationError[] = [];
-  if (promptOverride.length > MAX_PROMPT_OVERRIDE_CHARS) {
-    textErrors.push({ field: 'promptOverride', message: `Prompt 不能超过 ${MAX_PROMPT_OVERRIDE_CHARS} 字符` });
+  if (content.length > MAX_PROMPT_OVERRIDE_CHARS) {
+    textErrors.push({ field: 'content', message: `Prompt 不能超过 ${MAX_PROMPT_OVERRIDE_CHARS} 字符` });
   }
   if (negativePromptOverride.length > MAX_NEGATIVE_PROMPT_CHARS) {
     textErrors.push({ field: 'negativePromptOverride', message: `负向约束不能超过 ${MAX_NEGATIVE_PROMPT_CHARS} 字符` });
@@ -629,7 +666,7 @@ function normalizeDraftInput(input: any, sourceHash: string | null, userId: numb
   const attachments = normalizeReferenceAttachments(input?.firstFrameReferenceAttachments, userId);
   return {
     sourceHash,
-    ...(promptOverride ? { promptOverride } : {}),
+    ...(content ? { content } : {}),
     ...((excluded.length || added.length) ? { referenceOverrides: { ...(excluded.length ? { excluded } : {}), ...(added.length ? { added } : {}) } } : {}),
     ...(selection ? { firstFrameReferenceSelection: selection } : {}),
     ...(attachments.length ? { firstFrameReferenceAttachments: attachments } : {}),
@@ -645,16 +682,16 @@ export function currentFirstFrameEditDraft(project: any, groupIdx: number): Firs
   if (!rawDraft || typeof rawDraft !== 'object') return { draft: null, didMigrate: false };
   const updatedAt = String(rawDraft.updatedAt || '').trim();
   const updatedBy = Number(rawDraft.updatedBy || 0);
-  const promptOverride = cleanText(rawDraft.promptOverride, MAX_PROMPT_OVERRIDE_CHARS);
+  const content = cleanText(draftContentValue(rawDraft), MAX_PROMPT_OVERRIDE_CHARS);
   const legacyStyleRules = cleanLegacyStyleRuleOverrides(rawDraft.styleRuleOverrides);
-  const shouldMergeLegacyRules = legacyStyleRules.length > 0 && !isLegacyStyleRulePromptOverride(promptOverride);
-  const migratedPromptOverride = shouldMergeLegacyRules
-    ? cleanText([promptOverride, legacyStyleRuleBlock(legacyStyleRules)].filter(Boolean).join('\n\n'), MAX_PROMPT_OVERRIDE_CHARS)
-    : promptOverride;
+  const shouldMergeLegacyRules = legacyStyleRules.length > 0 && !isLegacyStyleRulePromptOverride(content);
+  const migratedContent = shouldMergeLegacyRules
+    ? cleanText([content, legacyStyleRuleBlock(legacyStyleRules)].filter(Boolean).join('\n\n'), MAX_PROMPT_OVERRIDE_CHARS)
+    : content;
   return {
     draft: {
       sourceHash: typeof rawDraft.sourceHash === 'string' ? rawDraft.sourceHash : null,
-      ...(migratedPromptOverride ? { promptOverride: migratedPromptOverride } : {}),
+      ...(migratedContent ? { content: migratedContent } : {}),
       ...(rawDraft.referenceOverrides && typeof rawDraft.referenceOverrides === 'object' ? { referenceOverrides: rawDraft.referenceOverrides } : {}),
       ...(rawDraft.firstFrameReferenceSelection && typeof rawDraft.firstFrameReferenceSelection === 'object'
         ? { firstFrameReferenceSelection: normalizeReferenceSelection(rawDraft.firstFrameReferenceSelection, typeof rawDraft.sourceHash === 'string' ? rawDraft.sourceHash : null) }
@@ -683,8 +720,17 @@ export function mergeFirstFrameDraftPatch(baseDraft: any, patch: any) {
   const base = baseDraft && typeof baseDraft === 'object' ? baseDraft : {};
   const patchObject = patch && typeof patch === 'object' ? patch : {};
   const next: Record<string, any> = { ...base };
+  if (!next.content && next.promptOverride) next.content = next.promptOverride;
+  delete next.promptOverride;
 
-  assignPatchField(next, patchObject, 'promptOverride');
+  assignPatchField(next, patchObject, 'content');
+  if (!Object.prototype.hasOwnProperty.call(patchObject, 'content')) {
+    assignPatchField(next, patchObject, 'promptOverride');
+    if (next.promptOverride !== undefined) {
+      next.content = next.promptOverride;
+      delete next.promptOverride;
+    }
+  }
   assignPatchField(next, patchObject, 'negativePromptOverride');
   assignPatchField(next, patchObject, 'firstFrameReferenceSelection');
   assignPatchField(next, patchObject, 'firstFrameReferenceAttachments');
@@ -790,8 +836,8 @@ export function validateAndNormalizeFirstFrameDraftWithWarnings(args: {
   }
   warnings.push(...conflictResult.warnings);
   const errors: FirstFrameDraftValidationError[] = [];
-  if (draft.promptOverride && draft.promptOverride.length > MAX_PROMPT_OVERRIDE_CHARS) {
-    errors.push({ field: 'promptOverride', message: `Prompt 不能超过 ${MAX_PROMPT_OVERRIDE_CHARS} 字符` });
+  if (draft.content && draft.content.length > MAX_PROMPT_OVERRIDE_CHARS) {
+    errors.push({ field: 'content', message: `Prompt 不能超过 ${MAX_PROMPT_OVERRIDE_CHARS} 字符` });
   }
   if (draft.negativePromptOverride && draft.negativePromptOverride.length > MAX_NEGATIVE_PROMPT_CHARS) {
     errors.push({ field: 'negativePromptOverride', message: `负向约束不能超过 ${MAX_NEGATIVE_PROMPT_CHARS} 字符` });
@@ -844,7 +890,11 @@ export function buildFirstFramePlanPreview(args: {
 } {
   const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
   const sb = storyboards[args.groupIdx] || {};
-  const shotIndices = storyboardShotIndices(args.project, args.groupIdx, sb, { mode: 'single-shot-strict' });
+  const hasExplicitShotBinding = Array.isArray(sb?.shotIndices) && sb.shotIndices.length > 0;
+  const shotIndices = storyboardShotIndices(args.project, args.groupIdx, sb, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: hasExplicitShotBinding ? undefined : [args.groupIdx],
+  });
   const imgCfg = resolveLLMConfig(args.user, 'image');
   const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
   const modelSnapshot = {
@@ -869,6 +919,132 @@ export function buildFirstFramePlanPreview(args: {
     shotIndices,
     modelSnapshot,
   };
+}
+
+function normalizeFirstFrameBasePrompt(value: any): FirstFrameBasePromptState | null {
+  if (!value || typeof value !== 'object') return null;
+  const content = cleanText(value.content, MAX_PROMPT_OVERRIDE_CHARS);
+  if (!content) return null;
+  const origin = value.origin === 'draft_commit' || value.origin === 'backup_restore' || value.origin === 'history_restore'
+    ? value.origin
+    : 'system';
+  const updatedBy = Number(value.updatedBy || 0);
+  return {
+    content,
+    sourceHash: typeof value.sourceHash === 'string' ? value.sourceHash : null,
+    updatedAt: typeof value.updatedAt === 'string' && value.updatedAt ? value.updatedAt : new Date(0).toISOString(),
+    updatedBy: Number.isFinite(updatedBy) ? updatedBy : 0,
+    origin,
+  };
+}
+
+function normalizeFirstFrameBackup(value: any): FirstFrameBackupState | null {
+  if (!value || typeof value !== 'object') return null;
+  const content = cleanText(value.content, MAX_PROMPT_OVERRIDE_CHARS);
+  if (!content) return null;
+  return {
+    content,
+    sourceHash: typeof value.sourceHash === 'string' ? value.sourceHash : null,
+    createdAt: typeof value.createdAt === 'string' && value.createdAt ? value.createdAt : new Date(0).toISOString(),
+  };
+}
+
+export function reconcileFirstFramePromptStateInPatch(args: {
+  project: any;
+  user: any;
+  groupIdx: number;
+  now?: string;
+}): FirstFramePromptReconcileState {
+  const preview = buildFirstFramePlanPreview({
+    project: args.project,
+    groupIdx: args.groupIdx,
+    ownerId: args.user.id,
+    user: args.user,
+  });
+  const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
+  const slot = storyboards[args.groupIdx] || {};
+  const { draft } = currentFirstFrameEditDraft(args.project, args.groupIdx);
+  const now = args.now || new Date().toISOString();
+  const systemContent = cleanText(preview.plan.finalPrompt, MAX_PROMPT_OVERRIDE_CHARS);
+  const existingBase = normalizeFirstFrameBasePrompt(slot.firstFrameBasePrompt);
+  const existingBackup = normalizeFirstFrameBackup(slot.firstFrameBackup);
+  let firstFrameBasePrompt = existingBase;
+  let firstFrameBackup = existingBackup;
+  const slotPatch: Record<string, any> = {};
+  const canAutoRefreshSystemPrompt = !draft && existingBase?.origin === 'system';
+  const baseHashChanged = !!(existingBase && (existingBase.sourceHash || null) !== (preview.sourceHash || null));
+
+  if (!firstFrameBasePrompt || (baseHashChanged && canAutoRefreshSystemPrompt)) {
+    firstFrameBasePrompt = {
+      content: systemContent,
+      sourceHash: preview.sourceHash,
+      updatedAt: now,
+      updatedBy: Number(args.user.id || 0),
+      origin: 'system',
+    };
+    slotPatch.firstFrameBasePrompt = firstFrameBasePrompt;
+  }
+
+  const backupHashChanged = !!(existingBackup && (existingBackup.sourceHash || null) !== (preview.sourceHash || null));
+  if (!firstFrameBackup || ((baseHashChanged || backupHashChanged) && canAutoRefreshSystemPrompt)) {
+    firstFrameBackup = {
+      content: systemContent,
+      sourceHash: preview.sourceHash,
+      createdAt: now,
+    };
+    slotPatch.firstFrameBackup = firstFrameBackup;
+  }
+
+  const changed = Object.keys(slotPatch).length > 0;
+  const effectiveBase = firstFrameBasePrompt || {
+    content: systemContent,
+    sourceHash: preview.sourceHash,
+    updatedAt: now,
+    updatedBy: Number(args.user.id || 0),
+    origin: 'system' as const,
+  };
+  const effectiveBackup = firstFrameBackup || {
+    content: systemContent,
+    sourceHash: preview.sourceHash,
+    createdAt: now,
+  };
+
+  return {
+    plan: preview.plan,
+    planSummary: preview.planSummary,
+    sourceHash: preview.sourceHash,
+    shotIndices: preview.shotIndices,
+    modelSnapshot: preview.modelSnapshot,
+    firstFrameBasePrompt: effectiveBase,
+    firstFrameBackup: effectiveBackup,
+    firstFrameBasePromptStale: (effectiveBase.sourceHash || null) !== (preview.sourceHash || null),
+    firstFrameDraftStale: !!(draft && isFirstFrameEditDraftStale(draft.sourceHash, preview.sourceHash)),
+    slotPatch: changed ? slotPatch : null,
+  };
+}
+
+export function reconcileFirstFramePromptState(args: {
+  projectId: string;
+  user: any;
+  groupIdx: number;
+}): FirstFramePromptReconcileState | null {
+  let state: FirstFramePromptReconcileState | null = null;
+  patchProjectForUser(args.projectId, args.user.id, (fresh) => {
+    if (!fresh) return null;
+    state = reconcileFirstFramePromptStateInPatch({
+      project: fresh,
+      user: args.user,
+      groupIdx: args.groupIdx,
+    });
+    if (!state.slotPatch) return {};
+    const storyboards = Array.isArray(fresh.storyboards) ? [...fresh.storyboards] : [];
+    const prev = storyboards[args.groupIdx] || {};
+    storyboards[args.groupIdx] = { ...prev, ...state.slotPatch };
+    return { storyboards };
+  });
+  if (state) return state;
+  const fresh = getProjectByIdForUser(args.projectId, args.user.id);
+  return fresh ? reconcileFirstFramePromptStateInPatch({ project: fresh, user: args.user, groupIdx: args.groupIdx }) : null;
 }
 
 export function availableFirstFrameAssets(project: any) {
@@ -1497,16 +1673,16 @@ export function applyFirstFrameDraftToPlan(args: {
 }): FrameImageGenerationPlan {
   const refs = effectiveFirstFrameReferences(args.project, args.userId, args.plan, args.draft);
   const customBlocks: string[] = [];
-  const promptOverride = cleanText(args.draft.promptOverride, MAX_PROMPT_OVERRIDE_CHARS);
-  const legacyAppendOnly = promptOverride && isLegacyStyleRulePromptOverride(promptOverride);
+  const content = cleanText(args.draft.content, MAX_PROMPT_OVERRIDE_CHARS);
+  const legacyAppendOnly = content && isLegacyStyleRulePromptOverride(content);
   if (legacyAppendOnly) {
-    customBlocks.push(promptOverride);
+    customBlocks.push(content);
   }
   if (args.draft.negativePromptOverride) {
     customBlocks.push('【User negative constraints】\n' + args.draft.negativePromptOverride);
   }
-  const finalPrompt = promptOverride && !legacyAppendOnly
-    ? promptOverride
+  const finalPrompt = content && !legacyAppendOnly
+    ? content
     : [args.plan.finalPrompt, ...customBlocks].filter(Boolean).join('\n\n');
   return {
     ...args.plan,

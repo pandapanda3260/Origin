@@ -14,25 +14,42 @@ export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const scope = url.searchParams.get('scope') || 'user';
   const limit = Math.min(200, Number(url.searchParams.get('limit') || 50));
+  const projectId = String(url.searchParams.get('projectId') || '').trim();
 
   const db = getDb();
   const rows = db
-    .prepare<{ uid: number; lim: number }, any>(
-      `SELECT id, project_id, group_idx, prompt, status, progress, filename, duration_sec, cover_image_id, created_at, updated_at
+    .prepare<{ uid: number; lim: number; projectId: string }, any>(
+      `SELECT id, project_id, group_idx, prompt, video_prompt_snapshot_json, status, progress, filename, duration_sec, cover_image_id, created_at, updated_at
        FROM video_tasks
-       WHERE owner_id = @uid AND status = 'completed'
+       WHERE owner_id = @uid
+         AND status = 'completed'
+         AND (@projectId = '' OR project_id = @projectId)
        ORDER BY created_at DESC
        LIMIT @lim`,
     )
-    .all({ uid: user.id, lim: limit });
+    .all({ uid: user.id, lim: limit, projectId });
+
+  const parseSnapshot = (value: unknown) => {
+    try {
+      const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
 
   const items = rows.map((r: any) => {
     const protectedUrl = `/api/videos/file/${r.id}`;
+    const videoPromptSnapshot = parseSnapshot(r.video_prompt_snapshot_json);
     return {
       taskId: r.id,
       projectId: r.project_id,
       groupIdx: r.group_idx,
       prompt: r.prompt,
+      videoPromptSnapshot,
+      videoPromptHistory: videoPromptSnapshot?.content || r.prompt,
+      videoPromptSnapshotLegacy: !videoPromptSnapshot?.content || !!videoPromptSnapshot?.legacy,
+      canApplyVideoPromptHistory: !!videoPromptSnapshot?.content && (!projectId || r.project_id === projectId),
       status: r.status,
       durationSec: r.duration_sec,
       url: buildSignedVideoUrl(r.id, user.id).url,

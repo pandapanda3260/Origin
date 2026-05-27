@@ -69,15 +69,15 @@ function _ffeInitialAutoSaveState() {
     errorMessage: "",
     conflict: false,
     touched: {
-      promptOverride: false,
+      content: false,
       negativePromptOverride: false,
     },
     fieldStatus: {
-      promptOverride: "initial",
+      content: "initial",
       negativePromptOverride: "initial",
     },
     fieldSaving: {
-      promptOverride: false,
+      content: false,
       negativePromptOverride: false,
     },
   };
@@ -95,9 +95,11 @@ function _ffeInitialEditorState(overrides) {
     baselineFingerprint: "",
     saving: false,
     generating: false,
+    generatingText: "",
     restoring: false,
     rewriting: false,
     generateBlock: null,
+    dismissedAlerts: {},
     referenceRolePickerOpen: false,
     referenceMaterialPicker: {
       open: false,
@@ -113,6 +115,8 @@ function _ffeInitialEditorState(overrides) {
 
 var _firstFrameEditor = _ffeInitialEditorState();
 var _firstFrameEditorScrollY = 0;
+var _firstFrameCardPromptAutosave = {};
+var _firstFrameCardPromptProjectId = '';
 
 export function initStoryboard(ctx) {
   _ctx = ctx || {};
@@ -120,6 +124,11 @@ export function initStoryboard(ctx) {
 }
 
 export function syncStoryboardProject(p) {
+  var nextProjectId = p && p.id || '';
+  if (nextProjectId !== _firstFrameCardPromptProjectId) {
+    _firstFrameCardPromptAutosave = {};
+    _firstFrameCardPromptProjectId = nextProjectId;
+  }
   project = p || null;
   setMaterialPanelProject(project && project.id || '', project && project.updatedAt || '');
 }
@@ -1180,6 +1189,453 @@ function _firstFrameEditButtonHtml(gIdx, sb) {
   return _frameButtonHtml(legacy ? '' : 'edit-first-frame', gIdx, 'tune', '编辑图片', title, 'secondary', legacy);
 }
 
+function _groupShotText(group, fields, joiner) {
+  fields = Array.isArray(fields) ? fields : [fields];
+  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
+  return shots.map(function (shot) {
+    for (var i = 0; i < fields.length; i += 1) {
+      var value = String((shot && shot[fields[i]]) || '').trim();
+      if (value) return value;
+    }
+    return '';
+  }).filter(Boolean).join(joiner || '\n');
+}
+
+function _framePromptForPanel(kind, sb, group) {
+  sb = sb || {};
+  var isTail = kind === 'tail';
+  var frame = (sb.frames && sb.frames[isTail ? 'tail' : 'first']) || {};
+  var visualFallback = _groupShotText(group, ['visual', 'description', 'desc'], ' ');
+  var cardPromptState = !isTail && group && group.groupIdx != null
+    ? _firstFrameCardPromptAutosave[String(group.groupIdx)]
+    : null;
+  var firstFrameDraftPrompt = sb.firstFrameEditDraft && sb.firstFrameEditDraft.content;
+  var firstFrameBasePrompt = sb.firstFrameBasePrompt && sb.firstFrameBasePrompt.content;
+  var firstFramePlanPrompt = (cardPromptState && cardPromptState.plan && cardPromptState.plan.finalPrompt)
+    || (sb.plan && sb.plan.finalPrompt);
+  var candidates = isTail
+    ? [
+      { text: frame.prompt, source: '尾帧生成记录' },
+      { text: sb.tailFramePrompt, source: '尾帧生成记录' },
+      { text: frame.originalPrompt, source: '尾帧原始提示词' },
+      { text: sb.originalTailFramePrompt, source: '尾帧原始提示词' },
+    ]
+    : [
+      { text: firstFrameDraftPrompt, source: '首帧草稿提示词' },
+      { text: firstFrameBasePrompt, source: '首帧当前正式提示词' },
+      { text: firstFramePlanPrompt, source: '首帧实时计划提示词' },
+    ];
+  for (var i = 0; i < candidates.length; i += 1) {
+    var text = String(candidates[i].text || '').trim();
+    if (text) return { text: text, source: candidates[i].source };
+  }
+  return {
+    text: isTail ? visualFallback : '',
+    source: isTail ? '镜头画面描述（尾帧未生成）' : '镜头画面描述',
+  };
+}
+
+function _sbFirstFrameCardPromptStatusInner(gIdx, status) {
+  status = status || 'initial';
+  var retryHtml = status === 'error'
+    ? '<button type="button" class="sb-frame-prompt-status-retry" data-action="retry-first-frame-prompt-save" data-gidx="' + escapeHtml(gIdx) + '">重试</button>'
+    : '';
+  return '<span>' + escapeHtml(_ffeFieldStatusText(status)) + '</span>' + retryHtml;
+}
+
+function _sbFirstFrameCardPromptState(gIdx) {
+  var key = String(gIdx);
+  if (!_firstFrameCardPromptAutosave[key]) {
+    _firstFrameCardPromptAutosave[key] = {
+      hydrated: false,
+      hydrating: null,
+      draft: null,
+      plan: null,
+      sourceHash: '',
+      savedDraftFingerprint: '',
+      expectedFingerprint: '',
+      lastSavedDraftJson: '{}',
+      pendingDraftJson: '{}',
+      pendingDraft: null,
+      dirtyAt: null,
+      debounceTimer: null,
+      maxWaitTimer: null,
+      inFlightPromise: null,
+      composing: false,
+      status: 'initial',
+      errorCode: '',
+      errorMessage: '',
+      staleWasShown: false,
+      staleNoticeShown: false,
+    };
+  }
+  return _firstFrameCardPromptAutosave[key];
+}
+
+function _sbFirstFrameCardPromptTextarea(gIdx) {
+  return document.querySelector('textarea[data-sb-first-prompt-field="content"][data-gidx="' + String(gIdx) + '"]');
+}
+
+function _sbFirstFrameCardPromptStatus(gIdx, sb) {
+  var state = _firstFrameCardPromptAutosave[String(gIdx)];
+  if (state && state.status) return state.status;
+  return _ffeSavedFieldStatus('content', sb && sb.firstFrameEditDraft);
+}
+
+function _sbFirstFrameCardPromptStatusHtml(gIdx, sb) {
+  var status = _sbFirstFrameCardPromptStatus(gIdx, sb);
+  return '<div class="sb-frame-prompt-status" data-sb-first-prompt-status="' + escapeHtml(gIdx) + '" data-status="' + escapeHtml(status) + '">' +
+    _sbFirstFrameCardPromptStatusInner(gIdx, status) +
+  '</div>';
+}
+
+function _sbSetFirstFrameCardPromptStatus(gIdx, status, message, code) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  state.status = status || 'initial';
+  state.errorMessage = message || '';
+  state.errorCode = code || '';
+  var node = document.querySelector('[data-sb-first-prompt-status="' + String(gIdx) + '"]');
+  if (!node) return;
+  node.dataset.status = state.status;
+  node.title = state.errorMessage || '';
+  node.innerHTML = _sbFirstFrameCardPromptStatusInner(gIdx, state.status);
+}
+
+function _sbFirstFramePromptEditorHtml(gIdx, text) {
+  return '<textarea class="sb-frame-text-box sb-frame-prompt-editor" data-sb-first-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="首帧提示词待生成。">' +
+    escapeHtml(text || '') +
+  '</textarea>';
+}
+
+function _sbFirstFrameCardBaseDraft(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (state.draft && typeof state.draft === 'object') return _ffeCloneDraft(state.draft);
+  var sb = project && project.storyboards && project.storyboards[gIdx] || {};
+  return _ffeCloneDraft(sb.firstFrameEditDraft || {});
+}
+
+function _sbFirstFrameCardDraftWithContent(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  var el = _sbFirstFrameCardPromptTextarea(gIdx);
+  if (!el) return _ffeCloneDraft(state.pendingDraft || state.draft || (project && project.storyboards && project.storyboards[gIdx] && project.storyboards[gIdx].firstFrameEditDraft) || {});
+  var content = _ffeCleanDraftText(el ? el.value : '', FFE_PROMPT_OVERRIDE_MAX_CHARS);
+  var draft = _sbFirstFrameCardBaseDraft(gIdx);
+  if (content) draft.content = content;
+  else delete draft.content;
+  return draft;
+}
+
+function _sbRefreshFirstFrameCardPendingDraft(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  var draft = _sbFirstFrameCardDraftWithContent(gIdx);
+  state.pendingDraft = draft;
+  state.pendingDraftJson = _ffeDraftJson(draft);
+  return { draft: draft, json: state.pendingDraftJson };
+}
+
+function _sbFirstFrameCardHasPendingChanges(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  _sbRefreshFirstFrameCardPendingDraft(gIdx);
+  return state.pendingDraftJson !== state.lastSavedDraftJson;
+}
+
+function _sbMergeFirstFrameCardPlanPayload(gIdx, payload) {
+  payload = payload || {};
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (!project.storyboards) project.storyboards = [];
+  if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+  var sb = project.storyboards[gIdx];
+  if (Object.prototype.hasOwnProperty.call(payload, 'draft')) sb.firstFrameEditDraft = payload.draft || null;
+  if (payload.firstFrameBasePrompt) sb.firstFrameBasePrompt = payload.firstFrameBasePrompt;
+  if (payload.firstFrameBackup) sb.firstFrameBackup = payload.firstFrameBackup;
+  state.plan = payload.plan || state.plan || null;
+  state.sourceHash = String(payload.sourceHash || '');
+  state.savedDraftFingerprint = String(payload.savedDraftFingerprint || '');
+  state.expectedFingerprint = state.savedDraftFingerprint;
+  state.draft = _ffeCloneDraft(payload.draft || {});
+  state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+  state.pendingDraftJson = state.lastSavedDraftJson;
+  state.pendingDraft = _ffeCloneDraft(state.draft);
+  state.hydrated = true;
+  state.staleWasShown = !!(payload.draftStale || payload.firstFrameBasePromptStale);
+  if (state.status !== 'saving') {
+    state.status = _ffeSavedFieldStatus('content', state.draft);
+    state.errorCode = '';
+    state.errorMessage = '';
+  }
+  _sbSetFirstFrameCardPromptStatus(gIdx, state.status);
+}
+
+async function _sbEnsureFirstFrameCardPromptState(gIdx, options) {
+  options = options || {};
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (state.hydrated && options.force !== true) return state;
+  if (state.hydrating) return await state.hydrating;
+  state.hydrating = (async function () {
+    try {
+      if (!project || !project.id) throw new Error('项目未加载');
+      var payload = await apiGet('/api/frames/plan?projectId=' + encodeURIComponent(project.id) + '&groupIdx=' + encodeURIComponent(gIdx) + '&frameType=first_frame');
+      _sbMergeFirstFrameCardPlanPayload(gIdx, payload);
+      return _sbFirstFrameCardPromptState(gIdx);
+    } catch (err) {
+      _sbSetFirstFrameCardPromptStatus(gIdx, 'error', _diagnoseApiError(((err && err.message) || err).toString()), 'hydrate_failed');
+      throw err;
+    } finally {
+      state.hydrating = null;
+    }
+  })();
+  return await state.hydrating;
+}
+
+function _sbFirstFrameCardPromptText(gIdx) {
+  var sb = project && project.storyboards && project.storyboards[gIdx] || {};
+  var groups = getStoryboardGroups();
+  var group = groups.find(function (item) { return Number(item.groupIdx) === Number(gIdx); }) || { groupIdx: gIdx };
+  return _framePromptForPanel('first', sb, group).text || '';
+}
+
+async function _sbHydrateFirstFramePromptEditor(gIdx, el) {
+  var beforeValue = String(el && el.value || '');
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  try {
+    await _sbEnsureFirstFrameCardPromptState(gIdx);
+    var currentEl = _sbFirstFrameCardPromptTextarea(gIdx);
+    if (currentEl && currentEl === el && !state.dirtyAt && String(currentEl.value || '') === beforeValue) {
+      currentEl.value = _sbFirstFrameCardPromptText(gIdx);
+    }
+    _sbRefreshFirstFrameCardPendingDraft(gIdx);
+    _sbSetFirstFrameCardPromptStatus(gIdx, _sbFirstFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
+  } catch (_) {
+    showToast('首帧提示词状态加载失败，请稍后重试', 'error');
+  }
+}
+
+function _sbHydrateFirstFramePromptEditors(root) {
+  if (!root || !project || !project.id) return;
+  Array.prototype.slice.call(root.querySelectorAll('textarea[data-sb-first-prompt-field="content"]')).forEach(function (el) {
+    var gIdx = parseInt(el.dataset.gidx, 10);
+    if (isNaN(gIdx)) return;
+    var state = _sbFirstFrameCardPromptState(gIdx);
+    if (state.hydrated || state.hydrating) return;
+    var beforeValue = String(el.value || '');
+    _sbEnsureFirstFrameCardPromptState(gIdx).then(function () {
+      var currentEl = _sbFirstFrameCardPromptTextarea(gIdx);
+      if (!currentEl) return;
+      var nextText = _sbFirstFrameCardPromptText(gIdx);
+      if (!state.dirtyAt && String(currentEl.value || '') === beforeValue) {
+        currentEl.value = nextText;
+      }
+      _sbRefreshFirstFrameCardPendingDraft(gIdx);
+      _sbSetFirstFrameCardPromptStatus(gIdx, _sbFirstFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
+    }).catch(function (err) {
+      console.warn('[first-frame-card-prompt] hydrate failed:', err);
+    });
+  });
+}
+
+function _sbClearFirstFrameCardPromptTimers(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (state.debounceTimer) clearTimeout(state.debounceTimer);
+  if (state.maxWaitTimer) clearTimeout(state.maxWaitTimer);
+  state.debounceTimer = null;
+  state.maxWaitTimer = null;
+}
+
+async function _sbRunFirstFrameCardPromptSave(gIdx, options) {
+  options = options || {};
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (!project || !project.id) return { ok: false, code: 'missing_project' };
+  if (state.inFlightPromise) return await state.inFlightPromise;
+  _sbClearFirstFrameCardPromptTimers(gIdx);
+  state.inFlightPromise = (async function () {
+    try {
+      await _sbEnsureFirstFrameCardPromptState(gIdx);
+      var snapshot = _sbRefreshFirstFrameCardPendingDraft(gIdx);
+      if (!options.forceSave && snapshot.json === state.lastSavedDraftJson) {
+        _sbSetFirstFrameCardPromptStatus(gIdx, _ffeSavedFieldStatus('content', state.draft));
+        return { ok: true, skipped: true };
+      }
+      _sbSetFirstFrameCardPromptStatus(gIdx, 'saving');
+      var resp = await apiPost('/api/frames/edit-draft', {
+        projectId: project.id,
+        groupIdx: gIdx,
+        draft: snapshot.draft || {},
+        expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+        force: options.force === true,
+      }, 'PUT');
+      state.draft = _ffeCloneDraft(resp.draft || {});
+      state.savedDraftFingerprint = String(resp.savedDraftFingerprint || '');
+      state.expectedFingerprint = state.savedDraftFingerprint;
+      state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+      state.pendingDraftJson = state.lastSavedDraftJson;
+      state.pendingDraft = _ffeCloneDraft(state.draft);
+      state.dirtyAt = null;
+      state.errorCode = '';
+      state.errorMessage = '';
+      if (!project.storyboards) project.storyboards = [];
+      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+      project.storyboards[gIdx].firstFrameEditDraft = resp.draft || null;
+      if (resp.firstFrameBasePrompt) project.storyboards[gIdx].firstFrameBasePrompt = resp.firstFrameBasePrompt;
+      if (resp.firstFrameBackup) project.storyboards[gIdx].firstFrameBackup = resp.firstFrameBackup;
+      var nextStatus = _ffeSavedFieldStatus('content', state.draft);
+      _sbSetFirstFrameCardPromptStatus(gIdx, nextStatus);
+      if (state.staleWasShown && !state.staleNoticeShown) {
+        state.staleNoticeShown = true;
+        showToast('已按当前镜头/资产/风格上下文保存', 'success');
+      }
+      return { ok: true, resp: resp };
+    } catch (err) {
+      var payload = err && err.payload || {};
+      var code = payload.code || 'save_failed';
+      var msg = payload.error || _diagnoseApiError(((err && err.message) || err).toString());
+      _sbSetFirstFrameCardPromptStatus(gIdx, 'error', msg, code);
+      if (code === 'saved_draft_changed') showToast('草稿在另一处被修改，请重试或刷新后继续。', 'warn');
+      else if (code === 'validation_failed') showToast('草稿校验失败，请检查提示词。', 'warn');
+      else showToast('自动保存失败: ' + msg, 'error');
+      return { ok: false, code: code, payload: payload };
+    } finally {
+      state.inFlightPromise = null;
+    }
+  })();
+  return await state.inFlightPromise;
+}
+
+function _sbScheduleFirstFrameCardPromptSave(gIdx, options) {
+  options = options || {};
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (state.composing) return;
+  _sbRefreshFirstFrameCardPendingDraft(gIdx);
+  if (state.pendingDraftJson === state.lastSavedDraftJson) {
+    state.dirtyAt = null;
+    _sbSetFirstFrameCardPromptStatus(gIdx, _ffeSavedFieldStatus('content', state.draft));
+    return;
+  }
+  if (!state.dirtyAt) state.dirtyAt = Date.now();
+  _sbClearFirstFrameCardPromptTimers(gIdx);
+  var run = function () {
+    _sbRunFirstFrameCardPromptSave(gIdx, { source: options.source || 'card-autosave' }).then(function (result) {
+      _sbRefreshFirstFrameCardPendingDraft(gIdx);
+      if (result && result.ok && _sbFirstFrameCardPromptState(gIdx).pendingDraftJson !== _sbFirstFrameCardPromptState(gIdx).lastSavedDraftJson) {
+        _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-followup' });
+      }
+    });
+  };
+  if (options.immediate) {
+    run();
+    return;
+  }
+  state.debounceTimer = setTimeout(run, FFE_AUTOSAVE_DEBOUNCE_MS);
+  var waitMs = Math.max(0, state.dirtyAt + FFE_AUTOSAVE_MAX_WAIT_MS - Date.now());
+  state.maxWaitTimer = setTimeout(run, waitMs);
+}
+
+async function _sbRetryFirstFrameCardPromptSave(gIdx) {
+  var state = _sbFirstFrameCardPromptState(gIdx);
+  if (state.errorCode === 'saved_draft_changed') {
+    var overwrite = window.confirm('草稿在另一处被修改，是否用本卡片里的版本覆盖？');
+    if (!overwrite) {
+      var refresh = window.confirm('是否刷新到最新草稿？刷新会放弃本卡片未保存修改。');
+      if (refresh) {
+        state.hydrated = false;
+        state.dirtyAt = null;
+        await _sbEnsureFirstFrameCardPromptState(gIdx, { force: true });
+        var el = _sbFirstFrameCardPromptTextarea(gIdx);
+        if (el) el.value = _sbFirstFrameCardPromptText(gIdx);
+      }
+      return;
+    }
+    await _sbRunFirstFrameCardPromptSave(gIdx, { force: true, forceSave: true });
+    return;
+  }
+  await _sbRunFirstFrameCardPromptSave(gIdx, { forceSave: true });
+}
+
+function _sbAnyFirstFrameCardPromptUnsaved() {
+  return Object.keys(_firstFrameCardPromptAutosave).some(function (key) {
+    var state = _firstFrameCardPromptAutosave[key];
+    if (!state) return false;
+    var gIdx = Number(key);
+    if (!Number.isFinite(gIdx)) return false;
+    return _sbFirstFrameCardHasPendingChanges(gIdx);
+  });
+}
+
+function _sbFlushFirstFrameCardPromptsOnPageHide() {
+  Object.keys(_firstFrameCardPromptAutosave).forEach(function (key) {
+    var gIdx = Number(key);
+    var state = _firstFrameCardPromptAutosave[key];
+    if (!Number.isFinite(gIdx) || !state || !project || !project.id) return;
+    var pending = _sbRefreshFirstFrameCardPendingDraft(gIdx);
+    if (pending.json === state.lastSavedDraftJson) return;
+    try {
+      fetch('/api/frames/edit-draft', {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          projectId: project.id,
+          groupIdx: gIdx,
+          draft: pending.draft || {},
+          expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+          force: true,
+        }),
+        keepalive: true,
+      }).catch(function () {});
+    } catch (_) {}
+  });
+}
+
+function _framePlanSummaryForPanel(kind, sb) {
+  sb = sb || {};
+  var isTail = kind === 'tail';
+  var frame = (sb.frames && sb.frames[isTail ? 'tail' : 'first']) || {};
+  var summary = frame.planSummary || (isTail ? sb.tailFramePlanSummary : sb.firstFramePlanSummary) || null;
+  if (!summary || typeof summary !== 'object') return { chips: [], text: '' };
+  var chips = [];
+  (summary.characterNames || []).forEach(function (name) { if (name) chips.push(name); });
+  if (summary.sceneName) chips.push(summary.sceneName);
+  (summary.propNames || []).forEach(function (name) { if (name) chips.push(name); });
+  var text = String(summary.compositionGuidance || '').trim();
+  return {
+    chips: chips.filter(Boolean).slice(0, 8),
+    text: text,
+  };
+}
+
+function _shotKeywordChipsHtml(group, sb, kind) {
+  var seen = {};
+  var chips = [];
+  function add(value) {
+    value = String(value || '').trim();
+    if (!value || seen[value]) return;
+    seen[value] = true;
+    chips.push(value);
+  }
+  var summary = _framePlanSummaryForPanel(kind, sb);
+  summary.chips.forEach(add);
+  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
+  shots.forEach(function (shot) {
+    String((shot && shot.keyInfo) || '').split(/[、,，;；|/]/).forEach(add);
+    (Array.isArray(shot && shot.characters) ? shot.characters : []).forEach(add);
+    add(shot && shot.scene);
+    (Array.isArray(shot && shot.props) ? shot.props : []).forEach(add);
+  });
+  if (!chips.length && shots[0]) {
+    add(shots[0].shotType);
+    add(shots[0].camera);
+  }
+  if (!chips.length) return '<span class="sb-frame-empty-note">暂无关键信息</span>';
+  return chips.slice(0, 8).map(function (chip) {
+    return '<span class="sb-frame-key-chip">' + escapeHtml(chip) + '</span>';
+  }).join('');
+}
+
+function _frameDialogueHtml(group) {
+  var dialogue = _groupShotText(group, ['dialogue', 'audio'], '\n');
+  if (!dialogue || dialogue === '——') dialogue = '---';
+  // tabindex=0 同 .sb-frame-text-box, 触发 :focus 视觉效果。
+  return '<div class="sb-frame-dialogue-box" tabindex="0">' + escapeHtml(dialogue) + '</div>';
+}
+
 function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   sb = sb || {};
   var isTail = kind === 'tail';
@@ -1207,9 +1663,13 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   }
 
   var placeholderIcon = isTail ? 'skip_next' : 'image';
+  // hover 放大: 不用 Tailwind `group-hover:` — 因为外层 .shot-workbench-card 已经带 `group`,
+  // 会让"鼠标在大卡任意位置(画面描述/对白等)"都触发图片放大, 而且图片首次生成出来时,
+  // 如果鼠标已经在大卡范围内, 新 img 挂载瞬间就会动一下。
+  // 改用纯 CSS `.sb-frame-preview-stage:hover img` 限定只在图片容器上 hover 才触发, 见 styles.css。
   var imgHtml = hasImg
-    ? '<img data-frame-img class="w-full h-full object-cover cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgUrl) + '" />'
-    : '<div class="sb-frame-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/25" data-img-class="w-full h-full object-cover cursor-pointer">' +
+    ? '<img data-frame-img class="w-full h-full object-contain cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgUrl) + '" />'
+    : '<div class="sb-frame-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/25" data-img-class="w-full h-full object-contain cursor-pointer">' +
         '<span class="material-symbols-outlined text-5xl mb-2">' + placeholderIcon + '</span>' +
         '<span class="text-[10px] font-bold uppercase tracking-[0.28em]">' + escapeHtml(statusText) + '</span>' +
       '</div>';
@@ -1221,13 +1681,15 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
     '</div>';
 
   var buttons = '';
+  // 按设计要求, 底部所有按钮统一为 secondary 白底外框样式 (编辑图片同款),
+  // 不再单独把"重新生成"做成 primary 黑底, 保持视觉一致。
   if (isTail && state.isLegacyPencil) {
-    buttons += _frameButtonHtml('', gIdx, primaryIcon, primaryText, primaryTitle || '当前首帧是旧版手稿图，不能作为尾帧锚点；请重新生成首帧', 'primary', true);
+    buttons += _frameButtonHtml('', gIdx, primaryIcon, primaryText, primaryTitle || '当前首帧是旧版手稿图，不能作为尾帧锚点；请重新生成首帧', 'secondary', true);
   } else {
     if (!isTail) buttons += _firstFrameEditButtonHtml(gIdx, sb);
     buttons += _frameButtonHtml(isTail ? 'upload-tail' : 'upload-first', gIdx, 'upload', isTail ? '上传尾帧' : '上传首帧', isTail ? '手动上传一张已有尾帧图' : '手动上传一张已有首帧图', 'secondary', false);
-    if (hasImg) buttons += _frameButtonHtml(isTail ? 'download-tail' : 'download-sb', gIdx, 'download', '下载', isTail ? '下载尾帧' : '下载首帧', 'secondary', false);
-    buttons += _frameButtonHtml((canPrimary && !materialBlocked) ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'primary', !canPrimary || materialBlocked);
+    if (hasImg) buttons += _frameButtonHtml(isTail ? 'download-tail' : 'download-sb', gIdx, 'download', '下载图片', isTail ? '下载尾帧' : '下载首帧', 'secondary', false);
+    buttons += _frameButtonHtml((canPrimary && !materialBlocked) ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'secondary', !canPrimary || materialBlocked);
     // Tail-only: 删除按钮 = 清图 + 清意图。只有"已生成尾帧"或"已请求但尚未生成"才暴露该按钮。
     if (isTail && (hasImg || sb.tailFrameIntent === 'requested')) {
       buttons += _frameButtonHtml('delete-tail', gIdx, 'delete', '删除', '删除该尾帧并清除"需要尾帧"的意图（下次批量重做不会再生成）', 'secondary', false);
@@ -1249,34 +1711,61 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   if (isTail) {
     adviceBannerHtml = _tailFrameAdviceBannerHtml(_tailFrameAdviceForGroup(group, sb), gIdx);
   }
+  var promptInfo = _framePromptForPanel(kind, sb, group);
+  var promptText = promptInfo.text || (isTail ? '尾帧提示词待生成。' : '');
+  var promptDisplay = isTail ? _sbPromptShort(promptText, 220) : promptText;
+  // 注: "来源：xxx" 行和 sb-frame-plan-note 构图指导段已按产品要求从首尾帧
+  // 卡片移除。promptInfo.source 仍保留在数据层(便于排查), 但不再渲染;
+  // _framePlanSummaryForPanel 仍被 _shotKeywordChipsHtml 用来拿角色/场景/道具
+  // chips, 不能删除函数本身。
 
-  return '<div data-frame="' + kind + '" class="sb-frame-panel min-h-0 flex flex-col rounded-3xl overflow-hidden border border-outline-variant/10 bg-white/70 shadow-inner">' +
-           '<div class="flex items-center justify-between gap-3 px-4 py-3 border-b border-outline-variant/10">' +
-             '<div class="min-w-0">' +
-               '<div class="flex items-center gap-2">' +
-                 '<span class="material-symbols-outlined text-base text-primary/60">' + icon + '</span>' +
-                 '<span class="text-[11px] font-black tracking-widest text-on-background">' + label + '</span>' +
-                 '<span class="text-[9px] font-black tracking-[0.24em] text-on-surface-variant/45 uppercase">' + labelEn + '</span>' +
-               '</div>' +
+  return '<section data-frame="' + kind + '" class="sb-frame-panel">' +
+           '<div class="sb-frame-panel-head">' +
+             '<div class="sb-frame-panel-title">' +
+               '<span class="material-symbols-outlined">' + icon + '</span>' +
+               '<strong>分镜板 · ' + escapeHtml(label) + '</strong>' +
+               '<em>' + escapeHtml(labelEn) + '</em>' +
              '</div>' +
-             '<div class="flex items-center gap-1.5 min-w-0 shrink-0">' +
-               '<span class="text-[10px] font-bold text-on-surface-variant/60 truncate" title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
+             '<div class="sb-frame-status">' +
+               '<span title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
                tailBadgesHtml +
              '</div>' +
            '</div>' +
            adviceBannerHtml +
-           '<div class="relative flex-1 min-h-[220px] bg-surface-container overflow-hidden">' +
-             imgHtml +
-             '<div class="sb-frame-loading" hidden>' +
-               '<div class="sb-frame-loading-card">' +
-                 '<div class="sb-frame-loading-spinner"></div>' +
-                 '<span class="sb-frame-loading-text">生成中…</span>' +
+           '<div class="sb-frame-layout">' +
+             '<div class="sb-frame-copy-col">' +
+               '<div class="sb-frame-field-label-row">' +
+                 '<div class="sb-frame-field-label">画面描述</div>' +
+                 (isTail ? '' : _sbFirstFrameCardPromptStatusHtml(gIdx, sb)) +
                '</div>' +
+               (isTail
+                 ? '<div class="sb-frame-text-box" tabindex="0">' + escapeHtml(promptDisplay) + '</div>'
+                 : _sbFirstFramePromptEditorHtml(gIdx, promptDisplay)) +
              '</div>' +
-             errorHtml +
-             '<div class="absolute right-3 bottom-3 flex items-center justify-end gap-2 flex-wrap max-w-[calc(100%-1.5rem)]">' + buttons + '</div>' +
+             '<div class="sb-frame-context-col">' +
+               '<div class="sb-frame-field-label">关键信息</div>' +
+               '<div class="sb-frame-keywords">' + _shotKeywordChipsHtml(group, sb, kind) + '</div>' +
+               '<div class="sb-frame-field-label">参考素材</div>' +
+               _storyboardAssetsHtml(group) +
+               '<div class="sb-frame-field-label">对白/旁白（本帧）</div>' +
+               _frameDialogueHtml(group) +
+             '</div>' +
+             '<div class="sb-frame-preview-col">' +
+               '<div class="sb-frame-field-label">图片展示</div>' +
+               '<div class="sb-frame-preview-stage">' +
+                 imgHtml +
+                 '<div class="sb-frame-loading" hidden>' +
+                   '<div class="sb-frame-loading-card">' +
+                     '<div class="sb-frame-loading-spinner"></div>' +
+                     '<span class="sb-frame-loading-text">生成中…</span>' +
+                   '</div>' +
+                 '</div>' +
+                 errorHtml +
+               '</div>' +
+               '<div class="sb-frame-actions">' + buttons + '</div>' +
+             '</div>' +
            '</div>' +
-         '</div>';
+         '</section>';
 }
 
 function _ffeShort(text, limit) {
@@ -1333,8 +1822,31 @@ function _ffeClearGenerateBlock() {
   _firstFrameEditor.generateBlock = null;
 }
 
+function _ffeSetGeneratingPreviewText(message) {
+  var text = String(message || '').trim() || '生成首帧中…';
+  _firstFrameEditor.generatingText = text;
+  var root = document.getElementById('firstFrameEditorRoot');
+  var textNode = root && root.querySelector ? root.querySelector('[data-ffe-generating-text]') : null;
+  if (textNode) textNode.textContent = text;
+}
+
+function _ffeClearGeneratingPreviewText() {
+  _firstFrameEditor.generatingText = '';
+}
+
 function _ffeDraftHasTextOverride(draft, field) {
+  if (field === 'content') return _ffePromptContentFromDraft(draft).length > 0;
   return typeof (draft && draft[field]) === 'string' && String(draft[field]).trim().length > 0;
+}
+
+function _ffePromptContentFromDraft(draft) {
+  return String((draft && draft.content) || '').trim();
+}
+
+function _ffeBasePromptContent(payload) {
+  var base = payload && payload.firstFrameBasePrompt || {};
+  var plan = payload && payload.plan || {};
+  return String(base.content || plan.finalPrompt || '').trim();
 }
 
 function _ffeSavedFieldStatus(field, draft) {
@@ -1397,9 +1909,8 @@ function _ffeFieldCurrentLength(field, payload) {
   if (el) return String(el.value || '').length;
   var fallbackPayload = payload || (_firstFrameEditor && _firstFrameEditor.payload) || {};
   var draft = (fallbackPayload && fallbackPayload.draft) || {};
-  if (field === 'promptOverride') {
-    var plan = (fallbackPayload && fallbackPayload.plan) || {};
-    return String(draft.promptOverride || plan.finalPrompt || '').length;
+  if (field === 'content') {
+    return String(_ffePromptContentFromDraft(draft) || _ffeBasePromptContent(fallbackPayload)).length;
   }
   if (field === 'negativePromptOverride') {
     return String(draft.negativePromptOverride || '').length;
@@ -1424,7 +1935,7 @@ function _ffeFieldMetaHtml(field, payload) {
 }
 
 function _ffeSetFieldCounter(field) {
-  if (field !== 'promptOverride' && field !== 'negativePromptOverride') return;
+  if (field !== 'content' && field !== 'negativePromptOverride') return;
   var root = document.getElementById('firstFrameEditorRoot');
   if (!root) return;
   var node = root.querySelector('[data-ffe-counter-field="' + field + '"]');
@@ -1436,7 +1947,7 @@ function _ffeSetFieldCounter(field) {
 }
 
 function _ffeResetFieldStatusesFromDraft(draft, restored) {
-  _ffeSetFieldStatus('promptOverride', restored ? 'restored' : _ffeSavedFieldStatus('promptOverride', draft));
+  _ffeSetFieldStatus('content', restored ? 'restored' : _ffeSavedFieldStatus('content', draft));
   _ffeSetFieldStatus('negativePromptOverride', restored ? 'restored' : _ffeSavedFieldStatus('negativePromptOverride', draft));
 }
 
@@ -1476,9 +1987,8 @@ function _ffeImagePreviewEyebrow(payload) {
 
 function _ffePromptHtml(payload) {
   var draft = payload && payload.draft || {};
-  var plan = payload && payload.plan || {};
-  var prompt = draft.promptOverride || plan.finalPrompt || '';
-  return '<textarea class="ffe-textarea ffe-prompt-textarea" data-ffe-field="promptOverride" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" placeholder="填写或调整最终首帧 Prompt">' + escapeHtml(prompt) + '</textarea>';
+  var prompt = _ffePromptContentFromDraft(draft) || _ffeBasePromptContent(payload);
+  return '<textarea class="ffe-textarea ffe-prompt-textarea" data-ffe-field="content" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" placeholder="填写或调整最终首帧 Prompt">' + escapeHtml(prompt) + '</textarea>';
 }
 
 function _ffeNegativePromptHtml(payload) {
@@ -1637,19 +2147,90 @@ function _ffeActualImageInput(payload) {
     : summary.actualImageInput;
 }
 
-function _ffeImageStaleHtml(payload) {
+function _ffeIsImageStale(payload) {
   var actualImageInput = _ffeActualImageInput(payload);
-  if (!actualImageInput || !actualImageInput.draftFingerprint) return '';
+  if (!actualImageInput || !actualImageInput.draftFingerprint) return false;
   var savedFingerprint = _firstFrameEditor.savedDraftFingerprint || (payload && payload.savedDraftFingerprint) || '';
   var formDirty = _ffeDraftJson(payload && payload.draft) !== (_firstFrameEditor.originalDraftJson || '{}');
-  if (!formDirty && (!savedFingerprint || actualImageInput.draftFingerprint === savedFingerprint)) return '';
-  return '<div class="ffe-image-stale">当前图片基于旧草稿生成，重新生成后才会应用最新修改。</div>';
+  if (!formDirty && (!savedFingerprint || actualImageInput.draftFingerprint === savedFingerprint)) return false;
+  return true;
+}
+
+function _ffeStaleDismissKey(payload) {
+  var actualImageInput = _ffeActualImageInput(payload);
+  return String((actualImageInput && actualImageInput.draftFingerprint) || '') + '|' +
+    String(_firstFrameEditor.savedDraftFingerprint || (payload && payload.savedDraftFingerprint) || '');
+}
+
+function _ffeAlertItemHtml(item) {
+  // item: { key, severity, message, dismissable }
+  var sev = item.severity || 'info';
+  return '<div class="ffe-image-alert ffe-image-alert--' + escapeHtml(sev) + '" data-alert-key="' + escapeHtml(item.key || '') + '">' +
+    '<span class="ffe-image-alert-text">' + escapeHtml(item.message) + '</span>' +
+    (item.dismissable !== false
+      ? '<button type="button" class="ffe-image-alert-dismiss" data-ffe-action="dismiss-image-alert" data-alert-key="' + escapeHtml(item.key || '') + '" title="关闭"><span class="material-symbols-outlined">close</span></button>'
+      : '') +
+  '</div>';
+}
+
+function _ffeImageAlertHtml(payload) {
+  var dismissed = _firstFrameEditor.dismissedAlerts || {};
+  var items = [];
+
+  // legacy (severity: error) — 结构性能力限制，可关闭
+  if (payload && payload.legacyUnsupported && !dismissed['legacy']) {
+    items.push({
+      key: 'legacy',
+      severity: 'error',
+      message: '旧版手稿首帧没有结构化生成计划，请先重新生成彩色首帧。',
+    });
+  }
+
+  // generateBlock (severity: error)
+  var gb = _firstFrameEditor.generateBlock;
+  if (gb && gb.message && !dismissed['generateBlock']) {
+    items.push({
+      key: 'generateBlock',
+      severity: 'error',
+      message: gb.message,
+    });
+  }
+
+  // notices (severity: info)
+  var notices = Array.isArray(payload && payload.notices) ? payload.notices : [];
+  notices.forEach(function (notice, idx) {
+    var code = (notice && (notice.code || notice.id)) || ('notice-' + idx);
+    var dismissKey = 'notice:' + code;
+    if (dismissed[dismissKey]) return;
+    var text = notice && (notice.message || notice.code) || '';
+    if (!text) return;
+    items.push({
+      key: dismissKey,
+      severity: 'info',
+      message: text,
+    });
+  });
+
+  // stale (severity: warn)
+  if (_ffeIsImageStale(payload)) {
+    var staleKey = 'stale:' + _ffeStaleDismissKey(payload);
+    if (!dismissed[staleKey]) {
+      items.push({
+        key: staleKey,
+        severity: 'warn',
+        message: '提示词/素材已改变，请重新生成图片',
+      });
+    }
+  }
+
+  if (!items.length) return '';
+  return '<div class="ffe-image-alert-stack">' + items.map(_ffeAlertItemHtml).join('') + '</div>';
 }
 
 function _ffeGenerationContextHtml(payload) {
   return '<div class="ffe-context-stack ffe-context-layout">' +
     '<div class="ffe-context-top">' + _ffeMaterialPanelHtml(payload) + '</div>' +
-    _ffePanelHtml('提示词展示区域', '画面提示词', _ffePromptHtml(payload), 'ffe-prompt-panel', _ffeFieldMetaHtml('promptOverride', payload)) +
+    _ffePanelHtml('提示词展示区域', '画面提示词', _ffePromptHtml(payload), 'ffe-prompt-panel', _ffeFieldMetaHtml('content', payload)) +
   '</div>';
 }
 
@@ -1878,35 +2459,35 @@ function _ffeModalHtml(payload, gIdx) {
   var currentUrl = payload.currentFrame && payload.currentFrame.url || '';
   var legacy = payload.legacyUnsupported;
   var summary = plan.planSummary || payload.planSummary || {};
-  var notices = Array.isArray(payload.notices) ? payload.notices : [];
-  var generateBlock = _firstFrameEditor.generateBlock;
-  var warnHtml = [
-    legacy ? '旧版手稿首帧没有结构化生成计划，请先重新生成彩色首帧。' : ''
-  ].concat(notices.map(function (notice) {
-    return notice && (notice.message || notice.code) || '';
-  })).concat(generateBlock && generateBlock.message ? [generateBlock.message] : []).filter(Boolean).map(function (text) {
-    return '<div class="ffe-warning">' + escapeHtml(text) + '</div>';
-  }).join('');
   var historyCount = (payload.currentFrame && payload.currentFrame.url ? 1 : 0) + (Array.isArray(payload.imageHistory) ? payload.imageHistory.length : 0);
   var chatDisabled = _firstFrameEditor.saving || _firstFrameEditor.generating || _firstFrameEditor.rewriting;
+  var generatingPreview = !!_firstFrameEditor.generating;
+  var generatingText = _firstFrameEditor.generatingText || '生成首帧中…';
 
   return '<div class="ffe-modal" role="dialog" aria-modal="true" aria-label="首帧编辑控制台">' +
     '<button type="button" class="ffe-close" data-ffe-action="close" title="关闭"><span class="material-symbols-outlined">close</span></button>' +
     '<div class="ffe-shell">' +
-      (warnHtml ? '<div class="ffe-alert-stack">' + warnHtml + '</div>' : '') +
       '<aside class="ffe-column ffe-context-column">' +
         _ffeGenerationContextHtml(payload) +
       '</aside>' +
       '<main class="ffe-center">' +
         _ffePanelHtml('图片展示区域', _ffeImagePreviewEyebrow(payload),
           '<div class="ffe-preview-slot">' +
-            '<div class="ffe-preview-stage">' +
+            '<div class="ffe-preview-stage' + (generatingPreview ? ' is-generating' : '') + '">' +
               (currentUrl
                 ? _ffeImageWithFallbackHtml(currentUrl, { variant: 'preview', alt: '当前首帧', dataAction: 'view-current', dataUrl: currentUrl })
                 : '<div class="ffe-image-empty"><span class="material-symbols-outlined">image</span><strong>暂无当前首帧</strong><span>可以先查看系统生成计划</span></div>') +
+              (generatingPreview
+                ? '<div class="ffe-image-generating" role="status" aria-live="polite">' +
+                    '<div class="ffe-image-generating-card">' +
+                      '<div class="ffe-image-generating-spinner"></div>' +
+                      '<span data-ffe-generating-text>' + escapeHtml(generatingText) + '</span>' +
+                    '</div>' +
+                  '</div>'
+                : '') +
             '</div>' +
           '</div>' +
-          _ffeImageStaleHtml(payload) +
+          _ffeImageAlertHtml(payload) +
           '<div class="ffe-image-actions">' +
             '<button type="button" class="ffe-action-secondary" data-ffe-action="download-current" data-url="' + escapeHtml(currentUrl) + '"' + (currentUrl ? '' : ' disabled') + '><span class="material-symbols-outlined">download</span><span>下载图片</span></button>' +
             '<span class="ffe-draft-actions">' +
@@ -1964,8 +2545,8 @@ function _ffeCleanDraftText(value, limit) {
 function _ffeDraftForCompare(draft) {
   draft = draft || {};
   var out = {};
-  var prompt = _ffeCleanDraftText(draft.promptOverride, FFE_PROMPT_OVERRIDE_MAX_CHARS);
-  if (prompt) out.promptOverride = prompt;
+  var prompt = _ffeCleanDraftText(_ffePromptContentFromDraft(draft), FFE_PROMPT_OVERRIDE_MAX_CHARS);
+  if (prompt) out.content = prompt;
   var negative = _ffeCleanDraftText(draft.negativePromptOverride, FFE_NEGATIVE_PROMPT_MAX_CHARS);
   if (negative) out.negativePromptOverride = negative;
   var excluded = draft.referenceOverrides && Array.isArray(draft.referenceOverrides.excluded)
@@ -2046,7 +2627,7 @@ function _ffeCloneDraft(draft) {
 }
 
 function _ffeMarkDraftFieldTouched(field) {
-  if (field !== 'promptOverride' && field !== 'negativePromptOverride') return;
+  if (field !== 'content' && field !== 'negativePromptOverride') return;
   var auto = _ffeAutoSaveState();
   if (!auto.touched) auto.touched = {};
   auto.touched[field] = true;
@@ -2077,18 +2658,18 @@ function _ffeResetSavedBaseline(payload) {
   auto.dirtyAt = null;
   auto.errorMessage = "";
   auto.conflict = false;
-  auto.touched.promptOverride = false;
+  auto.touched.content = false;
   auto.touched.negativePromptOverride = false;
-  auto.fieldSaving.promptOverride = false;
+  auto.fieldSaving.content = false;
   auto.fieldSaving.negativePromptOverride = false;
-  auto.fieldStatus.promptOverride = _ffeSavedFieldStatus('promptOverride', payload && payload.draft);
+  auto.fieldStatus.content = _ffeSavedFieldStatus('content', payload && payload.draft);
   auto.fieldStatus.negativePromptOverride = _ffeSavedFieldStatus('negativePromptOverride', payload && payload.draft);
 }
 
 function _ffeCollectDraft() {
   var root = document.getElementById('firstFrameEditorRoot');
   if (!root) return {};
-  var promptEl = root.querySelector('[data-ffe-field="promptOverride"]');
+  var promptEl = root.querySelector('[data-ffe-field="content"]');
   var negativeEl = root.querySelector('[data-ffe-field="negativePromptOverride"]');
   var payloadDraft = _firstFrameEditor.payload && _firstFrameEditor.payload.draft || {};
   var draft = {};
@@ -2096,7 +2677,7 @@ function _ffeCollectDraft() {
   var existingDraft = _firstFrameEditor.payload && _firstFrameEditor.payload.draft || {};
   var negative = negativeEl ? String(negativeEl.value || '').trim() : '';
   var auto = _ffeAutoSaveState();
-  if (prompt && (existingDraft.promptOverride || (auto.touched && auto.touched.promptOverride))) draft.promptOverride = prompt;
+  if (prompt && (_ffePromptContentFromDraft(existingDraft) || (auto.touched && auto.touched.content))) draft.content = prompt;
   if (negative) draft.negativePromptOverride = negative;
   if (payloadDraft.firstFrameReferenceSelection) draft.firstFrameReferenceSelection = payloadDraft.firstFrameReferenceSelection;
   if (Array.isArray(payloadDraft.firstFrameReferenceAttachments) && payloadDraft.firstFrameReferenceAttachments.length) {
@@ -2123,7 +2704,7 @@ function _ffeUpdateDirtyState() {
   if (!root) return;
   // 任何会引起 dirty 状态变化的路径（input/change/IME 结束、恢复初始、AI 应用、保存响应等）
   // 都会走到这里，顺带刷新两个 textarea 的字数计数，保证显示永远跟 DOM 实际内容一致。
-  _ffeSetFieldCounter('promptOverride');
+  _ffeSetFieldCounter('content');
   _ffeSetFieldCounter('negativePromptOverride');
   var dirty = _ffeDraftJson(_ffeCollectDraft()) !== (_firstFrameEditor.originalDraftJson || '{}');
   var saving = !!_firstFrameEditor.saving;
@@ -2132,10 +2713,10 @@ function _ffeUpdateDirtyState() {
   var rewriting = !!_firstFrameEditor.rewriting;
   var genBtn = root.querySelector('[data-ffe-action="generate-draft"]');
   var hasSavedDraft = (_firstFrameEditor.originalDraftJson || '{}') !== '{}';
-  if (genBtn) genBtn.disabled = generating || restoring || rewriting || (!dirty && !hasSavedDraft);
+  if (genBtn) genBtn.disabled = generating || restoring || rewriting;
   Array.prototype.slice.call(root.querySelectorAll('textarea, input, select')).forEach(function (el) {
     var field = el.dataset && el.dataset.ffeField || '';
-    var isAutoSavedText = field === 'promptOverride' || field === 'negativePromptOverride';
+    var isAutoSavedText = field === 'content' || field === 'negativePromptOverride';
     el.disabled = isAutoSavedText ? (generating || restoring || rewriting) : (generating || saving || restoring || rewriting);
   });
   _ffeDisableActions(root, ['restore-initial'], generating || restoring || rewriting || (!dirty && !hasSavedDraft));
@@ -2208,7 +2789,7 @@ function _ffeDraftTextFieldValue(draft, field) {
 }
 
 function _ffeChangedTextFields(nextDraft, prevDraft) {
-  return ['promptOverride', 'negativePromptOverride'].filter(function (field) {
+  return ['content', 'negativePromptOverride'].filter(function (field) {
     return _ffeDraftTextFieldValue(nextDraft, field) !== _ffeDraftTextFieldValue(prevDraft, field);
   });
 }
@@ -2229,7 +2810,7 @@ function _ffeHasAutoSaveChanges() {
 function _ffeSetSavingVisibleForFields(fields) {
   fields = Array.isArray(fields) ? fields : [];
   var auto = _ffeAutoSaveState();
-  auto.fieldSaving.promptOverride = fields.indexOf('promptOverride') >= 0;
+  auto.fieldSaving.content = fields.indexOf('content') >= 0;
   auto.fieldSaving.negativePromptOverride = fields.indexOf('negativePromptOverride') >= 0;
   fields.forEach(function (field) { _ffeSetFieldStatus(field, 'saving'); });
 }
@@ -2238,7 +2819,7 @@ function _ffeMarkSaveError(fields, message, conflict) {
   var auto = _ffeAutoSaveState();
   auto.errorMessage = message || '保存失败';
   auto.conflict = !!conflict;
-  (fields && fields.length ? fields : ['promptOverride', 'negativePromptOverride']).forEach(function (field) {
+  (fields && fields.length ? fields : ['content', 'negativePromptOverride']).forEach(function (field) {
     _ffeSetFieldStatus(field, 'error');
   });
 }
@@ -2268,11 +2849,15 @@ function _ffeApplyDraftSaveResponse(resp, options) {
   if (!project.storyboards) project.storyboards = [];
   if (!project.storyboards[_firstFrameEditor.groupIdx]) project.storyboards[_firstFrameEditor.groupIdx] = {};
   project.storyboards[_firstFrameEditor.groupIdx].firstFrameEditDraft = resp.draft || null;
+  if (resp.firstFrameBasePrompt) project.storyboards[_firstFrameEditor.groupIdx].firstFrameBasePrompt = resp.firstFrameBasePrompt;
+  if (resp.firstFrameBackup) project.storyboards[_firstFrameEditor.groupIdx].firstFrameBackup = resp.firstFrameBackup;
   if (_firstFrameEditor.payload) {
     _firstFrameEditor.payload.draft = resp.draft || null;
     if (resp.sourceHash) _firstFrameEditor.payload.sourceHash = resp.sourceHash;
     if (resp.savedDraftFingerprint) _firstFrameEditor.payload.savedDraftFingerprint = resp.savedDraftFingerprint;
     if (resp.baselineFingerprint) _firstFrameEditor.payload.baselineFingerprint = resp.baselineFingerprint;
+    if (resp.firstFrameBasePrompt) _firstFrameEditor.payload.firstFrameBasePrompt = resp.firstFrameBasePrompt;
+    if (resp.firstFrameBackup) _firstFrameEditor.payload.firstFrameBackup = resp.firstFrameBackup;
     if (resp.firstFrameMaterialPanel) _ffeApplyMaterialPanel(resp.firstFrameMaterialPanel);
   }
   var savedJson = _ffeDraftJson(resp.draft);
@@ -2288,7 +2873,7 @@ function _ffeApplyDraftSaveResponse(resp, options) {
   auto.errorMessage = "";
   auto.conflict = false;
   auto.forceSaveOnce = false;
-  auto.fieldSaving.promptOverride = false;
+  auto.fieldSaving.content = false;
   auto.fieldSaving.negativePromptOverride = false;
   _ffeResetFieldStatusesFromDraft(resp.draft, options.restored === true);
   if (auto.staleWasShown && !auto.staleNoticeShown && options.source && String(options.source).indexOf('autosave') === 0) {
@@ -2338,7 +2923,7 @@ async function _ffeRunOneSaveCycle(options) {
     return { ok: true, skipped: true, resp: null };
   }
   var changedFields = _ffeChangedTextFields(snapshot.draft, _ffeParseDraftJson(auto.lastSavedDraftJson));
-  if (auto.forceSaveOnce && !changedFields.length) changedFields = ['promptOverride'];
+  if (auto.forceSaveOnce && !changedFields.length) changedFields = ['content'];
   var promise = (async function () {
     var visibleTimer = null;
     var attempts = options.noRetry ? 1 : 2;
@@ -2513,7 +3098,7 @@ async function _refreshFirstFrameEditor() {
   _ffeMaybeStartForcedLegacySave();
 }
 
-async function _generateFirstFrameFromEditor(allowStale) {
+async function _generateFirstFrameFromEditor() {
   if (!_firstFrameEditor.open || _firstFrameEditor.groupIdx == null) return;
   var gIdx = _firstFrameEditor.groupIdx;
   _ffeClearGenerateBlock();
@@ -2526,29 +3111,21 @@ async function _generateFirstFrameFromEditor(allowStale) {
     _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
     return;
   }
-  if (!(_firstFrameEditor.payload && _firstFrameEditor.payload.draft)) {
-    _ffeSetGenerateBlock('请先编辑提示词或负向词后再重新生成。', { code: 'no_draft' });
-    _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
-    return;
-  }
   var preflightOk = await _ffeEnsureFirstFramePreflightAllowed(gIdx);
   if (!preflightOk) return;
 
   _firstFrameEditor.generating = true;
+  _ffeSetGeneratingPreviewText('生成首帧中…');
   _ffeUpdateDirtyState();
-  var retryStale = false;
+  _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
+  var shouldRefreshAfterGenerate = false;
   try {
     await generateStoryboardSheet(gIdx, {
       applyEditDraft: true,
-      allowStaleEditDraft: allowStale === true,
       skipPreflight: true,
+      onLoadingText: _ffeSetGeneratingPreviewText,
       onStartError: function (err) {
         var payload = err && err.payload || {};
-        if (payload.code === 'stale_edit_draft' && allowStale !== true) {
-          retryStale = true;
-          renderImageGrid();
-          return true;
-        }
         _ffeSetGenerateBlock('重新生成失败：' + _diagnoseApiError(((err && err.message) || err).toString()), {
           code: 'batch_failed',
           reason: payload.code || ''
@@ -2558,29 +3135,19 @@ async function _generateFirstFrameFromEditor(allowStale) {
         return true;
       }
     });
-    if (retryStale) {
-      await generateStoryboardSheet(gIdx, {
-        applyEditDraft: true,
-        allowStaleEditDraft: true,
-        skipPreflight: true,
-        onStartError: function (err) {
-          var payload = err && err.payload || {};
-          _ffeSetGenerateBlock('重新生成失败：' + _diagnoseApiError(((err && err.message) || err).toString()), {
-            code: 'retry_failed',
-            reason: payload.code || ''
-          });
-          _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
-          renderImageGrid();
-          return true;
-        }
-      });
-    }
     if (!_firstFrameEditor.generateBlock) {
-      await _refreshFirstFrameEditor();
+      shouldRefreshAfterGenerate = true;
     }
   } finally {
     _firstFrameEditor.generating = false;
+    _ffeClearGeneratingPreviewText();
     _ffeUpdateDirtyState();
+  }
+  if (shouldRefreshAfterGenerate) {
+    _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
+    await _refreshFirstFrameEditor();
+  } else if (_firstFrameEditor.open && _firstFrameEditor.generateBlock) {
+    _renderFirstFrameEditor(_firstFrameEditor.payload, gIdx);
   }
 }
 
@@ -2588,12 +3155,16 @@ async function _ffeApplyRestoreInitialResponse(resp) {
   resp = resp || {};
   if (project.storyboards && project.storyboards[_firstFrameEditor.groupIdx]) {
     delete project.storyboards[_firstFrameEditor.groupIdx].firstFrameEditDraft;
+    if (resp.firstFrameBasePrompt) project.storyboards[_firstFrameEditor.groupIdx].firstFrameBasePrompt = resp.firstFrameBasePrompt;
+    if (resp.firstFrameBackup) project.storyboards[_firstFrameEditor.groupIdx].firstFrameBackup = resp.firstFrameBackup;
   }
   if (_firstFrameEditor.payload) {
     _firstFrameEditor.payload.draft = null;
     if (resp.sourceHash) _firstFrameEditor.payload.sourceHash = resp.sourceHash;
     if (resp.savedDraftFingerprint) _firstFrameEditor.payload.savedDraftFingerprint = resp.savedDraftFingerprint;
     if (resp.baselineFingerprint) _firstFrameEditor.payload.baselineFingerprint = resp.baselineFingerprint;
+    if (resp.firstFrameBasePrompt) _firstFrameEditor.payload.firstFrameBasePrompt = resp.firstFrameBasePrompt;
+    if (resp.firstFrameBackup) _firstFrameEditor.payload.firstFrameBackup = resp.firstFrameBackup;
   }
   showToast('已恢复初始首帧计划', 'success');
   await _refreshFirstFrameEditor();
@@ -3503,6 +4074,15 @@ function _handleFirstFrameEditorClick(ev) {
     _closeFirstFrameEditor();
     return;
   }
+  if (action === 'dismiss-image-alert') {
+    var alertKey = btn.dataset.alertKey || '';
+    if (!alertKey) return;
+    if (!_firstFrameEditor.dismissedAlerts) _firstFrameEditor.dismissedAlerts = {};
+    _firstFrameEditor.dismissedAlerts[alertKey] = true;
+    if (alertKey === 'generateBlock') _ffeClearGenerateBlock();
+    _renderFirstFrameEditor(_firstFrameEditor.payload, _firstFrameEditor.groupIdx);
+    return;
+  }
   if (action === 'retry-autosave') {
     _ffeRetryAutoSaveWithConflictPrompt();
     return;
@@ -3512,7 +4092,7 @@ function _handleFirstFrameEditorClick(ev) {
     return;
   }
   if (action === 'generate-draft') {
-    _generateFirstFrameFromEditor(false);
+    _generateFirstFrameFromEditor();
     return;
   }
   if (action === 'download-current') {
@@ -3614,11 +4194,31 @@ function _handleFirstFrameEditorClick(ev) {
 
 document.addEventListener('click', _handleMaterialPanelAction);
 document.addEventListener('click', _handleFirstFrameEditorClick);
+document.addEventListener('focusin', function (ev) {
+  var target = ev.target;
+  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
+  var gIdx = parseInt(target.dataset.gidx, 10);
+  if (!isNaN(gIdx)) _sbHydrateFirstFramePromptEditor(gIdx, target);
+});
+document.addEventListener('input', function (ev) {
+  var target = ev.target;
+  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
+  var gIdx = parseInt(target.dataset.gidx, 10);
+  if (isNaN(gIdx)) return;
+  _sbRefreshFirstFrameCardPendingDraft(gIdx);
+  _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-input' });
+});
+document.addEventListener('change', function (ev) {
+  var target = ev.target;
+  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
+  var gIdx = parseInt(target.dataset.gidx, 10);
+  if (!isNaN(gIdx)) _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-change', immediate: true });
+});
 document.addEventListener('input', function (ev) {
   if (ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot')) {
     var field = ev.target.dataset && ev.target.dataset.ffeField || '';
     _ffeMarkDraftFieldTouched(field);
-    if (field === 'promptOverride' || field === 'negativePromptOverride') {
+    if (field === 'content' || field === 'negativePromptOverride') {
       _ffeScheduleAutoSave({ source: 'autosave-input' });
     }
     _ffeUpdateDirtyState();
@@ -3628,25 +4228,45 @@ document.addEventListener('change', function (ev) {
   if (ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot')) {
     var field = ev.target.dataset && ev.target.dataset.ffeField || '';
     _ffeMarkDraftFieldTouched(field);
-    if (field === 'promptOverride' || field === 'negativePromptOverride') {
+    if (field === 'content' || field === 'negativePromptOverride') {
       _ffeScheduleAutoSave({ source: 'autosave-change' });
     }
     _ffeUpdateDirtyState();
   }
 });
 document.addEventListener('compositionstart', function (ev) {
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var cardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(cardGIdx)) {
+      var cardAuto = _sbFirstFrameCardPromptState(cardGIdx);
+      cardAuto.composing = true;
+      cardAuto.dirtyAt = null;
+      _sbClearFirstFrameCardPromptTimers(cardGIdx);
+    }
+    return;
+  }
   if (!(ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot'))) return;
   var field = ev.target.dataset && ev.target.dataset.ffeField || '';
-  if (field !== 'promptOverride' && field !== 'negativePromptOverride') return;
+  if (field !== 'content' && field !== 'negativePromptOverride') return;
   var auto = _ffeAutoSaveState();
   auto.composing = true;
   auto.dirtyAt = null;
   _ffeCancelAutoSaveTimers();
 });
 document.addEventListener('compositionend', function (ev) {
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var cardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(cardGIdx)) {
+      var cardAuto = _sbFirstFrameCardPromptState(cardGIdx);
+      cardAuto.composing = false;
+      cardAuto.dirtyAt = null;
+      _sbScheduleFirstFrameCardPromptSave(cardGIdx, { source: 'card-autosave-compositionend' });
+    }
+    return;
+  }
   if (!(ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot'))) return;
   var field = ev.target.dataset && ev.target.dataset.ffeField || '';
-  if (field !== 'promptOverride' && field !== 'negativePromptOverride') return;
+  if (field !== 'content' && field !== 'negativePromptOverride') return;
   var auto = _ffeAutoSaveState();
   auto.composing = false;
   auto.dirtyAt = null;
@@ -3655,22 +4275,30 @@ document.addEventListener('compositionend', function (ev) {
   _ffeUpdateDirtyState();
 });
 document.addEventListener('blur', function (ev) {
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var cardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(cardGIdx) && !_sbFirstFrameCardPromptState(cardGIdx).composing) {
+      _sbScheduleFirstFrameCardPromptSave(cardGIdx, { source: 'card-autosave-blur', immediate: true });
+    }
+    return;
+  }
   if (!(ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot'))) return;
   var field = ev.target.dataset && ev.target.dataset.ffeField || '';
-  if (field !== 'promptOverride' && field !== 'negativePromptOverride') return;
+  if (field !== 'content' && field !== 'negativePromptOverride') return;
   if (_ffeAutoSaveState().composing) return;
   _ffeScheduleAutoSave({ source: 'autosave-blur', immediate: true });
 }, true);
 window.addEventListener('pagehide', function () {
   _ffeFlushAutoSaveOnPageHide();
+  _sbFlushFirstFrameCardPromptsOnPageHide();
 });
 window.addEventListener('beforeunload', function (ev) {
-  if (!_ffeBeforeUnloadHasUnsavedChanges()) return;
+  if (!_ffeBeforeUnloadHasUnsavedChanges() && !_sbAnyFirstFrameCardPromptUnsaved()) return;
   ev.preventDefault();
   ev.returnValue = '';
 });
 function _ffeCanScrollEditorText(target) {
-  return !!(target && target.closest && target.closest('.ffe-chat-panel .ffe-panel-body, .ffe-material-picker-body, .ffe-ref-picker-menu, [data-ffe-field="promptOverride"], [data-ffe-field="negativePromptOverride"], [data-ffe-field="chatInput"]'));
+  return !!(target && target.closest && target.closest('.ffe-chat-panel .ffe-panel-body, .ffe-material-picker-body, .ffe-ref-picker-menu, [data-ffe-field="content"], [data-ffe-field="negativePromptOverride"], [data-ffe-field="chatInput"]'));
 }
 document.addEventListener('wheel', function (ev) {
   if (_firstFrameEditor.open && ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot') && !_ffeCanScrollEditorText(ev.target)) ev.preventDefault();
@@ -4307,15 +4935,6 @@ export function renderImageGrid() {
           '</div>' +
         '</div>' +
         '<div class="shots-storyboard-card-body">' +
-          '<div class="shots-storyboard-meta">' +
-	            (hasShotBrief
-	              ? '<div class="shots-brief-box"><span>画面描述</span><p>' + escapeHtml(shotBriefSummary) + '</p></div>'
-	              : '<div class="shots-brief-box is-empty"><span>画面描述</span><p>待生成画面描述</p></div>') +
-	            _storyboardAssetsHtml(group) +
-	            '<div class="sb-prompt-area mt-3" hidden>' +
-	              '<textarea class="sb-prompt-edit w-full bg-surface-container-lowest text-[11px] text-on-surface-variant rounded-2xl p-3 border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none resize-none leading-relaxed" rows="3" data-gidx="' + gIdx + '">' + escapeHtml(promptText) + '</textarea>' +
-	            '</div>' +
-          '</div>' +
           '<div class="sb-frame-stack">' +
             _storyboardFramePanelHtml('first', sb, gIdx, group) +
             _storyboardFramePanelHtml('tail', sb, gIdx, group) +
@@ -4386,6 +5005,7 @@ export function renderImageGrid() {
 
   _initGalleryDrag(grid);
   hydrateProtectedImageElements(bindRoot);
+  requestAnimationFrame(function () { _sbHydrateFirstFramePromptEditors(bindRoot); });
   _ensureShotMaterialPanels(groups);
   _sbCurrentIdx = groups.length ? Math.min(prevIdx, groups.length - 1) : 0;
   if (!isShotLayout) _updateNavDots(groups.length);
@@ -4809,7 +5429,11 @@ export async function generateStoryboardSheet(gIdx, opts) {
     }
   }
 
-  updateStoryboardCard(gIdx, "loading", null, "生成视频首帧…");
+  var initialLoadingText = "生成视频首帧…";
+  updateStoryboardCard(gIdx, "loading", null, initialLoadingText);
+  if (typeof opts.onLoadingText === 'function') {
+    try { opts.onLoadingText(initialLoadingText); } catch (_loadingTextErr) {}
+  }
 
   var startResp;
   try {
@@ -4818,7 +5442,6 @@ export async function generateStoryboardSheet(gIdx, opts) {
       projectId: originId,
       targets: [{ groupIdx: gIdx, idx: gIdx, shotIndices: group.shotIndices || [] }],
       applyEditDraft: opts.applyEditDraft === true,
-      allowStaleEditDraft: opts.allowStaleEditDraft === true,
     });
   } catch (e) {
     if (opts.onStartError && opts.onStartError(e) === true) return;
@@ -4849,7 +5472,11 @@ export async function generateStoryboardSheet(gIdx, opts) {
     var eta = _startSingleFrameEta({
       initialSec: 70,
       onTick: function (remain) {
-        try { updateStoryboardCard(gIdx, "loading", null, "生成首帧中…约剩 " + remain + " 秒"); } catch (_e) {}
+        var loadingText = "生成首帧中…约剩 " + remain + " 秒";
+        try { updateStoryboardCard(gIdx, "loading", null, loadingText); } catch (_e) {}
+        if (typeof opts.onLoadingText === 'function') {
+          try { opts.onLoadingText(loadingText); } catch (_loadingTextErr) {}
+        }
       },
     });
     function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
@@ -5546,10 +6173,10 @@ export async function generateAllImages() {
   // Step 1：多参首帧模式直接由后端基于 visual + 资产上下文组装首帧 prompt。
   // 这里不再预生成旧的黑白铅笔 storyboard prompt，避免浪费 token，也避免
   // 后续视频兜底时被黑白/手绘语义污染。
+  // 注: 不再 blanket 给所有 group 打 "准备首帧…" loading 浮窗——那会让"补全 1 张" /
+  // "重试失败" 这类只重生一部分的场景, 所有 card 都莫名挂上 loading。
+  // 真正会重生的 group 在下面 targets 算出来后再打 loading 状态。
   if (hint) hint.textContent = "准备生成视频首帧…";
-  for (var gi = 0; gi < groups.length; gi++) {
-    updateStoryboardCard(gi, "loading", null, "准备首帧…");
-  }
 
   // Step 2：过滤仍缺图的组
   // 同时**裁剪 storyboards 数组**到当前分组数：之前用旧分组算法生成的
@@ -5666,10 +6293,14 @@ export async function generateAllImages() {
   // 用户可重试或点单张重新生成；硬回滚靠 git revert。
   var startResp;
   try {
+    // 批量入口 ("重新生成全部首帧图" / "补全 N 张") 也带 applyEditDraft: true,
+    // 让用户在画面描述里的草稿在批量重生时被采用, 而不仅仅是首帧编辑器弹窗。
+    // 后端有 `&& draft` 守卫, 没编辑过的 group 不受影响。
     startResp = await apiPost('/api/batch/start', {
       batchType: 'storyboard_images',
       projectId: originId,
       targets: targets,
+      applyEditDraft: true,
     });
   } catch (e) {
     console.error('[generateAllImages] /api/batch/start failed:', e);
@@ -6022,6 +6653,16 @@ export async function handleImageAction(e) {
     return;
   }
 
+  if (action === "retry-first-frame-prompt-save") {
+    var retryGIdx = parseInt(btn.dataset.gidx, 10);
+    if (isNaN(retryGIdx)) {
+      var retryCard = btn.closest(".sb-sheet");
+      retryGIdx = parseInt(retryCard && retryCard.dataset.groupIdx, 10);
+    }
+    if (!isNaN(retryGIdx)) _sbRetryFirstFrameCardPromptSave(retryGIdx);
+    return;
+  }
+
   if (action === "lightbox") {
     var imgSrc = btn.tagName === "IMG" ? btn.src : (btn.dataset.img || "");
     if (imgSrc) _openLightbox(imgSrc);
@@ -6040,11 +6681,21 @@ export async function handleImageAction(e) {
   if (action === "show-history") {
     var sbItem = project.storyboards && project.storyboards[gIdx];
     if (!sbItem) { showToast("暂无历史版本", "warn"); return; }
-    _openHistoryPopover(btn, sbItem, function (hi) {
-      if (_setHistoryAsCurrent(sbItem, hi)) {
-        saveProject();
+    _openHistoryPopover(btn, sbItem, async function (hi) {
+      var snap = sbItem.imageHistory && sbItem.imageHistory[hi];
+      var historyUrl = snap && (snap.url || snap.rawUrl || snap.realPhotoUrl || snap.pencilUrl) || "";
+      if (!historyUrl || !project || !project.id) return;
+      try {
+        await apiPost('/api/frames/set-current-from-history', {
+          projectId: project.id,
+          groupIdx: gIdx,
+          historyUrl: historyUrl,
+        });
+        await _reloadProjectFromServerForStoryboard(project.id);
         renderImageGrid();
         showToast("已恢复到历史版本", "ok");
+      } catch (err) {
+        showToast("恢复历史版本失败: " + _diagnoseApiError(((err && err.message) || err).toString()), "error");
       }
     });
     return;
@@ -6059,14 +6710,60 @@ export async function handleImageAction(e) {
       checkImagesConfirm();
       return;
     }
+    // P1 修复: 在发 /api/batch/start 之前, 先把卡片内联"画面描述"textarea 里还没
+    //  防抖落地的输入 flush 到 /api/frames/edit-draft。FFE 模态那条
+    //  (_generateFirstFrameFromEditor, line 3105) 一直有 _ffeFlushAutoSave 兜底,
+    //  这里补上对应的卡片版, 避免用户改了字立刻点重生时, 后端读到上一拍的旧 draft。
+    //  state.composing / hydrating 都由 _sbRunFirstFrameCardPromptSave 内部处理,
+    //  没改动直接 skipped, 不会重复发 PUT。
+    var cardFlushResult = await _sbRunFirstFrameCardPromptSave(gIdx, { source: 'regen-sb-flush' });
+    if (cardFlushResult && cardFlushResult.ok === false) {
+      // toast 已经在 _sbRunFirstFrameCardPromptSave 内部弹过, 这里直接不启动 batch,
+      // 让用户处理保存错误后再点。
+      renderImageGrid();
+      checkImagesConfirm();
+      return;
+    }
     if (!project.storyboards) project.storyboards = [];
     var oldSb = project.storyboards[gIdx];
     if (oldSb) _archiveOldImage(oldSb, "storyboard");
-    project.storyboards[gIdx] = oldSb && Array.isArray(oldSb.imageHistory) && oldSb.imageHistory.length
-      ? { imageHistory: oldSb.imageHistory }
-      : null;
+    // P2 修复: 原来这里把整槽换成 { imageHistory: [...] } / null 再 saveProject(),
+    //  会把"没有 draft / 没有 firstFrameBasePrompt / 没有 frames.tail"的本地状态
+    //  通过 debounced PUT /api/projects/<id> 推到服务器。当前依赖 batch executor
+    //  比 1.5s saveProject debounce 更快落地 + If-Match 409 自动 reload 救场,
+    //  但这不是契约: 慢一拍 draft 就被 PUT 覆盖丢了, 中间也会有 60-90s UI 抖动。
+    //  改成只删生成结果相关字段, 保留 firstFrameEditDraft / firstFrameBasePrompt /
+    //  firstFrameBackup / 尾帧 / shotIndices 等所有用户态。
+    if (oldSb) {
+      delete oldSb.url;
+      delete oldSb.imageUrl;
+      delete oldSb.rawUrl;
+      delete oldSb.firstFrameUrl;
+      delete oldSb.firstFrame;
+      delete oldSb.firstFramePrompt;
+      delete oldSb.firstFrameMode;
+      delete oldSb.firstFrameSourceHash;
+      delete oldSb.firstFrameLastError;
+      delete oldSb.firstFrameFailedAt;
+      delete oldSb.firstFrameSafetyAudit;
+      delete oldSb.firstFramePlanSummary;
+      delete oldSb.effectiveVisualDescription;
+      delete oldSb.imagePrompt;
+      delete oldSb.originalFirstFramePrompt;
+      delete oldSb.debugSketchUrl;
+      if (oldSb.frames && typeof oldSb.frames === 'object') {
+        var nextFrames = Object.assign({}, oldSb.frames);
+        delete nextFrames.first;
+        oldSb.frames = nextFrames;
+      }
+    } else {
+      project.storyboards[gIdx] = {};
+    }
     saveProject();
-    generateStoryboardSheet(gIdx, { skipPreflight: true }).then(function () {
+    // 卡片上的"重新生成"按钮: 沿用画面描述上的已保存草稿 (firstFrameEditDraft),
+    // 不再静默吞掉用户编辑。后端 (lib/batch-executors.ts:1234) 有 `&& draft` 守卫,
+    // 没编辑过的 group 这个 true 是空操作。
+    generateStoryboardSheet(gIdx, { skipPreflight: true, applyEditDraft: true }).then(function () {
       renderImageGrid();
       checkImagesConfirm();
     });
@@ -6139,29 +6836,30 @@ export async function handleImageAction(e) {
       showToast("重新生成失败: " + _diagnoseApiError(((err && err.message) || err).toString()), "error");
     });
   } else if (action === "download-sb") {
-    var sb = project.storyboards && project.storyboards[gIdx];
-    var firstUrl = _firstFrameImageUrl(sb);
-    if (firstUrl) {
-      var a = document.createElement("a");
-      a.href = firstUrl;
-      a.download = "storyboard_" + (gIdx + 1) + ".png";
-      a.target = "_blank";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    }
+    // 走 fetch→blob→<a> 的下载链路, 复用 _downloadOneMaterialAsBlob。
+    // 原本直接 <a href=/api/images/file/xxx> 会被浏览器当成"未认证下载"挡掉
+    // (受 JWT 保护的图片端点, <a download> 不会带认证 cookie/header),
+    // 出现 Chrome "无法从网站上提取文件" 提示。
+    (function () {
+      var sb = project.storyboards && project.storyboards[gIdx];
+      var firstUrl = _firstFrameImageUrl(sb);
+      if (!firstUrl) return;
+      var ext = _guessMaterialImageExt(firstUrl) || 'png';
+      // 命名: 镜头X首帧图X  (跟批量下载素材图的 "镜头X场景图Y" 命名风格保持一致)
+      var groupNo = gIdx + 1;
+      _downloadOneMaterialAsBlob(firstUrl, "镜头" + groupNo + "首帧图" + groupNo + "." + ext)
+        .catch(function (e) { showToast('下载首帧失败：' + ((e && e.message) || e), 'error'); });
+    })();
   } else if (action === "download-tail") {
-    var sbTail = project.storyboards && project.storyboards[gIdx];
-    var tailUrl = _tailFrameImageUrl(sbTail);
-    if (tailUrl) {
-      var tailA = document.createElement("a");
-      tailA.href = tailUrl;
-      tailA.download = "storyboard_" + (gIdx + 1) + "_tail.png";
-      tailA.target = "_blank";
-      document.body.appendChild(tailA);
-      tailA.click();
-      tailA.remove();
-    }
+    (function () {
+      var sbTail = project.storyboards && project.storyboards[gIdx];
+      var tailUrl = _tailFrameImageUrl(sbTail);
+      if (!tailUrl) return;
+      var ext = _guessMaterialImageExt(tailUrl) || 'png';
+      var groupNo = gIdx + 1;
+      _downloadOneMaterialAsBlob(tailUrl, "镜头" + groupNo + "尾帧图" + groupNo + "." + ext)
+        .catch(function (e) { showToast('下载尾帧失败：' + ((e && e.message) || e), 'error'); });
+    })();
   }
 }
 

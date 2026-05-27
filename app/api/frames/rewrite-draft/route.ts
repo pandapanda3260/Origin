@@ -46,7 +46,7 @@ const ConversationItemSchema = z.object({
 const ConversationHistorySchema = z.array(ConversationItemSchema).max(20);
 
 const BaselineDraftSchema = z.object({
-  promptOverride: z.string().optional(),
+  content: z.string().optional(),
   negativePromptOverride: z.string().optional(),
   referenceOverrides: z.object({
     excluded: z.array(z.object({
@@ -64,7 +64,7 @@ const BaselineDraftSchema = z.object({
 }).passthrough();
 
 function changedDraftFields(oldDraft: any, nextDraft: any) {
-  const fields = ['promptOverride', 'referenceOverrides', 'negativePromptOverride'];
+  const fields = ['content', 'referenceOverrides', 'negativePromptOverride'];
   return fields
     .filter((field) => JSON.stringify(oldDraft?.[field] ?? null) !== JSON.stringify(nextDraft?.[field] ?? null))
     .map((field) => field);
@@ -173,13 +173,13 @@ function applyRewriteOperations(args: {
   const next: Record<string, any> = { ...base };
   const warnings: FirstFrameDraftWarning[] = [];
 
-  const promptPatch = operations.promptOverride;
+  const promptPatch = operations.content;
   if (promptPatch?.op === 'set') {
     const prompt = String(promptPatch.value || '').trim().slice(0, MAX_PROMPT_OVERRIDE_CHARS);
-    if (prompt) next.promptOverride = prompt;
-    else warnings.push(warning('prompt_empty_kept', 'AI 试图把提示词改为空，已保留原提示词。', 'promptOverride', 'field'));
+    if (prompt) next.content = prompt;
+    else warnings.push(warning('prompt_empty_kept', 'AI 试图把提示词改为空，已保留原提示词。', 'content', 'field'));
   } else if (promptPatch?.op === 'clear') {
-    delete next.promptOverride;
+    delete next.content;
   }
 
   const negativePatch = operations.negativePromptOverride;
@@ -325,7 +325,7 @@ export async function POST(req: NextRequest) {
   }
   const { draft: savedDraftValue } = currentFirstFrameEditDraft(project, groupIdx);
   const savedDraft = savedDraftValue || {};
-  const actualSavedDraftFingerprint = firstFrameDraftFingerprint(preview.sourceHash, savedDraft);
+  const actualSavedDraftFingerprint = firstFrameDraftFingerprint(savedDraft);
   if (expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint) {
     return Response.json(
       {
@@ -353,7 +353,7 @@ export async function POST(req: NextRequest) {
       if (err instanceof FirstFrameDraftValidationException) return validationResponse(err.errors);
       throw err;
     }
-    const actualBaselineFingerprint = firstFrameDraftFingerprint(preview.sourceHash, baselineValidation.draft);
+    const actualBaselineFingerprint = firstFrameDraftFingerprint(baselineValidation.draft);
     if (baselineFingerprint && baselineFingerprint !== actualBaselineFingerprint) {
       return Response.json(
         {
@@ -375,12 +375,12 @@ export async function POST(req: NextRequest) {
       content:
         '你是首帧图片生成草稿编辑器。你必须只输出 JSON。' +
         '用户用什么语言提问，assistantMessage 就用什么语言回复。' +
-        '只能修改 promptOverride、referenceOverrides、negativePromptOverride。' +
+        '只能修改 content、referenceOverrides、negativePromptOverride。' +
         '禁止修改 styleRuleOverrides/provider/model/quality/size/style/sourceHash/updatedBy/updatedAt；用户要求修改这些字段时，draftPatch 全部 keep，并在 assistantMessage 说明不能通过对话修改。' +
-        '用户要求更冷、更暖、更电影感等风格变化时，必须转写到 promptOverride 或 negativePromptOverride，不要输出 styleRuleOverrides。' +
+        '用户要求更冷、更暖、更电影感等风格变化时，必须转写到 content 或 negativePromptOverride，不要输出 styleRuleOverrides。' +
         'assistantMessage 控制在 80 字以内，只点明建议意图，不要说已经完成修改。' +
         '输出 schema: {"assistantMessage":"...","intentSummary":"...","draftPatch":{...}}。' +
-        'promptOverride 只能使用 {"op":"set","value":"..."}、keep 或 clear，value 不能是数组。' +
+        'content 只能使用 {"op":"set","value":"..."}、keep 或 clear，value 不能是数组。' +
         'negativePromptOverride 可用 set/append/remove/clear，set.value 可为字符串或数组。' +
         'referenceOverrides.update 是累积修改，clear 表示恢复默认参考图，不是清空所有参考图。' +
         '参考资产优先使用 role+assetId；不知道 assetId 时可用 role+assetName，不要编造 ID。',
@@ -468,7 +468,7 @@ export async function POST(req: NextRequest) {
       }
     }
     const finalPlan = applyFirstFrameDraftToPlan({ project, userId: user.id, plan: preview.plan, draft: normalized });
-    const nextBaselineFingerprint = firstFrameDraftFingerprint(preview.sourceHash, normalized);
+    const nextBaselineFingerprint = firstFrameDraftFingerprint(normalized);
     return jsonOk({
       assistantMessage: clipText(result?.assistantMessage || '已生成草稿修改建议。', 120),
       intentSummary: result?.intentSummary ? clipText(result.intentSummary, 160) : '',

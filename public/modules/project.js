@@ -683,6 +683,16 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
 
     snap.at = Date.now();
     snap.source = source || "";
+    if (source === "storyboard") {
+      var basePrompt = item.firstFrameBasePrompt && typeof item.firstFrameBasePrompt === "object"
+        ? item.firstFrameBasePrompt.content
+        : item.firstFrameBasePrompt;
+      snap.mode = item.firstFrameMode || (item.frames && item.frames.first && item.frames.first.mode) || "";
+      snap.sourceHash = item.firstFrameSourceHash || (item.frames && item.frames.first && item.frames.first.sourceHash) || null;
+      snap.planSummary = item.firstFramePlanSummary || (item.frames && item.frames.first && item.frames.first.planSummary) || null;
+      snap.firstFrameBasePrompt = String(basePrompt || item.originalFirstFramePrompt || (item.frames && item.frames.first && item.frames.first.originalPrompt) || "");
+      snap.submittedPrompt = String(item.firstFramePrompt || (item.frames && item.frames.first && item.frames.first.prompt) || item.imagePrompt || "");
+    }
     if (!Array.isArray(item.imageHistory)) item.imageHistory = [];
     // Dedup: if the incoming snap equals the current top, do nothing.
     var top = item.imageHistory[0];

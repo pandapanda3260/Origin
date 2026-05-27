@@ -471,7 +471,9 @@ export function renderShotList() {
   var shotPlanNeedsAttention = shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown" || shotPlanStatus === "generating" || shotPlanStatus === "failed" || (project._staleFlags && project._staleFlags.shotPlan);
   if (shotPlanNeedsAttention) {
     var spb = document.createElement("div");
-    spb.className = "upstream-stale-banner mx-8";
+    // 注：此前用 mx-8 给 banner 左右各留 32px 边距，导致 banner 比下方 shot card 卡片窄。
+    // 用户反馈：banner 左右边界应与镜头卡片对齐，去掉 mx-8 让 banner 撑满 wrap 容器宽度。
+    spb.className = "upstream-stale-banner";
     var reasons = Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
     var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
     var message = "";
@@ -484,15 +486,15 @@ export function renderShotList() {
     } else {
       message = "剧本/风格/资产已变化，当前镜头计划可能不是最新版本。";
     }
+    // 注：此前在 banner 右侧渲染 "确认仍可用" 和 "重新生成镜头计划" 两个 pill 按钮。
+    // 用户反馈：banner 仅作提示用，相应的操作通过顶部"重新生成镜头计划"主按钮触发，
+    // banner 内不再放重复按钮。confirm-shot-plan-valid / regen-shot-plan 两个 action
+    // 仍由 handleShotAction 路由器保留（_getShotPlanActionState 与其他入口可能仍调用）。
     spb.innerHTML =
       '<span class="material-symbols-outlined">warning</span>' +
       '<div class="flex-1 min-w-0">' +
         '<div class="font-semibold">' + escapeHtml(_shotPlanStatusLabel(shotPlanStatus) || "镜头计划需校验") + '</div>' +
         '<div class="text-xs opacity-75">' + escapeHtml(message + (reasonText ? " " + reasonText : "")) + '</div>' +
-      '</div>' +
-      '<div class="flex gap-2 ml-auto">' +
-        ((shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown") ? '<button type="button" class="pill-btn" data-action="confirm-shot-plan-valid">确认仍可用</button>' : '') +
-        ((shotPlanStatus !== "generating") ? '<button type="button" class="pill-btn primary" data-action="regen-shot-plan">重新生成镜头计划</button>' : '') +
       '</div>';
     wrap.appendChild(spb);
   }
@@ -509,13 +511,32 @@ export function renderShotList() {
     card.dataset.shotIdx = idx;
 
     card.innerHTML =
-      '<div class="shot-card-form-pane">' +
-        '<div class="shot-card-head">' +
-          '<div class="shot-card-title">' +
-            '<span class="shot-card-index">' + String(idx+1).padStart(2,'0') + '</span>' +
-            '<span class="shot-card-duration">' + (shot.duration||4) + 's</span>' +
-            (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
+      '<header class="shot-card-head">' +
+        // 左对齐: 镜头 NN / SHOT NN  +  3s 时长 pill  +  情绪 badge。
+        // 原本"01"大数字索引和右侧的"时长 3s" pill 已删除——索引信息融进
+        // "镜头 NN"标题, 时长由小型 .shot-card-duration pill 承载。
+        '<div class="shot-card-title">' +
+          '<strong>镜头 ' + String(idx+1).padStart(2,'0') + '</strong>' +
+          '<span class="shot-card-en-label">/ SHOT ' + String(idx+1).padStart(2,'0') + '</span>' +
+          '<span class="shot-card-duration">' + (shot.duration||4) + 's</span>' +
+          (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
+        '</div>' +
+        '<div class="shot-card-meta-actions">' +
+          '<div class="shot-card-specs">' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>景别</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="shotType">' +
+                _buildSelectOptions(SHOT_TYPES, shot.shotType || "") +
+              '</select>' +
+            '</label>' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>运镜</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="camera">' +
+                _buildSelectOptions(CAMERA_MOVES, shot.camera || "") +
+              '</select>' +
+            '</label>' +
           '</div>' +
+          // @ / 删除 按钮直接跟在运镜后面, 右对齐 + 常亮 (CSS opacity:1)。
           '<div class="shot-card-actions">' +
             '<button type="button" class="shot-icon-btn" data-action="ref-agent" title="引用到 AI 助手">' +
               '<span class="material-symbols-outlined">alternate_email</span>' +
@@ -525,46 +546,14 @@ export function renderShotList() {
             '</button>' +
           '</div>' +
         '</div>' +
-        '<div class="shot-form-grid">' +
-          '<div>' +
-            '<label class="shot-field-label">景别</label>' +
-            '<select class="shot-field shot-select" data-field="shotType">' +
-              _buildSelectOptions(SHOT_TYPES, shot.shotType || "") +
-            '</select>' +
-          '</div>' +
-          '<div>' +
-            '<label class="shot-field-label">运镜</label>' +
-            '<select class="shot-field shot-select" data-field="camera">' +
-              _buildSelectOptions(CAMERA_MOVES, shot.camera || "") +
-            '</select>' +
-          '</div>' +
-        '</div>' +
-        '<div class="shot-field-block">' +
-          '<label class="shot-field-label">画面描述</label>' +
-          '<textarea class="shot-field shot-textarea" data-field="visual" rows="4" placeholder="画面内容">' + escapeHtml(shot.visual||"") + '</textarea>' +
-        '</div>' +
-        '<div class="shot-field-block">' +
-          '<label class="shot-field-label">对白/旁白</label>' +
-          '<textarea class="shot-field shot-textarea" data-field="dialogue" rows="2" placeholder="对白或旁白">' + escapeHtml(shot.dialogue||"") + '</textarea>' +
-        '</div>' +
-        '<div class="shot-field-block shot-keyinfo-block">' +
-          '<label class="shot-field-label shot-keyinfo-label"><span class="material-symbols-outlined">key</span><span>关键信息</span></label>' +
-          '<div class="shot-keyinfo-shell">' +
-            '<span class="material-symbols-outlined">sell</span>' +
-            '<input type="text" class="shot-field shot-input shot-keyinfo-input" data-field="keyInfo" value="' + escapeHtml(shot.keyInfo||"") + '" placeholder="情绪 / 道具 / 场景线索" />' +
-          '</div>' +
-        '</div>' +
-        '<div class="shot-material-slot" id="shotMaterialSlot_' + idx + '" data-shot-idx="' + idx + '">' +
-          '<div class="shot-material-slot-empty">生成镜头计划后显示生成素材区</div>' +
-        '</div>' +
-        '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />' +
-      '</div>' +
+      '</header>' +
       '<aside class="shot-storyboard-slot" id="shotStoryboardSlot_' + idx + '" data-shot-idx="' + idx + '" data-group-idx="' + idx + '">' +
         '<div class="shot-storyboard-slot-empty">' +
           '<span class="material-symbols-outlined">image</span>' +
           '<p>分镜首尾帧将在这里显示</p>' +
         '</div>' +
-      '</aside>';
+      '</aside>' +
+      '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />';
     wrap.appendChild(card);
   });
 
@@ -1053,7 +1042,16 @@ export async function acceptShotPlanForStoryboard() {
 
   try {
     var saved = await flushServerSave();
-    if (saved && saved.ok === false) throw new Error("project save rejected");
+    if (saved && saved.ok === false) {
+      // A first-frame draft autosave can legitimately advance the server version
+      // right before this flush. If no shot fields changed, the 409-sync result
+      // is not a failed shot-table save; continue from the freshly loaded project.
+      if (saved.stale === true && !changed) {
+        _syncRefs();
+        return true;
+      }
+      throw new Error("project save rejected");
+    }
     return true;
   } catch (e) {
     project.shotsApproved = prevShotsApproved;

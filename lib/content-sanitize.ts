@@ -280,53 +280,8 @@ export function extractImageModerationError(
   };
 }
 
-export function hasFillLightPositiveMention(text: string): boolean {
-  return /手机补光灯|补光灯|LED\s*(?:环形灯|小面板灯|面板灯)|环形灯|小面板灯|冷白小太阳|小太阳|phone[-\s]*mounted\s+fill[-\s]*light|ring\s+lights?|fill\s+(?:lights?|lamps?)|LED\s+(?:fill\s+)?(?:lamps?|lights?|panels?)/i
-    .test(String(text || ''));
-}
-
-export function sanitizeFillLightPositiveMentions(text: string): string {
-  let out = String(text || '');
-  if (!out) return out;
-  const protectedConstraints: string[] = [];
-  const protect = (m: string) => {
-    const token = `__FILL_LIGHT_PROTECTED_${protectedConstraints.length}__`;
-    protectedConstraints.push(m);
-    return token;
-  };
-  out = out.replace(/(?:HARD USER NEGATIVE CONSTRAINT|硬性负向约束)[^\n]*/gi, protect);
-  out = out.replace(
-    /(不要|禁止|不能|不需要|别|去掉|移除|无|没有)[^。；，,\n]{0,24}补光灯/g,
-    protect,
-  );
-  out = out
-    .replace(/[一二三四五六七八九十\d]+\s*[支盏个台组套]?\s*手机补光灯/g, '几部普通手机')
-    .replace(/[一二三四五六七八九十\d]+\s*[支盏个台组套]?\s*补光灯/g, '几处屏幕冷光')
-    .replace(/手机补光灯/g, '普通手机')
-    .replace(/LED\s*(?:环形补光灯|环形灯|小面板灯|面板灯)/gi, '手机屏幕冷光')
-    .replace(/(?:环形补光灯|环形灯|补光环|小面板灯|面板灯)/g, '手机屏幕冷光')
-    .replace(/(?:冷白)?小太阳/g, '普通手机屏幕微光')
-    .replace(/补光灯/g, '屏幕冷光')
-    .replace(/\bphone[-\s]*mounted\s+fill[-\s]*light(?:\s+rigs?)?\b/gi, 'ordinary phone mounts')
-    .replace(/\bLED\s+fill\s+lamps?\b/gi, 'soft screen glow')
-    .replace(/\bLED\s+ring\s+lights?\b/gi, 'ordinary smartphones')
-    .replace(/\bring\s+lights?\b/gi, 'ordinary phones')
-    .replace(/\bfill\s+lights?\b/gi, 'soft screen glow')
-    .replace(/\bfill\s+lamps?\b/gi, 'soft screen glow')
-    .replace(/\bLED\s+(?:light\s+)?panels?\b/gi, 'soft screen glow')
-    .replace(/\bsmall\s+LED\s+panels?\b/gi, 'soft screen glow')
-    .replace(/\bplastic\s+ring\s+and\s+panel\s+shapes\b/gi, 'ordinary phone bodies and simple mounts')
-    .replace(/\bring\s+and\s+panel\s+shapes\b/gi, 'ordinary phone bodies and simple mounts')
-    .replace(/\bcold\s+white\s+glow\b/gi, 'soft phone-screen glow')
-    .replace(/\bhard\s+brightness\b/gi, 'subtle screen reflection');
-  protectedConstraints.forEach((value, idx) => {
-    out = out.replace(`__FILL_LIGHT_PROTECTED_${idx}__`, value);
-  });
-  return out;
-}
-
 export function sanitizePromptObject<T>(value: T): T {
-  if (typeof value === 'string') return sanitizeFillLightPositiveMentions(value) as T;
+  if (typeof value === 'string') return value;
   if (Array.isArray(value)) return value.map((item) => sanitizePromptObject(item)) as T;
   if (value && typeof value === 'object') {
     const out: Record<string, any> = {};
@@ -336,42 +291,4 @@ export function sanitizePromptObject<T>(value: T): T {
     return out as T;
   }
   return value;
-}
-
-export function hasNoFillLightConstraint(text: string): boolean {
-  const t = String(text || '');
-  return (
-    /(不要|禁止|不能|不需要|别|去掉|移除|无|没有)[^。；，,\n]{0,18}补光灯/.test(t) ||
-    /\bno\s+(?:phone[-\s]*)?(?:fill|ring)\s+lights?\b/i.test(t) ||
-    /\bwithout\s+(?:phone[-\s]*)?(?:fill|ring)\s+lights?\b/i.test(t)
-  );
-}
-
-export function enforceNoFillLightConstraint(text: string): string {
-  let out = String(text || '');
-  const protectedConstraints: string[] = [];
-  const protectConstraint = (m: string) => {
-    const token = `__NO_FILL_LIGHT_CONSTRAINT_${protectedConstraints.length}__`;
-    protectedConstraints.push(m);
-    return token;
-  };
-  out = out.replace(/(?:HARD USER NEGATIVE CONSTRAINT|硬性负向约束)[^\n]*/gi, protectConstraint);
-  out = out.replace(
-    /(不要|禁止|不能|不需要|别|去掉|移除|无|没有)[^。；，,\n]{0,18}补光灯/g,
-    protectConstraint,
-  );
-  out = out ? sanitizeFillLightPositiveMentions(out) : out;
-  protectedConstraints.forEach((value, idx) => {
-    out = out.replace(`__NO_FILL_LIGHT_CONSTRAINT_${idx}__`, value);
-  });
-  if (!/(HARD USER NEGATIVE CONSTRAINT: no fill lights|硬性负向约束：禁止补光灯)/i.test(out)) {
-    out +=
-      '\n\n硬性负向约束：禁止补光灯、环形灯、LED 补光灯、影棚补光灯或手机补光灯支架。如果画面出现手机，只能是普通手机或自拍杆，不能作为照明设备。';
-  }
-  return out;
-}
-
-export function enforceHardVisualConstraints(text: string, sourceText: string): string {
-  if (hasNoFillLightConstraint(sourceText)) return enforceNoFillLightConstraint(text);
-  return text;
 }

@@ -3,8 +3,9 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
-import { getProjectByIdForUser } from '@/lib/projects-db';
+import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { storyboardShotIndices } from '@/lib/frame-workflow-state';
+import { syncEditProjectClips } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -44,6 +45,45 @@ function rowBelongsToCurrentSlot(project: any, row: any): boolean {
     vt?.protectedUrl,
     vt?._originVideoUrl,
   ].some((value) => stringContainsTaskId(value, taskId));
+}
+
+function computeReadiness(project: any) {
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+  let readyCount = 0;
+  for (let i = 0; i < storyboards.length; i += 1) {
+    const sb = storyboards[i];
+    const vt = videoTasks[i];
+    if (sb && typeof sb.videoUrl === 'string' && sb.videoUrl.trim() && sb.videoIsCurrent !== false && vt?.isCurrent !== false) {
+      readyCount += 1;
+    }
+  }
+  return {
+    totalCount: storyboards.length,
+    readyCount,
+    canEnterEdit: readyCount >= 1,
+  };
+}
+
+function clearStoryboardVideoFields(sb: any) {
+  if (!sb || typeof sb !== 'object') return sb;
+  const next = { ...sb, importedToEdit: false };
+  delete next.videoUrl;
+  delete next._originVideoUrl;
+  delete next.videoTaskId;
+  delete next.videoCoverUrl;
+  delete next.videoStatus;
+  delete next.videoMode;
+  delete next.videoTaskFinishedAt;
+  delete next.videoDurationSec;
+  delete next.readyForEdit;
+  delete next.videoWarnings;
+  delete next.videoIsCurrent;
+  // ⚠️ 关键：videoAssetId 也要清掉。前端 hydrateProjectAssetUrls 会用
+  // videoAssetId 重签出新的 videoUrl 塞回 storyboard，于是「删除 → 全部生成 →
+  // 该片段立刻显示已完成」的鬼影 bug 就出现了。
+  delete next.videoAssetId;
+  return next;
 }
 
 /**
@@ -119,4 +159,68 @@ export async function GET(req: NextRequest) {
   }));
 
   return jsonOk({ tasks, items, total: tasks.length });
+}
+
+export async function DELETE(req: NextRequest) {
+  const user = await getCurrentUser(req);
+  if (!user) return jsonError('unauthorized', 401);
+
+  const url = new URL(req.url);
+  const body = await req.json().catch(() => ({} as any));
+  const projectId = String(body?.projectId || url.searchParams.get('projectId') || '').trim();
+  const groupIdx = Number(body?.groupIdx ?? url.searchParams.get('groupIdx'));
+  if (!projectId) return jsonError('缺 projectId', 400);
+  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
+
+  const patched = patchProjectForUser(projectId, user.id, (fresh: any) => {
+    const storyboards = Array.isArray(fresh?.storyboards) ? [...fresh.storyboards] : [];
+    if (groupIdx >= storyboards.length || !storyboards[groupIdx]) return null;
+
+    storyboards[groupIdx] = clearStoryboardVideoFields(storyboards[groupIdx]);
+
+    const videoTasks = Array.isArray(fresh?.videoTasks) ? [...fresh.videoTasks] : [];
+    if (groupIdx < videoTasks.length) videoTasks[groupIdx] = null;
+
+    const editData = fresh?.editData && typeof fresh.editData === 'object'
+      ? { ...fresh.editData }
+      : {};
+    const edl = editData.edl && typeof editData.edl === 'object'
+      ? { ...editData.edl }
+      : null;
+    if (edl && Array.isArray(edl.timeline)) {
+      edl.timeline = edl.timeline.filter((entry: any) => !(entry && Number(entry.groupIdx) === groupIdx));
+      edl.version = (Number(edl.version) || 0) + 1;
+      editData.edl = edl;
+    }
+
+    return {
+      storyboards,
+      videoTasks,
+      editData: {
+        ...editData,
+        readiness: computeReadiness({ ...fresh, storyboards, videoTasks }),
+      },
+    };
+  });
+
+  if (!patched) return jsonError('项目不存在或片段不存在', 404);
+
+  const edl = patched?.editData?.edl;
+  try {
+    syncEditProjectClips({
+      ownerId: user.id,
+      projectId,
+      timeline: Array.isArray(edl?.timeline) ? edl.timeline : [],
+    });
+  } catch (clipError) {
+    console.warn('[video-by-project] edit clip sync skipped:', clipError);
+  }
+
+  return jsonOk({
+    ok: true,
+    groupIdx,
+    readiness: computeReadiness(patched),
+    edl: edl || null,
+    serverVersion: Number(patched.version) || undefined,
+  });
 }

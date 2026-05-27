@@ -2052,15 +2052,16 @@ body.is-online-editor-page .agent-panel {
   height: auto;
 }
 .sb-frame-loading {
-  /* UI redesign according to high-fidelity mockup: keep generation feedback inside the frame area instead of replacing the whole storyboard card. */
+  /* UI redesign according to high-fidelity mockup: keep generation feedback inside the frame area instead of replacing the whole storyboard card.
+     注意: 不要在这一层加白色背景 / 模糊滤镜, 否则会把下方的灰色占位 (sb-frame-placeholder
+     "等待首帧" 播放图标) 盖白。loading-card 自身有白底+阴影, 已经足够浮起来。 */
   position: absolute;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 22px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.78) 0%, rgba(255, 255, 255, 0.64) 100%);
-  backdrop-filter: blur(4px);
+  background: transparent;
 }
 .sb-frame-loading[hidden] {
   display: none;
@@ -2572,6 +2573,12 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 .batch-primary-action:hover { opacity: 0.94; transform: translateY(-1px); }
 .batch-primary-action:active { transform: translateY(0) scale(0.98); }
 .batch-primary-action .material-symbols-outlined { font-size: 16px; }
+.batch-redesign-hero-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
 .batch-hint {
   min-height: 0;
   margin: 0 0 12px;
@@ -2972,7 +2979,15 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 .batch-table-head,
 .batch-segment-row {
   display: grid;
-  grid-template-columns: minmax(210px, 1.25fr) minmax(112px, 0.58fr) minmax(95px, 0.48fr) minmax(92px, 0.48fr) minmax(124px, auto);
+  /* 列 5 之前是 minmax(124px, auto) —— auto 按当前 grid container 的列内容
+     最大宽度独立计算：header 里只有「操作」二字 ~28px，rows 里是
+     播放/重新生成/删除/︙ 整套按钮组 ~240px。两个 grid 列宽因此不一致，
+     fr 分配后整体错位。改成定宽，强制两侧列宽完全一致，标题就能稳定地
+     对到内容。240px ≈ 标准按钮组宽度，保证 .batch-row-actions 整组都能
+     塞进去；按钮组 .batch-row-actions 用 justify-content:center 居中后，
+     与表头 text-align:center 对齐到同一中线。 */
+  /* 列 5「操作」用 1fr 弹性吃掉剩余宽度，按钮组内部再 justify-content:flex-end 贴右 */
+  grid-template-columns: 300px 140px 120px 100px 1fr;
   column-gap: 10px;
   align-items: center;
 }
@@ -2981,6 +2996,29 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   color: #708194;
   font-size: 11px;
   font-weight: 900;
+}
+/* 让表头各列文字落在下方对应内容的视觉中线上：
+   - 列 1「片段信息」：padding-left 124px（= 112px 缩略图 + 12px gap）后落在文案起始位置；
+   - 列 2「状态 / 进度」：左对齐，跟「已完成」按钮左边对齐；
+   - 列 3「时长 / 剩余时间」：左对齐，跟「00:05」左边对齐；
+   - 列 4「基础信息」：左对齐，跟「3 人」前的图标左边对齐；
+   - 列 5「操作」：居中，落在「播放…竖省略号」按钮组的中点。
+     (列 5 grid-template 是 minmax(124px, auto)，列宽就是按钮组宽度，
+      所以 text-align:center 即按钮组中点。) */
+.batch-table-head > span {
+  text-align: left;
+}
+.batch-table-head > span:nth-child(1) {
+  padding-left: 124px;
+}
+.batch-table-head > span:nth-child(5) {
+  /* col 5 是 1fr 弹性宽度，按钮组 justify-content:flex-end 贴右。
+     给表头一个跟按钮组实际宽度（播放+重新生成+删除+︙ ≈ 230px）一致
+     的固定宽度，再 justify-self:end 推到 col 5 最右，然后内部 text-align:left
+     —— 这样「操作」文字左缘就跟按钮组的最左（也就是「播放」按钮的左缘）对齐。*/
+  justify-self: end;
+  width: 230px;
+  text-align: left;
 }
 .batch-workbench-scroll {
   min-width: 0;
@@ -3054,6 +3092,45 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 }
 .batch-row-warning { color: #a16207 !important; }
 .batch-row-error { color: #c2410c !important; }
+.has-tip { cursor: help; }
+.app-tip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 360px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.96);
+  color: #f8fafc;
+  font-size: 12px;
+  line-height: 1.5;
+  font-weight: 500;
+  white-space: normal;
+  word-break: break-word;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.08s ease-out;
+  display: none;
+}
+.app-tip.is-visible {
+  display: block;
+  opacity: 1;
+}
+.app-tip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+}
+.app-tip[data-placement="top"]::after {
+  bottom: -10px;
+  border-top-color: rgba(17, 24, 39, 0.96);
+}
+.app-tip[data-placement="bottom"]::after {
+  top: -10px;
+  border-bottom-color: rgba(17, 24, 39, 0.96);
+}
 .batch-row-status,
 .batch-row-time,
 .batch-row-basic,
@@ -3186,6 +3263,40 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   cursor: not-allowed;
   opacity: 0.48;
   transform: none;
+}
+.mirror-more-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.mirror-more-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid rgba(15,23,42,0.08);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 18px 36px rgba(15,23,42,0.12);
+  z-index: 40;
+  white-space: nowrap;
+}
+.mirror-more-menu[hidden] { display: none; }
+.mirror-more-wrap.is-open .mirror-more-btn,
+.mirror-more-btn[aria-expanded="true"] {
+  border-color: rgba(15,23,42,0.28);
+  background: #f4f8fb;
+}
+.mirror-delete-btn {
+  color: #b42335;
+}
+.mirror-delete-btn:hover {
+  border-color: rgba(239,68,68,0.35);
+  background: rgba(239,68,68,0.08);
 }
 .batch-inline-player,
 .tail-align-check {
@@ -6606,6 +6717,14 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   .batch-primary-action {
     width: 100%;
   }
+  .batch-redesign-hero-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .batch-redesign-hero-actions > .batch-primary-action {
+    flex: 1 1 auto;
+  }
   .batch-stat-grid {
     grid-template-columns: 1fr;
   }
@@ -7411,10 +7530,11 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   50% { opacity: 0.6; }
 }
 .stale-banner {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 16px;
+  padding: 8px 36px 8px 16px;
   font-size: 11px;
   font-weight: 600;
   color: #e65100;
@@ -7422,6 +7542,29 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   border-bottom: 1px solid #ffcc80;
   border-radius: 12px 12px 0 0;
 }
+
+/* 通用关闭按钮：appearance on banner-style notices via _initDismissibleBanners */
+.banner-dismiss-btn {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.16s ease, background 0.16s ease;
+  padding: 0;
+}
+.banner-dismiss-btn:hover { opacity: 1; background: rgba(0, 0, 0, 0.06); }
+.banner-dismiss-btn .material-symbols-outlined { font-size: 16px; }
 /* ── Script Library Panel ── */
 .script-lib-panel {
   position: absolute;
@@ -8496,10 +8639,10 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   box-shadow: 0 0 0 4px rgba(11, 19, 32, 0.05);
 }
 .script-retag-btn {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
   padding: 0 10px;
   border: 1px solid rgba(179, 194, 202, 0.58);
   border-radius: 999px;
@@ -8507,6 +8650,19 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   color: #536573;
   font-size: 10px;
   font-weight: 760;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+.script-retag-btn:hover:not(:disabled) {
+  background: #ffffff;
+  border-color: rgba(82, 101, 125, 0.55);
+  color: #26364a;
+}
+.script-panel-heading-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 .script-workbench-footer {
   flex-shrink: 0;
@@ -8973,10 +9129,11 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 
 .upstream-stale-banner {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 18px;
+  padding: 10px 40px 10px 18px;
   font-size: 12px;
   font-weight: 600;
   color: #bf360c;
@@ -9117,7 +9274,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 #editTimelineArea {
   flex: 0 0 clamp(198px, 27vh, 250px) !important;
   margin-left: 0 !important;
-  margin-right: clamp(72px, 5vw, 88px) !important;
+  margin-right: 0 !important;
   margin-bottom: 0 !important;
 }
 
@@ -10430,6 +10587,511 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   }
 }
 
+/* Shot page reference-layout override: middle module only. */
+.shot-workbench-card {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 24px 26px;
+  border-radius: 24px;
+  border: 1px solid rgba(144, 164, 174, 0.16);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 18px 52px rgba(11, 19, 32, 0.08);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+}
+.shot-workbench-card:hover {
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 22px 58px rgba(11, 19, 32, 0.1);
+}
+.shot-card-head {
+  position: relative;
+  display: grid;
+  /* 左列: 镜头标题 + 3s + 情绪 badge (左对齐)
+     右列: 景别/运镜/@ /删除 (右对齐) */
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 0;
+}
+.shot-card-title > strong {
+  font-size: 16px;
+  font-weight: 900;
+  color: #0B1320;
+  line-height: 1;
+}
+.shot-card-en-label {
+  color: rgba(69, 90, 100, 0.7);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.shot-card-title {
+  gap: 12px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.shot-card-index {
+  color: #101820;
+  font-size: clamp(30px, 2.25vw, 42px);
+  font-weight: 300;
+  letter-spacing: 0;
+}
+/* 注：此前这里有 .shot-card-duration 的尺寸覆盖（padding 5px 12px / font-size 12px / font-weight 900），
+ * 会让"4s"比同行的情绪 badge "铺垫 N" 大一圈，与上方 line 1810 处的注释"尺寸与 .emotion-badge 对齐"相违背。
+ * 用户反馈：duration 和情绪 badge 应等高对齐，已移除此覆盖；颜色样式可若需独立调整再单独追加。
+ * 颜色保留早期定义（background #DDE6EA / color #455A64），如想要 #DFF0FF/#0B4B73 蓝调可下次单独追加。 */
+.shot-card-center-title {
+  justify-self: center;
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  color: #0B1320;
+  white-space: nowrap;
+}
+.shot-card-center-title strong {
+  font-size: 16px;
+  font-weight: 900;
+}
+.shot-card-center-title span {
+  color: rgba(69, 90, 100, 0.7);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+.shot-card-meta-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+}
+.shot-card-specs {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.shot-pill-select-wrap,
+.shot-spec-pill {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(144, 164, 174, 0.12);
+  background: rgba(236, 239, 241, 0.62);
+  color: #0B1320;
+}
+.shot-pill-select-wrap > span,
+.shot-spec-pill > span {
+  color: rgba(69, 90, 100, 0.62);
+  font-size: 11px;
+  font-weight: 900;
+}
+.shot-spec-pill strong {
+  font-size: 12px;
+  font-weight: 900;
+}
+.shot-pill-select {
+  width: auto;
+  max-width: 120px;
+  min-width: 58px;
+  height: 24px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0 18px 0 0;
+  color: #0B1320;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+.shot-pill-select:focus {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.shot-card-actions {
+  /* 改为常亮 + 跟在景别/运镜后面右对齐, 不再 hover 才出现。 */
+  position: static;
+  opacity: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.shot-storyboard-slot {
+  width: 100%;
+  border-left: 0;
+  padding-left: 0;
+  display: block;
+}
+.shot-storyboard-slot .shots-storyboard-card-inner {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  border-radius: 0;
+}
+.shot-storyboard-slot .shots-storyboard-card-head {
+  display: none;
+}
+.shot-storyboard-slot .shots-storyboard-card-body {
+  display: block;
+  padding-top: 0;
+}
+.shot-storyboard-slot .sb-frame-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sb-frame-panel {
+  min-width: 0;
+  border-radius: 18px;
+  border: 1px solid rgba(144, 164, 174, 0.16);
+  background: rgba(255, 255, 255, 0.66);
+  overflow: hidden;
+}
+.sb-frame-panel-head {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 13px 18px;
+  border-bottom: 1px solid rgba(144, 164, 174, 0.1);
+}
+.sb-frame-panel-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sb-frame-panel-title .material-symbols-outlined {
+  color: rgba(11, 19, 32, 0.72);
+  font-size: 18px;
+}
+.sb-frame-panel-title strong {
+  color: #0B1320;
+  font-size: 14px;
+  font-weight: 900;
+}
+.sb-frame-panel-title em {
+  color: rgba(69, 90, 100, 0.66);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+.sb-frame-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: rgba(69, 90, 100, 0.72);
+  font-size: 11px;
+  font-weight: 900;
+}
+.sb-frame-layout {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.76fr) minmax(260px, 1fr) minmax(320px, 1.18fr);
+  gap: 22px;
+  padding: 18px;
+}
+.sb-frame-copy-col,
+.sb-frame-context-col,
+.sb-frame-preview-col {
+  min-width: 0;
+}
+.sb-frame-field-label {
+  /* 字段标题 (画面描述 / 关键信息 / 参考素材 / 对白旁白 / 图片展示),
+     颜色对齐资产页角色卡副标题 (text-on-surface-variant 全不透明)。
+     margin-bottom 4px: 收紧标题与正文之间的间距。 */
+  margin: 0 0 4px;
+  color: #2C3E50;
+  font-size: 11px;
+  font-weight: 900;
+}
+.sb-frame-field-label-row {
+  min-height: 20px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 4px;
+}
+.sb-frame-field-label-row .sb-frame-field-label {
+  margin: 0;
+}
+.sb-frame-prompt-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 72px;
+  color: rgba(69, 90, 100, 0.66);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1.4;
+  text-align: right;
+  white-space: nowrap;
+}
+.sb-frame-prompt-status[data-status="saving"] {
+  color: #2563eb;
+}
+.sb-frame-prompt-status[data-status="saved"],
+.sb-frame-prompt-status[data-status="restored"] {
+  color: #047857;
+}
+.sb-frame-prompt-status[data-status="error"] {
+  color: #b42318;
+}
+.sb-frame-prompt-status-retry {
+  min-height: 20px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(180, 35, 24, 0.22);
+  background: rgba(254, 243, 242, 0.9);
+  color: #b42318;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+.sb-frame-text-box,
+.sb-frame-dialogue-box {
+  /* 正文样式对齐资产页 .asset-desc-text:
+       - 11px 字号 / 默认 weight (~400, 浏览器默认)
+       - 60% 透明的灰 (text-on-surface-variant/60)
+       - hover 颜色全不透明 (asset 卡同款)
+       - 平时无边框, 聚焦后(tabindex)显示边框 + 微微的白底 + focus ring,
+         模拟 asset 卡 textarea 的"编辑态"视觉。 */
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: rgba(44, 62, 80, 0.6);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow: auto;
+  cursor: text;
+  outline: none;
+  transition: color 0.16s ease, border-color 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+.sb-frame-prompt-editor {
+  display: block;
+  max-height: calc(18 * 1.75em + 14px);
+  min-height: calc(18 * 1.75em + 14px);
+  padding: 6px 8px 6px 0;
+  resize: none;
+  overflow-y: auto;
+}
+.sb-frame-prompt-editor::placeholder {
+  color: rgba(69, 90, 100, 0.45);
+}
+.sb-frame-text-box:hover,
+.sb-frame-dialogue-box:hover {
+  color: #2C3E50;
+}
+.sb-frame-text-box:focus,
+.sb-frame-text-box:focus-within,
+.sb-frame-dialogue-box:focus,
+.sb-frame-dialogue-box:focus-within {
+  border-color: rgba(144, 164, 174, 0.32);
+  background: rgba(255, 255, 255, 0.7);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
+  color: #2C3E50;
+}
+.sb-frame-text-box {
+  /* padding 横向 0 → 正文左缘与标题左缘对齐; 纵向保留 6px 给焦点边框留呼吸感。 */
+  height: 228px;
+  padding: 6px 0;
+}
+.sb-frame-text-box.sb-frame-prompt-editor {
+  height: calc(18 * 1.75em + 14px);
+  padding: 6px 8px 6px 0;
+}
+.sb-frame-dialogue-box {
+  min-height: 80px;
+  max-height: 112px;
+  padding: 6px 0;
+}
+.sb-frame-source-line,
+.sb-frame-plan-note {
+  margin-top: 8px;
+  color: rgba(69, 90, 100, 0.62);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+}
+.sb-frame-plan-note {
+  color: rgba(11, 19, 32, 0.58);
+}
+.sb-frame-keywords {
+  min-height: 34px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.sb-frame-key-chip {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 13px;
+  border-radius: 9px;
+  border: 1px solid rgba(144, 164, 174, 0.18);
+  background: rgba(236, 239, 241, 0.62);
+  color: #263238;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.1;
+}
+.sb-frame-empty-note {
+  color: rgba(69, 90, 100, 0.58);
+  font-size: 11px;
+  font-weight: 800;
+}
+.sb-frame-context-col .sb-material-panel {
+  margin: 0 0 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.sb-frame-context-col .sb-material-panel-title {
+  display: none;
+}
+.sb-frame-context-col .ffe-material-empty {
+  min-height: 54px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px dashed rgba(144, 164, 174, 0.24);
+  color: rgba(69, 90, 100, 0.58);
+  font-size: 11px;
+  font-weight: 800;
+}
+.sb-frame-context-col .ffe-material-strip {
+  gap: 9px;
+}
+.sb-frame-context-col .sb-material-thumb-image,
+.sb-frame-context-col .sb-material-add-box {
+  min-height: 58px;
+  border-radius: 10px;
+}
+.sb-frame-context-col .sb-material-add-box em {
+  font-size: 9px;
+}
+.sb-frame-preview-stage {
+  position: relative;
+  width: 100%;
+  height: clamp(220px, 18vw, 292px);
+  border-radius: 14px;
+  background: #05070A;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.sb-frame-preview-stage > img,
+.sb-frame-preview-stage > .sb-frame-placeholder {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.sb-frame-preview-stage > img {
+  object-fit: contain;
+  background: #05070A;
+  /* hover 放大: 严格只在 .sb-frame-preview-stage 本身被 hover 时才放大。
+     不用 Tailwind group-hover, 避免被外层 .shot-workbench-card.group 误触,
+     也避免新 img 首次挂载时如果鼠标恰好在大卡里, 直接以放大状态闪入。 */
+  transform: scale(1);
+  transition: transform 0.7s ease;
+}
+.sb-frame-preview-stage:hover > img {
+  transform: scale(1.05);
+}
+.sb-frame-panel .sb-frame-placeholder {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  background: rgba(236, 239, 241, 0.75);
+}
+.sb-frame-loading,
+.sb-frame-error {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+.sb-frame-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: nowrap;
+  padding-top: 12px;
+}
+.sb-frame-actions button {
+  min-height: 34px;
+  padding: 7px 10px;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0;
+}
+.sb-frame-actions button span:not(.material-symbols-outlined) {
+  white-space: nowrap;
+}
+.sb-frame-actions button .material-symbols-outlined {
+  font-size: 15px;
+}
+.tail-advice-banner {
+  border-bottom: 1px solid rgba(144, 164, 174, 0.12);
+}
+
+@media (max-width: 1500px) {
+  .shot-card-head {
+    /* 窄屏单列堆叠: 标题块在上, 景别/运镜/按钮在下, 都左对齐。 */
+    grid-template-columns: 1fr;
+    justify-items: stretch;
+  }
+  .shot-card-meta-actions,
+  .shot-card-specs {
+    justify-content: flex-start;
+  }
+  .shot-card-actions {
+    /* 已在常规态就是 static + opacity:1, 这里保留兜底防御。 */
+    position: static;
+    opacity: 1;
+  }
+  .sb-frame-layout {
+    grid-template-columns: minmax(180px, 0.78fr) minmax(240px, 1fr) minmax(300px, 1fr);
+    gap: 16px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .sb-frame-layout {
+    grid-template-columns: 1fr;
+  }
+  .sb-frame-text-box {
+    height: 140px;
+  }
+  .sb-frame-text-box.sb-frame-prompt-editor {
+    height: calc(18 * 1.75em + 14px);
+  }
+  .sb-frame-preview-stage {
+    height: min(62vw, 360px);
+  }
+}
+
 /* 剧本对照面板：和右侧资产卡一致的毛玻璃风格，文字改深色保证可读。 */
 .script-ref-panel {
   background: rgba(255, 255, 255, 0.85);
@@ -11235,17 +11897,17 @@ body.first-frame-editor-lock {
   height: 0;
   display: none;
 }
-#firstFrameEditorRoot [data-ffe-field="promptOverride"] {
+#firstFrameEditorRoot [data-ffe-field="content"] {
   overflow-y: auto !important;
   scrollbar-width: thin;
   scrollbar-color: rgba(99, 117, 143, 0.35) transparent;
 }
-#firstFrameEditorRoot [data-ffe-field="promptOverride"]::-webkit-scrollbar {
+#firstFrameEditorRoot [data-ffe-field="content"]::-webkit-scrollbar {
   width: 6px;
   height: 6px;
   display: block;
 }
-#firstFrameEditorRoot [data-ffe-field="promptOverride"]::-webkit-scrollbar-thumb {
+#firstFrameEditorRoot [data-ffe-field="content"]::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background: rgba(99, 117, 143, 0.35);
 }
@@ -12457,6 +13119,50 @@ body.first-frame-editor-lock {
   cursor: zoom-in;
   display: block;
 }
+.ffe-preview-stage.is-generating img {
+  filter: blur(1px) saturate(0.82);
+}
+.ffe-image-generating {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(226, 232, 240, 0.58);
+  backdrop-filter: blur(2px);
+}
+.ffe-image-generating-card {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-width: 132px;
+  min-height: 92px;
+  padding: 18px 22px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(203, 213, 225, 0.72);
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.16);
+  color: #0b1320;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+.ffe-image-generating-spinner {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: 3px solid rgba(37, 99, 235, 0.18);
+  border-top-color: #2563eb;
+  animation: ffe-spin 0.8s linear infinite;
+}
+@keyframes ffe-spin {
+  to { transform: rotate(360deg); }
+}
 .ffe-image-stale {
   margin-top: 8px;
   padding: 7px 9px;
@@ -12467,6 +13173,68 @@ body.first-frame-editor-lock {
   font-size: 11px;
   line-height: 1.35;
   font-weight: 700;
+}
+.ffe-image-alert-stack {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ffe-image-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  padding-right: 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+.ffe-image-alert-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.ffe-image-alert-dismiss {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -2px -2px 0 0;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+.ffe-image-alert-dismiss:hover {
+  opacity: 1;
+  background: rgba(15, 23, 42, 0.08);
+}
+.ffe-image-alert-dismiss .material-symbols-outlined {
+  font-size: 15px;
+}
+.ffe-image-alert--warn {
+  border-color: rgba(217, 119, 6, 0.28);
+  background: rgba(254, 243, 199, 0.82);
+  color: #92400e;
+}
+.ffe-image-alert--info {
+  border-color: rgba(59, 130, 246, 0.28);
+  background: rgba(219, 234, 254, 0.78);
+  color: #1d4ed8;
+}
+.ffe-image-alert--error {
+  border-color: rgba(239, 68, 68, 0.32);
+  background: rgba(254, 226, 226, 0.85);
+  color: #b91c1c;
 }
 .ffe-image-empty,
 .ffe-chat-empty,

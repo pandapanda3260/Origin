@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { chatComplete } from '@/lib/llm';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { sanitizeFillLightPositiveMentions, sanitizePromptObject } from '@/lib/content-sanitize';
+import { sanitizePromptObject } from '@/lib/content-sanitize';
 import { appendCharacterCastingPrompt, omitCastingProfileFromStyleBible } from '@/lib/casting-profile';
 
 export const runtime = 'nodejs';
@@ -70,9 +70,9 @@ export async function POST(req: NextRequest) {
     return jsonError('提示词生成失败：' + (e?.message || String(e)), 502);
   }
 
-  let cleaned = sanitizeFillLightPositiveMentions(prompt.trim().replace(/^["'`]|["'`]$/g, ''));
+  let cleaned = prompt.trim().replace(/^["'`]|["'`]$/g, '');
   if (target === 'char' || target === 'character') {
-    cleaned = sanitizeFillLightPositiveMentions(appendCharacterCastingPrompt(cleaned, item, rawStyleBible));
+    cleaned = appendCharacterCastingPrompt(cleaned, item, rawStyleBible);
   }
   // 同时返回 prompt 和 imagePrompt 两个字段，前端两种调用方式都能拿到
   return jsonOk({ prompt: cleaned, imagePrompt: cleaned });

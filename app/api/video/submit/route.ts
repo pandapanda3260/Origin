@@ -20,6 +20,7 @@ import {
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { artifactUsageBlockedPayload, describeArtifactStatus } from '@/lib/sentinel';
+import { applyBlockerFilterWithWarnings } from '@/lib/batch-preflight';
 import {
   AssetQuotaError,
   assertCanStartAssetGeneration,
@@ -90,14 +91,15 @@ export async function POST(req: NextRequest) {
   let payloadModeReason: string | undefined;
   let assetBatchId: string | null = null;
   let assetShotUid: string | null = null;
+  let videoPromptSourceHash: string | null | undefined;
 
   if (hasProjectContext) {
-    const sentinel = describeArtifactStatus(project as any, {
+    const sentinel = applyBlockerFilterWithWarnings(describeArtifactStatus(project as any, {
       projectId,
       targetArtifact: 'video_segment',
       groupIdx,
       consumerOperation: 'video_submit',
-    });
+    })).decision;
     if (sentinel.usability === 'BLOCKED') {
       return Response.json(artifactUsageBlockedPayload(sentinel), { status: 409 });
     }
@@ -113,6 +115,7 @@ export async function POST(req: NextRequest) {
     if (!sb) return codedError('storyboard_not_found', `找不到片段 ${groupIdx + 1}。`, 404);
     assetShotUid = shotUidForGroup(project, groupIdx);
     prompt = String(sb.videoPrompt || '').trim();
+    videoPromptSourceHash = String(sb.videoPromptSourceHash || '') || null;
     if (!prompt) return codedError('missing_video_prompt', '缺少视频提示词，请先生成视频提示词。', 400);
 
     const firstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
@@ -211,10 +214,11 @@ export async function POST(req: NextRequest) {
       size: body.size || '1080x1920',
       resolution: body.resolution || body.quality,
       generateAudio: normalizeGenerateAudio(body.generateAudio ?? body.genAudio, true),
-      durationSec: body.durationSec || 4,
-      projectId: projectId || undefined,
-      groupIdx: hasProjectContext ? groupIdx : undefined,
-      referenceImagePath,
+	      durationSec: body.durationSec || 4,
+	      projectId: projectId || undefined,
+	      groupIdx: hasProjectContext ? groupIdx : undefined,
+	      videoPromptSourceHash,
+	      referenceImagePath,
       referenceImageRole,
       seedanceImageMode,
       payloadModeReason,

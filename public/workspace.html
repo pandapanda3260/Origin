@@ -9,10 +9,68 @@
     <meta http-equiv="Expires" content="0" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Origin</title>
+    <script>
+      (function () {
+        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "toolbox", "profile", "settings", "onlineEditor"];
+        var hashKey = "workspacePage";
+        function normalize(page) {
+          page = String(page || "");
+          if (page === "online-editor") page = "onlineEditor";
+          if (page === "images") page = "shots";
+          if (pages.indexOf(page) === -1 || page === "onlineEditor") return "";
+          return page;
+        }
+        function readStorage(storage, key) {
+          try { return storage.getItem(key) || ""; } catch (_) { return ""; }
+        }
+        function currentPrefix() {
+          try {
+            var user = JSON.parse(window.localStorage.getItem("sw_auth_user") || "{}");
+            return user && user.id ? ("u" + user.id + "_") : "";
+          } catch (_) {
+            return "";
+          }
+        }
+        var prefix = currentPrefix();
+        var page = readStorage(window.sessionStorage, prefix + "sw_workspace_active_page");
+        if (!page) {
+          try { page = (window.history && window.history.state && window.history.state.originWorkspaceActivePage) || ""; } catch (_) {}
+        }
+        if (!page) {
+          try {
+            var hash = String(window.location.hash || "");
+            var hashPrefix = "#" + hashKey + "=";
+            if (hash.indexOf(hashPrefix) === 0) page = decodeURIComponent(hash.slice(hashPrefix.length));
+          } catch (_) {}
+        }
+        if (!page) page = readStorage(window.localStorage, prefix + "sw_workspace_active_page_fallback");
+        page = normalize(page);
+        document.documentElement.setAttribute("data-workspace-boot-page", page || "overview");
+      })();
+    </script>
+    <style>
+      html[data-workspace-boot-page]:not([data-workspace-boot-ready]) .main-area > [id^="page"] {
+        display: none !important;
+      }
+      html[data-workspace-boot-page="overview"]:not([data-workspace-boot-ready]) #pageOverview,
+      html[data-workspace-boot-page="script"]:not([data-workspace-boot-ready]) #pageScript,
+      html[data-workspace-boot-page="style"]:not([data-workspace-boot-ready]) #pageStyle,
+      html[data-workspace-boot-page="assets"]:not([data-workspace-boot-ready]) #pageAssets,
+      html[data-workspace-boot-page="shots"]:not([data-workspace-boot-ready]) #pageShots,
+      html[data-workspace-boot-page="prompts"]:not([data-workspace-boot-ready]) #pagePrompts,
+      html[data-workspace-boot-page="batch"]:not([data-workspace-boot-ready]) #pageBatch,
+      html[data-workspace-boot-page="edit"]:not([data-workspace-boot-ready]) #pageEdit,
+      html[data-workspace-boot-page="library"]:not([data-workspace-boot-ready]) #pageLibrary,
+      html[data-workspace-boot-page="toolbox"]:not([data-workspace-boot-ready]) #pageToolbox,
+      html[data-workspace-boot-page="profile"]:not([data-workspace-boot-ready]) #pageProfile,
+      html[data-workspace-boot-page="settings"]:not([data-workspace-boot-ready]) #pageSettings {
+        display: block !important;
+      }
+    </style>
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=111" />
+    <link rel="stylesheet" href="styles.css?v=118" />
     <script>
       tailwind.config = {
         theme: {
@@ -576,7 +634,10 @@
                   <h2>剧本工作台</h2>
                   <p>SCRIPT WORKBENCH</p>
                 </div>
-                <span class="script-workbench-status">草稿编辑</span>
+                <div class="script-panel-heading-actions">
+                  <button type="button" id="btnRetagEmotions" class="script-retag-btn" hidden>重新分析情绪</button>
+                  <span class="script-workbench-status">草稿编辑</span>
+                </div>
               </div>
 
               <div class="script-workbench-scroll elegant-scroll" id="chatMessages">
@@ -646,7 +707,6 @@
                             <textarea id="scriptOutput" rows="10" class="script-output hidden"></textarea>
                           </div>
                           <div id="emotionRuler" class="emotion-ruler" hidden></div>
-                          <button type="button" id="btnRetagEmotions" class="script-retag-btn" hidden>重新分析情绪</button>
                         </div>
                       </div>
                     </div>
@@ -1054,10 +1114,20 @@
                 <h2>片段生成</h2>
                 <span>BATCH GENERATION</span>
               </div>
-              <button type="button" id="btnStartBatch" class="batch-primary-action" data-write-action>
-                <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">rocket_launch</span>
-                <span>确认片段视频，进入剪辑 →</span>
-              </button>
+              <div class="batch-redesign-hero-actions">
+                <button type="button" id="btnGenerateAllSegments" class="batch-primary-action" data-write-action>
+                  <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">bolt</span>
+                  <span>全部生成</span>
+                </button>
+                <button type="button" id="btnImportAllSegments" class="batch-primary-action" data-write-action>
+                  <span class="material-symbols-outlined">playlist_add_check</span>
+                  <span>全部导入</span>
+                </button>
+                <button type="button" id="btnStartBatch" class="batch-primary-action" data-write-action>
+                  <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">rocket_launch</span>
+                  <span>确认片段视频，进入剪辑 →</span>
+                </button>
+              </div>
             </section>
 
             <p class="batch-hint" id="batchHint"></p>
@@ -1153,6 +1223,16 @@
                   <label><span class="material-symbols-outlined">water_drop</span><span>水印</span><input type="checkbox" id="batchWatermark" /><span class="batch-switch-status" data-for="batchWatermark">无水印</span></label>
                 </div>
 
+                <div id="outputHistoryCard" class="batch-config-group" hidden>
+                  <label for="outputHistorySelect">历史视频</label>
+                  <select id="outputHistorySelect" class="batch-quality-select"></select>
+                  <button type="button" id="btnApplyHistoryPrompt" class="batch-primary-action batch-primary-action--secondary w-full justify-center mt-3" disabled>
+                    <span class="material-symbols-outlined">restore_page</span>
+                    <span>替换当前提示词</span>
+                  </button>
+                  <p id="outputHistoryPromptHint" class="batch-config-note">只可使用当前项目的历史视频提示词。</p>
+                </div>
+
               </section>
 
               <section class="batch-workbench" aria-label="片段工作台">
@@ -1174,16 +1254,6 @@
                     <span>已完成 <b id="batchTabDone">0</b></span>
                     <span>未开始 <b id="batchTabPending">0</b></span>
                     <span>异常 <b id="batchTabFailed">0</b></span>
-                  </div>
-                  <div class="batch-workbench-actions">
-                    <button type="button" id="btnGenerateAllSegments" class="batch-workbench-action batch-workbench-action-dark" data-write-action>
-                      <span class="material-symbols-outlined" style="font-variation-settings:'FILL' 1;">bolt</span>
-                      <span>全部生成</span>
-                    </button>
-                    <button type="button" id="btnImportAllSegments" class="batch-workbench-action" data-write-action>
-                      <span class="material-symbols-outlined">playlist_add_check</span>
-                      <span>全部导入</span>
-                    </button>
                   </div>
                 </div>
 
@@ -1711,7 +1781,7 @@
         "/modules/assets.js":         "/modules/assets.js?v=107",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
-        "/modules/edit.js":           "/modules/edit.js?v=101",
+        "/modules/edit.js":           "/modules/edit.js?v=102",
         "/modules/episodes.js":       "/modules/episodes.js?v=100",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/project.js":        "/modules/project.js?v=102",
@@ -1723,15 +1793,15 @@
         "/modules/storyboard.js":     "/modules/storyboard.js?v=117",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
         "/modules/tasks.js":          "/modules/tasks.js?v=100",
-        "/modules/utils.js":          "/modules/utils.js?v=102",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=104",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=108"
+        "/modules/utils.js":          "/modules/utils.js?v=103",
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=105",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=110"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
-    <script type="module" src="modules/utils.js?v=102"></script>
-    <script type="module" src="main.js?v=146"></script>
+    <script type="module" src="modules/utils.js?v=103"></script>
+    <script type="module" src="main.js?v=159"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

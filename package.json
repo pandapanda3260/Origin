@@ -46,6 +46,7 @@
     "test:project-dependency-state": "tsx scripts/test-project-dependency-state.js",
     "test:video-payload-decision": "tsx scripts/test-video-payload-decision.js",
     "test:video-reference-manifest": "node scripts/test-video-reference-manifest.js",
+    "test:video-prompt-lifecycle": "tsx scripts/test-video-prompt-lifecycle.ts",
     "test:video-prompt-dialogue-regression": "tsx scripts/test-video-prompt-dialogue-regression.ts",
     "test:visual-reference-state": "node scripts/test-visual-reference-state.js",
     "check:video-capabilities": "tsx scripts/check-video-model-capability-coverage.ts",

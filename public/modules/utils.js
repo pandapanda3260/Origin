@@ -819,6 +819,15 @@ export function showToast(msg, type, actions) {
   setTimeout(() => _dismissToast(el), dismissMs);
 }
 
+export function showConsistencyAggregateWarning(resp) {
+  const warnings = resp && resp.preflight && Array.isArray(resp.preflight.warnings)
+    ? resp.preflight.warnings
+    : [];
+  const item = warnings.find(w => w && w.kind === 'consistency_aggregate');
+  if (!item) return;
+  showToast(item.message || '角色一致性仍有待优化，已继续生成。', 'warn');
+}
+
 /**
  * 通用确认弹窗。支持两种用法：
  *   1. 回调式：showConfirm(title, msg, () => onOk(), () => onCancel())

@@ -16,7 +16,6 @@ import {
 } from '@/lib/video-payload-decision';
 import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
-import { buildFirstFramePlanPreview, currentFirstFrameEditDraft, isFirstFrameEditDraftStale } from '@/lib/first-frame-edit-draft';
 import {
   beginShotPlanGeneration,
   computeShotPlanSourceHash,
@@ -24,12 +23,13 @@ import {
   type ShotPlanSourceSnapshot,
 } from '@/lib/project-dependency-state';
 import { logVideoPromptTrace } from '@/lib/video-prompt-observability';
+import { artifactUsageBlockedPayload } from '@/lib/sentinel';
 import {
-  describeArtifactStatus,
-  artifactUsageBlockedPayload,
-  type ArtifactUsageDecision,
-  type TargetArtifact,
-} from '@/lib/sentinel';
+  collectBatchPreflight,
+  formatBatchPreflightBlockedDecision,
+  isShotPlanDependentBatchType,
+  sentinelMessage,
+} from '@/lib/batch-preflight';
 import '@/lib/init-executors'; // 副作用：注册所有 executor
 
 export const runtime = 'nodejs';
@@ -143,78 +143,6 @@ function formatVideoPayloadPreflightItem(item: any) {
   };
 }
 
-function targetArtifactForBatch(batchType: string): TargetArtifact | null {
-  if (batchType === 'storyboard_prompts') return 'storyboard_prompt';
-  if (batchType === 'storyboard_images') return 'storyboard_image_generation';
-  if (batchType === 'tail_frame_images') return 'storyboard_image';
-  if (batchType === 'video_prompts') return 'video_prompt_generation';
-  if (batchType === 'video_segments' || batchType === 'videos') return 'video_segment';
-  return null;
-}
-
-function sentinelMessage(decision: ArtifactUsageDecision) {
-  const groupLabel = decision.groupIdx == null ? '当前项目' : `片段 ${decision.groupIdx + 1}`;
-  const reason = decision.blockingReasons[0] || decision.reasons[0] || 'artifact_usage_blocked';
-  if (reason === 'shot_plan_generating') return '镜头计划仍在生成中，请等待完成后再进入下游生成。';
-  if (reason === 'shot_plan_failed') return '镜头计划生成失败，请先重新生成镜头计划。';
-  if (reason === 'shot_plan_stale' || reason === 'shot_plan_fresh_but_hash_mismatch') {
-    return '镜头计划所依赖的剧本/风格/资产已变化，请先确认旧镜头仍可用或重新生成。';
-  }
-  if (reason === 'shot_plan_legacy_unknown') return '当前镜头计划来自旧版本，请先确认旧镜头仍可用或重新生成。';
-  if (reason === 'storyboard_stale') return `${groupLabel} 分镜图已过期，请先重新生成分镜图。`;
-  if (reason === 'shot_prompt_stale') return `${groupLabel} 分镜提示词已过期，请先重新生成提示词。`;
-  if (reason === 'video_prompt_stale') return `${groupLabel} 视频提示词已过期，请先重新生成视频提示词。`;
-  if (reason === 'video_task_outdated' || reason === 'video_task_stale' || reason === 'storyboard_video_not_current') {
-    return `${groupLabel} 已有视频片段与当前上游不一致，请重新生成视频。`;
-  }
-  if (reason === 'character_consistency_blocked') {
-    const first = decision.consistency?.blockers?.[0]?.message;
-    return first ? `${groupLabel} 角色一致性未通过：${first}` : `${groupLabel} 角色一致性未通过。`;
-  }
-  return `${groupLabel} 产物一致性检查未通过：${reason}`;
-}
-
-function formatSentinelBlockedDecision(decision: ArtifactUsageDecision) {
-  const reason = decision.blockingReasons[0] || decision.reasons[0] || 'artifact_usage_blocked';
-  return {
-    groupIdx: decision.groupIdx ?? 0,
-    status: decision.generation || 'blocked',
-    reason,
-    blockers: (decision.consistency?.blockers?.length ? decision.consistency.blockers : [{
-      code: reason,
-      subReason: decision.upstreamStaleReasons?.join(',') || '',
-      message: sentinelMessage(decision),
-    }]),
-    warnings: decision.consistency?.warnings || [],
-    nextActions: decision.repairActions.map((action) => action.kind),
-    decision,
-  };
-}
-
-function sentinelPreflightForBatch(project: any, projectId: string, batchType: string, targets: any[]) {
-  const targetArtifact = targetArtifactForBatch(batchType);
-  if (!targetArtifact) return [] as ArtifactUsageDecision[];
-  return targets
-    .map((target: any, seq: number) => {
-      const rawGroupIdx = target?.groupIdx ?? target?.storyboardIdx ?? target?.idx;
-      const groupIdx = Number(rawGroupIdx);
-      const shotIndices = Array.isArray(target?.shotIndices)
-        ? target.shotIndices.filter((idx: any) => Number.isInteger(idx) && idx >= 0)
-        : targetArtifact === 'storyboard_prompt'
-          ? [Number.isFinite(groupIdx) ? Math.floor(groupIdx) : seq]
-          : undefined;
-      return describeArtifactStatus(project, {
-        projectId,
-        targetArtifact,
-        groupIdx: Number.isFinite(groupIdx) && groupIdx >= 0 ? Math.floor(groupIdx) : undefined,
-        shotIndices,
-        batchType,
-        consumerOperation: 'batch_start',
-      });
-    })
-    .filter((decision) => decision.usability === 'BLOCKED');
-}
-
 function normalizeTargetGroupIdx(target: any): number | null {
   const rawGroupIdx = target?.groupIdx ?? target?.storyboardIdx ?? target?.idx;
   const groupIdx = Number(rawGroupIdx);
@@ -222,15 +150,23 @@ function normalizeTargetGroupIdx(target: any): number | null {
   return Math.floor(groupIdx);
 }
 
-function isShotPlanDependentBatchType(batchType: string) {
-  return [
-    'storyboard_prompts',
-    'storyboard_images',
-    'tail_frame_images',
-    'video_prompts',
-    'video_segments',
-    'videos',
-  ].includes(batchType);
+const VIDEO_PROMPT_DRAFT_PREFLIGHT_EXEMPT_REASONS = new Set([
+  'missing_video_prompt',
+  'video_prompt_failed',
+  'video_prompt_stale',
+]);
+
+function hasSavedVideoPromptDraft(project: any, groupIdx: number) {
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const draft = storyboards[groupIdx]?.videoPromptEditDraft;
+  return !!(draft && typeof draft.content === 'string' && draft.content.trim());
+}
+
+function canDraftSatisfyVideoPromptBlock(project: any, groupIdx: number, reasons: any[]) {
+  if (!hasSavedVideoPromptDraft(project, groupIdx)) return false;
+  const blockingReasons = (reasons || []).map((reason) => String(reason || '')).filter(Boolean);
+  if (!blockingReasons.length) return false;
+  return blockingReasons.every((reason) => VIDEO_PROMPT_DRAFT_PREFLIGHT_EXEMPT_REASONS.has(reason));
 }
 
 function markVideoPromptBatchTargetsStarted(opts: {
@@ -343,8 +279,7 @@ export async function POST(req: NextRequest) {
   const options: any = body.options || {};
   let batchOptions: any = options;
   const applyEditDraft = body.applyEditDraft === true || options?.applyEditDraft === true;
-  const allowStaleEditDraft = body.allowStaleEditDraft === true || options?.allowStaleEditDraft === true;
-  let videoPreflightWarnings: any[] = [];
+  let batchPreflightWarnings: any[] = [];
   let shotPlanStartContext: null | { sourceHash: string; sourceSnapshot: ShotPlanSourceSnapshot } = null;
 
   if (!batchType) return jsonError('缺 batchType', 400);
@@ -367,9 +302,18 @@ export async function POST(req: NextRequest) {
   if (isShotPlanDependentBatchType(batchType)) {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
-    const blockedDecisions = sentinelPreflightForBatch(proj as any, projectId, batchType, targets);
+    const preflight = collectBatchPreflight(proj as any, projectId, batchType, targets, { consumerOperation: 'batch_start' });
+    let blockedDecisions = preflight.blockedDecisions;
+    if (batchType === 'video_segments' || batchType === 'videos') {
+      blockedDecisions = blockedDecisions.filter((decision: any) => {
+        const groupIdx = Number(decision?.groupIdx);
+        if (!Number.isInteger(groupIdx) || groupIdx < 0) return true;
+        return !canDraftSatisfyVideoPromptBlock(proj as any, groupIdx, decision.blockingReasons || decision.reasons || []);
+      });
+    }
+    batchPreflightWarnings = preflight.warnings;
     if (blockedDecisions.length) {
-      const blockedItems = blockedDecisions.map(formatSentinelBlockedDecision);
+      const blockedItems = blockedDecisions.map(formatBatchPreflightBlockedDecision);
       const first = blockedDecisions[0];
       return Response.json(
         {
@@ -389,39 +333,9 @@ export async function POST(req: NextRequest) {
   }
 
   if (batchType === 'storyboard_images' && applyEditDraft) {
-    const proj = getProjectByIdForUser(projectId, user.id);
-    if (!proj) return jsonError('项目不存在', 404);
-    for (const target of targets) {
-      const groupIdx = normalizeTargetGroupIdx(target);
-      if (groupIdx == null) continue;
-      const { draft } = currentFirstFrameEditDraft(proj as any, groupIdx);
-      if (!draft) {
-        return Response.json(
-          { error: 'no_edit_draft', code: 'no_edit_draft', detail: '当前片段没有已保存的首帧编辑草稿。' },
-          { status: 400 },
-        );
-      }
-      const currentHash = buildFirstFramePlanPreview({
-        project: proj as any,
-        groupIdx,
-        ownerId: user.id,
-        user,
-      }).sourceHash;
-      if (isFirstFrameEditDraftStale(draft.sourceHash, currentHash) && !allowStaleEditDraft) {
-        return Response.json(
-          {
-            error: 'stale_edit_draft',
-            code: 'stale_edit_draft',
-            groupIdx,
-          },
-          { status: 409 },
-        );
-      }
-    }
     batchOptions = {
       ...(batchOptions || {}),
       applyEditDraft: true,
-      allowStaleEditDraft,
     };
   }
 
@@ -441,9 +355,6 @@ export async function POST(req: NextRequest) {
   if (batchType === 'video_prompts') {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
-    if (!(proj as any).imagesApproved) {
-      return jsonError('请先确认分镜图，再生成视频提示词。', 409);
-    }
     const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
     targets.forEach((target: any, seq: number) => {
       const rawGroupIdx = target?.groupIdx ?? target?.storyboardIdx ?? target?.idx;
@@ -473,11 +384,13 @@ export async function POST(req: NextRequest) {
     );
     const readiness = assertVideoPromptReadyForGroups(proj as any, groupIdxs, 'videoSegment', { skipConsistency: true });
     const warningItems = [
-      ...videoPreflightWarnings,
-      ...(readiness.warnings || []).map(formatVideoPreflightWarningItem),
+      ...batchPreflightWarnings,
     ];
-    if (!readiness.ok) {
-      const blockedItems = readiness.blocked.map(formatVideoPreflightBlockedItem);
+    const readinessBlocked = readiness.ok
+      ? []
+      : readiness.blocked.filter((item: any) => !canDraftSatisfyVideoPromptBlock(proj as any, Number(item?.groupIdx), [item?.reason]));
+    if (readinessBlocked.length) {
+      const blockedItems = readinessBlocked.map(formatVideoPreflightBlockedItem);
       const labels = blockedItems.map((item) => `${item.groupIdx + 1}(${item.reason})`).join('、');
       return Response.json(
         {
@@ -562,23 +475,7 @@ export async function POST(req: NextRequest) {
       );
     }
     warningItems.push(...payloadWarnings);
-    if (warningItems.length && options?.ackPreflightWarnings !== true) {
-      const labels = warningItems.map((item) => `${item.groupIdx + 1}(${item.reason})`).join('、');
-      return Response.json(
-        {
-          error: `视频生成前检查有警告：片段 ${labels}`,
-          code: 'video_segment_preflight_warning',
-          detail: `视频生成前检查有警告：片段 ${labels}`,
-          preflight: {
-            allowed: true,
-            blocked: [],
-            warnings: warningItems,
-          },
-        },
-        { status: 409 },
-      );
-    }
-    if (warningItems.length) videoPreflightWarnings = warningItems;
+    if (warningItems.length) batchPreflightWarnings = warningItems;
   }
 
   try {
@@ -620,8 +517,8 @@ export async function POST(req: NextRequest) {
       status: reused ? 'running' : 'queued',
       reused: !!reused,
       duplicateGroupIdxs: duplicateGroupIdxs || [],
-      preflight: videoPreflightWarnings.length
-        ? { allowed: true, blocked: [], warnings: videoPreflightWarnings }
+      preflight: batchPreflightWarnings.length
+        ? { allowed: true, blocked: [], warnings: batchPreflightWarnings }
         : undefined,
     });
   } catch (e: any) {

@@ -13,6 +13,7 @@ import {
   currentFirstFrameEditDraft,
   nextFirstFrameReferenceMaterialsVersion,
   normalizeFirstFrameReferenceMaterials,
+  reconcileFirstFramePromptStateInPatch,
   type FirstFrameMaterialTileRole,
   type FirstFrameReferenceMaterial,
 } from '@/lib/first-frame-edit-draft';
@@ -150,8 +151,8 @@ export async function POST(req: NextRequest) {
     let firstFrameMaterialPanel: unknown = null;
     const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
-      const preview = buildFirstFramePlanPreview({ project: fresh, groupIdx, ownerId: user.id, user });
-      sourceHash = preview.sourceHash;
+      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user, groupIdx });
+      sourceHash = promptState.sourceHash;
       const { draft } = currentFirstFrameEditDraft(fresh, groupIdx);
       const existing = normalizeFirstFrameReferenceMaterials(fresh);
       const nextMaterials = [
@@ -166,11 +167,17 @@ export async function POST(req: NextRequest) {
       firstFrameMaterialPanel = buildFirstFrameMaterialPanel({
         project: nextFresh,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft,
         sourceHash,
       });
+      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+      if (promptState.slotPatch) {
+        const prev = storyboards[groupIdx] || {};
+        storyboards[groupIdx] = { ...prev, ...promptState.slotPatch };
+      }
       return {
+        ...(promptState.slotPatch ? { storyboards } : {}),
         firstFrameReferenceMaterials: nextMaterials,
         firstFrameReferenceMaterialsVersion: (nextFresh as any).firstFrameReferenceMaterialsVersion,
       };

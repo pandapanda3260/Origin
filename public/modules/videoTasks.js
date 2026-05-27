@@ -5,7 +5,7 @@
  * composition root and injects project/settings/videoState plus cross-domain
  * callbacks through initVideoTasks(ctx).
  */
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning } from './utils.js';
 import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from './edit.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { getBackgroundStylizeCount } from './assets.js';
@@ -47,6 +47,70 @@ export function initVideoTasks(ctx) {
   STATUS_COPY = _ctx.STATUS_COPY || STATUS_COPY;
   VIDEO_ADAPTERS = _ctx.VIDEO_ADAPTERS || VIDEO_ADAPTERS;
   _syncVideoRefs();
+  _ensureBatchTipBound();
+}
+
+// 给 [data-tip] 元素绑定一个轻量浮窗（替代原生 title，鼠标移上去即时显示）。
+function _ensureBatchTipBound() {
+  if (typeof document === "undefined" || document._batchTipBound) return;
+  document._batchTipBound = true;
+  var tipEl = null;
+  function ensureTipEl() {
+    if (tipEl && tipEl.isConnected) return tipEl;
+    tipEl = document.createElement("div");
+    tipEl.className = "app-tip";
+    tipEl.setAttribute("role", "tooltip");
+    document.body.appendChild(tipEl);
+    return tipEl;
+  }
+  function positionTip(target) {
+    if (!tipEl) return;
+    var rect = target.getBoundingClientRect();
+    tipEl.style.visibility = "hidden";
+    tipEl.style.display = "block";
+    var tipRect = tipEl.getBoundingClientRect();
+    var margin = 8;
+    var top = rect.top - tipRect.height - margin;
+    var placement = "top";
+    if (top < margin) {
+      top = rect.bottom + margin;
+      placement = "bottom";
+    }
+    var left = rect.left + rect.width / 2 - tipRect.width / 2;
+    var vw = window.innerWidth;
+    if (left < margin) left = margin;
+    if (left + tipRect.width > vw - margin) left = vw - margin - tipRect.width;
+    tipEl.style.top = Math.round(top) + "px";
+    tipEl.style.left = Math.round(left) + "px";
+    tipEl.dataset.placement = placement;
+    tipEl.style.visibility = "";
+  }
+  function showFor(target) {
+    var text = target.getAttribute("data-tip");
+    if (!text) return;
+    ensureTipEl();
+    tipEl.textContent = text;
+    tipEl.classList.add("is-visible");
+    positionTip(target);
+  }
+  function hide() {
+    if (!tipEl) return;
+    tipEl.classList.remove("is-visible");
+  }
+  document.addEventListener("mouseover", function (e) {
+    var target = e.target.closest && e.target.closest("[data-tip]");
+    if (!target) return;
+    showFor(target);
+  });
+  document.addEventListener("mouseout", function (e) {
+    var target = e.target.closest && e.target.closest("[data-tip]");
+    if (!target) return;
+    var related = e.relatedTarget;
+    if (related && target.contains(related)) return;
+    hide();
+  });
+  window.addEventListener("scroll", hide, true);
+  window.addEventListener("resize", hide);
 }
 
 export function syncVideoTasksProject(p) {
@@ -184,14 +248,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	  function _getVideoSegmentPreflightPayload(source) {
 	    var payload = source && source.payload ? source.payload : source;
 	    if (!payload || !payload.preflight) return null;
-	    if (payload.code === "video_segment_preflight_failed" || payload.code === "video_segment_preflight_warning") return payload;
+	    if (payload.code === "video_segment_preflight_failed") return payload;
 	    return null;
 	  }
 
 	  function _formatVideoSegmentPreflightMessage(payload) {
 	    var preflight = (payload && payload.preflight) || {};
 	    var blocked = Array.isArray(preflight.blocked) ? preflight.blocked : [];
-	    var warnings = Array.isArray(preflight.warnings) ? preflight.warnings : [];
 	    var lines = [];
 	    if (blocked.length) {
 	      lines.push("以下片段暂不能开始视频生成：");
@@ -206,14 +269,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	        lines.push(seg + "：" + (reasons.join("；") || "生成前检查未通过"));
 	      });
 	      if (blocked.length > 8) lines.push("还有 " + (blocked.length - 8) + " 个片段需要处理。");
-	    }
-	    if (warnings.length) {
-	      lines.push(blocked.length ? "\n同时有以下警告：" : "以下片段可以继续，但建议先确认：");
-	      warnings.slice(0, 8).forEach(function (item) {
-	        var seg = "片段 " + (Number(item.groupIdx) + 1);
-	        lines.push(seg + "：" + (item.message || item.reason || "存在非阻断警告"));
-	      });
-	      if (warnings.length > 8) lines.push("还有 " + (warnings.length - 8) + " 个警告。");
 	    }
 	    return lines.join("\n") || (payload && (payload.detail || payload.error)) || "视频生成前检查未通过";
 	  }
@@ -255,48 +310,21 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
 	  async function _postVideoBatchStartWithPreflightHandling(requestBody) {
 	    var body = JSON.parse(JSON.stringify(requestBody || {}));
-	    for (var attempt = 0; attempt < 2; attempt++) {
-	      try {
-	        return { resp: await apiPost("/api/batch/start", body) };
-	      } catch (e) {
-	        var payload = _getVideoSegmentPreflightPayload(e);
-	        if (!payload) throw e;
-	        var preflight = payload.preflight || {};
-	        var msg = _formatVideoSegmentPreflightMessage(payload);
-	        if (preflight.allowed === true && Array.isArray(preflight.warnings) && preflight.warnings.length) {
-	          var proceed = await showConfirm(
-	            "视频生成模式提示",
-	            msg + "\n\n可以按当前模式继续，也可以先回到分镜图页处理提示项。",
-	            "继续生成",
-	            "返回处理",
-	          );
-	          if (proceed) {
-	            body.options = Object.assign({}, body.options || {}, { ackPreflightWarnings: true });
-	            continue;
-	          }
-	          switchPage("images");
-	          return { aborted: true, payload: payload };
-	        }
-	        var go = await showConfirm(
-	          "视频生成前检查未通过",
-	          msg,
-	          "去处理",
-	          "稍后处理",
-	        );
-	        if (go) switchPage(_targetPageForVideoSegmentPreflight(payload));
-	        return { aborted: true, payload: payload };
-	      }
+	    try {
+	      return { resp: await apiPost("/api/batch/start", body) };
+	    } catch (e) {
+	      var payload = _getVideoSegmentPreflightPayload(e);
+	      if (!payload) throw e;
+	      var msg = _formatVideoSegmentPreflightMessage(payload);
+	      var go = await showConfirm(
+	        "视频生成前检查未通过",
+	        msg,
+	        "去处理",
+	        "稍后处理",
+	      );
+	      if (go) switchPage(_targetPageForVideoSegmentPreflight(payload));
+	      return { aborted: true, payload: payload };
 	    }
-	    return { aborted: true };
-	  }
-
-	  function _showVideoSegmentPreflightWarnings(resp) {
-	    var payload = _getVideoSegmentPreflightPayload(resp);
-	    var warnings = payload && payload.preflight && Array.isArray(payload.preflight.warnings)
-	      ? payload.preflight.warnings
-	      : [];
-	    if (!warnings.length) return;
-	    showToast("视频已按当前可用参考进入生成；可稍后回到分镜图页处理提示项", "warn");
 	  }
 
 	  function _hasCurrentVideoForGroup(gIdx) {
@@ -919,8 +947,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           // 已完成的历史任务：跑一遍 videoPipeline 把视频实际加载到 <video>，
           // 让 previewOk 翻 true，避免刷新后卡片显示"预览不可用（已在浏览器打开）"。
           // 失败也无所谓，pipeline 内部会写降级 UI。
+          // —— silent:true：用户感知里 task 始终保持「已完成」，不会被切到
+          // 「下载中」再切回来；预热完全在后台做。
           if (isSucceeded && task.videoUrl) {
-            try { videoPipeline(task).then(function () { updateBadge(); renderBatchClipList(); }); }
+            try { videoPipeline(task, { silent: true }).then(function () { updateBadge(); renderBatchClipList(); }); }
             catch (_pe) {}
           }
 
@@ -1043,10 +1073,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 	  }
 
+  // 预计时长展示在原算法基础上再 /3（用户口径调整：和实际后端调度并发后的体感更贴近）
+  var _BATCH_ESTIMATE_DIVISOR = 3;
+
   function _fallbackBatchEstimateText(stats) {
     var sec = Number(stats && stats.plannedSec) || 0;
     if (!sec) return "—";
-    return "~ " + Math.max(1, Math.ceil(sec * 3 / 60)) + " 分钟";
+    return "~ " + Math.max(1, Math.ceil(sec * 3 / 60 / _BATCH_ESTIMATE_DIVISOR)) + " 分钟";
   }
 
   function _batchEstimateText(stats) {
@@ -1054,7 +1087,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (!total) return "—";
     var avgSec = Number(_videoGenerationEstimate.averageSec);
     if (Number.isFinite(avgSec) && avgSec > 0) {
-      return "~ " + Math.max(1, Math.ceil(avgSec * total / 60)) + " 分钟";
+      return "~ " + Math.max(1, Math.ceil(avgSec * total / 60 / _BATCH_ESTIMATE_DIVISOR)) + " 分钟";
     }
     return _fallbackBatchEstimateText(stats);
   }
@@ -1267,10 +1300,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	      statusLabel = '未开始'; statusTone = 'is-pending'; statusIcon = 'radio_button_checked';
 	    }
 
-		    var taskMeta = escapeHtml(_taskDisplayMeta(task));
-		    var timeStr = formatTime(task.createdAt);
-		    var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
-		    var warningText = firstWarning ? escapeHtml(firstWarning.message || firstWarning.key || String(firstWarning)) : '';
+			    var taskMeta = escapeHtml(_taskDisplayMeta(task));
+			    var timeStr = formatTime(task.createdAt);
+			    var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
+			    var warningText = firstWarning ? escapeHtml(firstWarning.message || firstWarning.key || String(firstWarning)) : '';
+			    var failureText = fail ? _taskFailureDisplayText(task) : '';
+			    if (warningText && failureText && warningText === escapeHtml(failureText)) warningText = '';
 	    var rowGroupIdx = task._groupIdx != null && Number.isFinite(Number(task._groupIdx)) ? Number(task._groupIdx) : null;
 	    var rowGroups = [];
 	    try { rowGroups = getStoryboardGroups() || []; } catch (_rowGroupErr) { rowGroups = []; }
@@ -1294,6 +1329,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	      playBtnHtml =
 	        '<button type="button" class="batch-row-action batch-row-action-primary batch-play-btn" data-video-url="' + escapeHtml(task.blobUrl || task.videoUrl) + '">' +
 	          '<span class="material-symbols-outlined" style="font-variation-settings: \'FILL\' 1;">play_arrow</span>播放' +
+	        '</button>';
+	    }
+
+	    var deleteBtnHtml = '';
+	    if (done && task._groupIdx != null && (task.videoUrl || task.blobUrl)) {
+	      deleteBtnHtml =
+	        '<button type="button" class="batch-row-icon-action mirror-delete-btn" data-action="mirror-delete" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '" title="删除该已生成片段" aria-label="删除该已生成片段">' +
+	          '<span class="material-symbols-outlined">delete</span>' +
 	        '</button>';
 	    }
 
@@ -1330,6 +1373,20 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	        '<button type="button" class="batch-row-action mirror-download-btn" data-action="mirror-download" data-group-idx="' + task._groupIdx + '" data-task-id="' + task.localId + '" title="下载该视频片段">' +
 	          '<span class="material-symbols-outlined">download</span>下载' +
 	        '</button>';
+	    }
+
+	    var moreMenuHtml = '';
+	    if (importBtnHtml || downloadBtnHtml) {
+	      moreMenuHtml =
+	        '<div class="mirror-more-wrap">' +
+	          '<button type="button" class="batch-row-icon-action mirror-more-btn" data-action="toggle-mirror-menu" aria-haspopup="true" aria-expanded="false" title="更多操作" aria-label="更多操作">' +
+	            '<span class="material-symbols-outlined">more_vert</span>' +
+	          '</button>' +
+	          '<div class="mirror-more-menu" hidden>' +
+	            importBtnHtml +
+	            downloadBtnHtml +
+	          '</div>' +
+	        '</div>';
 	    }
 
     if (!mirror) {
@@ -1416,8 +1473,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	          '<h4>' + escapeHtml(rowGroupIdx != null ? (String(rowGroupIdx + 1).padStart(2, "0") + '_片段_' + rowShotType) : _taskDisplayName(task)) + '</h4>' +
 	          '<p>镜头类型：' + escapeHtml(rowShotType) + '</p>' +
 	          '<p>来源：' + taskMeta + '</p>' +
-	          (warningText ? '<p class="batch-row-warning">' + warningText + '</p>' : '') +
-	          (fail && task.statusCn ? '<p class="batch-row-error">' + escapeHtml(task.statusCn) + '</p>' : '') +
+	          (warningText ? '<p class="batch-row-warning has-tip" data-tip="' + warningText + '">' + warningText + '</p>' : '') +
+		          (fail && failureText ? '<p class="batch-row-error has-tip" data-tip="' + escapeHtml(failureText) + '">' + escapeHtml(failureText) + '</p>' : '') +
 	        '</div>' +
 	      '</div>' +
 	      '<div class="batch-row-status">' +
@@ -1438,8 +1495,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	      '<div class="batch-row-actions">' +
 	        playBtnHtml +
 	        regenBtnHtml +
-	        importBtnHtml +
-	        downloadBtnHtml +
+	        deleteBtnHtml +
+	        moreMenuHtml +
 	        failBtnsHtml +
 	      '</div>' +
 	      playerHtml +
@@ -1466,10 +1523,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       var v = player.querySelector("video");
       if (v) {
         try { v.pause(); } catch (_) {}
-        var src = v.currentSrc || v.src || "";
-        if (src.indexOf("blob:") === 0) {
-          try { URL.revokeObjectURL(src); } catch (_) {}
-        }
       }
       var blobUrl = player.dataset && player.dataset.blobUrl;
       if (blobUrl) {
@@ -1478,7 +1531,36 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       player.remove();
     }
 
-    bWrap.addEventListener("click", function (e) {
+    function closeAllMirrorMenus(except) {
+      var menus = bWrap.querySelectorAll(".mirror-more-wrap");
+      menus.forEach(function (w) {
+        if (except && w === except) return;
+        var menu = w.querySelector(".mirror-more-menu");
+        var btn = w.querySelector(".mirror-more-btn");
+        if (menu) menu.hidden = true;
+        if (btn) btn.setAttribute("aria-expanded", "false");
+        w.classList.remove("is-open");
+      });
+    }
+
+    if (!document._mirrorMenuOutsideBound) {
+      document._mirrorMenuOutsideBound = true;
+      document.addEventListener("click", function (e) {
+        var hostWrap = $("batchTaskListWrap");
+        if (!hostWrap) return;
+        if (e.target.closest(".mirror-more-wrap")) return;
+        var menus = hostWrap.querySelectorAll(".mirror-more-wrap");
+        menus.forEach(function (w) {
+          var menu = w.querySelector(".mirror-more-menu");
+          var btn = w.querySelector(".mirror-more-btn");
+          if (menu) menu.hidden = true;
+          if (btn) btn.setAttribute("aria-expanded", "false");
+          w.classList.remove("is-open");
+        });
+      });
+    }
+
+    bWrap.addEventListener("click", async function (e) {
       var closeBtn = e.target.closest(".batch-close-player");
       if (closeBtn && bWrap.contains(closeBtn)) {
         closeInlinePlayer(closeBtn.closest(".batch-inline-player"), e);
@@ -1489,6 +1571,98 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       if (actionBtn) {
         var act = actionBtn.dataset.action;
         var tid = actionBtn.dataset.taskId;
+        if (act === "toggle-mirror-menu") {
+          e.preventDefault();
+          e.stopPropagation();
+          var wrap = actionBtn.closest(".mirror-more-wrap");
+          if (!wrap) return;
+          var menu = wrap.querySelector(".mirror-more-menu");
+          var willOpen = menu && menu.hidden;
+          closeAllMirrorMenus(willOpen ? wrap : null);
+          if (menu) menu.hidden = !willOpen;
+          actionBtn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+          wrap.classList.toggle("is-open", !!willOpen);
+          return;
+        }
+        if (act === "mirror-delete") {
+          var delGIdx = parseInt(actionBtn.dataset.groupIdx, 10);
+          if (isNaN(delGIdx)) return;
+          if (!window.confirm("确定要删除该已生成的视频片段吗？此操作不可撤销。")) return;
+          if (!project || !project.id) {
+            showToast("请先打开项目", "warn");
+            return;
+          }
+          actionBtn.disabled = true;
+          try {
+            var delResp = await apiPost("/api/tasks/video-by-project", {
+              projectId: project.id,
+              groupIdx: delGIdx,
+            }, "DELETE");
+            if (delResp && delResp.serverVersion != null) {
+              project.version = Number(delResp.serverVersion) || project.version;
+            }
+            if (delResp && delResp.edl) {
+              if (!project.editData) project.editData = {};
+              project.editData.edl = delResp.edl;
+            }
+            if (delResp && delResp.readiness) {
+              if (!project.editData) project.editData = {};
+              project.editData.readiness = delResp.readiness;
+            }
+          } catch (delErr) {
+            actionBtn.disabled = false;
+            showToast("删除失败: " + _diagnoseApiError(((delErr && delErr.message) || delErr).toString()), "error");
+            return;
+          }
+          // 1) 清掉本地 storyboard/videoTasks 镜像；后端已原子落盘。
+          try {
+            if (project && project.storyboards && project.storyboards[delGIdx]) {
+              var sbDel = project.storyboards[delGIdx];
+              sbDel.importedToEdit = false;
+              delete sbDel.videoUrl;
+              delete sbDel._originVideoUrl;
+              delete sbDel.videoTaskId;
+              delete sbDel.videoCoverUrl;
+              delete sbDel.videoStatus;
+              delete sbDel.videoMode;
+              delete sbDel.videoTaskFinishedAt;
+              delete sbDel.videoDurationSec;
+              delete sbDel.readyForEdit;
+              delete sbDel.videoWarnings;
+              delete sbDel.videoIsCurrent;
+              // 必须连带清掉 videoAssetId，否则 hydrateProjectAssetUrls 会用
+              // 它重签出新的 videoUrl，导致「删除 → 全部生成」立刻显示已完成。
+              delete sbDel.videoAssetId;
+            }
+            if (project && Array.isArray(project.videoTasks) && project.videoTasks[delGIdx]) {
+              project.videoTasks[delGIdx] = null;
+            }
+          } catch (_e) {}
+          // 2) 干掉关联任务（清掉镜像卡 + 主任务卡）
+          try {
+            for (var dk = videoState.tasks.length - 1; dk >= 0; dk--) {
+              var dt = videoState.tasks[dk];
+              if (dt && Number(dt._groupIdx) === delGIdx) {
+                dt._killed = true;
+                if (dt._sseHandle) { try { dt._sseHandle.close(); } catch (_e) {} dt._sseHandle = null; }
+                if (dt.blobUrl) { try { URL.revokeObjectURL(dt.blobUrl); } catch (_e) {} dt.blobUrl = ""; }
+                if (dt.cardEl && dt.cardEl.parentNode) dt.cardEl.parentNode.removeChild(dt.cardEl);
+                videoState.tasks.splice(dk, 1);
+              }
+            }
+          } catch (_e) {}
+          // 3) 干掉对应的镜像行
+          try {
+            var oldMirror = bWrap.querySelector('[data-group-idx="' + delGIdx + '"]');
+            if (oldMirror && oldMirror.parentNode) oldMirror.parentNode.removeChild(oldMirror);
+          } catch (_e) {}
+          // 4) 刷新本页镜像；不再走 saveProject，避免旧版本整包 PUT 把删除覆盖回来。
+          try { renderBatchClipList(); } catch (_e) {}
+          try { syncTaskListVisibility(); } catch (_e) {}
+          try { updateBadge(); } catch (_e) {}
+          showToast("已删除该视频片段", "ok");
+          return;
+        }
         if (tid && act === "retry") {
           var task = null;
           for (var i = 0; i < videoState.tasks.length; i++) { if (videoState.tasks[i].localId === tid) { task = videoState.tasks[i]; break; } }
@@ -1515,6 +1689,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           var mTask = null;
           if (tid) { for (var j = 0; j < videoState.tasks.length; j++) { if (videoState.tasks[j].localId === tid) { mTask = videoState.tasks[j]; break; } } }
           if (mTask) updateTaskCard(mTask);
+          closeAllMirrorMenus(null);
           return;
         }
         if (act === "mirror-download") {
@@ -1533,6 +1708,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             }
           }
           downloadVideoTask(dlTask, actionBtn);
+          closeAllMirrorMenus(null);
           return;
         }
       }
@@ -1569,8 +1745,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             '<button type="button" class="batch-close-player absolute top-2 right-2 w-7 h-7 rounded-full bg-black/10 text-on-surface flex items-center justify-center hover:bg-black/20 transition-colors">' +
               '<span class="material-symbols-outlined text-sm">close</span>' +
             '</button>' +
-            '<p>暂时无法在此处播放，' +
-            '<a href="' + escapeHtml(videoUrl) + '" target="_blank" class="text-primary underline">点击新窗口播放</a></p>' +
+            '<p>预览加载失败，请关闭后重试。</p>' +
           '</div>';
         var c = playerDiv.querySelector(".batch-close-player");
         if (c) c.addEventListener("click", closePlayer);
@@ -1680,10 +1855,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
   function updateTaskCard(task) {
     if (!task.cardEl) return;
     if (task._killed || (task._projectId && project && task._projectId !== project.id)) return;
-    var st = task.status, active = !isTerminal(task), done = st === "done";
-    var fail = st === "failed" || st === "timeout", fetching = st === "fetching";
-    task.cardEl.classList.toggle("is-active", active);
-	    task._badge.textContent = task.statusCn;
+	    var st = task.status, active = !isTerminal(task), done = st === "done";
+	    var fail = st === "failed" || st === "timeout", fetching = st === "fetching";
+	    task.cardEl.classList.toggle("is-active", active);
+		    task._badge.textContent = fail ? _taskFailureDisplayText(task) : task.statusCn;
 	    task._badge.className = "tc-badge tc-badge--" + st;
 	    if (task._warningText) {
 	      var firstWarning = Array.isArray(task.warnings) && task.warnings.length ? task.warnings[0] : null;
@@ -1766,6 +1941,17 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (task.blobUrl) { try { URL.revokeObjectURL(task.blobUrl); } catch (e) {} task.blobUrl = ""; }
     if (task.cardEl && task.cardEl.parentNode) task.cardEl.parentNode.removeChild(task.cardEl);
     task.cardEl = null; task.videoEl = null;
+    // 同时清掉 batch 页的 mirror 行。否则任务因为 MAX_TASKS_TOTAL 容量超限
+    // 从 videoState.tasks 里被挤掉之后，孤儿 mirror 还留在 batchTaskListWrap
+    // 里，下一次 renderBatchClipList 又给同 groupIdx 渲一个 plan card，于是
+    // 出现「同一片段重复显示两行」的鬼影 bug。
+    try {
+      var bWrap = $("batchTaskListWrap");
+      if (bWrap && task.localId) {
+        var orphan = bWrap.querySelector('[data-mirror-id="' + task.localId + '"]');
+        if (orphan && orphan.parentNode) orphan.parentNode.removeChild(orphan);
+      }
+    } catch (_e) {}
   }
 
   /* Video helpers — API calls delegated to backend */
@@ -1784,13 +1970,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
   }
 
   /* 把底层错误文本分类成用户看得懂的简短提示 */
-  function _friendlyVideoError(errMsg) {
-    var raw = ((errMsg == null) ? "" : String(errMsg));
-    var s = raw.toLowerCase();
-    try { if (s) console.debug('[friendlyVideoError] raw:', raw.slice(0, 200)); } catch (_e) {}
-    if (!s) return "生成失败，请稍后重试";
-    // 积分不足 —— 直接把后端原文（含具体积分数）透出来，不要再被改成"生成失败"
-    if (/积分不足|insufficient.*credit|余额.*不足|credits?.*insufficient/.test(raw)) {
+	  function _friendlyVideoError(errMsg) {
+	    var raw = ((errMsg == null) ? "" : String(errMsg));
+	    var s = raw.toLowerCase();
+	    try { if (s) console.debug('[friendlyVideoError] raw:', raw.slice(0, 200)); } catch (_e) {}
+	    if (!s) return "生成失败，请稍后重试";
+	    if (/低质量提交图|jpeg\s*字节\/像素|low_jpeg_bytes_per_pixel/.test(raw)) return "疑似低质量首帧图生成视频";
+	    // 积分不足 —— 直接把后端原文（含具体积分数）透出来，不要再被改成"生成失败"
+	    if (/积分不足|insufficient.*credit|余额.*不足|credits?.*insufficient/.test(raw)) {
       // 只截前 60 字避免 UI 撑炸
       return raw.length > 60 ? (raw.slice(0, 58) + '…') : raw;
     }
@@ -1798,8 +1985,32 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (/network|econnreset|enet|fetch|connection/.test(s)) return "网络波动，请稍后再试";
     if (/content|policy|safety|blocked|敏感|违规/.test(s)) return "素材不符合内容规范，请调整后重试";
     if (/quota|rate.?limit|429/.test(s)) return "通道繁忙，请稍后再试";
-    return "生成失败，请稍后重试";
-  }
+	    return "生成失败，请稍后重试";
+	  }
+
+	  function _lowQualityFirstFrameWarningText(warnings) {
+	    var list = Array.isArray(warnings) ? warnings : [];
+	    for (var i = 0; i < list.length; i++) {
+	      var w = list[i] || {};
+	      var code = String(w.code || w.key || "");
+	      var msg = String(w.message || "");
+	      var role = String(w.role || "");
+	      if ((code.indexOf("low_jpeg_bytes_per_pixel") >= 0 || msg.indexOf("低质量") >= 0) && (!role || role === "first_frame" || msg.indexOf("首帧") >= 0)) {
+	        return "疑似低质量首帧图生成视频";
+	      }
+	    }
+	    return "";
+	  }
+
+	  function _taskFailureDisplayText(task) {
+	    var text = String((task && task.statusCn) || "");
+	    var friendly = text ? _friendlyVideoError(text) : "";
+	    if (friendly && friendly !== "生成失败，请稍后重试") return friendly;
+	    if (!text || text === "生成失败，请稍后重试") {
+	      return _lowQualityFirstFrameWarningText(task && task.warnings) || text || "生成失败，请稍后重试";
+	    }
+	    return text;
+	  }
 
   /* File I/O */
   function abToBase64(buffer) {
@@ -1913,12 +2124,20 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
   /* Video task lifecycle — Phase 2：createVideoTask + pollVideoTask 已被 SSE
    * 版的 createWorkflowVideoTask + _attachTaskStream 取代，这里保留注释作为
    * 架构锚点，提示维护者不要再往本文件加客户端轮询代码。 */
-  async function videoPipeline(task) {
+  async function videoPipeline(task, opts) {
+    // silent=true 用在「刷新后给已经完成的视频做预热」场景：task 本来就是
+    // done 状态，预热只是顺手把 <video> src 塞进去让点播放更快。如果再把
+    // 卡片切到 fetching → "下载中" 用户会以为视频在重新下载，每次刷新都看到
+    // 一闪而过的「下载中」也很怪。silent 模式下我们不动 task.status / 不调
+    // updateTaskCard，等到 previewOk 真的拿到再静默写回。
+    var silent = !!(opts && opts.silent);
     if (task._killed) { _persistVideoUrlToProject(task); return; }
-    task.status = "fetching"; task.statusCn = "正在加载成片"; updateTaskCard(task);
+    if (!silent) {
+      task.status = "fetching"; task.statusCn = "正在加载成片"; updateTaskCard(task);
+    }
     var vidEl = task.videoEl, ok = false;
     try {
-      console.log("[Video] Pipeline start, url:", task.videoUrl ? task.videoUrl.slice(0, 80) : "null");
+      console.log("[Video] Pipeline start" + (silent ? " (silent)" : "") + ", url:", task.videoUrl ? task.videoUrl.slice(0, 80) : "null");
 
       if (!task._killed) {
         ok = await tryVideoSrc(vidEl, task.videoUrl, "directURL", 8000);
@@ -1954,8 +2173,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           '</div>';
       }
       task._doneAt = Date.now();
-      task.status = "done"; task.statusCn = "已完成"; updateTaskCard(task);
-      console.log("[Video] Pipeline done, previewOk=" + ok);
+      task.status = "done"; task.statusCn = "已完成";
+      // silent 模式下 task.status 始终是 done，updateTaskCard 也要刷一下让
+      // previewOk 翻转后老 task-card 的 video 区显示出来（不会再翻回 fetching）。
+      updateTaskCard(task);
+      console.log("[Video] Pipeline done" + (silent ? " (silent)" : "") + ", previewOk=" + ok);
       appendOutputHistory(task.videoUrl, task.serverTaskId);
       _persistVideoUrlToProject(task);
     } catch (e) {
@@ -2139,7 +2361,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         return;
       }
       var resp = startResult && startResult.resp;
-      _showVideoSegmentPreflightWarnings(resp);
+      showConsistencyAggregateWarning(resp);
 
 	      if (resp && resp.errorCode === "MODEL_UNAVAILABLE") {
 	        await _handleModelUnavailable(task, resp, { videoModel: videoModel });
@@ -2210,10 +2432,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             releaseGroupLock();
           }
         },
-        onTaskFailed: function (data) {
-          task.status = "failed";
-          task.statusCn = _friendlyVideoError(data.reason || data.errorMsg || "failed");
-          updateTaskCard(task); updateBadge();
+	        onTaskFailed: function (data) {
+	          var failExtra = (data && data.extra) || {};
+	          _mergeVideoWarnings(task, failExtra, false);
+	          task.status = "failed";
+	          task.statusCn = _friendlyVideoError(data.reason || data.errorMsg || "failed");
+	          updateTaskCard(task); updateBadge();
           renderBatchClipList();
           releaseGroupLock();
         },
@@ -2272,10 +2496,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           updateTaskCard(task); updateBadge();
         }
       },
-      onFailed: function (data) {
-        task.status = "failed";
-        task.statusCn = _friendlyVideoError(data.reason || "failed");
-        updateTaskCard(task); updateBadge();
+	      onFailed: function (data) {
+	        var failExtra = (data && data.extra) || {};
+	        _mergeVideoWarnings(task, failExtra, false);
+	        task.status = "failed";
+	        task.statusCn = _friendlyVideoError(data.reason || "failed");
+	        updateTaskCard(task); updateBadge();
       },
       onClose: function () { task._sseHandle = null; },
     });
@@ -2349,9 +2575,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       var bcl = $("batchClipList"); if (bcl) bcl.innerHTML = "";
       return;
     }
-    if (needVP) needVP.hidden = true;
-    if (ready) ready.hidden = false;
-    renderBatchClipList();
+	    if (needVP) needVP.hidden = true;
+	    if (ready) ready.hidden = false;
+	    renderBatchClipList();
+	    refreshUserVideoHistory();
 
     var clipList = $("batchClipList");
     if (clipList && !clipList._regenBound) {
@@ -2518,7 +2745,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	      var groupShotIndicesText = Array.isArray(group.shotIndices) ? group.shotIndices.join(",") : "";
 
 	      var clipTask = _findTaskByGroup(gIdx);
-	      var hasLiveRow = !!(clipTask && liveWrap && liveWrap.querySelector('[data-group-idx="' + gIdx + '"]'));
+	      // 之前条件是 clipTask && liveWrap.querySelector(...)，但 task 可能被
+	      // MAX_TASKS_TOTAL 挤掉而 mirror DOM 还在 —— 这种情况下 clipTask=null
+	      // 会让 plan card 又渲一遍，造成「同 groupIdx 两行」。改成纯看 DOM。
+	      var hasLiveRow = !!(liveWrap && liveWrap.querySelector('[data-group-idx="' + gIdx + '"]'));
 	      if (hasLiveRow) return;
 
 	      var statusLabel = '', statusTone = '', progressPct = 0, remainingText = '—';
@@ -3295,7 +3525,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         return;
       }
       resp = startResult && startResult.resp;
-      _showVideoSegmentPreflightWarnings(resp);
+      showConsistencyAggregateWarning(resp);
     } catch (e) {
       _setBatchStartDisabled(false);
       if (hint) hint.textContent = "提交失败：" + ((e && e.message) || e);
@@ -3669,31 +3899,112 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     refreshUserVideoHistory();
   }
 
-  async function refreshUserVideoHistory() {
-    try {
-      var res = await apiGet("/api/video/history?scope=user&limit=50");
-      _userVideoHistory = Array.isArray(res && res.tasks) ? res.tasks : [];
-    } catch (e) {
-      console.warn("[history] fetch failed:", e);
-      _userVideoHistory = [];
-    }
-    renderUserVideoHistory();
-  }
+	  async function refreshUserVideoHistory() {
+	    try {
+	      var projectFilter = project && project.id ? "&projectId=" + encodeURIComponent(project.id) : "";
+	      var res = await apiGet("/api/video/history?scope=user&limit=50" + projectFilter);
+	      _userVideoHistory = Array.isArray(res && res.items) ? res.items : (Array.isArray(res && res.tasks) ? res.tasks : []);
+	    } catch (e) {
+	      console.warn("[history] fetch failed:", e);
+	      _userVideoHistory = [];
+	    }
+	    renderUserVideoHistory();
+	  }
 
-  function renderUserVideoHistory() {
-    var card = $("outputHistoryCard"), sel = $("outputHistorySelect"); if (!sel) return;
-    sel.innerHTML = "";
-    _userVideoHistory.forEach(function (item, i) {
-      var url = item.resultUrl || item.url || "";
-      if (!url) return;
-      var opt = document.createElement("option"); opt.value = url;
-      var ts = item.updatedAt || item.completedAt || item.createdAt || "";
-      var t = String(ts).slice(0, 19).replace("T", " ");
-      opt.textContent = (i + 1) + ". " + t + " — " + (url.length > 50 ? url.slice(0, 50) + "…" : url);
-      sel.appendChild(opt);
-    });
-    if (card) card.hidden = _userVideoHistory.length === 0;
-  }
+	  function _selectedHistoryItem() {
+	    var sel = $("outputHistorySelect");
+	    if (!sel) return null;
+	    var idx = parseInt(sel.value, 10);
+	    if (isNaN(idx) || idx < 0 || idx >= _userVideoHistory.length) return null;
+	    return _userVideoHistory[idx] || null;
+	  }
+
+	  function _historyApplyTargetGroupIdx(item) {
+	    var fromPromptPage = _ctx.getVpSelectedGroup ? Number(_ctx.getVpSelectedGroup()) : NaN;
+	    if (Number.isInteger(fromPromptPage) && fromPromptPage >= 0) return fromPromptPage;
+	    var fromItem = Number(item && item.groupIdx);
+	    return Number.isInteger(fromItem) && fromItem >= 0 ? fromItem : 0;
+	  }
+
+	  function _updateHistoryPromptAction() {
+	    var btn = $("btnApplyHistoryPrompt");
+	    var hint = $("outputHistoryPromptHint");
+	    if (!btn) return;
+	    var item = _selectedHistoryItem();
+	    var sameProject = !!(item && project && project.id && item.projectId === project.id);
+	    var hasPrompt = !!(item && item.videoPromptHistory);
+	    btn.disabled = !(sameProject && hasPrompt);
+	    if (hint) {
+	      if (!item) hint.textContent = "暂无可用历史视频。";
+	      else if (!sameProject) hint.textContent = "该历史视频不属于当前项目，不能替换当前提示词。";
+	      else if (!hasPrompt) hint.textContent = "该历史视频没有可用的提示词快照。";
+	      else if (item.videoPromptSnapshotLegacy) hint.textContent = "旧版本历史提示词可能被截断，替换前会再次确认。";
+	      else hint.textContent = "将替换提示词页当前选中片段的正式视频提示词。";
+	    }
+	  }
+
+	  async function _applySelectedHistoryPrompt() {
+	    _syncVideoRefs();
+	    var item = _selectedHistoryItem();
+	    if (!item || !project || !project.id) return;
+	    if (item.projectId !== project.id) { showToast("只能使用当前项目的历史视频提示词", "warn"); return; }
+	    if (!item.videoPromptHistory) { showToast("该历史视频没有可用提示词", "warn"); return; }
+	    var targetGroupIdx = _historyApplyTargetGroupIdx(item);
+	    if (item.videoPromptSnapshotLegacy) {
+	      var okLegacy = await showConfirm("替换历史提示词", "该历史视频来自旧版本，提示词可能被截断。确认仍要替换当前片段提示词？", "确认替换", "取消");
+	      if (!okLegacy) return;
+	    }
+	    try {
+	      var resp = await apiPost('/api/video-prompt/apply-history', {
+	        projectId: project.id,
+	        groupIdx: targetGroupIdx,
+	        taskId: item.taskId,
+	        confirmLegacy: !!item.videoPromptSnapshotLegacy,
+	      });
+	      if (!project.storyboards) project.storyboards = [];
+	      if (!project.storyboards[targetGroupIdx]) project.storyboards[targetGroupIdx] = {};
+	      project.storyboards[targetGroupIdx].videoPrompt = resp.videoPrompt || item.videoPromptHistory || '';
+	      project.storyboards[targetGroupIdx].videoPromptSourceHash = resp.videoPromptSourceHash || null;
+	      project.storyboards[targetGroupIdx].videoPromptRunId = resp.videoPromptRunId || project.storyboards[targetGroupIdx].videoPromptRunId;
+	      project.storyboards[targetGroupIdx].videoPromptStatus = 'ready';
+	      project.storyboards[targetGroupIdx].videoPromptUpdatedAt = new Date().toISOString();
+	      delete project.storyboards[targetGroupIdx].videoPromptEditDraft;
+	      delete project.storyboards[targetGroupIdx].videoPromptFailedAt;
+	      delete project.storyboards[targetGroupIdx].videoPromptLastError;
+	      project.storyboards[targetGroupIdx]._vpCache = null;
+	      if (_ctx.setVpSelectedGroup) _ctx.setVpSelectedGroup(targetGroupIdx);
+	      showToast("已用历史视频提示词替换当前片段", "ok");
+	      switchPage("prompts");
+	    } catch (e) {
+	      showToast("替换失败：" + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+	    }
+	  }
+
+	  function renderUserVideoHistory() {
+	    var card = $("outputHistoryCard"), sel = $("outputHistorySelect"); if (!sel) return;
+	    sel.innerHTML = "";
+	    _userVideoHistory.forEach(function (item, i) {
+	      var url = item.resultUrl || item.url || "";
+	      if (!url) return;
+	      var opt = document.createElement("option"); opt.value = String(i);
+	      var ts = item.updatedAt || item.completedAt || item.createdAt || "";
+	      var t = String(ts).slice(0, 19).replace("T", " ");
+	      var label = "片段 " + (Number(item.groupIdx || 0) + 1) + (item.videoPromptSnapshotLegacy ? " · 旧版" : "");
+	      opt.textContent = (i + 1) + ". " + t + " — " + label;
+	      sel.appendChild(opt);
+	    });
+	    if (card) card.hidden = _userVideoHistory.length === 0;
+	    if (sel && !sel._historyPromptBound) {
+	      sel._historyPromptBound = true;
+	      sel.addEventListener("change", _updateHistoryPromptAction);
+	    }
+	    var btn = $("btnApplyHistoryPrompt");
+	    if (btn && !btn._historyPromptBound) {
+	      btn._historyPromptBound = true;
+	      btn.addEventListener("click", _applySelectedHistoryPrompt);
+	    }
+	    _updateHistoryPromptAction();
+	  }
 
   function refreshHistoryUI() { renderUserVideoHistory(); }
 

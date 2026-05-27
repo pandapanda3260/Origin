@@ -1,5 +1,4 @@
 import { basename, relative } from 'node:path';
-import { hasFillLightPositiveMention } from './content-sanitize';
 import { resolveLocalImagePath } from './image-gen';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 import { selectCharacterReferencePanels, type CharacterReferencePanel } from './panel-selection';
@@ -562,10 +561,6 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   props.forEach((prop, idx) => {
     if (isMaterialAssetExcluded(project, 'prop', prop, input.groupIdx, idx)) return;
     const name = assetName(prop, `道具${idx + 1}`);
-    if (hasFillLightPositiveMention(name)) {
-      dropped.push({ role: 'prop', assetName: name, reason: 'filtered_constraint' });
-      return;
-    }
     const norm = normalizeReferenceName(name);
     const mentions = norm ? countOccurrences(normText, norm) : 0;
     const manualMatch = isStoryboardMaterialForGroup(prop, input.groupIdx, 'prop');

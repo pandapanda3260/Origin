@@ -6,6 +6,7 @@ import {
   buildFirstFrameMaterialPanel,
   buildFirstFramePlanPreview,
   currentFirstFrameEditDraft,
+  reconcileFirstFramePromptState,
 } from '@/lib/first-frame-edit-draft';
 
 export const runtime = 'nodejs';
@@ -39,17 +40,24 @@ export async function GET(req: NextRequest) {
   const project = getProjectByIdForUser(projectId, user.id);
   if (!project) return jsonError('项目不存在', 404);
 
-  const panels = groupIndicesForProject(project, groupIdx).map((idx) => {
+  let activeProject = project;
+  const reconciled = groupIdx == null ? null : reconcileFirstFramePromptState({ projectId, user, groupIdx });
+  if (groupIdx != null && !reconciled) return jsonError('项目不存在', 404);
+  if (reconciled) activeProject = getProjectByIdForUser(projectId, user.id) || project;
+
+  const panels = groupIndicesForProject(activeProject, groupIdx).map((idx) => {
     try {
-      const preview = buildFirstFramePlanPreview({
-        project,
-        groupIdx: idx,
-        ownerId: user.id,
-        user,
-      });
-      const { draft } = currentFirstFrameEditDraft(project, idx);
+      const preview = reconciled && idx === groupIdx
+        ? reconciled
+        : buildFirstFramePlanPreview({
+          project: activeProject,
+          groupIdx: idx,
+          ownerId: user.id,
+          user,
+        });
+      const { draft } = currentFirstFrameEditDraft(activeProject, idx);
       const firstFrameMaterialPanel = buildFirstFrameMaterialPanel({
-        project,
+        project: activeProject,
         userId: user.id,
         plan: preview.plan,
         draft,
@@ -72,7 +80,7 @@ export async function GET(req: NextRequest) {
 
   return jsonOk({
     projectId,
-    projectUpdatedAt: (project as any)?.updatedAt || null,
+    projectUpdatedAt: (activeProject as any)?.updatedAt || null,
     panels,
   });
 }

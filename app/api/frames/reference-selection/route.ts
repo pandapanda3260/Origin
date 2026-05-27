@@ -6,11 +6,11 @@ import {
   availableFirstFrameReferenceTileIds,
   buildFirstFrameDraftWithReferenceSelection,
   buildFirstFrameMaterialPanel,
-  buildFirstFramePlanPreview,
   currentFirstFrameEditDraft,
   firstFrameDraftFingerprint,
   nextFirstFrameReferenceMaterialsVersion,
   normalizeFirstFrameReferenceMaterials,
+  reconcileFirstFramePromptStateInPatch,
   validateAndNormalizeFirstFrameDraft,
   type FirstFrameReferenceAttachment,
   type FirstFrameReferenceMaterial,
@@ -105,13 +105,13 @@ export async function PUT(req: NextRequest) {
     let firstFrameMaterialPanel: unknown = null;
     const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
-      const preview = buildFirstFramePlanPreview({ project: fresh, groupIdx, ownerId: user.id, user });
-      sourceHash = preview.sourceHash;
+      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user, groupIdx });
+      sourceHash = promptState.sourceHash;
       const { draft: currentDraft } = currentFirstFrameEditDraft(fresh, groupIdx);
       const panel = buildFirstFrameMaterialPanel({
         project: fresh,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft: currentDraft,
         sourceHash,
       });
@@ -165,7 +165,7 @@ export async function PUT(req: NextRequest) {
       const available = new Set(availableFirstFrameReferenceTileIds({
         project: projectForSelection,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft: baseDraftForSelection,
       }));
       const invalidIds = includeIds.filter((id) => !available.has(id));
@@ -183,20 +183,20 @@ export async function PUT(req: NextRequest) {
         userId: user.id,
         includeIds,
         project: projectForSelection,
-        plan: preview.plan,
+        plan: promptState.plan,
       });
       validateAndNormalizeFirstFrameDraft({
         project: projectForSelection,
         groupIdx,
         userId: user.id,
         input: draft,
-        plan: preview.plan,
+        plan: promptState.plan,
       });
-      savedDraftFingerprint = firstFrameDraftFingerprint(sourceHash, draft);
+      savedDraftFingerprint = firstFrameDraftFingerprint(draft);
       firstFrameMaterialPanel = buildFirstFrameMaterialPanel({
         project: projectForSelection,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft,
         sourceHash,
       });
@@ -204,6 +204,7 @@ export async function PUT(req: NextRequest) {
       const prev = storyboards[groupIdx] || {};
       storyboards[groupIdx] = {
         ...prev,
+        ...(promptState.slotPatch || {}),
         firstFrameEditDraft: draft,
       };
       return {

@@ -42,6 +42,7 @@ import { getDataDir } from './runtime-paths';
 import type { ProviderTaskAdapter, ProviderTaskRow, ProviderPollResult } from './provider-recovery';
 import { createAssetRecord, finishGenerationBatch, hashFile, localAssetUri } from './asset-library';
 import { getExternalEnvValue } from './env';
+import { buildVideoPromptSnapshot } from './video-prompt-lifecycle';
 
 export type VideoGenInput = {
   prompt: string;
@@ -57,6 +58,7 @@ export type VideoGenInput = {
   durationSec?: number;
   projectId?: string;
   groupIdx?: number;
+  videoPromptSourceHash?: string | null;
   idempotencyKey?: string;
   deferProviderPolling?: boolean;
   onProviderTaskCreated?: (info: {
@@ -528,6 +530,23 @@ export type VideoGenUpstreamPendingResult = {
 
 export type VideoGenResult = VideoGenCompletedResult | VideoGenUpstreamPendingResult;
 
+function patchVideoPromptSnapshotFinalPromptHash(db: any, taskId: string, finalPromptHash?: string | null) {
+  const hash = String(finalPromptHash || '').trim();
+  if (!hash) return;
+  try {
+    const row = db.prepare('SELECT video_prompt_snapshot_json FROM video_tasks WHERE id=?').get(taskId) as any;
+    const snapshot = row?.video_prompt_snapshot_json ? JSON.parse(row.video_prompt_snapshot_json) : null;
+    if (!snapshot || !snapshot.content || snapshot.finalPromptHash === hash) return;
+    snapshot.finalPromptHash = hash;
+    db.prepare(
+      `UPDATE video_tasks SET video_prompt_snapshot_json=?,
+         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+    ).run(JSON.stringify(snapshot), taskId);
+  } catch (e: any) {
+    console.warn('[video-gen] patch video prompt snapshot finalPromptHash failed:', e?.message || e);
+  }
+}
+
 /**
  * Per-reference record written into videoAudit. Semantic fields (role, label...)
  * describe planning intent; apiRole + apiContentIndex describe what was actually
@@ -541,11 +560,12 @@ export type VideoAuditReferenceImage =
     apiContentIndex?: number;
     imageContentHash?: string;
     originalBytes?: number;
-    submittedBytes?: number;
-    submittedWidth?: number;
-    submittedHeight?: number;
-    submittedMime?: string;
-  };
+	    submittedBytes?: number;
+	    submittedWidth?: number;
+	    submittedHeight?: number;
+	    submittedMime?: string;
+	    warnings?: VideoSubmitImageWarning[];
+	  };
 
 export class VideoGenerationError extends Error {
   taskId?: string;
@@ -713,17 +733,28 @@ export async function generateVideo(
   let mode: 'real' | 'fake' = 'real';
   let videoAudit: VideoGenCompletedResult['videoAudit'] | undefined;
 
+  const videoPromptSnapshotJson = input.projectId && Number.isInteger(input.groupIdx)
+    ? JSON.stringify(buildVideoPromptSnapshot({
+        content: input.prompt,
+        sourceHash: input.videoPromptSourceHash || null,
+        projectId: input.projectId,
+        groupIdx: input.groupIdx as number,
+        videoTaskId: taskId,
+      }))
+    : '{}';
+
   // 入库登记
   const db = getDb();
   db.prepare(
-    `INSERT INTO video_tasks (id, owner_id, project_id, group_idx, prompt, provider, status, progress, filename, duration_sec)
-     VALUES (?, ?, ?, ?, ?, ?, 'running', 0, ?, ?)`,
+    `INSERT INTO video_tasks (id, owner_id, project_id, group_idx, prompt, video_prompt_snapshot_json, provider, status, progress, filename, duration_sec)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?)`,
   ).run(
     taskId,
     user.id,
     input.projectId || null,
     input.groupIdx ?? null,
     input.prompt.slice(0, 4000),
+    videoPromptSnapshotJson,
     cfg.mode === 'fake' ? 'fake' : (cfg.model || 'openai'),
     filename,
     dur,
@@ -924,12 +955,13 @@ export async function generateVideo(
               apiRole: 'first_frame',
               apiContentIndex: 1,
               imageContentHash: submittedFirstHash,
-              originalBytes: firstSubmitted?.originalBytes,
-              submittedBytes: firstSubmitted?.submittedBytes,
-              submittedWidth: firstSubmitted?.width,
-              submittedHeight: firstSubmitted?.height,
-              submittedMime: firstSubmitted?.mime,
-            },
+	              originalBytes: firstSubmitted?.originalBytes,
+	              submittedBytes: firstSubmitted?.submittedBytes,
+	              submittedWidth: firstSubmitted?.width,
+	              submittedHeight: firstSubmitted?.height,
+	              submittedMime: firstSubmitted?.mime,
+	              warnings: firstSubmitted?.warnings,
+	            },
             {
               role: 'target_end',
               path: lastFramePath,
@@ -937,12 +969,13 @@ export async function generateVideo(
               apiRole: 'last_frame',
               apiContentIndex: 2,
               imageContentHash: submittedLastHash,
-              originalBytes: lastSubmitted?.originalBytes,
-              submittedBytes: lastSubmitted?.submittedBytes,
-              submittedWidth: lastSubmitted?.width,
-              submittedHeight: lastSubmitted?.height,
-              submittedMime: lastSubmitted?.mime,
-            },
+	              originalBytes: lastSubmitted?.originalBytes,
+	              submittedBytes: lastSubmitted?.submittedBytes,
+	              submittedWidth: lastSubmitted?.width,
+	              submittedHeight: lastSubmitted?.height,
+	              submittedMime: lastSubmitted?.mime,
+	              warnings: lastSubmitted?.warnings,
+	            },
           ],
         };
 
@@ -967,9 +1000,10 @@ export async function generateVideo(
 	          deferProviderPolling: input.deferProviderPolling,
 	        });
 	        if (videoAudit) videoAudit.providerTaskId = remoteId;
-        if (input.deferProviderPolling) {
-	          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
-          return {
+	        if (input.deferProviderPolling) {
+		          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
+	          patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+	          return {
             taskId,
             status: 'upstream_pending',
             provider: 'volcengine_seedance_video',
@@ -1081,7 +1115,8 @@ export async function generateVideo(
           console.warn('[video-gen][seedance][first-last] extract cover failed:', e?.message);
         }
 
-        const completeInfo = db.prepare(
+	        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+	        const completeInfo = db.prepare(
           `UPDATE video_tasks SET status='completed', progress=100,
              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
         ).run(taskId);
@@ -1187,10 +1222,12 @@ export async function generateVideo(
 
       if (hasIndependentImageRefs) {
         try {
-          const submittedRefs: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
-          for (const ref of independentReferenceImages) {
-            const image = await buildVideoSubmitImageDataUrl(ref.path);
-            submittedRefs.push({ ref, image });
+	          const submittedRefs: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
+	          for (const ref of independentReferenceImages) {
+	            const image = await buildVideoSubmitImageDataUrl(ref.path, {
+	              lowBytesPerPixelMessage: lowQualitySubmitImageMessage(ref.role),
+	            });
+	            submittedRefs.push({ ref, image });
             content.push({
               type: 'image_url',
               image_url: { url: image.dataUrl },
@@ -1215,12 +1252,13 @@ export async function generateVideo(
               assetName: ref.assetName,
               promptHint: ref.promptHint,
               originalBytes: image.originalBytes,
-              submittedBytes: image.submittedBytes,
-              submittedWidth: image.width,
-              submittedHeight: image.height,
-              submittedMime: image.mime,
-            })),
-          };
+	              submittedBytes: image.submittedBytes,
+	              submittedWidth: image.width,
+	              submittedHeight: image.height,
+	              submittedMime: image.mime,
+	              warnings: image.warnings,
+	            })),
+	          };
           const originalBytes = submittedRefs.reduce((sum, item) => sum + item.image.originalBytes, 0);
           const submittedBytes = submittedRefs.reduce((sum, item) => sum + item.image.submittedBytes, 0);
           console.log(
@@ -1244,9 +1282,11 @@ export async function generateVideo(
           let refBuf: Buffer | null = null;
           let directFirstFrameImage: VideoSubmitImageDataUrl | null = null;
           let directFirstFramePath: string | undefined;
-          if (hasFirstFrameRef && input.referenceImagePath) {
-            directFirstFramePath = input.referenceImagePath;
-            directFirstFrameImage = await buildVideoSubmitImageDataUrl(input.referenceImagePath);
+	          if (hasFirstFrameRef && input.referenceImagePath) {
+	            directFirstFramePath = input.referenceImagePath;
+	            directFirstFrameImage = await buildVideoSubmitImageDataUrl(input.referenceImagePath, {
+	              lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
+	            });
             console.log(
               `[video-gen][seedance] attached first-frame ${input.seedanceImageMode === 'strict_first_frame' ? 'as first_frame' : 'as reference_image'} ` +
                 `(props=${input.propReferencePaths?.length || 0}, panels=${input.characterReferencePanels?.length || 0})`,
@@ -1297,13 +1337,14 @@ export async function generateVideo(
                 label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
                 apiRole: input.seedanceImageMode === 'strict_first_frame' ? 'first_frame' : 'reference_image',
                 apiContentIndex: content.length - 1,
-                originalBytes: directFirstFrameImage.originalBytes,
-                submittedBytes: directFirstFrameImage.submittedBytes,
-                submittedWidth: directFirstFrameImage.width,
-                submittedHeight: directFirstFrameImage.height,
-                submittedMime: directFirstFrameImage.mime,
-              }],
-            };
+	                originalBytes: directFirstFrameImage.originalBytes,
+	                submittedBytes: directFirstFrameImage.submittedBytes,
+	                submittedWidth: directFirstFrameImage.width,
+	                submittedHeight: directFirstFrameImage.height,
+	                submittedMime: directFirstFrameImage.mime,
+	                warnings: directFirstFrameImage.warnings,
+	              }],
+	            };
           } else if (refBuf) {
             const dataUrl = `data:image/png;base64,${refBuf.toString('base64')}`;
             content.push({ type: 'image_url', image_url: { url: dataUrl }, role: 'reference_image' });
@@ -1375,7 +1416,11 @@ export async function generateVideo(
             { type: 'text', text: fallbackPrompt.finalPrompt },
             {
               type: 'image_url',
-              image_url: { url: (await buildVideoSubmitImageDataUrl(input.referenceImagePath)).dataUrl },
+              image_url: {
+                url: (await buildVideoSubmitImageDataUrl(input.referenceImagePath, {
+                  lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
+                })).dataUrl,
+              },
               role: 'first_frame',
             },
           ];
@@ -1413,9 +1458,10 @@ export async function generateVideo(
 	        deferProviderPolling: input.deferProviderPolling,
 	      });
 	      if (videoAudit) videoAudit.providerTaskId = remoteId;
-      if (input.deferProviderPolling) {
-	        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
-        return {
+	      if (input.deferProviderPolling) {
+		        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
+	        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+	        return {
           taskId,
           status: 'upstream_pending',
           provider: 'volcengine_seedance_video',
@@ -1599,7 +1645,8 @@ export async function generateVideo(
     console.warn('[video-gen] extract cover failed:', e?.message);
   }
 
-  const completeInfo = db.prepare(
+	  patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+	  const completeInfo = db.prepare(
     `UPDATE video_tasks SET status='completed', progress=100,
        updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
   ).run(taskId);
@@ -1646,6 +1693,14 @@ export type VideoSubmitImageDataUrl = {
   originalHeight: number;
   originalBytes: number;
   submittedBytes: number;
+  warnings: VideoSubmitImageWarning[];
+};
+
+export type VideoSubmitImageWarning = {
+  code: 'low_jpeg_bytes_per_pixel';
+  message: string;
+  bytesPerPixel?: number;
+  threshold?: number;
 };
 
 const SEEDANCE_IMAGE_MAX_BYTES = Math.floor(30 * 1024 * 1024 * 0.9);
@@ -1656,7 +1711,18 @@ const SEEDANCE_MIN_ASPECT_RATIO = 0.4;
 const SEEDANCE_MAX_ASPECT_RATIO = 2.5;
 const SEEDANCE_MIN_JPEG_BYTES_PER_PIXEL = 0.08;
 
-export function assertSeedanceSubmitImage(image: VideoSubmitImageDataUrl, label = 'image'): void {
+function lowQualitySubmitImageMessage(role?: string): string {
+  if (role === 'first_frame') return '疑似低质量首帧图生成视频';
+  if (role === 'target_end' || role === 'last_frame' || role === 'tail_frame') return '疑似低质量尾帧图生成视频';
+  return '疑似低质量参考图生成视频';
+}
+
+export function assertSeedanceSubmitImage(
+  image: VideoSubmitImageDataUrl,
+  label = 'image',
+  opts: { lowBytesPerPixelMessage?: string } = {},
+): VideoSubmitImageWarning[] {
+  const warnings: VideoSubmitImageWarning[] = [];
   const width = Math.max(1, Number(image.width || 1));
   const height = Math.max(1, Number(image.height || 1));
   const bytes = Math.max(0, Number(image.submittedBytes || 0));
@@ -1680,10 +1746,14 @@ export function assertSeedanceSubmitImage(image: VideoSubmitImageDataUrl, label 
   }
   const bytesPerPixel = bytes / (width * height);
   if (image.mime === 'image/jpeg' && bytesPerPixel < SEEDANCE_MIN_JPEG_BYTES_PER_PIXEL) {
-    throw new Error(
-      `Seedance 图片校验失败：${label} JPEG 字节/像素 ${bytesPerPixel.toFixed(3)} 过低，疑似低质量提交图。`,
-    );
+    warnings.push({
+      code: 'low_jpeg_bytes_per_pixel',
+      message: opts.lowBytesPerPixelMessage || lowQualitySubmitImageMessage(),
+      bytesPerPixel: Number(bytesPerPixel.toFixed(3)),
+      threshold: SEEDANCE_MIN_JPEG_BYTES_PER_PIXEL,
+    });
   }
+  return warnings;
 }
 
 export function stringifySeedanceRequestBody(body: any): string {
@@ -1697,7 +1767,10 @@ export function stringifySeedanceRequestBody(body: any): string {
   return json;
 }
 
-export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<VideoSubmitImageDataUrl> {
+export async function buildVideoSubmitImageDataUrl(
+  imagePath: string,
+  opts: { lowBytesPerPixelMessage?: string } = {},
+): Promise<VideoSubmitImageDataUrl> {
   const source = readFileSync(imagePath);
   const originalBytes = source.length;
   const canvasMod: any = await import('@napi-rs/canvas').catch(() => null);
@@ -1721,7 +1794,7 @@ export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<V
   ctx.fillRect(0, 0, width, height);
   ctx.drawImage(image, 0, 0, width, height);
   const buf: Buffer = canvas.toBuffer('image/jpeg', quality);
-  const result = {
+  const result: VideoSubmitImageDataUrl = {
     dataUrl: `data:image/jpeg;base64,${buf.toString('base64')}`,
     mime: 'image/jpeg',
     width,
@@ -1730,8 +1803,9 @@ export async function buildVideoSubmitImageDataUrl(imagePath: string): Promise<V
     originalHeight,
     originalBytes,
     submittedBytes: buf.length,
+    warnings: [],
   };
-  assertSeedanceSubmitImage(result, imagePath);
+  result.warnings = assertSeedanceSubmitImage(result, imagePath, opts);
   return result;
 }
 
@@ -1782,8 +1856,12 @@ export async function buildSeedanceFirstLastFrameBody(opts: {
     generateAudio = true,
     returnLastFrame = true,
   } = opts;
-  const firstImage = await buildVideoSubmitImageDataUrl(firstFramePath);
-  const lastImage = await buildVideoSubmitImageDataUrl(lastFramePath);
+  const firstImage = await buildVideoSubmitImageDataUrl(firstFramePath, {
+    lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
+  });
+  const lastImage = await buildVideoSubmitImageDataUrl(lastFramePath, {
+    lowBytesPerPixelMessage: lowQualitySubmitImageMessage('target_end'),
+  });
   return {
     model,
     content: [

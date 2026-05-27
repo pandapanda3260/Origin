@@ -5,6 +5,82 @@ import {
   type TargetArtifact,
 } from './sentinel';
 
+export const CONSISTENCY_AGGREGATE_WARNING = {
+  kind: 'consistency_aggregate',
+  message: '角色一致性仍有待优化，已继续生成。',
+};
+
+const NON_BLOCKING_REASONS = new Set([
+  'shot_plan_stale',
+  'shot_plan_legacy_unknown',
+  'shot_plan_fresh_but_hash_mismatch',
+  'storyboard_stale',
+  'shot_prompt_stale',
+  'video_prompt_stale',
+  'video_task_outdated',
+  'video_task_stale',
+  'storyboard_video_not_current',
+  'character_consistency_blocked',
+  'character_status_not_locked',
+  'nonhuman_species_missing',
+  'critical_reference_missing',
+]);
+
+const CONSISTENCY_REASONS = new Set([
+  'character_consistency_blocked',
+  'character_status_not_locked',
+  'nonhuman_species_missing',
+  'critical_reference_missing',
+]);
+
+function uniqueWarnings(warnings: Array<typeof CONSISTENCY_AGGREGATE_WARNING>) {
+  const seen = new Set<string>();
+  return warnings.filter((warning) => {
+    const key = warning.kind;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function hasConsistencyBlock(decision: ArtifactUsageDecision) {
+  return (decision.blockingReasons || []).some((reason) => CONSISTENCY_REASONS.has(reason))
+    || !!decision.consistency?.blockers?.length;
+}
+
+function scrubFilteredConsistency(decision: ArtifactUsageDecision, hadConsistencyBlock: boolean) {
+  if (!decision.consistency) return decision.consistency;
+  const hadConsistencyWarnings = !!decision.consistency.warnings?.length;
+  if (!hadConsistencyBlock && !hadConsistencyWarnings) return decision.consistency;
+  return {
+    ...decision.consistency,
+    blockers: hadConsistencyBlock ? [] : decision.consistency.blockers,
+    warnings: [],
+  };
+}
+
+export function applyBlockerFilterWithWarnings(decision: ArtifactUsageDecision) {
+  const blockingReasons = (decision.blockingReasons || []).filter((reason) => !NON_BLOCKING_REASONS.has(reason));
+  const reasons = (decision.reasons || []).filter((reason) => !NON_BLOCKING_REASONS.has(reason));
+  const hadConsistencyBlock = hasConsistencyBlock(decision);
+  const filtered: ArtifactUsageDecision = {
+    ...decision,
+    usability: blockingReasons.length ? 'BLOCKED' : 'USABLE',
+    reasons,
+    blockingReasons,
+    staleFlagKeys: blockingReasons.length ? decision.staleFlagKeys : [],
+    consistency: scrubFilteredConsistency(decision, hadConsistencyBlock),
+  };
+  return {
+    decision: filtered,
+    warnings: hadConsistencyBlock && filtered.usability === 'USABLE' ? [CONSISTENCY_AGGREGATE_WARNING] : [],
+  };
+}
+
+export function applyBlockerFilter(decision: ArtifactUsageDecision): ArtifactUsageDecision {
+  return applyBlockerFilterWithWarnings(decision).decision;
+}
+
 export function targetArtifactForBatch(batchType: string): TargetArtifact | null {
   if (batchType === 'storyboard_prompts') return 'storyboard_prompt';
   if (batchType === 'storyboard_images') return 'storyboard_image_generation';
@@ -64,10 +140,11 @@ export function formatBatchPreflightBlockedDecision(decision: ArtifactUsageDecis
   };
 }
 
-export function sentinelPreflightForBatch(project: any, projectId: string, batchType: string, targets: any[]) {
+export function collectBatchPreflight(project: any, projectId: string, batchType: string, targets: any[], opts: { consumerOperation?: string } = {}) {
   const targetArtifact = targetArtifactForBatch(batchType);
-  if (!targetArtifact) return [] as ArtifactUsageDecision[];
-  return targets
+  if (!targetArtifact) return { blockedDecisions: [] as ArtifactUsageDecision[], warnings: [] as Array<typeof CONSISTENCY_AGGREGATE_WARNING> };
+  const warnings: Array<typeof CONSISTENCY_AGGREGATE_WARNING> = [];
+  const blockedDecisions = targets
     .map((target: any, seq: number) => {
       const rawGroupIdx = target?.groupIdx ?? target?.storyboardIdx ?? target?.idx;
       const groupIdx = Number(rawGroupIdx);
@@ -82,16 +159,30 @@ export function sentinelPreflightForBatch(project: any, projectId: string, batch
         groupIdx: Number.isFinite(groupIdx) && groupIdx >= 0 ? Math.floor(groupIdx) : undefined,
         shotIndices,
         batchType,
-        consumerOperation: 'batch_preflight',
+        consumerOperation: opts.consumerOperation || 'batch_preflight',
       });
     })
+    .map((decision) => {
+      const filtered = applyBlockerFilterWithWarnings(decision);
+      warnings.push(...filtered.warnings);
+      return filtered.decision;
+    })
     .filter((decision) => decision.usability === 'BLOCKED');
+  return {
+    blockedDecisions,
+    warnings: uniqueWarnings(warnings),
+  };
 }
 
-export function batchPreflightPayload(project: any, projectId: string, batchType: string, targets: any[]) {
-  const blockedDecisions = isShotPlanDependentBatchType(batchType)
-    ? sentinelPreflightForBatch(project, projectId, batchType, targets)
-    : [];
+export function sentinelPreflightForBatch(project: any, projectId: string, batchType: string, targets: any[], opts: { consumerOperation?: string } = {}) {
+  return collectBatchPreflight(project, projectId, batchType, targets, opts).blockedDecisions;
+}
+
+export function batchPreflightPayload(project: any, projectId: string, batchType: string, targets: any[], opts: { consumerOperation?: string } = {}) {
+  const result = isShotPlanDependentBatchType(batchType)
+    ? collectBatchPreflight(project, projectId, batchType, targets, opts)
+    : { blockedDecisions: [] as ArtifactUsageDecision[], warnings: [] as Array<typeof CONSISTENCY_AGGREGATE_WARNING> };
+  const blockedDecisions = result.blockedDecisions;
   const blocked = blockedDecisions.map(formatBatchPreflightBlockedDecision);
   const first = blockedDecisions[0] || null;
   return {
@@ -100,7 +191,7 @@ export function batchPreflightPayload(project: any, projectId: string, batchType
     preflight: {
       allowed: blocked.length === 0,
       blocked,
-      warnings: [],
+      warnings: result.warnings,
     },
     sentinel: first ? artifactUsageBlockedPayload(first) : null,
   };

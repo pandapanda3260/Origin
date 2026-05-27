@@ -62,11 +62,6 @@ function makeLoader(pathMap, state) {
 
   function localRequire(id) {
     if (id === 'node:path') return require('node:path');
-    if (id === './content-sanitize') {
-      return {
-        hasFillLightPositiveMention: (value) => /补光灯|fill light/i.test(String(value || '')),
-      };
-    }
     if (id === './image-gen') {
       return {
         resolveLocalImagePath: (url) => pathMap[url] || null,

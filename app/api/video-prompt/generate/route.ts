@@ -17,7 +17,9 @@ import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 import { logVideoPromptTrace, summarizePromptForTrace } from '@/lib/video-prompt-observability';
-import { describeArtifactStatus } from '@/lib/sentinel';
+import { describeArtifactStatus, type ArtifactUsageDecision } from '@/lib/sentinel';
+import { applyBlockerFilterWithWarnings } from '@/lib/batch-preflight';
+import { applyVideoPromptWrite } from '@/lib/video-prompt-lifecycle';
 import type { SSEWriter } from '@/lib/sse';
 import {
   validateCharacterConsistencyForGroup,
@@ -63,7 +65,7 @@ function normalizeRole(value: unknown): VideoReferenceRole | null {
   return null;
 }
 
-function sentinelBlockMessage(decision: ReturnType<typeof describeArtifactStatus>) {
+function sentinelBlockMessage(decision: Pick<ArtifactUsageDecision, 'consistency' | 'blockingReasons'>) {
   return decision.consistency?.blockers?.map((b) => b.message).filter(Boolean).join('；') ||
     decision.blockingReasons.join('、') ||
     'artifact_usage_blocked';
@@ -95,6 +97,7 @@ type VideoPromptStateWriteResult = {
   previousStatus?: string | null;
   project?: any | null;
   shotIndices?: number[];
+  sourceHash?: string | null;
 };
 
 type MarkVideoPromptGeneratingArgs = {
@@ -386,103 +389,25 @@ function markVideoPromptFailedSameRunUnsafe(args: MarkVideoPromptFailedArgs): Vi
 }
 
 function writeVideoPromptReadySameRun(args: WriteVideoPromptReadyArgs): VideoPromptStateWriteResult {
-  const {
-    projectId,
-    userId,
-    groupIdx,
-    promptRunId,
-    prompt,
-    gate,
-    referenceManifest,
-    droppedReferences,
-  } = args;
-  let decision: VideoPromptStateWriteResult = {
-    applied: false,
-    skippedReason: 'project_missing',
-    storedRunId: null,
-    storedStatus: null,
-  };
-  const readyProject = patchProjectForUser(projectId, userId, (fresh) => {
-    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    const currentSb = storyboards[groupIdx];
-    if (!currentSb) {
-      decision = {
-        applied: false,
-        skippedReason: 'slot_missing',
-        storedRunId: null,
-        storedStatus: null,
-      };
-      return {};
-    }
-    if (currentSb.videoPromptRunId && currentSb.videoPromptRunId !== promptRunId) {
-      decision = {
-        applied: false,
-        skippedReason: 'run_taken_by_other',
-        storedRunId: currentSb.videoPromptRunId || null,
-        storedStatus: currentSb.videoPromptStatus || null,
-      };
-      return {};
-    }
-    const resolvedShotIndices = storyboardShotIndices(fresh as any, groupIdx, currentSb, {
-      mode: 'single-shot-strict',
-      explicitShotIndices: args.shotIndices,
-    });
-    const now = new Date().toISOString();
-    const patch: any = {
-      idx: groupIdx,
-      shotIdx: groupIdx + 1,
-      shotIndices: resolvedShotIndices,
-      videoPrompt: prompt,
-      videoPromptStatus: 'ready',
-      videoPromptRunId: promptRunId,
-      videoPromptUpdatedAt: now,
-      videoPromptLastError: undefined,
-      videoPromptFailedAt: undefined,
-      _vpCache: null,
-      videoReferenceManifest: referenceManifest,
-      videoReferenceDropped: droppedReferences,
-      consistency: {
-        ...(currentSb.consistency || {}),
-        videoPrompt: {
-          characterUsages: gate.characterUsages,
-          score: gate.score,
-          level: gate.level,
-          warnings: gate.warnings,
-        },
-      },
-    };
-    storyboards[groupIdx] = {
-      ...markStoryboardVideoOutdated(currentSb, 'video_prompt_regeneration', now),
-      ...patch,
-    };
-    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', now);
-    }
-    maybeAssertStoryboardsAlignedWithShots({ ...(fresh as any), storyboards, videoTasks }, 'video-prompt-ready');
-    decision = {
-      applied: true,
-      storedRunId: promptRunId,
-      storedStatus: 'ready',
-      shotIndices: resolvedShotIndices,
-    };
-    return { storyboards, videoTasks };
-  });
-  const readySb = Array.isArray((readyProject as any)?.storyboards)
-    ? (readyProject as any).storyboards[groupIdx] || {}
-    : {};
-  const applied =
-    readySb.videoPromptStatus === 'ready' &&
-    readySb.videoPromptRunId === promptRunId &&
-    String(readySb.videoPrompt || '').trim() === prompt;
   return {
-    ...decision,
-    applied,
-    skippedReason: applied ? undefined : (decision.skippedReason || 'write_not_applied'),
-    storedRunId: readySb.videoPromptRunId || decision.storedRunId || null,
-    storedStatus: readySb.videoPromptStatus || decision.storedStatus || null,
-    project: readyProject,
-    shotIndices: decision.shotIndices,
+    ...applyVideoPromptWrite({
+      projectId: args.projectId,
+      userId: args.userId,
+      groupIdx: args.groupIdx,
+      prompt: args.prompt,
+      runId: args.promptRunId,
+      ownership: 'same-run',
+      writeKind: 'system_generated',
+      referenceManifest: args.referenceManifest,
+      droppedReferences: args.droppedReferences,
+      shotIndices: args.shotIndices,
+      consistency: {
+        characterUsages: args.gate.characterUsages,
+        score: args.gate.score,
+        level: args.gate.level,
+        warnings: args.gate.warnings,
+      },
+    }),
   };
 }
 
@@ -678,14 +603,6 @@ export async function POST(req: NextRequest) {
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
       if (proj) {
-        if (!(proj as any).imagesApproved) {
-          failSingleVideoPrompt(writer, '请先确认分镜图，再生成视频提示词。', {
-            errorCode: 'VIDEO_PROMPT_IMAGES_NOT_APPROVED',
-            failureStage: 'preflight',
-            reason: 'images_not_approved',
-          });
-          return;
-        }
         const sb = Array.isArray((proj as any).storyboards) ? ((proj as any).storyboards[groupIdx] || {}) : {};
         shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
           mode: 'single-shot-strict',
@@ -698,8 +615,9 @@ export async function POST(req: NextRequest) {
           shotIndices,
           consumerOperation: 'video_prompt_generate',
         });
-        if (sentinel.usability === 'BLOCKED') {
-          failSingleVideoPrompt(writer, `视频提示词生成前检查未通过：${sentinelBlockMessage(sentinel)}`, {
+        const filteredSentinel = applyBlockerFilterWithWarnings(sentinel);
+        if (filteredSentinel.decision.usability === 'BLOCKED') {
+          failSingleVideoPrompt(writer, `视频提示词生成前检查未通过：${sentinelBlockMessage(filteredSentinel.decision)}`, {
             errorCode: 'VIDEO_PROMPT_PREFLIGHT_BLOCKED',
             failureStage: 'preflight',
             reason: 'sentinel_blocked',
@@ -907,6 +825,7 @@ export async function POST(req: NextRequest) {
       return;
     }
 
+    let readySourceHash: string | null = null;
     // 写回到对应 storyboard group 的 videoPrompt + shotIndices
     if (projectId) {
       const proj = getProjectByIdForUser(projectId, user.id);
@@ -1011,8 +930,9 @@ export async function POST(req: NextRequest) {
         return;
       }
 
+      let readyResult: VideoPromptStateWriteResult | null = null;
       try {
-        const readyResult = writeVideoPromptReadySameRun({
+        readyResult = writeVideoPromptReadySameRun({
           projectId,
           userId: user.id,
           groupIdx,
@@ -1088,6 +1008,7 @@ export async function POST(req: NextRequest) {
           return;
         }
         shotIndices = readyResult.shotIndices || shotIndices;
+        readySourceHash = readyResult.sourceHash || null;
       } catch (error: any) {
         const errorMessage = error?.message || String(error);
         const failureMark = maybeMarkVideoPromptFailedSameRun({
@@ -1131,10 +1052,11 @@ export async function POST(req: NextRequest) {
       videoPrompt: cleanedPrompt,
       narrationsUsed: narrations,
       referenceManifest,
-      droppedReferences,
-      groupIdx,
+	      droppedReferences,
+	      groupIdx,
       videoPromptStatus: 'ready',
       videoPromptRunId: promptRunId,
+      videoPromptSourceHash: readySourceHash,
     });
   });
 }

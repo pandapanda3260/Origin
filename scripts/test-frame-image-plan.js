@@ -10,8 +10,7 @@
  *     硬性禁止等）；相同输入 promptHash 一致;
  *   - tail_frame: primaryShot = 组内最末 shot, selfFirstFrame 作为 slot 1 锚点;
  *   - shotConstraintText 覆盖 visual/description/desc/dialogue/scriptRef/keyInfo/
- *     imagePrompt 字段, 用户在其中任一字段写 "不要补光灯" 都会触发硬性负向约束
- *     兜底注入;
+ *     imagePrompt 字段, 用户原文会进入 finalPrompt 的用户约束区，不做专项改写;
  *   - 未知 frameType 抛错。
  *
  * 约定与其它 test:xxx 脚本一致, 用 ts.transpileModule + vm.runInNewContext 注入依赖。
@@ -606,9 +605,9 @@ async function testTailFrameWithSelfFirstFrame() {
   assert(plan.finalPrompt.includes('相比 Image 1 必须有可见差异'), 'tail prompt requires visible difference from first frame');
 }
 
-async function testShotFieldsTriggerHardConstraint() {
+async function testShotFieldsPreserveUserConstraints() {
   // shotConstraintText 要覆盖所有用户可能写剧本约束的字段; 在任一字段写
-  // "不要补光灯" 都应命中 enforceHardVisualConstraints 并注入硬性负向约束。
+  // 用户约束都应按原文进入 finalPrompt, 但不再注入补光灯专项硬约束。
   const fields = [
     'visual',
     'description',
@@ -625,7 +624,7 @@ async function testShotFieldsTriggerHardConstraint() {
       sceneSelection: makeSceneSelectionStub(scene),
     });
     const project = makeFixtureProject();
-    // 清空所有可被扫描的 shot 字段, 只保留当前被测字段写 "不要补光灯",
+    // 清空所有可被扫描的 shot 字段, 只保留当前被测字段写用户约束,
     // 确保命中的只能来自当前字段而不是 fixture 默认的 visual。
     for (const f of fields) {
       delete project.shots[0][f];
@@ -641,8 +640,12 @@ async function testShotFieldsTriggerHardConstraint() {
       modelSnapshot: MODEL_SNAPSHOT_CAP1,
     });
     assert(
-      /硬性负向约束：禁止补光灯/.test(plan.finalPrompt),
-      `finalPrompt should contain hard negative constraint when constraint written in shot.${field}`,
+      plan.finalPrompt.includes('不要补光灯'),
+      `finalPrompt should preserve the original user constraint from shot.${field}`,
+    );
+    assert(
+      !/硬性负向约束：禁止补光灯/.test(plan.finalPrompt),
+      `finalPrompt should not inject fill-light hard constraint for shot.${field}`,
     );
   }
 }
@@ -924,7 +927,7 @@ async function main() {
     ['no images available → text_only', testNoImagesAvailable],
     ['tail_frame plan basic (no self_first_frame)', testTailFramePlanBasic],
     ['tail_frame with self_first_frame slot 1', testTailFrameWithSelfFirstFrame],
-    ['shot constraint fields all trigger hard negative constraint', testShotFieldsTriggerHardConstraint],
+    ['shot constraint fields preserve user text without fill-light injection', testShotFieldsPreserveUserConstraints],
     ['imageNo continuity when scene skipped', testImageNoContinuity],
     ['plan cap=3 → all 3 candidates as image, imageNo 1/2/3', testPlanCapThreeAllImages],
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],

@@ -48,11 +48,11 @@ function testNormalizeStatus() {
 
 function testAutoMatrix() {
   const cases = [
-    ['missing', null, { payloadMode: 'first_frame_multi_ref', reason: 'tail_missing', hardFail: false, warningReason: 'tail_missing' }],
+    ['missing', null, { payloadMode: 'first_frame_multi_ref', reason: 'tail_missing', hardFail: false }],
     ['pending', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_pending', hardFail: true, failureCode: 'tail_frame_pending' }],
     ['ready', '/tmp/tail.png', { payloadMode: 'first_last_frame', reason: 'tail_ready', hardFail: false, hasFirstLast: true }],
-    ['failed', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_failed', hardFail: false, warningReason: 'tail_failed' }],
-    ['file_missing', '', { payloadMode: 'first_frame_multi_ref', reason: 'tail_file_missing', hardFail: false, warningReason: 'tail_file_missing' }],
+    ['failed', '/tmp/tail.png', { payloadMode: 'first_frame_multi_ref', reason: 'tail_failed', hardFail: false }],
+    ['file_missing', '', { payloadMode: 'first_frame_multi_ref', reason: 'tail_file_missing', hardFail: false }],
   ];
   for (const [status, tailFramePath, expected] of cases) {
     const got = pick(decision({ tailReferenceStatus: status, tailFramePath }));
@@ -86,16 +86,16 @@ function testExplicitFirstLastMatrix() {
     'explicit first-last ready uses first-last payload',
   );
   const cases = [
-    ['missing', null, 'first_last_frame_tail_missing'],
-    ['pending', '/tmp/tail.png', 'first_last_frame_tail_pending'],
-    ['failed', '/tmp/tail.png', 'first_last_frame_tail_failed'],
-    ['file_missing', '', 'first_last_frame_tail_file_missing'],
+    ['missing', null, false, undefined],
+    ['pending', '/tmp/tail.png', true, 'first_last_frame_tail_pending'],
+    ['failed', '/tmp/tail.png', false, undefined],
+    ['file_missing', '', false, undefined],
   ];
-  for (const [status, tailFramePath, failureCode] of cases) {
+  for (const [status, tailFramePath, hardFail, failureCode] of cases) {
     const got = pick(decision({ submitMode: 'first_last_frame', tailReferenceStatus: status, tailFramePath }));
     eq(
       { payloadMode: got.payloadMode, reason: got.reason, hardFail: got.hardFail, failureCode: got.failureCode },
-      { payloadMode: 'first_frame_multi_ref', reason: status === 'missing' ? 'tail_missing' : status === 'file_missing' ? 'tail_file_missing' : `tail_${status}`, hardFail: true, failureCode },
+      { payloadMode: 'first_frame_multi_ref', reason: status === 'missing' ? 'tail_missing' : status === 'file_missing' ? 'tail_file_missing' : `tail_${status}`, hardFail, failureCode },
       `explicit first-last status=${status}`,
     );
   }
@@ -111,9 +111,9 @@ function testCapabilityAndFeature() {
       hardFail: false,
       failureCode: undefined,
       hasFirstLast: false,
-      warningReason: 'capability_unsupported',
+      warningReason: undefined,
     },
-    'auto capability unsupported soft-degrades',
+    'auto capability unsupported silently falls back',
   );
   eq(
     pick(decision({ submitMode: 'first_last_frame', capabilityFirstLastSupported: false })),
@@ -121,12 +121,12 @@ function testCapabilityAndFeature() {
       submitMode: 'first_last_frame',
       payloadMode: 'first_frame_multi_ref',
       reason: 'capability_unsupported',
-      hardFail: true,
-      failureCode: 'first_last_frame_capability_unsupported',
+      hardFail: false,
+      failureCode: undefined,
       hasFirstLast: false,
       warningReason: undefined,
     },
-    'explicit capability unsupported hard-fails',
+    'explicit capability unsupported silently falls back',
   );
   eq(pick(decision({ firstLastFeatureEnabled: false })).reason, 'feature_disabled', 'feature disabled reason');
 }
@@ -151,9 +151,9 @@ function testFirstFrameAndIntent() {
     'auto without tail intent stays strict-first-frame',
   );
   eq(
-    pick(decision({ submitMode: 'first_last_frame', tailIntentRequested: false })).failureCode,
-    'first_last_frame_requires_tail_intent',
-    'explicit first-last requires tail intent',
+    pick(decision({ submitMode: 'first_last_frame', tailIntentRequested: false })).hardFail,
+    false,
+    'explicit first-last without tail intent silently falls back',
   );
 }
 
@@ -162,16 +162,14 @@ function testOtherModes() {
   eq(pick(decision({ submitMode: 'reference_images', firstFramePath: '' })).reason, 'reference_images', 'reference_images remains explicit debug mode');
   eq(
     {
-      reason: decision({ submitMode: 'reference_images', tailReferenceStatus: 'pending' }).warning?.reason,
-      key: decision({ submitMode: 'reference_images', tailReferenceStatus: 'pending' }).warning?.key,
+      warning: decision({ submitMode: 'reference_images', tailReferenceStatus: 'pending' }).warning,
       hardFail: decision({ submitMode: 'reference_images', tailReferenceStatus: 'pending' }).hardFail,
     },
     {
-      reason: 'reference_images_mode',
-      key: 'target_end_not_used',
+      warning: undefined,
       hardFail: false,
     },
-    'reference_images with pending tail warns that tail is not used',
+    'reference_images with pending tail stays quiet',
   );
 }
 

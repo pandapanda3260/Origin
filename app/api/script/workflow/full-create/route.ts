@@ -129,7 +129,7 @@ export async function POST(req: NextRequest) {
       if (charge) {
         try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 2, reason: 'script.error', refId: projectId }); } catch (_) {}
       }
-      writer.error(`剧本生成失败：${e?.message || String(e)}`);
+      writer.error(formatScriptGenerationError(e, { isAdapt }));
       return;
     }
 
@@ -251,6 +251,24 @@ function makeSourceTextBrief(sourceText: string): string {
     .trim();
   const brief = cleaned.slice(0, 180);
   return brief ? `原文改编：${brief}${cleaned.length > 180 ? '…' : ''}` : '原文改编';
+}
+
+function formatScriptGenerationError(error: any, opts: { isAdapt: boolean }): string {
+  const raw = (error?.message || error || '').toString();
+  const normalized = raw.toLowerCase();
+  const isInputTpmLimit =
+    normalized.includes('request_limit_exceeded')
+    || normalized.includes('input tokens per minute')
+    || normalized.includes('workspace input tokens')
+    || /llm\s*429/.test(normalized);
+
+  if (isInputTpmLimit) {
+    return opts.isAdapt
+      ? '原文较长，模型本分钟可处理的文字额度已满。请稍等 1-2 分钟再试，或缩短原文后生成。'
+      : '模型本分钟可处理的文字额度已满。请稍等 1-2 分钟后重试。';
+  }
+
+  return `剧本生成失败：${raw || '请稍后重试'}`;
 }
 
 /**

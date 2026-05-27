@@ -8,7 +8,6 @@ import {
   renderCharacterLockRosterLine,
   type CharacterLock,
 } from './character-consistency';
-import { sanitizeFillLightPositiveMentions } from './content-sanitize';
 
 export function truncate(value: any, n: number): string {
   const s = String(value || '');
@@ -48,9 +47,7 @@ export function stringifyPromptValue(value: any): string {
 }
 
 export function joinPromptValues(values: any[]): string {
-  return sanitizeFillLightPositiveMentions(
-    values.map(stringifyPromptValue).filter(Boolean).join('; '),
-  );
+  return values.map(stringifyPromptValue).filter(Boolean).join('; ');
 }
 
 export function dedupeAssetsByIdentity<T extends Record<string, any>>(items: T[]): T[] {

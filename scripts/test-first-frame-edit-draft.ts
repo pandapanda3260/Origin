@@ -23,7 +23,7 @@ import { getDataDir } from '../lib/runtime-paths';
 
 const baseDraft = {
   sourceHash: 'source-a',
-  promptOverride: 'base prompt',
+  content: 'base prompt',
   negativePromptOverride: 'base negative',
   referenceOverrides: {
     excluded: [{ role: 'character', assetId: 'char-a' }],
@@ -81,10 +81,11 @@ function assertPanelMatchesEffective(
 
 {
   const next = mergeFirstFrameDraftPatch(baseDraft, {
-    promptOverride: 'new prompt',
+    content: 'new prompt',
   });
 
-  assert.equal(next.promptOverride, 'new prompt');
+  assert.equal(next.content, 'new prompt');
+  assert.equal('promptOverride' in next, false);
   assert.equal(next.negativePromptOverride, 'base negative');
   assert.deepEqual(next.referenceOverrides, baseDraft.referenceOverrides);
   assert.equal('styleRuleOverrides' in next, false);
@@ -92,11 +93,11 @@ function assertPanelMatchesEffective(
 
 {
   const next = mergeFirstFrameDraftPatch(baseDraft, {
-    promptOverride: null,
+    content: null,
     styleRuleOverrides: ['legacy patch ignored'],
   });
 
-  assert.equal('promptOverride' in next, false);
+  assert.equal('content' in next, false);
   assert.equal('styleRuleOverrides' in next, false);
   assert.equal(next.negativePromptOverride, 'base negative');
 }
@@ -203,10 +204,10 @@ const plan: any = {
     project,
     groupIdx: 0,
     userId: 7,
-    input: { promptOverride: longPrompt },
+    input: { content: longPrompt },
     plan,
   });
-  assert.equal(draft.promptOverride, longPrompt);
+  assert.equal(draft.content, longPrompt);
   assert.ok(longPrompt.length > 2000);
   assert.ok(longPrompt.length < MAX_PROMPT_OVERRIDE_CHARS);
 }
@@ -218,11 +219,11 @@ const plan: any = {
       project,
       groupIdx: 0,
       userId: 7,
-      input: { promptOverride: overLimitPrompt },
+      input: { content: overLimitPrompt },
       plan,
     }),
     (err: any) => err instanceof FirstFrameDraftValidationException
-      && err.errors.some((item: any) => item.field === 'promptOverride' && item.message.includes(String(MAX_PROMPT_OVERRIDE_CHARS))),
+      && err.errors.some((item: any) => item.field === 'content' && item.message.includes(String(MAX_PROMPT_OVERRIDE_CHARS))),
   );
 }
 
@@ -245,7 +246,7 @@ const plan: any = {
   const normalizedA = normalizeFirstFrameDraftForFingerprint({
     updatedAt: 'ignored',
     updatedBy: 99,
-    promptOverride: '',
+    content: '',
     styleRuleOverrides: ['  beta  ', 'alpha', ''],
     referenceOverrides: {
       added: [
@@ -270,20 +271,20 @@ const plan: any = {
     },
   });
   assert.equal(
-    firstFrameDraftFingerprint('source-a', { referenceOverrides: { added: [{ role: 'prop', assetId: 'prop-b' }, { role: 'character', assetId: 'char-a' }] } }),
-    firstFrameDraftFingerprint('source-a', { referenceOverrides: { added: [{ role: 'character', assetId: 'char-a' }, { role: 'prop', assetId: 'prop-b' }] } }),
+    firstFrameDraftFingerprint({ referenceOverrides: { added: [{ role: 'prop', assetId: 'prop-b' }, { role: 'character', assetId: 'char-a' }] } }),
+    firstFrameDraftFingerprint({ referenceOverrides: { added: [{ role: 'character', assetId: 'char-a' }, { role: 'prop', assetId: 'prop-b' }] } }),
   );
   assert.equal(
-    firstFrameDraftFingerprint('source-a', { styleRuleOverrides: ['alpha'] }),
-    firstFrameDraftFingerprint('source-a', {}),
+    firstFrameDraftFingerprint({ styleRuleOverrides: ['alpha'] }),
+    firstFrameDraftFingerprint({}),
   );
   assert.notEqual(
-    firstFrameDraftFingerprint('source-a', { firstFrameReferenceSelection: { mode: 'manual', includeIds: ['ref:char:char-a'] } }),
-    firstFrameDraftFingerprint('source-a', { firstFrameReferenceSelection: { mode: 'manual', includeIds: ['ref:scene:scene-a'] } }),
+    firstFrameDraftFingerprint({ firstFrameReferenceSelection: { mode: 'manual', includeIds: ['ref:char:char-a'] } }),
+    firstFrameDraftFingerprint({ firstFrameReferenceSelection: { mode: 'manual', includeIds: ['ref:scene:scene-a'] } }),
   );
   assert.notEqual(
-    firstFrameDraftFingerprint('source-a', { firstFrameReferenceAttachments: [{ id: 'upload:a', imageId: '11111111-1111-4111-8111-111111111111', role: 'scene', url: '/api/images/file/11111111-1111-4111-8111-111111111111' }] }),
-    firstFrameDraftFingerprint('source-a', { firstFrameReferenceAttachments: [{ id: 'upload:b', imageId: '22222222-2222-4222-8222-222222222222', role: 'scene', url: '/api/images/file/22222222-2222-4222-8222-222222222222' }] }),
+    firstFrameDraftFingerprint({ firstFrameReferenceAttachments: [{ id: 'upload:a', imageId: '11111111-1111-4111-8111-111111111111', role: 'scene', url: '/api/images/file/11111111-1111-4111-8111-111111111111' }] }),
+    firstFrameDraftFingerprint({ firstFrameReferenceAttachments: [{ id: 'upload:b', imageId: '22222222-2222-4222-8222-222222222222', role: 'scene', url: '/api/images/file/22222222-2222-4222-8222-222222222222' }] }),
   );
 }
 
@@ -292,7 +293,7 @@ const plan: any = {
     storyboards: [{
       firstFrameEditDraft: {
         sourceHash: 'source-a',
-        promptOverride: '',
+        content: '',
         styleRuleOverrides: ['  保留手绘质感  ', ''],
         updatedAt: '2026-01-01T00:00:00.000Z',
         updatedBy: 7,
@@ -303,8 +304,8 @@ const plan: any = {
   assert.equal(didMigrate, true);
   assert.ok(draft);
   assert.equal('styleRuleOverrides' in draft!, false);
-  assert.ok(draft!.promptOverride?.startsWith(LEGACY_STYLE_RULE_BLOCK_PREFIX));
-  assert.match(draft!.promptOverride || '', /保留手绘质感/);
+  assert.ok(draft!.content?.startsWith(LEGACY_STYLE_RULE_BLOCK_PREFIX));
+  assert.match(draft!.content || '', /保留手绘质感/);
 
   const finalPlan = applyFirstFrameDraftToPlan({ project, userId: 7, plan, draft: draft! });
   assert.ok(finalPlan.finalPrompt.startsWith('base prompt'));
@@ -320,7 +321,7 @@ const plan: any = {
     storyboards: [{
       firstFrameEditDraft: {
         sourceHash: 'source-a',
-        promptOverride: 'custom prompt',
+        content: 'custom prompt',
         styleRuleOverrides: ['以前未生效的规则'],
         updatedAt: '2026-01-01T00:00:00.000Z',
         updatedBy: 7,
@@ -330,9 +331,9 @@ const plan: any = {
 
   assert.equal(didMigrate, true);
   assert.equal('styleRuleOverrides' in draft!, false);
-  assert.equal(draft!.promptOverride?.startsWith(LEGACY_STYLE_RULE_BLOCK_PREFIX), false);
-  assert.match(draft!.promptOverride || '', /custom prompt/);
-  assert.match(draft!.promptOverride || '', /以前未生效的规则/);
+  assert.equal(draft!.content?.startsWith(LEGACY_STYLE_RULE_BLOCK_PREFIX), false);
+  assert.match(draft!.content || '', /custom prompt/);
+  assert.match(draft!.content || '', /以前未生效的规则/);
 
   const finalPlan = applyFirstFrameDraftToPlan({ project, userId: 7, plan, draft: draft! });
   assert.equal(finalPlan.finalPrompt.startsWith('base prompt'), false);
@@ -354,7 +355,7 @@ const plan: any = {
   assert.equal(didMigrate, false);
   assert.ok(draft);
   assert.equal('styleRuleOverrides' in draft!, false);
-  assert.equal('promptOverride' in draft!, false);
+  assert.equal('content' in draft!, false);
 }
 
 {

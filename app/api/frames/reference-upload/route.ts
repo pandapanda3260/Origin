@@ -14,6 +14,7 @@ import {
   buildFirstFramePlanPreview,
   currentFirstFrameEditDraft,
   firstFrameDraftFingerprint,
+  reconcileFirstFramePromptStateInPatch,
   selectedFirstFrameReferenceTileIds,
   validateAndNormalizeFirstFrameDraft,
   type FirstFrameMaterialTileRole,
@@ -187,13 +188,13 @@ export async function POST(req: NextRequest) {
     let savedDraftFingerprint = '';
     const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
-      const preview = buildFirstFramePlanPreview({ project: fresh, groupIdx, ownerId: user.id, user });
-      sourceHash = preview.sourceHash;
+      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user, groupIdx });
+      sourceHash = promptState.sourceHash;
       const { draft: currentDraft } = currentFirstFrameEditDraft(fresh, groupIdx);
       const panel = buildFirstFrameMaterialPanel({
         project: fresh,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft: currentDraft,
         sourceHash,
       });
@@ -212,7 +213,7 @@ export async function POST(req: NextRequest) {
       const selectedIds = selectedFirstFrameReferenceTileIds({
         project: fresh,
         userId: user.id,
-        plan: preview.plan,
+        plan: promptState.plan,
         draft: currentDraft,
       });
       draft = buildFirstFrameDraftWithReferenceAttachment({
@@ -222,20 +223,21 @@ export async function POST(req: NextRequest) {
         attachment,
         includeIds: [...selectedIds, attachment.id],
         project: fresh,
-        plan: preview.plan,
+        plan: promptState.plan,
       });
       validateAndNormalizeFirstFrameDraft({
         project: fresh,
         groupIdx,
         userId: user.id,
         input: draft,
-        plan: preview.plan,
+        plan: promptState.plan,
       });
-      savedDraftFingerprint = firstFrameDraftFingerprint(sourceHash, draft);
+      savedDraftFingerprint = firstFrameDraftFingerprint(draft);
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
       const prev = storyboards[groupIdx] || {};
       storyboards[groupIdx] = {
         ...prev,
+        ...(promptState.slotPatch || {}),
         firstFrameEditDraft: draft,
       };
       return { storyboards };

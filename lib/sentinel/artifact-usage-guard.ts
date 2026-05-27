@@ -324,6 +324,8 @@ const RELAX_UPSTREAM_STALE_TARGETS: TargetArtifact[] = [
   'storyboard_image_generation',
   'storyboard_image',
   'video_prompt_generation',
+  'video_prompt',
+  'video_segment',
 ];
 
 function shouldRelaxUpstreamStale(target: TargetArtifact): boolean {
@@ -486,8 +488,32 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
   }
 
   if ((target === 'video_prompt' || target === 'video_segment') && groupIdx != null) {
-    pushNonBlockingFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, staleFlagKeys });
-    pushFlagDecision({ staleFlags, key: `video_prompt_${groupIdx}`, reason: 'video_prompt_stale', reasons, blockingReasons, staleFlagKeys });
+    if (target === 'video_prompt') {
+      pushStaleFlagWithRelax({
+        staleFlags,
+        key: `storyboard_${groupIdx}`,
+        reason: 'storyboard_stale',
+        reasons,
+        blockingReasons,
+        staleFlagKeys,
+        target,
+        groupIdx,
+        relax: relaxUpstreamStale,
+      });
+    } else {
+      pushNonBlockingFlagDecision({ staleFlags, key: `storyboard_${groupIdx}`, reason: 'storyboard_stale', reasons, staleFlagKeys });
+    }
+    pushStaleFlagWithRelax({
+      staleFlags,
+      key: `video_prompt_${groupIdx}`,
+      reason: 'video_prompt_stale',
+      reasons,
+      blockingReasons,
+      staleFlagKeys,
+      target,
+      groupIdx,
+      relax: relaxUpstreamStale,
+    });
     checkShotPromptFlags();
 
     const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];

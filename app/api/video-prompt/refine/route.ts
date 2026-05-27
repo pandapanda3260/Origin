@@ -9,6 +9,7 @@ import {
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { prepareVideoPromptRefineMessagesWithKnowledge } from '@/lib/knowledge/video-prompt-refine-injection';
 import { artifactUsageBlockedPayload, describeArtifactStatus } from '@/lib/sentinel';
+import { applyBlockerFilter } from '@/lib/batch-preflight';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -30,12 +31,12 @@ export async function POST(req: NextRequest) {
     return new Response(JSON.stringify({ detail: '项目不存在' }), { status: 404 });
   }
   if (projectId && project && groupIdx != null) {
-    const decision = describeArtifactStatus(project as any, {
+    const decision = applyBlockerFilter(describeArtifactStatus(project as any, {
       projectId,
       targetArtifact: 'video_prompt',
       groupIdx,
       consumerOperation: 'video_prompt_refine',
-    });
+    }));
     if (decision.usability === 'BLOCKED') {
       return Response.json(artifactUsageBlockedPayload(decision), { status: 409 });
     }

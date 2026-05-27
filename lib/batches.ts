@@ -114,6 +114,14 @@ function _targetGroupIdx(target: BatchTaskTarget): number | null {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 }
 
+function _targetShotIndices(target: BatchTaskTarget, groupIdx: number): number[] {
+  const raw = Array.isArray(target?.shotIndices) ? target.shotIndices : [];
+  const normalized = raw
+    .map((idx: any) => Number(idx))
+    .filter((idx: number) => Number.isInteger(idx) && idx >= 0);
+  return normalized.length ? normalized : [groupIdx];
+}
+
 function _clearFailedStoryboardImageState(opts: {
   batchType: string;
   projectId: string;
@@ -134,7 +142,10 @@ function _clearFailedStoryboardImageState(opts: {
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
       if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+      });
       const error = {
         message: firstFrameLastError,
         failedAt: new Date().toISOString(),
@@ -196,7 +207,10 @@ function _clearFailedTailFrameImageState(opts: {
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
       if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+      });
       const failedAt = new Date().toISOString();
       const errorRec = {
         message: tailFrameLastError,

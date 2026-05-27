@@ -597,7 +597,7 @@ function _renderCharCards(container, items) {
 
     card.innerHTML =
       '<div class="flex flex-col md:flex-row h-full min-h-[360px]">' +
-        '<div class="w-full md:w-[45%] relative h-72 md:h-auto overflow-hidden rounded-lg cursor-pointer" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
+        '<div class="w-full md:w-[45%] relative h-72 md:h-auto overflow-hidden rounded-xl cursor-pointer -mt-1 -ml-1 -mr-1 md:mr-0 md:-mb-1" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
           imgHtml +
           previewBadgeHtml +
           '<div class="absolute inset-0 flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity bg-black/20"><span class="material-symbols-outlined text-white text-3xl drop-shadow-lg">zoom_in</span></div>' +
@@ -617,16 +617,16 @@ function _renderCharCards(container, items) {
             '</div>' +
             '<div class="asset-desc-wrap mt-3" data-action="edit-asset">' +
               '<p class="asset-desc-text text-[11px] text-on-surface-variant/60 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors">' + escapeHtml(desc.slice(0, 300)) + '</p>' +
-              '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4">' + escapeHtml(desc.slice(0, 300)) + '</textarea>' +
+              '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4">' + escapeHtml(desc.slice(0, 300)) + '</textarea>' +
             '</div>' +
             tagsHtml +
             '<div class="p-3 bg-surface-container-lowest rounded-lg border border-outline-variant/10 mt-5">' + statusHtml + '</div>' +
           '</div>' +
-          '<div class="flex gap-3 mt-5">' +
-            '<button type="button" class="flex-1 py-3 bg-primary text-on-primary rounded-full font-bold text-[11px] tracking-wider uppercase hover:shadow-lg transition-all" data-action="regen-asset">重新生成</button>' +
+          '<div class="flex items-center gap-3 mt-5">' +
+            '<button type="button" class="flex-1 h-10 flex items-center justify-center bg-primary text-on-primary rounded-full font-bold text-[11px] tracking-wider uppercase hover:shadow-lg transition-all" data-action="regen-asset">重新生成</button>' +
             _ctx.historyBtnHtml(item, "pill-dark") +
-            '<button type="button" class="p-3 bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-lg">alternate_email</span></button>' +
-            '<button type="button" class="p-3 bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="edit-asset"><span class="material-symbols-outlined text-on-surface text-lg">edit</span></button>' +
+            '<button type="button" class="w-10 h-10 flex items-center justify-center bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-lg">alternate_email</span></button>' +
+            '<button type="button" class="w-10 h-10 flex items-center justify-center bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="edit-asset"><span class="material-symbols-outlined text-on-surface text-lg">edit</span></button>' +
           '</div>' +
         '</div>' +
       '</div>';
@@ -661,10 +661,10 @@ function _renderSceneCards(container, items) {
 
     card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500";
     card.innerHTML =
-      '<div class="relative aspect-[16/9] rounded-lg overflow-hidden' + imageClass + '"' + imageAttrs + '>' +
+      '<div class="relative aspect-[16/9] rounded-xl overflow-hidden -mt-1 -ml-1 -mr-1' + imageClass + '"' + imageAttrs + '>' +
         imgHtml +
         '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
-        '<div class="absolute inset-x-0 bottom-0 p-3 bg-gradient-to-t from-black/65 via-black/20 to-transparent">' +
+        '<div class="absolute inset-x-0 bottom-0 p-3 pl-5 bg-gradient-to-t from-black/65 via-black/20 to-transparent">' +
           '<div class="flex items-center gap-2">' +
             (isMain ? '<span class="bg-primary/90 text-on-primary px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>' : '') +
             (item.location ? '<span class="text-[11px] font-medium text-white/80 truncate">' + escapeHtml(item.location) + '</span>' : '') +
@@ -672,13 +672,10 @@ function _renderSceneCards(container, items) {
         '</div>' +
       '</div>' +
       '<div class="p-4">' +
-        '<div class="flex items-start justify-between gap-3">' +
-          '<div class="min-w-0">' +
-            '<h4 class="text-base font-bold tracking-tight text-on-background truncate">' + escapeHtml(item.name || '场景') + '</h4>' +
-            '<div class="asset-desc-wrap" data-action="edit-asset">' +
-              '<p class="' + sceneDescClass + '">' + escapeHtml(sceneDescText) + '</p>' +
-              '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
-            '</div>' +
+        '<div class="flex items-center justify-between gap-3">' +
+          '<div class="flex items-center gap-5 min-w-0 flex-1">' +
+            '<h4 class="text-base font-bold tracking-tight text-on-background truncate min-w-0">' + escapeHtml(item.name || '场景') + '</h4>' +
+            (metaTags ? '<div class="flex items-center gap-3 shrink-0">' + metaTags + '</div>' : '') +
           '</div>' +
           '<div class="flex gap-1.5 shrink-0">' +
             (imgSrc ? '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><span class="material-symbols-outlined text-on-surface text-sm">zoom_in</span></button>' : '') +
@@ -688,7 +685,10 @@ function _renderSceneCards(container, items) {
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="edit-asset" title="编辑"><span class="material-symbols-outlined text-on-surface text-sm">edit</span></button>' +
           '</div>' +
         '</div>' +
-        (metaTags ? '<div class="flex flex-wrap gap-3 mt-3">' + metaTags + '</div>' : '') +
+        '<div class="asset-desc-wrap" data-action="edit-asset">' +
+          '<p class="' + sceneDescClass + '">' + escapeHtml(sceneDescText) + '</p>' +
+          '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
+        '</div>' +
       '</div>';
     container.appendChild(card);
   });
