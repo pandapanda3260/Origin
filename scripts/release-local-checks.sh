@@ -23,6 +23,8 @@ run_isolated() {
   ORIGIN_DATA_DIR="$tmp/data" \
     DB_PATH="$tmp/data/qd.sqlite" \
     ORIGIN_ENV_FILE="$tmp/empty.env" \
+    JWT_SECRET="${JWT_SECRET:-origin-release-local-jwt-secret-000000000000000000}" \
+    ADMIN_JWT_SECRET="${ADMIN_JWT_SECRET:-origin-release-local-admin-secret-000000000000000}" \
     NODE_ENV=test \
     IMAGE_API_KEY= \
     IMAGE_SEEDREAM_API_KEY= \
@@ -41,6 +43,8 @@ run_build() {
   printf "\n==> npm run build\n"
   NEXT_TELEMETRY_DISABLED=1 \
     ORIGIN_ENV_FILE="$tmp/empty.env" \
+    JWT_SECRET="${JWT_SECRET:-origin-release-local-jwt-secret-000000000000000000}" \
+    ADMIN_JWT_SECRET="${ADMIN_JWT_SECRET:-origin-release-local-admin-secret-000000000000000}" \
     IMAGE_API_KEY= \
     IMAGE_SEEDREAM_API_KEY= \
     VIDEO_API_KEY= \
