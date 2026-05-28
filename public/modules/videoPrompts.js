@@ -215,7 +215,12 @@ function _updateVideoPromptConfirmButton(groups) {
   var allDone = _areAllVideoPromptsReady(groups || getStoryboardGroups());
   area.hidden = false;
   btn.disabled = !allDone;
-  btn.textContent = "提示词已确认，进入下一步";
+  // 用 innerHTML 整段重写，保留前置语义 icon + 末尾箭头；如果只 setText 会把 workspace.html
+  // 里的 <span class="material-symbols-outlined"> 子节点冲掉，导致 icon 一刷新就丢。
+  btn.innerHTML =
+    '<span class="material-symbols-outlined text-base">auto_awesome</span>' +
+    '<span>确认提示词，进入下一步</span>' +
+    '<span class="material-symbols-outlined text-base">arrow_forward</span>';
   btn.classList.toggle("opacity-50", !allDone);
   btn.classList.toggle("cursor-not-allowed", !allDone);
   btn.classList.toggle("shadow-none", !allDone);

@@ -13,6 +13,12 @@ import {
   LEGACY_STYLE_RULE_NOTICE_MESSAGE,
   reconcileFirstFramePromptState,
 } from '@/lib/first-frame-edit-draft';
+import {
+  currentTailFrameEditDraft,
+  reconcileTailFramePromptState,
+  tailFrameCurrentFramePayload,
+  tailFrameDraftFingerprint,
+} from '@/lib/tail-frame-edit-draft';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,6 +33,10 @@ function firstFrameUrl(sb: any): string {
   return String(sb?.frames?.first?.url || sb?.firstFrameUrl || sb?.imageUrl || sb?.rawUrl || sb?.url || '').trim();
 }
 
+function tailFrameHistory(sb: any): any[] {
+  return Array.isArray(sb?.tailFrameHistory) ? sb.tailFrameHistory : [];
+}
+
 export async function GET(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
@@ -38,13 +48,56 @@ export async function GET(req: NextRequest) {
 
   if (!projectId) return jsonError('缺 projectId', 400);
   if (groupIdx == null) return jsonError('缺 groupIdx', 400);
-  if (frameType !== 'first_frame') return jsonError('当前仅支持 first_frame', 400);
+  if (frameType !== 'first_frame' && frameType !== 'tail_frame') return jsonError('当前仅支持 first_frame / tail_frame', 400);
 
   const project = getProjectByIdForUser(projectId, user.id);
   if (!project) return jsonError('项目不存在', 404);
 
   const storyboards = Array.isArray((project as any).storyboards) ? (project as any).storyboards : [];
   const sb = storyboards[groupIdx] || {};
+
+  if (frameType === 'tail_frame') {
+    const promptState = reconcileTailFramePromptState({ projectId, user, groupIdx });
+    if (!promptState) return jsonError('项目不存在', 404);
+    const activeProject = getProjectByIdForUser(projectId, user.id) || project;
+    const activeStoryboards = Array.isArray((activeProject as any).storyboards) ? (activeProject as any).storyboards : [];
+    const activeSb = activeStoryboards[groupIdx] || {};
+    const { draft } = currentTailFrameEditDraft(activeProject, groupIdx);
+    const savedDraftFingerprint = tailFrameDraftFingerprint(draft);
+    return jsonOk({
+      projectId,
+      groupIdx,
+      frameType,
+      sourceHash: promptState.sourceHash,
+      draft,
+      savedDraftFingerprint,
+      baselineFingerprint: savedDraftFingerprint,
+      draftStale: promptState.tailFrameDraftStale,
+      tailFrameBasePrompt: promptState.tailFrameBasePrompt,
+      tailFrameBackup: promptState.tailFrameBackup,
+      tailFrameBasePromptStale: promptState.tailFrameBasePromptStale,
+      currentFrame: tailFrameCurrentFramePayload(activeSb),
+      tailFrameHistory: tailFrameHistory(activeSb),
+      preflight: promptState.preflight,
+      plan: promptState.plan ? {
+        finalPrompt: promptState.plan.finalPrompt,
+        planSummary: promptState.planSummary,
+        modelSnapshot: promptState.modelSnapshot,
+        primaryShotIdx: promptState.plan.primaryShotIdx,
+        primaryShot: promptState.plan.primaryShot,
+        contextShotIndices: promptState.plan.contextShotIndices,
+        contextShots: promptState.plan.contextShots,
+        styleLock: promptState.plan.styleLock,
+        characterLockText: promptState.plan.characterLockText,
+        sceneLockText: promptState.plan.sceneLockText,
+        propLockText: promptState.plan.propLockText,
+        driftGuardrails: promptState.plan.driftGuardrails,
+        compositionGuidance: promptState.plan.compositionGuidance,
+        referenceManifest: promptState.plan.referenceManifest,
+      } : null,
+    });
+  }
+
   const currentUrl = firstFrameUrl(sb);
   const imageHistory = Array.isArray(sb.imageHistory) ? sb.imageHistory : [];
   const legacyUnsupported = String(sb.firstFrameMode || '') === 'legacy_pencil';

@@ -3655,6 +3655,8 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 #btnGenAllVideoPrompts,
 #btnConfirmVideoPromptsTop,
 #btnStartBatch,
+#btnGenerateAllSegments,
+#btnImportAllSegments,
 #btnLibWorldTemplates,
 #btnSettingsLogout {
   height: 38px !important;
@@ -10678,11 +10680,13 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 .shot-pill-select-wrap,
 .shot-spec-pill {
-  min-height: 38px;
+  /* 由 38px 压到 30px：4px 垂直 padding + 20px 内容（select）+ 2px 边框 = 30px。
+   * 水平 padding 不动，icon-text gap 也不动；其他按钮如需对齐到 30px，统一改这一处即可。 */
+  min-height: 30px;
   display: inline-flex;
   align-items: center;
   gap: 9px;
-  padding: 6px 14px;
+  padding: 4px 14px;
   border-radius: 999px;
   border: 1px solid rgba(144, 164, 174, 0.12);
   background: rgba(236, 239, 241, 0.62);
@@ -10702,7 +10706,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   width: auto;
   max-width: 120px;
   min-width: 58px;
-  height: 24px;
+  /* 内部 select 高度由 24px → 20px，配合外层 wrap 的 30px 总高。 */
+  height: 20px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -10798,6 +10803,40 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-size: 11px;
   font-weight: 900;
 }
+/* 包住右侧"已生成 chip + 点击展开/折叠"按钮, gap 控制两者间距 (>= 30px 是产品要求)。 */
+.sb-frame-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 30px;
+}
+/* 折叠 toggle 按钮: 纯文本 + 右侧 chevron icon。配色对齐 .sb-frame-status 的弱化灰,
+   hover 时回到主文字色。letter-spacing 跟 .sb-frame-status 一档, 视觉上和"已生成"chip 一行。 */
+.sb-frame-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: rgba(69, 90, 100, 0.72);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sb-frame-toggle:hover {
+  color: #0B1320;
+}
+.sb-frame-toggle .sb-frame-toggle-icon {
+  font-size: 18px;
+}
+/* 折叠态: 仅隐藏 layout 主体, 保留 tail-advice-banner 让"建议生成尾帧 / 不建议使用尾帧"
+   这条结论即使在折叠态也持续可见 (产品要求, 用户不展开尾帧 card 也要能一眼判断)。
+   head 自带的 1px 淡边线保留, 折叠态下与 banner 顶边自然衔接, 不需要额外微调。 */
+.sb-frame-panel.is-collapsed .sb-frame-layout {
+  display: none;
+}
 .sb-frame-layout {
   display: grid;
   grid-template-columns: minmax(168px, 0.66fr) minmax(214px, 0.84fr) minmax(300px, 1.2fr);
@@ -10808,6 +10847,14 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .sb-frame-context-col,
 .sb-frame-preview-col {
   min-width: 0;
+}
+/* 让画面描述 textarea 跟着 card 高度向下延伸。grid 默认 stretch, copy-col 高度 =
+   最高那列 (通常是中间列 chips + 素材 + 对白); col 用 flex column, label 行固定,
+   下方 textarea flex:1 吃掉剩余空间, 不再在 textarea 下方留隐形空白。
+   min-height 保留原本 ~360px 兜底, 防止极矮场景下 textarea 缩成一条。 */
+.sb-frame-copy-col {
+  display: flex;
+  flex-direction: column;
 }
 .sb-frame-field-label {
   /* 字段标题 (画面描述 / 关键信息 / 参考素材 / 对白旁白 / 图片展示),
@@ -10863,6 +10910,17 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 900;
   line-height: 1;
 }
+.sb-frame-prompt-status-action {
+  min-height: 20px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(69, 90, 100, 0.18);
+  background: rgba(255, 255, 255, 0.85);
+  color: rgba(44, 62, 80, 0.78);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
 .sb-frame-text-box,
 .sb-frame-dialogue-box {
   /* 正文样式对齐资产页 .asset-desc-text:
@@ -10887,14 +10945,21 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 .sb-frame-prompt-editor {
   display: block;
-  max-height: calc(18 * 1.75em + 14px);
+  /* 去掉 max-height + height 固定值, 让 textarea 在 .sb-frame-copy-col 里 flex 撑高。
+     保留 min-height 兜底, 跟过去的 18 行 × 1.75em + 14px 视觉一致。 */
   min-height: calc(18 * 1.75em + 14px);
   padding: 6px 8px 6px 0;
   resize: none;
   overflow-y: auto;
+  flex: 1 1 auto;
 }
 .sb-frame-prompt-editor::placeholder {
   color: rgba(69, 90, 100, 0.45);
+}
+.sb-frame-prompt-editor[readonly] {
+  cursor: not-allowed;
+  color: rgba(69, 90, 100, 0.62);
+  background: rgba(236, 239, 241, 0.35);
 }
 .sb-frame-text-box:hover,
 .sb-frame-dialogue-box:hover {
@@ -10915,7 +10980,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   padding: 6px 0;
 }
 .sb-frame-text-box.sb-frame-prompt-editor {
-  height: calc(18 * 1.75em + 14px);
+  /* 不再写死 height, 让 .sb-frame-prompt-editor 的 flex:1 + min-height 决定实际高度。
+     padding 保留, 用来给焦点态边框留呼吸感。 */
   padding: 6px 8px 6px 0;
 }
 .sb-frame-dialogue-box {
@@ -11035,14 +11101,20 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .sb-frame-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
+  /* 让每个按钮 flex:1 等分容器宽度后，间距由 gap 控制即可——不再需要 space-between，
+   * 也不再需要 flex-wrap（强制单行，避免"3 个超宽 + 1 个落单"的奇怪布局）。 */
+  gap: 8px;
   padding-top: 12px;
 }
 .sb-frame-actions button {
-  min-height: 34px;
-  padding: 7px 10px;
+  /* flex:1 + min-width:0 让 4 个按钮等分父容器宽度，自动适配镜头列的真实宽度。
+   * justify-content:center 让按钮内 icon+文字居中（默认 flex 是 flex-start）。 */
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 8px;
+  gap: 4px;
   border-radius: 999px;
   font-size: 10px;
   letter-spacing: 0;
@@ -11051,10 +11123,20 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   white-space: nowrap;
 }
 .sb-frame-actions button .material-symbols-outlined {
-  font-size: 15px;
+  font-size: 14px;
 }
 .tail-advice-banner {
   border-bottom: 1px solid rgba(144, 164, 174, 0.12);
+  /* 与 .sb-frame-panel-head 的 padding:13px 18px 对齐, 不再依赖 Tailwind 的 px-[18px]
+     arbitrary value (如果没被编译进 CSS, 实际还是 px-4 = 16px)。!important 是因为
+     HTML 里同时挂着 Tailwind 的 px-4 utility, 要确保这条写死的 18px 胜出。 */
+  padding-left: 18px !important;
+  padding-right: 18px !important;
+}
+/* 让 banner 的图标字号跟 head 里 .sb-frame-panel-title 的 material-symbols 一致 (18px),
+   避免不同字号下字符盒边界错位导致"banner 图标看起来更靠右"。 */
+.tail-advice-banner .material-symbols-outlined {
+  font-size: 18px !important;
 }
 
 @media (max-width: 1500px) {
@@ -11087,7 +11169,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
     height: 140px;
   }
   .sb-frame-text-box.sb-frame-prompt-editor {
-    height: calc(18 * 1.75em + 14px);
+    height: auto;
+    min-height: calc(18 * 1.75em + 14px);
   }
   .sb-frame-preview-stage {
     height: min(62vw, 360px);
@@ -12264,8 +12347,16 @@ body.first-frame-editor-lock {
 }
 .ffe-material-strip {
   --ffe-material-slot-count: 5;
+  --ffe-material-tile-min: 64px;
   display: grid;
-  grid-template-columns: repeat(var(--ffe-material-slot-count), minmax(0, 1fr));
+  /* 此前用 repeat(slot-count, minmax(0, 1fr))：cap 设得高时（如 8、10）会把容器
+   * 强制等分成 N 列，每个 thumbnail 被挤压到很小，"添加素材"按钮的"+"和文字
+   * 也跟着变形。改为 auto-fill + minmax(64px, 1fr)：每个 thumbnail 保留至少
+   * 64px 最小宽度，一行排不下自动换到下一行。slot-count 变量保留（兼容性，
+   * 其他地方可能引用），但本规则不再使用。
+   * FFE 弹窗版（#firstFrameEditorRoot .ffe-material-strip）使用固定 tile size，
+   * 不受此影响。 */
+  grid-template-columns: repeat(auto-fill, minmax(var(--ffe-material-tile-min), 1fr));
   gap: 6px;
   align-items: start;
 }

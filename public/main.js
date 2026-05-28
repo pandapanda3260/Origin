@@ -6457,6 +6457,9 @@ var _scriptEditInitialText = "";
       flushServerSave: () => _flushServerSave(),
       safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
       switchPage: (p) => switchPage(p),
+      // 资产确认 → 跳到分镜页后自动启动镜头计划生成（仅在 project.shots 为空时）。
+      // 体验对齐 _confirmStyleAndContinue 的"确认风格 → 自动 extractAssets"。
+      generateShots: (opts) => generateShots(opts),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
       markDownstreamStale: (scope, detail) => _markDownstreamStale(scope, detail),
       isStale: (key) => _isStale(key),

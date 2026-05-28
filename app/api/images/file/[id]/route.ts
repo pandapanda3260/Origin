@@ -169,6 +169,11 @@ function parseImageInfo(buf: Buffer, mime: string): ImageInfo {
   return {};
 }
 
+function looksLikeSvgBuffer(buf: Buffer) {
+  const sample = buf.subarray(0, Math.min(buf.length, 4096)).toString('utf8').toLowerCase();
+  return sample.includes('<svg') || /<\?xml[\s\S]{0,1024}<svg/.test(sample);
+}
+
 function shouldPassthroughSource(row: any) {
   const mime = String(row.mime || '').toLowerCase();
   const ext = extname(String(row.filename || '')).toLowerCase();
@@ -180,6 +185,19 @@ function shouldPassthroughSource(row: any) {
     mime.includes('heic') ||
     mime.includes('heif') ||
     ['.svg', '.gif', '.apng', '.avif', '.heic', '.heif'].includes(ext)
+  );
+}
+
+function shouldFallbackResizeError(message: string) {
+  const normalized = String(message || '').toLowerCase();
+  return (
+    normalized.includes('invalid svg') ||
+    normalized.includes('decode') ||
+    normalized.includes('unsupported_source') ||
+    normalized.includes('resize_queue_timeout') ||
+    normalized.includes('resize_task_timeout') ||
+    normalized.includes('worker_timeout') ||
+    normalized.includes('resize_timeout')
   );
 }
 
@@ -454,6 +472,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (fileStat.size > MAX_SOURCE_BYTES) return originalResponse(row, fullPath, width, started, 'source_too_large');
 
   const header = await readHeader(fullPath, Math.min(HEADER_BYTES, fileStat.size));
+  if (looksLikeSvgBuffer(header)) return originalResponse(row, fullPath, width, started, 'unsupported_source_detected');
   const headerInfo = parseImageInfo(header, row.mime || '');
   const sourceWidth = Number(row.width) || headerInfo.width || 0;
   const sourceHeight = Number(row.height) || headerInfo.height || 0;
@@ -492,7 +511,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn('[images/file] thumbnail resize failed:', error);
-    if (message.includes('timeout')) return originalResponse(row, fullPath, width, started, message);
+    if (shouldFallbackResizeError(message)) return originalResponse(row, fullPath, width, started, message);
     return new Response('thumbnail failed', { status: 422 });
   }
 

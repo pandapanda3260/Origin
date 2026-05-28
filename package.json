@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "NEXT_DIST_DIR=.next-dev next dev -p 3000",
+    "build:workspace-css": "tailwindcss -c ./tailwind.workspace.config.cjs -i ./public/workspace-tailwind.src.css -o ./public/workspace-tailwind.css --minify",
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "verify:release:local": "bash scripts/release-local-checks.sh",
@@ -33,6 +34,7 @@
     "test:sanitize": "node scripts/test-image-moderation-sanitizer.js",
     "test:moderation-recovery": "node scripts/test-image-moderation-recovery.js",
     "test:image-provider-routing": "tsx scripts/test-image-provider-routing.ts",
+    "test:image-svg-fallback": "tsx scripts/test-image-svg-fallback.ts",
     "test:frame-workflow-state": "node scripts/test-frame-workflow-state.js",
     "test:frame-image-plan": "node scripts/test-frame-image-plan.js",
     "test:llm-background-mode": "node scripts/test-llm-background-mode.js",
@@ -83,11 +85,19 @@
     "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
+    "@fontsource/inter": "5.2.8",
+    "@fontsource/space-grotesk": "5.2.10",
+    "@tailwindcss/container-queries": "0.1.1",
+    "@tailwindcss/forms": "0.5.10",
     "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "20.14.10",
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",
+    "autoprefixer": "10.4.20",
+    "material-symbols": "0.44.10",
+    "postcss": "8.4.49",
+    "tailwindcss": "3.4.17",
     "typescript": "5.5.4"
   }
 }

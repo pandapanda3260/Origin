@@ -123,8 +123,14 @@ assert.match(
 
 assert.match(
   source,
-  /var promptDisplay = isTail \? _sbPromptShort\(promptText, 220\) : promptText;/,
+  /var promptDisplay = promptText;/,
   'first-frame card description must keep the full prompt instead of applying the old short-text ellipsis',
+);
+
+assert.doesNotMatch(
+  source,
+  /var promptDisplay = isTail \? _sbPromptShort\(promptText, 220\) : promptText;/,
+  'storyboard frame card must not use the old short-text ellipsis path',
 );
 
 assert.match(
@@ -141,7 +147,7 @@ assert.match(
 
 assert.match(
   source,
-  /hydrateProtectedImageElements\(bindRoot\);[\s\S]*?requestAnimationFrame\(function \(\) \{ _sbHydrateFirstFramePromptEditors\(bindRoot\); \}\);/,
+  /hydrateProtectedImageElements\(bindRoot\);[\s\S]*?requestAnimationFrame\(function \(\) \{[\s\S]*?_sbHydrateFirstFramePromptEditors\(bindRoot\);[\s\S]*?_sbHydrateTailFramePromptEditors\(bindRoot\);[\s\S]*?\}\);/,
   'storyboard render must schedule first-frame prompt hydration after card DOM is mounted',
 );
 
@@ -657,8 +663,14 @@ assert.match(
 
 assert.match(
   styles,
-  /\.sb-frame-prompt-editor\s*\{[\s\S]*?max-height:\s*calc\(18 \* 1\.75em \+ 14px\)[\s\S]*?overflow-y:\s*auto[\s\S]*?resize:\s*none/,
-  'first-frame card prompt editor must cap visible content at 18 lines and scroll overflow',
+  /\.sb-frame-prompt-editor\s*\{[\s\S]*?min-height:\s*calc\(18 \* 1\.75em \+ 14px\)[\s\S]*?overflow-y:\s*auto[\s\S]*?flex:\s*1 1 auto[\s\S]*?resize:\s*none/,
+  'first-frame card prompt editor must keep an 18-line minimum and stretch inside the frame card',
+);
+
+assert.doesNotMatch(
+  styles,
+  /\.sb-frame-text-box\.sb-frame-prompt-editor\s*\{[^}]*?\n\s*height\s*:\s*calc\(18 \* 1\.75em \+ 14px\)/,
+  'first-frame card prompt editor must not use the old fixed-height rule',
 );
 
 assert.match(

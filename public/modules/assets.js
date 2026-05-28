@@ -2020,6 +2020,22 @@ export function checkAssetsConfirm() {
   if (knowledgeBtn) knowledgeBtn.hidden = false;
 }
 
+// 资产确认后跳分镜页时，如果项目还没生成过镜头计划，自动跑一次 generateShots()。
+// 行为对齐 _confirmStyleAndContinue 的 "确认风格 → 跳资产页 → 自动 extractAssets"，
+// 让 风格→资产→分镜 三步流水线在用户视角下连贯衔接，不必每页都手动再点一下生成。
+// 用 300ms 延迟是为了等 switchPage 完成 DOM 切换、refreshShotsPage 把 #shotsReady
+// 显示出来后再启动，避免生成中态的进度条 UI 还没挂上就被 generateShots 写入。
+function _autoStartShotPlanAfterAssetConfirm() {
+  var originId = project && project.id;
+  setTimeout(function () {
+    if (!_ctx || typeof _ctx.generateShots !== "function") return;
+    // 项目被切走了 / 用户又跳回别的页面就不要触发，避免串项目或在错误页面打扰。
+    if (!project || project.id !== originId) return;
+    if (Array.isArray(project.shots) && project.shots.length > 0) return;
+    try { _ctx.generateShots(); } catch (e) { console.warn("[ConfirmAssets] auto generateShots failed:", e); }
+  }, 300);
+}
+
 export function confirmAssets() {
   if (!project || !project.assets) { showToast("请先分析资产", "warn"); return; }
 
@@ -2050,6 +2066,7 @@ export function confirmAssets() {
         _saveAssetsProject();
         _ctx.checkAndSuggest("assetConfirm");
         _ctx.switchPage("shots");
+        _autoStartShotPlanAfterAssetConfirm();
       }
     );
     return;
@@ -2060,6 +2077,7 @@ export function confirmAssets() {
   _saveAssetsProject();
   _ctx.checkAndSuggest("assetConfirm");
   _ctx.switchPage("shots");
+  _autoStartShotPlanAfterAssetConfirm();
 }
 
 export function handleAssetAction(e) {

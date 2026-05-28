@@ -146,8 +146,12 @@ function _syncEditExportButtonState() {
   btn.title = state.hint || "";
   var hintEl = $("editExportHint");
   if (hintEl) {
-    hintEl.hidden = !state.hint;
+    // 修 B：当 auto-compose blocker 已经在显示更具体的"检测到时间线被手工修改"提示时，
+    // 这里的同义警告就让位，避免双份提示。
+    var blockerEl = $("editAutoComposeBlocker");
+    var blockerVisible = !!(blockerEl && !blockerEl.hidden);
     hintEl.textContent = state.hint || "";
+    hintEl.hidden = blockerVisible || !state.hint;
   }
 }
 
@@ -3200,11 +3204,23 @@ export function syncEditProject(p) {
     if (!box) return;
     var show = !!evt;
     box.hidden = !show;
-    if (!show) return;
+    var hintEl = $("editExportHint");
+    if (!show) {
+      // Blocker 隐藏后让 export state 重新接管 hint 显示
+      _syncEditExportButtonState();
+      return;
+    }
     var title = $("editAutoComposeBlockerTitle");
     var text = $("editAutoComposeBlockerText");
-    if (title) title.textContent = "检测到时间线被手工修改";
-    if (text) text.textContent = (evt && (evt.message || evt.error)) || "请选择如何处理当前时间线，然后再继续一键成片。";
+    var titleText = "检测到时间线被手工修改";
+    if (title) title.textContent = titleText;
+    // 修 A：当服务端 message/error 与标题完全相同（route.ts 当前就是这样发的），
+    // 回退到默认引导文案，避免标题/正文重复显示同一句话。
+    var rawMsg = evt && (evt.message || evt.error);
+    var msg = (rawMsg && rawMsg !== titleText) ? rawMsg : "请选择如何处理当前时间线，然后再继续一键成片。";
+    if (text) text.textContent = msg;
+    // 修 B：blocker 显示时隐藏 export hint，避免和 "时间线已修改，请先一键成片" 双份警告。
+    if (hintEl) hintEl.hidden = true;
   }
 
   async function _resolveAutoComposeTimeline(action) {

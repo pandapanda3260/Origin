@@ -503,7 +503,7 @@ export function renderShotList() {
   var totalSec = 0;
   project.shots.forEach(function (s) { totalSec += (s.duration || 4); });
   var summaryMeta = $("shotSummaryMeta");
-  if (summaryMeta) summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · 总时长约 " + totalSec + " 秒";
+  if (summaryMeta) summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · " + totalSec + " 秒";
 
   project.shots.forEach(function (shot, idx) {
     var card = document.createElement("div");

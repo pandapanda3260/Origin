@@ -13,7 +13,9 @@ npm ci
 npm run verify:release:local
 ```
 
-`verify:release:local` runs TypeScript, the local deterministic test set, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
+`verify:release:local` runs TypeScript, the local deterministic test set, the workspace CSS build, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
+
+The workspace page uses local generated assets instead of runtime CDN CSS/fonts. Make sure release artifacts include `public/fonts.css`, `public/workspace-tailwind.css`, `public/vendor/fonts/`, `public/workspace-tailwind.src.css`, and `tailwind.workspace.config.cjs`.
 
 `npm run lint` is not a release gate yet: the script exists, but this repository has no ESLint config or ESLint dependency, so `next lint` prompts for interactive setup.
 
@@ -86,6 +88,7 @@ Use a staging host or staging process group with its own `ORIGIN_DATA_DIR`, `DB_
 
 ```bash
 npm ci
+npm run build:workspace-css
 npm run verify:release:local
 ORIGIN_APP_DIR=/opt/origin-staging pm2 start deploy/pm2/ecosystem.config.cjs --update-env
 ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
@@ -109,6 +112,7 @@ Do not deploy uncommitted local state. Commit the release, record the commit SHA
 # on server, after uploading/extracting the release into /opt/origin-next-<release-id>
 cd /opt/origin-next-<release-id>
 npm ci
+npm run build:workspace-css
 npm run build
 
 cp -a /opt/origin/vevdemo-1.0.6 ./vevdemo-1.0.6

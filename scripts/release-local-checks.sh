@@ -40,6 +40,12 @@ run_build() {
   local tmp
   tmp="$(mktemp -d /tmp/origin-release-build.XXXXXX)"
   : > "$tmp/empty.env"
+  printf "\n==> npm run build:workspace-css\n"
+  npm run build:workspace-css
+  local css_status=$?
+  printf "<== npm run build:workspace-css [%s]\n" "$css_status"
+  if [ "$css_status" -ne 0 ]; then failures=1; fi
+
   printf "\n==> npm run build\n"
   NEXT_TELEMETRY_DISABLED=1 \
     ORIGIN_ENV_FILE="$tmp/empty.env" \
@@ -59,6 +65,7 @@ run npm run typecheck
 
 run_isolated npm run check:admin-governance
 run_isolated npm run test:image-provider-routing
+run_isolated npm run test:image-svg-fallback
 run_isolated npm run test:frame-workflow-state
 run_isolated npm run test:frame-image-plan
 run_isolated npm run test:llm-background-mode

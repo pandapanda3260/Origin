@@ -67,79 +67,9 @@
         display: block !important;
       }
     </style>
-    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="styles.css?v=118" />
-    <script>
-      tailwind.config = {
-        theme: {
-          extend: {
-            colors: {
-              "surface": "#ECEFF1",
-              "inverse-primary": "#CFD8DC",
-              "tertiary-container": "#CFD8DC",
-              "on-secondary-container": "#2C3E50",
-              "on-primary-container": "#0B1320",
-              "tertiary-fixed": "#CFD8DC",
-              "primary-container": "#CFD8DC",
-              "surface-container": "#CFD8DC",
-              "error-container": "#fe8983",
-              "surface-container-low": "#ECEFF1",
-              "primary-fixed": "#CFD8DC",
-              "on-secondary": "#ECEFF1",
-              "surface-tint": "#0B1320",
-              "on-surface-variant": "#2C3E50",
-              "primary-fixed-dim": "#90A4AE",
-              "surface-bright": "#ECEFF1",
-              "on-background": "#0B1320",
-              "surface-dim": "#CFD8DC",
-              "on-secondary-fixed-variant": "#2C3E50",
-              "surface-container-lowest": "#ffffff",
-              "on-error": "#fff7f6",
-              "on-tertiary-fixed-variant": "#2C3E50",
-              "error-dim": "#4e0309",
-              "inverse-surface": "#0B1320",
-              "on-primary": "#ECEFF1",
-              "secondary-container": "#CFD8DC",
-              "primary-dim": "#2C3E50",
-              "on-secondary-fixed": "#0B1320",
-              "tertiary": "#2C3E50",
-              "surface-container-highest": "#CFD8DC",
-              "secondary-dim": "#2C3E50",
-              "tertiary-dim": "#2C3E50",
-              "on-primary-fixed-variant": "#0B1320",
-              "on-primary-fixed": "#0B1320",
-              "on-error-container": "#752121",
-              "on-tertiary-container": "#2C3E50",
-              "surface-container-high": "#CFD8DC",
-              "outline-variant": "#90A4AE",
-              "on-tertiary-fixed": "#0B1320",
-              "outline": "#90A4AE",
-              "error": "#9f403d",
-              "background": "#ECEFF1",
-              "primary": "#0B1320",
-              "inverse-on-surface": "#90A4AE",
-              "secondary": "#2C3E50",
-              "on-tertiary": "#ECEFF1",
-              "surface-variant": "#CFD8DC",
-              "secondary-fixed-dim": "#90A4AE",
-              "tertiary-fixed-dim": "#90A4AE",
-              "on-surface": "#0B1320",
-              "secondary-fixed": "#CFD8DC",
-              "on-secondary-fixed-variant": "#2C3E50",
-              "on-tertiary-fixed": "#0B1320",
-              "primary-fixed": "#CFD8DC",
-              "on-error-container": "#752121",
-              "surface-container-high": "#CFD8DC",
-              "on-primary-fixed-variant": "#0B1320",
-            },
-            borderRadius: { DEFAULT: "1rem", lg: "2rem", xl: "3rem", full: "9999px" },
-            fontFamily: { headline: ["Inter"], body: ["Inter"], label: ["Inter"] },
-          },
-        },
-      };
-    </script>
+    <link rel="stylesheet" href="fonts.css?v=1" />
+    <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
+    <link rel="stylesheet" href="styles.css?v=119" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -489,8 +419,9 @@
             </div>
             <div class="style-page-actions">
               <button type="button" id="btnStyleConfirm" class="style-primary-btn" data-write-action>
+                <span class="material-symbols-outlined">palette</span>
+                <span>确认风格，进入下一步</span>
                 <span class="material-symbols-outlined">arrow_forward</span>
-                确认风格，进入资产库
               </button>
             </div>
           </section>
@@ -622,7 +553,9 @@
               </button>
               <input type="file" id="scriptFileInput" accept=".txt,.md" hidden />
               <button type="button" id="btnScriptHeaderRegen" class="script-toolbar-btn script-toolbar-btn--primary" data-write-action>
-                <span>确认剧本，进入风格定制→</span>
+                <span class="material-symbols-outlined">description</span>
+                <span>确认剧本，进入下一步</span>
+                <span class="material-symbols-outlined">arrow_forward</span>
               </button>
             </div>
           </header>
@@ -800,7 +733,8 @@
                   <span class="material-symbols-outlined text-[16px]">auto_awesome</span>生成全部图片
                 </button>
 			                <button type="button" id="btnConfirmAssetsTop" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden data-write-action>
-		                  确认资产，进入镜头设计
+		                  <span class="material-symbols-outlined text-[16px]">inventory_2</span>
+		                  <span>确认资产，进入下一步</span>
 		                  <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
 		                </button>
 	              </div>
@@ -880,7 +814,8 @@
             <!-- Confirm Area -->
             <section id="assetsConfirmArea" class="mt-6 flex flex-col items-center gap-3" hidden>
               <button type="button" id="btnConfirmAssets" class="h-14 px-12 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-xl shadow-primary/15 hover:opacity-90 transition-all flex items-center gap-2" data-write-action>
-                确认资产库，进入镜头设计
+                <span class="material-symbols-outlined text-lg">inventory_2</span>
+                <span>确认资产，进入下一步</span>
                 <span class="material-symbols-outlined text-lg">arrow_forward</span>
               </button>
             </section>
@@ -909,8 +844,10 @@
                   </button>
                 </div>
                 <section id="shotsConfirmArea" class="flex items-start" hidden>
-                  <button type="button" id="btnConfirmShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap" data-write-action>
-                    确认分镜图，进入提示词 →
+                  <button type="button" id="btnConfirmShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap inline-flex items-center gap-2" data-write-action>
+                    <span class="material-symbols-outlined text-base">image</span>
+                    <span>确认分镜图，进入下一步</span>
+                    <span class="material-symbols-outlined text-base">arrow_forward</span>
                   </button>
                 </section>
               </div>
@@ -1056,8 +993,10 @@
 	                       渲染入口：public/modules/videoPrompts.js -> _renderVpStoryboardFrames。
 	                       事件绑定：main.js 里原来对应的 vpBtn{RefAgent,RegenSingle,Copy} 监听器一并移除。 -->
 	                  <section id="videoPromptsConfirmTopArea" class="shrink-0" hidden>
-	                    <button type="button" id="btnConfirmVideoPromptsTop" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all" data-write-action>
-	                      提示词已确认，进入下一步
+	                    <button type="button" id="btnConfirmVideoPromptsTop" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all inline-flex items-center gap-2" data-write-action>
+	                      <span class="material-symbols-outlined text-base">auto_awesome</span>
+	                      <span>确认提示词，进入下一步</span>
+	                      <span class="material-symbols-outlined text-base">arrow_forward</span>
 	                    </button>
 	                  </section>
 	                </div>
@@ -1124,8 +1063,9 @@
                   <span>全部导入</span>
                 </button>
                 <button type="button" id="btnStartBatch" class="batch-primary-action" data-write-action>
-                  <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">rocket_launch</span>
-                  <span>确认片段视频，进入剪辑 →</span>
+                  <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">movie</span>
+                  <span>确认片段视频，进入下一步</span>
+                  <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
               </div>
             </section>
@@ -1801,7 +1741,7 @@
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=104"></script>
-    <script type="module" src="main.js?v=160"></script>
+    <script type="module" src="main.js?v=162"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

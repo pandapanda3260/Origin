@@ -16,6 +16,22 @@ const nextConfig = {
       ],
     };
   },
+  async headers() {
+    return [
+      {
+        source: '/workspace',
+        headers: [{ key: 'Cache-Control', value: 'no-store' }],
+      },
+      {
+        source: '/workspace.html',
+        headers: [{ key: 'Cache-Control', value: 'no-store' }],
+      },
+      {
+        source: '/vendor/fonts/:path*',
+        headers: [{ key: 'Cache-Control', value: 'public, max-age=31536000, immutable' }],
+      },
+    ];
+  },
   webpack(config) {
     config.watchOptions = {
       ...(config.watchOptions || {}),

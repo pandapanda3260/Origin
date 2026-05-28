@@ -9,6 +9,13 @@ import {
   validateAndNormalizeFirstFrameDraft,
   FirstFrameDraftValidationException,
 } from '@/lib/first-frame-edit-draft';
+import {
+  TailFrameDraftValidationException,
+  currentTailFrameEditDraft,
+  reconcileTailFramePromptStateInPatch,
+  tailFrameDraftFingerprint,
+  validateAndNormalizeTailFrameDraft,
+} from '@/lib/tail-frame-edit-draft';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -61,15 +68,71 @@ export async function PUT(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const projectId = String(body?.projectId || '').trim();
   const groupIdx = parseGroupIdx(body?.groupIdx);
+  const frameType = String(body?.frameType || 'first_frame');
   const input = body?.draft || {};
   const expectedSavedDraftFingerprint = String(body?.expectedSavedDraftFingerprint || '').trim();
   const force = body?.force === true;
 
   if (!projectId) return jsonError('缺 projectId', 400);
   if (groupIdx == null) return jsonError('缺 groupIdx', 400);
+  if (frameType !== 'first_frame' && frameType !== 'tail_frame') return jsonError('当前仅支持 first_frame / tail_frame', 400);
 
   const project = getProjectByIdForUser(projectId, user.id);
   if (!project) return jsonError('项目不存在', 404);
+
+  if (frameType === 'tail_frame') {
+    try {
+      let draft: any = null;
+      let sourceHash: string | null = null;
+      let savedDraftFingerprint = '';
+      const updated = patchProjectForUser(projectId, user.id, (fresh) => {
+        if (!fresh) return null;
+        const promptState = reconcileTailFramePromptStateInPatch({ project: fresh, user, groupIdx });
+        sourceHash = promptState.sourceHash;
+        const { draft: currentDraft } = currentTailFrameEditDraft(fresh, groupIdx);
+        const actualSavedDraftFingerprint = tailFrameDraftFingerprint(currentDraft);
+        if (expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint && !force) {
+          throw new SavedDraftChangedException(expectedSavedDraftFingerprint, actualSavedDraftFingerprint);
+        }
+        if (force && expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint) {
+          console.warn('[tail-frame-edit-draft] force overwrite after saved draft changed', {
+            userId: user.id,
+            projectId,
+            groupIdx,
+            expectedSavedDraftFingerprint,
+            actualSavedDraftFingerprint,
+          });
+        }
+        draft = validateAndNormalizeTailFrameDraft({
+          input,
+          sourceHash: promptState.sourceHash,
+          userId: user.id,
+        });
+        savedDraftFingerprint = tailFrameDraftFingerprint(draft);
+        const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+        const prev = storyboards[groupIdx] || {};
+        storyboards[groupIdx] = {
+          ...prev,
+          ...(promptState.slotPatch || {}),
+          tailFrameEditDraft: draft,
+        };
+        return { storyboards };
+      });
+      return jsonOk({
+        draft,
+        sourceHash,
+        savedDraftFingerprint,
+        baselineFingerprint: savedDraftFingerprint,
+        tailFrameBasePrompt: (updated as any)?.storyboards?.[groupIdx]?.tailFrameBasePrompt || null,
+        tailFrameBackup: (updated as any)?.storyboards?.[groupIdx]?.tailFrameBackup || null,
+        projectUpdatedAt: (updated as any)?.updatedAt || null,
+      });
+    } catch (err: any) {
+      if (err instanceof SavedDraftChangedException) return savedDraftChangedResponse(err);
+      if (err instanceof TailFrameDraftValidationException) return validationResponse(err.errors);
+      return jsonError(err?.message || '保存尾帧草稿失败', 500);
+    }
+  }
 
   try {
     let draft: any = null;
@@ -135,14 +198,84 @@ export async function DELETE(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const projectId = String(body?.projectId || '').trim();
   const groupIdx = parseGroupIdx(body?.groupIdx);
+  const frameType = String(body?.frameType || 'first_frame');
   const expectedSavedDraftFingerprint = String(body?.expectedSavedDraftFingerprint || '').trim();
   const force = body?.force === true;
 
   if (!projectId) return jsonError('缺 projectId', 400);
   if (groupIdx == null) return jsonError('缺 groupIdx', 400);
+  if (frameType !== 'first_frame' && frameType !== 'tail_frame') return jsonError('当前仅支持 first_frame / tail_frame', 400);
 
   const project = getProjectByIdForUser(projectId, user.id);
   if (!project) return jsonError('项目不存在', 404);
+
+  if (frameType === 'tail_frame') {
+    try {
+      let sourceHash: string | null = null;
+      let savedDraftFingerprint = '';
+      const updated = patchProjectForUser(projectId, user.id, (fresh) => {
+        if (!fresh) return null;
+        const promptState = reconcileTailFramePromptStateInPatch({ project: fresh, user, groupIdx });
+        sourceHash = promptState.sourceHash;
+        const { draft: currentDraft } = currentTailFrameEditDraft(fresh, groupIdx);
+        const actualSavedDraftFingerprint = tailFrameDraftFingerprint(currentDraft);
+        if (expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint && !force) {
+          throw new SavedDraftChangedException(expectedSavedDraftFingerprint, actualSavedDraftFingerprint);
+        }
+        if (force && expectedSavedDraftFingerprint && expectedSavedDraftFingerprint !== actualSavedDraftFingerprint) {
+          console.warn('[tail-frame-edit-draft] force delete after saved draft changed', {
+            userId: user.id,
+            projectId,
+            groupIdx,
+            expectedSavedDraftFingerprint,
+            actualSavedDraftFingerprint,
+          });
+        }
+        const backup = promptState.tailFrameBackup;
+        if (!backup?.content) {
+          const err = new Error('no_backup_to_restore');
+          (err as any).status = 422;
+          (err as any).code = 'no_backup_to_restore';
+          throw err;
+        }
+        const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+        const prev = storyboards[groupIdx] || {};
+        const next = {
+          ...prev,
+          ...(promptState.slotPatch || {}),
+          tailFrameBasePrompt: {
+            content: backup.content,
+            sourceHash: backup.sourceHash,
+            updatedAt: new Date().toISOString(),
+            updatedBy: user.id,
+            origin: 'backup_restore',
+          },
+        };
+        delete next.tailFrameEditDraft;
+        storyboards[groupIdx] = next;
+        savedDraftFingerprint = tailFrameDraftFingerprint(null);
+        return { storyboards };
+      });
+      return jsonOk({
+        ok: true,
+        sourceHash,
+        savedDraftFingerprint,
+        baselineFingerprint: savedDraftFingerprint,
+        tailFrameBasePrompt: (updated as any)?.storyboards?.[groupIdx]?.tailFrameBasePrompt || null,
+        tailFrameBackup: (updated as any)?.storyboards?.[groupIdx]?.tailFrameBackup || null,
+        projectUpdatedAt: (updated as any)?.updatedAt || null,
+      });
+    } catch (err: any) {
+      if (err instanceof SavedDraftChangedException) return savedDraftChangedResponse(err);
+      if (err?.status === 422 || err?.code === 'no_backup_to_restore') {
+        return Response.json(
+          { error: '暂无可恢复的初始 prompt', code: 'no_backup_to_restore' },
+          { status: 422 },
+        );
+      }
+      return jsonError(err?.message || '恢复尾帧初始提示词失败', 500);
+    }
+  }
 
   try {
     let sourceHash: string | null = null;

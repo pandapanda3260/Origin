@@ -116,6 +116,7 @@ function _ffeInitialEditorState(overrides) {
 var _firstFrameEditor = _ffeInitialEditorState();
 var _firstFrameEditorScrollY = 0;
 var _firstFrameCardPromptAutosave = {};
+var _tailFrameCardPromptAutosave = {};
 var _firstFrameCardPromptProjectId = '';
 
 export function initStoryboard(ctx) {
@@ -127,6 +128,7 @@ export function syncStoryboardProject(p) {
   var nextProjectId = p && p.id || '';
   if (nextProjectId !== _firstFrameCardPromptProjectId) {
     _firstFrameCardPromptAutosave = {};
+    _tailFrameCardPromptAutosave = {};
     _firstFrameCardPromptProjectId = nextProjectId;
   }
   project = p || null;
@@ -654,8 +656,10 @@ function _applyTailFrameFields(existing, rawUrl, extra, fallbackShotIndices) {
     : (existing.tailFrameSourceHash || null);
   existing.tailFrameReferenceStatus = extra.tailFrameReferenceStatus || "ready";
   if (extra.tailFramePrompt) existing.tailFramePrompt = extra.tailFramePrompt;
+  if (extra.originalTailFramePrompt) existing.originalTailFramePrompt = extra.originalTailFramePrompt;
   if (extra.tailFrameSafetyAudit) existing.tailFrameSafetyAudit = extra.tailFrameSafetyAudit;
   if (extra.tailFramePlanSummary) existing.tailFramePlanSummary = extra.tailFramePlanSummary;
+  if (Array.isArray(extra.tailFrameHistory)) existing.tailFrameHistory = extra.tailFrameHistory;
   var incomingTail = (extra.frames && extra.frames.tail) ? extra.frames.tail : {
     url: tailUrl,
     prompt: extra.tailFramePrompt,
@@ -943,6 +947,8 @@ function _tailFrameAdviceBannerHtml(advice, gIdx) {
     : '点击仍然生成尾帧（系统不建议）。') + advice.reasonLong;
   return (
     '<button type="button" ' +
+      // padding 与 head 的 18px 基线对齐由 .tail-advice-banner CSS 控制 (见 styles.css),
+      // 这里的 px-4 只是兜底, 防止 CSS 没加载时 banner 完全没左右内边距。
       'class="tail-advice-banner w-full flex items-center gap-1.5 px-4 py-1.5 ' +
         toneCls +
         'transition-colors cursor-pointer text-[11px] leading-tight text-left" ' +
@@ -1209,16 +1215,25 @@ function _framePromptForPanel(kind, sb, group) {
   var cardPromptState = !isTail && group && group.groupIdx != null
     ? _firstFrameCardPromptAutosave[String(group.groupIdx)]
     : null;
+  var tailCardPromptState = isTail && group && group.groupIdx != null
+    ? _tailFrameCardPromptAutosave[String(group.groupIdx)]
+    : null;
   var firstFrameDraftPrompt = sb.firstFrameEditDraft && sb.firstFrameEditDraft.content;
   var firstFrameBasePrompt = sb.firstFrameBasePrompt && sb.firstFrameBasePrompt.content;
   var firstFramePlanPrompt = (cardPromptState && cardPromptState.plan && cardPromptState.plan.finalPrompt)
     || (sb.plan && sb.plan.finalPrompt);
+  var tailFrameDraftPrompt = sb.tailFrameEditDraft && sb.tailFrameEditDraft.content;
+  var tailFrameBasePrompt = sb.tailFrameBasePrompt && sb.tailFrameBasePrompt.content;
+  var tailFramePlanPrompt = (tailCardPromptState && tailCardPromptState.plan && tailCardPromptState.plan.finalPrompt) || '';
   var candidates = isTail
     ? [
-      { text: frame.prompt, source: '尾帧生成记录' },
-      { text: sb.tailFramePrompt, source: '尾帧生成记录' },
+      { text: tailFrameDraftPrompt, source: '尾帧草稿提示词' },
+      { text: tailFrameBasePrompt, source: '尾帧当前正式提示词' },
+      { text: tailFramePlanPrompt, source: '尾帧实时计划提示词' },
       { text: frame.originalPrompt, source: '尾帧原始提示词' },
       { text: sb.originalTailFramePrompt, source: '尾帧原始提示词' },
+      { text: frame.prompt, source: '尾帧生成记录' },
+      { text: sb.tailFramePrompt, source: '尾帧生成记录' },
     ]
     : [
       { text: firstFrameDraftPrompt, source: '首帧草稿提示词' },
@@ -1584,6 +1599,449 @@ function _sbFlushFirstFrameCardPromptsOnPageHide() {
   });
 }
 
+function _sbTailFrameCardPromptStatusInner(gIdx, status) {
+  status = status || 'initial';
+  var retryHtml = status === 'error'
+    ? '<button type="button" class="sb-frame-prompt-status-retry" data-action="retry-tail-frame-prompt-save" data-gidx="' + escapeHtml(gIdx) + '">重试</button>'
+    : '';
+  var restoreHtml = '<button type="button" class="sb-frame-prompt-status-action" data-action="restore-tail-frame-prompt" data-gidx="' + escapeHtml(gIdx) + '">恢复</button>';
+  return '<span>' + escapeHtml(_ffeFieldStatusText(status)) + '</span>' + retryHtml + restoreHtml;
+}
+
+function _sbTailFrameCardPromptState(gIdx) {
+  var key = String(gIdx);
+  if (!_tailFrameCardPromptAutosave[key]) {
+    _tailFrameCardPromptAutosave[key] = {
+      hydrated: false,
+      hydrating: null,
+      draft: null,
+      plan: null,
+      sourceHash: '',
+      savedDraftFingerprint: '',
+      expectedFingerprint: '',
+      lastSavedDraftJson: '{}',
+      pendingDraftJson: '{}',
+      pendingDraft: null,
+      dirtyAt: null,
+      debounceTimer: null,
+      maxWaitTimer: null,
+      inFlightPromise: null,
+      composing: false,
+      status: 'initial',
+      errorCode: '',
+      errorMessage: '',
+      staleWasShown: false,
+      staleNoticeShown: false,
+      preflight: null,
+    };
+  }
+  return _tailFrameCardPromptAutosave[key];
+}
+
+function _sbTailFrameCardPromptTextarea(gIdx) {
+  return document.querySelector('textarea[data-sb-tail-prompt-field="content"][data-gidx="' + String(gIdx) + '"]');
+}
+
+function _sbTailFrameCardPromptStatus(gIdx, sb) {
+  var state = _tailFrameCardPromptAutosave[String(gIdx)];
+  if (state && state.status) return state.status;
+  return _ffeSavedFieldStatus('content', sb && sb.tailFrameEditDraft);
+}
+
+function _sbTailFramePromptReadOnly(gIdx, sb) {
+  sb = sb || (project && project.storyboards && project.storyboards[gIdx]) || {};
+  if (!_canGenerateTailFrame(sb)) return true;
+  var state = _tailFrameCardPromptAutosave[String(gIdx)];
+  return !!(state && state.preflight && state.preflight.allowed === false);
+}
+
+function _sbTailFrameCardPromptStatusHtml(gIdx, sb) {
+  var status = _sbTailFrameCardPromptStatus(gIdx, sb);
+  return '<div class="sb-frame-prompt-status" data-sb-tail-prompt-status="' + escapeHtml(gIdx) + '" data-status="' + escapeHtml(status) + '">' +
+    _sbTailFrameCardPromptStatusInner(gIdx, status) +
+  '</div>';
+}
+
+function _sbSetTailFrameCardPromptStatus(gIdx, status, message, code) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  state.status = status || 'initial';
+  state.errorMessage = message || '';
+  state.errorCode = code || '';
+  var node = document.querySelector('[data-sb-tail-prompt-status="' + String(gIdx) + '"]');
+  if (!node) return;
+  node.dataset.status = state.status;
+  node.title = state.errorMessage || '';
+  node.innerHTML = _sbTailFrameCardPromptStatusInner(gIdx, state.status);
+}
+
+function _sbTailFramePromptEditorHtml(gIdx, text, opts) {
+  opts = opts || {};
+  var readOnly = opts.readOnly === true;
+  var readOnlyAttrs = readOnly
+    ? ' readonly aria-readonly="true" title="' + escapeHtml(opts.title || '需先完成彩色视频首帧后才能编辑尾帧提示词') + '"'
+    : '';
+  return '<textarea class="sb-frame-text-box sb-frame-prompt-editor" data-sb-tail-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="尾帧提示词待生成。"' + readOnlyAttrs + '>' +
+    escapeHtml(text || '') +
+  '</textarea>';
+}
+
+function _sbTailFrameCardBaseDraft(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (state.draft && typeof state.draft === 'object') return _ffeCloneDraft(state.draft);
+  var sb = project && project.storyboards && project.storyboards[gIdx] || {};
+  return _ffeCloneDraft(sb.tailFrameEditDraft || {});
+}
+
+function _sbTailFrameCardDraftWithContent(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  var el = _sbTailFrameCardPromptTextarea(gIdx);
+  if (!el) return _ffeCloneDraft(state.pendingDraft || state.draft || (project && project.storyboards && project.storyboards[gIdx] && project.storyboards[gIdx].tailFrameEditDraft) || {});
+  var content = _ffeCleanDraftText(el ? el.value : '', FFE_PROMPT_OVERRIDE_MAX_CHARS);
+  var draft = _sbTailFrameCardBaseDraft(gIdx);
+  if (content) draft.content = content;
+  else delete draft.content;
+  return draft;
+}
+
+function _sbRefreshTailFrameCardPendingDraft(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  var draft = _sbTailFrameCardDraftWithContent(gIdx);
+  state.pendingDraft = draft;
+  state.pendingDraftJson = _ffeDraftJson(draft);
+  return { draft: draft, json: state.pendingDraftJson };
+}
+
+function _sbTailFrameCardHasPendingChanges(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  _sbRefreshTailFrameCardPendingDraft(gIdx);
+  return state.pendingDraftJson !== state.lastSavedDraftJson;
+}
+
+function _sbMergeTailFrameCardPlanPayload(gIdx, payload) {
+  payload = payload || {};
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (!project.storyboards) project.storyboards = [];
+  if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+  var sb = project.storyboards[gIdx];
+  if (Object.prototype.hasOwnProperty.call(payload, 'draft')) sb.tailFrameEditDraft = payload.draft || null;
+  if (payload.tailFrameBasePrompt) sb.tailFrameBasePrompt = payload.tailFrameBasePrompt;
+  if (payload.tailFrameBackup) sb.tailFrameBackup = payload.tailFrameBackup;
+  if (Array.isArray(payload.tailFrameHistory)) sb.tailFrameHistory = payload.tailFrameHistory;
+  state.plan = payload.plan || state.plan || null;
+  state.preflight = payload.preflight || null;
+  state.sourceHash = String(payload.sourceHash || '');
+  state.savedDraftFingerprint = String(payload.savedDraftFingerprint || '');
+  state.expectedFingerprint = state.savedDraftFingerprint;
+  state.draft = _ffeCloneDraft(payload.draft || {});
+  state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+  state.pendingDraftJson = state.lastSavedDraftJson;
+  state.pendingDraft = _ffeCloneDraft(state.draft);
+  state.hydrated = true;
+  state.staleWasShown = !!(payload.draftStale || payload.tailFrameBasePromptStale);
+  if (state.status !== 'saving') {
+    state.status = _ffeSavedFieldStatus('content', state.draft);
+    state.errorCode = '';
+    state.errorMessage = '';
+  }
+  var el = _sbTailFrameCardPromptTextarea(gIdx);
+  if (el) {
+    var readOnly = _sbTailFramePromptReadOnly(gIdx, sb);
+    el.readOnly = readOnly;
+    if (readOnly) {
+      el.setAttribute('aria-readonly', 'true');
+      el.title = (state.preflight && state.preflight.message) || '需先完成彩色视频首帧后才能编辑尾帧提示词';
+    } else {
+      el.removeAttribute('aria-readonly');
+      el.title = '';
+    }
+  }
+  _sbSetTailFrameCardPromptStatus(gIdx, state.status);
+}
+
+async function _sbEnsureTailFrameCardPromptState(gIdx, options) {
+  options = options || {};
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (state.hydrated && options.force !== true) return state;
+  if (state.hydrating) return await state.hydrating;
+  state.hydrating = (async function () {
+    try {
+      if (!project || !project.id) throw new Error('项目未加载');
+      var payload = await apiGet('/api/frames/plan?projectId=' + encodeURIComponent(project.id) + '&groupIdx=' + encodeURIComponent(gIdx) + '&frameType=tail_frame');
+      _sbMergeTailFrameCardPlanPayload(gIdx, payload);
+      return _sbTailFrameCardPromptState(gIdx);
+    } catch (err) {
+      _sbSetTailFrameCardPromptStatus(gIdx, 'error', _diagnoseApiError(((err && err.message) || err).toString()), 'hydrate_failed');
+      throw err;
+    } finally {
+      state.hydrating = null;
+    }
+  })();
+  return await state.hydrating;
+}
+
+function _sbTailFrameCardPromptText(gIdx) {
+  var sb = project && project.storyboards && project.storyboards[gIdx] || {};
+  var groups = getStoryboardGroups();
+  var group = groups.find(function (item) { return Number(item.groupIdx) === Number(gIdx); }) || { groupIdx: gIdx };
+  return _framePromptForPanel('tail', sb, group).text || '';
+}
+
+async function _sbHydrateTailFramePromptEditor(gIdx, el) {
+  var beforeValue = String(el && el.value || '');
+  var state = _sbTailFrameCardPromptState(gIdx);
+  try {
+    await _sbEnsureTailFrameCardPromptState(gIdx);
+    var currentEl = _sbTailFrameCardPromptTextarea(gIdx);
+    if (currentEl && currentEl === el && !state.dirtyAt && String(currentEl.value || '') === beforeValue) {
+      currentEl.value = _sbTailFrameCardPromptText(gIdx);
+    }
+    _sbRefreshTailFrameCardPendingDraft(gIdx);
+    _sbSetTailFrameCardPromptStatus(gIdx, _sbTailFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
+  } catch (_) {
+    showToast('尾帧提示词状态加载失败，请稍后重试', 'error');
+  }
+}
+
+function _sbHydrateTailFramePromptEditors(root) {
+  if (!root || !project || !project.id) return;
+  Array.prototype.slice.call(root.querySelectorAll('textarea[data-sb-tail-prompt-field="content"]')).forEach(function (el) {
+    var gIdx = parseInt(el.dataset.gidx, 10);
+    if (isNaN(gIdx)) return;
+    var state = _sbTailFrameCardPromptState(gIdx);
+    if (state.hydrated || state.hydrating) return;
+    var beforeValue = String(el.value || '');
+    _sbEnsureTailFrameCardPromptState(gIdx).then(function () {
+      var currentEl = _sbTailFrameCardPromptTextarea(gIdx);
+      if (!currentEl) return;
+      var nextText = _sbTailFrameCardPromptText(gIdx);
+      if (!state.dirtyAt && String(currentEl.value || '') === beforeValue) {
+        currentEl.value = nextText;
+      }
+      _sbRefreshTailFrameCardPendingDraft(gIdx);
+      _sbSetTailFrameCardPromptStatus(gIdx, _sbTailFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
+    }).catch(function (err) {
+      console.warn('[tail-frame-card-prompt] hydrate failed:', err);
+    });
+  });
+}
+
+function _sbClearTailFrameCardPromptTimers(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (state.debounceTimer) clearTimeout(state.debounceTimer);
+  if (state.maxWaitTimer) clearTimeout(state.maxWaitTimer);
+  state.debounceTimer = null;
+  state.maxWaitTimer = null;
+}
+
+async function _sbRunTailFrameCardPromptSave(gIdx, options) {
+  options = options || {};
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (!project || !project.id) return { ok: false, code: 'missing_project' };
+  if (state.inFlightPromise) return await state.inFlightPromise;
+  _sbClearTailFrameCardPromptTimers(gIdx);
+  state.inFlightPromise = (async function () {
+    try {
+      await _sbEnsureTailFrameCardPromptState(gIdx);
+      if (_sbTailFramePromptReadOnly(gIdx, project && project.storyboards && project.storyboards[gIdx])) {
+        _sbSetTailFrameCardPromptStatus(gIdx, 'initial');
+        return { ok: false, code: 'tail_frame_preflight_blocked', readOnly: true };
+      }
+      var el = _sbTailFrameCardPromptTextarea(gIdx);
+      var currentText = _ffeCleanDraftText(el && el.value, FFE_PROMPT_OVERRIDE_MAX_CHARS);
+      var baselineText = _ffeCleanDraftText(_sbTailFrameCardPromptText(gIdx), FFE_PROMPT_OVERRIDE_MAX_CHARS);
+      if (!options.forceSave && !state.dirtyAt && !(state.draft && state.draft.content) && currentText === baselineText) {
+        _sbSetTailFrameCardPromptStatus(gIdx, 'initial');
+        return { ok: true, skipped: true, unchangedBaseline: true };
+      }
+      var snapshot = _sbRefreshTailFrameCardPendingDraft(gIdx);
+      if (!options.forceSave && snapshot.json === state.lastSavedDraftJson) {
+        _sbSetTailFrameCardPromptStatus(gIdx, _ffeSavedFieldStatus('content', state.draft));
+        return { ok: true, skipped: true };
+      }
+      _sbSetTailFrameCardPromptStatus(gIdx, 'saving');
+      var resp = await apiPost('/api/frames/edit-draft', {
+        projectId: project.id,
+        groupIdx: gIdx,
+        frameType: 'tail_frame',
+        draft: snapshot.draft || {},
+        expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+        force: options.force === true,
+      }, 'PUT');
+      state.draft = _ffeCloneDraft(resp.draft || {});
+      state.savedDraftFingerprint = String(resp.savedDraftFingerprint || '');
+      state.expectedFingerprint = state.savedDraftFingerprint;
+      state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+      state.pendingDraftJson = state.lastSavedDraftJson;
+      state.pendingDraft = _ffeCloneDraft(state.draft);
+      state.dirtyAt = null;
+      state.errorCode = '';
+      state.errorMessage = '';
+      if (!project.storyboards) project.storyboards = [];
+      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+      project.storyboards[gIdx].tailFrameEditDraft = resp.draft || null;
+      if (resp.tailFrameBasePrompt) project.storyboards[gIdx].tailFrameBasePrompt = resp.tailFrameBasePrompt;
+      if (resp.tailFrameBackup) project.storyboards[gIdx].tailFrameBackup = resp.tailFrameBackup;
+      var nextStatus = _ffeSavedFieldStatus('content', state.draft);
+      _sbSetTailFrameCardPromptStatus(gIdx, nextStatus);
+      if (state.staleWasShown && !state.staleNoticeShown) {
+        state.staleNoticeShown = true;
+        showToast('已按当前镜头/资产/风格上下文保存', 'success');
+      }
+      return { ok: true, resp: resp };
+    } catch (err) {
+      var payload = err && err.payload || {};
+      var code = payload.code || 'save_failed';
+      var msg = payload.error || _diagnoseApiError(((err && err.message) || err).toString());
+      _sbSetTailFrameCardPromptStatus(gIdx, 'error', msg, code);
+      if (code === 'saved_draft_changed') showToast('草稿在另一处被修改，请重试或刷新后继续。', 'warn');
+      else if (code === 'validation_failed') showToast('草稿校验失败，请检查提示词。', 'warn');
+      else showToast('自动保存失败: ' + msg, 'error');
+      return { ok: false, code: code, payload: payload };
+    } finally {
+      state.inFlightPromise = null;
+    }
+  })();
+  return await state.inFlightPromise;
+}
+
+function _sbScheduleTailFrameCardPromptSave(gIdx, options) {
+  options = options || {};
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (_sbTailFramePromptReadOnly(gIdx)) return;
+  if (state.composing) return;
+  _sbRefreshTailFrameCardPendingDraft(gIdx);
+  if (state.pendingDraftJson === state.lastSavedDraftJson) {
+    state.dirtyAt = null;
+    _sbSetTailFrameCardPromptStatus(gIdx, _ffeSavedFieldStatus('content', state.draft));
+    return;
+  }
+  if (!state.dirtyAt) state.dirtyAt = Date.now();
+  _sbClearTailFrameCardPromptTimers(gIdx);
+  var run = function () {
+    _sbRunTailFrameCardPromptSave(gIdx, { source: options.source || 'tail-card-autosave' }).then(function (result) {
+      _sbRefreshTailFrameCardPendingDraft(gIdx);
+      if (result && result.ok && _sbTailFrameCardPromptState(gIdx).pendingDraftJson !== _sbTailFrameCardPromptState(gIdx).lastSavedDraftJson) {
+        _sbScheduleTailFrameCardPromptSave(gIdx, { source: 'tail-card-autosave-followup' });
+      }
+    });
+  };
+  if (options.immediate) {
+    run();
+    return;
+  }
+  state.debounceTimer = setTimeout(run, FFE_AUTOSAVE_DEBOUNCE_MS);
+  var waitMs = Math.max(0, state.dirtyAt + FFE_AUTOSAVE_MAX_WAIT_MS - Date.now());
+  state.maxWaitTimer = setTimeout(run, waitMs);
+}
+
+async function _sbRetryTailFrameCardPromptSave(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (state.errorCode === 'saved_draft_changed') {
+    var overwrite = window.confirm('草稿在另一处被修改，是否用本卡片里的版本覆盖？');
+    if (!overwrite) {
+      var refresh = window.confirm('是否刷新到最新草稿？刷新会放弃本卡片未保存修改。');
+      if (refresh) {
+        state.hydrated = false;
+        state.dirtyAt = null;
+        await _sbEnsureTailFrameCardPromptState(gIdx, { force: true });
+        var el = _sbTailFrameCardPromptTextarea(gIdx);
+        if (el) el.value = _sbTailFrameCardPromptText(gIdx);
+      }
+      return;
+    }
+    await _sbRunTailFrameCardPromptSave(gIdx, { force: true, forceSave: true });
+    return;
+  }
+  await _sbRunTailFrameCardPromptSave(gIdx, { forceSave: true });
+}
+
+async function _sbRestoreTailFrameCardPrompt(gIdx) {
+  var state = _sbTailFrameCardPromptState(gIdx);
+  if (!project || !project.id) return;
+  try {
+    await _sbEnsureTailFrameCardPromptState(gIdx);
+    _sbClearTailFrameCardPromptTimers(gIdx);
+    _sbSetTailFrameCardPromptStatus(gIdx, 'saving');
+    var resp = await apiPost('/api/frames/edit-draft', {
+      projectId: project.id,
+      groupIdx: gIdx,
+      frameType: 'tail_frame',
+      expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+      force: true,
+    }, 'DELETE');
+    state.draft = _ffeCloneDraft(resp.draft || {});
+    state.savedDraftFingerprint = String(resp.savedDraftFingerprint || '');
+    state.expectedFingerprint = state.savedDraftFingerprint;
+    state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+    state.pendingDraftJson = state.lastSavedDraftJson;
+    state.pendingDraft = _ffeCloneDraft(state.draft);
+    state.dirtyAt = null;
+    if (!project.storyboards) project.storyboards = [];
+    if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+    project.storyboards[gIdx].tailFrameEditDraft = resp.draft || null;
+    if (resp.tailFrameBasePrompt) project.storyboards[gIdx].tailFrameBasePrompt = resp.tailFrameBasePrompt;
+    if (resp.tailFrameBackup) project.storyboards[gIdx].tailFrameBackup = resp.tailFrameBackup;
+    var el = _sbTailFrameCardPromptTextarea(gIdx);
+    if (el) el.value = _sbTailFrameCardPromptText(gIdx);
+    _sbSetTailFrameCardPromptStatus(gIdx, 'restored');
+    showToast('已恢复尾帧初始 prompt', 'success');
+  } catch (err) {
+    var payload = err && err.payload || {};
+    var code = payload.code || 'restore_failed';
+    var msg = payload.error || _diagnoseApiError(((err && err.message) || err).toString());
+    _sbSetTailFrameCardPromptStatus(gIdx, 'error', msg, code);
+    if (code === 'no_backup_to_restore') showToast('暂无可恢复的初始 prompt', 'warn');
+    else showToast('恢复尾帧 prompt 失败: ' + msg, 'error');
+  }
+}
+
+function _sbAnyTailFrameCardPromptUnsaved() {
+  return Object.keys(_tailFrameCardPromptAutosave).some(function (key) {
+    var state = _tailFrameCardPromptAutosave[key];
+    if (!state) return false;
+    var gIdx = Number(key);
+    if (!Number.isFinite(gIdx)) return false;
+    return _sbTailFrameCardHasPendingChanges(gIdx);
+  });
+}
+
+function _sbFlushTailFrameCardPromptsOnPageHide() {
+  Object.keys(_tailFrameCardPromptAutosave).forEach(function (key) {
+    var gIdx = Number(key);
+    var state = _tailFrameCardPromptAutosave[key];
+    if (!Number.isFinite(gIdx) || !state || !project || !project.id) return;
+    var pending = _sbRefreshTailFrameCardPendingDraft(gIdx);
+    if (pending.json === state.lastSavedDraftJson) return;
+    try {
+      fetch('/api/frames/edit-draft', {
+        method: 'PUT',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          projectId: project.id,
+          groupIdx: gIdx,
+          frameType: 'tail_frame',
+          draft: pending.draft || {},
+          expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+          force: true,
+        }),
+        keepalive: true,
+      }).catch(function () {});
+    } catch (_) {}
+  });
+}
+
+async function _sbFlushTailFrameCardPromptsForTargets(targets, source) {
+  var seen = Object.create(null);
+  for (var i = 0; i < targets.length; i += 1) {
+    var gIdx = Number(targets[i] && targets[i].groupIdx);
+    if (!Number.isFinite(gIdx) || seen[gIdx]) continue;
+    seen[gIdx] = true;
+    var result = await _sbRunTailFrameCardPromptSave(gIdx, { source: source || 'tail-frame-generate-flush' });
+    if (result && result.ok === false) return result;
+  }
+  return { ok: true };
+}
+
 function _framePlanSummaryForPanel(kind, sb) {
   sb = sb || {};
   var isTail = kind === 'tail';
@@ -1634,6 +2092,36 @@ function _frameDialogueHtml(group) {
   if (!dialogue || dialogue === '——') dialogue = '---';
   // tabindex=0 同 .sb-frame-text-box, 触发 :focus 视觉效果。
   return '<div class="sb-frame-dialogue-box" tabindex="0">' + escapeHtml(dialogue) + '</div>';
+}
+
+// 首帧/尾帧 card 折叠状态: 模块内存, 不持久化。
+//   key 形式: "<gIdx>:<kind>", value 为 true 表示折叠。
+//   默认: 首帧展开 (false), 尾帧折叠 (true)。re-render (renderImageGrid) 时也读这个 map,
+//   所以状态可以跨 re-render 保留, 用户切换页面 / 重新加载后回到默认。
+var _frameCardCollapsed = {};
+function _frameCardCollapseKey(gIdx, kind) {
+  return String(gIdx) + ':' + String(kind);
+}
+function _isFrameCardCollapsed(gIdx, kind) {
+  var key = _frameCardCollapseKey(gIdx, kind);
+  if (Object.prototype.hasOwnProperty.call(_frameCardCollapsed, key)) {
+    return !!_frameCardCollapsed[key];
+  }
+  return kind === 'tail';
+}
+function _setFrameCardCollapsed(gIdx, kind, collapsed) {
+  _frameCardCollapsed[_frameCardCollapseKey(gIdx, kind)] = !!collapsed;
+}
+function _frameCardToggleButtonHtml(gIdx, kind) {
+  var collapsed = _isFrameCardCollapsed(gIdx, kind);
+  var label = collapsed ? '点击展开' : '点击折叠';
+  var icon = collapsed ? 'expand_more' : 'expand_less';
+  return '<button type="button" class="sb-frame-toggle" ' +
+    'data-action="toggle-frame-card" data-gidx="' + gIdx + '" data-frame="' + escapeHtml(kind) + '" ' +
+    'aria-expanded="' + (collapsed ? 'false' : 'true') + '">' +
+      '<span class="sb-frame-toggle-label">' + label + '</span>' +
+      '<span class="material-symbols-outlined sb-frame-toggle-icon">' + icon + '</span>' +
+    '</button>';
 }
 
 function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
@@ -1689,6 +2177,9 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
     if (!isTail) buttons += _firstFrameEditButtonHtml(gIdx, sb);
     buttons += _frameButtonHtml(isTail ? 'upload-tail' : 'upload-first', gIdx, 'upload', isTail ? '上传尾帧' : '上传首帧', isTail ? '手动上传一张已有尾帧图' : '手动上传一张已有首帧图', 'secondary', false);
     if (hasImg) buttons += _frameButtonHtml(isTail ? 'download-tail' : 'download-sb', gIdx, 'download', '下载图片', isTail ? '下载尾帧' : '下载首帧', 'secondary', false);
+    if (isTail && Array.isArray(sb.tailFrameHistory) && sb.tailFrameHistory.length) {
+      buttons += _frameButtonHtml('show-tail-history', gIdx, 'history', '历史', '查看尾帧历史版本', 'secondary', false);
+    }
     buttons += _frameButtonHtml((canPrimary && !materialBlocked) ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'secondary', !canPrimary || materialBlocked);
     // Tail-only: 删除按钮 = 清图 + 清意图。只有"已生成尾帧"或"已请求但尚未生成"才暴露该按钮。
     if (isTail && (hasImg || sb.tailFrameIntent === 'requested')) {
@@ -1713,22 +2204,26 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   }
   var promptInfo = _framePromptForPanel(kind, sb, group);
   var promptText = promptInfo.text || (isTail ? '尾帧提示词待生成。' : '');
-  var promptDisplay = isTail ? _sbPromptShort(promptText, 220) : promptText;
+  var promptDisplay = promptText;
   // 注: "来源：xxx" 行和 sb-frame-plan-note 构图指导段已按产品要求从首尾帧
   // 卡片移除。promptInfo.source 仍保留在数据层(便于排查), 但不再渲染;
   // _framePlanSummaryForPanel 仍被 _shotKeywordChipsHtml 用来拿角色/场景/道具
   // chips, 不能删除函数本身。
 
-  return '<section data-frame="' + kind + '" class="sb-frame-panel">' +
+  var isCollapsed = _isFrameCardCollapsed(gIdx, kind);
+  return '<section data-frame="' + kind + '" class="sb-frame-panel' + (isCollapsed ? ' is-collapsed' : '') + '">' +
            '<div class="sb-frame-panel-head">' +
              '<div class="sb-frame-panel-title">' +
                '<span class="material-symbols-outlined">' + icon + '</span>' +
                '<strong>分镜板 · ' + escapeHtml(label) + '</strong>' +
                '<em>' + escapeHtml(labelEn) + '</em>' +
              '</div>' +
-             '<div class="sb-frame-status">' +
-               '<span title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
-               tailBadgesHtml +
+             '<div class="sb-frame-head-right">' +
+               '<div class="sb-frame-status">' +
+                 '<span title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
+                 tailBadgesHtml +
+               '</div>' +
+               _frameCardToggleButtonHtml(gIdx, kind) +
              '</div>' +
            '</div>' +
            adviceBannerHtml +
@@ -1736,10 +2231,13 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
              '<div class="sb-frame-copy-col">' +
                '<div class="sb-frame-field-label-row">' +
                  '<div class="sb-frame-field-label">画面描述</div>' +
-                 (isTail ? '' : _sbFirstFrameCardPromptStatusHtml(gIdx, sb)) +
+                 (isTail ? _sbTailFrameCardPromptStatusHtml(gIdx, sb) : _sbFirstFrameCardPromptStatusHtml(gIdx, sb)) +
                '</div>' +
                (isTail
-                 ? '<div class="sb-frame-text-box" tabindex="0">' + escapeHtml(promptDisplay) + '</div>'
+                 ? _sbTailFramePromptEditorHtml(gIdx, promptDisplay, {
+                     readOnly: !state.canGenerate,
+                     title: state.preflightMsg,
+                   })
                  : _sbFirstFramePromptEditorHtml(gIdx, promptDisplay)) +
              '</div>' +
              '<div class="sb-frame-context-col">' +
@@ -4196,23 +4694,45 @@ document.addEventListener('click', _handleMaterialPanelAction);
 document.addEventListener('click', _handleFirstFrameEditorClick);
 document.addEventListener('focusin', function (ev) {
   var target = ev.target;
-  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
-  var gIdx = parseInt(target.dataset.gidx, 10);
-  if (!isNaN(gIdx)) _sbHydrateFirstFramePromptEditor(gIdx, target);
+  if (target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var gIdx = parseInt(target.dataset.gidx, 10);
+    if (!isNaN(gIdx)) _sbHydrateFirstFramePromptEditor(gIdx, target);
+    return;
+  }
+  if (target && target.matches && target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    var tailGIdx = parseInt(target.dataset.gidx, 10);
+    if (!isNaN(tailGIdx)) _sbHydrateTailFramePromptEditor(tailGIdx, target);
+  }
 });
 document.addEventListener('input', function (ev) {
   var target = ev.target;
-  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
-  var gIdx = parseInt(target.dataset.gidx, 10);
-  if (isNaN(gIdx)) return;
-  _sbRefreshFirstFrameCardPendingDraft(gIdx);
-  _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-input' });
+  if (target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var gIdx = parseInt(target.dataset.gidx, 10);
+    if (isNaN(gIdx)) return;
+    _sbRefreshFirstFrameCardPendingDraft(gIdx);
+    _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-input' });
+    return;
+  }
+  if (target && target.matches && target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    if (target.readOnly) return;
+    var tailGIdx = parseInt(target.dataset.gidx, 10);
+    if (isNaN(tailGIdx)) return;
+    _sbRefreshTailFrameCardPendingDraft(tailGIdx);
+    _sbScheduleTailFrameCardPromptSave(tailGIdx, { source: 'tail-card-autosave-input' });
+  }
 });
 document.addEventListener('change', function (ev) {
   var target = ev.target;
-  if (!(target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]'))) return;
-  var gIdx = parseInt(target.dataset.gidx, 10);
-  if (!isNaN(gIdx)) _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-change', immediate: true });
+  if (target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    var gIdx = parseInt(target.dataset.gidx, 10);
+    if (!isNaN(gIdx)) _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-change', immediate: true });
+    return;
+  }
+  if (target && target.matches && target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    if (target.readOnly) return;
+    var tailGIdx = parseInt(target.dataset.gidx, 10);
+    if (!isNaN(tailGIdx)) _sbScheduleTailFrameCardPromptSave(tailGIdx, { source: 'tail-card-autosave-change', immediate: true });
+  }
 });
 document.addEventListener('input', function (ev) {
   if (ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot')) {
@@ -4245,6 +4765,17 @@ document.addEventListener('compositionstart', function (ev) {
     }
     return;
   }
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    if (ev.target.readOnly) return;
+    var tailCardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(tailCardGIdx)) {
+      var tailCardAuto = _sbTailFrameCardPromptState(tailCardGIdx);
+      tailCardAuto.composing = true;
+      tailCardAuto.dirtyAt = null;
+      _sbClearTailFrameCardPromptTimers(tailCardGIdx);
+    }
+    return;
+  }
   if (!(ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot'))) return;
   var field = ev.target.dataset && ev.target.dataset.ffeField || '';
   if (field !== 'content' && field !== 'negativePromptOverride') return;
@@ -4261,6 +4792,17 @@ document.addEventListener('compositionend', function (ev) {
       cardAuto.composing = false;
       cardAuto.dirtyAt = null;
       _sbScheduleFirstFrameCardPromptSave(cardGIdx, { source: 'card-autosave-compositionend' });
+    }
+    return;
+  }
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    if (ev.target.readOnly) return;
+    var tailCardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(tailCardGIdx)) {
+      var tailCardAuto = _sbTailFrameCardPromptState(tailCardGIdx);
+      tailCardAuto.composing = false;
+      tailCardAuto.dirtyAt = null;
+      _sbScheduleTailFrameCardPromptSave(tailCardGIdx, { source: 'tail-card-autosave-compositionend' });
     }
     return;
   }
@@ -4282,6 +4824,14 @@ document.addEventListener('blur', function (ev) {
     }
     return;
   }
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-tail-prompt-field="content"]')) {
+    if (ev.target.readOnly) return;
+    var tailCardGIdx = parseInt(ev.target.dataset.gidx, 10);
+    if (!isNaN(tailCardGIdx) && !_sbTailFrameCardPromptState(tailCardGIdx).composing) {
+      _sbScheduleTailFrameCardPromptSave(tailCardGIdx, { source: 'tail-card-autosave-blur', immediate: true });
+    }
+    return;
+  }
   if (!(ev.target && ev.target.closest && ev.target.closest('#firstFrameEditorRoot'))) return;
   var field = ev.target.dataset && ev.target.dataset.ffeField || '';
   if (field !== 'content' && field !== 'negativePromptOverride') return;
@@ -4291,9 +4841,10 @@ document.addEventListener('blur', function (ev) {
 window.addEventListener('pagehide', function () {
   _ffeFlushAutoSaveOnPageHide();
   _sbFlushFirstFrameCardPromptsOnPageHide();
+  _sbFlushTailFrameCardPromptsOnPageHide();
 });
 window.addEventListener('beforeunload', function (ev) {
-  if (!_ffeBeforeUnloadHasUnsavedChanges() && !_sbAnyFirstFrameCardPromptUnsaved()) return;
+  if (!_ffeBeforeUnloadHasUnsavedChanges() && !_sbAnyFirstFrameCardPromptUnsaved() && !_sbAnyTailFrameCardPromptUnsaved()) return;
   ev.preventDefault();
   ev.returnValue = '';
 });
@@ -5005,7 +5556,10 @@ export function renderImageGrid() {
 
   _initGalleryDrag(grid);
   hydrateProtectedImageElements(bindRoot);
-  requestAnimationFrame(function () { _sbHydrateFirstFramePromptEditors(bindRoot); });
+  requestAnimationFrame(function () {
+    _sbHydrateFirstFramePromptEditors(bindRoot);
+    _sbHydrateTailFramePromptEditors(bindRoot);
+  });
   _ensureShotMaterialPanels(groups);
   _sbCurrentIdx = groups.length ? Math.min(prevIdx, groups.length - 1) : 0;
   if (!isShotLayout) _updateNavDots(groups.length);
@@ -5345,15 +5899,22 @@ function _syncMergedStoryboardConfirmState(groups) {
   topBtn.classList.toggle("shadow-none", !allFirstFramesReady);
   topBtn.classList.toggle("hover:opacity-90", allFirstFramesReady);
   topBtn.classList.toggle("hover:opacity-50", !allFirstFramesReady);
+  // 统一文案：不论 allFirstFramesReady / imagesApproved 状态，都展示"确认分镜图，进入下一步"，
+  // 禁用态由 disabled + opacity 区分；图标/箭头结构与其他确认按钮保持一致，避免每次 setText 把
+  // workspace.html 里的 icon 子节点冲掉（这是上一版按钮 icon 丢失的根因）。
+  var SHOTS_CONFIRM_HTML =
+    '<span class="material-symbols-outlined text-base">image</span>' +
+    '<span>确认分镜图，进入下一步</span>' +
+    '<span class="material-symbols-outlined text-base">arrow_forward</span>';
   if (!allFirstFramesReady) {
-    topBtn.textContent = "确认分镜图，进入提示词 →";
+    topBtn.innerHTML = SHOTS_CONFIRM_HTML;
     topBtn.title = "请先生成全部首帧图";
     return;
   }
-  topBtn.textContent = project.imagesApproved
-    ? "分镜图已确认，查看视频提示词 →"
-    : "确认分镜图，进入提示词 →";
-  topBtn.title = "确认所有首帧分镜图并进入视频提示词";
+  topBtn.innerHTML = SHOTS_CONFIRM_HTML;
+  topBtn.title = project.imagesApproved
+    ? "分镜图已确认，可继续查看视频提示词"
+    : "确认所有首帧分镜图并进入视频提示词";
 }
 
 function _updateImagesActionButton(groups) {
@@ -5775,6 +6336,17 @@ export async function generateStoryboardTailFrame(gIdx) {
     showToast("已标记这段需要尾帧，请先生成彩色首帧", "info");
     return;
   }
+  var tailFlushResult = await _sbRunTailFrameCardPromptSave(gIdx, { source: 'regen-tail-flush' });
+  if (tailFlushResult && tailFlushResult.ok === false) {
+    if (tailFlushResult.readOnly) {
+      var tailState = _sbTailFrameCardPromptState(gIdx);
+      showToast((tailState.preflight && tailState.preflight.message) || '请先完成彩色视频首帧，再生成尾帧。', 'warn');
+    }
+    renderImageGrid();
+    checkImagesConfirm();
+    return;
+  }
+  sb = project.storyboards[gIdx] || sb;
   sb.tailFrameIntent = "requested";
   sb.tailFrameIntentUpdatedAt = sb.tailFrameIntentUpdatedAt || new Date().toISOString();
   project.storyboards[gIdx] = sb;
@@ -5788,6 +6360,7 @@ export async function generateStoryboardTailFrame(gIdx) {
       batchType: 'tail_frame_images',
       projectId: originId,
       targets: [{ groupIdx: gIdx, idx: gIdx, shotIndices: group.shotIndices || [] }],
+      applyEditDraft: true,
     });
   } catch (e) {
     var errMsg = ((e && e.message) || e).toString().slice(0, 120);
@@ -5962,6 +6535,15 @@ export async function generateAllTailFrames(opts) {
     renderImageGrid();
     return;
   }
+  var tailFlushResult = await _sbFlushTailFrameCardPromptsForTargets(targets, 'tail-frame-batch-flush');
+  if (tailFlushResult && tailFlushResult.ok === false) {
+    if (tailFlushResult.readOnly) {
+      showToast('部分尾帧暂不可编辑或生成，请先完成对应彩色视频首帧。', 'warn');
+    }
+    renderImageGrid();
+    checkImagesConfirm();
+    return;
+  }
 
   var btn = opts.buttonId ? $(opts.buttonId) : null;
   if (btn) btn.disabled = true;
@@ -5975,6 +6557,7 @@ export async function generateAllTailFrames(opts) {
       batchType: 'tail_frame_images',
       projectId: originId,
       targets: targets,
+      applyEditDraft: true,
     });
   } catch (e) {
     var errMsg = ((e && e.message) || e).toString().slice(0, 120);
@@ -6663,6 +7246,45 @@ export async function handleImageAction(e) {
     return;
   }
 
+  if (action === "retry-tail-frame-prompt-save") {
+    var retryTailGIdx = parseInt(btn.dataset.gidx, 10);
+    if (isNaN(retryTailGIdx)) {
+      var retryTailCard = btn.closest(".sb-sheet");
+      retryTailGIdx = parseInt(retryTailCard && retryTailCard.dataset.groupIdx, 10);
+    }
+    if (!isNaN(retryTailGIdx)) _sbRetryTailFrameCardPromptSave(retryTailGIdx);
+    return;
+  }
+
+  if (action === "restore-tail-frame-prompt") {
+    var restoreTailGIdx = parseInt(btn.dataset.gidx, 10);
+    if (isNaN(restoreTailGIdx)) {
+      var restoreTailCard = btn.closest(".sb-sheet");
+      restoreTailGIdx = parseInt(restoreTailCard && restoreTailCard.dataset.groupIdx, 10);
+    }
+    if (!isNaN(restoreTailGIdx)) _sbRestoreTailFrameCardPrompt(restoreTailGIdx);
+    return;
+  }
+
+  if (action === "toggle-frame-card") {
+    // 折叠/展开首帧 / 尾帧 card。仅切 CSS class + 改按钮文案/图标, 不走完整 re-render,
+    // 避免破坏画面描述 textarea 的焦点/输入态。状态写进 _frameCardCollapsed map,
+    // 下次 renderImageGrid 时也会读到, 所以跨 re-render 不会丢。
+    var toggleGIdx = parseInt(btn.dataset.gidx, 10);
+    var toggleKind = btn.dataset.frame === 'tail' ? 'tail' : 'first';
+    if (isNaN(toggleGIdx)) return;
+    var nextCollapsed = !_isFrameCardCollapsed(toggleGIdx, toggleKind);
+    _setFrameCardCollapsed(toggleGIdx, toggleKind, nextCollapsed);
+    var panel = btn.closest('.sb-frame-panel');
+    if (panel) panel.classList.toggle('is-collapsed', nextCollapsed);
+    btn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+    var labelEl = btn.querySelector('.sb-frame-toggle-label');
+    if (labelEl) labelEl.textContent = nextCollapsed ? '点击展开' : '点击折叠';
+    var iconEl = btn.querySelector('.sb-frame-toggle-icon');
+    if (iconEl) iconEl.textContent = nextCollapsed ? 'expand_more' : 'expand_less';
+    return;
+  }
+
   if (action === "lightbox") {
     var imgSrc = btn.tagName === "IMG" ? btn.src : (btn.dataset.img || "");
     if (imgSrc) _openLightbox(imgSrc);
@@ -6696,6 +7318,33 @@ export async function handleImageAction(e) {
         showToast("已恢复到历史版本", "ok");
       } catch (err) {
         showToast("恢复历史版本失败: " + _diagnoseApiError(((err && err.message) || err).toString()), "error");
+      }
+    });
+    return;
+  }
+
+  if (action === "show-tail-history") {
+    var tailSbItem = project.storyboards && project.storyboards[gIdx];
+    if (!tailSbItem || !Array.isArray(tailSbItem.tailFrameHistory) || !tailSbItem.tailFrameHistory.length) {
+      showToast("暂无尾帧历史版本", "warn");
+      return;
+    }
+    _openHistoryPopover(btn, { imageHistory: tailSbItem.tailFrameHistory }, async function (hi) {
+      var snap = tailSbItem.tailFrameHistory && tailSbItem.tailFrameHistory[hi];
+      var historyUrl = snap && (snap.url || snap.rawUrl) || "";
+      if (!historyUrl || !project || !project.id) return;
+      try {
+        await apiPost('/api/frames/set-current-from-history', {
+          projectId: project.id,
+          groupIdx: gIdx,
+          frameType: 'tail_frame',
+          historyUrl: historyUrl,
+        });
+        await _reloadProjectFromServerForStoryboard(project.id);
+        renderImageGrid();
+        showToast("已恢复尾帧历史版本", "ok");
+      } catch (err) {
+        showToast("恢复尾帧历史版本失败: " + _diagnoseApiError(((err && err.message) || err).toString()), "error");
       }
     });
     return;

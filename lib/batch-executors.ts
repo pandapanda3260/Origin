@@ -104,6 +104,15 @@ import {
   validateAndNormalizeFirstFrameDraft,
   FirstFrameDraftValidationException,
 } from './first-frame-edit-draft';
+import {
+  currentTailFrameEditDraft,
+  nextTailFrameHistory,
+  reconcileTailFramePromptStateInPatch,
+  tailFrameDraftFingerprint,
+  tailFrameHistoryItemFromCurrent,
+  validateAndNormalizeTailFrameDraft,
+  TailFrameDraftValidationException,
+} from './tail-frame-edit-draft';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
 import { resolveTargetEndStrategy, resolveVideoModelCapability } from './video-provider-capabilities';
 import { captionTailFrameForVideo, hashImageFileContent, type TailFrameCaption } from './image-caption';
@@ -115,7 +124,6 @@ import {
 import { normalizeTailFrameSignals } from './shot-tail-frame-signals';
 import {
   computeFirstFrameSourceHash,
-  computeTailFrameSourceHash,
   makeSingleShotStoryboardSlots,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
@@ -1705,27 +1713,88 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   ctx.progress({ stage: 'building_prompt' });
 
   const imgCfg = resolveLLMConfig(ctx.user, 'image');
-  const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
-  const plan = buildFrameImageGenerationPlan({
-    project: proj,
-    groupIdx,
-    shotIndices,
-    ownerId: ctx.user.id,
-    frameType: 'tail_frame',
-    modelSnapshot: {
-      provider: imgCfg.provider,
-      model: imgCfg.model,
-      baseUrl: imgCfg.baseUrl,
-      quality: imgCfg.imageQuality || 'medium',
-      multiRefImageCap: capMulti,
-    },
-    selfFirstFrame: {
-      remoteUrl: firstFrameUrl,
-      localPath: selfFirstFrameLocal,
-    },
+  const generationState: { finalPlan: FrameImageGenerationPlan | null } = { finalPlan: null };
+  let appliedEditDraft = false;
+  let appliedDraftForFingerprint: any = null;
+  let committedTailFrameBasePromptContent = '';
+  let generationShotIndices = shotIndices;
+  let tailFrameSourceHashForInput: string | null = null;
+  let previousTailFrameHistoryItem: ReturnType<typeof tailFrameHistoryItemFromCurrent> = null;
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const originalStoryboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+    previousTailFrameHistoryItem = tailFrameHistoryItemFromCurrent(originalStoryboards[groupIdx] || {}, {
+      at: nowIso(),
+      source: 'current_before_tail_frame_regenerate',
+    });
+    const promptState = reconcileTailFramePromptStateInPatch({ project: fresh, user: ctx.user, groupIdx });
+    if (!promptState.plan || !promptState.tailFrameBasePrompt?.content) {
+      const code = promptState.preflight.code || 'tail_frame_prompt_unready';
+      throw errorWithRecoveryHint(
+        promptState.preflight.message || '尾帧提示词状态未就绪，无法生成尾帧。',
+        code,
+        code === 'first_frame_file_unresolvable'
+          ? '请重新生成首帧，或点击“上传”重新上传一张首帧图后，再生成尾帧。'
+          : '请先完成彩色视频首帧，再生成尾帧。',
+      );
+    }
+    let nextPlan = {
+      ...promptState.plan,
+      finalPrompt: promptState.tailFrameBasePrompt.content,
+    };
+    let slotPatch: Record<string, any> = { ...(promptState.slotPatch || {}) };
+    const { draft } = currentTailFrameEditDraft(fresh, groupIdx);
+    if (ctx.options?.applyEditDraft === true && draft) {
+      let normalizedDraft: ReturnType<typeof validateAndNormalizeTailFrameDraft>;
+      try {
+        normalizedDraft = validateAndNormalizeTailFrameDraft({
+          input: draft,
+          sourceHash: promptState.sourceHash,
+          userId: ctx.user.id,
+        });
+      } catch (err) {
+        if (err instanceof TailFrameDraftValidationException) {
+          throw new Error(err.errors.map((item) => item.message).join('; ') || '尾帧草稿校验失败');
+        }
+        throw err;
+      }
+      if (!normalizedDraft.content) {
+        throw new Error('尾帧草稿为空，无法提交生成');
+      }
+      nextPlan = {
+        ...promptState.plan,
+        finalPrompt: normalizedDraft.content,
+      };
+      appliedEditDraft = true;
+      appliedDraftForFingerprint = normalizedDraft;
+      slotPatch = {
+        ...slotPatch,
+        tailFrameBasePrompt: {
+          content: nextPlan.finalPrompt,
+          sourceHash: promptState.sourceHash,
+          updatedAt: nowIso(),
+          updatedBy: ctx.user.id,
+          origin: 'draft_commit',
+        },
+        tailFrameEditDraft: undefined,
+      };
+    }
+    generationState.finalPlan = nextPlan;
+    committedTailFrameBasePromptContent = nextPlan.finalPrompt;
+    generationShotIndices = promptState.shotIndices;
+    tailFrameSourceHashForInput = promptState.sourceHash;
+    if (!Object.keys(slotPatch).length) return {};
+    const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+    while (storyboards.length <= groupIdx) storyboards.push({});
+    const prev = storyboards[groupIdx] || {};
+    const nextSlot = { ...prev, ...slotPatch };
+    if (slotPatch.tailFrameEditDraft === undefined) delete nextSlot.tailFrameEditDraft;
+    storyboards[groupIdx] = nextSlot;
+    return { storyboards };
   });
-
-  const basePrompt = plan.finalPrompt;
+  const plan = generationState.finalPlan;
+  if (!plan) throw new Error('尾帧生成计划初始化失败');
+  const tailFrameBasePromptContent = committedTailFrameBasePromptContent || plan.finalPrompt;
   const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
   const referenceImagePaths = imageRefs
     .map((r) => r.localPath)
@@ -1738,27 +1807,27 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     groupIdx,
   });
   const imageStyle = 'photographic' as const;
-  const tailFrameSourceHashForInput = computeTailFrameSourceHash(proj, ctx.user.id, groupIdx);
   const planSummary = {
     ...summarizePlanForAudit(plan),
+    appliedEditDraft,
     actualImageInput: {
       quality: imageQuality,
       size: frameImageSize,
       style: imageStyle,
       referenceImageCount: referenceImagePaths.length,
-      draftFingerprint: firstFrameDraftFingerprint(null),
+      draftFingerprint: tailFrameDraftFingerprint(appliedDraftForFingerprint),
     },
   };
 
   ctx.progress({
     stage: 'calling_image_api',
-    shotCount: shotIndices.length,
+    shotCount: generationShotIndices.length,
     mode: 'tail_frame',
     hint: '调用图像 API 生成彩色视频尾帧…',
   });
 
   const result = await generateImageWithModerationRecovery(ctx.user, {
-    prompt: basePrompt,
+    prompt: tailFrameBasePromptContent,
     size: frameImageSize,
     style: imageStyle,
     kind: 'storyboard',
@@ -1774,14 +1843,14 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   const frameTail = {
     url: result.url,
     prompt: result.submittedPrompt,
-    originalPrompt: basePrompt,
+    originalPrompt: tailFrameBasePromptContent,
     mode: 'structured_v1' as const,
     status: 'ready' as const,
     planSummary,
     safetyAudit: result.safetyAudit,
     visualAnchorDescription: result.visualAnchorDescription,
     generatedAt,
-    shotIndices,
+    shotIndices: generationShotIndices,
     sourceHash: tailFrameSourceHash,
     referenceStatus: 'ready' as const,
   };
@@ -1793,9 +1862,12 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     const prev = sbs[groupIdx] || {};
     sbs[groupIdx] = {
       ...prev,
+      tailFrameHistory: nextTailFrameHistory(prev.tailFrameHistory, previousTailFrameHistoryItem, {
+        excludeUrls: [result.url],
+      }),
       tailFrameUrl: result.url,
       tailFramePrompt: result.submittedPrompt,
-      originalTailFramePrompt: basePrompt,
+      originalTailFramePrompt: tailFrameBasePromptContent,
       tailFrameMode: 'structured_v1',
       tailFrameSafetyAudit: result.safetyAudit,
       tailFramePlanSummary: planSummary,
@@ -1817,11 +1889,11 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     provider: imgCfg.provider,
     stageTarget: {
       groupIdx,
-      shotIndices,
+      shotIndices: generationShotIndices,
       mode: 'structured_v1',
       referenceCount: plan.referenceManifest.length,
       imageReferenceCount: imageRefs.length,
-      hasSelfFirstFrame: !!selfFirstFrameLocal,
+      hasSelfFirstFrame: plan.referenceManifest.some((ref) => ref.role === 'self_first_frame' && ref.delivery === 'image'),
       planSummary,
     },
   });
@@ -1834,7 +1906,7 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       url: result.url,
       tailFrameUrl: result.url,
       tailFrameMode: 'structured_v1',
-      shotIndices,
+      shotIndices: generationShotIndices,
       tailFramePrompt: result.submittedPrompt,
       tailFrameSafetyAudit: result.safetyAudit,
       tailFramePlanSummary: planSummary,
@@ -1850,9 +1922,9 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       url: result.url,
       tailFrameUrl: result.url,
       tailFrameMode: 'structured_v1',
-      shotIndices,
+      shotIndices: generationShotIndices,
       tailFramePrompt: result.submittedPrompt,
-      originalTailFramePrompt: basePrompt,
+      originalTailFramePrompt: tailFrameBasePromptContent,
       tailFrameSafetyAudit: result.safetyAudit,
       tailFramePlanSummary: planSummary,
       tailFrameIntent: 'requested',

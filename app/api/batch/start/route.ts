@@ -332,7 +332,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  if (batchType === 'storyboard_images' && applyEditDraft) {
+  if ((batchType === 'storyboard_images' || batchType === 'tail_frame_images') && applyEditDraft) {
     batchOptions = {
       ...(batchOptions || {}),
       applyEditDraft: true,
