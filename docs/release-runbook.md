@@ -111,6 +111,7 @@ Do not deploy uncommitted local state. Commit the release, record the commit SHA
 ```bash
 # on server, after uploading/extracting the release into /opt/origin-next-<release-id>
 cd /opt/origin-next-<release-id>
+set -a && . /etc/origin/origin.env && set +a
 npm ci
 npm run build:workspace-css
 npm run build
