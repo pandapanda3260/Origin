@@ -9947,8 +9947,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
    根本触发不到"贴顶"条件。min-height 给左列撑出滚动空间，右列就能跟。 */
 .shots-two-col {
   display: grid;
-  grid-template-columns: minmax(660px, 1fr) minmax(288px, 344px);
-  gap: 22px;
+  grid-template-columns: minmax(700px, 1fr) minmax(248px, 300px);
+  gap: 18px;
   align-items: flex-start;
   min-height: calc(100vh - 200px);
 }
@@ -9975,8 +9975,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 
 @media (min-width: 1800px) {
   .shots-two-col {
-    grid-template-columns: minmax(720px, 1fr) minmax(300px, 360px);
-    gap: 24px;
+    grid-template-columns: minmax(760px, 1fr) minmax(268px, 320px);
+    gap: 22px;
   }
   .shot-workbench-card {
     grid-template-columns: minmax(330px, 0.92fr) minmax(420px, 1.08fr);
@@ -9989,8 +9989,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 
 @media (max-width: 1600px) {
   .shots-two-col {
-    grid-template-columns: minmax(660px, 1fr) minmax(280px, 340px);
-    gap: 20px;
+    grid-template-columns: minmax(680px, 1fr) minmax(236px, 292px);
+    gap: 16px;
   }
 
   .shot-workbench-card {
@@ -10800,9 +10800,9 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 .sb-frame-layout {
   display: grid;
-  grid-template-columns: minmax(190px, 0.76fr) minmax(260px, 1fr) minmax(320px, 1.18fr);
-  gap: 22px;
-  padding: 18px;
+  grid-template-columns: minmax(168px, 0.66fr) minmax(214px, 0.84fr) minmax(300px, 1.2fr);
+  gap: 16px;
+  padding: 16px;
 }
 .sb-frame-copy-col,
 .sb-frame-context-col,
@@ -10994,7 +10994,8 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .sb-frame-preview-stage {
   position: relative;
   width: 100%;
-  height: clamp(220px, 18vw, 292px);
+  max-width: 100%;
+  height: clamp(210px, 16vw, 276px);
   border-radius: 14px;
   background: #05070A;
   overflow: hidden;
@@ -11036,7 +11037,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   padding-top: 12px;
 }
 .sb-frame-actions button {
@@ -11072,12 +11073,13 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
     opacity: 1;
   }
   .sb-frame-layout {
-    grid-template-columns: minmax(180px, 0.78fr) minmax(240px, 1fr) minmax(300px, 1fr);
-    gap: 16px;
+    grid-template-columns: minmax(154px, 0.62fr) minmax(206px, 0.82fr) minmax(280px, 1.22fr);
+    gap: 14px;
+    padding: 14px;
   }
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 900px) {
   .sb-frame-layout {
     grid-template-columns: 1fr;
   }
