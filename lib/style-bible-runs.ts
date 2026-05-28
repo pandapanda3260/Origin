@@ -644,6 +644,12 @@ function completeStyleBibleRun(row: StyleBibleRunRow, styleBible: any, input: St
   const db = getDb();
   const now = new Date().toISOString();
   let recentMapping: { worldTemplateId: string; styleTemplateId: string; worldTemplateOwnerId?: number } | null = null;
+  const inputStyleTemplateId = cleanTemplateId(input.styleTemplateSnapshot)
+    || input.styleBibleGenerationContext?.styleTemplateId
+    || null;
+  const inputWorldTemplateId = cleanTemplateId(input.worldTemplateSnapshot)
+    || input.styleBibleGenerationContext?.worldTemplateId
+    || null;
   const txn = db.transaction(() => {
     db.prepare(
       `UPDATE style_bible_runs
@@ -675,6 +681,10 @@ function completeStyleBibleRun(row: StyleBibleRunRow, styleBible: any, input: St
       ...data,
       styleBible,
       styleOptions: { ...(data.styleOptions || {}), ...(input.styleOptions || {}) },
+      ...((!data.selectedStyleTemplateId && inputStyleTemplateId) ? { selectedStyleTemplateId: inputStyleTemplateId } : {}),
+      ...((!data.styleTemplateSnapshot && input.styleTemplateSnapshot) ? { styleTemplateSnapshot: input.styleTemplateSnapshot } : {}),
+      ...((!data.selectedWorldTemplateId && inputWorldTemplateId) ? { selectedWorldTemplateId: inputWorldTemplateId } : {}),
+      ...((!data.worldTemplateSnapshot && input.worldTemplateSnapshot) ? { worldTemplateSnapshot: input.worldTemplateSnapshot } : {}),
       styleBibleStatus: 'ready',
       styleBibleError: '',
       styleBibleErrorCode: null,
@@ -763,6 +773,12 @@ function patchProjectDataRaw(db: ReturnType<typeof getDb>, row: StyleBibleRunRow
 function isStyleBibleRunCurrent(row: StyleBibleRunRow) {
   const project = getProjectByIdForUser(row.project_id, row.owner_id);
   return !!project && (project as any).styleBibleRunId === row.run_id;
+}
+
+function cleanTemplateId(snapshot: any) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const id = String(snapshot.id || snapshot.templateId || snapshot.template_id || '').trim();
+  return id || null;
 }
 
 function isRunTimedOut(row: StyleBibleRunRow) {

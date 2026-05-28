@@ -52,6 +52,7 @@ function outputForStage(stage: string) {
       era: '现代都市深夜，雨中广场、广告屏与室内婚宴厅相连，现实商业空间冷硬而压迫。',
       mood: '冷峻克制，前段压抑蓄势，婚礼揭示后情绪骤然收紧。',
       worldRules: '世界遵循现实都市逻辑，没有超自然能力；血、雨、广告屏、婚纱和戒指都是现实物件，被镜头强化但不脱离真实质感。',
+      castingProfile: { ethnicityType: 'han_chinese' },
     };
   }
   if (stage === 'characters') {
@@ -313,12 +314,79 @@ async function runStageObsoleteSmoke() {
   assert(!claimed.includes(runId), 'obsolete cancelled run should not be claimed again');
 }
 
+async function runTemplateSourcePreserveSmoke() {
+  const projectId = 'p-style-run-template-source';
+  const runId = 'run-template-source';
+  resetProject(projectId);
+  insertProject(projectId, runId);
+
+  const styleTemplateSnapshot = {
+    id: 'style_live_action_realistic',
+    name: '真人写实',
+    updatedAt: '2026-05-28T00:00:00.000Z',
+    visual: { lighting: '自然光' },
+  };
+  createStyleBibleRun({
+    ownerId: 1,
+    projectId,
+    runId,
+    input: {
+      script: '雨夜婚礼，萧南归来复仇。',
+      styleOptions: { aspectRatio: '9:16' },
+      styleTemplateSnapshot,
+      styleBibleGenerationContext: {
+        aspectRatio: '9:16',
+        worldTemplateId: null,
+        worldTemplateHash: null,
+        styleTemplateId: 'style_live_action_realistic',
+        styleTemplateHash: 'style_live_action_realistic:2026-05-28T00:00:00.000Z',
+      },
+    },
+  });
+
+  setStyleBibleRunJsonCallerForTests((async (_user: any, _messages: any[], _opts: any, _parser: any, taskName = '') => {
+    return outputForStage(String(taskName).replace(/^styleBible\./, ''));
+  }) as any);
+  try {
+    for (let i = 0; i < 6; i += 1) {
+      await runClaimed(runId);
+    }
+  } finally {
+    setStyleBibleRunJsonCallerForTests(null);
+  }
+
+  const project: any = getProjectByIdForUser(projectId, 1);
+  assert(project.styleBibleStatus === 'ready', `template-source run should be ready, got ${project.styleBibleStatus}`);
+  assert(project.selectedStyleTemplateId === 'style_live_action_realistic', `selected style template should be restored, got ${project.selectedStyleTemplateId}`);
+  assert(project.styleTemplateSnapshot?.name === '真人写实', 'style template snapshot should be restored from run input');
+  assert(project.styleBibleGenerationContext?.styleTemplateId === 'style_live_action_realistic', 'generation context should retain style template id');
+}
+
+function runFrontendResponsePreserveStaticSmoke() {
+  const source = readFileSync('public/modules/script.js', 'utf8');
+  const assignment = 'proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null';
+  const assignmentIndex = source.indexOf(assignment);
+  const guardIndex = assignmentIndex >= 0
+    ? source.lastIndexOf('hasOwnProperty.call(resp || {}, "styleBibleGenerationContext")', assignmentIndex)
+    : -1;
+  assert(
+    guardIndex >= 0 && assignmentIndex - guardIndex < 180,
+    'frontend must guard styleBibleGenerationContext overwrite on explicit response fields',
+  );
+  assert(
+    source.includes('if (resp.styleTemplateSnapshot)'),
+    'frontend should preserve or restore style template snapshot from completed responses',
+  );
+}
+
 async function main() {
   await runSixStageSmoke();
   await runSupersededSmoke();
   await runPutPreserveSmoke();
   await runReadyStyleBibleRollbackProtectSmoke();
   await runStageObsoleteSmoke();
+  await runTemplateSourcePreserveSmoke();
+  runFrontendResponsePreserveStaticSmoke();
   console.log('style bible run state smoke ok');
 }
 

@@ -71,6 +71,7 @@ run_isolated npm run test:video-reference-manifest
 run_isolated npm run test:video-prompt-lifecycle
 run_isolated npm run test:video-prompt-dialogue-regression
 run_isolated npm run test:visual-reference-state
+run_isolated npm run test:style-bible-runs
 run_isolated npm run test:provider-recovery
 run_isolated npm run test:online-editor-expiry
 

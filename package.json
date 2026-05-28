@@ -49,6 +49,7 @@
     "test:video-prompt-lifecycle": "tsx scripts/test-video-prompt-lifecycle.ts",
     "test:video-prompt-dialogue-regression": "tsx scripts/test-video-prompt-dialogue-regression.ts",
     "test:visual-reference-state": "node scripts/test-visual-reference-state.js",
+    "test:style-bible-runs": "tsx scripts/test-style-bible-runs.ts",
     "check:video-capabilities": "tsx scripts/check-video-model-capability-coverage.ts",
     "probe:seedance-first-last": "tsx scripts/probe-seedance-first-last.ts",
     "test:durable-tasks": "tsx scripts/test-durable-tasks.ts",

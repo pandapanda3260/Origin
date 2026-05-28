@@ -94,11 +94,22 @@ function completedStyleBiblePayload(row: any, proj: any, shouldHealProject: bool
   const input = parseStyleBibleRunInput(row);
   const generatedAt = row.completed_at || row.updated_at || row.created_at || new Date().toISOString();
   const styleBible = hasDraft ? draft : ((proj as any).styleBible || null);
+  const generatedStyleTemplateId = cleanTemplateId(input.styleTemplateSnapshot)
+    || input.styleBibleGenerationContext?.styleTemplateId
+    || null;
+  const generatedWorldTemplateId = cleanTemplateId(input.worldTemplateSnapshot)
+    || input.styleBibleGenerationContext?.worldTemplateId
+    || null;
   if (shouldHealProject && hasDraft && shouldHealCompletedStyleBibleMirror(proj, draft, generatedAt)) {
     try {
       patchProjectForUser(row.project_id, row.owner_id, () => ({
         allowStyleBibleRunOverwrite: true,
         styleBible: draft,
+        styleOptions: mergeStyleOptions((proj as any).styleOptions || {}, input.styleOptions || {}),
+        ...((!(proj as any).selectedStyleTemplateId && generatedStyleTemplateId) ? { selectedStyleTemplateId: generatedStyleTemplateId } : {}),
+        ...((!(proj as any).styleTemplateSnapshot && input.styleTemplateSnapshot) ? { styleTemplateSnapshot: input.styleTemplateSnapshot } : {}),
+        ...((!(proj as any).selectedWorldTemplateId && generatedWorldTemplateId) ? { selectedWorldTemplateId: generatedWorldTemplateId } : {}),
+        ...((!(proj as any).worldTemplateSnapshot && input.worldTemplateSnapshot) ? { worldTemplateSnapshot: input.worldTemplateSnapshot } : {}),
         styleBibleStatus: 'ready',
         styleBibleError: '',
         styleBibleErrorCode: null,
@@ -132,6 +143,14 @@ function completedStyleBiblePayload(row: any, proj: any, shouldHealProject: bool
     styleBibleStartedAt: row.started_at || row.created_at || null,
     styleBibleGeneratedAt: generatedAt,
     styleBible,
+    styleBibleSource: 'generated',
+    styleBibleSourceHash: input.styleBibleSourceHash || (proj as any).styleBibleSourceHash || null,
+    styleBibleGenerationContext: input.styleBibleGenerationContext || (proj as any).styleBibleGenerationContext || null,
+    styleOptions: mergeStyleOptions((proj as any).styleOptions || {}, input.styleOptions || {}),
+    selectedStyleTemplateId: (proj as any).selectedStyleTemplateId || generatedStyleTemplateId || null,
+    styleTemplateSnapshot: (proj as any).styleTemplateSnapshot || input.styleTemplateSnapshot || null,
+    selectedWorldTemplateId: (proj as any).selectedWorldTemplateId || generatedWorldTemplateId || null,
+    worldTemplateSnapshot: (proj as any).worldTemplateSnapshot || input.worldTemplateSnapshot || null,
     run: styleBibleRunPayload(row),
   };
 }

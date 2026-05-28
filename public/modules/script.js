@@ -506,6 +506,11 @@ function _isStyleBibleReadyResponse(resp) {
   return !!(resp && resp.styleBibleStatus !== "failed" && hasUsableStyleBible(resp.styleBible, resp));
 }
 
+function _styleTemplateIdFromSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  return String(snapshot.id || snapshot.templateId || snapshot.template_id || "").trim();
+}
+
 function _applyStyleBibleResponse(proj, resp) {
   var ready = _isStyleBibleReadyResponse(resp);
   var status = (resp && (resp.styleBibleStatus || (resp.run && resp.run.status))) || "";
@@ -523,7 +528,11 @@ function _applyStyleBibleResponse(proj, resp) {
   proj.styleBibleHeartbeatAt = resp ? (resp.styleBibleHeartbeatAt || (resp.run && resp.run.heartbeatAt) || null) : null;
   if (ready) {
     proj.styleBibleSourceHash = resp.styleBibleSourceHash || proj.styleBibleSourceHash || null;
-    proj.styleOptions = resp.styleOptions || proj.styleOptions || {};
+    if (Object.prototype.hasOwnProperty.call(resp || {}, "styleOptions")) {
+      proj.styleOptions = resp.styleOptions || proj.styleOptions || {};
+    } else {
+      proj.styleOptions = proj.styleOptions || {};
+    }
 	    proj.styleBibleRunId = null;
 	    proj.styleBibleStartedAt = null;
 	    proj.styleBibleStage = null;
@@ -534,9 +543,27 @@ function _applyStyleBibleResponse(proj, resp) {
 	    proj.styleBibleStaleSince = resp.styleBibleStaleSince || null;
 	    proj.styleBibleManuallyEditedAt = resp.styleBibleManuallyEditedAt || null;
 	    proj.styleBibleSource = resp.styleBibleSource || "generated";
-	    proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
-	    if (resp.styleTemplateSnapshot) proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
-	    if (resp.worldTemplateSnapshot) proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;
+	    if (Object.prototype.hasOwnProperty.call(resp || {}, "styleBibleGenerationContext")) {
+	      proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
+	    }
+	    if (resp.styleTemplateSnapshot) {
+	      proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
+	      var styleTplId = _styleTemplateIdFromSnapshot(resp.styleTemplateSnapshot) ||
+	        (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.styleTemplateId) ||
+	        resp.selectedStyleTemplateId;
+	      if (!proj.selectedStyleTemplateId && styleTplId) proj.selectedStyleTemplateId = styleTplId;
+	    } else if (resp.selectedStyleTemplateId && !proj.selectedStyleTemplateId) {
+	      proj.selectedStyleTemplateId = resp.selectedStyleTemplateId;
+	    }
+	    if (resp.worldTemplateSnapshot) {
+	      proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;
+	      var worldTplId = _styleTemplateIdFromSnapshot(resp.worldTemplateSnapshot) ||
+	        (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.worldTemplateId) ||
+	        resp.selectedWorldTemplateId;
+	      if (!proj.selectedWorldTemplateId && worldTplId) proj.selectedWorldTemplateId = worldTplId;
+	    } else if (resp.selectedWorldTemplateId && !proj.selectedWorldTemplateId) {
+	      proj.selectedWorldTemplateId = resp.selectedWorldTemplateId;
+	    }
 	  }
   if (ready && proj._staleFlags) delete proj._staleFlags["style_bible"];
   return ready;
