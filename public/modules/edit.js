@@ -6,8 +6,8 @@ import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, 
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
 
-// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 95" 才能确认新代码加载到。
-console.log('%c[EDIT_JS_VERSION] 95 —— 字幕延后 0.3s 切换，每句多 hold 0.3s 等演员说完', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 96" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 96 —— 剪辑预览会刷新签名播放地址', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
 
 let _ctx = {};
 let project = null;
@@ -255,6 +255,9 @@ export function syncEditProject(p) {
     _undoPtr: -1,
   };
 
+  var _videoUrlHydrationRunId = 0;
+  var _videoUrlHydrationPromise = null;
+
   var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
 
   function _protectedVideoUrlFrom(url) {
@@ -289,6 +292,69 @@ export function syncEditProject(p) {
       return _hydrateVideoEntryUrl(entry);
     }));
     return edl;
+  }
+
+  function _runtimeVideoUrlNeedsRefresh(url) {
+    url = String(url || '').trim();
+    var protectedUrl = _protectedVideoUrlFrom(url);
+    if (!protectedUrl) return false;
+    if (url === protectedUrl) return true;
+    try {
+      var u = new URL(url, window.location.origin);
+      var exp = Number(u.searchParams.get('exp') || 0);
+      return !Number.isFinite(exp) || exp * 1000 <= Date.now() + 5000;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function _collectTimelineVideoEntries() {
+    var entries = [];
+    if (_editState && _editState.edl && Array.isArray(_editState.edl.timeline)) {
+      entries = entries.concat(_editState.edl.timeline);
+    }
+    if (_editState && Array.isArray(_editState.segments)) {
+      entries = entries.concat(_editState.segments);
+    }
+    return entries.filter(Boolean);
+  }
+
+  function _timelineVideoUrlsNeedRefresh() {
+    return _collectTimelineVideoEntries().some(function (entry) {
+      return _runtimeVideoUrlNeedsRefresh(entry && entry.videoUrl);
+    });
+  }
+
+  async function _hydrateTimelineVideoUrls() {
+    var entries = _collectTimelineVideoEntries();
+    var before = entries.map(function (entry) {
+      return [entry.videoUrl || '', entry.protectedUrl || '', entry._originVideoUrl || ''].join('|');
+    }).join('\n');
+    await Promise.all(entries.map(function (entry) {
+      return _hydrateVideoEntryUrl(entry);
+    }));
+    var after = entries.map(function (entry) {
+      return [entry.videoUrl || '', entry.protectedUrl || '', entry._originVideoUrl || ''].join('|');
+    }).join('\n');
+    return before !== after;
+  }
+
+  function _scheduleTimelineVideoUrlHydration() {
+    if (!_timelineVideoUrlsNeedRefresh()) return;
+    var runId = ++_videoUrlHydrationRunId;
+    var promise = _hydrateTimelineVideoUrls();
+    _videoUrlHydrationPromise = promise;
+    promise.then(function (changed) {
+      if (runId !== _videoUrlHydrationRunId) return;
+      _videoUrlHydrationPromise = null;
+      if (changed && (!_ctx.getActivePage || _ctx.getActivePage() === "edit")) {
+        _initDoubleBuffer();
+      }
+    }).catch(function (err) {
+      if (runId !== _videoUrlHydrationRunId) return;
+      _videoUrlHydrationPromise = null;
+      console.warn("[Edit] video URL hydrate failed:", err);
+    });
   }
 
   function _entryForPersistence(entry) {
@@ -610,6 +676,7 @@ export function syncEditProject(p) {
     _updateEditTimeDisplay();
 
     _initDoubleBuffer();
+    _scheduleTimelineVideoUrlHydration();
 
     _loadUploadedMedia().then(function () { _renderMediaLibrary(); });
     _renderMediaLibrary();
@@ -1768,6 +1835,26 @@ export function syncEditProject(p) {
     _refreshTickCache();
     var segs = _tickCache.segs;
     if (!segs.length) return;
+
+    if (_timelineVideoUrlsNeedRefresh()) {
+      showToast("正在刷新视频播放地址…", "warn");
+      var hydration = _videoUrlHydrationPromise || _hydrateTimelineVideoUrls();
+      _videoUrlHydrationPromise = hydration;
+      hydration.then(function (changed) {
+        if (_videoUrlHydrationPromise === hydration) _videoUrlHydrationPromise = null;
+        if (_timelineVideoUrlsNeedRefresh()) {
+          showToast("视频播放地址刷新失败，请重新登录后再试", "error");
+          return;
+        }
+        if (changed) _initDoubleBuffer();
+        _editPlay();
+      }).catch(function (err) {
+        if (_videoUrlHydrationPromise === hydration) _videoUrlHydrationPromise = null;
+        console.warn("[EditPlay] video URL hydrate failed:", err);
+        showToast("视频播放地址刷新失败，请重新登录后再试", "error");
+      });
+      return;
+    }
 
     if (_editState.currentSegIdx >= segs.length) {
       _editState.currentSegIdx = 0;
