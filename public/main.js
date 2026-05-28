@@ -3,7 +3,7 @@
  */
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,
-  getAuthToken, getAuthHeaders, checkAuth, fetchAssetSignedUrl } from './modules/utils.js?v=102';
+  getAuthToken, getAuthHeaders, checkAuth, fetchAssetSignedUrl } from './modules/utils.js?v=104';
 import { appStore } from './modules/store.js';
 import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js';
 import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from './modules/edit.js';
@@ -13,7 +13,8 @@ import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modu
 import { initProject, getProject, setProject, loadProject, loadProjectData, saveProject,
   _serializeProject, cleanupBlobUrls, _registerServerTask, _updateServerTaskStatus,
   _notifyServerTaskDone,
-  _archiveOldImage, _safeWriteBack, _flushServerSave } from './modules/project.js';
+  _archiveOldImage, _safeWriteBack, _flushServerSave, fetchProjectByIdShared,
+  flushPendingProjectSaveOnUnload } from './modules/project.js?v=103';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
@@ -21,7 +22,7 @@ import { initEpisodes, syncEpisodesProject,
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js';
+  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js?v=111';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
@@ -36,7 +37,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=117';
+  reattachStoryboardBatches, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=118';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -55,7 +56,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=107';
+  _openLightbox } from './modules/assets.js?v=108';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
 import { mountPixelCard } from './modules/pixel_card.js';
@@ -76,6 +77,7 @@ var _projectEpoch = 0;
 var _projectActivationToken = 0;
 var _projectSkeletonToken = 0;
 var _projectActivating = false;
+var _projectActivationAbort = null;
 var _scriptEditInitialText = "";
 
   /* ================================================================
@@ -706,6 +708,12 @@ var _scriptEditInitialText = "";
     if (!projId) return null;
     var token = ++_projectActivationToken;
     var useSkeleton = !!options.showSkeleton;
+    if (_projectActivationAbort) {
+      try { _projectActivationAbort.abort(); } catch (_) {}
+      _projectActivationAbort = null;
+    }
+    var activationCtl = (typeof AbortController === "function") ? new AbortController() : null;
+    _projectActivationAbort = activationCtl;
     _setProjectActivating(true);
     if (useSkeleton) {
       _projectSkeletonToken = token;
@@ -719,11 +727,10 @@ var _scriptEditInitialText = "";
         if (!_isProjectActivationCurrent(token)) return null;
       }
 
-      var resp = await fetch("/api/projects/" + encodeURIComponent(projId), { headers: _getAuthHeaders() });
-      if (!_isProjectActivationCurrent(token)) return null;
-      if (!resp.ok) throw new Error("无法加载项目");
-
-      var p = await resp.json();
+      var p = await fetchProjectByIdShared(projId, {
+        signal: activationCtl ? activationCtl.signal : undefined,
+        force: true,
+      });
       if (!_isProjectActivationCurrent(token)) return null;
       if (!p || !p.id) throw new Error("项目数据为空");
 
@@ -753,6 +760,7 @@ var _scriptEditInitialText = "";
       console.log("[Project] Loaded from server:", project.name, "v=", project.version);
       return project;
     } finally {
+      if (_projectActivationAbort === activationCtl) _projectActivationAbort = null;
       if (useSkeleton && _projectSkeletonToken === token) {
         _showProjectSkeleton(false);
         _projectSkeletonToken = 0;
@@ -2361,21 +2369,37 @@ var _scriptEditInitialText = "";
     var proj = detail || summary || {};
     var projectId = _ovFirst(proj.id, summary && summary.id);
     var localTasks = _ovLocalTasksForProject(projectId);
-    var segmentCount = _ovProjectSegmentCount(proj, localTasks);
+    var hasDetail = !!detail || !!(project && project.id === projectId && proj === project);
+    var summarySegmentCount = Number(summary && summary.segmentCount);
+    var segmentCount = hasDetail
+      ? _ovProjectSegmentCount(proj, localTasks)
+      : Math.max(Number.isFinite(summarySegmentCount) ? summarySegmentCount : 0, _ovProjectSegmentCount(proj, localTasks));
     var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
     var vts = Array.isArray(proj.videoTasks) ? proj.videoTasks : [];
-    var counts = { running: 0, done: 0, failed: 0, pending: 0 };
+    var summaryCounts = summary && summary.statusCounts && typeof summary.statusCounts === "object"
+      ? summary.statusCounts
+      : null;
+    var counts = !hasDetail && summaryCounts
+      ? {
+          running: Number(summaryCounts.running || 0),
+          done: Number(summaryCounts.done || 0),
+          failed: Number(summaryCounts.failed || 0),
+          pending: Number(summaryCounts.pending || 0),
+        }
+      : { running: 0, done: 0, failed: 0, pending: 0 };
     var progressTotal = 0;
 
-    for (var i = 0; i < segmentCount; i++) {
-      var localTask = _ovLocalTaskForProjectGroup(localTasks, i);
-      var serverStatus = _ovStatusFrom(null, vts[i] || {}, sbs[i] || {});
-      var status = (serverStatus === "done" || serverStatus === "failed")
-        ? serverStatus
-        : _ovStatusFrom(localTask, vts[i] || {}, sbs[i] || {});
-      if (counts[status] === undefined) status = "pending";
-      counts[status]++;
-      progressTotal += _ovProgressFor(localTask, status);
+    if (hasDetail || !summaryCounts) {
+      for (var i = 0; i < segmentCount; i++) {
+        var localTask = _ovLocalTaskForProjectGroup(localTasks, i);
+        var serverStatus = _ovStatusFrom(null, vts[i] || {}, sbs[i] || {});
+        var status = (serverStatus === "done" || serverStatus === "failed")
+          ? serverStatus
+          : _ovStatusFrom(localTask, vts[i] || {}, sbs[i] || {});
+        if (counts[status] === undefined) status = "pending";
+        counts[status]++;
+        progressTotal += _ovProgressFor(localTask, status);
+      }
     }
 
     var rawProjectStatus = String(proj.status || summary && summary.status || "").toLowerCase();
@@ -2393,9 +2417,15 @@ var _scriptEditInitialText = "";
       progress = segmentCount ? Math.max(8, Math.min(99, Math.round(progressTotal / segmentCount))) : 8;
     }
 
-    var media = _ovProjectMedia(proj);
+    var media = hasDetail
+      ? _ovProjectMedia(proj)
+      : { videoUrl: "", thumbnail: _ovFirst(summary && summary.thumbnail, _ovProjectMedia(proj).thumbnail) };
     var promptText = _ovProjectPromptSummary(proj);
-    var durationSec = _ovProjectDurationSec(proj);
+    var summaryDurationSec = Number(summary && summary.durationSec);
+    var durationSec = hasDetail
+      ? _ovProjectDurationSec(proj)
+      : (Number.isFinite(summaryDurationSec) && summaryDurationSec > 0 ? summaryDurationSec : _ovProjectDurationSec(proj));
+    var summaryAssetCount = Number(summary && summary.assetCount);
     var createdAt = _ovFirst(proj.createdAt, summary && summary.createdAt);
     var updatedAt = _ovFirst(proj.updatedAt, summary && summary.updatedAt, createdAt);
     var title = _ovFirst(proj.name, proj.title, summary && (summary.name || summary.title), "未命名项目");
@@ -2413,7 +2443,9 @@ var _scriptEditInitialText = "";
       segmentCounts: counts,
       durationSec: durationSec,
       durationText: _ovFormatDuration(durationSec),
-      assetCount: _ovProjectAssetCount(proj),
+      assetCount: hasDetail
+        ? _ovProjectAssetCount(proj)
+        : (Number.isFinite(summaryAssetCount) ? summaryAssetCount : _ovProjectAssetCount(proj)),
       resolution: "1080 x 1920",
       model: _ovText(_ovCurrentModelLabel(), "--"),
       ratio: "9:16",
@@ -2439,10 +2471,7 @@ var _scriptEditInitialText = "";
     if (!projectId) return null;
     if (project && project.id === projectId) return _ovHydrateProjectOverviewThumbnail(project);
     try {
-      var resp = await fetch("/api/projects/" + encodeURIComponent(projectId), { headers: _getAuthHeaders() });
-      _checkAuth(resp);
-      if (!resp.ok) return null;
-      var data = await resp.json();
+      var data = await fetchProjectByIdShared(projectId);
       if (data && data.id) await _ovHydrateProjectOverviewThumbnail(data);
       return data && data.id ? data : null;
     } catch (_) {
@@ -2463,23 +2492,15 @@ var _scriptEditInitialText = "";
       var summaries = await getProjectListFromServer();
       if (!Array.isArray(summaries) || !summaries.length) summaries = _ovProjectTaskSummariesFallback();
       summaries = summaries.map(function (sp) {
-        return { id: sp.id, name: sp.name || sp.title, title: sp.title || sp.name, createdAt: sp.createdAt, updatedAt: sp.updatedAt, status: sp.status };
+        return Object.assign({}, sp, {
+          name: sp.name || sp.title,
+          title: sp.title || sp.name,
+        });
       }).filter(function (sp) { return !!sp.id; });
       try { saveProjectList(summaries.map(function (sp) { return { id: sp.id, name: sp.name, createdAt: sp.createdAt }; })); } catch (_) {}
       _ovPrimeProjectTasksFromSummaries(summaries);
       _ovProjectTasksLoaded = true;
       if (seq === _ovProjectTasksSeq) _ovRenderDashboard();
-
-      var details = await Promise.all(summaries.map(function (sp) {
-        if (project && project.id === sp.id) return Promise.resolve(project);
-        return _ovFetchProjectDataForOverview(sp.id);
-      }));
-      if (seq !== _ovProjectTasksSeq) return;
-      _ovProjectTasks = summaries.map(function (sp, idx) {
-        return _ovProjectTaskFromSummary(sp, details[idx], { detailFailed: !details[idx] });
-      });
-      _ovProjectTasksLoaded = true;
-      _ovRenderDashboard();
     } finally {
       if (seq === _ovProjectTasksSeq) {
         _ovProjectTasksLoading = false;
@@ -6245,6 +6266,7 @@ var _scriptEditInitialText = "";
       restoreVideoTasks: () => _restoreVideoTasks(),
       addProjectToList: (p) => addProjectToList(p),
       refreshAllPages: () => refreshAllPages(),
+      refreshActivePage: () => _refreshPageForActiveRoute(activePage),
       resetProjectUI: () => _resetProjectUI(),
       renderEpisodeTabs: () => _renderEpisodeTabs(),
       syncEditProject: (p) => syncEditProject(p),
@@ -6511,7 +6533,7 @@ var _scriptEditInitialText = "";
     try { _startMaintenanceBannerPoll(); } catch (e) { console.warn("[Init] maintenanceBanner failed:", e); }
 
     window.addEventListener("beforeunload", function () {
-      if (project) { saveProject(); }
+      flushPendingProjectSaveOnUnload();
     });
 
     _wireCoreNavigationOnce();

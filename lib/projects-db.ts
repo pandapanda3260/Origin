@@ -181,6 +181,91 @@ function rowToPublic(r: ProjectRow) {
   };
 }
 
+function arr(value: any): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function firstValue(...values: any[]) {
+  for (const value of values) {
+    if (value !== null && typeof value !== 'undefined' && value !== '') return value;
+  }
+  return '';
+}
+
+function projectSummaryAssetCount(data: any): number {
+  const assets = data?.assets || {};
+  return arr(assets.characters || data?.characters).length
+    + arr(assets.scenes || data?.environments).length
+    + arr(assets.props || data?.props).length;
+}
+
+function projectSummarySegmentCount(data: any): number {
+  return Math.max(
+    arr(data?.storyboards).length,
+    arr(data?.videoTasks).length,
+    arr(data?.videoPrompts).length,
+  );
+}
+
+function projectSummaryStatus(persisted: any, sb: any): 'pending' | 'running' | 'done' | 'failed' {
+  if ((persisted && persisted.isCurrent === false) || (sb && sb.videoIsCurrent === false)) return 'pending';
+  const raw = String(firstValue(persisted?.status, sb?.videoStatus) || '').toLowerCase();
+  if (
+    raw === 'done'
+    || raw === 'completed'
+    || raw === 'complete'
+    || raw === 'succeeded'
+    || (sb && sb.videoUrl && !raw)
+  ) return 'done';
+  if (raw === 'failed' || raw === 'timeout' || raw === 'cancelled' || raw === 'retry_failed') return 'failed';
+  if (
+    raw === 'polling'
+    || raw === 'running'
+    || raw === 'queued'
+    || raw === 'submit'
+    || raw === 'submitting'
+    || raw === 'preparing'
+    || raw === 'fetching'
+    || raw === 'in_progress'
+  ) return 'running';
+  if (sb && sb.videoUrl) return 'done';
+  return 'pending';
+}
+
+function projectSummaryStatusCounts(data: any) {
+  const sbs = arr(data?.storyboards);
+  const vts = arr(data?.videoTasks);
+  const segmentCount = projectSummarySegmentCount(data);
+  const counts = { running: 0, done: 0, failed: 0, pending: 0 };
+  for (let i = 0; i < segmentCount; i += 1) {
+    counts[projectSummaryStatus(vts[i] || {}, sbs[i] || {})] += 1;
+  }
+  return counts;
+}
+
+function projectSummaryDurationSec(data: any): number {
+  const sbs = arr(data?.storyboards);
+  const vts = arr(data?.videoTasks);
+  let total = 0;
+  for (let i = 0; i < Math.max(sbs.length, vts.length); i += 1) {
+    const n = Number(firstValue(vts[i]?.durationSec, vts[i]?.duration_sec, sbs[i]?.videoDurationSec));
+    if (Number.isFinite(n) && n > 0) total += n;
+  }
+  return total;
+}
+
+function projectSummaryThumbnail(data: any): string {
+  const sbs = arr(data?.storyboards);
+  const vts = arr(data?.videoTasks);
+  for (let i = 0; i < Math.max(sbs.length, vts.length); i += 1) {
+    const sb = sbs[i] || {};
+    const vt = vts[i] || {};
+    const thumbnail = firstValue(vt.coverUrl, vt.videoCoverUrl, sb.videoCoverUrl, sb.coverUrl, sb.rawUrl, sb.imageUrl);
+    if (thumbnail) return String(thumbnail);
+  }
+  return '';
+}
+
 function rowToSummary(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
@@ -193,7 +278,13 @@ function rowToSummary(r: ProjectRow) {
     status: r.status,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    version: Number(r.version) || 1,
     clientRequestId: data?.clientRequestId,
+    assetCount: projectSummaryAssetCount(data),
+    segmentCount: projectSummarySegmentCount(data),
+    statusCounts: projectSummaryStatusCounts(data),
+    durationSec: projectSummaryDurationSec(data),
+    thumbnail: projectSummaryThumbnail(data),
   };
 }
 

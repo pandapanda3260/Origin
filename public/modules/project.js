@@ -12,7 +12,7 @@ import {
   escapeHtml,
   fetchAssetSignedUrl,
   fetchVideoSignedUrl,
-} from './utils.js';
+} from './utils.js?v=104';
 
 let _ctx = {};
 
@@ -258,17 +258,62 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
   async function _fetchWithTimeout(url, options, timeoutMs) {
     options = options || {};
     timeoutMs = timeoutMs || 10000;
+    var externalSignal = options.signal || null;
     var ctl = (typeof AbortController === "function") ? new AbortController() : null;
     var timer = null;
+    var onAbort = null;
     if (ctl) {
-      options.signal = ctl.signal;
+      if (externalSignal) {
+        if (externalSignal.aborted) {
+          try { ctl.abort(); } catch (_) {}
+        } else if (typeof externalSignal.addEventListener === "function") {
+          onAbort = function () { try { ctl.abort(); } catch (_) {} };
+          externalSignal.addEventListener("abort", onAbort, { once: true });
+        }
+      }
+      options = Object.assign({}, options, { signal: ctl.signal });
       timer = setTimeout(function () { try { ctl.abort(); } catch (_) {} }, timeoutMs);
     }
     try {
       return await fetch(url, options);
     } finally {
       if (timer) clearTimeout(timer);
+      if (externalSignal && onAbort && typeof externalSignal.removeEventListener === "function") {
+        try { externalSignal.removeEventListener("abort", onAbort); } catch (_) {}
+      }
     }
+  }
+
+  var _projectFetchInFlight = Object.create(null);
+
+  async function fetchProjectByIdShared(projId, options) {
+    options = options || {};
+    if (!projId) return null;
+    var key = String(projId);
+    if (!options.force && _projectFetchInFlight[key]) return _projectFetchInFlight[key];
+    var promise = (async function () {
+      try {
+        var resp = await _fetchWithTimeout(
+          "/api/projects/" + encodeURIComponent(key),
+          { headers: _getAuthHeaders(), signal: options.signal },
+          options.timeoutMs || 10000,
+        );
+        _checkAuth(resp);
+        if (!resp.ok) return null;
+        var data = await resp.json();
+        return (data && data.id) ? data : null;
+      } catch (e) {
+        if (!(e && (e.name === "AbortError" || e.code === 20))) {
+          console.warn("[fetchProjectByIdShared] failed:", e);
+        }
+        return null;
+      }
+    })();
+    _projectFetchInFlight[key] = promise;
+    promise.finally(function () {
+      if (_projectFetchInFlight[key] === promise) delete _projectFetchInFlight[key];
+    });
+    return promise;
   }
 
   async function loadProject() {
@@ -339,7 +384,10 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
           (function runHydrateInBackground(proj) {
             hydrateProjectAssetUrls(proj)
               .then(function () {
-                try { _ctx.refreshAllPages && _ctx.refreshAllPages(); } catch (_) {}
+                try {
+                  if (_ctx.refreshActivePage) _ctx.refreshActivePage();
+                  else if (_ctx.refreshAllPages) _ctx.refreshAllPages();
+                } catch (_) {}
               })
               .catch(function (err) {
                 console.warn("[loadProject] hydrateProjectAssetUrls failed:", err);
@@ -363,7 +411,10 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
     }
 
     try { _ctx.resetProjectUI && _ctx.resetProjectUI(); } catch (_) {}
-    try { _ctx.refreshAllPages && _ctx.refreshAllPages(); } catch (_) {}
+    try {
+      if (_ctx.refreshActivePage) _ctx.refreshActivePage();
+      else if (_ctx.refreshAllPages) _ctx.refreshAllPages();
+    } catch (_) {}
 
     if (_getProject()) {
       try { _ctx.restoreAssetGenStatus && _ctx.restoreAssetGenStatus(); } catch (_) {}
@@ -388,20 +439,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    */
   async function fetchProjectFromServer(projId) {
     if (!projId) return null;
-    try {
-      var resp = await _fetchWithTimeout(
-        "/api/projects/" + encodeURIComponent(projId),
-        { headers: _getAuthHeaders() },
-        10000,
-      );
-      _checkAuth(resp);
-      if (!resp.ok) return null;
-      var data = await resp.json();
-      return (data && data.id) ? data : null;
-    } catch (e) {
-      console.warn("[fetchProjectFromServer] failed:", e);
-      return null;
-    }
+    return fetchProjectByIdShared(projId);
   }
 
   /**
@@ -534,7 +572,8 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    *   - `debounce: true` → 延迟 1500ms 合并后续编辑再真正 PUT（saveProject 路径）
    *   - `silent: true`   → 409 stale_version 时不弹 toast（后台静默同步用）
    *
-   * 后端 project_api.py 看到客户端 `If-Match: "v<version>"` 落后服务器时返回
+   * 后端 app/api/projects/[id]/route.ts + lib/projects-db.ts::updateProjectForUser
+   * 看到客户端 `If-Match: "v<version>"` 落后服务器时返回
    * 409 `{ error: "stale_version", serverVersion, clientVersion }`：
    *   - 不覆盖本地改动，让调用方决定后续（通常建议用户刷新）
    *   - 给个 toast 提示被其他 tab/设备改过
@@ -625,6 +664,29 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
       _serverSaveTimer = null;
     }
     return _serverSave();
+  }
+
+  function flushPendingProjectSaveOnUnload() {
+    var proj = _getProject();
+    if (!proj || !proj.id || !_serverSaveTimer) return false;
+    clearTimeout(_serverSaveTimer);
+    _serverSaveTimer = null;
+    try { if (_ctx.saveCurrentEpisode) _ctx.saveCurrentEpisode(); } catch (_) {}
+    try {
+      var headers = Object.assign({}, _getAuthHeaders());
+      var clientVer = parseInt(proj.version, 10);
+      if (!isNaN(clientVer) && clientVer >= 0) headers["If-Match"] = "v" + clientVer;
+      fetch("/api/projects/" + encodeURIComponent(proj.id), {
+        method: "PUT",
+        headers: headers,
+        body: _serializeProject(proj),
+        keepalive: true,
+      }).catch(function () {});
+      return true;
+    } catch (e) {
+      console.warn("[ServerSave] unload keepalive failed:", e);
+      return false;
+    }
   }
 
   /**
@@ -752,5 +814,5 @@ export function setProject(p) { _setProject(p); }
 export { loadProject, saveProject, _serializeProject, cleanupBlobUrls,
   _registerServerTask, _updateServerTaskStatus, _notifyServerTaskDone,
   _syncProjectsFromServer, _loadProjectFromServer, _archiveOldImage, _safeWriteBack,
-  _flushServerSave,
-  fetchProjectFromServer, loadProjectData };
+  _flushServerSave, flushPendingProjectSaveOnUnload,
+  fetchProjectByIdShared, fetchProjectFromServer, loadProjectData };

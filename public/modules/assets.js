@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl } from './utils.js?v=102';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared } from './utils.js?v=104';
 import { loadProjectData } from './project.js';
 import { subscribeBatch, subscribeTask } from './backend_stream.js';
 import { renderAssetCard } from './render_hooks.js';
@@ -1682,7 +1682,7 @@ export async function reattachActiveBatches(originId) {
   if (!originId) return { reattached: 0 };
   var data;
   try {
-    data = await apiGet("/api/batch/active?projectId=" + encodeURIComponent(originId));
+    data = await getActiveBatchesShared(originId);
   } catch (e) {
     console.warn("[Reattach] /api/batch/active failed:", (e && e.message) || e);
     return { reattached: 0, err: e };

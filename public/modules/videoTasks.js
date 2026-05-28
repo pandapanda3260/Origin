@@ -5,7 +5,7 @@
  * composition root and injects project/settings/videoState plus cross-domain
  * callbacks through initVideoTasks(ctx).
  */
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=104';
 import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from './edit.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { getBackgroundStylizeCount } from './assets.js';
@@ -608,7 +608,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
     // Step 1: active batches — 进行中的批次优先
     try {
-      var batchResp = await apiGet("/api/batch/active?projectId=" + encodeURIComponent(restoreProjectId));
+      var batchResp = await getActiveBatchesShared(restoreProjectId);
       if (!guard()) return false;
       var batches = (batchResp && batchResp.batches) || [];
       batches.forEach(function (b) {

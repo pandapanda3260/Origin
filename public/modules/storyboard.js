@@ -1,5 +1,5 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, apiGet, getAuthHeaders,
-  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=102';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, apiGet, getAuthHeaders, getActiveBatchesShared,
+  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=104';
 import {
   materialPanelCandidateTilesForRole,
   materialPanelOrderedTiles,
@@ -144,7 +144,7 @@ export async function reattachStoryboardBatches() {
   if (!project || !project.id) return;
   var resp;
   try {
-    resp = await apiGet("/api/batch/active?projectId=" + encodeURIComponent(project.id));
+    resp = await getActiveBatchesShared(project.id);
   } catch (e) {
     console.warn("[StoryboardReattach] /api/batch/active failed:", (e && e.message) || e);
     return;

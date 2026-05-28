@@ -90,6 +90,32 @@ export async function apiGet(path) {
   return data;
 }
 
+const _ACTIVE_BATCH_SHARED_TTL_MS = 5000;
+const _activeBatchSharedRequests = Object.create(null);
+
+export function getActiveBatchesShared(projectId) {
+  const key = String(projectId || '');
+  if (!key) return Promise.resolve({ batches: [], items: [], total: 0 });
+  const now = Date.now();
+  const existing = _activeBatchSharedRequests[key];
+  if (existing && existing.expiresAt > now) return existing.promise;
+
+  const entry = {
+    expiresAt: now + _ACTIVE_BATCH_SHARED_TTL_MS,
+    promise: null,
+  };
+  entry.promise = apiGet('/api/batch/active?projectId=' + encodeURIComponent(key))
+    .catch(function (err) {
+      if (_activeBatchSharedRequests[key] === entry) delete _activeBatchSharedRequests[key];
+      throw err;
+    });
+  _activeBatchSharedRequests[key] = entry;
+  setTimeout(function () {
+    if (_activeBatchSharedRequests[key] === entry) delete _activeBatchSharedRequests[key];
+  }, _ACTIVE_BATCH_SHARED_TTL_MS);
+  return entry.promise;
+}
+
 /**
  * 对外错误文案一刀切：任何生成类失败，用户只看到「生成失败，请稍后重试」。
  * 真实原因只写入 console.debug 给开发排查，不暴露给用户。
