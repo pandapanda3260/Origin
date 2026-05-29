@@ -4,6 +4,7 @@ import { getDb } from './db';
 export function costForBatchType(batchType: string): number {
   if (
     batchType === 'asset_images' ||
+    batchType === 'asset_stylize' ||
     batchType === 'storyboard_images' ||
     batchType === 'tail_frame_images'
   ) {
@@ -55,7 +56,7 @@ export function finalizeBatchFromTasks(batchId: string) {
   const status =
     total === 0
       ? (current?.status || 'queued')
-      : needsReview > 0 || active > 0
+      : active > 0
         ? 'running'
         : completed === total
           ? 'completed'
@@ -63,6 +64,8 @@ export function finalizeBatchFromTasks(batchId: string) {
             ? 'cancelled'
             : failed === total
               ? 'failed'
+              : needsReview === total
+                ? 'partial'
               : 'partial';
   db.prepare(
     `UPDATE batches

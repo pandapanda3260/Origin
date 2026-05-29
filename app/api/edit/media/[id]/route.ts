@@ -53,6 +53,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
           'Content-Range': `bytes ${start}-${end}/${stat.size}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': String(chunkSize),
+          'Cache-Control': 'private, max-age=3600',
         },
       });
     }

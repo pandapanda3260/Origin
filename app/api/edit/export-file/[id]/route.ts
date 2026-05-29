@@ -56,6 +56,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
           'Content-Range': `bytes ${start}-${end}/${total}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': String(chunkSize),
+          'Cache-Control': 'private, max-age=3600',
         },
       });
     }
@@ -69,6 +70,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       'Content-Length': String(total),
       'Accept-Ranges': 'bytes',
       'Content-Disposition': `inline; filename="${id}.mp4"`,
+      'Cache-Control': 'private, max-age=3600',
     },
   });
 }

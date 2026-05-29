@@ -275,7 +275,7 @@ function _markFailedAssetImageState(opts: {
   referenceStatus: 'degraded' | 'failed';
   imageSafetyAudit?: any;
 } {
-  if (opts.batchType !== 'asset_images') return null;
+  if (opts.batchType !== 'asset_images' && opts.batchType !== 'asset_stylize') return null;
   const type = String(opts.target?.type || '');
   const idx = Number(opts.target?.idx);
   if (!Number.isFinite(idx) || idx < 0) return null;
@@ -291,6 +291,28 @@ function _markFailedAssetImageState(opts: {
       const assets = (fresh as any).assets || { characters: [], scenes: [], props: [] };
       if (!Array.isArray(assets[cat])) assets[cat] = [];
       const currentAsset = assets[cat][idx] || {};
+      if (opts.batchType === 'asset_stylize') {
+        const message = (opts.message || '风格图生成失败').slice(0, 1000);
+        const nextAsset = {
+          ...currentAsset,
+          _pencilFailed: true,
+          pencilLastError: message,
+          pencilFailedAt: failedAt,
+          imageSafetyAudit: opts.imageSafetyAudit || currentAsset.imageSafetyAudit,
+        };
+        assets[cat][idx] = nextAsset;
+        const top = Array.isArray((fresh as any)[topKey]) ? [...(fresh as any)[topKey]] : [];
+        if (top[idx]) {
+          top[idx] = {
+            ...top[idx],
+            _pencilFailed: true,
+            pencilLastError: message,
+            pencilFailedAt: failedAt,
+            imageSafetyAudit: opts.imageSafetyAudit || top[idx].imageSafetyAudit,
+          };
+        }
+        return { assets, [topKey]: top };
+      }
       const existingUrl =
         currentAsset?.reference?.currentUrl ||
         currentAsset?.reference?.lastKnownGoodUrl ||
@@ -579,7 +601,7 @@ function _concurrencyFor(batchType: string): number {
   if (batchType === 'storyboard_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   if (batchType === 'tail_frame_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   // 资产图也先跟随全局图片上限；后续如需按任务类型细分，再单独加调度策略。
-  if (batchType === 'asset_images') {
+  if (batchType === 'asset_images' || batchType === 'asset_stylize') {
     return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   }
   return 3;
@@ -1328,8 +1350,19 @@ export async function runBatch(opts: {
   const db = getDb();
   const exec = _executors.get(opts.batchType);
   if (!exec) {
-    db.prepare(`UPDATE batches SET status='failed', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(opts.batchId);
-    _emit(opts.batchId, 'batch_completed', { batchId: opts.batchId, status: 'failed', reason: '未知 batchType: ' + opts.batchType });
+    const reason = '未知 batchType: ' + opts.batchType;
+    db.prepare(
+      `UPDATE batch_tasks
+          SET status='failed',
+              error_msg=?,
+              error_message=?,
+              updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE batch_id=?
+          AND status IN ('queued','running','retry_pending')`,
+    ).run(reason, reason, opts.batchId);
+    const final = finalizeBatchFromTasks(opts.batchId);
+    _emit(opts.batchId, 'batch_completed', { batchId: opts.batchId, status: final.status, reason });
+    if (final.status !== 'failed') emitSnapshot(opts.batchId);
     return;
   }
 
@@ -1638,51 +1671,15 @@ export async function runBatch(opts: {
     tryNext();
   });
 
-  const finalCounts = db
-    .prepare<{ bid: string }, any>(
-      `SELECT
-         COUNT(*) AS total,
-         SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
-         SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-         SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
-         SUM(CASE WHEN status='needs_review' THEN 1 ELSE 0 END) AS needs_review,
-         SUM(CASE WHEN status IN ('queued','running','retry_pending','upstream_pending') THEN 1 ELSE 0 END) AS active
-       FROM batch_tasks
-       WHERE batch_id = @bid`,
-    )
-    .get({ bid: opts.batchId }) || {};
-  const totalTasks = Number(finalCounts.total || 0);
-  const completedTasks = Number(finalCounts.completed || 0);
-  const failedTasks = Number(finalCounts.failed || 0);
-  const cancelledTasks = Number(finalCounts.cancelled || 0);
-  const needsReviewTasks = Number(finalCounts.needs_review || 0);
-  const activeTasks = Number(finalCounts.active || 0);
-  const finalStatus =
-    needsReviewTasks > 0 || activeTasks > 0
-      ? 'running'
-      : totalTasks > 0 && completedTasks === totalTasks
-        ? 'completed'
-        : totalTasks > 0 && cancelledTasks === totalTasks
-          ? 'cancelled'
-          : totalTasks > 0 && failedTasks === totalTasks
-            ? 'failed'
-            : 'partial';
-  db.prepare(
-    `UPDATE batches
-       SET status=?,
-           succeeded=?,
-           failed=?,
-           updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     WHERE id=?`,
-  ).run(finalStatus, completedTasks, failedTasks, opts.batchId);
+  const final = finalizeBatchFromTasks(opts.batchId);
   _emit(opts.batchId, 'batch_completed', {
     batchId: opts.batchId,
-    status: finalStatus,
-    succeeded: completedTasks,
-    failed: failedTasks,
-    cancelled: cancelledTasks,
-    needsReview: needsReviewTasks,
-    total: Number(getBatchSnapshot(opts.batchId)?.total || totalTasks),
+    status: final.status,
+    succeeded: final.completed,
+    failed: final.failed,
+    cancelled: final.cancelled,
+    needsReview: final.needsReview,
+    total: Number(getBatchSnapshot(opts.batchId)?.total || final.total),
   });
   // 60 秒后回收 EventEmitter，避免 _emitters map 无限膨胀。
   // 留 60s 是给"stream 路由晚订阅一帧"的用户仍能收到最终事件；超时后即使有订阅也只是静默。

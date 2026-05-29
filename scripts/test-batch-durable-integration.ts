@@ -64,6 +64,7 @@ async function main() {
   }
 
   assert.equal(costForBatchType('asset_images'), 30);
+  assert.equal(costForBatchType('asset_stylize'), 30);
   assert.equal(costForBatchType('video_prompts'), 1);
   assert.equal(creditKindForBatchType('video_segments'), 'video');
   assert.equal(creditKindForBatchType('video_prompts'), 'text');
@@ -78,6 +79,19 @@ async function main() {
   const emptyFinal = finalizeBatchFromTasks(emptyBatchId);
   assert.equal(emptyFinal.status, 'queued');
   assert.equal((db.prepare('SELECT status FROM batches WHERE id = ?').get(emptyBatchId) as any).status, 'queued');
+
+  const reviewOnlyBatchId = 'batch-review-only-finalize';
+  db.prepare(
+    `INSERT INTO batches (id, owner_id, project_id, batch_type, status, total)
+     VALUES (?, ?, 'project-review-only-finalize', 'asset_images', 'running', 1)`,
+  ).run(reviewOnlyBatchId, user.id);
+  db.prepare(
+    `INSERT INTO batch_tasks (id, batch_id, seq, task_type, status, target_json)
+     VALUES ('task-review-only-finalize', ?, 0, 'asset_images', 'needs_review', '{}')`,
+  ).run(reviewOnlyBatchId);
+  const reviewOnlyFinal = finalizeBatchFromTasks(reviewOnlyBatchId);
+  assert.equal(reviewOnlyFinal.status, 'partial');
+  assert.equal((db.prepare('SELECT status FROM batches WHERE id = ?').get(reviewOnlyBatchId) as any).status, 'partial');
 
   db.prepare(
     `UPDATE user_credits
@@ -140,6 +154,22 @@ async function main() {
     )
     .get(ok.batchId) as any;
   assert.equal(idempotencyRows.c, 2);
+
+  const staleReviewBatchId = 'batch-stale-review-only';
+  db.prepare(
+    `INSERT INTO batches
+      (id, owner_id, project_id, batch_type, status, total, runner_id, runner_heartbeat_at)
+     VALUES (?, ?, 'project-stale-review-only', 'asset_images', 'running', 1, 'dead-runner', '2020-01-01T00:00:00.000Z')`,
+  ).run(staleReviewBatchId, user.id);
+  db.prepare(
+    `INSERT INTO batch_tasks
+      (id, batch_id, seq, task_type, status, target_json)
+     VALUES ('task-stale-review-only', ?, 0, 'asset_images', 'needs_review', '{}')`,
+  ).run(staleReviewBatchId);
+  recoverStaleBatches(10);
+  const staleReviewSnap = await waitForBatch(getBatchSnapshot, staleReviewBatchId);
+  assert.equal(staleReviewSnap.status, 'partial');
+  assert.equal(staleReviewSnap.tasks[0].status, 'needs_review');
 
   const okCharges = db
     .prepare(

@@ -49,6 +49,56 @@ async function _safeJson(resp) {
   }
 }
 
+const DEFAULT_API_TIMEOUT_MS = 45_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 180_000;
+
+function _timeoutMs(value, fallback) {
+  var n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  if (n === 0) return 0;
+  return Math.max(1000, Math.floor(n));
+}
+
+function _timeoutError(path, timeoutMs) {
+  var err = new Error('请求超时，请检查网络后重试');
+  err.name = 'TimeoutError';
+  err.timeoutMs = timeoutMs;
+  err.path = path;
+  return err;
+}
+
+async function _fetchWithTimeout(path, fetchOptions, timeoutMs) {
+  timeoutMs = _timeoutMs(timeoutMs, DEFAULT_API_TIMEOUT_MS);
+  if (timeoutMs <= 0 || typeof AbortController !== 'function') {
+    return fetch(path, fetchOptions);
+  }
+  var externalSignal = fetchOptions && fetchOptions.signal;
+  var ctl = new AbortController();
+  var timedOut = false;
+  var timer = setTimeout(function () {
+    timedOut = true;
+    try { ctl.abort(); } catch (_) {}
+  }, timeoutMs);
+  var onExternalAbort = function () {
+    try { ctl.abort(); } catch (_) {}
+  };
+  if (externalSignal) {
+    if (externalSignal.aborted) onExternalAbort();
+    else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  try {
+    return await fetch(path, Object.assign({}, fetchOptions, { signal: ctl.signal }));
+  } catch (e) {
+    if (timedOut) throw _timeoutError(path, timeoutMs);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (externalSignal) {
+      try { externalSignal.removeEventListener('abort', onExternalAbort); } catch (_) {}
+    }
+  }
+}
+
 // 维护模式 soft-block 名单：这里列的 path 一旦命中、且用户未确认"已知风险
 // 继续使用"，apiPost 会在发出请求前直接 reject 掉。`/api/images/submit` 虽然
 // 在前端业务代码里已被 Phase 3-B-8 淘汰，但保留在这张名单里做兼容兜底——
@@ -70,20 +120,30 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiPost(path, body, method) {
+export async function apiPost(path, body, method, options) {
   method = method || 'POST';
   if (method === 'POST' && _SOFT_BLOCKED_PATHS[path] && typeof window.maintenanceSoftBlock === 'function') {
     if (!window.maintenanceSoftBlock()) throw new Error('系统即将维护，请稍后再开始新任务');
   }
-  const resp = await fetch(path, { method, headers: getAuthHeaders(), body: JSON.stringify(body) });
+  options = options || {};
+  const resp = await _fetchWithTimeout(
+    path,
+    { method, headers: getAuthHeaders(), body: JSON.stringify(body), signal: options.signal },
+    options.timeoutMs,
+  );
   checkAuth(resp);
   const data = await _safeJson(resp);
   if (data.error) throw new ApiError(data.error, resp.status, data);
   return data;
 }
 
-export async function apiGet(path) {
-  const resp = await fetch(path, { headers: getAuthHeaders(), cache: 'no-store' });
+export async function apiGet(path, options) {
+  options = options || {};
+  const resp = await _fetchWithTimeout(
+    path,
+    { headers: getAuthHeaders(), cache: 'no-store', signal: options.signal },
+    options.timeoutMs,
+  );
   checkAuth(resp);
   const data = await _safeJson(resp);
   if (data.error) throw new ApiError(data.error, resp.status, data);
@@ -136,53 +196,89 @@ export function friendlyModelError(rawMsg) {
 }
 
 export async function apiPostStream(path, body, onChunk, onEvent, options) {
+  options = options || {};
+  const timeoutMs = _timeoutMs(options.timeoutMs, DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+  const ctl = (timeoutMs > 0 && typeof AbortController === 'function') ? new AbortController() : null;
+  const externalSignal = options.signal;
+  let timedOut = false;
+  let timer = null;
+  function abortForTimeout() {
+    timedOut = true;
+    try { ctl && ctl.abort(); } catch (_) {}
+  }
+  function resetTimer() {
+    if (!ctl) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(abortForTimeout, timeoutMs);
+  }
+  function onExternalAbort() {
+    try { ctl && ctl.abort(); } catch (_) {}
+  }
+  if (ctl && externalSignal) {
+    if (externalSignal.aborted) onExternalAbort();
+    else externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
   const fetchOptions = { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify(body) };
-  if (options && options.signal) fetchOptions.signal = options.signal;
-  const resp = await fetch(path, fetchOptions);
-  checkAuth(resp);
-  if (!resp.ok) {
-    const text = await resp.text();
-    if (text.trim().charAt(0) === '<') throw new Error(_diagnoseHttpHtml(resp.status));
-    throw new Error('生成失败，请稍后重试');
-  }
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let finalData = null;
-  function handleEventPart(part) {
-    const line = part.trim();
-    if (!line.startsWith('data: ')) return;
-    try {
-      const evt = JSON.parse(line.slice(6));
-      if (onEvent) {
-        try { onEvent(evt); } catch (_e) { /* ignore listener errors */ }
+  if (ctl) fetchOptions.signal = ctl.signal;
+  else if (externalSignal) fetchOptions.signal = externalSignal;
+  try {
+    resetTimer();
+    const resp = await fetch(path, fetchOptions);
+    resetTimer();
+    checkAuth(resp);
+    if (!resp.ok) {
+      const text = await resp.text();
+      if (text.trim().charAt(0) === '<') throw new Error(_diagnoseHttpHtml(resp.status));
+      throw new Error('生成失败，请稍后重试');
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalData = null;
+    function handleEventPart(part) {
+      const line = part.trim();
+      if (!line.startsWith('data: ')) return;
+      try {
+        const evt = JSON.parse(line.slice(6));
+        if (onEvent) {
+          try { onEvent(evt); } catch (_e) { /* ignore listener errors */ }
+        }
+        if (evt.type === 'chunk' && onChunk) onChunk(evt.content || '');
+        else if (evt.type === 'done') finalData = evt;
+        else if (evt.type === 'error') {
+          const err = new Error(friendlyModelError(evt.error));
+          err.payload = evt;
+          err.errorCode = evt.errorCode || '';
+          err.failureStage = evt.failureStage || '';
+          throw err;
+        }
+      } catch (parseErr) {
+        if (parseErr.message && !parseErr.message.startsWith('Unexpected')) throw parseErr;
       }
-      if (evt.type === 'chunk' && onChunk) onChunk(evt.content || '');
-      else if (evt.type === 'done') finalData = evt;
-      else if (evt.type === 'error') {
-        const err = new Error(friendlyModelError(evt.error));
-        err.payload = evt;
-        err.errorCode = evt.errorCode || '';
-        err.failureStage = evt.failureStage || '';
-        throw err;
+    }
+    while (true) {
+      const { done, value } = await reader.read();
+      resetTimer();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+      for (const part of parts) {
+        handleEventPart(part);
       }
-    } catch (parseErr) {
-      if (parseErr.message && !parseErr.message.startsWith('Unexpected')) throw parseErr;
+    }
+    if (buffer.trim()) handleEventPart(buffer);
+    if (!finalData) throw new Error('生成失败，请稍后重试');
+    return finalData;
+  } catch (e) {
+    if (timedOut) throw _timeoutError(path, timeoutMs);
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (ctl && externalSignal) {
+      try { externalSignal.removeEventListener('abort', onExternalAbort); } catch (_) {}
     }
   }
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() || '';
-    for (const part of parts) {
-      handleEventPart(part);
-    }
-  }
-  if (buffer.trim()) handleEventPart(buffer);
-  if (!finalData) throw new Error('生成失败，请稍后重试');
-  return finalData;
 }
 
 // Phase 3-B-8：apiImageGenerate / _pollImageFallback 整条「前端自持提交+轮询」

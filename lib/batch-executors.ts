@@ -1051,6 +1051,123 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   };
 });
 
+registerExecutor('asset_stylize', async (ctx: BatchExecCtx) => {
+  const proj = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  if (!proj) throw new Error('项目不存在');
+
+  const { item, type, idx, cat } = resolveAssetTarget(proj, ctx.target);
+  if (!item || type !== 'char' || cat !== 'characters') throw new Error(`找不到 characters[${idx}]`);
+
+  const sourceUrl = String(
+    item.realPhotoUrl ||
+    item.rawUrl ||
+    item.imageUrl ||
+    item.reference?.currentUrl ||
+    item.reference?.lastKnownGoodUrl ||
+    '',
+  ).trim();
+  if (!sourceUrl) throw new Error(`角色 ${idx + 1} 缺少可转绘的参考图`);
+
+  const sourcePath = resolveLocalImagePath(sourceUrl, ctx.user.id);
+  let pencilUrl = sourceUrl;
+  let result: Awaited<ReturnType<typeof generateImageWithModerationRecovery>> | null = null;
+  if (sourcePath) {
+    ctx.progress({ stage: 'building_stylize_prompt' });
+    const rawStyleBible = (proj as any).styleBible || {};
+    const styleLockContext = buildAssetStyleLock(rawStyleBible, 'char');
+    const basePrompt = [
+      `Use the provided reference image as the exact identity source for ${item.name || 'the character'}.`,
+      'Create a clean production character reference image that preserves the same face, hair, body shape, clothing, colors, props, and silhouette.',
+      'Keep the character immediately recognizable from the reference. Do not invent a different person.',
+      'Use a neutral uncluttered background suitable for downstream video generation and character consistency checks.',
+      item.appearance && `Authoritative appearance: ${item.appearance}.`,
+      item.clothing && `Authoritative clothing: ${item.clothing}.`,
+      item.equipment && `Holding / wearing: ${item.equipment}.`,
+      styleLockContext.prompt,
+    ].filter(Boolean).join('\n');
+    const prompt = appendCharacterCastingPrompt(basePrompt, item, rawStyleBible, { script: (proj as any).script || (proj as any).scriptDraft || '' });
+
+    ctx.progress({ stage: 'calling_image_edit_api' });
+    result = await generateImageWithModerationRecovery(ctx.user, {
+      prompt,
+      size: '1536x1024',
+      style: 'natural',
+      kind: 'character',
+      entityType: inferEntityTypeFromCharacter(item),
+      projectId: ctx.projectId,
+      assetRef: `${cat}[${idx}].stylize`,
+      quality: 'medium',
+      referenceImagePath: sourcePath,
+      styleLockApplied: styleLockContext.hasMeaningfulStyle,
+      styleBackdropColor: styleLockContext.resolvedBackdropColor,
+      imageAuditMetadata: {
+        source: 'asset_stylize',
+        styleBibleSignature: styleLockContext.signature,
+        styleBibleSignatureType: styleLockContext.signatureType,
+        styleLockVersion: styleLockContext.styleLockVersion,
+        resolvedBackdropColor: styleLockContext.resolvedBackdropColor || null,
+      },
+    });
+    pencilUrl = result.url;
+  }
+
+  const nowIso = new Date().toISOString();
+  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+    if (!fresh) return null;
+    const assets = (fresh as any).assets || { characters: [], scenes: [], props: [] };
+    if (!Array.isArray(assets.characters)) assets.characters = [];
+    const currentAsset = assets.characters[idx] || {};
+    assets.characters[idx] = {
+      ...currentAsset,
+      pencilUrl,
+      imageUrl: currentAsset.imageUrl || pencilUrl,
+      rawUrl: currentAsset.rawUrl || sourceUrl,
+      stylizedAt: nowIso,
+      skippedStylize: !sourcePath ? true : undefined,
+      imageSafetyAudit: result?.safetyAudit || currentAsset.imageSafetyAudit,
+    };
+    delete assets.characters[idx]._pencilFailed;
+
+    const top = Array.isArray((fresh as any).characters) ? [...(fresh as any).characters] : [];
+    if (top[idx]) {
+      top[idx] = {
+        ...top[idx],
+        pencilUrl,
+        imageUrl: top[idx].imageUrl || pencilUrl,
+        rawUrl: top[idx].rawUrl || sourceUrl,
+        stylizedAt: nowIso,
+        skippedStylize: !sourcePath ? true : undefined,
+        imageSafetyAudit: result?.safetyAudit || top[idx].imageSafetyAudit,
+      };
+      delete top[idx]._pencilFailed;
+    }
+    return { assets, characters: top };
+  });
+
+  return {
+    resultUrl: pencilUrl,
+    patch: {
+      type: 'asset_stylize',
+      cat,
+      idx,
+      value: pencilUrl,
+      imageUrl: pencilUrl,
+    },
+    extra: {
+      type,
+      idx,
+      imageUrl: pencilUrl,
+      rawUrl: pencilUrl,
+      pencilUrl,
+      skippedStylize: !sourcePath || undefined,
+      mode: result?.mode || 'reuse',
+      width: result?.width,
+      height: result?.height,
+      imageSafetyAudit: result?.safetyAudit,
+    },
+  };
+});
+
 /* ============================================================
    2. storyboard_prompts executor —— 把单个镜头描述转成图像生成提示词
    ============================================================ */
