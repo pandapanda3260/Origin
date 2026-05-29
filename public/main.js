@@ -969,10 +969,14 @@ var _scriptEditInitialText = "";
       var resp = await fetch("/api/config/client", { headers: _getAuthHeaders(), cache: "no-store" });
       if (!resp.ok) return;
       var cfg = await resp.json();
+      var limits = cfg && cfg.limits && typeof cfg.limits === "object" ? cfg.limits : {};
       if (cfg && cfg.features && typeof cfg.features === "object") CLIENT_FEATURES = cfg.features;
       if (cfg && typeof cfg.maxProjects === "number") MAX_PROJECTS = cfg.maxProjects;
+      else if (typeof limits.maxProjects === "number") MAX_PROJECTS = limits.maxProjects;
       if (cfg && typeof cfg.maxConcurrent === "number") MAX_CONCURRENT = cfg.maxConcurrent;
+      else if (typeof limits.maxConcurrentVideoTasks === "number") MAX_CONCURRENT = limits.maxConcurrentVideoTasks;
       if (cfg && typeof cfg.maxTasksTotal === "number") MAX_TASKS_TOTAL = cfg.maxTasksTotal;
+      else if (typeof limits.maxTasksTotal === "number") MAX_TASKS_TOTAL = limits.maxTasksTotal;
     } catch (e) {
       console.warn("[ClientConfig] fetch failed, keeping defaults:", e);
     }
@@ -1064,6 +1068,9 @@ var _scriptEditInitialText = "";
       if (!Array.isArray(list)) list = [];
     } catch (_e) {
       list = getProjectList();
+    }
+    if (list.length >= MAX_PROJECTS) {
+      try { await _loadClientConfig(); } catch (_) {}
     }
     if (list.length >= MAX_PROJECTS) {
       showToast("最多保存 " + MAX_PROJECTS + " 个项目，请先删除旧项目", "warn");
