@@ -120,6 +120,13 @@ const TASK_OUTPUT_POLICIES: Record<string, TaskOutputPolicy> = {
     retryTimeoutMs: 600_000,
     allowOutputIncompleteRetry: true,
   },
+  'style-template-classifier': {
+    baseMaxTokens: 800,
+    retryMaxTokens: 1200,
+    timeoutMs: 60_000,
+    retryTimeoutMs: 90_000,
+    allowOutputIncompleteRetry: true,
+  },
   emotions: {
     baseMaxTokens: 8_000,
     retryMaxTokens: 12_000,
@@ -678,7 +685,7 @@ type TokenBudgetDecision = {
   logOnly: boolean;
 };
 
-function applyTokenBudget(
+export function applyTokenBudget(
   cfg: ResolvedModelConfig,
   messages: ChatMessage[],
   opts: LLMOptions,
@@ -819,6 +826,8 @@ function resolveReasoningReserve(cfg: ResolvedModelConfig, opts: LLMOptions): nu
 function reasoningReserveEnv(role?: TextModelRole): number | undefined {
   const names: string[] = [];
   if (role === 'styleBible') names.push('STYLE_BIBLE_REASONING_RESERVE_TOKENS');
+  else if (role === 'projectClassifier') names.push('PROJECT_CLASSIFIER_REASONING_RESERVE_TOKENS', 'STYLE_CLASSIFIER_REASONING_RESERVE_TOKENS');
+  else if (role === 'styleClassifier') names.push('STYLE_CLASSIFIER_REASONING_RESERVE_TOKENS');
   else if (role === 'profileDerive') names.push('PROFILE_DERIVE_REASONING_RESERVE_TOKENS');
   else if (role === 'structured') names.push('STRUCTURED_REASONING_RESERVE_TOKENS');
   else if (role === 'brain') names.push('BRAIN_REASONING_RESERVE_TOKENS', 'CLAUDE_REASONING_RESERVE_TOKENS');
@@ -1326,7 +1335,7 @@ function withDefaultTokenContext(user: UserRow | null, opts: LLMOptions): LLMOpt
   if (!user?.id) return opts;
   const base: TokenUsageContext = {
     ownerId: user.id,
-    usernameSnapshot: user.username || user.email || null,
+	    usernameSnapshot: user.phone || user.display_name || user.username || null,
   };
   return {
     ...opts,

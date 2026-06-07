@@ -11,6 +11,7 @@ export const dynamic = 'force-dynamic';
 type AdminUserListRow = {
   id: number;
   username: string;
+  phone: string | null;
   email: string | null;
   display_name: string;
   email_verified: number;
@@ -27,6 +28,7 @@ type AdminUserListRow = {
 type UserSnapshot = {
   id: number;
   username: string;
+  phone: string | null;
   email: string | null;
   displayName: string;
   emailVerified: boolean;
@@ -57,18 +59,20 @@ export async function GET(req: NextRequest) {
   };
   const searchClause = q
     ? `AND (
-         CAST(u.id AS TEXT) = @q
-         OR u.username LIKE @like ESCAPE '\\'
-         OR COALESCE(u.email, '') LIKE @like ESCAPE '\\'
-         OR u.display_name LIKE @like ESCAPE '\\'
+	         CAST(u.id AS TEXT) = @q
+	         OR u.username LIKE @like ESCAPE '\\'
+	         OR COALESCE(u.phone, '') LIKE @like ESCAPE '\\'
+	         OR COALESCE(u.email, '') LIKE @like ESCAPE '\\'
+	         OR u.display_name LIKE @like ESCAPE '\\'
        )`
     : '';
   const rows = getDb()
     .prepare<typeof params, AdminUserListRow>(
       `SELECT
-         u.id,
-         u.username,
-         u.email,
+	         u.id,
+	         u.username,
+	         u.phone,
+	         u.email,
          u.display_name,
          u.email_verified,
          u.disabled_at,
@@ -135,9 +139,10 @@ function readUserSnapshot(userId: number): UserSnapshot | null {
   const row = getDb()
     .prepare<{ id: number }, AdminUserListRow>(
       `SELECT
-         u.id,
-         u.username,
-         u.email,
+	         u.id,
+	         u.username,
+	         u.phone,
+	         u.email,
          u.display_name,
          u.email_verified,
          u.disabled_at,
@@ -203,9 +208,10 @@ function planAfter(before: UserSnapshot, action: string, now: string): UserSnaps
 
 function toSnapshot(row: AdminUserListRow): UserSnapshot {
   return {
-    id: row.id,
-    username: row.username,
-    email: row.email,
+	    id: row.id,
+	    username: row.username,
+	    phone: row.phone,
+	    email: row.email,
     displayName: row.display_name,
     emailVerified: !!row.email_verified,
     disabledAt: row.disabled_at,

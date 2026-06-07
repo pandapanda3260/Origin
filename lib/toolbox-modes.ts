@@ -116,15 +116,55 @@ export function normalizeToolboxVideoResolution(resolution: unknown): '720p' | '
   return value === '1080p' ? '1080p' : '720p';
 }
 
+// 运镜 / 特殊拍摄手法的"无效/未选择"哨兵。
+// 历史构建用过英文默认值（'none' / 'static'），现版本用中文（'无'）。
+// 这里统一忽略它们，避免把无意义值注入提示词。
+const TOOLBOX_MOTION_SENTINELS = new Set(['', '无', 'none', 'static']);
+
+function isToolboxMotionUnset(value: string): boolean {
+  return TOOLBOX_MOTION_SENTINELS.has(value.trim().toLowerCase());
+}
+
+// 把图片 provider 的原始报错（尤其 Azure/OpenAI 的长 JSON moderation 报错）翻译成用户可懂的中文。
+// 原始报错仍写日志 + 资产失败审计，便于排查；这里只决定"展示给用户看什么"。
+export function toolboxImageFriendlyError(raw: string): string {
+  const text = String(raw || '').trim();
+  if (/moderation|safety|content[_ ]?policy|content management policy|image_generation_user_error|safety_violation|rejected|blocked/i.test(text)) {
+    return '提示词或参考图未通过内容安全审核（例如涉及真实人物、敏感内容），请调整后重试。';
+  }
+  if (/retry_deadline_exceeded|timed?\s*out|timeout|超时|deadline/i.test(text)) {
+    return '图片生成超时，请稍后重试。';
+  }
+  if (/rate.?limit|too many requests|\b429\b|限流/i.test(text)) {
+    return '当前生成繁忙（限流），请稍后重试。';
+  }
+  return '图片生成失败，请调整提示词或稍后重试。';
+}
+
+// 把视频 provider 的晦涩报错翻译成用户可懂的文案；原始报错仍写日志 + 资产失败审计。
+// 仅翻译已知的晦涩内部错误，其余保留原始信息（部分 provider 报错对用户是有用的）。
+export function toolboxVideoFriendlyError(raw: string, mode: string): string {
+  const text = String(raw || '').trim();
+  if (/invalid svg|svg/i.test(text)) {
+    return mode === 'first_last_frame_video'
+      ? '首尾帧视频合成失败（首/尾帧图片解析异常）。请更换首/尾帧图片后重试，或改用图生视频。'
+      : '图片解析异常，请更换图片后重试。';
+  }
+  if (/moderation|safety|content[_ ]?policy|rejected|blocked|安全审核/i.test(text)) {
+    return '内容未通过安全审核（例如涉及真实人物、儿童或敏感内容），请调整提示词或参考图后重试。';
+  }
+  return text || '视频生成失败，请稍后重试。';
+}
+
 export function buildToolboxVideoPrompt(basePrompt: string, params: ToolboxVideoParams = {}) {
   const prompt = String(basePrompt || '').trim();
   const parts: string[] = [];
   const motion = String(params.cameraMotion || '').trim();
   const motionDesc = String(params.cameraMotionDescription || '').trim();
   const special = String(params.specialShot || '').trim();
-  if (motion && motion !== '无') parts.push(`镜头运动=${motion}`);
+  if (!isToolboxMotionUnset(motion)) parts.push(`镜头运动=${motion}`);
   if (motionDesc) parts.push(`镜头运动描述=${motionDesc}`);
-  if (special && special !== '无') parts.push(`特殊拍摄手法=${special}`);
+  if (!isToolboxMotionUnset(special)) parts.push(`特殊拍摄手法=${special}`);
   if (!parts.length) return prompt;
   return `${prompt}\n\n工具箱参数：${parts.join('；')}。`;
 }

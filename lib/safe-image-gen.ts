@@ -4,13 +4,23 @@ import type { UserRow } from './db';
 import { getDb } from './db';
 import {
   extractImageModerationError,
+  inferImagePromptSafetyHints,
   preflightImageModerationPrompt,
   rewriteImagePromptForModeration,
   type ImagePromptModerationRewrite,
+  type ImagePromptSafetyHint,
   type RewriteDiff,
   type ViolationCategory,
 } from './content-sanitize';
 import { recordContentFlag } from './content-flags';
+import { rewriteImagePromptForModerationLLM, type ImageSafetyRewriteInvalidReason } from './image-safety-rewrite';
+
+type RewriteAttemptNote = {
+  source: 'llm';
+  attempt: number;
+  changed: boolean;
+  invalidReason?: ImageSafetyRewriteInvalidReason | string;
+};
 
 export type ImageGenerationSafetyAudit = {
   correlationId: string;
@@ -26,6 +36,12 @@ export type ImageGenerationSafetyAudit = {
   finalComposedPromptLength?: number;
   finalComposedPreflight?: ReturnType<typeof preflightImageModerationPrompt>;
   preflight: ReturnType<typeof preflightImageModerationPrompt>;
+  safetyDiagnostics?: {
+    providerCategory: ViolationCategory[];
+    providerReturnedSpecificCategory: boolean;
+    likelySensitiveFragments: ImagePromptSafetyHint[];
+    note: string;
+  };
   attempts: Array<{
     attempt: 0 | 1 | 2;
     submittedPromptHash: string;
@@ -40,6 +56,8 @@ export type ImageGenerationSafetyAudit = {
       toPreview?: string;
       toLength?: number;
     }>;
+    rewriteAttemptNotes?: RewriteAttemptNote[];
+    rewriteFailureReason?: string;
     errorMessage?: string;
   }>;
   visualAnchorDescription?: ImagePromptModerationRewrite['visualAnchorDescription'];
@@ -61,6 +79,8 @@ type FullImageGenerationSafetyAudit = Omit<
     safetyViolations?: ViolationCategory[];
     errorCode?: string;
     rewriteDiff?: RewriteDiff[];
+    rewriteAttemptNotes?: RewriteAttemptNote[];
+    rewriteFailureReason?: string;
     errorMessage?: string;
   }>;
 };
@@ -105,6 +125,12 @@ function compactImageSafetyAudit(audit: FullImageGenerationSafetyAudit): ImageGe
   const original = promptFingerprint(audit.originalPrompt);
   const finalPrompt = audit.finalSubmittedPrompt ? promptFingerprint(audit.finalSubmittedPrompt) : null;
   const composedPrompt = audit.finalComposedPrompt ? promptFingerprint(audit.finalComposedPrompt) : null;
+  const providerCategory = auditSafetyViolations(audit);
+  const providerReturnedSpecificCategory = providerCategory.some((category) => category !== 'unknown');
+  const likelySensitiveFragments = inferImagePromptSafetyHints(
+    [audit.originalPrompt, audit.finalSubmittedPrompt].filter(Boolean).join('\n'),
+    8,
+  );
   return {
     correlationId: audit.correlationId,
     startedAt: audit.startedAt,
@@ -121,6 +147,14 @@ function compactImageSafetyAudit(audit: FullImageGenerationSafetyAudit): ImageGe
       ? preflightImageModerationPrompt(audit.finalComposedPrompt)
       : undefined,
     preflight: audit.preflight,
+    safetyDiagnostics: {
+      providerCategory,
+      providerReturnedSpecificCategory,
+      likelySensitiveFragments,
+      note: providerReturnedSpecificCategory
+        ? '图像服务返回了安全类别；片段为本地规则辅助定位。'
+        : '图像服务未返回具体拦截词或类别；片段为系统按 prompt 启发式推断的优先排查项。',
+    },
     attempts: audit.attempts.map((attempt) => {
       const submitted = promptFingerprint(attempt.submittedPrompt);
       return {
@@ -132,6 +166,8 @@ function compactImageSafetyAudit(audit: FullImageGenerationSafetyAudit): ImageGe
         safetyViolations: attempt.safetyViolations,
         errorCode: attempt.errorCode,
         rewriteDiff: compactRewriteDiff(attempt.rewriteDiff),
+        rewriteAttemptNotes: attempt.rewriteAttemptNotes,
+        rewriteFailureReason: attempt.rewriteFailureReason,
         errorMessage: attempt.errorMessage,
       };
     }),
@@ -193,10 +229,25 @@ function persistImageGenerationAudit(
   }
 }
 
+function appendRewriteAttemptNote(audit: FullImageGenerationSafetyAudit, note: RewriteAttemptNote) {
+  const last = audit.attempts[audit.attempts.length - 1];
+  if (!last) return;
+  last.rewriteAttemptNotes = [...(last.rewriteAttemptNotes || []), note];
+}
+
+function markRewriteFailure(audit: FullImageGenerationSafetyAudit, reason: string) {
+  const last = audit.attempts[audit.attempts.length - 1];
+  if (!last) return;
+  last.rewriteFailureReason = reason;
+}
+
 export async function generateImageWithModerationRecovery(
   user: UserRow,
   input: ImageGenInput,
-  deps: { generateImageImpl?: typeof generateImage } = {},
+  deps: {
+    generateImageImpl?: typeof generateImage;
+    rewriteLLMImpl?: typeof rewriteImagePromptForModerationLLM;
+  } = {},
 ): Promise<SafeImageGenResult> {
   const originalPrompt = String(input.prompt || '');
   const audit: FullImageGenerationSafetyAudit = {
@@ -282,30 +333,63 @@ export async function generateImageWithModerationRecovery(
         };
         throw e;
       }
-      const rewrite = rewriteImagePromptForModeration(
+      // 快路径:关键词改写。图像审核常见 unknown 类别 → 这里多半 0 改动。
+      const kw = rewriteImagePromptForModeration(
         submittedPrompt,
         info.safetyViolations.length ? info.safetyViolations : ['unknown'],
       );
-      if (!rewrite.rewriteDiff.length || rewrite.rewrittenPrompt === submittedPrompt) {
-        persistImageGenerationAudit(user, input, {
-          ...audit,
-          finalSubmittedPrompt: submittedPrompt,
-          finalComposedPrompt: composeFinalImagePrompt({ ...input, prompt: submittedPrompt }),
-          visualAnchorDescription,
+      let nextPrompt = kw.rewrittenPrompt;
+      let nextDiff: RewriteDiff[] = kw.rewriteDiff;
+      let nextAnchor = kw.visualAnchorDescription;
+      if (!kw.rewriteDiff.length || kw.rewrittenPrompt === submittedPrompt) {
+        // 方向 B:关键词改写没动 → 用 LLM 把提示词中性化再重试;LLM 也救不回才放弃。
+        const rewriteLLM = deps.rewriteLLMImpl || rewriteImagePromptForModerationLLM;
+        let llm = await rewriteLLM(user, submittedPrompt, {
+          traceName: 'image-moderation-rewrite',
         });
-        (e as any).imageSafetyAudit = {
-          ...compactImageSafetyAudit({
+        appendRewriteAttemptNote(audit, {
+          source: 'llm',
+          attempt: 1,
+          changed: !!llm.changed,
+          invalidReason: llm.invalidReason,
+        });
+        if (!llm.changed) {
+          llm = await rewriteLLM(user, submittedPrompt, {
+            traceName: 'image-moderation-rewrite-retry',
+          });
+          appendRewriteAttemptNote(audit, {
+            source: 'llm',
+            attempt: 2,
+            changed: !!llm.changed,
+            invalidReason: llm.invalidReason,
+          });
+        }
+        if (!llm.changed) {
+          const reason = llm.invalidReason || 'no_change';
+          markRewriteFailure(audit, `rewrite_failed:${reason}`);
+          persistImageGenerationAudit(user, input, {
             ...audit,
             finalSubmittedPrompt: submittedPrompt,
             finalComposedPrompt: composeFinalImagePrompt({ ...input, prompt: submittedPrompt }),
             visualAnchorDescription,
-          }),
-        };
-        throw e;
+          });
+          (e as any).imageSafetyAudit = {
+            ...compactImageSafetyAudit({
+              ...audit,
+              finalSubmittedPrompt: submittedPrompt,
+              finalComposedPrompt: composeFinalImagePrompt({ ...input, prompt: submittedPrompt }),
+              visualAnchorDescription,
+            }),
+          };
+          throw e;
+        }
+        nextPrompt = llm.rewrittenPrompt;
+        nextDiff = llm.rewriteDiff;
+        nextAnchor = llm.visualAnchorDescription;
       }
-      submittedPrompt = rewrite.rewrittenPrompt;
-      visualAnchorDescription = rewrite.visualAnchorDescription;
-      nextRewriteDiff = rewrite.rewriteDiff;
+      submittedPrompt = nextPrompt;
+      visualAnchorDescription = nextAnchor;
+      nextRewriteDiff = nextDiff;
     }
   }
 

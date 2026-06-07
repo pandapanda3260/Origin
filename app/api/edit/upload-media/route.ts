@@ -36,6 +36,7 @@ export async function POST(req: NextRequest) {
     const form = await req.formData();
     const file = form.get('file') as File | null;
     const projectId = (form.get('projectId') || '').toString() || null;
+    const purpose = (form.get('purpose') || '').toString().trim();
     if (!file) return jsonError('没有上传文件', 400);
 
     const mime = (file as any).type || 'application/octet-stream';
@@ -43,6 +44,9 @@ export async function POST(req: NextRequest) {
       return jsonError('不支持的文件类型：' + mime, 415);
     }
     const kind = mime.startsWith('video') ? 'video' : mime.startsWith('audio') ? 'audio' : 'image';
+    if (purpose === 'edit_timeline' && kind !== 'video') {
+      return jsonError('剪辑页目前仅支持上传视频素材', 415);
+    }
     const perFileLimit = kind === 'image' ? MAX_IMAGE_BYTES : MAX_AV_BYTES;
     const declaredSize = Number((file as any).size || 0);
     if (declaredSize && declaredSize > perFileLimit) {

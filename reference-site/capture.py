@@ -15,8 +15,8 @@ DOM = ROOT / "dom"
 SHOTS.mkdir(exist_ok=True)
 DOM.mkdir(exist_ok=True)
 
-USERNAME = "pokerman"
-PASSWORD = "joker0606"
+PHONE = os.environ.get("ORIGIN_CAPTURE_PHONE", "19900000000")
+PASSWORD = os.environ.get("ORIGIN_CAPTURE_PASSWORD", "change-me")
 BASE = "https://inf.apiqd.com"
 
 PAGES = [
@@ -51,10 +51,10 @@ def main():
 
         print("[3] Fill credentials via JS API")
         api_resp = page.evaluate(
-            """async ({u,p}) => {
+            """async ({phone,p}) => {
                 const resp = await fetch('/api/auth/login', {
                     method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({username:u, password:p})
+                    body: JSON.stringify({phone, password:p})
                 });
                 const data = await resp.json();
                 if (resp.ok && data && data.token) {
@@ -64,7 +64,7 @@ def main():
                 }
                 return {ok:false, status:resp.status, body:data};
             }""",
-            {"u": USERNAME, "p": PASSWORD},
+            {"phone": PHONE, "p": PASSWORD},
         )
         print("    login result:", api_resp)
         page.screenshot(path=str(SHOTS / "02-login-filled.png"), full_page=True)

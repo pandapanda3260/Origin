@@ -5,7 +5,7 @@ import { getBalance, InsufficientCreditsError } from '@/lib/credits';
 import { generateImage } from '@/lib/image-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { chargeToolboxCredits, refundToolboxCredits, toolboxCreditPrice } from '@/lib/toolbox-billing';
-import { createToolboxItem, serializeToolboxItem, updateToolboxItem } from '@/lib/toolbox-db';
+import { countRunningImageToolboxItems, createToolboxItem, serializeToolboxItem, updateToolboxItem } from '@/lib/toolbox-db';
 import {
   AssetQuotaError,
   assertCanStartAssetGeneration,
@@ -13,12 +13,18 @@ import {
   finishGenerationBatch,
   recordGenerationFailure,
 } from '@/lib/asset-library';
-import { TOOLBOX_IMAGE_GENERATION_MAX_COUNT, TOOLBOX_IMAGE_REFERENCE_MAX_COUNT } from '@/lib/toolbox-limits';
+import {
+  TOOLBOX_IMAGE_GENERATION_MAX_COUNT,
+  TOOLBOX_IMAGE_REFERENCE_MAX_COUNT,
+  TOOLBOX_IMAGE_RUNNING_LIMIT,
+  TOOLBOX_IMAGE_RUNNING_STALE_MS,
+} from '@/lib/toolbox-limits';
 import { assertToolboxImageRefPath } from '@/lib/toolbox-media';
 import {
   imageSizeForToolboxRatio,
   normalizeToolboxImageRatio,
   normalizeToolboxMode,
+  toolboxImageFriendlyError,
   type ToolboxInputRef,
 } from '@/lib/toolbox-modes';
 
@@ -59,6 +65,10 @@ export async function POST(req: NextRequest) {
   } catch (error: any) {
     if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
     throw error;
+  }
+
+  if (countRunningImageToolboxItems(user.id, TOOLBOX_IMAGE_RUNNING_STALE_MS) >= TOOLBOX_IMAGE_RUNNING_LIMIT) {
+    return jsonError('当前已有较多图片生成任务进行中，请稍后再试', 409);
   }
 
   let referencePath: string | null = null;
@@ -140,6 +150,7 @@ export async function POST(req: NextRequest) {
       items.push(serializeToolboxItem(updated || item));
     } catch (error: any) {
       const message = String(error?.message || error || '图片生成失败').slice(0, 1000);
+      console.error('[toolbox][image] generate failed', { mode, message });
       recordGenerationFailure({
         batchId,
         ownerId: user.id,
@@ -150,7 +161,7 @@ export async function POST(req: NextRequest) {
       refundToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'failed',
-        errorMessage: message,
+        errorMessage: toolboxImageFriendlyError(message),
       });
       items.push(serializeToolboxItem(updated || item));
     }

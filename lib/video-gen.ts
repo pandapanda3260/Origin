@@ -20,21 +20,27 @@ import { resolveLLMConfig } from './llm';
 import { recordModelCallEvent } from './model-routing';
 import { getDb } from './db';
 import type { UserRow } from './db';
-import { makeBlackVideo, extractCover } from './ffmpeg';
+import { makeBlackVideo, extractCover, probeMediaStreamDurations } from './ffmpeg';
 import { generateImage } from './image-gen';
 import { buildSignedVideoUrl } from './signed-asset-url';
-import { patchProjectForUser } from './projects-db';
+import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 import type { CharacterReferencePanel } from './panel-selection';
 import { fetchViaProxy } from './proxy-fetch';
 import {
   buildSeedancePromptParts,
   buildSeedanceFirstLastFramePromptParts,
   type VideoReferenceImage,
+  type VideoPromptShotPlanItem,
 } from './video-prompt-runtime';
 import type { TargetEndStrategy } from './video-provider-capabilities';
 import { resolveVideoModelCapability } from './video-provider-capabilities';
 import { hashString, resolveGenerationDurationSec } from './video-reference-manifest';
 import type { DialoguePolicy } from './video-reference-manifest';
+import {
+  buildTailRushedWarning,
+  shouldMarkTailRushedAfterProbe,
+  type SegmentTempoBudget,
+} from './video-segment-runtime';
 import type { VideoPromptFailureStage } from './video-prompt-state';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
 import { DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT, getGlobalVideoConcurrencyLimit, isVideoGenerationEnabled } from './system-config';
@@ -43,6 +49,7 @@ import type { ProviderTaskAdapter, ProviderTaskRow, ProviderPollResult } from '.
 import { createAssetRecord, finishGenerationBatch, hashFile, localAssetUri } from './asset-library';
 import { getExternalEnvValue } from './env';
 import { buildVideoPromptSnapshot } from './video-prompt-lifecycle';
+import { normalizeVideoAspectRatio } from './aspect-ratio';
 
 export type VideoGenInput = {
   prompt: string;
@@ -56,6 +63,8 @@ export type VideoGenInput = {
   /** 是否让视频模型同时生成声音。默认开启；前端关闭时显式传 false。 */
   generateAudio?: boolean;
   durationSec?: number;
+  shotPlan?: VideoPromptShotPlanItem[];
+  tempoBudget?: SegmentTempoBudget;
   projectId?: string;
   groupIdx?: number;
   videoPromptSourceHash?: string | null;
@@ -463,19 +472,6 @@ export function sanitizeForSeedance(rawPrompt: string): string {
   return t;
 }
 
-/** 把 ratio 字符串规范成统一格式 + size 映射 */
-function normalizeRatio(ratio?: string): { ratio: string; size: '1080x1920' | '1920x1080' | '1024x1024' } {
-  const r = (ratio || '').trim();
-  if (r === '16:9') return { ratio: '16:9', size: '1920x1080' };
-  if (r === '9:16') return { ratio: '9:16', size: '1080x1920' };
-  if (r === '1:1') return { ratio: '1:1', size: '1024x1024' };
-  // 4:3 / 3:4 / 21:9 等 grok 暂不支持，回退
-  if (r === '4:3' || r === '21:9') return { ratio: '16:9', size: '1920x1080' };
-  if (r === '3:4') return { ratio: '9:16', size: '1080x1920' };
-  // Default: 竖屏短视频 9:16（v2 起沿用）。调用方未传 input.ratio 时走此分支。
-  return { ratio: '9:16', size: '1080x1920' };
-}
-
 export type VideoGenCompletedResult = {
   taskId: string;
   status: 'completed' | 'failed';
@@ -483,7 +479,9 @@ export type VideoGenCompletedResult = {
   protectedUrl: string;
   coverUrl: string | null;
   durationSec: number;
+  realDurationSec?: number;
   mode: 'real' | 'fake';
+  videoWarnings?: any[];
   videoAudit?: {
     provider: string;
     model?: string;
@@ -530,6 +528,59 @@ export type VideoGenUpstreamPendingResult = {
 
 export type VideoGenResult = VideoGenCompletedResult | VideoGenUpstreamPendingResult;
 
+type VideoTempoProbeResult = {
+  realDurationSec?: number;
+  videoWarnings: any[];
+};
+
+function roundProbeDurationSec(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function mergeVideoWarningsLocal(...groups: any[][]): any[] {
+  const merged: any[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    for (const warning of Array.isArray(group) ? group : []) {
+      if (!warning) continue;
+      const normalized = typeof warning === 'string'
+        ? { key: warning, level: 'warn', message: warning }
+        : warning;
+      const key = String(normalized.key || normalized.message || '');
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(normalized);
+    }
+  }
+  return merged;
+}
+
+async function probeVideoTempoBudget(
+  fullPath: string,
+  tempoBudget?: SegmentTempoBudget | null,
+): Promise<VideoTempoProbeResult> {
+  if (!tempoBudget) return { videoWarnings: [] };
+  const durations = await probeMediaStreamDurations(fullPath);
+  const formatSec = Number(durations.formatSec) || 0;
+  if (formatSec <= 0) return { videoWarnings: [] };
+  const realDurationSec = roundProbeDurationSec(formatSec);
+  return {
+    realDurationSec,
+    videoWarnings: shouldMarkTailRushedAfterProbe(realDurationSec, tempoBudget)
+      ? [buildTailRushedWarning(tempoBudget)]
+      : [],
+  };
+}
+
+function readProjectTempoBudget(projectId: string | null | undefined, userId: number, groupIdx: number | null | undefined): SegmentTempoBudget | null {
+  if (!projectId || groupIdx == null || !Number.isInteger(Number(groupIdx))) return null;
+  const project = getProjectByIdForUser(projectId, userId) as any;
+  const idx = Number(groupIdx);
+  const task = Array.isArray(project?.videoTasks) ? project.videoTasks[idx] : null;
+  const budget = task?.tempoBudget || task?.videoPlan?.tempoBudget;
+  return budget && typeof budget === 'object' ? budget as SegmentTempoBudget : null;
+}
+
 function patchVideoPromptSnapshotFinalPromptHash(db: any, taskId: string, finalPromptHash?: string | null) {
   const hash = String(finalPromptHash || '').trim();
   if (!hash) return;
@@ -554,7 +605,7 @@ function patchVideoPromptSnapshotFinalPromptHash(db: any, taskId: string, finalP
  * comparison between planning and submission.
  */
 export type VideoAuditReferenceImage =
-  Pick<VideoReferenceImage, 'role' | 'path' | 'label' | 'sourceUrl' | 'assetId' | 'assetName' | 'promptHint'>
+  Pick<VideoReferenceImage, 'role' | 'path' | 'label' | 'sourceUrl' | 'assetId' | 'assetName' | 'promptHint' | 'useFor' | 'immutable' | 'panelInfo' | 'referenceBrief'>
   & {
     apiRole?: string;
     apiContentIndex?: number;
@@ -713,7 +764,8 @@ export async function generateVideo(
   const cfgIsGrok = /^grok-video/i.test(cfg.model || '');
   const isVolcano = /volces\.com|volcengine|ark\.cn-/i.test(cfg.baseUrl) || /seedance|doubao/i.test(cfg.model);
   const isGrok = cfgIsGrok;
-  // 生成请求时长来自镜头表计划时长；仅在模型自身固定时长或供应商最小时长时做适配。
+  // 生成请求时长来自镜头表计划/预算后的 input.durationSec；这里的 dur 仍是请求时长。
+  // 任务完成后 video_tasks.duration_sec 会被真实探测时长覆盖，剪辑页不读取请求时长。
   const dur = resolveGenerationDurationSec({
     plannedDurationSec: input.durationSec,
     model: cfg.model,
@@ -722,7 +774,7 @@ export async function generateVideo(
   });
   // ratio 优先；没传 ratio 时尊重 size，否则按 size 反推
   const sizeArgPresent = !!input.size;
-  const { ratio: aspectRatio, size: sizeFromRatio } = normalizeRatio(
+  const { ratio: aspectRatio, size: sizeFromRatio } = normalizeVideoAspectRatio(
     input.ratio || (input.size === '1080x1920' ? '9:16' : input.size === '1920x1080' ? '16:9' : input.size === '1024x1024' ? '1:1' : '16:9'),
   );
   const size = (sizeArgPresent && !input.ratio ? input.size! : sizeFromRatio) as '1080x1920' | '1920x1080' | '1024x1024';
@@ -910,6 +962,8 @@ export async function generateVideo(
 
         const promptParts = buildSeedanceFirstLastFramePromptParts({
           prompt: input.prompt || '',
+          durationSec: dur,
+          shotPlan: input.shotPlan,
           dialoguePairs: input.dialoguePairs,
           characterLockRoster: input.characterLockRoster,
           voiceRoster: input.voiceRoster,
@@ -1115,11 +1169,14 @@ export async function generateVideo(
           console.warn('[video-gen][seedance][first-last] extract cover failed:', e?.message);
         }
 
-	        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
-	        const completeInfo = db.prepare(
-          `UPDATE video_tasks SET status='completed', progress=100,
-             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
-        ).run(taskId);
+		        const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
+		        const finalDurationSec = tempoProbe.realDurationSec || dur;
+		        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+		        const completeInfo = db.prepare(
+	          `UPDATE video_tasks SET status='completed', progress=100,
+	             duration_sec=?,
+	             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
+	        ).run(finalDurationSec, taskId);
         if (completeInfo.changes <= 0) {
           console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
           return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode, videoAudit };
@@ -1131,21 +1188,23 @@ export async function generateVideo(
           user,
           input,
           taskId,
-          filename,
-          fullPath,
-          coverUrl,
-          durationSec: dur,
-        });
-        return {
+	          filename,
+	          fullPath,
+	          coverUrl,
+	          durationSec: finalDurationSec,
+	        });
+	        return {
           taskId,
           status: 'completed',
           url: buildSignedVideoUrl(taskId, user.id).url,
-          protectedUrl,
-          coverUrl,
-          durationSec: dur,
-          mode,
-          videoAudit,
-        };
+	          protectedUrl,
+	          coverUrl,
+	          durationSec: finalDurationSec,
+	          realDurationSec: tempoProbe.realDurationSec,
+	          mode,
+	          videoWarnings: tempoProbe.videoWarnings,
+	          videoAudit,
+	        };
       } catch (e: any) {
         const msg = String(e?.message || e);
         let friendly = msg;
@@ -1198,6 +1257,7 @@ export async function generateVideo(
         ...input,
         ratio: aspectRatio,
         durationSec: dur,
+        shotPlan: input.shotPlan,
       });
       const independentReferenceImages = seedancePrompt.independentReferenceImages;
       const hasIndependentImageRefs = seedancePrompt.hasIndependentImageRefs;
@@ -1221,61 +1281,134 @@ export async function generateVideo(
       ];
 
       if (hasIndependentImageRefs) {
-        try {
-	          const submittedRefs: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
-	          for (const ref of independentReferenceImages) {
-	            const image = await buildVideoSubmitImageDataUrl(ref.path, {
-	              lowBytesPerPixelMessage: lowQualitySubmitImageMessage(ref.role),
-	            });
-	            submittedRefs.push({ ref, image });
+        const submittedRefs: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
+        const failedRefs: Array<{ ref: VideoReferenceImage; error: string }> = [];
+        for (const ref of independentReferenceImages) {
+          try {
+            const image = await buildVideoSubmitImageDataUrl(ref.path, {
+              lowBytesPerPixelMessage: lowQualitySubmitImageMessage(ref.role),
+            });
+            submittedRefs.push({ ref, image });
+          } catch (refErr: any) {
+            failedRefs.push({ ref, error: String(refErr?.message || refErr).slice(0, 300) });
+          }
+        }
+        if (!submittedRefs.length) {
+          if (!hasFirstFrameRef || !input.referenceImagePath) {
+            throw new Error('参考图提交失败，请检查图片或重试');
+          }
+          try {
+            const fallbackImage = await buildVideoSubmitImageDataUrl(input.referenceImagePath, {
+              lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
+            });
+            content.push({
+              type: 'image_url',
+              image_url: { url: fallbackImage.dataUrl },
+              role: 'first_frame',
+            });
+            videoAudit = {
+              provider: 'seedance',
+              model: cfg.model,
+              finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
+              finalPromptHash: hashString(seedancePrompt.finalPrompt),
+              finalPromptLength: seedancePrompt.finalPrompt.length,
+              dialoguePolicy: 'budget_check_only',
+              payloadMode: 'first_frame_multi_ref',
+              modeReason: input.payloadModeReason || 'first_frame_fallback',
+              referenceImages: [{
+                role: 'first_frame',
+                path: input.referenceImagePath,
+                label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
+                promptHint: 'Fallback after all independent reference images failed to build.',
+                apiRole: 'first_frame',
+                apiContentIndex: 1,
+                imageContentHash: hashFile(input.referenceImagePath),
+                originalBytes: fallbackImage.originalBytes,
+                submittedBytes: fallbackImage.submittedBytes,
+                submittedWidth: fallbackImage.width,
+                submittedHeight: fallbackImage.height,
+                submittedMime: fallbackImage.mime,
+                warnings: fallbackImage.warnings,
+              }],
+              fallbackReason: 'reference_image_build_all_failed_first_frame_fallback',
+            };
+          } catch (fallbackErr: any) {
+            console.warn(
+              '[video-gen][seedance] independent reference images and first-frame fallback build failed:',
+              fallbackErr?.message || fallbackErr,
+            );
+            throw new Error('参考图提交失败，请检查图片或重试');
+          }
+        }
+        if (submittedRefs.length) {
+          for (const { image } of submittedRefs) {
             content.push({
               type: 'image_url',
               image_url: { url: image.dataUrl },
               role: 'reference_image',
             });
           }
-          videoAudit = {
-            provider: 'seedance',
-            model: cfg.model,
-            finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
-            finalPromptHash: hashString(seedancePrompt.finalPrompt),
-            finalPromptLength: seedancePrompt.finalPrompt.length,
-            dialoguePolicy: 'budget_check_only',
-            payloadMode: 'first_frame_multi_ref',
-            modeReason: input.payloadModeReason || 'no_tail_intent',
-            referenceImages: submittedRefs.map(({ ref, image }) => ({
-              role: ref.role,
-              path: ref.path,
-              label: ref.label,
-              sourceUrl: ref.sourceUrl,
-              assetId: ref.assetId,
-              assetName: ref.assetName,
-              promptHint: ref.promptHint,
-              originalBytes: image.originalBytes,
-	              submittedBytes: image.submittedBytes,
-	              submittedWidth: image.width,
-	              submittedHeight: image.height,
-	              submittedMime: image.mime,
-	              warnings: image.warnings,
-	            })),
-	          };
-          const originalBytes = submittedRefs.reduce((sum, item) => sum + item.image.originalBytes, 0);
-          const submittedBytes = submittedRefs.reduce((sum, item) => sum + item.image.submittedBytes, 0);
-          console.log(
-            `[video-gen][seedance] attached independent reference images ` +
-              `(${submittedRefs.map(({ ref, image }, i) => `Image${i + 1}:${ref.role}:${ref.label}:${image.width}x${image.height}`).join(' | ')}) ` +
-              `payloadImages=${(originalBytes / 1024 / 1024).toFixed(2)}MB->${(submittedBytes / 1024 / 1024).toFixed(2)}MB`,
-          );
-          console.log(
-            `[metric][seedance][multi-image] attempted groupIdx=${input.groupIdx ?? -1} ` +
-              `images=${independentReferenceImages.length} ` +
-              `roles=${independentReferenceImages.map((ref) => ref.role).join(',')}`,
-          );
-        } catch (refErr: any) {
-          console.warn(
-            '[video-gen][seedance] independent reference image build failed, falling back to text-only:',
-            refErr?.message || refErr,
-          );
+          if (failedRefs.length) {
+            console.warn(
+              '[video-gen][seedance] independent reference image build partially failed:',
+              failedRefs.map((item) => `${item.ref.role}:${item.ref.label}:${item.error}`).join(' | '),
+            );
+          }
+          try {
+            videoAudit = {
+              provider: 'seedance',
+              model: cfg.model,
+              finalPromptPreview: seedancePrompt.finalPrompt.slice(0, 500),
+              finalPromptHash: hashString(seedancePrompt.finalPrompt),
+              finalPromptLength: seedancePrompt.finalPrompt.length,
+              dialoguePolicy: 'budget_check_only',
+              payloadMode: 'first_frame_multi_ref',
+              modeReason: input.payloadModeReason || 'no_tail_intent',
+              referenceImages: submittedRefs.map(({ ref, image }, idx) => ({
+                role: ref.role,
+                path: ref.path,
+                label: ref.label,
+                sourceUrl: ref.sourceUrl,
+                assetId: ref.assetId,
+                assetName: ref.assetName,
+                promptHint: ref.promptHint,
+                useFor: ref.useFor,
+                immutable: ref.immutable,
+                panelInfo: ref.panelInfo,
+                referenceBrief: ref.referenceBrief,
+                apiRole: 'reference_image',
+                apiContentIndex: idx + 1,
+                imageContentHash: hashFile(ref.path),
+                originalBytes: image.originalBytes,
+	                submittedBytes: image.submittedBytes,
+	                submittedWidth: image.width,
+	                submittedHeight: image.height,
+	                submittedMime: image.mime,
+	                warnings: image.warnings,
+	              })),
+              fallbackReason: failedRefs.length || submittedRefs.length < independentReferenceImages.length
+                ? 'reference_image_build_partial_failure'
+                : undefined,
+	            };
+            const originalBytes = submittedRefs.reduce((sum, item) => sum + item.image.originalBytes, 0);
+            const submittedBytes = submittedRefs.reduce((sum, item) => sum + item.image.submittedBytes, 0);
+            console.log(
+              `[video-gen][seedance] attached independent reference images ` +
+                `(${submittedRefs.map(({ ref, image }, i) => `Image${i + 1}:${ref.role}:${ref.label}:${image.width}x${image.height}`).join(' | ')}) ` +
+                `payloadImages=${(originalBytes / 1024 / 1024).toFixed(2)}MB->${(submittedBytes / 1024 / 1024).toFixed(2)}MB`,
+            );
+            console.log(
+              `[metric][seedance][multi-image] attempted groupIdx=${input.groupIdx ?? -1} ` +
+                `images=${independentReferenceImages.length} ` +
+                `submitted=${submittedRefs.length} ` +
+                `roles=${independentReferenceImages.map((ref) => ref.role).join(',')}`,
+            );
+          } catch (auditErr: any) {
+            console.warn(
+              '[video-gen][seedance] independent reference audit failed:',
+              auditErr?.message || auditErr,
+            );
+          }
         }
       } else if (hasAnyRef) {
         try {
@@ -1337,6 +1470,7 @@ export async function generateVideo(
                 label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
                 apiRole: input.seedanceImageMode === 'strict_first_frame' ? 'first_frame' : 'reference_image',
                 apiContentIndex: content.length - 1,
+                imageContentHash: directFirstFramePath ? hashFile(directFirstFramePath) : undefined,
 	                originalBytes: directFirstFrameImage.originalBytes,
 	                submittedBytes: directFirstFrameImage.submittedBytes,
 	                submittedWidth: directFirstFrameImage.width,
@@ -1392,8 +1526,12 @@ export async function generateVideo(
             ...input,
             ratio: aspectRatio,
             durationSec: dur,
+            shotPlan: input.shotPlan,
             referenceImages: undefined,
             referenceImageRole: 'first_frame',
+          });
+          const fallbackImage = await buildVideoSubmitImageDataUrl(input.referenceImagePath, {
+            lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
           });
           videoAudit = {
             provider: 'seedance',
@@ -1409,6 +1547,15 @@ export async function generateVideo(
               path: input.referenceImagePath,
               label: `segment ${(input.groupIdx ?? 0) + 1} first frame`,
               promptHint: 'Fallback after independent reference images were rejected.',
+              apiRole: 'first_frame',
+              apiContentIndex: 1,
+              imageContentHash: hashFile(input.referenceImagePath),
+              originalBytes: fallbackImage.originalBytes,
+              submittedBytes: fallbackImage.submittedBytes,
+              submittedWidth: fallbackImage.width,
+              submittedHeight: fallbackImage.height,
+              submittedMime: fallbackImage.mime,
+              warnings: fallbackImage.warnings,
             }],
             fallbackReason: 'independent_refs_rejected_by_input_image_safety',
           };
@@ -1417,9 +1564,7 @@ export async function generateVideo(
             {
               type: 'image_url',
               image_url: {
-                url: (await buildVideoSubmitImageDataUrl(input.referenceImagePath, {
-                  lowBytesPerPixelMessage: lowQualitySubmitImageMessage('first_frame'),
-                })).dataUrl,
+                url: fallbackImage.dataUrl,
               },
               role: 'first_frame',
             },
@@ -1645,11 +1790,14 @@ export async function generateVideo(
     console.warn('[video-gen] extract cover failed:', e?.message);
   }
 
-	  patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
-	  const completeInfo = db.prepare(
-    `UPDATE video_tasks SET status='completed', progress=100,
-       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
-  ).run(taskId);
+		  const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
+		  const finalDurationSec = tempoProbe.realDurationSec || dur;
+		  patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+		  const completeInfo = db.prepare(
+	    `UPDATE video_tasks SET status='completed', progress=100,
+	       duration_sec=?,
+	       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
+	  ).run(finalDurationSec, taskId);
   if (completeInfo.changes <= 0) {
     console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
     return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode };
@@ -1662,22 +1810,24 @@ export async function generateVideo(
     user,
     input,
     taskId,
-    filename,
-    fullPath,
-    coverUrl,
-    durationSec: dur,
-  });
+	    filename,
+	    fullPath,
+	    coverUrl,
+	    durationSec: finalDurationSec,
+	  });
 
   return {
     taskId,
     status: 'completed',
     url: buildSignedVideoUrl(taskId, user.id).url,
     protectedUrl,
-      coverUrl,
-      durationSec: dur,
-      mode,
-      videoAudit,
-    };
+	      coverUrl,
+	      durationSec: finalDurationSec,
+	      realDurationSec: tempoProbe.realDurationSec,
+	      mode,
+	      videoWarnings: tempoProbe.videoWarnings,
+	      videoAudit,
+	    };
 }
 
 function sleep(ms: number) {
@@ -2238,9 +2388,9 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 
   let coverImageId = row.cover_image_id || null;
   let coverUrl = coverImageId ? `/api/images/file/${coverImageId}` : null;
-  if (!coverImageId) {
-    try {
-      const coverPath = join(ownerDir, `${taskId}.cover.png`);
+	  if (!coverImageId) {
+	    try {
+	      const coverPath = join(ownerDir, `${taskId}.cover.png`);
       await extractCover({ videoPath: fullPath, outputPath: coverPath });
       coverImageId = randomUUID();
       const stat = statSync(coverPath);
@@ -2258,20 +2408,25 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
       );
       coverUrl = `/api/images/file/${coverImageId}`;
     } catch (e: any) {
-      console.warn('[video-recover] extract cover failed:', e?.message || e);
-    }
-  }
+	      console.warn('[video-recover] extract cover failed:', e?.message || e);
+	    }
+	  }
+	  const groupIdxForBudget = row.group_idx == null ? null : Number(row.group_idx);
+	  const tempoBudget = readProjectTempoBudget(row.project_id || null, user.id, groupIdxForBudget);
+	  const tempoProbe = await probeVideoTempoBudget(fullPath, tempoBudget);
+	  const durationSec = tempoProbe.realDurationSec || Number(row.duration_sec) || 0;
 
-  const completeInfo = db.prepare(
-    `UPDATE video_tasks
-     SET status='completed',
-         progress=100,
-         filename=?,
-         cover_image_id=?,
-         error_msg=NULL,
-         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     WHERE id=? AND status IN ('queued','running')`,
-  ).run(filename, coverImageId, taskId);
+	  const completeInfo = db.prepare(
+	    `UPDATE video_tasks
+	     SET status='completed',
+	         progress=100,
+	         filename=?,
+	         cover_image_id=?,
+	         duration_sec=?,
+	         error_msg=NULL,
+	         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	     WHERE id=? AND status IN ('queued','running')`,
+	  ).run(filename, coverImageId, durationSec, taskId);
   if (completeInfo.changes <= 0) {
     console.warn('[video-recover] completion ignored because task is no longer active:', taskId);
     return {
@@ -2281,41 +2436,69 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
       protectedUrl: '',
       durationSec: Number(row.duration_sec) || 0,
     };
-  }
+	  }
 
-  const protectedUrl = `/api/videos/file/${taskId}`;
-  const durationSec = Number(row.duration_sec) || 0;
+	  const protectedUrl = `/api/videos/file/${taskId}`;
 
-  if (row.project_id && row.group_idx != null) {
+	  if (row.project_id && row.group_idx != null) {
     const groupIdx = Number(row.group_idx);
     patchProjectForUser(String(row.project_id), user.id, (fresh) => {
       if (!fresh) return null;
       const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
       if (groupIdx >= shots.length) return null;
-      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const sb = storyboards[groupIdx];
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, sb, { mode: 'single-shot-strict' });
-      videoTasks[groupIdx] = {
-        ...(videoTasks[groupIdx] || {}),
-        groupIdx,
-        taskId,
-        status: 'completed',
-        url: protectedUrl,
-        coverUrl,
-        durationSec,
-        prompt: row.prompt || '',
-      };
+		      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+		      const sb = storyboards[groupIdx];
+		      const previousTask = videoTasks[groupIdx] || {};
+		      const shotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
+		        mode: 'single-shot-strict',
+		        explicitShotIndices: previousTask.shotIndices,
+		      });
+		      const firstShotForWrite = shots[shotIndices[0]];
+		      const warnings = mergeVideoWarningsLocal(previousTask.warnings || [], tempoProbe.videoWarnings);
+	      const previousPlan = previousTask.videoPlan && typeof previousTask.videoPlan === 'object'
+	        ? previousTask.videoPlan
+	        : null;
+	      const videoPlan = previousPlan
+	        ? {
+	            ...previousPlan,
+	            tempoBudget: tempoBudget || previousPlan.tempoBudget,
+	            params: {
+	              ...(previousPlan.params || {}),
+	              durationSec,
+	            },
+	            audit: {
+	              ...(previousPlan.audit || {}),
+	              status: 'completed',
+	              warnings: warnings.map((warning: any) => warning?.message || String(warning)).filter(Boolean),
+	            },
+	          }
+	        : undefined;
+	      videoTasks[groupIdx] = {
+	        ...previousTask,
+		        groupIdx,
+		        shotIndices,
+		        taskId,
+	        status: 'completed',
+	        url: protectedUrl,
+	        coverUrl,
+	        durationSec,
+	        tempoBudget: tempoBudget || previousTask.tempoBudget,
+	        warnings,
+	        videoPlan,
+	        prompt: row.prompt || '',
+	      };
 
       storyboards[groupIdx] = {
-        ...sb,
-        idx: groupIdx,
-        shotIdx: groupIdx + 1,
-        shotIndices,
-        videoUrl: protectedUrl,
-        videoTaskId: taskId,
-        videoDurationSec: durationSec || sb.videoDurationSec,
-      };
+	        ...sb,
+	        idx: groupIdx,
+	        shotIdx: firstShotForWrite?.idx ?? shotIndices[0] + 1,
+	        shotIndices,
+	        videoUrl: protectedUrl,
+	        videoTaskId: taskId,
+	        videoDurationSec: durationSec || sb.videoDurationSec,
+	        videoWarnings: warnings,
+	      };
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-task-recovery');
       return { videoTasks, storyboards };
     });
@@ -2323,11 +2506,13 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 
   return {
     taskId,
-    protectedUrl,
-    coverUrl,
-    durationSec,
-    mode: 'real' as const,
-  };
+	    protectedUrl,
+	    coverUrl,
+	    durationSec,
+	    realDurationSec: tempoProbe.realDurationSec,
+	    videoWarnings: tempoProbe.videoWarnings,
+	    mode: 'real' as const,
+	  };
 }
 
 function safeParseVideoTaskJson(value: string | null | undefined) {

@@ -125,10 +125,11 @@ export function collectEditSegmentsForCompose(project: any): {
     }
     const duration = Number(
       sb.videoDurationSec ??
-      sb.durationSec ??
-      sb.duration ??
       vt.durationSec ??
       vt.duration_sec ??
+      sb.plannedDurationSec ??
+      sb.durationSec ??
+      sb.duration ??
       vt.duration ??
       0,
     );

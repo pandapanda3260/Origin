@@ -40,6 +40,21 @@ function loadSafeImageGen(contentSanitize) {
   function localRequire(id) {
     if (id === './content-sanitize') return contentSanitize;
     if (id === './content-flags') return { recordContentFlag: () => null };
+    if (id === './image-safety-rewrite') {
+      return {
+        rewriteImagePromptForModerationLLM: async (_user, prompt) => ({
+          changed: false,
+          rewrittenPrompt: prompt,
+          rewriteDiff: [],
+          visualAnchorDescription: {
+            originalText: prompt,
+            effectiveText: prompt,
+            source: 'original',
+            rewriteDiff: [],
+          },
+        }),
+      };
+    }
     if (id === './image-gen') {
       return {
         generateImage: async () => { throw new Error('test should inject generateImageImpl'); },

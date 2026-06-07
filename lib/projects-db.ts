@@ -29,6 +29,7 @@ import {
   normalizeScriptConsultState,
 } from './script-consult-state';
 import { isProjectCreatePayloadWhitelistEnabled } from './system-config';
+import { createEmptyEpisode } from '../public/modules/episode_fields.js';
 
 const STYLE_ASPECT_DEFAULT_VERSION = '2026-05-14-9x16';
 
@@ -39,6 +40,7 @@ const EMPTY_DATA = {
   oneSentence: '',
   scriptTargetDurationSec: null as any,
   scriptApproved: false,
+  scriptReviewState: '',
   scriptDraft: '',
   emotionSegments: null as any,
   scriptAnalysis: null as any,
@@ -57,6 +59,7 @@ const EMPTY_DATA = {
   styleBibleManuallyEditedAt: null as any,
   selectedWorldTemplateId: null as any,
   worldTemplateSnapshot: null as any,
+  pendingWorldFacts: null as any,
   selectedStyleTemplateId: null as any,
   styleTemplateSnapshot: null as any,
   characters: [] as any[],
@@ -288,16 +291,99 @@ function rowToSummary(r: ProjectRow) {
   };
 }
 
-function buildExportedEdlVersionBackfillPatch(project: any) {
+function buildExportedEdlVersionBackfillPatch(project: any, userId: number) {
   const editData = project?.editData;
   if (!editData || !editData.exportUrl) return null;
-  if (typeof editData.exportedEdlVersion !== 'undefined') return null;
-  const edlVersion = Number(editData?.edl?.version);
-  if (!Number.isFinite(edlVersion)) return null;
+  let next = editData;
+  let changed = false;
+  if (typeof next.exportedEdlVersion === 'undefined') {
+    const edlVersion = Number(next?.edl?.version);
+    if (Number.isFinite(edlVersion)) {
+      next = { ...next, exportedEdlVersion: edlVersion };
+      changed = true;
+    }
+  }
+  if (!next.exportedEdlSignatureMeta) {
+    const meta = buildExportedEdlSignatureMetaBackfill(project, userId);
+    if (meta) {
+      next = { ...next, exportedEdlSignatureMeta: meta };
+      changed = true;
+    }
+  }
+  return changed ? { editData: next } : null;
+}
+
+function parseExportMetaJson(value: unknown): Record<string, any> {
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function exportTaskIdFromEditData(editData: any) {
+  const explicit = String(editData?.exportTaskId || '').trim();
+  if (explicit) return explicit;
+  const url = String(editData?.exportUrl || '').trim();
+  const match = /\/api\/edit\/export-file\/([^/?#]+)/.exec(url);
+  return match ? match[1] : '';
+}
+
+function buildExportedEdlSignatureMetaBackfill(project: any, userId: number) {
+  const editData = project?.editData;
+  const taskId = exportTaskIdFromEditData(editData);
+  if (!editData || !taskId) return null;
+  const row = getDb()
+    .prepare<{ id: string; uid: number }, any>('SELECT id, bgm_id, edl_json FROM exports WHERE id = @id AND owner_id = @uid')
+    .get({ id: taskId, uid: userId });
+  if (!row) return null;
+
+  const meta = parseExportMetaJson(row.edl_json);
+  if (meta.exportedEdlSignatureMeta && typeof meta.exportedEdlSignatureMeta === 'object' && !Array.isArray(meta.exportedEdlSignatureMeta)) {
+    return meta.exportedEdlSignatureMeta;
+  }
+
+  const exportFormat = meta.composeMeta?.exportFormat || {};
+  const edlBgm = editData?.edl?.bgm && typeof editData.edl.bgm === 'object' ? editData.edl.bgm : null;
+  const rowBgmId = String(meta.bgmId || row.bgm_id || '').trim();
+  const edlTrackId = String(edlBgm?.trackId || '').trim();
+  const bgmExplicitlyOn = !!(edlBgm && edlBgm.enabled === true);
+  const bgmExplicitlyOff = !!(edlBgm && edlBgm.enabled === false);
+  const suggestedBGMCategory = String(editData?.segmentTags?.suggestedBGMCategory || '').trim();
+  const exportSegmentFingerprint = String(meta.composeMeta?.segmentFingerprint || '').trim();
+  const currentSegmentFingerprint = String(editData?.segmentTags?.sourceFingerprint || '').trim();
+  const segmentFingerprint = exportSegmentFingerprint || currentSegmentFingerprint;
+  const canTreatAsAutoBgm = !!(
+    bgmExplicitlyOn &&
+    !edlTrackId &&
+    rowBgmId &&
+    suggestedBGMCategory &&
+    exportSegmentFingerprint &&
+    currentSegmentFingerprint &&
+    exportSegmentFingerprint === currentSegmentFingerprint
+  );
+  const source = bgmExplicitlyOff
+    ? 'off'
+    : bgmExplicitlyOn && edlTrackId && edlTrackId === rowBgmId
+      ? 'explicit'
+      : canTreatAsAutoBgm
+        ? 'auto'
+        : 'none';
+  const effectiveBgmId = source === 'auto' || source === 'explicit' ? rowBgmId : '';
+
   return {
-    editData: {
-      ...editData,
-      exportedEdlVersion: edlVersion,
+    version: 1,
+    taskId: row.id,
+    exportFormat,
+    bgm: {
+      source,
+      enabled: bgmExplicitlyOn && !!effectiveBgmId,
+      trackId: effectiveBgmId,
+      offsetTime: effectiveBgmId ? Math.max(0, Number(edlBgm?.offsetTime) || 0) : 0,
+      suggestedBGMCategory,
+      segmentFingerprint,
     },
   };
 }
@@ -349,7 +435,7 @@ export function getProjectByIdForUser(id: string, userId: number) {
   const normalizedProject = { ...project, ...(normalizationPatch || {}) };
   const backfillPatch = buildExportedEdlVersionBackfillPatch({
     ...normalizedProject,
-  });
+  }, userId);
   const tBackfill = perfDiag ? performance.now() : 0;
   const backfilledProject = { ...normalizedProject, ...(backfillPatch || {}) };
   const staleExportPatch = buildFailedExportTaskCleanupPatch(backfilledProject, userId);
@@ -360,13 +446,21 @@ export function getProjectByIdForUser(id: string, userId: number) {
   let tUpdate = tStaleExport;
   if (combinedPatch) {
     const applied = applyPatchToRow(row, combinedPatch);
-    db.prepare(
+    const updateInfo = db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ? AND owner_id = ?`,
-    ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId);
+       WHERE id = ? AND owner_id = ? AND updated_at = ?`,
+    ).run(applied.title, applied.description, applied.coverUrl, applied.status, applied.dataJson, id, userId, row.updated_at);
     tUpdate = perfDiag ? performance.now() : tUpdate;
+    if (updateInfo.changes === 0) {
+      const freshRow = db
+        .prepare<{ id: string; uid: number }, ProjectRow>(
+          'SELECT * FROM projects WHERE id = @id AND owner_id = @uid',
+        )
+        .get({ id, uid: userId });
+      return freshRow ? rowToPublic(freshRow) : null;
+    }
     if (perfDiag) {
       const fmt = (n: number) => n.toFixed(0);
       console.log(
@@ -479,26 +573,11 @@ function cleanPlainObject(value: any): any | null {
 
 function buildEmptyEpisode(payload: any) {
   const first = Array.isArray(payload?.episodes) ? payload.episodes[0] : null;
-  return {
-    id: cleanId(first?.id) || `ep_${Date.now()}`,
-    title: String(first?.title || '第 1 集').slice(0, 80),
-    idea: '',
-    script: '',
-    scriptDraft: '',
-    scriptTargetDurationSec: null,
-    scriptApproved: false,
-    emotionSegments: null,
-    assets: null,
-    assetsApproved: false,
-    shots: [],
-    shotsApproved: false,
-    storyboards: [],
-    imagesApproved: false,
-    videoPrompts: [],
-    videoPromptsApproved: false,
-    narrations: [],
-    currentStep: 1,
-  };
+  return createEmptyEpisode({
+    id: cleanId(first?.id) || undefined,
+    title: first?.title || '第 1 集',
+    scriptTargetDurationSec: payload?.scriptTargetDurationSec,
+  });
 }
 
 function isEffectivelyEmptyCreateValue(key: string, value: any): boolean {
@@ -540,6 +619,7 @@ function buildNewProjectData(userId: number, projectId: string, payload: any = {
     scriptDraft: '',
     scriptTargetDurationSec: finiteDuration(payload.scriptTargetDurationSec),
     scriptApproved: false,
+    scriptReviewState: '',
     emotionSegments: null,
     scriptAnalysis: null,
     styleOptions: normalizeProjectStyleDefaults({ styleOptions }).styleOptions,
@@ -635,6 +715,19 @@ function applyPutShotPlanDependencyGuard(current: any, patch: any): any {
   return dependencyPatch ? { ...patch, ...dependencyPatch } : patch;
 }
 
+type ProjectWriteOptions = {
+  expectedVersion?: number;
+  allowTitleUpdate?: boolean;
+};
+
+function stripImplicitTitleFields(patch: any, opts?: ProjectWriteOptions): any {
+  if (!patch || typeof patch !== 'object' || opts?.allowTitleUpdate === true) return patch || {};
+  const next = { ...patch };
+  delete next.name;
+  delete next.title;
+  return next;
+}
+
 /**
  * 用 patch 覆盖/合并指定字段。在事务里重新读最新行再合并，防止 TOCTOU。
  * 注意：如果 patch 里的某个键是数组（如 storyboards），这里仍然是整体替换，
@@ -659,7 +752,7 @@ export function updateProjectForUser(
   id: string,
   userId: number,
   patch: any,
-  opts?: { expectedVersion?: number },
+  opts?: ProjectWriteOptions,
 ) {
   const db = getDb();
   let hit = false;
@@ -682,19 +775,23 @@ export function updateProjectForUser(
     const current = rowToPublic(existing);
     const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
     const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
-    const rawPatch = patch || {};
+    const rawPatch = stripImplicitTitleFields(patch || {}, opts);
     const guardedPatch = applyPutShotPlanDependencyGuard(normalizedCurrent, rawPatch);
     const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...guardedPatch } : guardedPatch;
     const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
       Object.prototype.hasOwnProperty.call(combinedPatch, key)
     ));
+    const repairPatch = touchesFrameStructure
+      ? buildFrameWorkflowNormalizationPatch({ ...normalizedCurrent, ...combinedPatch }, userId)
+      : null;
+    const finalPatch = repairPatch ? { ...combinedPatch, ...repairPatch } : combinedPatch;
     if (touchesFrameStructure) {
       maybeAssertStoryboardsAlignedWithShots(
-        { ...normalizedCurrent, ...combinedPatch },
+        { ...normalizedCurrent, ...finalPatch },
         'updateProjectForUser',
       );
     }
-    const applied = applyPatchToRow(existing, combinedPatch);
+    const applied = applyPatchToRow(existing, finalPatch);
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,
@@ -723,6 +820,7 @@ export function patchProjectForUser(
   id: string,
   userId: number,
   patcher: (current: any) => any | null | undefined,
+  opts?: ProjectWriteOptions,
 ) {
   const db = getDb();
   let hit = false;
@@ -737,19 +835,23 @@ export function patchProjectForUser(
     const current = rowToPublic(existing);
     const normalizationPatch = buildFrameWorkflowNormalizationPatch(current, userId);
     const normalizedCurrent = normalizationPatch ? { ...current, ...normalizationPatch } : current;
-    const patch = patcher(normalizedCurrent) || {};
+    const patch = stripImplicitTitleFields(patcher(normalizedCurrent) || {}, opts);
     const combinedPatch = normalizationPatch ? { ...normalizationPatch, ...patch } : patch;
     if (Object.keys(combinedPatch).length === 0) return;
     const touchesFrameStructure = ['shots', 'storyboards', 'videoTasks'].some((key) => (
       Object.prototype.hasOwnProperty.call(combinedPatch, key)
     ));
+    const repairPatch = touchesFrameStructure
+      ? buildFrameWorkflowNormalizationPatch({ ...normalizedCurrent, ...combinedPatch }, userId)
+      : null;
+    const finalPatch = repairPatch ? { ...combinedPatch, ...repairPatch } : combinedPatch;
     if (touchesFrameStructure) {
       maybeAssertStoryboardsAlignedWithShots(
-        { ...normalizedCurrent, ...combinedPatch },
+        { ...normalizedCurrent, ...finalPatch },
         'patchProjectForUser',
       );
     }
-    const applied = applyPatchToRow(existing, combinedPatch);
+    const applied = applyPatchToRow(existing, finalPatch);
     db.prepare(
       `UPDATE projects
        SET title = ?, description = ?, cover_url = ?, status = ?, data_json = ?,

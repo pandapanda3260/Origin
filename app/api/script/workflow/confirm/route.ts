@@ -15,13 +15,19 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({} as any));
   const projectId: string | undefined = body.projectId;
+  const scriptText = (body.script || body.scriptText || '').toString().trim();
   if (!projectId) return jsonError('缺 projectId', 400);
 
   const proj = getProjectByIdForUser(projectId, user.id);
   if (!proj) return jsonError('项目不存在', 404);
+  const finalScript = scriptText || ((proj as any).script || (proj as any).scriptDraft || '').toString().trim();
+  if (!finalScript) return jsonError('当前没有剧本可确认', 400);
 
   updateProjectForUser(projectId, user.id, {
+    script: finalScript,
+    scriptDraft: finalScript,
     scriptApproved: true,
+    scriptReviewState: 'approved',
     currentStep: 2,
   });
 

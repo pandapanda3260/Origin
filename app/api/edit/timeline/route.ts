@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { syncEditProjectClips } from '@/lib/asset-library';
+import { resolveGroupImportDurationSec, resolveTrustedActualDurationSec } from '@/lib/edit-duration-runtime';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,7 +14,7 @@ export const dynamic = 'force-dynamic';
  * 前端走的是 op 协议 —— 每个 mutation 一条 POST，body 形如：
  *   { projectId, op: "import-group" | "remove-group" | "set-edl" |
  *                   "reorder" | "trim" | "transition" |
- *                   "bgm-select" | "bgm-offset" | "add-media", ... }
+ *                   "bgm-select" | "bgm-offset" | "bgm-toggle" | "add-media", ... }
  *
  * 后端在 project.editData.edl 上做权威写盘，并回 readiness 全景镜像
  * 与 serverVersion，让前端 _sendTimelineOp 把内存乐观更新和后端态对齐。
@@ -23,7 +24,7 @@ export const dynamic = 'force-dynamic';
 
 type Edl = {
   timeline: any[];
-  bgm?: { trackId?: string | null; offsetTime?: number } | null;
+  bgm?: { trackId?: string | null; offsetTime?: number; enabled?: boolean } | null;
   version?: number;
 };
 
@@ -41,17 +42,8 @@ function ensureEdl(proj: any): Edl {
 }
 
 function sumGroupDuration(proj: any, groupIdx: number): number {
-  const sbs: any[] = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
-  const sb = sbs[groupIdx];
-  if (!sb) return 5;
-  // 关键：优先用真实生成文件时长；镜头表 duration 只是计划时长。
-  // 不走这一步会出现"计划时长和实际视频文件不一致"导致字幕串到下一段的错位。
-  const real = Number(sb.videoDurationSec);
-  if (real > 0) return real;
-  if (!Array.isArray(sb.shots) || !sb.shots.length) return 5;
-  let dur = 0;
-  for (const s of sb.shots) dur += Number(s?.duration) || 4;
-  return dur || 5;
+  // 新导入可以用计划/镜头累加兜底；已存在 EDL 的自愈不能用估计值覆盖。
+  return resolveGroupImportDurationSec(proj, groupIdx);
 }
 
 function computeReadiness(proj: any) {
@@ -78,13 +70,14 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
 
   // ⚠️ 一次性 normalize：老 timeline 里可能已经存了用错误 sumGroupDuration 写下的
   // duration / outPoint（按 shots 累加 = 5），但实际视频是 10s。每次 mutation 前
-  // 用真实视频时长（sb.videoDurationSec）纠正一遍，让陈旧数据自动愈合落盘。
+  // 用高置信真实视频时长纠正一遍，让陈旧数据自动愈合落盘。
+  // 缺真实时长时继续 skip，避免用 plannedDurationSec / shots / 5 覆盖本来正确的 EDL。
   // 只动 inPoint=0 的段，避免覆盖用户已手动 trim 的范围。
   for (const seg of edl.timeline) {
     if (!seg || seg.groupIdx == null) continue;
     const sb = sbs[seg.groupIdx];
     if (!sb) continue;
-    const realDur = Number(sb.videoDurationSec) || 0;
+    const realDur = resolveTrustedActualDurationSec(proj, Number(seg.groupIdx));
     if (!realDur) continue;
     const curDur = Number(seg.duration) || 0;
     if (Math.abs(curDur - realDur) < 0.05) continue;
@@ -200,9 +193,16 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
       break;
     }
     case 'bgm-select': {
-      const trackId = body?.trackId == null ? null : String(body.trackId);
+      const rawTrackId = body?.trackId == null ? '' : String(body.trackId).trim();
+      const trackId = rawTrackId ? rawTrackId : null;
       const prev = (edl.bgm && typeof edl.bgm === 'object') ? edl.bgm : null;
-      edl.bgm = { trackId, offsetTime: (prev && typeof prev.offsetTime === 'number') ? prev.offsetTime : 0 };
+      const prevEnabled = (prev && typeof (prev as any).enabled === 'boolean') ? (prev as any).enabled : false;
+      // 选中一首具体曲子 = 手动 + 打开；trackId 置空时才沿用旧开关态
+      edl.bgm = {
+        trackId,
+        offsetTime: (prev && typeof prev.offsetTime === 'number') ? prev.offsetTime : 0,
+        enabled: trackId == null ? prevEnabled : true,
+      };
       break;
     }
     case 'bgm-offset': {
@@ -211,7 +211,22 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
         return { edl, storyboards: null, error: '非法 offsetTime' };
       }
       const prev = (edl.bgm && typeof edl.bgm === 'object') ? edl.bgm : { trackId: null };
-      edl.bgm = { trackId: prev.trackId ?? null, offsetTime: offset };
+      edl.bgm = {
+        trackId: prev.trackId ?? null,
+        offsetTime: offset,
+        enabled: (prev && typeof (prev as any).enabled === 'boolean') ? (prev as any).enabled : false,
+      };
+      break;
+    }
+    case 'bgm-toggle': {
+      // BGM 总开关：默认关，只有显式 true 才开；保留已选 trackId / offset。
+      const enabled = body?.enabled === true;
+      const prev = (edl.bgm && typeof edl.bgm === 'object') ? edl.bgm : null;
+      edl.bgm = {
+        trackId: (prev && prev.trackId) ? prev.trackId : null,
+        offsetTime: (prev && typeof prev.offsetTime === 'number') ? prev.offsetTime : 0,
+        enabled,
+      };
       break;
     }
     case 'add-media': {
@@ -242,7 +257,11 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
       };
       // 去除 undefined 键
       const cleaned = Object.fromEntries(Object.entries(sanitized).filter(([, v]) => v !== undefined));
-      edl.timeline.push(cleaned);
+      const requestedIndex = Number(body?.insertIndex);
+      const insertIndex = Number.isInteger(requestedIndex)
+        ? Math.max(0, Math.min(requestedIndex, edl.timeline.length))
+        : edl.timeline.length;
+      edl.timeline.splice(insertIndex, 0, cleaned);
       break;
     }
     default:

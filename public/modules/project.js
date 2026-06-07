@@ -12,7 +12,7 @@ import {
   escapeHtml,
   fetchAssetSignedUrl,
   fetchVideoSignedUrl,
-} from './utils.js?v=104';
+} from './utils.js?v=201';
 
 let _ctx = {};
 
@@ -636,8 +636,10 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
       return resp.json().then(function (j) {
         // 服务器把新 version 挂在响应里 → 写回内存，为下次 PUT 带对齐的 If-Match
         var latest = _getProject();
-        if (latest && latest.id === proj.id && j && typeof j.version === "number") {
-          latest.version = j.version;
+        if (latest && latest.id === proj.id && j) {
+          if (typeof j.version === "number") latest.version = j.version;
+          if (typeof j.name === "string") latest.name = j.name;
+          if (typeof j.title === "string") latest.title = j.title;
         }
         return { ok: true, version: j && j.version };
       });
@@ -730,6 +732,35 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    * item. Safe to call even when the slot is still empty — it silently no-ops.
    * Max 10 snapshots per item; oldest gets dropped.
    */
+  // 资产卡按类型扫的「信息字段表」——和后端 IMAGE_RELEVANT_FIELDS 一一对应。
+  // 这些字段任一变化都意味着图片需要重生成，归档时把当前快照里的这些字段一起保存，
+  // 后续从「历史记录」一键替换时可以一并还原。
+  var _ASSET_INFO_FIELDS = {
+    char: ["name","role","identity","appearance","clothing","equipment",
+           "temperament","actionTraits","entityType","castingOverride",
+           "imagePrompt","description","tags"],
+    scene: ["name","description","location","timeSetting","weather","lighting",
+            "atmosphere","elements","imagePrompt"],
+    prop: ["name","propType","features","material","imagePrompt"],
+  };
+
+  function _captureItemInfo(item, source) {
+    if (!item || typeof item !== "object") return null;
+    // source 形如 "stylize" / "regen" / "restore" / "info_changed" 等，无法直接区分 char/scene/prop。
+    // 用启发：char 卡才会有 appearance/clothing/equipment；scene 才会有 location/atmosphere；
+    // 都没有就当 prop。
+    var kind = "prop";
+    if ("appearance" in item || "clothing" in item || "equipment" in item || "actionTraits" in item) kind = "char";
+    else if ("location" in item || "atmosphere" in item || "timeSetting" in item) kind = "scene";
+    var fields = _ASSET_INFO_FIELDS[kind];
+    var info = {};
+    // 全字段都记录（含 null/undefined），还原时能完整覆盖回去，避免"曾经为空但当前有值"的字段没被清空。
+    fields.forEach(function (f) {
+      info[f] = item[f] === undefined ? null : item[f];
+    });
+    return info;
+  }
+
   function _archiveOldImage(item, source) {
     if (!item || typeof item !== "object") return;
     var snap = {};
@@ -738,6 +769,8 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
     if (item.realPhotoUrl && item.realPhotoUrl !== snap.url) snap.realPhotoUrl = item.realPhotoUrl;
     if (item.pencilUrl) snap.pencilUrl = item.pencilUrl;
     if (!snap.url && !snap.rawUrl && !snap.realPhotoUrl && !snap.pencilUrl) return;
+    var info = _captureItemInfo(item, source);
+    if (info) snap.info = info;
 
     // Skip dead blob:// snapshots — they won't survive a page reload anyway.
     var mainUrl = snap.url || snap.rawUrl || snap.realPhotoUrl || snap.pencilUrl;

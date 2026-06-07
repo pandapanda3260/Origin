@@ -20,11 +20,17 @@ import { getDataDir } from './runtime-paths';
 import { isExportEnabled } from './system-config';
 import { projectHiddenContentReferences } from './content-flags';
 import { createAssetRecord, hashFile, localAssetUri } from './asset-library';
+import { normalizeVideoAspectRatio, resolveVideoAspectRatio } from './aspect-ratio';
+import { computeEditExportSignatureFromParts } from './edit-export-signature';
+import { buildEditExportDownloadFilename, editExportNameInputFromProject } from './edit-export-filename';
+import { extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines } from '../public/modules/subtitle_format.js';
 
 const DATA_DIR = getDataDir();
 const EXPORTS_DIR = join(DATA_DIR, 'exports');
 const VIDEOS_DIR = join(DATA_DIR, 'videos');
 const BGM_DIR = join(DATA_DIR, 'bgm');
+type EditExportFormat = ReturnType<typeof normalizeVideoAspectRatio>;
+type EditExportBgmSource = 'explicit' | 'auto' | 'off' | 'none';
 
 export class EditExportError extends Error {
   status: number;
@@ -78,69 +84,24 @@ function fmtSrtTime(sec: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
 }
 
-function splitDialogueLines(raw: string): string[] {
-  if (!raw) return [];
-  const SPEAKER_RE = /([^：:\s「『""''""''『」』]{1,12})[：:]/g;
-  const anchors: Array<{ speaker: string; textStart: number }> = [];
-  let m: RegExpExecArray | null;
-  while ((m = SPEAKER_RE.exec(raw)) !== null) {
-    anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
-  }
-  if (!anchors.length) {
-    const t = raw
-      .trim()
-      .replace(/^["'""'「『]+/, '')
-      .replace(/["'""'」』]+$/, '')
-      .trim();
-    return t ? [t] : [];
-  }
-  const out: string[] = [];
-  for (let i = 0; i < anchors.length; i++) {
-    const cur = anchors[i];
-    const nextStart =
-      i + 1 < anchors.length
-        ? anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
-        : raw.length;
-    let text = raw.slice(cur.textStart, nextStart).trim();
-    text = text
-      .replace(/^["'""'「『]+/, '')
-      .replace(/["'""'」』]+$/, '')
-      .trim();
-    if (text) out.push(text);
-  }
-  return out;
-}
-
 function buildSrt(items: { groupIdx: number | null; inSec: number; outSec: number }[], project: any, clipDurations: number[]): string {
   const sbs: any[] = Array.isArray(project?.storyboards) ? project.storyboards : [];
   const shots: any[] = Array.isArray(project?.shots) ? project.shots : [];
 
   function dialogueForGroup(gIdx: number): string[] {
     const sb = sbs[gIdx];
-    const shotIndex = storyboardShotIndices(project, gIdx, sb, { mode: 'single-shot-strict' })[0];
     const lines: string[] = [];
     const prompt: string = (sb && sb.videoPrompt) || '';
     if (prompt) {
-      const Q = '\u201C\u201D\u2018\u2019\u0022\u0027\u300C\u300D\u300E\u300F';
-      const DIALOG_RE = new RegExp(
-        '[\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9\\u00B7]{0,11}[\\uFF1A:]\\s*[' + Q + ']([^' + Q + '\\n]{1,80}?)[' + Q + ']',
-        'g',
-      );
-      let m: RegExpExecArray | null;
-      while ((m = DIALOG_RE.exec(prompt)) !== null) {
-        const t = (m[1] || '').trim();
-        const cleaned = t.replace(/[，。,.]/g, '').trim();
-        if (cleaned) lines.push(cleaned);
-      }
+      lines.push(...extractSubtitleLinesFromPrompt(prompt));
     }
     if (!lines.length) {
-      const sh = shots[shotIndex];
-      const raw = String(sh?.dialogue || '').trim();
-      if (raw && raw !== '——' && raw !== '-' && raw !== '无') {
-        const pieces = splitDialogueLines(raw);
+      const shotIndices = storyboardShotIndices(project, gIdx, sb, { mode: 'legacy-compatible' });
+      for (const shotIndex of shotIndices) {
+        const sh = shots[shotIndex];
+        const pieces = splitSubtitleDialogueLines(String(sh?.dialogue || '').trim());
         for (const p of pieces) {
-          const cleaned = p.replace(/[，。,.]/g, '').trim();
-          if (cleaned) lines.push(cleaned);
+          if (p) lines.push(p);
         }
       }
     }
@@ -175,11 +136,17 @@ function buildSrt(items: { groupIdx: number | null; inSec: number; outSec: numbe
 function normalizeExportItems(project: any, rawEdl: any) {
   let timeline: any[] = [];
   let bgmIdFromEdl: string | undefined;
+  let bgmEnabled = false; // BGM 总开关：缺省视为关；只有 edl.bgm.enabled===true 时开
+  let bgmOffsetTime = 0;
   if (Array.isArray(rawEdl)) {
     timeline = rawEdl;
   } else if (rawEdl && Array.isArray(rawEdl.timeline)) {
     timeline = rawEdl.timeline;
     if (rawEdl.bgm && rawEdl.bgm.trackId) bgmIdFromEdl = String(rawEdl.bgm.trackId);
+    if (rawEdl.bgm && rawEdl.bgm.enabled === true) bgmEnabled = true;
+    if (rawEdl.bgm && Number.isFinite(Number(rawEdl.bgm.offsetTime))) {
+      bgmOffsetTime = Math.max(0, Number(rawEdl.bgm.offsetTime));
+    }
   }
   if (!timeline.length) {
     throw new EditExportError('EDL 不能为空（时间线上没有素材）', 400);
@@ -215,7 +182,7 @@ function normalizeExportItems(project: any, rawEdl: any) {
   if (!items.length) {
     throw new EditExportError('没找到任何可用的视频片段（请先生成视频，或确认时间线已有素材）', 400);
   }
-  return { items, bgmIdFromEdl };
+  return { items, bgmIdFromEdl, bgmEnabled, bgmOffsetTime };
 }
 
 function chooseBgmId(project: any, bgmId: string | undefined) {
@@ -232,6 +199,55 @@ function chooseBgmId(project: any, bgmId: string | undefined) {
     } catch (_) {}
   }
   return pick;
+}
+
+function normalizedExportSec(value: unknown) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const rounded = Math.round(Math.max(0, n) * 1000) / 1000;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function buildExportedEdlSignatureMeta(args: {
+  exportId: string;
+  project: any;
+  requestedBgmId?: string;
+  resolvedBgmId?: string;
+  bgmEnabled: boolean;
+  bgmOffsetTime: number;
+  exportFormat: EditExportFormat;
+  composeMeta: any;
+}) {
+  const requestedBgmId = String(args.requestedBgmId || '').trim();
+  const resolvedBgmId = args.bgmEnabled === false ? '' : String(args.resolvedBgmId || '').trim();
+  const editData = (args.project?.editData as any) || {};
+  const suggestedBGMCategory = String(editData?.segmentTags?.suggestedBGMCategory || '').trim();
+  const segmentFingerprint = String(
+    args.composeMeta?.segmentFingerprint ||
+    editData?.segmentTags?.sourceFingerprint ||
+    '',
+  ).trim();
+  const source: EditExportBgmSource = args.bgmEnabled === false
+    ? 'off'
+    : requestedBgmId
+      ? 'explicit'
+      : resolvedBgmId
+        ? 'auto'
+        : 'none';
+
+  return {
+    version: 1,
+    taskId: args.exportId,
+    exportFormat: args.exportFormat,
+    bgm: {
+      source,
+      enabled: args.bgmEnabled !== false && !!resolvedBgmId,
+      trackId: resolvedBgmId,
+      offsetTime: resolvedBgmId ? normalizedExportSec(args.bgmOffsetTime) : 0,
+      suggestedBGMCategory,
+      segmentFingerprint,
+    },
+  };
 }
 
 export function markExportTaskIgnored(args: {
@@ -289,14 +305,41 @@ export async function startEditExport(args: {
     });
   }
 
-  const { items, bgmIdFromEdl } = normalizeExportItems(args.project, args.edl);
-  const bgmId = chooseBgmId(args.project, args.bgmId || bgmIdFromEdl);
+  const { items, bgmIdFromEdl, bgmEnabled, bgmOffsetTime } = normalizeExportItems(args.project, args.edl);
+  // BGM 默认关闭：只有时间线显式 enabled=true 时才配乐。
+  // 开启但尚无 trackId 时，按 suggestedBGMCategory 自动补一首。
+  const requestedBgmId = args.bgmId || bgmIdFromEdl;
+  const bgmId = bgmEnabled === false ? undefined : chooseBgmId(args.project, requestedBgmId);
   const explicitVersion = Number(args.edlVersion);
   const inferredVersion = Number(args.edl?.version ?? args.project?.editData?.edl?.version);
   const edlVersion = Number.isFinite(explicitVersion)
     ? explicitVersion
     : (Number.isFinite(inferredVersion) ? inferredVersion : null);
   const exportId = randomUUID();
+  const exportRatio = resolveVideoAspectRatio(args.project);
+  const exportFormat = normalizeVideoAspectRatio(exportRatio);
+  const exportedEdlSignature = computeEditExportSignatureFromParts({
+    items,
+    bgmId: bgmId || null,
+    bgmEnabled,
+    bgmOffsetTime,
+    exportFormat,
+  });
+  const composeMeta = {
+    ...(args.composeMeta && typeof args.composeMeta === 'object' ? args.composeMeta : {}),
+    exportFormat,
+  };
+  const downloadFilename = buildEditExportDownloadFilename(editExportNameInputFromProject(args.project, projectId));
+  const exportedEdlSignatureMeta = buildExportedEdlSignatureMeta({
+    exportId,
+    project: args.project,
+    requestedBgmId,
+    resolvedBgmId: bgmId,
+    bgmEnabled,
+    bgmOffsetTime,
+    exportFormat,
+    composeMeta,
+  });
 
   try {
     chargeCredits({
@@ -349,7 +392,7 @@ export async function startEditExport(args: {
       args.user.id,
       projectId,
       filename,
-      JSON.stringify({ items, bgmId: bgmId || null, composeMeta: args.composeMeta || null }),
+      JSON.stringify({ items, bgmId: bgmId || null, exportedEdlSignature, exportedEdlSignatureMeta, composeMeta, downloadFilename }),
       edlVersion,
       bgmId || null,
     );
@@ -377,6 +420,7 @@ export async function startEditExport(args: {
           bgmId: bgmId || null,
           edlVersion,
           hasComposeMeta: !!args.composeMeta,
+          exportFormat,
         },
       });
       recordKnowledgeContextBestEffort({ ownerId: args.user.id, projectId, context, runId: exportId });
@@ -390,7 +434,7 @@ export async function startEditExport(args: {
 
   setImmediate(async () => {
     try {
-      await doExport({ exportId, userId: args.user.id, projectId, items, bgmId, outputPath: fullPath, project: args.project, edlVersion });
+      await doExport({ exportId, userId: args.user.id, projectId, items, bgmId, outputPath: fullPath, project: args.project, edlVersion, exportFormat, exportedEdlSignature, exportedEdlSignatureMeta });
       const cur = getDb().prepare<{ id: string }, any>('SELECT status FROM exports WHERE id = @id').get({ id: exportId });
       if (cur?.status === 'failed') refundOnFailure('doExport-set-failed');
     } catch (e) {
@@ -400,7 +444,7 @@ export async function startEditExport(args: {
     }
   });
 
-  return { ok: true, taskId: exportId, status: 'queued' };
+  return { ok: true, taskId: exportId, status: 'queued', exportedEdlSignature, exportedEdlSignatureMeta };
 }
 
 async function doExport(opts: {
@@ -412,8 +456,11 @@ async function doExport(opts: {
   outputPath: string;
   project: any;
   edlVersion: number | null;
+  exportFormat: EditExportFormat;
+  exportedEdlSignature: string;
+  exportedEdlSignatureMeta: ReturnType<typeof buildExportedEdlSignatureMeta>;
 }) {
-  const { exportId, userId, projectId, items, bgmId, outputPath, project, edlVersion } = opts;
+  const { exportId, userId, projectId, items, bgmId, outputPath, project, edlVersion, exportFormat, exportedEdlSignature, exportedEdlSignatureMeta } = opts;
   const db = getDb();
   const isCancelled = () => {
     const cur = db.prepare<{ id: string }, any>('SELECT status FROM exports WHERE id = @id').get({ id: exportId });
@@ -470,7 +517,7 @@ async function doExport(opts: {
     if (isCancelled()) return;
 
     const concatPath = join(EXPORTS_DIR, String(userId), `${exportId}.concat.mp4`);
-    await concatClips({ clips, outputPath: concatPath });
+    await concatClips({ clips, outputPath: concatPath, width: exportFormat.width, height: exportFormat.height });
     try {
       await assertAudioVideoDurationAligned(concatPath, { label: `export ${exportId} concat` });
     } catch (e) {
@@ -484,6 +531,8 @@ async function doExport(opts: {
           transitionInDuration: 0,
         })),
         outputPath: concatPath,
+        width: exportFormat.width,
+        height: exportFormat.height,
       });
       await assertAudioVideoDurationAligned(concatPath, { label: `export ${exportId} concat fallback` });
     }
@@ -498,7 +547,7 @@ async function doExport(opts: {
       writeFileSync(srtPath, srt, 'utf-8');
       const subbed = join(EXPORTS_DIR, String(userId), `${exportId}.subbed.mp4`);
       try {
-        await burnSubtitles({ videoPath: concatPath, srtPath, outputPath: subbed });
+        await burnSubtitles({ videoPath: concatPath, srtPath, outputPath: subbed, width: exportFormat.width, height: exportFormat.height });
         workingVideo = subbed;
       } catch (e) {
         console.warn('[export] burnSubtitles failed, keep raw concat:', (e as any)?.message || e);
@@ -586,6 +635,8 @@ async function doExport(opts: {
           if (Number.isFinite(Number(edlVersion))) {
             editData.exportedEdlVersion = Number(edlVersion);
           }
+          editData.exportedEdlSignature = exportedEdlSignature;
+          editData.exportedEdlSignatureMeta = exportedEdlSignatureMeta;
           return { editData };
         });
       } catch (e) {

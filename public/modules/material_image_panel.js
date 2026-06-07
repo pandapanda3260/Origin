@@ -1,4 +1,4 @@
-import { apiGet, escapeHtml } from './utils.js?v=102';
+import { apiGet, escapeHtml } from './utils.js?v=201';
 
 export const MATERIAL_PANEL_ROLES = ['scene', 'char', 'prop'];
 export const MATERIAL_PANEL_CACHE_TTL_MS = 60000;
@@ -449,7 +449,6 @@ export function renderMaterialPickerHtml(opts) {
         '<span class="ffe-material-picker-check"><span class="material-symbols-outlined">check</span></span>' +
         (url ? renderMaterialImageWithFallbackHtml(url, { variant: 'picker', alt: name }) : '<span class="ffe-material-picker-placeholder material-symbols-outlined">' + escapeHtml(materialPanelRoleIcon(role)) + '</span>') +
       '</button>' +
-      (tile.url ? '<button type="button" class="ffe-material-picker-preview"' + actionAttr(actions.view, opts) + ' data-url="' + escapeHtml(tile.url) + '" title="查看大图"><span class="material-symbols-outlined">zoom_in</span></button>' : '') +
       '<div class="ffe-material-picker-card-meta"><strong>' + escapeHtml(name) + '</strong><span>' + escapeHtml(status) + '</span></div>' +
     '</article>';
   }).join('');
@@ -459,7 +458,7 @@ export function renderMaterialPickerHtml(opts) {
   return '<div class="ffe-material-picker-backdrop" role="presentation"' + panelScopeAttrs(opts) + '>' +
     '<section class="ffe-material-picker-modal" role="dialog" aria-modal="true" aria-label="' + escapeHtml(title) + '">' +
       '<header class="ffe-material-picker-head">' +
-        '<div><h3>' + escapeHtml(title) + '</h3><span>本次首帧最多可使用 ' + Number(panel.cap || 0) + ' 张参考图，还可选 ' + Math.max(0, Number(panel.remaining || 0)) + ' 张</span></div>' +
+        '<div><h3>' + escapeHtml(title) + '</h3></div>' +
         '<button type="button" class="ffe-material-picker-close"' + actionAttr(actions.closePicker, opts) + ' title="关闭"><span class="material-symbols-outlined">close</span></button>' +
       '</header>' +
       (picker.error ? '<div class="ffe-field-warning">' + escapeHtml(picker.error) + '</div>' : '') +

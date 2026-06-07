@@ -9,6 +9,7 @@ import {
   normalizeRefineGuardMode,
 } from './refine-output-guard';
 import type { KnowledgeContextForStage } from './types';
+import { formatWorldContextForPrompt, projectWorldContextForStage } from '../world-template-context';
 
 export function prepareVideoPromptRefineMessagesWithKnowledge(input: {
   ownerId: number;
@@ -35,7 +36,19 @@ export function prepareVideoPromptRefineMessagesWithKnowledge(input: {
     referenceManifest: input.referenceManifest,
   });
   const guardFacts = factsForRefineGuardMode(immutableFacts, guardMode);
-  const immutableFactsBlock = guardMode === 'off' ? '' : formatImmutableFactsForPrompt(guardFacts);
+  const worldContext = guardMode === 'off'
+    ? undefined
+    : projectWorldContextForStage('video_prompt_refine', (input.project as any)?.worldTemplateSnapshot, {
+        project: input.project,
+        target: { groupIdx: input.groupIdx ?? null },
+      });
+  const worldFactsBlock = formatWorldContextForPrompt(worldContext, { includeSoft: false });
+  const immutableFactsBlock = guardMode === 'off'
+    ? ''
+    : [
+        formatImmutableFactsForPrompt(guardFacts),
+        worldFactsBlock ? `世界观硬事实（精修时不得改写、删除或反向描述）：\n${worldFactsBlock}` : '',
+      ].filter(Boolean).join('\n\n');
   const originalMessages = buildRefineMessages(input.currentPrompt, input.instruction, immutableFactsBlock, { guardMode });
 
   if (!input.projectId || !input.project) {

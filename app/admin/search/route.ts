@@ -25,7 +25,7 @@ export async function GET(req: NextRequest) {
     </style>`,
     bodyHtml: `<section class="panel">
       <div class="search-toolbar">
-        <input data-admin-search-input="true" placeholder="输入 userId / username / email / orderId / batchId / taskId / projectId / exportId" />
+        <input data-admin-search-input="true" placeholder="输入 userId / 手机号 / 旧邮箱 / orderId / batchId / taskId / projectId / exportId" />
         <button class="primary" data-admin-search-button="true">检索</button>
       </div>
       <div class="notice" data-admin-search-notice="true"></div>
@@ -47,9 +47,10 @@ export async function GET(req: NextRequest) {
       const fieldLabels = {
         userId: '用户 ID',
         ownerId: '归属用户',
-        username: '用户名',
+        username: '内部账号',
+        phone: '手机号',
         displayName: '昵称',
-        email: '邮箱',
+        email: '旧邮箱',
         disabledAt: '禁用时间',
         totalCredits: '余额',
         projectCount: '项目数',

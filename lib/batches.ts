@@ -33,6 +33,7 @@ import { markFirstFrameFailed, markTailFrameFailed } from './visual-reference-st
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
 import { failShotPlanGenerationPatch } from './project-dependency-state';
 import { recordTextFlagIfSensitive } from './content-flags';
+import { extractImageModerationError } from './content-sanitize';
 import {
   DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT,
   DEFAULT_GLOBAL_VIDEO_CONCURRENCY_LIMIT,
@@ -122,6 +123,41 @@ function _targetShotIndices(target: BatchTaskTarget, groupIdx: number): number[]
   return normalized.length ? normalized : [groupIdx];
 }
 
+/**
+ * 图像生成失败信息转人话: 若是内容安全审核拦截 (moderation_blocked / content_filter 等),
+ * 把展示给用户的报错换成一句明确、可操作的中文; 原始报错仍保留在 imageSafetyAudit 里供排查。
+ * 非审核类失败 (网络/限流/参数/鉴权等) 原样返回。检测复用 extractImageModerationError,
+ * 它对参数/账户类错误有排除, 不会误判。
+ */
+function _imageSafetyAuditHint(imageSafetyAudit?: any): string {
+  const diagnostics = imageSafetyAudit?.safetyDiagnostics || {};
+  const fragments = Array.isArray(diagnostics.likelySensitiveFragments)
+    ? diagnostics.likelySensitiveFragments
+    : [];
+  const uniqueTexts = Array.from(new Set(
+    fragments
+      .map((item: any) => String(item?.text || '').trim())
+      .filter(Boolean),
+  )).slice(0, 4);
+  if (uniqueTexts.length) {
+    return `图像服务未返回具体拦截词，系统推测可先弱化：${uniqueTexts.join('、')}。`;
+  }
+  const attempts = Array.isArray(imageSafetyAudit?.attempts) ? imageSafetyAudit.attempts : [];
+  const hadRewrite = attempts.some((attempt: any) => Array.isArray(attempt?.rewriteDiff) && attempt.rewriteDiff.length);
+  if (hadRewrite) {
+    return '系统已自动改写并重试，仍被拦截；请进一步弱化惊恐、压迫、爆发、人群挤压等描写，或减少参考图后重试。';
+  }
+  return '图像服务未返回具体拦截词；建议先弱化惊恐/压迫/爆发/人群挤压等描述，或更换、减少参考图后重试。';
+}
+
+function _userFacingImageFailureMessage(rawMessage: string, frameLabel: '首帧' | '尾帧', imageSafetyAudit?: any): string {
+  const raw = String(rawMessage || '生成失败');
+  const info = extractImageModerationError(raw);
+  if (!info.blocked) return raw;
+  const code = info.errorCode ? `（${info.errorCode}）` : '';
+  return `${frameLabel}未通过内容安全审核${code}：提示词或参考图被图像服务判定为敏感/违规内容。${_imageSafetyAuditHint(imageSafetyAudit)}`;
+}
+
 function _clearFailedStoryboardImageState(opts: {
   batchType: string;
   projectId: string;
@@ -133,7 +169,7 @@ function _clearFailedStoryboardImageState(opts: {
   if (opts.batchType !== 'storyboard_images') return null;
   const groupIdx = _targetGroupIdx(opts.target);
   if (groupIdx == null || !opts.projectId) return null;
-  const firstFrameLastError = (opts.message || '生成失败').slice(0, 500);
+  const firstFrameLastError = _userFacingImageFailureMessage(opts.message, '首帧', opts.imageSafetyAudit).slice(0, 500);
 
   try {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
@@ -160,6 +196,7 @@ function _clearFailedStoryboardImageState(opts: {
         firstFrame: markFirstFrameFailed(prev, error),
         firstFrameLastError,
         firstFrameFailedAt: error.failedAt,
+        firstFrameSafetyAudit: opts.imageSafetyAudit || prev.firstFrameSafetyAudit,
       };
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-failure-cleanup');
       return { storyboards };
@@ -191,7 +228,7 @@ function _clearFailedTailFrameImageState(opts: {
   if (opts.batchType !== 'tail_frame_images') return null;
   const groupIdx = _targetGroupIdx(opts.target);
   if (groupIdx == null || !opts.projectId) return null;
-  const tailFrameLastError = (opts.message || '生成失败').slice(0, 500);
+  const tailFrameLastError = _userFacingImageFailureMessage(opts.message, '尾帧', opts.imageSafetyAudit).slice(0, 500);
   const errorCode = typeof opts.errorCode === 'string' && opts.errorCode.trim()
     ? opts.errorCode.trim()
     : undefined;
@@ -418,7 +455,10 @@ function _markFailedVideoPromptState(opts: {
         return {};
       }
       const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+      });
       if (prev.videoPromptRunId && prev.videoPromptRunId !== opts.batchId) {
         console.warn(
           `[batch] ignored stale video_prompt failure project=${opts.projectId} group=${groupIdx} ` +
@@ -1620,11 +1660,13 @@ export async function runBatch(opts: {
           user: opts.user,
           message: msg,
         });
-        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || shotPlanCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
-        if (extra && failureStage) (extra as any).failureStage = failureStage;
-        if (extra && errorCode) (extra as any).errorCode = errorCode;
-        if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
-        const failureResultPayload: Record<string, any> = {};
+	        const extra = cleanupExtra || tailCleanupExtra || assetCleanupExtra || promptCleanupExtra || shotPlanCleanupExtra || (failureStage || e?.imageSafetyAudit ? {} : undefined);
+	        if (extra && failureStage) (extra as any).failureStage = failureStage;
+	        if (extra && errorCode) (extra as any).errorCode = errorCode;
+	        if (extra && e?.imageSafetyAudit) (extra as any).imageSafetyAudit = e.imageSafetyAudit;
+	        if (extra && Array.isArray(e?.videoWarnings)) (extra as any).videoWarnings = e.videoWarnings;
+	        if (extra && e?.groupIdx != null) (extra as any).groupIdx = e.groupIdx;
+	        const failureResultPayload: Record<string, any> = {};
         if (failureStage) failureResultPayload.failureStage = failureStage;
         if (errorCode) failureResultPayload.errorCode = errorCode;
         if (e?.imageSafetyAudit) failureResultPayload.imageSafetyAudit = e.imageSafetyAudit;

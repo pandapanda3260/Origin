@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared } from './utils.js?v=104';
+import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared } from './utils.js?v=201';
 import { loadProjectData } from './project.js';
 import { subscribeBatch, subscribeTask } from './backend_stream.js';
 import { renderAssetCard } from './render_hooks.js';
@@ -14,7 +14,7 @@ var project = null;
 
 export function initAssets(ctx) { _ctx = ctx; }
 export function syncAssetsProject(p) { project = p; }
-export function resetLibraryState() { _libActiveProject = null; _libActiveTab = "all"; }
+export function resetLibraryState() { _libActiveProject = null; _libActiveTab = "all"; _libProjPage = 0; _libProjPages = []; _libProjList = []; }
 
 function _invalidateMaterialPanelsAfterAssetChange() {
   invalidateAllMaterialPanels();
@@ -32,9 +32,15 @@ function _saveAssetsProject() {
 var _assetsExtracting = false;
 var _assetImagesGenerating = false;
 var _assetGenStatus = {};
+var _assetReviewSnapshot = null;
 var _pendingAssetRerender = false;
 var _libActiveProject = null;
 var _libActiveTab = "all";
+var _libProjPage = 0;          // 素材库项目切换：当前页（0 基）
+var _libProjPages = [];        // 每页对应的按钮 DOM 数组
+var _libProjList = [];         // 最近一次渲染的项目列表（resize 时复用）
+var _libProjPagerBound = false;
+var _LIB_PROJ_GAP = 12;        // 对应 libProjectTabs 的 gap-3 (0.75rem)
 var ASSET_ENTRANCE_ANIM_MS = 1400;
 var _assetEntranceClearTimer = null;
 var ASSET_CARD_DISPLAY_W = 1024;
@@ -59,6 +65,286 @@ function _firstAssetUrl() {
     if (url) return url;
   }
   return "";
+}
+
+var _ASSET_GENERATED_FIELDS = [
+  "imageUrl",
+  "rawUrl",
+  "realPhotoUrl",
+  "pencilUrl",
+  "assetId",
+  "imageAssetId",
+  "pencilAssetId",
+  "submittedImagePrompt",
+  "imageSafetyAudit",
+  "effectiveVisualDescription",
+  "reference",
+  "imageGeneratedAt",
+  "skippedStylize",
+];
+
+function _assetTypeLabel(type) {
+  return type === "char" ? "角色" : type === "scene" ? "场景" : "道具";
+}
+
+function _assetTypeCat(type) {
+  return type === "char" ? "characters" : type === "scene" ? "scenes" : "props";
+}
+
+function _assetTypeTopKey(type) {
+  return type === "char" ? "characters" : type === "scene" ? "environments" : "props";
+}
+
+function _assetListByTypeFromAssets(assets, type) {
+  if (!assets) return [];
+  var cat = _assetTypeCat(type);
+  return Array.isArray(assets[cat]) ? assets[cat] : [];
+}
+
+function _cloneAssetReviewAssets(assets) {
+  assets = assets || {};
+  return {
+    characters: _deepClonePlain(Array.isArray(assets.characters) ? assets.characters : []),
+    scenes: _deepClonePlain(Array.isArray(assets.scenes) ? assets.scenes : []),
+    props: _deepClonePlain(Array.isArray(assets.props) ? assets.props : []),
+  };
+}
+
+function _captureAssetReviewSnapshot() {
+  if (!project || !project.id) {
+    _assetReviewSnapshot = null;
+    return;
+  }
+  _assetReviewSnapshot = {
+    projectId: String(project.id),
+    assets: _cloneAssetReviewAssets(project.assets),
+  };
+}
+
+function _currentAssetReviewSnapshotAssets() {
+  if (!project || !project.id || !_assetReviewSnapshot || !_assetReviewSnapshot.projectId) return null;
+  if (String(_assetReviewSnapshot.projectId) !== String(project.id)) return null;
+  return _assetReviewSnapshot.assets || null;
+}
+
+function _cloneAssetReviewValue(value) {
+  if (typeof value === "undefined") return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_e) {
+    return value;
+  }
+}
+
+function _normalizeAssetReviewKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/[“”"']/g, "").replace(/\s+/g, "");
+}
+
+function _assetReviewKeys(item) {
+  item = item || {};
+  return [item.characterId, item.name].map(_normalizeAssetReviewKey).filter(Boolean);
+}
+
+function _assetReviewHasSharedKey(left, right) {
+  var leftKeys = _assetReviewKeys(left);
+  var rightKeys = _assetReviewKeys(right);
+  if (!leftKeys.length || !rightKeys.length) return false;
+  return leftKeys.some(function (key) { return rightKeys.indexOf(key) >= 0; });
+}
+
+function _findAssetReviewMatchIndex(item, list) {
+  list = Array.isArray(list) ? list : [];
+  for (var i = 0; i < list.length; i++) {
+    if (_assetReviewHasSharedKey(item, list[i])) return i;
+  }
+  return -1;
+}
+
+function _hasAssetImage(type, item) {
+  if (!item) return false;
+  var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
+  var panels = item.panels && typeof item.panels === "object" ? item.panels : {};
+  if (type === "char" && String(reference.status || "").toLowerCase() === "failed") return false;
+  return !!_firstAssetUrl(
+    item.imageUrl,
+    item.rawUrl,
+    item.realPhotoUrl,
+    item.pencilUrl,
+    reference.currentUrl,
+    reference.lastKnownGoodUrl,
+    item.referenceLock && item.referenceLock.sheetUrl,
+    panels.sheetUrl,
+    panels.frontUrl,
+    panels.sideUrl,
+    panels.backUrl,
+  );
+}
+
+function _assetHasHistory(item) {
+  return !!(item && Array.isArray(item.imageHistory) && item.imageHistory.length);
+}
+
+function _latestInfoChangedSnap(item) {
+  if (!item || !Array.isArray(item.imageHistory) || !item.imageHistory.length) return null;
+  var snap = item.imageHistory[0] || null;
+  return snap && snap.source === "info_changed" ? snap : null;
+}
+
+function _reviewSnapshotUrl(snap) {
+  snap = snap || {};
+  var ref = snap.reference && typeof snap.reference === "object" ? snap.reference : {};
+  return _firstAssetUrl(
+    snap.imageUrl,
+    snap.pencilUrl,
+    snap.realPhotoUrl,
+    snap.rawUrl,
+    snap.url,
+    ref.currentUrl,
+    ref.lastKnownGoodUrl,
+  );
+}
+
+function _reviewAssetUrl(type, item, snap) {
+  item = item || {};
+  var ref = item.reference && typeof item.reference === "object" ? item.reference : {};
+  var panels = item.panels && typeof item.panels === "object" ? item.panels : {};
+  var currentUrl = _firstAssetUrl(
+    item.thumbUrl,
+    item.displayUrl,
+    item.imageUrl,
+    type === "char" ? item.pencilUrl : "",
+    item.realPhotoUrl,
+    item.rawUrl,
+    ref.currentUrl,
+    ref.lastKnownGoodUrl,
+    item.referenceLock && item.referenceLock.sheetUrl,
+    panels.sheetUrl,
+    panels.frontUrl,
+    panels.sideUrl,
+    panels.backUrl,
+  );
+  return currentUrl || _reviewSnapshotUrl(snap);
+}
+
+function _assetReviewThumbHtml(row) {
+  var url = row.thumbUrl || "";
+  var label = row.iconText || "待生成";
+  if (url) {
+    return '<img src="' + escapeHtml(_assetVariant(url, ASSET_CARD_THUMB_W)) + '" alt="' + escapeHtml(row.name || "") + '" class="w-full h-full object-cover" loading="lazy" decoding="async" onerror="window.__originMarkImageMissing && window.__originMarkImageMissing(this)" />';
+  }
+  return '<div class="w-full h-full flex items-center justify-center bg-surface-container-highest/40 text-on-surface-variant text-[11px] font-bold tracking-wider">' + escapeHtml(label) + '</div>';
+}
+
+function _assetReviewRowId(type, idx, deletedIndex) {
+  if (deletedIndex != null) return type + "_deleted_" + deletedIndex;
+  return type + "_" + idx;
+}
+
+function _assetReviewMakeRow(type, idx, item, oldList) {
+  item = item || {};
+  var typeLabel = _assetTypeLabel(type);
+  var hasImage = _hasAssetImage(type, item);
+  var infoSnap = _latestInfoChangedSnap(item);
+  var oldMatch = _findAssetReviewMatchIndex(item, oldList);
+  var isAdded = oldList && oldList.length && oldMatch < 0;
+  var name = item.name || (typeLabel + "#" + (idx + 1));
+  var row = {
+    id: _assetReviewRowId(type, idx),
+    type: type,
+    idx: idx,
+    name: name,
+    disabled: false,
+    checked: false,
+    kind: "stable",
+    status: typeLabel + "信息无变化，建议不勾选",
+    iconText: "待生成",
+    thumbUrl: _reviewAssetUrl(type, item, infoSnap),
+  };
+  if (hasImage) {
+    row.kind = infoSnap ? "changed_with_image" : "stable_with_image";
+    row.checked = false;
+    row.status = infoSnap ? "已经重新生成或手动更新了参考图，建议不勾选" : (typeLabel + "信息无变化，建议不勾选");
+    row.iconText = "已生成";
+    return row;
+  }
+  if (infoSnap) {
+    row.kind = "changed_missing";
+    row.checked = true;
+    row.status = typeLabel + "信息发生了变化，建议勾选";
+    row.iconText = "旧图";
+    row.thumbUrl = _reviewAssetUrl(type, item, infoSnap);
+    return row;
+  }
+  if (isAdded) {
+    row.kind = "added";
+    row.checked = true;
+    row.status = "新增" + typeLabel + "，建议勾选";
+    row.iconText = "新" + typeLabel;
+    row.thumbUrl = "";
+    return row;
+  }
+  row.kind = "missing";
+  row.checked = true;
+  row.status = typeLabel + "图尚未生成，建议勾选";
+  row.iconText = "待生成";
+  return row;
+}
+
+function _buildDeletedAssetReviewRows(type, currentList, oldList) {
+  if (!oldList || !oldList.length) return [];
+  var typeLabel = _assetTypeLabel(type);
+  var rows = [];
+  oldList.forEach(function (oldItem, oldIdx) {
+    if (_findAssetReviewMatchIndex(oldItem, currentList) >= 0) return;
+    var name = (oldItem && oldItem.name) || (typeLabel + "#" + (oldIdx + 1));
+    rows.push({
+      id: _assetReviewRowId(type, oldIdx, oldIdx),
+      type: type,
+      idx: null,
+      deleted: true,
+      disabled: true,
+      checked: false,
+      kind: "deleted",
+      name: name,
+      status: name + "已移除，建议不勾选",
+      iconText: "已移除",
+      thumbUrl: _reviewAssetUrl(type, oldItem, null),
+    });
+  });
+  return rows;
+}
+
+function _buildAssetRegenerationReviewRows() {
+  if (!project || !project.assets) return [];
+  var rows = [];
+  var snapshotAssets = _currentAssetReviewSnapshotAssets();
+  ["char", "scene", "prop"].forEach(function (type) {
+    var currentList = _assetListByTypeFromAssets(project.assets, type);
+    var oldList = snapshotAssets ? _assetListByTypeFromAssets(snapshotAssets, type) : [];
+    rows = rows.concat(_buildDeletedAssetReviewRows(type, currentList, oldList));
+    currentList.forEach(function (item, idx) {
+      rows.push(_assetReviewMakeRow(type, idx, item, oldList));
+    });
+  });
+  return rows;
+}
+
+function _assetsHaveExistingGeneratedState(assets) {
+  var found = false;
+  ["char", "scene", "prop"].forEach(function (type) {
+    if (found) return;
+    _assetListByTypeFromAssets(assets, type).forEach(function (item) {
+      if (found) return;
+      if (_hasAssetImage(type, item) || _assetHasHistory(item)) found = true;
+    });
+  });
+  return found;
+}
+
+function _shouldShowAssetRegenerationReview() {
+  if (!project || !project.assets) return false;
+  var snapshotAssets = _currentAssetReviewSnapshotAssets();
+  return _assetsHaveExistingGeneratedState(project.assets) || _assetsHaveExistingGeneratedState(snapshotAssets);
 }
 
 function _normalizeCharacterEntityType(value) {
@@ -223,6 +509,7 @@ export function refreshAssetsPage() {
   var content = $("assetsContent");
   var saveTplBtn = $("btnSaveWorldTemplate");
   var knowledgeBtn = $("btnKnowledgeSnapshot");
+  var pendingWorldBtn = $("btnConfirmPendingWorldFacts");
   var hasScript = !!(project && (project.finalScript || project.script));
   if (!project || !hasScript) {
     // 真实数据不存在（无项目 / 无剧本）时仍显示 need 状态，避免空页面误导用户
@@ -231,6 +518,7 @@ export function refreshAssetsPage() {
     if (content) content.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
     if (knowledgeBtn) knowledgeBtn.hidden = true;
+    if (pendingWorldBtn) pendingWorldBtn.hidden = true;
     return;
   }
   need.hidden = true;
@@ -248,14 +536,40 @@ export function refreshAssetsPage() {
     renderAssets();
     _showAssetActions();
     checkAssetsConfirm();
+    _refreshWorldKnowledgeButtons();
     _updateStylizeBadge();
   } else {
     if (content) content.hidden = true;
     var banner = $("assetsExtractBanner");
     if (banner) banner.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
-    if (knowledgeBtn) knowledgeBtn.hidden = true;
+    checkAssetsConfirm();
   }
+}
+
+function _hasConsistencyAttention() {
+  var meta = project && project.consistency && project.consistency.meta;
+  return !!(meta && (meta.needsRoleSync || (Array.isArray(meta.roleSyncReasons) && meta.roleSyncReasons.length)));
+}
+
+function _hasPendingWorldFacts() {
+  return !!(project && project.pendingWorldFacts && project.pendingWorldFacts.worldTemplateSnapshot);
+}
+
+function _refreshWorldKnowledgeButtons() {
+  var knowledgeBtn = $("btnKnowledgeSnapshot");
+  var pendingWorldBtn = $("btnConfirmPendingWorldFacts");
+  var hasProject = !!(project && project.id);
+  var hasAttention = _hasConsistencyAttention() || _hasPendingWorldFacts();
+  if (knowledgeBtn) {
+    knowledgeBtn.hidden = !hasProject;
+    var icon = knowledgeBtn.querySelector(".material-symbols-outlined");
+    if (icon) icon.textContent = hasAttention ? "priority_high" : "info";
+    knowledgeBtn.classList.toggle("text-[#8A5A00]", hasAttention);
+    knowledgeBtn.classList.toggle("border-[#F7D48B]", hasAttention);
+    knowledgeBtn.classList.toggle("bg-[#FFF8E6]", hasAttention);
+  }
+  if (pendingWorldBtn) pendingWorldBtn.hidden = !_hasPendingWorldFacts();
 }
 
 function _setExtractProgress(pct, title, hint) {
@@ -272,6 +586,8 @@ function _setExtractProgress(pct, title, hint) {
 export async function extractAssets() {
   if (_assetsExtracting) return;
   _assetsExtracting = true;
+  _captureAssetReviewSnapshot();
+  checkAssetsConfirm();
   var originId = project.id;
   var btn = $("btnExtractAssets");
   if (btn) btn.disabled = true;
@@ -314,7 +630,14 @@ export async function extractAssets() {
     }
 
     var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-      proj.assets = resp.assets;
+      var nextAssets = resp.assets || { characters: [], scenes: [], props: [] };
+      proj.assets = nextAssets;
+      proj.characters = Array.isArray(resp.characters) ? resp.characters : _deepClonePlain(nextAssets.characters || []);
+      proj.environments = Array.isArray(resp.environments) ? resp.environments : _deepClonePlain(nextAssets.scenes || []);
+      proj.props = Array.isArray(resp.props) ? resp.props : _deepClonePlain(nextAssets.props || []);
+      if (Object.prototype.hasOwnProperty.call(resp, "pendingWorldFacts")) {
+        proj.pendingWorldFacts = resp.pendingWorldFacts;
+      }
       if (proj._staleFlags) delete proj._staleFlags["assets"];
       if (Object.keys(warningsMap).length) {
         proj._carryWarnings = warningsMap;
@@ -368,6 +691,7 @@ export async function extractAssets() {
     showToast("资产分析失败：" + friendly, "error");
   }
   _assetsExtracting = false;
+  checkAssetsConfirm();
   if (btn) btn.disabled = false;
 }
 
@@ -624,7 +948,6 @@ function _renderCharCards(container, items) {
           '</div>' +
           '<div class="flex items-center gap-3 mt-5">' +
             '<button type="button" class="flex-1 h-10 flex items-center justify-center bg-primary text-on-primary rounded-full font-bold text-[11px] tracking-wider uppercase hover:shadow-lg transition-all" data-action="regen-asset">重新生成</button>' +
-            _ctx.historyBtnHtml(item, "pill-dark") +
             '<button type="button" class="w-10 h-10 flex items-center justify-center bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-lg">alternate_email</span></button>' +
             '<button type="button" class="w-10 h-10 flex items-center justify-center bg-surface-container-highest/30 rounded-full hover:bg-surface-container-highest transition-all" data-action="edit-asset"><span class="material-symbols-outlined text-on-surface text-lg">edit</span></button>' +
           '</div>' +
@@ -632,6 +955,286 @@ function _renderCharCards(container, items) {
       '</div>';
     container.appendChild(card);
   });
+}
+
+function _sceneEditableFields(item) {
+  item = item || {};
+  return {
+    location: (item.location || '').toString(),
+    timeSetting: (item.timeSetting || '').toString(),
+    atmosphere: (item.atmosphere || '').toString(),
+    description: (item.description || '').toString(),
+  };
+}
+
+function _sceneEditorField(editor, field) {
+  return editor && editor.querySelector ? editor.querySelector('[data-scene-edit-field="' + field + '"]') : null;
+}
+
+function _readSceneEditorValues(editor) {
+  var values = {};
+  ["location", "timeSetting", "atmosphere", "description"].forEach(function (field) {
+    var el = _sceneEditorField(editor, field);
+    values[field] = el && el.value ? el.value.trim() : "";
+  });
+  return values;
+}
+
+function _sceneFieldsEqual(a, b) {
+  return ["location", "timeSetting", "atmosphere", "description"].every(function (field) {
+    return (a && a[field] || "") === (b && b[field] || "");
+  });
+}
+
+function _syncSceneTopLevelFields(idx, values) {
+  if (!project || !project.environments || !project.environments[idx]) return;
+  project.environments[idx].location = values.location;
+  project.environments[idx].timeSetting = values.timeSetting;
+  project.environments[idx].atmosphere = values.atmosphere;
+  project.environments[idx].description = values.description;
+}
+
+var _sceneEditPopoverDismissHandler = null;
+var _sceneEditPopoverKeyHandler = null;
+var _sceneMoreMenuDismissHandler = null;
+var _sceneMoreMenuScrollHandler = null;
+
+function _sceneEditFieldHtml(field, label, icon, value, placeholder, multiline) {
+  var head = '<label class="qd-field">' +
+    '<span class="qd-field-label">' + label + ' <span class="qd-field-label-en">' + field + '</span></span>';
+  if (multiline) {
+    return head +
+      '<div class="qd-field-control qd-field-control--multi">' +
+        '<span class="material-symbols-outlined qd-field-icon qd-field-icon--top">' + icon + '</span>' +
+        '<textarea data-scene-edit-field="' + field + '" rows="4" placeholder="' + escapeHtml(placeholder) + '" class="qd-field-textarea">' + escapeHtml(value) + '</textarea>' +
+      '</div>' +
+    '</label>';
+  }
+  return head +
+    '<div class="qd-field-control">' +
+      '<span class="material-symbols-outlined qd-field-icon">' + icon + '</span>' +
+      '<input type="text" data-scene-edit-field="' + field + '" value="' + escapeHtml(value) + '" placeholder="' + escapeHtml(placeholder) + '" class="qd-field-input" />' +
+    '</div>' +
+  '</label>';
+}
+
+function _sceneEditPopoverHtml(item) {
+  var values = _sceneEditableFields(item);
+  return '<div class="qd-modal-card rounded-[22px] border border-outline-variant/20 bg-white/95 p-5 shadow-2xl backdrop-blur-md">' +
+    '<button type="button" class="qd-prompt-close" aria-label="关闭" data-scene-edit-close><span class="material-symbols-outlined">close</span></button>' +
+    '<h3 class="text-base font-black tracking-tight text-on-background pr-8">编辑场景信息</h3>' +
+    '<div class="qd-modal-fields">' +
+      _sceneEditFieldHtml("location", "地点", "place", values.location, "街边门店外街区", false) +
+      _sceneEditFieldHtml("timeSetting", "时间", "schedule", values.timeSetting, "夜晚", false) +
+      _sceneEditFieldHtml("atmosphere", "氛围", "cloud", values.atmosphere, "冷清，都市", false) +
+      _sceneEditFieldHtml("description", "描述", "notes", values.description, "补充场景空间、构图、视觉细节", true) +
+    '</div>' +
+    '<div class="qd-modal-foot">' +
+      '<button type="button" class="qd-modal-btn qd-modal-btn--ghost" data-scene-edit-cancel>取消</button>' +
+      '<button type="button" class="qd-modal-btn qd-modal-btn--primary" data-scene-edit-save>保存</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function _positionSceneFloatingPanel(panel, anchor, width, fallbackHeight) {
+  var rect = anchor && anchor.getBoundingClientRect
+    ? anchor.getBoundingClientRect()
+    : { left: 24, right: 24, top: 96, bottom: 128 };
+  var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+  var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+  var gap = 12;
+  var panelWidth = Math.min(width, Math.max(280, vw - 24));
+  panel.style.width = panelWidth + "px";
+  var left = rect.right + gap;
+  if (left + panelWidth > vw - 12) left = rect.left - panelWidth - gap;
+  if (left < 12) left = Math.max(12, vw - panelWidth - 12);
+  var panelHeight = panel.offsetHeight || fallbackHeight || 420;
+  var top = rect.top - 8;
+  if (top + panelHeight > vh - 12) top = Math.max(12, vh - panelHeight - 12);
+  panel.style.left = Math.round(left) + "px";
+  panel.style.top = Math.round(top) + "px";
+}
+
+function _dismissSceneEditPopover() {
+  var popover = document.getElementById("assetSceneEditPopover");
+  if (popover) popover.remove();
+  if (_sceneEditPopoverDismissHandler) {
+    document.removeEventListener("click", _sceneEditPopoverDismissHandler);
+    _sceneEditPopoverDismissHandler = null;
+  }
+  if (_sceneEditPopoverKeyHandler) {
+    document.removeEventListener("keydown", _sceneEditPopoverKeyHandler);
+    _sceneEditPopoverKeyHandler = null;
+  }
+}
+
+function _commitSceneAssetEditor(sceneEditor, item, idx) {
+  var original = {};
+  try { original = JSON.parse(sceneEditor.dataset.original || "{}"); } catch (_e) { original = _sceneEditableFields(item); }
+  var next = _readSceneEditorValues(sceneEditor);
+  if (_sceneFieldsEqual(original, next)) { _dismissSceneEditPopover(); return; }
+
+  item.location = next.location;
+  item.timeSetting = next.timeSetting;
+  item.atmosphere = next.atmosphere;
+  item.description = next.description;
+  _syncSceneTopLevelFields(idx, next);
+  item._descEdited = true;
+  _ctx.markDownstreamStale("asset", { type: "scene", idx: idx, name: item.name || "" });
+  _saveAssetsProject();
+  _dismissSceneEditPopover();
+  _rerenderAssetGrid("scene");
+  _autoSyncUpstream("scene", idx);
+}
+
+function _openSceneAssetEditor(anchor, item, idx) {
+  _dismissSceneMoreMenu();
+  _dismissSceneEditPopover();
+
+  var overlay = document.createElement("div");
+  overlay.id = "assetSceneEditPopover";
+  overlay.className = "qd-prompt-overlay";
+  overlay.dataset.original = JSON.stringify(_sceneEditableFields(item));
+  overlay.innerHTML = _sceneEditPopoverHtml(item);
+  document.body.appendChild(overlay);
+
+  // 弹窗打开时锁住背景滚动，避免页面在弹窗后面滑动（修复"弹窗不跟随滚动"的观感）。
+  var _blockSceneScroll = function (e) { e.preventDefault(); };
+  overlay.addEventListener("wheel", _blockSceneScroll, { passive: false });
+  overlay.addEventListener("touchmove", _blockSceneScroll, { passive: false });
+
+  var saveBtn = overlay.querySelector("[data-scene-edit-save]");
+  var cancelBtn = overlay.querySelector("[data-scene-edit-cancel]");
+  var closeBtn = overlay.querySelector("[data-scene-edit-close]");
+  if (saveBtn) {
+    saveBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      _commitSceneAssetEditor(overlay, item, idx);
+    });
+  }
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      _dismissSceneEditPopover();
+    });
+  }
+  // 右上角 X = 保存并关闭（与点遮罩一致）。
+  if (closeBtn) {
+    closeBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      _commitSceneAssetEditor(overlay, item, idx);
+    });
+  }
+  // 点弹窗外的遮罩 = 保存并关闭。
+  overlay.addEventListener("click", function (ev) {
+    if (ev.target === overlay) _commitSceneAssetEditor(overlay, item, idx);
+  });
+  // 取消 / Esc = 放弃修改（保留一个明确的“不保存”出口）；Cmd/Ctrl+Enter = 保存。
+  _sceneEditPopoverKeyHandler = function (ev) {
+    if (ev.key === "Escape") {
+      _dismissSceneEditPopover();
+    } else if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
+      _commitSceneAssetEditor(overlay, item, idx);
+    }
+  };
+  setTimeout(function () {
+    document.addEventListener("keydown", _sceneEditPopoverKeyHandler);
+  }, 0);
+}
+
+function _dismissSceneMoreMenu() {
+  var menu = document.getElementById("sceneContextMenu");
+  if (menu) menu.remove();
+  if (_sceneMoreMenuDismissHandler) {
+    document.removeEventListener("click", _sceneMoreMenuDismissHandler);
+    _sceneMoreMenuDismissHandler = null;
+  }
+  if (_sceneMoreMenuScrollHandler) {
+    window.removeEventListener("scroll", _sceneMoreMenuScrollHandler, true);
+    window.removeEventListener("resize", _sceneMoreMenuScrollHandler);
+    _sceneMoreMenuScrollHandler = null;
+  }
+}
+
+function _showSceneMenu(anchor, idx) {
+  var existing = document.getElementById("sceneContextMenu");
+  _dismissSceneMoreMenu();
+  if (existing) return;
+  var item = project && project.assets && project.assets.scenes && project.assets.scenes[idx];
+  if (!item) return;
+  var menu = document.createElement("div");
+  menu.id = "sceneContextMenu";
+  menu.className = "fixed z-[10002] min-w-[200px] bg-white rounded-2xl overflow-hidden border border-black/[0.06]";
+  menu.style.cssText = "z-index: 10002; box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);";
+  menu.innerHTML =
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-2xl" data-scene-menu="upload"><span class="material-symbols-outlined text-lg text-[#2E7D32]">upload</span>上传场景图</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-scene-menu="download"><span class="material-symbols-outlined text-lg text-[#1565C0]">download</span>下载图片</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-scene-menu="history"><span class="material-symbols-outlined text-lg">history</span>历史记录</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-2xl" data-scene-menu="delete"><span class="material-symbols-outlined text-lg">delete_outline</span>删除场景</button>';
+  document.body.appendChild(menu);
+  var _sceneAnchorRect = anchor.getBoundingClientRect();
+  menu.style.top = (_sceneAnchorRect.bottom + 8) + "px";
+  menu.style.right = (window.innerWidth - _sceneAnchorRect.right) + "px";
+  menu.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    var btn = ev.target.closest("[data-scene-menu]");
+    if (!btn) return;
+    var act = btn.dataset.sceneMenu;
+    _dismissSceneMoreMenu();
+    if (act === "upload") {
+      _triggerAssetImageUpload("scene", idx);
+    } else if (act === "download") {
+      _downloadAssetImage("scene", idx);
+    } else if (act === "history") {
+      _openAssetHistoryFor("scene", idx);
+      return;
+    } else if (act === "history-legacy") {
+      _ctx.openHistoryPopover(anchor, item, function (hi) {
+        if (_ctx.setHistoryAsCurrent(item, hi)) {
+          _saveAssetsProject();
+          refreshAssetsPage();
+          showToast("已恢复到历史版本", "ok");
+        }
+      });
+    } else if (act === "delete") {
+      var _delSceneName = item.name || "";
+      showConfirm("删除场景", "确定删除场景「" + _delSceneName + "」？", function () {
+        _ctx.markDownstreamStale("asset", { type: "scene", idx: idx, name: _delSceneName });
+        project.assets.scenes.splice(idx, 1);
+        if (Array.isArray(project.environments)) project.environments.splice(idx, 1);
+        if (project._staleFlags) delete project._staleFlags["asset_img_scene_" + idx];
+        _saveAssetsProject();
+        renderAssets();
+        _showAssetActions();
+      });
+    }
+  });
+  _sceneMoreMenuDismissHandler = function (ev) {
+    if (menu.contains(ev.target) || (anchor && anchor.contains && anchor.contains(ev.target))) return;
+    _dismissSceneMoreMenu();
+  };
+  var _sceneRepoPending = false;
+  _sceneMoreMenuScrollHandler = function () {
+    if (_sceneRepoPending) return;
+    _sceneRepoPending = true;
+    requestAnimationFrame(function () {
+      _sceneRepoPending = false;
+      var m = document.getElementById("sceneContextMenu");
+      if (!m) return;
+      if (!document.body.contains(anchor)) { _dismissSceneMoreMenu(); return; }
+      var r = anchor.getBoundingClientRect();
+      m.style.top = (r.bottom + 8) + "px";
+      m.style.right = (window.innerWidth - r.right) + "px";
+    });
+  };
+  setTimeout(function () {
+    document.addEventListener("click", _sceneMoreMenuDismissHandler);
+    window.addEventListener("scroll", _sceneMoreMenuScrollHandler, true);
+    window.addEventListener("resize", _sceneMoreMenuScrollHandler);
+  }, 0);
 }
 
 function _renderSceneCards(container, items) {
@@ -653,11 +1256,11 @@ function _renderSceneCards(container, items) {
 
     var metaTags = '';
     if (item.timeSetting) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</span>';
-    if (item.atmosphere) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).slice(0, 2).join(', ')) + '</span>';
-    var sceneDescText = item.description ? item.description.slice(0, 120) : '暂无场景描述';
-    var sceneDescClass = item.description
-      ? 'asset-desc-text text-[11px] text-on-surface-variant/60 mt-1.5 leading-relaxed max-h-10 overflow-hidden cursor-text hover:text-on-surface-variant transition-colors'
-      : 'asset-desc-text text-[11px] text-on-surface-variant/35 mt-1.5 leading-relaxed max-h-10 overflow-hidden cursor-text hover:text-on-surface-variant transition-colors';
+	    if (item.atmosphere) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">cloud</span>' + escapeHtml(item.atmosphere.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean).join(', ')) + '</span>';
+	    var sceneDescText = item.description ? item.description.slice(0, 120) : '暂无场景描述';
+	    var sceneDescClass = item.description
+	      ? 'asset-desc-text text-[11px] text-on-surface-variant/60 mt-1.5 leading-relaxed max-h-10 overflow-hidden'
+	      : 'asset-desc-text text-[11px] text-on-surface-variant/35 mt-1.5 leading-relaxed max-h-10 overflow-hidden';
 
     card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500";
     card.innerHTML =
@@ -673,25 +1276,41 @@ function _renderSceneCards(container, items) {
       '</div>' +
       '<div class="p-4">' +
         '<div class="flex items-center justify-between gap-3">' +
-          '<div class="flex items-center gap-5 min-w-0 flex-1">' +
-            '<h4 class="text-base font-bold tracking-tight text-on-background truncate min-w-0">' + escapeHtml(item.name || '场景') + '</h4>' +
-            (metaTags ? '<div class="flex items-center gap-3 shrink-0">' + metaTags + '</div>' : '') +
-          '</div>' +
+          '<h4 class="text-base font-bold tracking-tight text-on-background truncate min-w-0 flex-1">' + escapeHtml(item.name || '场景') + '</h4>' +
           '<div class="flex gap-1.5 shrink-0">' +
-            (imgSrc ? '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><span class="material-symbols-outlined text-on-surface text-sm">zoom_in</span></button>' : '') +
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="ref-agent" title="引用到 AI 助手"><span class="material-symbols-outlined text-on-surface text-sm">alternate_email</span></button>' +
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="regen-asset" title="重新生成"><span class="material-symbols-outlined text-on-surface text-sm">refresh</span></button>' +
-            _ctx.historyBtnHtml(item, "chip") +
             '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="edit-asset" title="编辑"><span class="material-symbols-outlined text-on-surface text-sm">edit</span></button>' +
+            '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="scene-more" title="更多"><span class="material-symbols-outlined text-on-surface text-sm">more_vert</span></button>' +
           '</div>' +
         '</div>' +
-        '<div class="asset-desc-wrap" data-action="edit-asset">' +
+        (metaTags ? '<div class="flex flex-wrap items-center gap-3 mt-2">' + metaTags + '</div>' : '') +
+        '<div class="asset-desc-wrap cursor-text" data-action="edit-scene-desc" title="点击直接编辑描述">' +
           '<p class="' + sceneDescClass + '">' + escapeHtml(sceneDescText) + '</p>' +
-          '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
+          '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4"></textarea>' +
         '</div>' +
       '</div>';
     container.appendChild(card);
   });
+}
+
+/**
+ * 把道具 ownership（角色 id，如 "c1"）解析成角色名用于展示。
+ * 在 project.assets.characters 里按 id 精确匹配；查不到（角色被删/脏数据）
+ * 回退显示原 id，保证不丢信息也不报错。公共道具 ownership 为空返回空串。
+ */
+function _resolveOwnerName(ownership) {
+  var oid = (ownership == null ? '' : String(ownership)).trim();
+  if (!oid) return '';
+  var chars = (project && project.assets && project.assets.characters) || [];
+  for (var i = 0; i < chars.length; i++) {
+    var c = chars[i];
+    if (c && c.id != null && String(c.id).trim() === oid) {
+      var nm = c.name ? String(c.name).trim() : '';
+      return nm || oid;
+    }
+  }
+  return oid;
 }
 
 function _renderPropCards(container, items) {
@@ -710,17 +1329,21 @@ function _renderPropCards(container, items) {
       : '<div class="asset-prop-thumb rounded-2xl bg-surface-container flex items-center justify-center border border-outline-variant/10 shrink-0"><span class="material-symbols-outlined text-on-surface-variant/20 text-3xl">handyman</span></div>';
 
     var typeLabel = item.propType || '道具';
-    var propDescText = item.description ? item.description.slice(0, 80) : '暂无道具描述';
-    var propDescClass = item.description
-      ? 'asset-desc-text text-[11px] text-on-surface-variant/50 mt-1 line-clamp-2 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors'
-      : 'asset-desc-text text-[11px] text-on-surface-variant/35 mt-1 line-clamp-2 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors';
+    var functionSubtitleHtml = item.function
+      ? '<p class="text-[9px] text-on-surface-variant/70 mt-1 leading-relaxed">' + escapeHtml(item.function) + '</p>'
+      : '';
+
+    var propDescParts = [];
+    if (item.features) propDescParts.push(item.features);
+    if (item.material) propDescParts.push(item.material);
+    var propDesc = propDescParts.join(' | ');
 
     var tagsHtml = '';
     var tags = [];
-    if (item.propType) tags.push(item.propType);
-    if (item.ownership) tags.push(item.ownership);
-    if (item.features) tags.push(item.features);
-    if (item.function) tags.push(item.function);
+    if (item.ownership) {
+      var ownerName = _resolveOwnerName(item.ownership);
+      if (ownerName) tags.push('道具归属：' + ownerName);
+    }
     if (tags.length) {
       tagsHtml = '<div class="flex flex-wrap gap-1 mt-2">';
       tags.forEach(function (t) {
@@ -748,21 +1371,22 @@ function _renderPropCards(container, items) {
         '<div class="flex-1 min-w-0">' +
           '<span class="text-[9px] font-bold text-primary tracking-widest uppercase">' + escapeHtml(typeLabel) + '</span>' +
           '<h5 class="text-base font-bold mt-1 text-on-background">' + escapeHtml(item.name) + '</h5>' +
-          '<div class="asset-desc-wrap" data-action="edit-asset">' +
-            '<p class="' + propDescClass + '">' + escapeHtml(propDescText) + '</p>' +
-            '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded-lg p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="3"></textarea>' +
-          '</div>' +
+          functionSubtitleHtml +
           tagsHtml +
           '<div class="flex flex-wrap items-center gap-1">' + carriesTagHtml + warnHtml + '</div>' +
         '</div>' +
         thumbHtml +
       '</div>' +
+      '<div class="asset-desc-wrap mt-3" data-action="edit-asset">' +
+        '<p class="asset-desc-text text-[11px] text-on-surface-variant/60 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors">' + escapeHtml(propDesc) + '</p>' +
+        '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4">' + escapeHtml(propDesc) + '</textarea>' +
+      '</div>' +
       '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10 rounded-xl"' + (_assetGenStatus["prop_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
       '<div class="flex gap-1.5 mt-auto pt-3 flex-wrap">' +
         '<button type="button" class="flex-1 py-2 bg-surface-container-highest/40 text-on-surface text-[9px] font-bold uppercase tracking-[0.15em] rounded-lg hover:bg-surface-container-highest transition-colors" data-action="regen-asset">重新生成</button>' +
-        _ctx.historyBtnHtml(item, "chip") +
         '<button type="button" class="py-2 px-3 bg-surface-container-highest/40 text-on-surface text-[9px] font-bold uppercase tracking-[0.15em] rounded-lg hover:bg-surface-container-highest transition-colors" data-action="ref-agent" title="引用到 AI 助手">@</button>' +
-        '<button type="button" class="py-2 px-3 bg-surface-container-highest/40 text-on-surface text-[9px] font-bold uppercase tracking-[0.15em] rounded-lg hover:bg-surface-container-highest transition-colors" data-action="edit-asset">编辑</button>' +
+        '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="edit-asset" title="编辑"><span class="material-symbols-outlined text-on-surface text-sm">edit</span></button>' +
+        '<button type="button" class="w-8 h-8 bg-surface-container-highest/30 hover:bg-surface-container-highest rounded-full flex items-center justify-center transition-colors" data-action="prop-more" title="更多"><span class="material-symbols-outlined text-on-surface text-sm">more_vert</span></button>' +
       '</div>';
     container.appendChild(card);
   });
@@ -870,6 +1494,7 @@ export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
   if (status === "done") {
     console.log("[updateAssetCardImage] " + type + "#" + idx + " DONE url=" + (imgUrl || "").slice(0, 80));
   }
+  checkAssetsConfirm();
 
   var renderUrl = imgUrl;
   var zoomUrl = "";
@@ -924,6 +1549,100 @@ function _assetDisplayUrl(type, item) {
   }
   var original = item.originalUrl || item.imageUrl || item.rawUrl || "";
   return item.displayUrl || _assetVariant(original, ASSET_CARD_DISPLAY_W);
+}
+
+function _assetDownloadTypeLabel(type) {
+  return type === "char" ? "角色图" : type === "scene" ? "场景图" : "道具图";
+}
+
+function _sanitizeAssetDownloadPart(value, fallback) {
+  var text = String(value || "").trim() || fallback || "未命名";
+  return text
+    .replace(/[\\/:*?"<>|\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80) || fallback || "未命名";
+}
+
+function _assetDownloadBaseName(type, item) {
+  var taskName = _sanitizeAssetDownloadPart((project && (project.name || project.title)) || "", "未命名任务");
+  var assetType = _assetDownloadTypeLabel(type);
+  var assetName = _sanitizeAssetDownloadPart(item && item.name, _assetTypeLabel(type));
+  return taskName + "-" + assetType + "-" + assetName;
+}
+
+function _assetDownloadUrl(type, item, idx) {
+  if (!item) return "";
+  if (type === "char") {
+    var state = deriveAssetCardState(item, idx);
+    return _firstAssetUrl(state.previewOriginalUrl, state.originalUrl, state.previewImageUrl, state.mainImageUrl);
+  }
+  var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
+  return _firstAssetUrl(
+    item.originalUrl,
+    item.rawUrl,
+    item.imageUrl,
+    reference.currentUrl,
+    reference.lastKnownGoodUrl,
+    item.displayUrl,
+    item.thumbUrl,
+  );
+}
+
+function _assetDownloadExtFrom(url, contentType) {
+  var type = String(contentType || "").split(";")[0].trim().toLowerCase();
+  if (type === "image/jpeg" || type === "image/jpg") return ".jpg";
+  if (type === "image/png") return ".png";
+  if (type === "image/webp") return ".webp";
+  if (type === "image/gif") return ".gif";
+  if (type === "image/svg+xml") return ".svg";
+  var cleanUrl = String(url || "").split("?")[0].split("#")[0];
+  var match = cleanUrl.match(/\.(jpe?g|png|webp|gif|svg)$/i);
+  return match ? "." + match[1].toLowerCase().replace("jpeg", "jpg") : ".png";
+}
+
+function _assetDownloadFetchOptions(url) {
+  var opts = { method: "GET" };
+  try {
+    var parsed = new URL(url, window.location.href);
+    if (parsed.origin === window.location.origin) {
+      var authHeaders = getAuthHeaders ? getAuthHeaders() : {};
+      if (authHeaders.Authorization) opts.headers = { Authorization: authHeaders.Authorization };
+      opts.credentials = "same-origin";
+    }
+  } catch (_e) {}
+  return opts;
+}
+
+async function _downloadAssetImage(type, idx) {
+  var item = _assetItemFor(type, idx);
+  if (!item) {
+    showToast("当前资产不存在", "warn");
+    return;
+  }
+  var url = _assetDownloadUrl(type, item, idx);
+  if (!url) {
+    showToast("暂无可下载图片", "warn");
+    return;
+  }
+  try {
+    var resp = await fetch(url, _assetDownloadFetchOptions(url));
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    var blob = await resp.blob();
+    var baseName = _assetDownloadBaseName(type, item);
+    var ext = _assetDownloadExtFrom(url, blob.type || resp.headers.get("content-type") || "");
+    var blobUrl = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = baseName + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(blobUrl); }, 1000);
+  } catch (e) {
+    console.warn("[AssetDownload] failed:", e);
+    showToast("下载失败，请稍后重试", "error");
+  }
 }
 
 function _syncGeneratedAssetCardsFromProject() {
@@ -1096,6 +1815,18 @@ export function _diagnoseApiError(msg) {
   if (s.indexOf("quota is not enough") >= 0 || s.indexOf("insufficient_quota") >= 0 || s.indexOf("insufficient quota") >= 0 || s.indexOf("billing") >= 0) {
     return "中转站/账户余额不足，请到中转站充值或换一个 Key";
   }
+  if (
+    raw.indexOf("未通过内容安全审核") >= 0 ||
+    raw.indexOf("图像服务未返回具体拦截词") >= 0 ||
+    raw.indexOf("系统推测可先弱化") >= 0
+  ) {
+    return raw.slice(0, 260);
+  }
+  // 图像内容安全审核拦截(moderation_blocked / safety system)。通用文案: 不带"首帧/尾帧"
+  // 前缀, 因为本函数同样服务尾帧/资产/视频; 具体语境由调用处的卡片/前缀给出。
+  if (s.indexOf("moderation_blocked") >= 0 || s.indexOf("safety system") >= 0 || s.indexOf("image_generation_user_error") >= 0 || s.indexOf("content_policy") >= 0 || s.indexOf("rejected by the safety") >= 0 || s.indexOf("内容安全") >= 0 || s.indexOf("安全审核") >= 0) {
+    return "提示词违规，未通过安全审核";
+  }
   if (s.indexOf("rate limit") >= 0 || s.indexOf("rate_limit") >= 0 || s.indexOf("429") >= 0 || s.indexOf("too many requests") >= 0) {
     return "调用太频繁触发限流，请等 30 秒后重试";
   }
@@ -1203,59 +1934,33 @@ function _updateStylizeBadge() {
   }
 }
 
-export async function generateAllAssetImages() {
-  // Phase 3-B-4 / 3-B-6 / 3-B-7 / 3-B-8：全部资产（角色一条龙 Step1+Step2、
-  // 场景、道具）都进同一个后端 batch。**单卡重试**也走相同
-  // executor —— `generateSingleAssetImage` 直接发单元素 batch，完全不再碰
-  // `/api/images/submit` / `_pollStylizeTask` / `_pendingImageTasks`。
-  // 前端只负责：
-  //   1. 扫 project.assets 决定哪些要生成
-  //   2. 挂 loading 占位
-  //   3. POST /api/batch/start + subscribeBatch 看进度
-  if (_assetImagesGenerating) return;
-  _assetImagesGenerating = true;
-  var btn = $("btnGenAssetImages");
-  var hint = $("assetImgHint");
-  if (btn) btn.disabled = true;
-  if (hint) hint.textContent = "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
-
-  var originId = project.id;
-
-  // Phase 3-B-7：扫描 project.assets，把需要生成的主资产统一排进一个队列。
-  var allTargets = [];
+function _collectDefaultAssetImageTargets() {
+  var targets = [];
+  if (!project || !project.assets) return targets;
   ["characters", "scenes", "props"].forEach(function (cat) {
     var type = cat === "characters" ? "char" : cat === "scenes" ? "scene" : "prop";
     (project.assets[cat] || []).forEach(function (item, idx) {
       var needsGen = !item.imageUrl && item.imagePrompt;
       if (!needsGen) return;
-      allTargets.push({ type: type, idx: idx });
+      targets.push({ type: type, idx: idx });
     });
   });
+  return targets;
+}
 
-  var totalTasks = allTargets.length;
-  if (totalTasks === 0) {
-    if (hint) hint.textContent = "没有需要生成的资产";
-    _assetImagesGenerating = false;
-    if (btn) btn.disabled = false;
-    return;
-  }
+function _setAssetImagesGeneratingLocked(locked) {
+  _assetImagesGenerating = !!locked;
+  var btn = $("btnGenAssetImages");
+  if (btn) btn.disabled = !!locked;
+  checkAssetsConfirm();
+}
 
-  // 为所有 target 先置 loading 占位。
-  allTargets.forEach(function (t) {
-    updateAssetCardImage(t.type, t.idx, "loading");
-  });
-
-  var batchResult = await _runAssetImageBatch(originId, allTargets, hint, totalTasks);
-  // batchResult: { done, failed }
-
-  _assetImagesGenerating = false;
-  if (btn) btn.disabled = false;
-
-  // 汇总文案（沿用旧版口径）
+function _summarizeAssetImageGeneration(hint) {
   var done = 0;
   var still_missing = 0;
   var pencil_pending = 0;
-    ["characters", "scenes", "props"].forEach(function (cat) {
+  if (!project || !project.assets) return;
+  ["characters", "scenes", "props"].forEach(function (cat) {
     (project.assets[cat] || []).forEach(function (item) {
       if (item.imageUrl) done++;
       else if (item.imagePrompt) still_missing++;
@@ -1272,7 +1977,7 @@ export async function generateAllAssetImages() {
     if (pencil_pending > 0) hintParts.push(pencil_pending + " 个角色风格图后台补全中");
     if (hintParts.length > 0) {
       hint.textContent = done + " 张已生成，" + hintParts.join("、") + "（可进入下一步）";
-          } else {
+    } else {
       hint.textContent = done + " 张参考图全部生成完成 ✓";
     }
   }
@@ -1285,6 +1990,276 @@ export async function generateAllAssetImages() {
   }
   _updateStylizeBadge();
   checkAssetsConfirm();
+}
+
+async function _runAssetImageTargets(targets, hint) {
+  if (!project || !project.id) return;
+  targets = Array.isArray(targets) ? targets : [];
+  if (_assetImagesGenerating) return;
+  if (!targets.length) {
+    if (hint) hint.textContent = "没有需要生成的资产";
+    return;
+  }
+  _setAssetImagesGeneratingLocked(true);
+  try {
+    if (hint) hint.textContent = "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
+    targets.forEach(function (t) {
+      updateAssetCardImage(t.type, t.idx, "loading");
+    });
+    await _runAssetImageBatch(project.id, targets, hint, targets.length);
+    _summarizeAssetImageGeneration(hint);
+  } finally {
+    _setAssetImagesGeneratingLocked(false);
+  }
+}
+
+function _clearAssetImageDerivedFields(item) {
+  [
+    "originalUrl",
+    "displayUrl",
+    "thumbUrl",
+    "pencilOriginalUrl",
+    "pencilDisplayUrl",
+    "pencilThumbUrl",
+    "_originImageUrl",
+    "_originRawUrl",
+    "_originRealPhotoUrl",
+    "_originPencilUrl",
+    "_originOriginalUrl",
+    "_originDisplayUrl",
+    "_originThumbUrl",
+    "_originPencilOriginalUrl",
+    "_originPencilDisplayUrl",
+    "_originPencilThumbUrl",
+  ].forEach(function (field) { delete item[field]; });
+}
+
+function _reuseLatestInfoChangedImage(type, idx) {
+  if (!project || !project.assets) return false;
+  var list = _assetListByTypeFromAssets(project.assets, type);
+  var item = list && list[idx];
+  var snap = _latestInfoChangedSnap(item);
+  if (!item || !snap) return false;
+
+  _ASSET_GENERATED_FIELDS.forEach(function (field) {
+    if (Object.prototype.hasOwnProperty.call(snap, field)) {
+      item[field] = _cloneAssetReviewValue(snap[field]);
+    } else {
+      delete item[field];
+    }
+  });
+
+  var restoredUrl = _reviewSnapshotUrl(snap);
+  if (restoredUrl) {
+    if (!item.imageUrl) item.imageUrl = restoredUrl;
+    if (!item.rawUrl) item.rawUrl = restoredUrl;
+    item.reference = Object.assign({}, item.reference || {}, {
+      currentUrl: item.imageUrl || restoredUrl,
+      lastKnownGoodUrl: item.imageUrl || restoredUrl,
+      status: "ready",
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  _clearAssetImageDerivedFields(item);
+  delete item.imageLastError;
+  delete item.imageFailedAt;
+  delete item._pencilFailed;
+  delete item.panelsError;
+  delete item.panelsErrorAt;
+  if (item.reference) {
+    delete item.reference.lastError;
+    delete item.reference.lastAttemptUrl;
+    delete item.reference.lastFailedAt;
+  }
+  if (project._staleFlags) delete project._staleFlags["asset_img_" + type + "_" + idx];
+
+  var topKey = _assetTypeTopKey(type);
+  if (!Array.isArray(project[topKey])) project[topKey] = [];
+  project[topKey][idx] = _deepClonePlain(item);
+  return true;
+}
+
+function _assetReviewGroupedRows(rows, type) {
+  return rows.filter(function (row) { return row.type === type; });
+}
+
+function _assetReviewGroupHtml(rows, type, title) {
+  var groupRows = _assetReviewGroupedRows(rows, type);
+  if (!groupRows.length) return "";
+  var body = groupRows.map(function (row) {
+    var disabled = row.disabled ? " disabled" : "";
+    var checked = row.checked ? " checked" : "";
+    return '<label class="flex items-center gap-3 rounded-xl border border-outline/10 bg-surface/80 px-3 py-3 hover:border-outline/25 transition-colors' + (row.disabled ? ' opacity-60' : '') + '" data-review-row="' + escapeHtml(row.id) + '">' +
+      '<span class="relative w-16 h-16 shrink-0 overflow-hidden rounded-lg border border-outline/10 bg-surface-container-highest/40">' +
+        _assetReviewThumbHtml(row) +
+      '</span>' +
+      '<span class="min-w-0 flex-1">' +
+        '<span class="block truncate text-sm font-bold text-on-surface">' + escapeHtml(row.name || "") + '</span>' +
+        '<span class="mt-1 block text-xs text-on-surface-variant">' + escapeHtml(row.status || "") + '</span>' +
+      '</span>' +
+      '<input type="checkbox" class="w-5 h-5 rounded border-outline/30 accent-primary shrink-0" data-review-checkbox data-row-id="' + escapeHtml(row.id) + '"' + checked + disabled + ' />' +
+    '</label>';
+  }).join("");
+  return '<section class="asset-review-section">' +
+    '<div class="mb-3 flex items-center justify-between">' +
+      '<h4 class="text-xs font-bold uppercase tracking-[0.16em] text-on-surface-variant">' + escapeHtml(title) + '</h4>' +
+      '<span class="text-[11px] text-on-surface-variant/70">' + groupRows.length + ' 项</span>' +
+    '</div>' +
+    '<div class="grid grid-cols-1 md:grid-cols-2 gap-3">' + body + '</div>' +
+  '</section>';
+}
+
+function _assetReviewSelectedState(overlay, rows) {
+  var rowMap = {};
+  rows.forEach(function (row) { rowMap[row.id] = row; });
+  var targets = [];
+  var reuseRows = [];
+  var inputs = overlay.querySelectorAll("[data-review-checkbox]");
+  inputs.forEach(function (input) {
+    var row = rowMap[input.getAttribute("data-row-id") || ""];
+    if (!row || row.deleted || row.disabled) return;
+    if (input.checked) {
+      targets.push({ type: row.type, idx: row.idx });
+      return;
+    }
+    if (row.kind === "changed_missing") {
+      reuseRows.push(row);
+    }
+  });
+  return { targets: targets, reuseRows: reuseRows };
+}
+
+function _updateAssetReviewConfirmEnabled(overlay, rows) {
+  var confirmBtn = overlay.querySelector("[data-review-confirm]");
+  if (!confirmBtn) return;
+  var state = _assetReviewSelectedState(overlay, rows);
+  confirmBtn.disabled = !(state.targets.length || state.reuseRows.length);
+}
+
+function _dismissAssetRegenerationReviewDialog() {
+  var overlay = document.getElementById("assetRegenerationReviewDialog");
+  if (overlay) overlay.remove();
+}
+
+async function _executeAssetRegenerationReview(targets, reuseRows) {
+  if (!project || !project.id || _assetImagesGenerating) return;
+  var hint = $("assetImgHint");
+  var reused = 0;
+  _setAssetImagesGeneratingLocked(true);
+  try {
+    if (hint) hint.textContent = reuseRows.length && targets.length ? "正在沿用历史图并生成选中资产…" : reuseRows.length ? "正在沿用历史参考图…" : "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
+    reuseRows.forEach(function (row) {
+      if (_reuseLatestInfoChangedImage(row.type, row.idx)) reused++;
+    });
+    if (reused > 0) {
+      if (_ctx.flushServerSave) {
+        await _ctx.flushServerSave();
+      } else if (_ctx.saveProject) {
+        await _saveAssetsProject();
+      }
+      renderAssets();
+      _showAssetActions();
+    }
+    if (targets.length) {
+      targets.forEach(function (t) {
+        updateAssetCardImage(t.type, t.idx, "loading");
+      });
+      await _runAssetImageBatch(project.id, targets, hint, targets.length);
+      _summarizeAssetImageGeneration(hint);
+    } else {
+      if (hint) hint.textContent = reused > 0 ? "已沿用历史参考图" : "没有需要生成的资产";
+      if (reused > 0) showToast("已沿用历史参考图", "ok");
+      _updateStylizeBadge();
+      checkAssetsConfirm();
+    }
+  } finally {
+    _setAssetImagesGeneratingLocked(false);
+  }
+}
+
+function _showAssetRegenerationReviewDialog() {
+  var rows = _buildAssetRegenerationReviewRows();
+  if (!rows.length) return false;
+  _dismissAssetRegenerationReviewDialog();
+  var overlay = document.createElement("div");
+  overlay.id = "assetRegenerationReviewDialog";
+  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/35 backdrop-blur-sm px-4 py-6";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.innerHTML =
+    '<div class="w-full max-w-5xl max-h-[86vh] overflow-hidden rounded-[28px] bg-surface shadow-2xl border border-outline/10 flex flex-col">' +
+      '<div class="flex items-start justify-between gap-4 border-b border-outline/10 px-6 py-5">' +
+        '<div>' +
+          '<h3 class="text-xl font-bold text-on-surface">请确认重新生成范围：</h3>' +
+        '</div>' +
+        '<button type="button" class="w-10 h-10 rounded-full border border-outline/15 bg-surface-container-low text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high flex items-center justify-center transition-colors" data-review-close aria-label="关闭">' +
+          '<span class="material-symbols-outlined text-xl">close</span>' +
+        '</button>' +
+      '</div>' +
+      '<div class="flex-1 overflow-y-auto px-6 py-5 space-y-6">' +
+        _assetReviewGroupHtml(rows, "char", "角色 Characters") +
+        _assetReviewGroupHtml(rows, "scene", "场景 Scenes") +
+        _assetReviewGroupHtml(rows, "prop", "道具 Props") +
+      '</div>' +
+      '<div class="flex items-center justify-end gap-3 border-t border-outline/10 px-6 py-5">' +
+        '<button type="button" class="h-11 px-7 rounded-full bg-surface-container-high text-on-surface-variant font-bold hover:bg-surface-container-highest transition-colors" data-review-close>取消</button>' +
+        '<button type="button" class="h-11 px-8 rounded-full bg-primary text-on-primary font-bold disabled:opacity-40 disabled:cursor-not-allowed hover:shadow-lg transition-all" data-review-confirm>确定</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  hydrateProtectedImageElements(overlay);
+  _updateAssetReviewConfirmEnabled(overlay, rows);
+
+  overlay.addEventListener("change", function (ev) {
+    if (ev.target && ev.target.matches("[data-review-checkbox]")) {
+      _updateAssetReviewConfirmEnabled(overlay, rows);
+    }
+  });
+  overlay.addEventListener("click", function (ev) {
+    var closeBtn = ev.target.closest("[data-review-close]");
+    if (closeBtn) {
+      _dismissAssetRegenerationReviewDialog();
+      return;
+    }
+    var confirmBtn = ev.target.closest("[data-review-confirm]");
+    if (!confirmBtn || confirmBtn.disabled) return;
+    var state = _assetReviewSelectedState(overlay, rows);
+    if (!state.targets.length && !state.reuseRows.length) {
+      _updateAssetReviewConfirmEnabled(overlay, rows);
+      return;
+    }
+    confirmBtn.disabled = true;
+    _dismissAssetRegenerationReviewDialog();
+    _executeAssetRegenerationReview(state.targets, state.reuseRows).catch(function (e) {
+      console.error("[AssetReview] confirm failed:", e);
+      showToast("生成范围确认失败：" + ((e && e.message) || e), "error");
+      _setAssetImagesGeneratingLocked(false);
+    });
+  });
+  return true;
+}
+
+export async function generateAllAssetImages() {
+  // Phase 3-B-4 / 3-B-6 / 3-B-7 / 3-B-8：全部资产（角色一条龙 Step1+Step2、
+  // 场景、道具）都进同一个后端 batch。**单卡重试**也走相同
+  // executor —— `generateSingleAssetImage` 直接发单元素 batch，完全不再碰
+  // `/api/images/submit` / `_pollStylizeTask` / `_pendingImageTasks`。
+  // 前端只负责：
+  //   1. 扫 project.assets 决定哪些要生成
+  //   2. 挂 loading 占位
+  //   3. POST /api/batch/start + subscribeBatch 看进度
+  if (_assetImagesGenerating) return;
+  var hint = $("assetImgHint");
+  if (_shouldShowAssetRegenerationReview()) {
+    if (_showAssetRegenerationReviewDialog()) return;
+  }
+  var allTargets = _collectDefaultAssetImageTargets();
+  if (!allTargets.length) {
+    if (hint) hint.textContent = "没有需要生成的资产";
+    return;
+  }
+  await _runAssetImageTargets(allTargets, hint);
 }
 
 /**
@@ -1379,6 +2354,7 @@ function _attachAssetImageBatch(opts) {
     if (settled) return;
     settled = true;
     _stopPoll();
+    checkAssetsConfirm();
     onFinish(res);
   }
 
@@ -1574,7 +2550,14 @@ function _attachAssetImageBatch(opts) {
         if (!proj.assets[cat]) proj.assets[cat] = [];
         var item = proj.assets[cat][idx];
         if (!item) return;
-        _ctx.archiveOldImage(item, type === "char" ? "character" : type);
+        // 后端 asset_images executor 现在会归档旧图进 imageHistory；
+        // 如果 polling 已经把新版（含归档）拉回内存，item.imageUrl 已经是 displayUrl，
+        // 再调一次 archiveOldImage 会把"新 URL"也塞进 history（错）。
+        // 用 URL 比对识别这种情况就跳过前端归档。
+        var alreadySynced = (item.imageUrl === displayUrl) && (item.rawUrl === url);
+        if (!alreadySynced) {
+          _ctx.archiveOldImage(item, type === "char" ? "character" : type);
+        }
         if (type === "char") {
           item.realPhotoUrl = url;
           if (pencilUrl) {
@@ -2002,22 +2985,83 @@ function _runStylizeBatch(originId, targets) {
   });
 }
 
+function _assetItemsForConfirm() {
+  if (!project || !project.assets) return [];
+  var assets = project.assets;
+  return []
+    .concat((assets.characters || []).map(function (item) { return { type: "char", item: item }; }))
+    .concat((assets.scenes || []).map(function (item) { return { type: "scene", item: item }; }))
+    .concat((assets.props || []).map(function (item) { return { type: "prop", item: item }; }));
+}
+
+function _assetHasGeneratedReference(type, item) {
+  if (!item) return false;
+  var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
+  var panels = item.panels && typeof item.panels === "object" ? item.panels : {};
+  if (type === "char" && reference.status === "failed") return false;
+  return !!_firstAssetUrl(
+    item.imageUrl,
+    item.rawUrl,
+    item.realPhotoUrl,
+    item.pencilUrl,
+    reference.currentUrl,
+    reference.lastKnownGoodUrl,
+    item.referenceLock && item.referenceLock.sheetUrl,
+    panels.sheetUrl,
+    panels.frontUrl,
+    panels.sideUrl,
+    panels.backUrl,
+  );
+}
+
+function _assetImageAttemptFinished(item) {
+  if (!item) return false;
+  var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
+  var referenceStatus = String(reference.status || "").toLowerCase();
+  return !!(
+    item.imageFailedAt ||
+    item.imageGeneratedAt ||
+    reference.lastFailedAt ||
+    reference.lastError ||
+    referenceStatus === "failed"
+  );
+}
+
+function _assetImagesReadyForConfirm() {
+  if (_assetsExtracting || _assetImagesGenerating || Object.keys(_assetGenStatus).length > 0) return false;
+  var items = _assetItemsForConfirm();
+  if (!items.length) return false;
+  var hasTerminalAssetImage = false;
+  var hasPendingAssetImage = false;
+  items.forEach(function (entry) {
+    var item = entry.item || {};
+    if (_assetHasGeneratedReference(entry.type, item) || _assetImageAttemptFinished(item)) {
+      hasTerminalAssetImage = true;
+      return;
+    }
+    if (item.imagePrompt || item.submittedImagePrompt || item.effectiveVisualDescription) {
+      hasPendingAssetImage = true;
+    }
+  });
+  return hasTerminalAssetImage && !hasPendingAssetImage;
+}
+
 export function checkAssetsConfirm() {
   var area = $("assetsConfirmArea");
   var topBtn = $("btnConfirmAssetsTop");
   var saveTplBtn = $("btnSaveWorldTemplate");
-  var knowledgeBtn = $("btnKnowledgeSnapshot");
+  _refreshWorldKnowledgeButtons();
   if (!area || !project || !project.assets) {
+    if (area) area.hidden = true;
     if (topBtn) topBtn.hidden = true;
     if (saveTplBtn) saveTplBtn.hidden = true;
-    if (knowledgeBtn) knowledgeBtn.hidden = true;
     return;
   }
-  var hasAssets = (project.assets.characters || []).length > 0 || (project.assets.scenes || []).length > 0;
-  area.hidden = !hasAssets;
+  var hasAssets = _assetItemsForConfirm().length > 0;
+  var canConfirm = _assetImagesReadyForConfirm();
+  area.hidden = !canConfirm;
   if (topBtn) topBtn.hidden = !hasAssets;
   if (saveTplBtn) saveTplBtn.hidden = !hasAssets;
-  if (knowledgeBtn) knowledgeBtn.hidden = false;
 }
 
 // 资产确认后跳分镜页时，如果项目还没生成过镜头计划，自动跑一次 generateShots()。
@@ -2111,6 +3155,47 @@ export function handleAssetAction(e) {
     return;
   }
 
+  if (action === "scene-more") {
+    if (type === "scene") _showSceneMenu(btn, idx);
+    return;
+  }
+
+  if (action === "prop-more") {
+    if (type === "prop") _showPropMenu(btn, idx);
+    return;
+  }
+
+  // 场景卡描述「就地编辑」快捷入口：点描述文字直接改，铅笔按钮仍走弹窗。
+  if (action === "edit-scene-desc") {
+    if (type !== "scene") return;
+    var swrap = card.querySelector(".asset-desc-wrap");
+    if (!swrap) return;
+    var stext = swrap.querySelector(".asset-desc-text");
+    var sedit = swrap.querySelector(".asset-desc-edit");
+    if (!stext || !sedit) return;
+    if (sedit.classList.contains("hidden")) {
+      var _sDescOrig = item.description || "";
+      sedit.value = _sDescOrig;
+      stext.classList.add("hidden");
+      sedit.classList.remove("hidden");
+      sedit.focus();
+      sedit.onblur = function () {
+        var nv = sedit.value.trim();
+        sedit.classList.add("hidden");
+        stext.classList.remove("hidden");
+        if (nv === _sDescOrig) return;
+        item.description = nv;
+        if (project.environments && project.environments[idx]) project.environments[idx].description = nv;
+        item._descEdited = true;
+        _ctx.markDownstreamStale("asset", { type: "scene", idx: idx, name: item.name || "" });
+        _saveAssetsProject();
+        stext.textContent = nv || "暂无场景描述";
+        _autoSyncUpstream("scene", idx);
+      };
+    }
+    return;
+  }
+
   if (action === "show-history") {
     _ctx.openHistoryPopover(btn, item, function (hi) {
       if (_ctx.setHistoryAsCurrent(item, hi)) {
@@ -2126,6 +3211,10 @@ export function handleAssetAction(e) {
     if (_assetImagesGenerating) { showToast("正在批量生成中", "warn"); return; }
     generateSingleAssetImage(type, idx);
   } else if (action === "edit-asset") {
+    if (type === "scene") {
+      _openSceneAssetEditor(btn, item, idx);
+      return;
+    }
     var wrap = card.querySelector(".asset-desc-wrap");
     if (!wrap) return;
     var textEl = wrap.querySelector(".asset-desc-text");
@@ -2140,6 +3229,11 @@ export function handleAssetAction(e) {
         if (item.clothing) parts.push(item.clothing);
         if (item.equipment) parts.push(item.equipment);
         fullDesc = parts.join(' | ');
+      } else if (type === "prop") {
+        var pparts = [];
+        if (item.features) pparts.push(item.features);
+        if (item.material) pparts.push(item.material);
+        fullDesc = pparts.join(' | ');
       } else {
         fullDesc = item.description || '';
       }
@@ -2158,6 +3252,10 @@ export function handleAssetAction(e) {
           item.appearance = segments[0] || '';
           item.clothing = segments[1] || '';
           item.equipment = segments[2] || '';
+        } else if (type === "prop") {
+          var psegs = newVal.split(/\s*\|\s*/);
+          item.features = psegs[0] || '';
+          item.material = psegs[1] || '';
         } else {
           item.description = newVal;
         }
@@ -2171,37 +3269,59 @@ export function handleAssetAction(e) {
   } else if (action === "edit-char-mode") {
     if (type !== "char") return;
     var curVia = item.via || '';
-    var newVia = prompt("修改出现方式（回忆 / 照片 / 梦境 / 通缉令 / 电话那头 / 别人的讲述 等）\n留空则改回「当下活动角色」。", curVia);
-    if (newVia === null) return;
-    newVia = newVia.trim();
-    if (newVia) {
-      item.appearanceMode = 'referenced';
-      item.via = newVia;
-    } else {
-      item.appearanceMode = 'main';
-      delete item.via;
-    }
-    _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-    _saveAssetsProject();
-    renderAssetsUI();
-    showToast("出现方式已更新", "ok");
+    showPrompt({
+      title: "修改出现方式",
+      message: "回忆 / 照片 / 梦境 / 通缉令 / 电话那头 / 别人的讲述 等。\n留空则改回「当下活动角色」。",
+      defaultValue: curVia,
+      placeholder: "例：回忆",
+      icon: "auto_stories",
+      okText: "好",
+      hideCancel: true,
+      commitOnDismiss: true,
+    }).then(function (newVia) {
+      if (newVia === null) return;
+      newVia = newVia.trim();
+      if (newVia === (item.via || '')) return;
+      if (newVia) {
+        item.appearanceMode = 'referenced';
+        item.via = newVia;
+      } else {
+        item.appearanceMode = 'main';
+        delete item.via;
+      }
+      _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
+      _saveAssetsProject();
+      renderAssetsUI();
+      showToast("出现方式已更新", "ok");
+    });
   } else if (action === "edit-char-crowd") {
     if (type !== "char") return;
     var curSize = item.crowdSize || '';
-    var newSize = prompt("修改群体规模（如：三四个 / 一队（十几人） / 成群）\n留空则改回「单人角色」。", curSize);
-    if (newSize === null) return;
-    newSize = newSize.trim();
-    if (newSize) {
-      item.isCrowd = true;
-      item.crowdSize = newSize;
-    } else {
-      item.isCrowd = false;
-      delete item.crowdSize;
-    }
-    _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
-    _saveAssetsProject();
-    renderAssetsUI();
-    showToast("群体规模已更新", "ok");
+    showPrompt({
+      title: "修改群体规模",
+      message: "如：三四个 / 一队（十几人） / 成群。\n留空则改回「单人角色」。",
+      defaultValue: curSize,
+      placeholder: "例：三四个",
+      icon: "groups",
+      okText: "好",
+      hideCancel: true,
+      commitOnDismiss: true,
+    }).then(function (newSize) {
+      if (newSize === null) return;
+      newSize = newSize.trim();
+      if (newSize === (item.crowdSize || '')) return;
+      if (newSize) {
+        item.isCrowd = true;
+        item.crowdSize = newSize;
+      } else {
+        item.isCrowd = false;
+        delete item.crowdSize;
+      }
+      _ctx.markDownstreamStale("asset", { type: "char", idx: idx, name: item.name || "" });
+      _saveAssetsProject();
+      renderAssetsUI();
+      showToast("群体规模已更新", "ok");
+    });
   } else if (action === "add-char-tag") {
     if (type !== "char") return;
     var choice = prompt("添加哪类标签？\n  1 = 非当下角色（回忆/照片/梦境等）\n  2 = 群体角色（群演）\n输入 1 或 2：");
@@ -2238,35 +3358,49 @@ export function handleAssetAction(e) {
       "例：仇人，未婚妻\n" +
       "留空则改回普通道具。\n" +
       "仅当此道具是照片/通缉令/海报/画像/电视屏等「承载人脸的载体」时才填写。";
-    var newCarries = prompt(helpText, curCarries);
-    if (newCarries === null) return;
-    newCarries = (newCarries || '').trim();
-    var list = newCarries ? newCarries.split(/[，,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
-    if (list.length) {
-      var known = {};
-      (project.assets && project.assets.characters || []).forEach(function (c) {
-        if (c && c.name) known[c.name.trim()] = true;
-      });
-      var missing = list.filter(function (n) { return !known[n]; });
-      item.carriesCharacter = list;
-      if (!project._carryWarnings) project._carryWarnings = {};
-      if (missing.length) {
-        project._carryWarnings[idx] = {
-          missing: missing,
-          message: "载体承载的角色未在角色列表中：" + missing.join('、') + "。请先把这些角色补到角色卡片里。",
-        };
-      } else if (project._carryWarnings && project._carryWarnings[idx]) {
-        delete project._carryWarnings[idx];
+    showPrompt({
+      title: "标注载体承载的角色",
+      message: helpText,
+      defaultValue: curCarries,
+      placeholder: "例：仇人，未婚妻",
+      icon: "portrait",
+      okText: "好",
+      cancelText: "取消",
+      hideCancel: true,
+      commitOnDismiss: true,
+    }).then(function (newCarries) {
+      if (newCarries === null) return;
+      newCarries = (newCarries || '').trim();
+      var list = newCarries ? newCarries.split(/[，,、]/).map(function (s) { return s.trim(); }).filter(Boolean) : [];
+      // 内容没变就直接返回：点 X / 点遮罩等误触不再把下游标记为过期，也不弹无意义的提示。
+      var _origCarries = Array.isArray(item.carriesCharacter) ? item.carriesCharacter.slice() : [];
+      if (list.join('\u0001') === _origCarries.join('\u0001')) return;
+      if (list.length) {
+        var known = {};
+        (project.assets && project.assets.characters || []).forEach(function (c) {
+          if (c && c.name) known[c.name.trim()] = true;
+        });
+        var missing = list.filter(function (n) { return !known[n]; });
+        item.carriesCharacter = list;
+        if (!project._carryWarnings) project._carryWarnings = {};
+        if (missing.length) {
+          project._carryWarnings[idx] = {
+            missing: missing,
+            message: "载体承载的角色未在角色列表中：" + missing.join('、') + "。请先把这些角色补到角色卡片里。",
+          };
+        } else if (project._carryWarnings && project._carryWarnings[idx]) {
+          delete project._carryWarnings[idx];
+        }
+      } else {
+        delete item.carriesCharacter;
+        if (project._carryWarnings && project._carryWarnings[idx]) delete project._carryWarnings[idx];
       }
-    } else {
-      delete item.carriesCharacter;
-      if (project._carryWarnings && project._carryWarnings[idx]) delete project._carryWarnings[idx];
-    }
-    item._descEdited = true;
-    _ctx.markDownstreamStale("asset", { type: "prop", idx: idx, name: item.name || "" });
-    _saveAssetsProject();
-    renderAssetsUI();
-    showToast(list.length ? "载体承载已更新" : "已改回普通道具", "ok");
+      item._descEdited = true;
+      _ctx.markDownstreamStale("asset", { type: "prop", idx: idx, name: item.name || "" });
+      _saveAssetsProject();
+      renderAssetsUI();
+      showToast(list.length ? "载体承载已更新" : "已改回普通道具", "ok");
+    });
   } else if (action === "show-carry-warning") {
     var w = project && project._carryWarnings && project._carryWarnings[idx];
     if (w) alert("⚠ 载体校验问题\n\n" + (w.message || "未知问题"));
@@ -2275,6 +3409,125 @@ export function handleAssetAction(e) {
 
 /* ── 角色卡右上角菜单 ── */
 var _charMenuDismissHandler = null;
+var _charMenuScrollHandler = null;
+var _customCharReplaceDismissHandler = null;
+var _customCharReplaceKeyHandler = null;
+var _customCharReplaceSelection = "";
+var _customCharReplaceItems = [];
+
+/* ── 道具卡右上角菜单 ── */
+var _propMoreMenuDismissHandler = null;
+var _propMoreMenuScrollHandler = null;
+
+function _dismissPropMoreMenu() {
+  var menu = document.getElementById("propContextMenu");
+  if (menu) menu.remove();
+  if (_propMoreMenuDismissHandler) {
+    document.removeEventListener("click", _propMoreMenuDismissHandler);
+    _propMoreMenuDismissHandler = null;
+  }
+  if (_propMoreMenuScrollHandler) {
+    window.removeEventListener("scroll", _propMoreMenuScrollHandler, true);
+    window.removeEventListener("resize", _propMoreMenuScrollHandler);
+    _propMoreMenuScrollHandler = null;
+  }
+}
+
+function _showPropMenu(anchor, idx) {
+  var existing = document.getElementById("propContextMenu");
+  _dismissPropMoreMenu();
+  if (existing) return;
+  var item = project && project.assets && project.assets.props && project.assets.props[idx];
+  if (!item) return;
+  var menu = document.createElement("div");
+  menu.id = "propContextMenu";
+  menu.className = "fixed z-[10002] min-w-[200px] bg-white rounded-2xl overflow-hidden border border-black/[0.06]";
+  menu.style.cssText = "z-index: 10002; box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);";
+  menu.innerHTML =
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-2xl" data-prop-menu="upload"><span class="material-symbols-outlined text-lg text-[#2E7D32]">upload</span>上传道具图</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-prop-menu="download"><span class="material-symbols-outlined text-lg text-[#1565C0]">download</span>下载图片</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-prop-menu="history"><span class="material-symbols-outlined text-lg">history</span>历史记录</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-2xl" data-prop-menu="delete"><span class="material-symbols-outlined text-lg">delete_outline</span>删除道具</button>';
+  document.body.appendChild(menu);
+  var _propAnchorRect = anchor.getBoundingClientRect();
+  menu.style.top = (_propAnchorRect.bottom + 8) + "px";
+  menu.style.right = (window.innerWidth - _propAnchorRect.right) + "px";
+
+  menu.addEventListener("click", function (ev) {
+    ev.stopPropagation();
+    var btn = ev.target.closest("[data-prop-menu]");
+    if (!btn) return;
+    var act = btn.dataset.propMenu;
+    _dismissPropMoreMenu();
+    if (act === "upload") {
+      _triggerAssetImageUpload("prop", idx);
+    } else if (act === "download") {
+      _downloadAssetImage("prop", idx);
+    } else if (act === "history") {
+      _openAssetHistoryFor("prop", idx);
+    } else if (act === "delete") {
+      var _delPropName = item.name || "";
+      showConfirm("删除道具", "确定删除道具「" + _delPropName + "」？", function () {
+        _ctx.markDownstreamStale("asset", { type: "prop", idx: idx, name: _delPropName });
+        project.assets.props.splice(idx, 1);
+        if (project._staleFlags) delete project._staleFlags["asset_img_prop_" + idx];
+        _saveAssetsProject();
+        renderAssets();
+        _showAssetActions();
+      });
+    }
+  });
+  _propMoreMenuDismissHandler = function (ev) {
+    if (menu.contains(ev.target) || (anchor && anchor.contains && anchor.contains(ev.target))) return;
+    _dismissPropMoreMenu();
+  };
+  var _propRepoPending = false;
+  _propMoreMenuScrollHandler = function () {
+    if (_propRepoPending) return;
+    _propRepoPending = true;
+    requestAnimationFrame(function () {
+      _propRepoPending = false;
+      var m = document.getElementById("propContextMenu");
+      if (!m) return;
+      if (!document.body.contains(anchor)) { _dismissPropMoreMenu(); return; }
+      var r = anchor.getBoundingClientRect();
+      m.style.top = (r.bottom + 8) + "px";
+      m.style.right = (window.innerWidth - r.right) + "px";
+    });
+  };
+  setTimeout(function () {
+    document.addEventListener("click", _propMoreMenuDismissHandler);
+    window.addEventListener("scroll", _propMoreMenuScrollHandler, true);
+    window.addEventListener("resize", _propMoreMenuScrollHandler);
+  }, 0);
+}
+
+// 资产卡「历史记录」入口：菜单中"历史记录"项点击后调用。
+// 走 main.js 的 _openAssetHistoryModal（统一弹窗 UI），onApply 处理替换 + 回写持久化。
+function _openAssetHistoryFor(type, idx) {
+  var list = type === "char" ? project.assets.characters
+           : type === "scene" ? project.assets.scenes
+           : project.assets.props;
+  var item = list && list[idx];
+  if (!item) return;
+  if (!Array.isArray(item.imageHistory) || !item.imageHistory.length) {
+    showToast("暂无历史版本", "warn");
+    return;
+  }
+  _ctx.openAssetHistoryModal(item, type, function (snapIdx) {
+    if (!_ctx.setHistoryAsCurrent(item, snapIdx)) {
+      showToast("替换失败", "error");
+      return;
+    }
+    _ctx.markDownstreamStale("asset", { type: type, idx: idx, name: item.name || "" });
+    _saveAssetsProject();
+    _rerenderAssetGrid(type);
+    showToast("已替换为该历史版本", "ok");
+  });
+}
 
 function _showCharMenu(anchor, type, idx) {
   var existing = document.getElementById("charContextMenu");
@@ -2284,7 +3537,7 @@ function _showCharMenu(anchor, type, idx) {
 
   var menu = document.createElement("div");
   menu.id = "charContextMenu";
-  menu.className = "absolute right-0 top-full mt-2 z-50 min-w-[200px] bg-white rounded-2xl py-2 border border-black/[0.06]";
+  menu.className = "fixed z-50 min-w-[200px] bg-white rounded-2xl overflow-hidden border border-black/[0.06]";
   menu.style.cssText = "box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);";
   var _charItem = project.assets.characters[idx];
   var _hasPencilIssue = _charItem && _charItem.realPhotoUrl && !_charItem.pencilUrl;
@@ -2292,15 +3545,27 @@ function _showCharMenu(anchor, type, idx) {
   var _isNonHumanMenu = _menuEntityType === 'non-human';
   var _retryLabel = _isNonHumanMenu ? '重试实体概念图' : '重试风格转换';
   menu.innerHTML =
-    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-xl" data-menu="upload-char-img">' +
+    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-2xl" data-menu="upload-char-img">' +
       '<span class="material-symbols-outlined text-lg text-[#2E7D32]">upload</span>上传角色图' +
+    '</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-menu="download-char-img">' +
+      '<span class="material-symbols-outlined text-lg text-[#1565C0]">download</span>下载图片' +
+    '</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-menu="replace-custom-char">' +
+      '<span class="material-symbols-outlined text-lg text-primary">frame_person</span>替换角色特征' +
+    '</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-menu="char-history">' +
+      '<span class="material-symbols-outlined text-lg">history</span>历史记录' +
     '</button>' +
     (_hasPencilIssue ? '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e65100] hover:bg-orange-50 transition-colors" data-menu="retry-pencil">' +
       '<span class="material-symbols-outlined text-lg">brush</span>' + _retryLabel +
     '</button>' : '') +
     '<div class="mx-4 border-t border-black/[0.06]"></div>' +
-    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-xl" data-menu="delete-char">' +
+    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-2xl" data-menu="delete-char">' +
       '<span class="material-symbols-outlined text-lg">delete_outline</span>删除' + (_isNonHumanMenu ? '实体' : '角色') +
     '</button>';
 
@@ -2312,6 +3577,14 @@ function _showCharMenu(anchor, type, idx) {
     _dismissCharMenu();
     if (act === "upload-char-img") {
       _triggerCharImageUpload(idx);
+    } else if (act === "download-char-img") {
+      _downloadAssetImage("char", idx);
+    } else if (act === "replace-custom-char") {
+      _openCustomCharacterReplaceDialog(idx).catch(function (e) {
+        showToast("定制角色加载失败：" + ((e && e.message) || e), "error");
+      });
+    } else if (act === "char-history") {
+      _openAssetHistoryFor("char", idx);
     } else if (act === "retry-pencil") {
       _retryPencilConversion(idx);
     } else if (act === "delete-char") {
@@ -2346,18 +3619,33 @@ function _showCharMenu(anchor, type, idx) {
     }
   });
 
-  var wrapper = anchor.closest(".flex.justify-between");
-  if (wrapper) {
-    wrapper.style.position = "relative";
-    wrapper.appendChild(menu);
-  }
+  var _anchorRect = anchor.getBoundingClientRect();
+  menu.style.top = (_anchorRect.bottom + 8) + "px";
+  menu.style.right = (window.innerWidth - _anchorRect.right) + "px";
+  document.body.appendChild(menu);
 
   _charMenuDismissHandler = function (ev) {
     if (menu.contains(ev.target) || anchor.contains(ev.target)) return;
     _dismissCharMenu();
   };
+  var _repositionPending = false;
+  _charMenuScrollHandler = function () {
+    if (_repositionPending) return;
+    _repositionPending = true;
+    requestAnimationFrame(function () {
+      _repositionPending = false;
+      var m = document.getElementById("charContextMenu");
+      if (!m) return;
+      if (!document.body.contains(anchor)) { _dismissCharMenu(); return; }
+      var r = anchor.getBoundingClientRect();
+      m.style.top = (r.bottom + 8) + "px";
+      m.style.right = (window.innerWidth - r.right) + "px";
+    });
+  };
   setTimeout(function () {
     document.addEventListener("click", _charMenuDismissHandler);
+    window.addEventListener("scroll", _charMenuScrollHandler, true);
+    window.addEventListener("resize", _charMenuScrollHandler);
   }, 0);
 }
 
@@ -2368,6 +3656,216 @@ function _dismissCharMenu() {
     document.removeEventListener("click", _charMenuDismissHandler);
     _charMenuDismissHandler = null;
   }
+  if (_charMenuScrollHandler) {
+    window.removeEventListener("scroll", _charMenuScrollHandler, true);
+    window.removeEventListener("resize", _charMenuScrollHandler);
+    _charMenuScrollHandler = null;
+  }
+}
+
+function _deepClonePlain(value) {
+  try {
+    return JSON.parse(JSON.stringify(value || {}));
+  } catch (_e) {
+    return {};
+  }
+}
+
+function _customCharacterCurrentFields(item) {
+  item = item || {};
+  return item.current || item.currentVersion && item.currentVersion.fields || {};
+}
+
+function _customCharacterDisplayName(item) {
+  var fields = _customCharacterCurrentFields(item);
+  return fields.name || item.title || "未命名角色";
+}
+
+function _customCharacterThumbUrl(item) {
+  var fields = _customCharacterCurrentFields(item);
+  var state = deriveAssetCardState(fields, 0);
+  return state.previewThumbUrl || state.previewImageUrl || "";
+}
+
+function _customCharacterCardHtml(item, selectedId) {
+  var fields = _customCharacterCurrentFields(item);
+  var id = item && item.id || "";
+  var name = _customCharacterDisplayName(item);
+  var thumb = _customCharacterThumbUrl(item);
+  var identity = fields.identity || fields.role || "";
+  var selected = id && id === selectedId;
+  return '<button type="button" class="custom-char-choice' + (selected ? ' is-selected' : '') + '" data-custom-char-choice="' + escapeHtml(id) + '">' +
+    '<span class="custom-char-choice-thumb">' +
+      (thumb ? '<img src="' + escapeHtml(thumb) + '" alt="' + escapeHtml(name) + '" loading="lazy" decoding="async" />' : '<span class="material-symbols-outlined">person</span>') +
+    '</span>' +
+    '<span class="custom-char-choice-copy">' +
+      '<strong>' + escapeHtml(name) + '</strong>' +
+      (identity ? '<small>' + escapeHtml(String(identity).slice(0, 48)) + '</small>' : '<small>定制角色</small>') +
+    '</span>' +
+  '</button>';
+}
+
+function _renderCustomCharacterReplaceDialog(idx, loading, errorText) {
+  var overlay = document.getElementById("customCharReplaceDialog");
+  if (!overlay) return;
+  var currentName = project && project.assets && project.assets.characters && project.assets.characters[idx]
+    ? project.assets.characters[idx].name || ("角色 " + (idx + 1))
+    : ("角色 " + (idx + 1));
+  var listHtml = "";
+  if (loading) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined toolbox-spin">progress_activity</span><p>正在加载定制角色</p></div>';
+  } else if (errorText) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined">error</span><p>' + escapeHtml(errorText) + '</p></div>';
+  } else if (!_customCharReplaceItems.length) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined">person_off</span><p>暂无可替换的定制角色</p></div>';
+  } else {
+    listHtml = _customCharReplaceItems.map(function (item) {
+      return _customCharacterCardHtml(item, _customCharReplaceSelection);
+    }).join("");
+  }
+  overlay.innerHTML =
+    '<div class="custom-char-replace-card" role="dialog" aria-modal="true" aria-label="替换角色特征" onclick="event.stopPropagation()">' +
+      '<button type="button" class="custom-char-replace-close" data-custom-char-replace-close title="关闭"><span class="material-symbols-outlined">close</span></button>' +
+      '<div class="custom-char-replace-head">' +
+        '<p>REPLACE CHARACTER TRAITS</p>' +
+        '<h3>替换角色特征</h3>' +
+        '<small>将「' + escapeHtml(currentName) + '」的图片和特征替换为一个已确认的定制角色，角色名称和 ID 保持不变。</small>' +
+      '</div>' +
+      '<div class="custom-char-picker-grid">' + listHtml + '</div>' +
+      '<div class="custom-char-replace-foot">' +
+        '<button type="button" class="custom-char-replace-cancel" data-custom-char-replace-close>取消</button>' +
+        '<button type="button" class="custom-char-replace-confirm" data-custom-char-replace-confirm="' + escapeHtml(String(idx)) + '" ' + (!_customCharReplaceSelection ? 'disabled' : '') + '>确认替换特征</button>' +
+      '</div>' +
+    '</div>';
+  hydrateProtectedImageElements(overlay);
+  var card = overlay.querySelector(".custom-char-replace-card");
+  if (card) {
+    card.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      var close = ev.target.closest("[data-custom-char-replace-close]");
+      if (close) {
+        _dismissCustomCharacterReplaceDialog();
+        return;
+      }
+      var choice = ev.target.closest("[data-custom-char-choice]");
+      if (choice) {
+        _customCharReplaceSelection = choice.getAttribute("data-custom-char-choice") || "";
+        _renderCustomCharacterReplaceDialog(Number(overlay.getAttribute("data-replace-idx") || 0), false, "");
+        return;
+      }
+      var confirm = ev.target.closest("[data-custom-char-replace-confirm]");
+      if (confirm) {
+        var idx = Number(confirm.getAttribute("data-custom-char-replace-confirm"));
+        var selected = _customCharReplaceItems.find(function (item) { return item && item.id === _customCharReplaceSelection; });
+        if (!selected) {
+          showToast("请先选择一个定制角色", "warn");
+          return;
+        }
+        _dismissCustomCharacterReplaceDialog();
+        _replaceAssetCharacterWithCustom(idx, selected);
+      }
+    });
+  }
+}
+
+function _dismissCustomCharacterReplaceDialog() {
+  var overlay = document.getElementById("customCharReplaceDialog");
+  if (overlay) overlay.remove();
+  if (_customCharReplaceDismissHandler) {
+    document.removeEventListener("click", _customCharReplaceDismissHandler);
+    _customCharReplaceDismissHandler = null;
+  }
+  if (_customCharReplaceKeyHandler) {
+    document.removeEventListener("keydown", _customCharReplaceKeyHandler);
+    _customCharReplaceKeyHandler = null;
+  }
+}
+
+async function _openCustomCharacterReplaceDialog(idx) {
+  if (!project || !project.assets || !project.assets.characters || !project.assets.characters[idx]) return;
+  _dismissCustomCharacterReplaceDialog();
+  _customCharReplaceSelection = "";
+  _customCharReplaceItems = [];
+
+  var overlay = document.createElement("div");
+  overlay.id = "customCharReplaceDialog";
+  overlay.className = "custom-char-replace-overlay";
+  overlay.setAttribute("data-replace-idx", String(idx));
+  document.body.appendChild(overlay);
+  _renderCustomCharacterReplaceDialog(idx, true, "");
+
+  overlay.addEventListener("click", function () { _dismissCustomCharacterReplaceDialog(); });
+  _customCharReplaceDismissHandler = function (ev) {
+    if (!overlay.contains(ev.target)) _dismissCustomCharacterReplaceDialog();
+  };
+  _customCharReplaceKeyHandler = function (ev) {
+    if (ev.key === "Escape") _dismissCustomCharacterReplaceDialog();
+  };
+  setTimeout(function () {
+    document.addEventListener("click", _customCharReplaceDismissHandler);
+    document.addEventListener("keydown", _customCharReplaceKeyHandler);
+  }, 0);
+
+  try {
+    // 定制角色是用户级全局库：项目调用环节也不按项目过滤，确保能选到自己所有已确认角色。
+    var url = "/api/character-custom/history?limit=100";
+    var data = await apiGet(url, { timeoutMs: 15000 });
+    _customCharReplaceItems = (data.items || []).filter(function (item) {
+      var fields = _customCharacterCurrentFields(item);
+      var state = deriveAssetCardState(fields, 0);
+      return state.status === "ready" || state.status === "degraded";
+    });
+    if (!_customCharReplaceSelection && _customCharReplaceItems.length) {
+      _customCharReplaceSelection = _customCharReplaceItems[0].id || "";
+    }
+    _renderCustomCharacterReplaceDialog(idx, false, "");
+  } catch (e) {
+    _renderCustomCharacterReplaceDialog(idx, false, (e && e.message) || "定制角色加载失败");
+  }
+}
+
+function _customCharacterToAssetCharacter(item, previous) {
+  var fields = _deepClonePlain(_customCharacterCurrentFields(item));
+  previous = previous || {};
+  var preservedName = previous.name || previous.canonicalName || fields.name || item.title || "未命名角色";
+  var preservedId = previous.id || previous.characterId || fields.id || item.id || "";
+  var preservedCharacterId = previous.characterId || previous.id || preservedId || fields.characterId || fields.id || item.id || "";
+  var next = {
+    ...fields,
+    id: preservedId,
+    characterId: preservedCharacterId,
+    name: preservedName,
+    customCharacterId: item.id || "",
+    customCharacterVersionId: item.currentVersion && item.currentVersion.id || item.currentVersionId || "",
+    _fromCustomCharacter: true,
+  };
+  next.canonicalName = previous.canonicalName || preservedName;
+  if (previous.assetId) next.assetId = previous.assetId;
+  if (previous.materialId) next.materialId = previous.materialId;
+  if (previous.sourceAssetId) next.sourceAssetId = previous.sourceAssetId;
+  delete next.imageLastError;
+  delete next.imageFailedAt;
+  delete next._pencilFailed;
+  return next;
+}
+
+function _replaceAssetCharacterWithCustom(idx, item) {
+  if (!project || !project.assets || !project.assets.characters || !project.assets.characters[idx]) return;
+  var previous = project.assets.characters[idx] || {};
+  var next = _customCharacterToAssetCharacter(item, previous);
+  project.assets.characters[idx] = next;
+  if (Array.isArray(project.characters)) {
+    project.characters[idx] = _deepClonePlain(next);
+  }
+  if (project._staleFlags) {
+    delete project._staleFlags["asset_img_char_" + idx];
+  }
+  _saveAssetsProject();
+  renderAssets();
+  _showAssetActions();
+  if (project.styleBible && _ctx.refreshStylePage) _ctx.refreshStylePage();
+  _syncAssetToStyleBible("char", idx);
+  showToast("已替换角色特征，角色名称和 ID 已保留", "ok");
 }
 
 /**
@@ -2427,6 +3925,143 @@ export async function _retryPencilConversion(idx) {
 }
 
 var _charUploadStreams = {};
+var _assetUploadStreams = {};
+
+function _assetUploadLabel(type) {
+  return type === "scene" ? "场景" : type === "prop" ? "道具" : "角色";
+}
+
+function _assetUploadList(type) {
+  if (!project || !project.assets) return null;
+  if (type === "char") return project.assets.characters;
+  if (type === "scene") return project.assets.scenes;
+  if (type === "prop") return project.assets.props;
+  return null;
+}
+
+function _assetUploadTopList(type) {
+  if (!project) return null;
+  if (type === "char") return project.characters;
+  if (type === "scene") return project.environments;
+  if (type === "prop") return project.props;
+  return null;
+}
+
+function _assetUploadRef(type, idx) {
+  if (type === "char") return "characters[" + idx + "]";
+  if (type === "scene") return "scenes[" + idx + "]";
+  return "props[" + idx + "]";
+}
+
+function _triggerAssetImageUpload(type, idx) {
+  if (type === "char") {
+    _triggerCharImageUpload(idx);
+    return;
+  }
+  var key = type + "_" + idx;
+  var label = _assetUploadLabel(type);
+  if (_assetUploadStreams[key]) {
+    showToast("该" + label + "正在上传中，请稍候", "warn");
+    return;
+  }
+  var input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/jpeg,image/png,image/webp,image/gif";
+  input.style.display = "none";
+  input.addEventListener("change", function () {
+    var file = input.files && input.files[0];
+    if (!file) { input.remove(); return; }
+    if (file.size > 20 * 1024 * 1024) {
+      showToast("图片过大，最大 20MB", "error");
+      input.remove();
+      return;
+    }
+    _uploadAssetImage(type, idx, file).finally(function () { input.remove(); });
+  });
+  document.body.appendChild(input);
+  input.click();
+}
+
+async function _uploadAssetImage(type, idx, file) {
+  var list = _assetUploadList(type);
+  var item = list && list[idx];
+  if (!item) {
+    showToast("当前资产不存在", "warn");
+    return;
+  }
+  var key = type + "_" + idx;
+  var label = _assetUploadLabel(type);
+  var assetName = item.name || (label + "#" + (idx + 1));
+  _assetUploadStreams[key] = true;
+  showToast("正在上传「" + assetName + "」的" + label + "图...", "info");
+
+  var formData = new FormData();
+  formData.append("file", file);
+  formData.append("projectId", project.id || "default");
+  formData.append("assetType", type);
+  formData.append("idx", String(idx));
+  formData.append("assetRef", _assetUploadRef(type, idx));
+
+  try {
+    var authToken = "";
+    try { authToken = localStorage.getItem("sw_auth_token") || ""; } catch(_e) {}
+    var resp = await fetch("/api/assets/upload-char-image", {
+      method: "POST",
+      headers: authToken ? { "Authorization": "Bearer " + authToken } : {},
+      body: formData,
+    });
+    var data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok || data.error) {
+      showToast((data && (data.error || data.detail)) || "上传失败", "error");
+      return;
+    }
+    var uploadedUrl = data.url || "";
+    if (!uploadedUrl) {
+      showToast("上传失败：没有返回图片地址", "error");
+      return;
+    }
+    var displayUrl = data.signedUrl || uploadedUrl;
+    if (typeof _ctx.archiveOldImage === "function") _ctx.archiveOldImage(item, type);
+    item.rawUrl = uploadedUrl;
+    item.imageUrl = uploadedUrl;
+    item.assetId = data.assetId || data.id || item.assetId;
+    item.imageGeneratedAt = new Date().toISOString();
+    item.reference = Object.assign({}, item.reference || {}, {
+      currentUrl: uploadedUrl,
+      lastKnownGoodUrl: uploadedUrl,
+      status: "ready",
+      updatedAt: new Date().toISOString(),
+    });
+    delete item.imageLastError;
+    delete item.imageFailedAt;
+    if (item.reference) {
+      delete item.reference.lastError;
+      delete item.reference.lastFailedAt;
+      delete item.reference.lastAttemptUrl;
+    }
+
+    var top = _assetUploadTopList(type);
+    if (Array.isArray(top) && top[idx]) {
+      top[idx].rawUrl = uploadedUrl;
+      top[idx].imageUrl = uploadedUrl;
+      top[idx].assetId = item.assetId;
+      top[idx].imageGeneratedAt = item.imageGeneratedAt;
+      top[idx].reference = Object.assign({}, top[idx].reference || {}, item.reference || {});
+      delete top[idx].imageLastError;
+      delete top[idx].imageFailedAt;
+    }
+    if (project._staleFlags) delete project._staleFlags["asset_img_" + type + "_" + idx];
+    _saveAssetsProject();
+    updateAssetCardImage(type, idx, "done", displayUrl);
+    renderAssets();
+    _showAssetActions();
+    showToast(label + "图上传成功，已保存为当前参考图", "success");
+  } catch (e) {
+    showToast("上传失败：" + ((e && e.message) || e), "error");
+  } finally {
+    delete _assetUploadStreams[key];
+  }
+}
 
 function _triggerCharImageUpload(charIdx) {
   if (_charUploadStreams[charIdx]) {
@@ -2557,12 +4192,6 @@ export function _openLightbox(imgUrl, title, originalUrl) {
   if (existing) existing.remove();
 
   var safeTitle = String(title || "").trim();
-  var safeOriginalUrl = String(originalUrl || "").trim();
-  var originalLinkHtml = safeOriginalUrl
-    ? '<a class="asset-lightbox-original" href="' + escapeHtml(safeOriginalUrl) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="查看原图" style="position:absolute;right:58px;top:12px;width:34px;height:34px;border-radius:999px;background:rgba(255,255,255,.12);color:#fff;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(8px);">' +
-        '<span class="material-symbols-outlined" style="font-size:18px;">open_in_new</span>' +
-      '</a>'
-    : '';
   var headerHtml = safeTitle
     ? '<div class="asset-lightbox-header" style="position:absolute;top:-52px;left:50%;transform:translateX(-50%);z-index:10010;width:100vw;height:42px;display:flex;align-items:center;justify-content:center;pointer-events:none;" onclick="event.stopPropagation()">' +
         '<div class="asset-lightbox-caption" style="width:auto;max-width:min(80vw,960px);padding:0 52px;border:0;background:transparent;color:#fff;font-size:16px;font-weight:900;line-height:1.45;text-align:center;box-shadow:none;text-shadow:0 2px 4px rgba(0,0,0,.95),0 8px 24px rgba(0,0,0,.72);">' + escapeHtml(safeTitle) + '</div>' +
@@ -2584,7 +4213,6 @@ export function _openLightbox(imgUrl, title, originalUrl) {
           '<span>原图链接失效或文件不可访问</span>' +
         '</div>' +
       '</div>' +
-      originalLinkHtml +
       '<button class="asset-lightbox-close" onclick="this.closest(\'#assetLightbox\').remove()">' +
         '<span class="material-symbols-outlined">close</span>' +
       '</button>' +
@@ -2768,6 +4396,12 @@ export function _getStyleTemplates() {
   return Array.isArray(_styleTemplatesMem) ? _styleTemplatesMem : [];
 }
 
+// 是否已完成首次拉取（不论结果是否为空）。用于区分「加载中」与「真的没有模板」，
+// 避免风格页刷新/重载时先闪一下「暂无可用风格模板」空态。
+export function _styleTemplatesLoaded() {
+  return _styleTemplatesPrimed;
+}
+
 async function _loadWorldTemplateDetail(tpl) {
   if (!tpl || !tpl.id) return tpl;
   if (!tpl.summaryOnly && (Array.isArray(tpl.characters) || tpl.styleBible || tpl.loadedAt)) return tpl;
@@ -2804,6 +4438,44 @@ export function snapshotWorldTemplate(tpl) {
   if (!snap.id && source.id) snap.id = source.id;
   if (!snap.name && source.name) snap.name = source.name;
   return snap;
+}
+
+function _projectStyleTemplatePreferenceForWorldSnapshot() {
+  if (!project || typeof project !== "object") return null;
+  var snapshot = project.styleTemplateSnapshot && typeof project.styleTemplateSnapshot === "object"
+    ? project.styleTemplateSnapshot
+    : {};
+  var id = String(
+    project.selectedStyleTemplateId ||
+    snapshot.id ||
+    snapshot.templateId ||
+    snapshot.template_id ||
+    ""
+  ).trim();
+  if (!id) return null;
+  var name = String(
+    snapshot.name ||
+    snapshot.title ||
+    snapshot.styleName ||
+    snapshot.label ||
+    ""
+  ).trim();
+  return {
+    preferredStyleTemplateId: id,
+    preferredStyleTemplateName: name,
+    preferredStyleTemplateSource: "project_style_selection"
+  };
+}
+
+function _attachProjectStylePreferenceToWorldSnapshot(worldSnapshot) {
+  if (!worldSnapshot || typeof worldSnapshot !== "object") return worldSnapshot;
+  if (worldSnapshot.preferredStyleTemplateId || worldSnapshot.preferred_style_template_id) return worldSnapshot;
+  var preference = _projectStyleTemplatePreferenceForWorldSnapshot();
+  if (!preference) return worldSnapshot;
+  worldSnapshot.preferredStyleTemplateId = preference.preferredStyleTemplateId;
+  if (preference.preferredStyleTemplateName) worldSnapshot.preferredStyleTemplateName = preference.preferredStyleTemplateName;
+  worldSnapshot.preferredStyleTemplateSource = preference.preferredStyleTemplateSource;
+  return worldSnapshot;
 }
 
 function _parseWorldTemplateResponse(resp) {
@@ -3023,6 +4695,67 @@ function _renderKnowledgeTemplate(title, tpl, drift) {
   '</section>';
 }
 
+function _knowledgeConflictReasonText(reason) {
+  var text = String(reason || "").trim();
+  var m = /^world_template_conflict:([^:]+):(.+)$/.exec(text);
+  if (!m) return text || "存在待复核的一致性差异";
+  var fieldMap = {
+    "canonicalName": "角色名称",
+    "identityLock.role": "身份角色",
+    "identityLock.identity": "身份设定",
+    "identityLock.entityType": "实体类型",
+    "identityLock.species": "物种",
+    "identityLock.gender": "性别",
+    "identityLock.ageBand": "年龄段",
+    "visualLock.appearance": "外貌",
+    "visualLock.clothing": "服装",
+    "visualLock.equipment": "装备",
+    "visualLock.scaleRule": "比例规则",
+    "visualLock.negativeRules": "外观禁忌",
+    "visualLock.signatureColors": "标志色",
+    "performanceLock.temperament": "气质",
+    "performanceLock.actionTraits": "动作习惯",
+    "performanceLock.gestureRules": "手势规则",
+    "voiceLock.voiceGender": "声音性别",
+    "voiceLock.voiceAge": "声音年龄",
+    "voiceLock.timbre": "音色",
+    "voiceLock.speechStyle": "说话方式",
+    "voiceLock.accent": "口音",
+    "referenceLock.sheetUrl": "参考图",
+  };
+  return m[1] + "：" + (fieldMap[m[2]] || m[2]) + " 与世界观模板不一致";
+}
+
+function _renderKnowledgeConsistencyAlerts(consistency) {
+  var reasons = consistency && Array.isArray(consistency.roleSyncReasons) ? consistency.roleSyncReasons : [];
+  if (!(consistency && consistency.needsRoleSync) && !reasons.length) return "";
+  var reasonHtml = reasons.length
+    ? '<ul class="mt-2 space-y-1">' + reasons.slice(0, 8).map(function (reason) {
+        return '<li class="text-xs text-[#8A5A00] leading-relaxed">• ' + escapeHtml(_knowledgeConflictReasonText(reason)) + '</li>';
+      }).join("") + '</ul>'
+    : '<p class="text-xs text-[#8A5A00] mt-2">角色锁与世界观模板存在待复核差异。</p>';
+  return '<section class="rounded-xl border border-[#F7D48B] bg-[#FFF8E6] p-4">' +
+    '<div class="flex items-center gap-2">' +
+      '<span class="material-symbols-outlined text-base text-[#B45309]">warning</span>' +
+      '<h4 class="text-sm font-bold text-[#8A5A00]">世界观 / 角色一致性待复核</h4>' +
+    '</div>' +
+    reasonHtml +
+  '</section>';
+}
+
+function _renderKnowledgePendingWorldFacts(pending) {
+  if (!pending) return "";
+  var summary = pending.summary || {};
+  return '<section class="rounded-xl border border-[#D6E4FF] bg-[#F5F8FF] p-4">' +
+    '<div class="flex items-center gap-2">' +
+      '<span class="material-symbols-outlined text-base text-[#3156A3]">priority_high</span>' +
+      '<h4 class="text-sm font-bold text-[#24427A]">待确认的世界观回填</h4>' +
+    '</div>' +
+    '<p class="text-xs text-[#526989] mt-2 leading-relaxed">资产抽取发现可补充到世界观的空字段，确认后才会写入剧级世界观。</p>' +
+    _knowledgeInfoRow("候选", (summary.characterCount || 0) + " 个角色 / " + (summary.locationCount || 0) + " 个场景 / " + (summary.propCount || 0) + " 个道具") +
+  '</section>';
+}
+
 function _renderKnowledgeCharacters(characters) {
   if (!characters || !characters.length) {
     return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
@@ -3115,6 +4848,7 @@ export async function openKnowledgeSnapshot() {
     if (!resp.ok) throw new Error(data.detail || "读取失败");
     var style = data.style || {};
     var world = data.world || {};
+    var consistency = data.consistency || {};
     var body = overlay.querySelector("#knowledgeSnapshotBody");
     body.innerHTML =
       '<div class="space-y-4">' +
@@ -3126,6 +4860,8 @@ export async function openKnowledgeSnapshot() {
         '</section>' +
         _renderKnowledgeTemplate("风格模板", style.template, style.drift) +
         _renderKnowledgeTemplate("世界观模板", world.template, world.drift) +
+        _renderKnowledgePendingWorldFacts(world.pendingFacts) +
+        _renderKnowledgeConsistencyAlerts(consistency) +
         _renderKnowledgeCharacters(data.characters || []) +
         _renderKnowledgeStages(data.recentStages || []) +
       '</div>';
@@ -3135,6 +4871,27 @@ export async function openKnowledgeSnapshot() {
       errBody.innerHTML = '<div class="rounded-xl border border-[#FFCDD2] bg-[#FFF5F5] p-5 text-sm text-[#B71C1C]">读取失败：' + escapeHtml((e && e.message) || e) + '</div>';
     }
   }
+}
+
+export async function confirmPendingWorldFacts() {
+  if (!project || !project.id) { showToast("请先打开项目", "warn"); return; }
+  var pending = project.pendingWorldFacts;
+  var snapshot = pending && pending.worldTemplateSnapshot;
+  if (!snapshot) { showToast("没有待确认的世界观更新", "info"); return; }
+  var summary = pending.summary || {};
+  var msg = "将把本次资产抽取得到的空字段补充写入当前项目世界观。";
+  if (summary.characterCount || summary.locationCount || summary.propCount) {
+    msg += "\n\n候选包含：" + (summary.characterCount || 0) + " 个角色 / " + (summary.locationCount || 0) + " 个场景 / " + (summary.propCount || 0) + " 个道具。";
+  }
+  msg += "\n\n已存在的非空字段不会被覆盖。";
+  var ok = await showConfirm("确认世界观更新", msg, "确认更新", "取消");
+  if (!ok) return;
+  project.worldTemplateSnapshot = snapshot;
+  project.selectedWorldTemplateId = snapshot.id || project.selectedWorldTemplateId || null;
+  project.pendingWorldFacts = null;
+  _saveAssetsProject();
+  _refreshWorldKnowledgeButtons();
+  showToast("世界观更新已确认", "success");
 }
 
 function _openSaveTemplateDialog() {
@@ -3186,7 +4943,7 @@ function _openSaveTemplateDialog() {
           '</div>' +
           '<div>' +
           '<h3 class="text-base font-bold text-[#1a1a1a]">保存为世界观模板</h3>' +
-          '<p class="text-[11px] text-[#90A4AE] mt-0.5">保存角色与世界观参考，不包含风格圣经</p>' +
+          '<p class="text-[11px] text-[#90A4AE] mt-0.5">保存角色与世界观参考，并记录当前风格模板偏好</p>' +
           '</div>' +
         '</div>' +
         '<div class="mb-5">' +
@@ -3302,26 +5059,9 @@ async function _doSaveWorldTemplate(name, options) {
 export function _applyWorldTemplate(tpl) {
   if (!project) return;
 
-  var worldSnapshot = snapshotWorldTemplate(tpl);
+  var worldSnapshot = _attachProjectStylePreferenceToWorldSnapshot(snapshotWorldTemplate(tpl));
   project.selectedWorldTemplateId = worldSnapshot.id || tpl.id || project.selectedWorldTemplateId || null;
   project.worldTemplateSnapshot = worldSnapshot;
-
-  if (tpl.characters && tpl.characters.length) {
-    if (!project.assets) project.assets = { characters: [], scenes: [], props: [] };
-    var existing = project.assets.characters || [];
-    var existingNames = {};
-    existing.forEach(function (c) { if (c.name) existingNames[c.name] = true; });
-
-    tpl.characters.forEach(function (ch) {
-      var copy = JSON.parse(JSON.stringify(ch));
-      if (existingNames[copy.name]) {
-        copy.name = copy.name + "（模板）";
-      }
-      copy._fromTemplate = tpl.name || "模板";
-      existing.push(copy);
-    });
-    project.assets.characters = existing;
-  }
 
   if (project.shots && project.shots.length) {
     project.shots = [];
@@ -3336,7 +5076,7 @@ export function _applyWorldTemplate(tpl) {
   _saveAssetsProject();
 
   var charCount = (tpl.characters || []).length;
-  showToast("已导入世界观模板：世界观来源已记录，" + charCount + " 个角色已追加到资产库", "success");
+  showToast("已应用世界观模板：世界观来源已记录，" + charCount + " 个角色将进入一致性对账", "success");
 
   _ctx.refreshOverview();
   _ctx.switchPage("assets");
@@ -3345,19 +5085,8 @@ export function _applyWorldTemplate(tpl) {
 export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
   if (!project || !tpl) return;
 
-  var selectedId = String(project.selectedWorldTemplateId || "");
-  var tplId = String(tpl.id || "");
-  if (selectedId && tplId && selectedId === tplId) {
-    project.selectedWorldTemplateId = null;
-    project.worldTemplateSnapshot = null;
-    _saveAssetsProject();
-    if (_ctx.refreshStylePage) _ctx.refreshStylePage();
-    showToast("已清除关联世界观", "info");
-    return;
-  }
-
   var full = await _loadWorldTemplateDetail(tpl);
-  var worldSnapshot = snapshotWorldTemplate(full || tpl);
+  var worldSnapshot = _attachProjectStylePreferenceToWorldSnapshot(snapshotWorldTemplate(full || tpl));
   project.selectedWorldTemplateId = worldSnapshot.id || full.id || tpl.id || null;
   project.worldTemplateSnapshot = worldSnapshot;
   _saveAssetsProject();
@@ -3371,12 +5100,19 @@ export async function _applyWorldTemplateFromStylePage(tpl) {
 
 export async function _applyStyleTemplateFromStylePage(tpl) {
   if (!project || !tpl) return;
+  if (!project.styleOptions || typeof project.styleOptions !== "object") project.styleOptions = {};
 
   var selectedId = String(project.selectedStyleTemplateId || "");
   var tplId = String(tpl.id || "");
   if (selectedId && tplId && selectedId === tplId) {
     project.selectedStyleTemplateId = null;
     project.styleTemplateSnapshot = null;
+    project.styleOptions.styleTemplateSelectionMode = "manual_clear";
+    project.styleOptions.styleTemplateSelectionSource = "manual_clear";
+    project.styleOptions.styleTemplateSelectedAt = new Date().toISOString();
+    delete project.styleOptions.autoStyleTemplateId;
+    delete project.styleOptions.autoStyleTemplateReason;
+    delete project.styleOptions.autoStyleTemplateScriptKey;
     _saveAssetsProject();
     if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     showToast("已清除风格模板选择", "info");
@@ -3385,6 +5121,12 @@ export async function _applyStyleTemplateFromStylePage(tpl) {
 
   project.selectedStyleTemplateId = tpl.id || null;
   project.styleTemplateSnapshot = JSON.parse(JSON.stringify(tpl));
+  project.styleOptions.styleTemplateSelectionMode = "manual";
+  project.styleOptions.styleTemplateSelectionSource = "manual";
+  project.styleOptions.styleTemplateSelectedAt = new Date().toISOString();
+  delete project.styleOptions.autoStyleTemplateId;
+  delete project.styleOptions.autoStyleTemplateReason;
+  delete project.styleOptions.autoStyleTemplateScriptKey;
   _saveAssetsProject();
   if (_ctx.refreshStylePage) _ctx.refreshStylePage();
   showToast("已选择风格模板「" + ((tpl && tpl.name) || "未命名") + "」。它会参与生成风格圣经。", "success");
@@ -3461,7 +5203,7 @@ export function _openTemplateImportModal() {
       '<div class="flex items-center justify-between px-6 py-4 border-b border-outline-variant/10">' +
         '<div>' +
           '<h3 class="text-lg font-bold text-on-background">从世界观模板创建</h3>' +
-          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个模板，将关联世界观并追加角色到当前项目</p>' +
+          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个模板，将关联世界观作为剧级内容参考</p>' +
         '</div>' +
         '<button class="w-9 h-9 rounded-full hover:bg-surface-container flex items-center justify-center transition-colors" id="btnCloseTplModal">' +
           '<span class="material-symbols-outlined text-on-surface-variant">close</span>' +
@@ -3487,7 +5229,7 @@ export function _openTemplateImportModal() {
       if (!tpl) return;
       showConfirm(
         "导入模板",
-        "将关联世界观并追加角色到资产库，已有镜头表和分镜将被清空，确定继续？",
+        "将关联世界观模板，已有镜头表和分镜将被清空，确定继续？",
         async function () {
           try {
             var full = await _loadWorldTemplateDetail(tpl);
@@ -3666,27 +5408,164 @@ export function _collectLibraryAssets(proj) {
   return assets;
 }
 
-export async function refreshLibraryPage() {
-  var projList = _ctx.getProjectList();
-  if (project && !projList.some(function (p) { return p.id === project.id; })) {
-    projList.unshift({ id: project.id, name: project.name });
+// 项目创建时间倒序：优先 createdAt；老数据缺失时退回 updatedAt，数值(ms) 或 ISO 字符串都兼容。
+function _projEntryTime(p) {
+  if (!p) return 0;
+  var t = (p.createdAt != null) ? p.createdAt : p.updatedAt;
+  if (t == null) return 0;
+  if (typeof t === "number") return t;
+  var parsed = Date.parse(t);
+  return isNaN(parsed) ? 0 : parsed;
+}
+
+function _projTabButtonHtml(p) {
+  var active = p.id === _libActiveProject;
+  var name = p.name || "未命名项目";
+  return '<button type="button" class="lib-proj-btn px-6 py-2.5 rounded-xl text-xs font-bold tracking-[0.1em] uppercase transition-all duration-200 ' +
+    (active
+      ? 'bg-[#2C3E50] text-white shadow-lg'
+      : 'bg-white/60 text-[#2C3E50] hover:bg-white/80 border border-[#CFD8DC]') +
+    '" data-proj-id="' + escapeHtml(p.id) + '" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</button>';
+}
+
+// 贪心地把按钮按宽度排进若干行（和 flex-wrap 的换行算法一致），返回每行的按钮下标数组。
+function _packTabRows(widths, avail) {
+  var rows = [], cur = [], curW = 0;
+  for (var i = 0; i < widths.length; i++) {
+    var w = widths[i];
+    var next = cur.length === 0 ? w : curW + _LIB_PROJ_GAP + w;
+    if (cur.length && next > avail) { rows.push(cur); cur = [i]; curW = w; }
+    else { cur.push(i); curW = next; }
   }
+  if (cur.length) rows.push(cur);
+  return rows;
+}
+
+/**
+ * 素材库「项目切换」标签：最多显示两行，超出则分页。
+ * Pager 显示在「全部 / 图片 / 视频」tabs 的右侧；项目标签区始终按自身全宽
+ * 打包成每页两行，保证新项目排在第一页左上角。
+ * 每页渲染时其余按钮 display:none，flex-wrap 会把当前页精确排成它的那两行。
+ */
+function _renderProjectTabs(projList) {
+  _libProjList = projList || [];
+  var tabsWrap = $("libProjectTabs");
+  var pager = $("libProjectPager");
+  if (!tabsWrap) return;
+
+  tabsWrap.innerHTML = _libProjList.map(_projTabButtonHtml).join("");
+  var btns = Array.prototype.slice.call(tabsWrap.querySelectorAll(".lib-proj-btn"));
+  if (!btns.length) {
+    _libProjPages = [];
+    if (pager) { pager.hidden = true; pager.innerHTML = ""; }
+    return;
+  }
+
+  // 容器还不可测量（页面尚未显示）→ 退化为单页不分页，后续 resize / 重进会修正。
+  var fullWidth = tabsWrap.clientWidth;
+  if (!fullWidth) {
+    _libProjPages = [btns];
+    _libProjPage = 0;
+    if (pager) pager.hidden = true;
+    return;
+  }
+
+  var widths = btns.map(function (b) { return b.offsetWidth; });
+  var rows = _packTabRows(widths, fullWidth);
+  if (rows.length <= 2) {
+    _libProjPages = [btns];
+    _libProjPage = 0;
+    if (pager) { pager.hidden = true; pager.innerHTML = ""; }
+    return;
+  }
+
+  var pages = [];
+  for (var r = 0; r < rows.length; r += 2) {
+    var idxs = rows[r].concat(rows[r + 1] || []);
+    pages.push(idxs.map(function (i) { return btns[i]; }));
+  }
+  _libProjPages = pages;
+
+  // 默认停在第 1 页（最新）；页码只随用户翻页 / resize 变化，刷新后回到第 1 页，
+  // 不再自动跳到激活项目所在页（激活项目可能是较旧、在后面页的项目）。
+  if (_libProjPage >= pages.length) _libProjPage = pages.length - 1;
+  if (_libProjPage < 0) _libProjPage = 0;
+  _applyProjectTabPage();
+}
+
+function _applyProjectTabPage() {
+  var pager = $("libProjectPager");
+  var pages = _libProjPages || [];
+  if (pages.length <= 1) {
+    if (pager) { pager.hidden = true; pager.innerHTML = ""; }
+    (pages[0] || []).forEach(function (b) { b.style.display = ""; });
+    return;
+  }
+  if (_libProjPage < 0) _libProjPage = 0;
+  if (_libProjPage >= pages.length) _libProjPage = pages.length - 1;
+  pages.forEach(function (pg, i) {
+    var show = i === _libProjPage;
+    pg.forEach(function (b) { b.style.display = show ? "" : "none"; });
+  });
+  _renderProjectPager();
+}
+
+function _projectPagerSequence(total, page) {
+  if (total <= 4) {
+    var all = [];
+    for (var i = 1; i <= total; i++) all.push(i);
+    return all;
+  }
+  if (page <= 2) return [1, 2, 3, "more-end"];
+  if (page >= total - 1) return ["more-start", total - 2, total - 1, total];
+  return ["more-start", page - 1, page, page + 1, "more-end"];
+}
+
+function _renderProjectPager() {
+  var pager = $("libProjectPager");
+  if (!pager) return;
+  var total = (_libProjPages || []).length;
+  if (total <= 1) {
+    pager.hidden = true;
+    pager.innerHTML = "";
+    return;
+  }
+
+  var page = _libProjPage + 1;
+  var html = "";
+  html += '<button type="button" class="lib-project-pager__btn lib-project-pager__btn--nav" data-lib-proj-page-action="prev"' + (page <= 1 ? " disabled" : "") + '>上一页</button>';
+  _projectPagerSequence(total, page).forEach(function (item) {
+    if (typeof item === "number") {
+      html += '<button type="button" class="lib-project-pager__btn' + (item === page ? " is-active" : "") + '" data-lib-proj-page="' + item + '"' + (item === page ? ' aria-current="page"' : "") + '>' + item + '</button>';
+    } else {
+      html += '<span class="lib-project-pager__ellipsis" aria-hidden="true">…</span>';
+    }
+  });
+  html += '<button type="button" class="lib-project-pager__btn lib-project-pager__btn--nav" data-lib-proj-page-action="next"' + (page >= total ? " disabled" : "") + '>下一页</button>';
+  pager.innerHTML = html;
+  pager.hidden = false;
+}
+
+function _goProjectTabPage(pageIdx) {
+  var total = (_libProjPages || []).length;
+  if (!total) return;
+  var next = Math.max(0, Math.min(total - 1, pageIdx));
+  if (next === _libProjPage) return;
+  _libProjPage = next;
+  _applyProjectTabPage();
+}
+
+export async function refreshLibraryPage() {
+  var projList = (_ctx && typeof _ctx.getProjectList === "function" ? _ctx.getProjectList() : []) || [];
+  if (project && !projList.some(function (p) { return p.id === project.id; })) {
+    projList.unshift({ id: project.id, name: project.name, createdAt: project.createdAt });
+  }
+  // 创建时间倒序：新项目在前、旧项目在后（配合分页：第 1 页最新，页码越大越旧）。
+  projList.sort(function (a, b) { return _projEntryTime(b) - _projEntryTime(a); });
   if (!_libActiveProject && project) _libActiveProject = project.id;
   if (!_libActiveProject && projList.length) _libActiveProject = projList[0].id;
 
-  var tabsWrap = $("libProjectTabs");
-  if (tabsWrap) {
-    var html = "";
-    projList.forEach(function (p) {
-      var active = p.id === _libActiveProject;
-      html += '<button class="lib-proj-btn px-6 py-2.5 rounded-xl text-xs font-bold tracking-[0.1em] uppercase transition-all duration-200 ' +
-        (active
-          ? 'bg-[#2C3E50] text-white shadow-lg'
-          : 'bg-white/60 text-[#2C3E50] hover:bg-white/80 border border-[#CFD8DC]') +
-        '" data-proj-id="' + escapeHtml(p.id) + '">' + escapeHtml(p.name || "未命名项目") + '</button>';
-    });
-    tabsWrap.innerHTML = html;
-  }
+  _renderProjectTabs(projList);
 
   var templates = _getWorldTemplates();
   var countTpl = document.querySelector(".lib-count-template");
@@ -3712,7 +5591,8 @@ export async function refreshLibraryPage() {
   }
 
   var typeTabs = tabs[0] && tabs[0].closest(".flex.items-center");
-  var projSection = tabsWrap ? tabsWrap.closest("section") : null;
+  var projTabsEl = $("libProjectTabs");
+  var projSection = projTabsEl ? projTabsEl.closest("section") : null;
   if (_libActiveTab === "template") {
     if (typeTabs) typeTabs.hidden = true;
     if (projSection) projSection.hidden = true;
@@ -3735,7 +5615,9 @@ export async function refreshLibraryPage() {
     return;
   }
 
-  var targetProj = (_libActiveProject === (project && project.id)) ? project : await loadProjectData(_libActiveProject);
+  var targetProj = _libActiveProject
+    ? ((_libActiveProject === (project && project.id)) ? project : await loadProjectData(_libActiveProject))
+    : (project || null);
   var allAssets = _collectLibraryAssets(targetProj);
 
   var images = allAssets.filter(function (a) { return a.type === "image"; });
@@ -3796,7 +5678,11 @@ export async function refreshLibraryPage() {
       cards +=
         '<div class="' + colSpan + ' relative group rounded-xl overflow-hidden bg-white/60 border border-[#CFD8DC] shadow-sm hover:shadow-xl transition-all duration-500 cursor-pointer" data-lib-action="view-image" data-lib-url="' + escapeHtml(asset.url) + '">' +
           '<div class="' + aspect + ' relative">' +
-            '<img class="w-full h-full object-cover" src="' + escapeHtml(asset.url) + '" alt="' + escapeHtml(asset.name) + '" loading="lazy" />' +
+            '<img class="lib-img w-full h-full object-cover" src="' + escapeHtml(asset.url) + '" alt="' + escapeHtml(asset.name) + '" loading="lazy" />' +
+            '<div class="lib-img-fallback hidden absolute inset-0 flex-col items-center justify-center bg-[#ECEFF1] text-[#90A4AE] pointer-events-none">' +
+              '<span class="material-symbols-outlined text-3xl">broken_image</span>' +
+              '<span class="text-[9px] font-bold uppercase tracking-widest mt-1">资源不可用</span>' +
+            '</div>' +
             '<div class="absolute inset-0 bg-[#0B1320]/85 opacity-0 group-hover:opacity-100 transition-all duration-400 p-6 flex flex-col justify-between">' +
               '<div>' +
                 '<div class="flex items-center gap-2 mb-4">' +
@@ -3818,6 +5704,26 @@ export async function refreshLibraryPage() {
     }
   });
   grid.innerHTML = cards;
+
+  // 受保护图片（/api/images/file/<uuid> 等无签名路径）必须先换成带鉴权的 blob URL，
+  // 否则 <img> 裸 src 直接打受保护接口会 401/403 → 浏览器破图。其余出图路径都做了
+  // 这步水合，素材库历史快照卡片之前漏调用，导致「历史 vN」卡渲染成 "?"。
+  hydrateProtectedImageElements(grid);
+
+  // onerror 兜底：真正失效的 URL（过期 / 已删资产）不再显示生硬的浏览器破图，而是
+  // 回落到占位；load 时再恢复，可自愈「先报错、水合后才换上 blob」的时序竞态。
+  grid.querySelectorAll("img.lib-img").forEach(function (img) {
+    img.addEventListener("error", function () {
+      var fb = img.parentNode && img.parentNode.querySelector(".lib-img-fallback");
+      if (fb) { fb.classList.remove("hidden"); fb.classList.add("flex"); }
+      img.classList.add("hidden");
+    });
+    img.addEventListener("load", function () {
+      var fb = img.parentNode && img.parentNode.querySelector(".lib-img-fallback");
+      if (fb) { fb.classList.add("hidden"); fb.classList.remove("flex"); }
+      img.classList.remove("hidden");
+    });
+  });
 }
 
 function _renderLibraryTemplates(container, templates) {
@@ -3884,7 +5790,7 @@ function _renderLibraryTemplates(container, templates) {
       var idx = parseInt(btn.dataset.tplLibApply, 10);
       var tpl = templates[idx];
       if (!tpl) return;
-      if (!confirm("导入模板将关联世界观并追加角色到资产库，已有的镜头表和分镜将被清空，确定继续？")) return;
+      if (!confirm("导入模板将关联世界观，已有的镜头表和分镜将被清空，确定继续？")) return;
       try {
         var full = await _loadWorldTemplateDetail(tpl);
         _applyWorldTemplate(full);
@@ -3903,6 +5809,40 @@ export function _initLibraryEvents() {
       if (!btn) return;
       _libActiveProject = btn.dataset.projId;
       refreshLibraryPage();
+    });
+  }
+
+  var projPager = $("libProjectPager");
+  if (projPager && !projPager.dataset.bound) {
+    projPager.dataset.bound = "1";
+    projPager.addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-lib-proj-page-action], [data-lib-proj-page]");
+      if (!btn || btn.disabled) return;
+      var action = btn.dataset.libProjPageAction;
+      if (action === "prev") {
+        _goProjectTabPage(_libProjPage - 1);
+        return;
+      }
+      if (action === "next") {
+        _goProjectTabPage(_libProjPage + 1);
+        return;
+      }
+      var page = parseInt(btn.dataset.libProjPage || "", 10);
+      if (!isNaN(page)) _goProjectTabPage(page - 1);
+    });
+  }
+
+  // 容器宽度变化会改变每两行能放下的按钮数，需重新分页（防抖）。
+  if (!_libProjPagerBound) {
+    _libProjPagerBound = true;
+    var _projResizeTimer = null;
+    window.addEventListener("resize", function () {
+      if (_projResizeTimer) clearTimeout(_projResizeTimer);
+      _projResizeTimer = setTimeout(function () {
+        var pageEl = $("pageLibrary");
+        if (!pageEl || pageEl.hidden || !_libProjList.length) return;
+        _renderProjectTabs(_libProjList);
+      }, 150);
     });
   }
 
@@ -4013,6 +5953,14 @@ export function _getAssetDescText(type, idx) {
     if (item.clothing) parts.push(item.clothing);
     if (item.equipment) parts.push(item.equipment);
     return parts.join(" | ");
+  }
+  if (type === "scene") {
+    var sceneParts = [];
+    if (item.description) sceneParts.push(item.description);
+    if (item.location) sceneParts.push("地点：" + item.location);
+    if (item.timeSetting) sceneParts.push("时间：" + item.timeSetting);
+    if (item.atmosphere) sceneParts.push("氛围：" + item.atmosphere);
+    return sceneParts.join(" | ");
   }
   return item.description || "";
 }

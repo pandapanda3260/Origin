@@ -53,6 +53,6 @@ export function clearUserAuthCache(userId?: number) {
 function tokenIssuedBeforeRevocation(issuedAt: number, issuedAtMs: number, revokedAt: string): boolean {
   const revokedAtMs = Date.parse(revokedAt);
   if (!Number.isFinite(revokedAtMs)) return true;
-  if (issuedAtMs > 0) return issuedAtMs < revokedAtMs;
+  if (issuedAtMs > 0) return issuedAtMs <= revokedAtMs;
   return issuedAt <= Math.floor(revokedAtMs / 1000);
 }

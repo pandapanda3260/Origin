@@ -50,6 +50,7 @@ function loadContentSanitizeModule(envPatch = {}) {
 
 const {
   extractImageModerationError,
+  inferImagePromptSafetyHints,
   preflightImageModerationPrompt,
   rewriteImagePromptForModeration,
 } = loadContentSanitizeModule();
@@ -174,6 +175,13 @@ const normalExplanation = extractImageModerationError(
   new Error('Image API 400: {"error":{"message":"说明：该内容不违反版权，系统拒绝生成低质内容"}}'),
 );
 assert(!normalExplanation.blocked, 'unanchored Chinese words should not be treated as moderation');
+
+const hints = inferImagePromptSafetyHints(
+  '广场前排的圆脸少年被金光照得脸色发白，惊惧地仰头。金色符文从指缝喷薄而出，画面像定格的引信。',
+);
+assert(hints.length >= 2, 'safety hints should flag fear and impact imagery');
+assert(hints.some((hint) => hint.text.includes('脸色发白') || hint.text.includes('惊惧')), 'safety hints should include fear phrasing');
+assert(hints.some((hint) => hint.text.includes('喷薄') || hint.text.includes('引信')), 'safety hints should include impact phrasing');
 
 const degradedModule = loadContentSanitizeModule({
   IMAGE_SANITIZE_RULES_PATH: path.join(root, '.missing-image-sanitize-rules.json'),

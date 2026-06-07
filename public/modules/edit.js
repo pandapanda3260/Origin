@@ -2,12 +2,13 @@
  * Edit workbench module — extracted from main.js (stage 2 refactor).
  * Call initEdit(ctx) once at startup, then syncEditProject(p) whenever project changes.
  */
-import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl, fetchUploadSignedUrl, hydrateProtectedImageElements } from './utils.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
+import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js';
 
-// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 96" 才能确认新代码加载到。
-console.log('%c[EDIT_JS_VERSION] 96 —— 剪辑预览会刷新签名播放地址', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 116" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 116 —— BGM 默认关闭并按开关自动匹配', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
 
 let _ctx = {};
 let project = null;
@@ -90,6 +91,214 @@ function _currentEditEdlVersion() {
   return Number.isFinite(v) ? v : 0;
 }
 
+function _stableExportStringify(value) {
+  if (value == null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(_stableExportStringify).join(",") + "]";
+  var keys = Object.keys(value).sort();
+  return "{" + keys.map(function (key) {
+    return JSON.stringify(key) + ":" + _stableExportStringify(value[key]);
+  }).join(",") + "}";
+}
+
+function _sha256Hex(text) {
+  var bytes = new TextEncoder().encode(String(text || ""));
+  var h = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+  ];
+  var k = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  var bitLen = bytes.length * 8;
+  var dataLen = (((bytes.length + 9 + 63) >> 6) << 6);
+  var data = new Uint8Array(dataLen);
+  data.set(bytes);
+  data[bytes.length] = 0x80;
+  var hi = Math.floor(bitLen / 0x100000000);
+  var lo = bitLen >>> 0;
+  data[dataLen - 8] = (hi >>> 24) & 255;
+  data[dataLen - 7] = (hi >>> 16) & 255;
+  data[dataLen - 6] = (hi >>> 8) & 255;
+  data[dataLen - 5] = hi & 255;
+  data[dataLen - 4] = (lo >>> 24) & 255;
+  data[dataLen - 3] = (lo >>> 16) & 255;
+  data[dataLen - 2] = (lo >>> 8) & 255;
+  data[dataLen - 1] = lo & 255;
+  var w = new Uint32Array(64);
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+  for (var offset = 0; offset < data.length; offset += 64) {
+    for (var i = 0; i < 16; i++) {
+      var j = offset + i * 4;
+      w[i] = ((data[j] << 24) | (data[j + 1] << 16) | (data[j + 2] << 8) | data[j + 3]) >>> 0;
+    }
+    for (i = 16; i < 64; i++) {
+      var s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
+      var s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (i = 0; i < 64; i++) {
+      var S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+      var ch = ((e & f) ^ ((~e) & g)) >>> 0;
+      var temp1 = (hh + S1 + ch + k[i] + w[i]) >>> 0;
+      var S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+      var maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      var temp2 = (S0 + maj) >>> 0;
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0;
+    h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0;
+    h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0;
+    h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0;
+    h[7] = (h[7] + hh) >>> 0;
+  }
+  return h.map(function (x) { return (x >>> 0).toString(16).padStart(8, "0"); }).join("");
+}
+
+function _roundExportSec(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  var rounded = Math.round(Math.max(0, n) * 1000) / 1000;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function _extractExportClipIdFromUrl(value) {
+  if (typeof value !== "string") return "";
+  var m = /\/api\/videos\/file\/([a-zA-Z0-9-]+)/.exec(value);
+  return m ? m[1] : "";
+}
+
+function _cleanExportGroupIdx(value) {
+  if (value == null || value === "") return null;
+  var n = Number(value);
+  return Number.isInteger(n) ? n : null;
+}
+
+function _currentClipIdForGroup(groupIdx) {
+  if (!project || !Number.isInteger(Number(groupIdx))) return "";
+  var gi = Number(groupIdx);
+  var sb = Array.isArray(project.storyboards) ? project.storyboards[gi] : null;
+  var vt = Array.isArray(project.videoTasks) ? project.videoTasks[gi] : null;
+  return String(
+    (sb && sb.videoTaskId) ||
+    (vt && (vt.taskId || vt.serverTaskId || vt.id)) ||
+    _extractExportClipIdFromUrl(sb && (sb.videoUrl || sb._originVideoUrl)) ||
+    _extractExportClipIdFromUrl(vt && (vt.url || vt.videoUrl || vt.protectedUrl)) ||
+    ""
+  ).trim();
+}
+
+function _resolveCurrentExportFormat() {
+  var candidates = [
+    project && project.styleOptions && project.styleOptions.aspectRatio,
+    project && project.styleBible && project.styleBible.aspectRatio,
+    project && project.videoAspectRatio,
+    "9:16"
+  ];
+  var ratio = "9:16";
+  for (var i = 0; i < candidates.length; i++) {
+    var r = String(candidates[i] || "").trim();
+    if (/^(16:9|9:16|1:1|21:9|4:3|3:4)$/.test(r)) { ratio = r; break; }
+  }
+  if (ratio === "16:9" || ratio === "4:3" || ratio === "21:9") {
+    return { ratio: "16:9", size: "1920x1080", width: 1920, height: 1080 };
+  }
+  if (ratio === "1:1") return { ratio: "1:1", size: "1024x1024", width: 1024, height: 1024 };
+  return { ratio: "9:16", size: "1080x1920", width: 1080, height: 1920 };
+}
+
+function _currentEditExportSignature(options) {
+  options = options || {};
+  var edl = _currentEditEdl();
+  var timeline = Array.isArray(edl) ? edl : (edl && Array.isArray(edl.timeline) ? edl.timeline : []);
+  if (!timeline.length) return "";
+  var items = [];
+  timeline.forEach(function (entry) {
+    if (!entry) return;
+    var clipId = String(entry.clipId || "").trim();
+    if (!clipId && typeof entry.videoUrl === "string") clipId = _extractExportClipIdFromUrl(entry.videoUrl);
+    if (!clipId && typeof entry.protectedUrl === "string") clipId = _extractExportClipIdFromUrl(entry.protectedUrl);
+    if (!clipId && typeof entry._originVideoUrl === "string") clipId = _extractExportClipIdFromUrl(entry._originVideoUrl);
+    if (!clipId && Number.isInteger(Number(entry.groupIdx))) clipId = _currentClipIdForGroup(Number(entry.groupIdx));
+    if (!clipId) return;
+    var inSec = Math.max(0, Number(entry.inPoint != null ? entry.inPoint : (entry.in != null ? entry.in : 0)) || 0);
+    var outSec = Number(entry.outPoint != null ? entry.outPoint : entry.out);
+    if (!Number.isFinite(outSec) || outSec <= inSec) {
+      outSec = Number(entry.duration) > 0 ? inSec + Number(entry.duration) : 0;
+    }
+    items.push({
+      clipId: clipId,
+      groupIdx: _cleanExportGroupIdx(entry.groupIdx),
+      inSec: _roundExportSec(inSec),
+      outSec: _roundExportSec(outSec),
+      transitionInType: String((entry.transitionIn && entry.transitionIn.type) || entry.transitionIn || "cut").trim().toLowerCase() || "cut"
+    });
+  });
+  if (!items.length) return "";
+  var bgm = edl && edl.bgm && typeof edl.bgm === "object" ? edl.bgm : null;
+  var bgmEnabled = !!(bgm && bgm.enabled === true);
+  var bgmId = bgmEnabled && bgm && bgm.trackId ? String(bgm.trackId).trim() : "";
+  var bgmOffsetTime = bgmId ? _roundExportSec(bgm && bgm.offsetTime) : 0;
+  var resolvedBgm = options.resolvedBgm && typeof options.resolvedBgm === "object" ? options.resolvedBgm : null;
+  if (resolvedBgm && resolvedBgm.trackId) {
+    bgmEnabled = true;
+    bgmId = String(resolvedBgm.trackId).trim();
+    bgmOffsetTime = bgmId ? _roundExportSec(resolvedBgm.offsetTime) : 0;
+  }
+  var payload = {
+    version: 1,
+    exportFormat: _resolveCurrentExportFormat(),
+    items: items,
+    bgm: {
+      enabled: bgmEnabled && !!bgmId,
+      trackId: bgmId,
+      offsetTime: bgmOffsetTime
+    }
+  };
+  return "edit-export-v1:" + _sha256Hex(_stableExportStringify(payload));
+}
+
+function _exportMatchesAutoBgmSignature(exportedSignature) {
+  var editData = _getEditData();
+  var meta = editData.exportedEdlSignatureMeta && typeof editData.exportedEdlSignatureMeta === "object"
+    ? editData.exportedEdlSignatureMeta
+    : null;
+  var bgmMeta = meta && meta.bgm && typeof meta.bgm === "object" ? meta.bgm : null;
+  if (!bgmMeta || bgmMeta.source !== "auto" || !bgmMeta.trackId) return false;
+
+  var edl = _currentEditEdl();
+  var bgm = edl && edl.bgm && typeof edl.bgm === "object" ? edl.bgm : null;
+  if (!bgm || bgm.enabled !== true || bgm.trackId) return false;
+
+  var segmentTags = editData.segmentTags && typeof editData.segmentTags === "object" ? editData.segmentTags : {};
+  if (String(segmentTags.suggestedBGMCategory || "") !== String(bgmMeta.suggestedBGMCategory || "")) return false;
+  if (String(segmentTags.sourceFingerprint || "") !== String(bgmMeta.segmentFingerprint || "")) return false;
+
+  return exportedSignature === _currentEditExportSignature({
+    resolvedBgm: {
+      trackId: bgmMeta.trackId,
+      offsetTime: bgmMeta.offsetTime,
+    },
+  });
+}
+
 function _isAutoComposeRunning() {
   if (_editActionBusy && _editActionBusy.btnEditAutoCompose) return true;
   var runs = _getEditData().composeRuns;
@@ -98,12 +307,20 @@ function _isAutoComposeRunning() {
   });
 }
 
-function _exportVersionMatchesCurrentEdl() {
+function _exportMatchesCurrentEdl() {
   var editData = _getEditData();
   if (!editData.exportUrl) return false;
+  var exportedSignature = String(editData.exportedEdlSignature || "").trim();
+  if (exportedSignature) {
+    var currentSignature = _currentEditExportSignature();
+    return exportedSignature === currentSignature || _exportMatchesAutoBgmSignature(exportedSignature);
+  }
   var exportedVersion = Number(editData.exportedEdlVersion);
   if (!Number.isFinite(exportedVersion)) return false;
-  return exportedVersion === _currentEditEdlVersion();
+  if (exportedVersion !== _currentEditEdlVersion()) return false;
+  var currentSignature = _currentEditExportSignature();
+  if (currentSignature) editData.exportedEdlSignature = currentSignature;
+  return true;
 }
 
 function _getEditExportState() {
@@ -118,7 +335,7 @@ function _getEditExportState() {
     return { state: "exporting", label: "导出中", sub: "Exporting", disabled: true, hint: "" };
   }
   if (editData.exportUrl) {
-    if (_exportVersionMatchesCurrentEdl()) {
+    if (_exportMatchesCurrentEdl()) {
       return { state: "download", label: "下载成片", sub: "Download", disabled: false, hint: "" };
     }
     return {
@@ -126,7 +343,7 @@ function _getEditExportState() {
       label: "需重新成片",
       sub: "Outdated",
       disabled: true,
-      hint: "时间线已修改，请先一键成片",
+      hint: "",
     };
   }
   return { state: "export", label: "下载导出", sub: "Export", disabled: false, hint: "" };
@@ -146,12 +363,8 @@ function _syncEditExportButtonState() {
   btn.title = state.hint || "";
   var hintEl = $("editExportHint");
   if (hintEl) {
-    // 修 B：当 auto-compose blocker 已经在显示更具体的"检测到时间线被手工修改"提示时，
-    // 这里的同义警告就让位，避免双份提示。
-    var blockerEl = $("editAutoComposeBlocker");
-    var blockerVisible = !!(blockerEl && !blockerEl.hidden);
     hintEl.textContent = state.hint || "";
-    hintEl.hidden = blockerVisible || !state.hint;
+    hintEl.hidden = !state.hint;
   }
 }
 
@@ -206,6 +419,12 @@ async function _resyncEditDataFromServer() {
     if (Object.prototype.hasOwnProperty.call(ed, "exportedEdlVersion")) {
       project.editData.exportedEdlVersion = ed.exportedEdlVersion; // arch-guard:allow-editdata 强同步回灌
     }
+    if (Object.prototype.hasOwnProperty.call(ed, "exportedEdlSignature")) {
+      project.editData.exportedEdlSignature = ed.exportedEdlSignature; // arch-guard:allow-editdata 强同步回灌
+    }
+    if (Object.prototype.hasOwnProperty.call(ed, "exportedEdlSignatureMeta")) {
+      project.editData.exportedEdlSignatureMeta = ed.exportedEdlSignatureMeta; // arch-guard:allow-editdata 强同步回灌
+    }
     if (Array.isArray(ed.composeRuns)) project.editData.composeRuns = ed.composeRuns; // arch-guard:allow-editdata 强同步回灌
     if (typeof ed.lastAutoComposeEdlVersion !== "undefined") {
       project.editData.lastAutoComposeEdlVersion = ed.lastAutoComposeEdlVersion; // arch-guard:allow-editdata 强同步回灌
@@ -250,6 +469,7 @@ export function syncEditProject(p) {
     _thumbCache: {},
     /* waveform peak cache: { [groupIdx]: Float32Array } */
     _waveformCache: {},
+    _bgmStatusRafId: null,
     /* undo/redo */
     _undoStack: [],
     _undoPtr: -1,
@@ -259,6 +479,7 @@ export function syncEditProject(p) {
   var _videoUrlHydrationPromise = null;
 
   var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
+  var _PROTECTED_UPLOAD_RE = /\/api\/edit\/media\/([0-9a-fA-F-]{36})/;
 
   function _protectedVideoUrlFrom(url) {
     url = String(url || '').trim();
@@ -267,17 +488,33 @@ export function syncEditProject(p) {
     return m ? '/api/videos/file/' + m[1] : '';
   }
 
+  // 上传素材的"裸"受保护形式（去掉 exp/sig），用于持久化与按需重签。
+  function _protectedUploadUrlFrom(url) {
+    url = String(url || '').trim();
+    if (!url) return '';
+    var m = _PROTECTED_UPLOAD_RE.exec(url);
+    return m ? '/api/edit/media/' + m[1] : '';
+  }
+
+  // 生成片段优先匹配（行为与改前完全一致），否则尝试上传素材。
+  function _protectedMediaUrlFrom(url) {
+    return _protectedVideoUrlFrom(url) || _protectedUploadUrlFrom(url);
+  }
+
   function _segPersistedVideoUrl(seg) {
     if (!seg) return '';
-    return seg._originVideoUrl || seg.protectedUrl || _protectedVideoUrlFrom(seg.videoUrl) || seg.videoUrl || '';
+    return seg._originVideoUrl || seg.protectedUrl || _protectedMediaUrlFrom(seg.videoUrl) || seg.videoUrl || '';
   }
 
   async function _hydrateVideoEntryUrl(entry) {
     if (!entry) return;
     var origin = _segPersistedVideoUrl(entry);
-    if (!_protectedVideoUrlFrom(origin)) return;
+    var isUpload = !_protectedVideoUrlFrom(origin) && !!_protectedUploadUrlFrom(origin);
+    if (!_protectedMediaUrlFrom(origin)) return;
     try {
-      var runtimeUrl = await fetchVideoSignedUrl(origin);
+      var runtimeUrl = isUpload
+        ? await fetchUploadSignedUrl(origin)
+        : await fetchVideoSignedUrl(origin);
       if (runtimeUrl && runtimeUrl !== origin) {
         if (typeof entry._originVideoUrl === 'undefined') entry._originVideoUrl = origin;
         entry.protectedUrl = origin;
@@ -296,7 +533,7 @@ export function syncEditProject(p) {
 
   function _runtimeVideoUrlNeedsRefresh(url) {
     url = String(url || '').trim();
-    var protectedUrl = _protectedVideoUrlFrom(url);
+    var protectedUrl = _protectedMediaUrlFrom(url);
     if (!protectedUrl) return false;
     if (url === protectedUrl) return true;
     try {
@@ -384,12 +621,7 @@ export function syncEditProject(p) {
 	      if (sb.videoIsCurrent === false || (vt && vt.isCurrent === false)) continue;
 	      if (sb.importedToEdit !== true) continue;
       var shots = g.shots || [];
-      // sb.videoDurationSec 是真实生成文件时长；fallback 到 shots[].duration 累加
-      // 只是为了兼容老数据或尚未生成视频的预估。
-      var dur = Number(sb.videoDurationSec) || 0;
-      if (!dur) {
-        shots.forEach(function (shot) { dur += (shot.duration || 4); });
-      }
+      var dur = _resolveGroupImportDuration(gi);
       segs.push({
         groupIdx: g.groupIdx != null ? g.groupIdx : gi,
         videoUrl: sb.videoUrl,
@@ -464,17 +696,80 @@ export function syncEditProject(p) {
     return !!(sb && sb.importedToEdit === true);
   }
 
-  function _sumGroupDuration(groupIdx) {
-    // 优先用真实视频时长；退回 shots[].duration 累加只是兼容老数据 /
-    // 视频还没生成时的预估。
+  function _positiveDurationSec(value) {
+    var n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 10) / 10 : 0;
+  }
+
+  function _completedVideoStatus(value) {
+    var status = String(value || "").toLowerCase();
+    return status === "completed" || status === "done";
+  }
+
+  function _currentMatchedVideoTask(groupIdx) {
     var sb = (project && Array.isArray(project.storyboards)) ? project.storyboards[groupIdx] : null;
-    if (sb && Number(sb.videoDurationSec) > 0) return Number(sb.videoDurationSec);
+    var vt = (project && Array.isArray(project.videoTasks)) ? project.videoTasks[groupIdx] : null;
+    if (!sb || !vt) return null;
+    var sbTaskId = String(sb.videoTaskId || "");
+    var vtTaskId = String(vt.taskId || "");
+    if (!sbTaskId || !vtTaskId || sbTaskId !== vtTaskId) return null;
+    if (sb.videoIsCurrent === false || vt.isCurrent === false) return null;
+    if (!_completedVideoStatus(vt.status)) return null;
+    return vt;
+  }
+
+  function _shotDurationForEdit(shot) {
+    var n = Number(shot && (shot.duration != null ? shot.duration : shot.durationSec));
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 10) / 10 : 4;
+  }
+
+  function _sumProjectShotDurationsForGroup(sb) {
+    if (!project || !Array.isArray(project.shots) || !Array.isArray(sb && sb.shotIndices) || !sb.shotIndices.length) return 0;
+    var total = 0;
+    sb.shotIndices.forEach(function (value) {
+      var idx = Number(value);
+      if (!Number.isInteger(idx) || idx < 0 || !project.shots[idx]) return;
+      total += _shotDurationForEdit(project.shots[idx]);
+    });
+    return _positiveDurationSec(total);
+  }
+
+  function _sumGroupShotDurations(groupIdx) {
     var groups = _ctx.getStoryboardGroups ? _ctx.getStoryboardGroups() : [];
     var g = groups[groupIdx];
-    if (!g || !Array.isArray(g.shots) || !g.shots.length) return 5;
+    if (!g || !Array.isArray(g.shots) || !g.shots.length) return 0;
     var dur = 0;
-    g.shots.forEach(function (s) { dur += (s.duration || 4); });
-    return dur || 5;
+    g.shots.forEach(function (s) { dur += _shotDurationForEdit(s); });
+    return _positiveDurationSec(dur);
+  }
+
+  function _resolveTrustedActualDuration(groupIdx) {
+    var sb = (project && Array.isArray(project.storyboards)) ? project.storyboards[groupIdx] : null;
+    if (!sb) return 0;
+    var storyboardDuration = _positiveDurationSec(sb.videoDurationSec);
+    if (storyboardDuration > 0) return storyboardDuration;
+    var vt = _currentMatchedVideoTask(groupIdx);
+    return vt ? _positiveDurationSec(vt.durationSec != null ? vt.durationSec : vt.duration_sec) : 0;
+  }
+
+  function _resolveGroupImportDuration(groupIdx) {
+    var sb = (project && Array.isArray(project.storyboards)) ? project.storyboards[groupIdx] : null;
+    if (!sb) return 5;
+    var trustedActual = _resolveTrustedActualDuration(groupIdx);
+    if (trustedActual > 0) return trustedActual;
+    var plannedDuration = _positiveDurationSec(sb.plannedDurationSec);
+    if (plannedDuration > 0) return plannedDuration;
+    var storyboardDuration = _positiveDurationSec(sb.durationSec != null ? sb.durationSec : sb.duration);
+    if (storyboardDuration > 0) return storyboardDuration;
+    var projectShotDuration = _sumProjectShotDurationsForGroup(sb);
+    if (projectShotDuration > 0) return projectShotDuration;
+    var groupShotDuration = _sumGroupShotDurations(groupIdx);
+    if (groupShotDuration > 0) return groupShotDuration;
+    return 5;
+  }
+
+  function _sumGroupDuration(groupIdx) {
+    return _resolveGroupImportDuration(groupIdx);
   }
 
   /** 把 _editState.edl.timeline 里"陈旧的 duration / outPoint"修正到当前
@@ -486,8 +781,7 @@ export function syncEditProject(p) {
     var changed = false;
     _editState.edl.timeline.forEach(function (item) {
       if (!item || item.groupIdx == null) return;
-      var sb = project.storyboards[item.groupIdx];
-      var realDur = sb && Number(sb.videoDurationSec) > 0 ? Number(sb.videoDurationSec) : 0;
+      var realDur = _resolveTrustedActualDuration(item.groupIdx);
       if (!realDur) return;
       var curDur = Number(item.duration) || 0;
       if (Math.abs(curDur - realDur) < 0.05) return;
@@ -536,15 +830,15 @@ export function syncEditProject(p) {
     }
 
     if (_editState.edl && Array.isArray(_editState.edl.timeline)) {
-      var dur2 = _sumGroupDuration(groupIdx);
+      var trustedDur = _resolveTrustedActualDuration(groupIdx);
       _editState.edl.timeline.forEach(function (entry) {
         if (!entry || entry.groupIdx !== groupIdx) return;
         entry.videoUrl = sb.videoUrl;
         entry.protectedUrl = _segPersistedVideoUrl(sb);
         entry._originVideoUrl = _segPersistedVideoUrl(sb);
-        if (!entry.inPoint || Number(entry.inPoint) === 0) {
-          entry.duration = dur2;
-          entry.outPoint = dur2;
+        if (trustedDur > 0 && (!entry.inPoint || Number(entry.inPoint) === 0)) {
+          entry.duration = trustedDur;
+          entry.outPoint = trustedDur;
         }
       });
       if (!project.editData) project.editData = {};
@@ -641,6 +935,7 @@ export function syncEditProject(p) {
       if (guard) guard.hidden = false;
       if (workspace) workspace.hidden = true;
       _renderEditGuardHint(readiness);
+      _syncUndoRedoButtons();
       return;
     }
     if (guard) guard.hidden = true;
@@ -669,6 +964,8 @@ export function syncEditProject(p) {
 
     if (_editState.edl && _editState._undoStack.length === 0) {
       _editSaveUndo();
+    } else {
+      _syncUndoRedoButtons();
     }
 
     _buildSegStartTimes();
@@ -684,19 +981,235 @@ export function syncEditProject(p) {
     // 刷新时也要把 BGM 选择器渲出来——之前只在 _analyzeEditSegments / _generateEditEdl
     // 之后才 render，导致用户刷新页面就完全看不到 BGM 区域，反馈"刷新后没看到 bgm"。
     _renderBgmSelector();
-    _renderBgmClearButton();
+    _renderBgmStatus();
     _renderTransitionPanel();
     _wireTransitionControls();
 
-    // 刷新进来如果 EDL 已经选了 BGM，把 audio 元素 src 同步上，但不 autoplay
+    // 刷新进来如果 EDL 已明确打开 BGM，把 audio 元素 src 同步上，但不 autoplay
     // （等用户按播放才起播）。这样用户一进剪辑页就有正确的 BGM 状态。
-    if (_editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId) {
+    if (_editState.edl && _editState.edl.bgm && _editState.edl.bgm.enabled === true && _editState.edl.bgm.trackId) {
       setTimeout(_syncBgmPlayback, 0);
     }
 
     // E-2.2：若上一次导出任务尚未完成（editData.exportTaskId 有值且无 exportUrl），
     // 刷新回来时自动重订 SSE，保证"刷新不丢状态"宪法。
     _tryResumeExportStream();
+  }
+
+  function _timelineTransitionGapPx() {
+    var el = $("editTimelineArea") || document.documentElement;
+    if (!el || typeof getComputedStyle !== "function") return 36;
+    var raw = getComputedStyle(el).getPropertyValue("--edit-transition-gap");
+    var px = parseFloat(raw || "36");
+    return Number.isFinite(px) ? px : 36;
+  }
+
+  function _timelineContentWidth(totalDur, pps, segCount) {
+    var gaps = Math.max(0, (segCount || 0) - 1) * _timelineTransitionGapPx();
+    return Math.max((totalDur || 0) * pps + gaps + 100, 600);
+  }
+
+  function _timelineDurationWidth(duration, pps) {
+    return Math.max((duration || 0) * pps, 2);
+  }
+
+  function _timelineStarts(segs) {
+    var starts = [];
+    var t = 0;
+    (segs || []).forEach(function (seg) {
+      starts.push(t);
+      t += _segDuration(seg);
+    });
+    return { starts: starts, totalDur: t };
+  }
+
+  function _timelineBoundaryCountForTime(time, starts) {
+    var count = 0;
+    var t = Math.max(0, Number(time) || 0);
+    (starts || []).forEach(function (start, i) {
+      if (i > 0 && t >= start - 0.001) count = i;
+    });
+    return count;
+  }
+
+  function _timelineSegmentLeft(start, index, pps) {
+    return (Number(start) || 0) * pps + Math.max(0, Number(index) || 0) * _timelineTransitionGapPx();
+  }
+
+  function _timelineTransitionCenter(start, index, pps) {
+    return (Number(start) || 0) * pps + (Math.max(1, Number(index) || 1) - 0.5) * _timelineTransitionGapPx();
+  }
+
+  function _timelineTimeToX(time, pps, starts) {
+    return Math.max(0, Number(time) || 0) * pps + _timelineBoundaryCountForTime(time, starts) * _timelineTransitionGapPx();
+  }
+
+  function _timelineXToTime(x, pps, segs, starts) {
+    var px = Math.max(0, Number(x) || 0);
+    var list = segs || [];
+    var st = starts || _timelineStarts(list).starts;
+    if (!list.length || !(pps > 0)) return 0;
+
+    for (var i = 0; i < list.length; i++) {
+      var left = _timelineSegmentLeft(st[i] || 0, i, pps);
+      var right = left + _timelineDurationWidth(_segDuration(list[i]), pps);
+      if (px < left) return st[i] || 0;
+      if (px <= right) return (st[i] || 0) + (px - left) / pps;
+    }
+    var lastIdx = list.length - 1;
+    return (st[lastIdx] || 0) + _segDuration(list[lastIdx]);
+  }
+
+  function _timelineInsertIndexFromClientX(clientX, trackEl) {
+    var list = _getTimelineSegs();
+    if (!list || !list.length) return 0;
+    var pps = _editState.pixelsPerSecond * _editState.zoom;
+    var starts = (_editState.segStartTimes && _editState.segStartTimes.length === list.length)
+      ? _editState.segStartTimes
+      : _timelineStarts(list).starts;
+    var track = trackEl || $("editVideoTrack");
+    if (!track || !track.getBoundingClientRect) return list.length;
+    var x = clientX - track.getBoundingClientRect().left;
+    for (var i = 0; i < list.length; i++) {
+      var left = _timelineSegmentLeft(starts[i] || 0, i, pps);
+      var right = left + _timelineDurationWidth(_segDuration(list[i]), pps);
+      if (x <= (left + right) / 2) return i;
+    }
+    return list.length;
+  }
+
+  function _timelineInsertSlotX(insertIndex, list, starts, pps) {
+    var segs = list || _getTimelineSegs();
+    if (!segs || !segs.length) return 0;
+    var idx = Math.max(0, Math.min(Number(insertIndex) || 0, segs.length));
+    var st = (starts && starts.length === segs.length) ? starts : _timelineStarts(segs).starts;
+    var gap = _timelineTransitionGapPx();
+    if (idx <= 0) return _timelineSegmentLeft(st[0] || 0, 0, pps);
+    if (idx >= segs.length) {
+      var lastIdx = segs.length - 1;
+      var lastLeft = _timelineSegmentLeft(st[lastIdx] || 0, lastIdx, pps);
+      return lastLeft + _timelineDurationWidth(_segDuration(segs[lastIdx]), pps) + gap / 2;
+    }
+    return _timelineTransitionCenter(st[idx] || 0, idx, pps);
+  }
+
+  function _timelineEntryDisplayNo(entry, fallbackIndex) {
+    var raw = entry && entry.groupIdx != null ? Number(entry.groupIdx) : Number(fallbackIndex);
+    if (!Number.isInteger(raw)) raw = Number(fallbackIndex) || 0;
+    return String(raw + 1);
+  }
+
+  function _timelineInsertSlotLabel(insertIndex, list) {
+    var segs = list || _getTimelineSegs();
+    var len = segs ? segs.length : 0;
+    if (!len) return "插入到 V1";
+    var idx = Math.max(0, Math.min(Number(insertIndex) || 0, len));
+    if (idx <= 0) return "插入到 " + _timelineEntryDisplayNo(segs[0], 0) + " 前";
+    if (idx >= len) return "插入到 " + _timelineEntryDisplayNo(segs[len - 1], len - 1) + " 后";
+    return "插入到 " + _timelineEntryDisplayNo(segs[idx - 1], idx - 1) +
+      " 与 " + _timelineEntryDisplayNo(segs[idx], idx) + " 之间";
+  }
+
+  function _clearTimelineInsertAdjacency(track) {
+    var root = track || $("editVideoTrack");
+    if (!root) return;
+    root.querySelectorAll(".edit-segment-block").forEach(function (block) {
+      block.classList.remove("edit-seg-insert-before", "edit-seg-insert-after");
+    });
+  }
+
+  function _ensureTimelineInsertCue(track) {
+    var root = track || $("editVideoTrack");
+    if (!root) return null;
+    var cue = root.querySelector(".edit-timeline-insert-cue");
+    if (!cue) {
+      cue = document.createElement("div");
+      cue.className = "edit-timeline-insert-cue";
+      cue.hidden = true;
+      cue.innerHTML =
+        '<span class="edit-timeline-insert-cue__label"></span>' +
+        '<span class="edit-timeline-insert-cue__line" aria-hidden="true"></span>';
+      root.appendChild(cue);
+    }
+    return cue;
+  }
+
+  function _showTimelineInsertCue(insertIndex, track) {
+    var root = track || $("editVideoTrack");
+    if (!root) return;
+    var segs = _getTimelineSegs();
+    var len = segs ? segs.length : 0;
+    var idx = Math.max(0, Math.min(Number(insertIndex) || 0, len));
+    var pps = _editState.pixelsPerSecond * _editState.zoom;
+    var starts = (_editState.segStartTimes && _editState.segStartTimes.length === len)
+      ? _editState.segStartTimes
+      : _timelineStarts(segs || []).starts;
+    var cue = _ensureTimelineInsertCue(root);
+    if (!cue) return;
+    var x = _timelineInsertSlotX(idx, segs || [], starts, pps);
+    cue.style.left = x + "px";
+    cue.dataset.insertIndex = String(idx);
+    cue.dataset.edge = idx <= 0 ? "start" : (idx >= len ? "end" : "middle");
+    var label = cue.querySelector(".edit-timeline-insert-cue__label");
+    if (label) label.textContent = _timelineInsertSlotLabel(idx, segs || []);
+    cue.hidden = false;
+    root.classList.add("edit-video-track--drop-active");
+    _clearTimelineInsertAdjacency(root);
+    var blocks = root.querySelectorAll(".edit-segment-block");
+    if (idx > 0 && blocks[idx - 1]) blocks[idx - 1].classList.add("edit-seg-insert-after");
+    if (idx < blocks.length && blocks[idx]) blocks[idx].classList.add("edit-seg-insert-before");
+  }
+
+  function _hideTimelineInsertCue(track) {
+    var root = track || $("editVideoTrack");
+    if (!root) return;
+    root.classList.remove("edit-video-track--drop-active");
+    _clearTimelineInsertAdjacency(root);
+    var cue = root.querySelector(".edit-timeline-insert-cue");
+    if (cue) cue.hidden = true;
+  }
+
+  function _normalizeTimelineInsertIndex(insertIndex) {
+    var len = (_editState.edl && Array.isArray(_editState.edl.timeline)) ? _editState.edl.timeline.length : 0;
+    var n = Number(insertIndex);
+    if (!Number.isInteger(n)) return len;
+    return Math.max(0, Math.min(n, len));
+  }
+
+  function _nextExternalMediaGroupIdx() {
+    var tl = (_editState.edl && Array.isArray(_editState.edl.timeline)) ? _editState.edl.timeline : [];
+    var max = 899;
+    tl.forEach(function (entry) {
+      var g = Number(entry && entry.groupIdx);
+      if (Number.isInteger(g) && g >= 900 && g > max) max = g;
+    });
+    return max + 1;
+  }
+
+  function _setTimelineContentWidth(width) {
+    _setTimelineTrackWidth($("editTimelineContent"), width);
+  }
+
+  function _setTimelineTrackWidth(el, width) {
+    if (!el) return;
+    el.style.width = width + "px";
+    el.style.minWidth = width + "px";
+  }
+
+  function _timelineOriginX(scrollEl) {
+    var el = scrollEl || $("editTimelineScroll");
+    if (!el || typeof getComputedStyle !== "function") return 0;
+    var style = getComputedStyle(el);
+    var px = parseFloat(style.paddingLeft || "0");
+    return Number.isFinite(px) ? px : 0;
+  }
+
+  function _syncTimelineScrollLayers(scrollEl) {
+    var scroll = scrollEl || $("editTimelineScroll");
+    var x = scroll ? scroll.scrollLeft || 0 : 0;
+    var tx = "translateX(" + (-x) + "px)";
+    var rulerCanvas = $("editRuler");
+    if (rulerCanvas) rulerCanvas.style.transform = tx;
   }
 
   function _renderEditTimeline() {
@@ -706,6 +1219,10 @@ export function syncEditProject(p) {
 
     var segs = _editState.edl ? _editState.edl.timeline : _editState.segments;
     var pps = _editState.pixelsPerSecond * _editState.zoom;
+    var timing = _timelineStarts(segs);
+    var starts = timing.starts;
+    var totalDur = timing.totalDur;
+    var contentW = _timelineContentWidth(totalDur, pps, segs.length);
 
     // 任意时间线变化都顺手刷新右侧"转场控制"面板的统计 + 按钮可用态
     if (typeof _renderTransitionPanel === "function") _renderTransitionPanel();
@@ -715,9 +1232,14 @@ export function syncEditProject(p) {
       resolution: "#2C3E50", climax: "#0B1320",
     };
 
+    _setTimelineContentWidth(contentW);
+    _setTimelineTrackWidth(track, contentW);
+    _syncTimelineScrollLayers();
+
     segs.forEach(function (seg, i) {
       var dur = _segDuration(seg);
-      var w = Math.max(dur * pps, 40);
+      var w = _timelineDurationWidth(dur, pps);
+      var left = _timelineSegmentLeft(starts[i], i, pps);
       var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
 
       var tag = null;
@@ -730,11 +1252,12 @@ export function syncEditProject(p) {
       /* transition marker */
       if (i > 0) {
         var trans = (seg.transitionIn && seg.transitionIn.type) || "cut";
-        var transLabel = trans === "crossfade" ? "叠" : trans === "fade_from_black" ? "淡" : trans === "fade_to_black" ? "黑" : "切";
+        var transLabel = trans === "crossfade" ? "叠化" : trans === "fade_from_black" ? "淡入" : trans === "fade_to_black" ? "淡黑" : "硬切";
         var transEl = document.createElement("div");
-        transEl.className = "edit-transition-marker";
-        transEl.title = "点击切换转场: " + trans;
+        transEl.className = "edit-transition-marker" + (trans !== "cut" ? " edit-transition-marker--active" : "");
+        transEl.title = "转场：" + transLabel + " · 点击切换";
         transEl.textContent = transLabel;
+        transEl.style.left = _timelineTransitionCenter(starts[i], i, pps) + "px";
         (function (idx) {
           transEl.addEventListener("click", function (ev) { ev.stopPropagation(); _cycleTransition(idx); });
         })(i);
@@ -745,6 +1268,9 @@ export function syncEditProject(p) {
       var block = document.createElement("div");
       block.className = "edit-segment-block";
       block.style.width = w + "px";
+      block.style.left = left + "px";
+      block.style.top = "0";
+      block.style.bottom = "0";
       block.style.borderColor = color;
       block.dataset.segIdx = i;
       block.title = "片段 " + (gIdx + 1) + " · " + dur.toFixed(1) + "s";
@@ -830,15 +1356,11 @@ export function syncEditProject(p) {
       track.appendChild(block);
     });
 
-    var totalDur = 0;
-    segs.forEach(function (s) { totalDur += _segDuration(s); });
-    track.style.minWidth = (totalDur * pps + 100) + "px";
-
     /* render tag track above video track */
-    _renderTagTrack(segs, pps);
+    _renderTagTrack(segs, pps, starts, contentW);
 
     /* render time ruler */
-    _renderTimeRuler(totalDur, pps);
+    _renderTimeRuler(totalDur, pps, starts, segs);
 
     /* render filmstrips (async) */
     _renderAllFilmstrips(segs, pps);
@@ -847,7 +1369,7 @@ export function syncEditProject(p) {
     _renderAllWaveforms(segs, pps);
 
     /* render BGM track */
-    _renderBgmTrack(totalDur, pps);
+    _renderBgmTrack(totalDur, pps, contentW, starts, segs);
   }
 
   /* ── Tag track (AI segment labels above video track) ── */
@@ -855,7 +1377,7 @@ export function syncEditProject(p) {
   var _TAG_PLOT_LABELS = { setup: "铺垫", rising: "递进", climax: "高潮", falling: "回落", resolution: "收尾" };
   var _TAG_PLOT_COLORS = { setup: "#ECEFF1", rising: "#CFD8DC", falling: "#90A4AE", resolution: "#2C3E50", climax: "#0B1320" };
 
-  function _renderTagTrack(segs, pps) {
+  function _renderTagTrack(segs, pps, starts, contentW) {
     var container = $("editTagTrack");
     if (!container) return;
     container.innerHTML = "";
@@ -865,23 +1387,21 @@ export function syncEditProject(p) {
       return;
     }
 
-    container.style.display = "flex";
+    container.style.display = "block";
+    var fallbackTiming = contentW ? null : _timelineStarts(segs);
+    _setTimelineTrackWidth(container, contentW || _timelineContentWidth(fallbackTiming.totalDur, pps, segs.length));
 
     segs.forEach(function (seg, i) {
       var dur = _segDuration(seg);
-      var w = Math.max(dur * pps, 40);
+      var w = _timelineDurationWidth(dur, pps);
+      var left = _timelineSegmentLeft((starts && starts[i] != null) ? starts[i] : _timelineStarts(segs).starts[i], i, pps);
       var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
-
-      if (i > 0) {
-        var spacer = document.createElement("div");
-        spacer.className = "edit-tag-spacer";
-        container.appendChild(spacer);
-      }
 
       var tag = _editState.segmentTags.segments.find(function (t) { return t.groupIdx === gIdx; });
       var block = document.createElement("div");
       block.className = "edit-tag-block";
       block.style.width = w + "px";
+      block.style.left = left + "px";
 
       if (tag) {
         var color = _TAG_PLOT_COLORS[tag.plotRole] || "#526168";
@@ -937,7 +1457,7 @@ export function syncEditProject(p) {
           }
           item.duration = (item.outPoint || maxDur) - (item.inPoint || 0);
 
-          var newW = Math.max(item.duration * pps, 40);
+          var newW = _timelineDurationWidth(item.duration, pps);
           block.style.width = newW + "px";
           var durEl = block.querySelector(".edit-seg-dur");
           if (durEl) durEl.textContent = item.duration.toFixed(1) + "s";
@@ -979,7 +1499,7 @@ export function syncEditProject(p) {
     segs.forEach(function (seg, i) {
       var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
       var dur = _segDuration(seg);
-      var w = Math.max(dur * pps, 40);
+      var w = _timelineDurationWidth(dur, pps);
       var thumbCount = Math.max(1, Math.floor(w / 50));
 
       var container = document.querySelector('.edit-seg-filmstrip[data-gidx="' + gIdx + '"]');
@@ -1072,7 +1592,7 @@ export function syncEditProject(p) {
     segs.forEach(function (seg, i) {
       var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
       var dur = _segDuration(seg);
-      var w = Math.max(dur * pps, 40);
+      var w = _timelineDurationWidth(dur, pps);
 
       var canvas = document.querySelector('.edit-seg-waveform[data-gidx="' + gIdx + '"]');
       if (!canvas) return;
@@ -1147,10 +1667,10 @@ export function syncEditProject(p) {
 
   /* ── Time ruler ── */
 
-  function _renderTimeRuler(totalDur, pps) {
+  function _renderTimeRuler(totalDur, pps, starts, segs) {
     var rulerCanvas = $("editRuler");
     if (!rulerCanvas) return;
-    var totalW = Math.max(totalDur * pps + 100, 600);
+    var totalW = _timelineContentWidth(totalDur, pps, segs && segs.length);
     rulerCanvas.width = totalW;
     rulerCanvas.style.width = totalW + "px";
 
@@ -1169,7 +1689,7 @@ export function syncEditProject(p) {
     ctx.textBaseline = "top";
 
     for (var t = 0; t <= totalDur + interval; t += interval) {
-      var x = t * pps;
+      var x = _timelineTimeToX(t, pps, starts);
       ctx.fillRect(x, 14, 1, 10);
       ctx.fillText(_formatTime(t), x + 3, 2);
     }
@@ -1178,7 +1698,7 @@ export function syncEditProject(p) {
     if (subInterval >= 0.2) {
       ctx.fillStyle = "rgba(207,216,220,0.1)";
       for (var st = 0; st <= totalDur + subInterval; st += subInterval) {
-        var sx = st * pps;
+        var sx = _timelineTimeToX(st, pps, starts);
         ctx.fillRect(sx, 18, 1, 6);
       }
     }
@@ -1186,66 +1706,134 @@ export function syncEditProject(p) {
 
   /* ── BGM track visualization ── */
 
-  function _renderBgmTrack(totalDur, pps) {
+  function _renderBgmTrack(totalDur, pps, contentW, starts, segs) {
     var aTrack = $("editAudioTrack");
     if (!aTrack) return;
     aTrack.innerHTML = "";
-    aTrack.style.minWidth = (totalDur * pps + 100) + "px";
+    _setTimelineTrackWidth(aTrack, contentW || _timelineContentWidth(totalDur, pps, segs && segs.length));
 
     var bgm = _editState.edl && _editState.edl.bgm;
-    if (!bgm || !bgm.trackId) {
+    if (!bgm || bgm.enabled !== true || !bgm.trackId) {
       aTrack.innerHTML = '<p class="text-[11px] text-white/10 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">BGM 轨道</p>';
       return;
     }
 
     var catalog = _bgmCatalogCache || [];
-    var entry = catalog.find(function (t) { return t.id === bgm.trackId; });
+    var trackIdText = String(bgm.trackId || "").toLowerCase();
+    var seedTrackFallbacks = {
+      "hopeful_seed.mp3": { category: "hopeful", name: "希望 · 晨光" },
+      "calm_seed.mp3": { category: "calm", name: "平静 · 海面" },
+      "romantic_seed.mp3": { category: "romantic", name: "浪漫 · 旧木屋" },
+      "tense_seed.mp3": { category: "tense", name: "紧张 · 追逐" },
+      "action_seed.mp3": { category: "action", name: "动作 · 高速" },
+      "sad_seed.mp3": { category: "sad", name: "悲伤 · 雨夜" },
+      "epic_seed.mp3": { category: "epic", name: "史诗 · 旷野" },
+      "mysterious_seed.mp3": { category: "mysterious", name: "神秘 · 雾林" }
+    };
+    var entry = catalog.find(function (t) { return t.id === bgm.trackId; }) || seedTrackFallbacks[trackIdText] || null;
     var name = entry ? entry.name : bgm.trackId;
-    var bgmDur = entry ? entry.duration : totalDur;
-    var bgmW = Math.max(bgmDur * pps, 60);
-    var offsetX = (bgm.offsetTime || 0) * pps;
+    var categoryMatch = trackIdText.match(/^(hopeful|calm|romantic|mysterious|tense|action|epic|sad)(?:[_\-.]|$)/);
+    var category = entry && entry.category ? String(entry.category).toLowerCase() : (categoryMatch ? categoryMatch[1] : "");
+    var categoryClass = /^(hopeful|calm|romantic|mysterious|tense|action|epic|sad)$/.test(category)
+      ? " edit-bgm-block--" + category
+      : "";
+    var bgmDur = (entry && entry.duration > 0) ? entry.duration : totalDur;
+    if (!(bgmDur > 0)) bgmDur = totalDur || 1; // 防御：时长缺失/为 0 时退化成单段
 
-    var block = document.createElement("div");
-    block.className = "edit-bgm-block";
-    block.style.width = bgmW + "px";
-    block.style.marginLeft = offsetX + "px";
-    block.innerHTML = '<span class="material-symbols-outlined text-xs" style="font-variation-settings:\'FILL\' 1">music_note</span>' +
-      '<span class="text-[10px] font-bold truncate">' + escapeHtml(name) + '</span>' +
-      '<span class="text-[9px] opacity-50">' + _formatTime(bgmDur) + '</span>';
+    // BGM 循环铺到视频结尾、超出截断——与导出(-stream_loop -1 + -shortest)和
+    // 预览(_bgmAudio.loop=true)的实际行为一致。首段带曲名+拖拽手柄；其后为循环
+    // 重复段（弱化 + 接缝竖线），末段按视频结尾截断。视频短于一遍 BGM 时只画截断的首段。
+    var offset = bgm.offsetTime || 0;
+    var fillEnd = totalDur || 0;
+    var tileCount = Math.min(500, Math.max(1, Math.ceil((fillEnd - offset) / bgmDur)));
 
+    var fillW = Math.max(0, _timelineTimeToX(fillEnd, pps, starts) - _timelineTimeToX(offset, pps, starts));
+    var strip = document.createElement("div");
+    strip.style.display = "flex";
+    strip.style.alignItems = "stretch";
+    strip.style.height = "100%";
+    strip.style.position = "absolute";
+    strip.style.top = "0";
+    strip.style.bottom = "0";
+    strip.style.left = _timelineTimeToX(offset, pps, starts) + "px";
+    strip.style.width = fillW + "px";
+
+    for (var i = 0; i < tileCount; i++) {
+      var tileStart = offset + i * bgmDur;
+      if (tileStart >= fillEnd) break;
+      var tileEnd = Math.min(tileStart + bgmDur, fillEnd); // 末段截断到视频结尾
+      var tileW = Math.max(_timelineTimeToX(tileEnd, pps, starts) - _timelineTimeToX(tileStart, pps, starts), 2);
+
+      var block = document.createElement("div");
+      block.className = "edit-bgm-block" + categoryClass;
+      if (category) block.dataset.bgmCategory = category;
+      block.style.flex = "0 0 auto";
+      block.style.width = tileW + "px";
+      if (i > 0) {
+        // 循环重复段：弱化 + 接缝竖线 + 循环图标
+        block.style.opacity = "0.5";
+        block.style.borderLeft = "1px dashed rgba(255,255,255,0.25)";
+        block.style.justifyContent = "center";
+        block.title = name + "（循环）";
+        block.innerHTML = '<span class="material-symbols-outlined text-[11px] opacity-70">repeat</span>';
+      } else {
+        block.innerHTML = '<span class="material-symbols-outlined text-xs" style="font-variation-settings:\'FILL\' 1">music_note</span>' +
+          '<span class="text-[10px] font-bold truncate">' + escapeHtml(name) + '</span>' +
+          '<span class="text-[9px] opacity-50">' + _formatTime(bgmDur) + '</span>';
+      }
+      strip.appendChild(block);
+    }
+
+    // 拖拽整条 BGM 调 offset（保留原交互）：拖动改 offsetTime，松手 PATCH bgm-offset 并重铺。
     var dragStartX = 0;
     var dragStartOffset = 0;
-    block.addEventListener("mousedown", function (ev) {
+    strip.addEventListener("mousedown", function (ev) {
       ev.preventDefault();
       dragStartX = ev.clientX;
       dragStartOffset = bgm.offsetTime || 0;
 
       function onMove(me) {
         var dx = me.clientX - dragStartX;
-        var newOffset = Math.max(0, dragStartOffset + dx / pps);
+        var newOffset = Math.max(0, _timelineXToTime(_timelineTimeToX(dragStartOffset, pps, starts) + dx, pps, segs, starts));
         bgm.offsetTime = Math.round(newOffset * 10) / 10;
-        block.style.marginLeft = (bgm.offsetTime * pps) + "px";
+        strip.style.left = _timelineTimeToX(bgm.offsetTime, pps, starts) + "px";
       }
       function onUp() {
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
         // E-4.2：BGM 偏移拖动收尾 → PATCH bgm-offset；内存 bgm.offsetTime 已同步更新。
-        _sendTimelineOp({
-          op: "bgm-offset",
-          offsetTime: bgm.offsetTime || 0,
-        });
+        _sendTimelineOp({ op: "bgm-offset", offsetTime: bgm.offsetTime || 0 });
+        _renderBgmTrack(totalDur, pps, contentW, starts, segs); // 重铺，循环段跟随新 offset、末段重新截断
       }
       document.addEventListener("mousemove", onMove);
       document.addEventListener("mouseup", onUp);
     });
 
-    aTrack.appendChild(block);
+    aTrack.appendChild(strip);
   }
 
   /* ── Undo / Redo ── */
 
+  function _syncUndoRedoButtons() {
+    var undoBtn = $("editUndoBtn");
+    var redoBtn = $("editRedoBtn");
+    var canUndo = _editState._undoPtr > 0;
+    var canRedo = _editState._undoPtr >= 0 && _editState._undoPtr < _editState._undoStack.length - 1;
+    if (undoBtn) {
+      undoBtn.disabled = !canUndo;
+      undoBtn.title = canUndo ? "撤销 (Ctrl+Z)" : "暂无可撤销操作";
+    }
+    if (redoBtn) {
+      redoBtn.disabled = !canRedo;
+      redoBtn.title = canRedo ? "恢复 (Ctrl+Shift+Z)" : "暂无可恢复操作";
+    }
+  }
+
   function _editSaveUndo() {
-    if (!_editState.edl) return;
+    if (!_editState.edl) {
+      _syncUndoRedoButtons();
+      return;
+    }
     var snapshot = JSON.parse(JSON.stringify(_editState.edl));
     if (_editState._undoPtr < _editState._undoStack.length - 1) {
       _editState._undoStack.splice(_editState._undoPtr + 1);
@@ -1253,6 +1841,7 @@ export function syncEditProject(p) {
     _editState._undoStack.push(snapshot);
     if (_editState._undoStack.length > 50) _editState._undoStack.shift();
     _editState._undoPtr = _editState._undoStack.length - 1;
+    _syncUndoRedoButtons();
   }
 
   function _editUndo() {
@@ -1269,7 +1858,9 @@ export function syncEditProject(p) {
     _sendTimelineOp({ op: "set-edl", edl: _edlForPersistence(snap) });
     _buildSegStartTimes();
     _renderEditTimeline();
+    _renderBgmStatus();
     _updatePlayhead();
+    _syncUndoRedoButtons();
     showToast("已撤销", "ok");
   }
 
@@ -1285,7 +1876,9 @@ export function syncEditProject(p) {
     _sendTimelineOp({ op: "set-edl", edl: _edlForPersistence(snap) });
     _buildSegStartTimes();
     _renderEditTimeline();
+    _renderBgmStatus();
     _updatePlayhead();
+    _syncUndoRedoButtons();
     showToast("已重做", "ok");
   }
 
@@ -1400,7 +1993,6 @@ export function syncEditProject(p) {
       duration: item.transitionIn.duration,
     });
     _renderEditTimeline();
-    showToast("转场: " + (_TRANSITION_LABELS[next] || next), "ok");
   }
 
   /* ── Timeline data helpers ── */
@@ -1450,6 +2042,71 @@ export function syncEditProject(p) {
     return v;
   }
 
+  function _editPreviewCanvasRect(area) {
+    if (!area) return null;
+    var boxW = area.clientWidth || 0;
+    var boxH = area.clientHeight || 0;
+    if (!boxW || !boxH) return null;
+    var fmt = _resolveCurrentExportFormat();
+    var mediaRatio = Math.max(0.01, (fmt.width || 1080) / (fmt.height || 1920));
+    var boxRatio = boxW / boxH;
+    var w;
+    var h;
+    var x;
+    var y;
+    if (boxRatio > mediaRatio) {
+      h = boxH;
+      w = h * mediaRatio;
+      x = (boxW - w) / 2;
+      y = 0;
+    } else {
+      w = boxW;
+      h = w / mediaRatio;
+      x = 0;
+      y = (boxH - h) / 2;
+    }
+    return { x: x, y: y, width: w, height: h, format: fmt };
+  }
+
+  function _syncSubtitleOverlayLayout() {
+    var area = $("editPreviewArea");
+    var sub = _editState && _editState._subtitleEl;
+    if (!area || !sub) return;
+    var canvasRect = _editPreviewCanvasRect(area);
+    if (!canvasRect) return;
+    var spec = resolveSubtitleLayoutSpec({
+      width: canvasRect.format.width,
+      height: canvasRect.format.height,
+    });
+    var scale = canvasRect.height / spec.height;
+    var fontPx = Math.max(8, Math.round(spec.fontSize * scale));
+    var lineHeightPx = Math.max(fontPx + 2, Math.round(fontPx * 1.25));
+    var top = canvasRect.y + canvasRect.height * spec.topRatio;
+    var maxTop = canvasRect.y + Math.max(0, canvasRect.height - lineHeightPx * 2 - canvasRect.height * 0.02);
+    top = Math.max(canvasRect.y, Math.min(top, maxTop));
+
+    sub.style.left = Math.round(canvasRect.x) + "px";
+    sub.style.right = "auto";
+    sub.style.top = Math.round(top) + "px";
+    sub.style.bottom = "auto";
+    sub.style.width = Math.round(canvasRect.width) + "px";
+    sub.style.padding = "0";
+
+    var span = sub.firstElementChild;
+    if (span) {
+      var shadowOffset = Math.max(1, Math.round(fontPx / 12));
+      var shadowBlur = Math.max(2, Math.round(fontPx / 3));
+      span.style.maxWidth = Math.max(24, Math.round(canvasRect.width * spec.maxWidthRatio)) + "px";
+      span.style.font = "700 " + fontPx + "px/" + lineHeightPx + "px 'PingFang SC', 'Noto Sans CJK SC', sans-serif";
+      span.style.textShadow =
+        "-" + shadowOffset + "px -" + shadowOffset + "px 0 #000," +
+        shadowOffset + "px -" + shadowOffset + "px 0 #000," +
+        "-" + shadowOffset + "px " + shadowOffset + "px 0 #000," +
+        shadowOffset + "px " + shadowOffset + "px 0 #000," +
+        "0 0 " + shadowBlur + "px rgba(0,0,0,.7)";
+    }
+  }
+
   function _initDoubleBuffer() {
     var area = $("editPreviewArea");
     if (!area) return;
@@ -1474,13 +2131,14 @@ export function syncEditProject(p) {
       var sub = document.createElement('div');
       sub.id = 'editSubtitleOverlay';
       sub.style.cssText =
-        'position:absolute;left:0;right:0;bottom:32px;text-align:center;' +
-        'pointer-events:none;z-index:20;padding:0 24px;';
-      sub.innerHTML = '<span style="display:inline-block;max-width:90%;font:600 18px/1.4 \'PingFang SC\',sans-serif;' +
-        'color:#fff;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 0 6px rgba(0,0,0,.7);"></span>';
+        'position:absolute;left:0;top:0;width:0;text-align:center;' +
+        'pointer-events:none;z-index:20;padding:0;';
+      sub.innerHTML = '<span style="display:inline-block;max-width:90%;font:700 8px/10px \'PingFang SC\',\'Noto Sans CJK SC\',sans-serif;' +
+        'white-space:pre-line;overflow-wrap:anywhere;word-break:break-word;color:#fff;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 0 3px rgba(0,0,0,.7);"></span>';
       area.appendChild(sub);
       _editState._subtitleEl = sub;
     }
+    _syncSubtitleOverlayLayout();
 
     // BGM 播放器：单例 audio，selected 时 src 跟着变；播放/暂停/seek 跟随 globalTime
     if (!_editState._bgmAudio) {
@@ -1764,10 +2422,9 @@ export function syncEditProject(p) {
 
   function _editSeekToTime(timelineX) {
     var pps = _editState.pixelsPerSecond * _editState.zoom;
-    var t = Math.max(0, Math.min(timelineX / pps, _editState.totalDuration));
-
     var segs = _getTimelineSegs();
     var starts = _editState.segStartTimes;
+    var t = Math.max(0, Math.min(_timelineXToTime(timelineX, pps, segs, starts), _editState.totalDuration));
     var segIdx = 0;
     for (var i = 0; i < starts.length; i++) {
       var dur = _segDuration(segs[i]);
@@ -1801,7 +2458,7 @@ export function syncEditProject(p) {
     }
     _showVid(vid);
 
-    _updatePlayhead();
+    _updatePlayhead(true);
     _updateEditTimeDisplay();
     _highlightActiveSeg(segIdx);
 
@@ -1823,6 +2480,16 @@ export function syncEditProject(p) {
     _tickCache.timeEl = $("editTimeDisplay");
     var btn = $("editPlayBtn");
     _tickCache.playBtnSpan = btn ? btn.querySelector("span") : null;
+    var previewBtn = $("editPreviewPlayBtn");
+    _tickCache.previewPlayBtnSpan = previewBtn ? previewBtn.querySelector("span") : null;
+  }
+
+  function _syncEditPlayButtons(isPlaying) {
+    var icon = isPlaying ? "pause" : "play_arrow";
+    var mainSpan = _tickCache.playBtnSpan || ($("editPlayBtn") && $("editPlayBtn").querySelector("span"));
+    var previewSpan = _tickCache.previewPlayBtnSpan || ($("editPreviewPlayBtn") && $("editPreviewPlayBtn").querySelector("span"));
+    if (mainSpan) mainSpan.textContent = icon;
+    if (previewSpan) previewSpan.textContent = icon;
   }
 
   function _editTogglePlay() {
@@ -1895,7 +2562,7 @@ export function syncEditProject(p) {
     _prebufferNext(segIdx);
 
     _editState.isPlaying = true;
-    if (_tickCache.playBtnSpan) _tickCache.playBtnSpan.textContent = "pause";
+    _syncEditPlayButtons(true);
     _highlightActiveSeg(segIdx);
 
     if (vid) {
@@ -1922,36 +2589,41 @@ export function syncEditProject(p) {
 
     // 暂停 BGM
     if (_editState._bgmAudio) { try { _editState._bgmAudio.pause(); } catch (_) {} }
+    _updateBgmStatusFromTimeline();
 
-    if (_tickCache.playBtnSpan) _tickCache.playBtnSpan.textContent = "play_arrow";
+    _syncEditPlayButtons(false);
   }
 
-  /** 把 BGM audio 同步到当前播放状态：选了 BGM 就 play 并按 globalTime 起跳 */
+  /** 把 BGM audio 同步到当前播放状态：明确打开 BGM 才 play 并按 globalTime 起跳 */
   function _syncBgmPlayback() {
     var bgm = _editState._bgmAudio;
     if (!bgm) return;
-    var trackId = _editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId;
+    var _b = _editState.edl && _editState.edl.bgm;
+    var trackId = (_b && _b.enabled === true) ? _b.trackId : null;
     if (!trackId) {
       try { bgm.pause(); } catch (_) {}
       bgm.removeAttribute('src');
       return;
     }
-    var url = '/api/edit/bgm/' + encodeURIComponent(trackId);
-    if (bgm.getAttribute('src') !== url) {
-      bgm.src = url;
-      bgm.load();
-    }
-    var setStart = function () {
-      // BGM 循环播放：currentTime = globalTime mod bgmDuration
-      var bgmDur = isFinite(bgm.duration) && bgm.duration > 0 ? bgm.duration : 28;
-      var startAt = ((_editState.globalTime || 0) % bgmDur);
-      try { bgm.currentTime = startAt; } catch (_) {}
-      if (_editState.isPlaying) {
-        bgm.play().catch(function () { /* autoplay blocked，无视即可 */ });
+    // 用带 token 的 fetch 取流转 blob objectURL，再喂给 audio（媒体请求带不了 Bearer header）。
+    _ensureBgmObjectUrl(trackId, function (objUrl) {
+      if (bgm.getAttribute('src') !== objUrl) {
+        bgm.src = objUrl;
+        bgm.load();
       }
-    };
-    if (bgm.readyState >= 1) setStart();
-    else bgm.addEventListener('loadedmetadata', setStart, { once: true });
+      var setStart = function () {
+        // BGM 循环播放：currentTime = globalTime mod bgmDuration
+        var bgmDur = isFinite(bgm.duration) && bgm.duration > 0 ? bgm.duration : 28;
+        var startAt = ((_editState.globalTime || 0) % bgmDur);
+        try { bgm.currentTime = startAt; } catch (_) {}
+        _updateBgmStatusFromAudio(bgm, trackId);
+        if (_editState.isPlaying) {
+          bgm.play().catch(function () { /* autoplay blocked，无视即可 */ });
+        }
+      };
+      if (bgm.readyState >= 1) setStart();
+      else bgm.addEventListener('loadedmetadata', setStart, { once: true });
+    });
   }
 
   function _seekThenPlay(vid, seekTime) {
@@ -2085,7 +2757,7 @@ export function syncEditProject(p) {
     // 否则 globalTime 会读到旧 vid 的越界 currentTime → playhead 抽搐
     // 或者还没切到 nextIdx 就又触发一次切到 nextIdx+1 的连锁错位。
     if (_editState._swapping) {
-      _updatePlayheadFast();
+      _updatePlayheadFast(true);
       _updateTimeDisplayFast();
       _editState._rafId = requestAnimationFrame(_editTickLoop);
       return;
@@ -2116,7 +2788,7 @@ export function syncEditProject(p) {
       if (nextIdx >= segs.length) {
         _editState.globalTime = _editState.totalDuration;
         _editPause();
-        _updatePlayheadFast();
+        _updatePlayheadFast(true);
         _updateTimeDisplayFast();
         return;
       }
@@ -2274,50 +2946,16 @@ export function syncEditProject(p) {
       }
     }
 
-    _updatePlayheadFast();
+    _updatePlayheadFast(true);
     _updateTimeDisplayFast();
     _updateSubtitleFast();
+    _updateBgmStatusFromTimeline();
 
     _editState._rafId = requestAnimationFrame(_editTickLoop);
   }
 
-  /** 把"老板：xxx 帝王蟹：yyy"形式的多句对白拆成 [{speaker, text}, ...]
-   * speaker 仅作元数据（不进字幕），text 是真正显示的台词。
-   * 老的"只剥开头一段 speaker 前缀"实现会把后续每句的 speaker 名留在字幕里
-   * （用户截图：「家人们，今晚复盘。" 帝王蟹队长："先别画饼，手酸。」） */
-  function _splitDialogueLines(raw) {
-    if (!raw) return [];
-    var SPEAKER_RE = /([^：:\s「『""''""''『」』]{1,12})[：:]/g;
-    var anchors = [];
-    var m;
-    while ((m = SPEAKER_RE.exec(raw)) !== null) {
-      anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
-    }
-    if (!anchors.length) {
-      var t = raw.trim().replace(/^["'""'「『]+|["'""'」』]+$/g, '').trim();
-      return t ? [t] : [];
-    }
-    var out = [];
-    for (var i = 0; i < anchors.length; i++) {
-      var cur = anchors[i];
-      var nextStart = i + 1 < anchors.length
-        ? anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
-        : raw.length;
-      var text = raw.slice(cur.textStart, nextStart).trim();
-      text = text
-        .replace(/^["'""'「『]+/, '')
-        .replace(/["'""'」』]+$/, '')
-        .trim();
-      if (text) out.push(text);
-    }
-    return out;
-  }
-
-  /** 当前 globalTime 应该展示的字幕文本（已剥掉所有 speaker 前缀，
-   * 并按用户要求去掉逗号 / 句号—— 字幕里只留干净的台词内容） */
-  function _stripPunctForSubtitle(s) {
-    return String(s || '').replace(/[，。,.]/g, '').trim();
-  }
+  /** 当前 globalTime 应该展示的字幕文本。清洗、speaker 剥离、"——" 跳过、
+   * 短视频标点和两行分行都由 subtitle_format.js 统一处理。 */
   function _currentSubtitleText() {
     var segs = _tickCache.segs || [];
     var starts = _tickCache.starts || [];
@@ -2351,22 +2989,7 @@ export function syncEditProject(p) {
     // 仅当 prompt 抓不到任何台词时才退回 shots[].dialogue。
     var prompt = (sb && sb.videoPrompt) || '';
     if (prompt) {
-      // 角色名 1-12 字 + ：/: + 引号包裹的台词。
-      // 引号必须用 \u 转义显式写出，否则字符在保存 / 序列化过程中可能被规范化
-      // 成普通 ASCII 双引号，导致字符类退化、永远匹配不到中文引号 “…” 的台词。
-      // 覆盖：U+201C/D 中文双引号、U+2018/9 中文单引号、U+0022 ASCII 双引号、
-      // U+0027 ASCII 单引号、U+300C/D 「」、U+300E/F 『』。
-      var Q = '\u201C\u201D\u2018\u2019\u0022\u0027\u300C\u300D\u300E\u300F';
-      var DIALOG_RE = new RegExp(
-        '[\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9\\u00B7]{0,11}[\\uFF1A:]\\s*[' + Q + ']([^' + Q + '\\n]{1,80}?)[' + Q + ']',
-        'g'
-      );
-      var dm;
-      while ((dm = DIALOG_RE.exec(prompt)) !== null) {
-        var t = (dm[1] || '').trim();
-        var clean = _stripPunctForSubtitle(t);
-        if (clean) lines.push(clean);
-      }
+      lines = extractSubtitleLinesFromPrompt(prompt);
     }
     if (!lines.length) {
       // fallback：老路径，从 shots[].dialogue 取
@@ -2375,11 +2998,9 @@ export function syncEditProject(p) {
         var sh = shots[shotIdxs[i]];
         if (!sh) continue;
         var raw = String(sh.dialogue || '').trim();
-        if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-        var pieces = _splitDialogueLines(raw);
+        var pieces = splitSubtitleDialogueLines(raw);
         for (var j = 0; j < pieces.length; j++) {
-          var c2 = _stripPunctForSubtitle(pieces[j]);
-          if (c2) lines.push(c2);
+          if (pieces[j]) lines.push(pieces[j]);
         }
       }
     }
@@ -2407,7 +3028,7 @@ export function syncEditProject(p) {
 
     var rawSum = 0;
     for (var li0 = 0; li0 < lines.length; li0++) {
-      rawSum += Math.max(0.6, lines[li0].length) * perChar;
+      rawSum += Math.max(0.6, subtitleVisibleCharCount(lines[li0])) * perChar;
     }
 
     var ends = [];
@@ -2415,7 +3036,7 @@ export function syncEditProject(p) {
     if (rawSum <= avail) {
       // 策略 (a)：宽裕——用 minPerLine 撑短句，再按比例填到段尾
       for (var li = 0; li < lines.length; li++) {
-        var d = Math.max(minPerLine, lines[li].length * perChar);
+        var d = Math.max(minPerLine, subtitleVisibleCharCount(lines[li]) * perChar);
         t += d;
         ends.push(t);
       }
@@ -2427,11 +3048,11 @@ export function syncEditProject(p) {
       // 策略 (b)：紧——纯按字符比例分配 avail，不再 minPerLine 兜底
       var totalChar = 0;
       for (var ci = 0; ci < lines.length; ci++) {
-        totalChar += Math.max(2, lines[ci].length); // 极短句保底 2 字权重
+        totalChar += Math.max(2, subtitleVisibleCharCount(lines[ci])); // 极短句保底 2 字权重
       }
       var t2 = 0;
       for (var li2 = 0; li2 < lines.length; li2++) {
-        var w = Math.max(2, lines[li2].length);
+        var w = Math.max(2, subtitleVisibleCharCount(lines[li2]));
         t2 += avail * w / totalChar;
         ends.push(t2);
       }
@@ -2452,6 +3073,7 @@ export function syncEditProject(p) {
   function _updateSubtitleFast() {
     var sub = _editState._subtitleEl;
     if (!sub) return;
+    _syncSubtitleOverlayLayout();
     // 切换中：currentSegIdx 已经指向下一段，但 standby 视频还没真正切到画面前置；
     // 这时如果照常更新字幕，用户会看到"画面是上一段、字幕是下一段"的串台词。
     // 切换期间冻结字幕，等画面 swap 完成后下一帧再刷新。
@@ -2463,21 +3085,28 @@ export function syncEditProject(p) {
 
   /* ── UI update helpers (fast path uses cached DOM refs) ── */
 
-  function _updatePlayheadFast() {
+  function _updatePlayheadFast(allowAutoScroll) {
     var el = _tickCache.playheadEl;
     if (!el) return;
     var pps = _editState.pixelsPerSecond * _editState.zoom;
-    var x = _editState.globalTime * pps;
+    var segs = _tickCache.segs || _getTimelineSegs();
+    var starts = _tickCache.starts || _editState.segStartTimes || _timelineStarts(segs).starts;
+    var x = _timelineTimeToX(_editState.globalTime, pps, starts);
 
     var scroll = _tickCache.scrollEl;
     if (scroll) {
       var visible = scroll.clientWidth;
-      if (x > scroll.scrollLeft + visible - 60) scroll.scrollLeft = x - visible / 2;
-      else if (x < scroll.scrollLeft + 30) scroll.scrollLeft = Math.max(0, x - 30);
-      // playhead is outside scroll container — offset by padding (32px) minus scrollLeft
-      el.style.left = (x - scroll.scrollLeft + 32) + "px";
+      if (allowAutoScroll && x > scroll.scrollLeft + visible - 60) {
+        scroll.scrollLeft = x - visible / 2;
+        _syncTimelineScrollLayers(scroll);
+      } else if (allowAutoScroll && x < scroll.scrollLeft + 30) {
+        scroll.scrollLeft = Math.max(0, x - 30);
+        _syncTimelineScrollLayers(scroll);
+      }
+      // playhead lives outside the scroller, so align it to the scroller's real content origin.
+      el.style.left = (x - scroll.scrollLeft + _timelineOriginX(scroll)) + "px";
     } else {
-      el.style.left = (x + 32) + "px";
+      el.style.left = (x + _timelineOriginX()) + "px";
     }
   }
 
@@ -2487,15 +3116,77 @@ export function syncEditProject(p) {
     el.textContent = _formatTime(_editState.globalTime) + " / " + _formatTime(_editState.totalDuration);
   }
 
-  function _updatePlayhead() {
+  function _updatePlayhead(allowAutoScroll) {
     _tickCache.playheadEl = _tickCache.playheadEl || $("editPlayhead");
     _tickCache.scrollEl = _tickCache.scrollEl || $("editTimelineScroll");
-    _updatePlayheadFast();
+    _updatePlayheadFast(!!allowAutoScroll);
   }
 
   function _updateEditTimeDisplay() {
     _tickCache.timeEl = _tickCache.timeEl || $("editTimeDisplay");
     _updateTimeDisplayFast();
+  }
+
+  function _currentBgmTrackId() {
+    var bgm = _editState.edl && _editState.edl.bgm;
+    if (!bgm || bgm.enabled !== true || !bgm.trackId) return "";
+    return bgm.trackId;
+  }
+
+  function _findBgmEntry(trackId) {
+    if (!trackId) return null;
+    return (_bgmCatalogCache || []).find(function (t) { return t.id === trackId; }) || null;
+  }
+
+  function _resolveBgmDuration(trackId, audio) {
+    var audioDur = audio && isFinite(audio.duration) && audio.duration > 0 ? Number(audio.duration) : 0;
+    if (audioDur > 0) return audioDur;
+    var entry = _findBgmEntry(trackId);
+    var entryDur = Number(entry && entry.duration);
+    return Number.isFinite(entryDur) && entryDur > 0 ? entryDur : 0;
+  }
+
+  function _setBgmStatusProgress(current, duration) {
+    var statusEl = $("editBgmStatus");
+    if (!statusEl) return;
+    var progressEl = statusEl.querySelector("[data-bgm-progress]");
+    var timeEl = statusEl.querySelector("[data-bgm-time]");
+    var dur = Number(duration) || 0;
+    var cur = Number(current) || 0;
+    if (dur > 0) cur = ((cur % dur) + dur) % dur;
+    else cur = 0;
+    var pct = dur > 0 ? Math.max(0, Math.min(100, cur / dur * 100)) : 0;
+    if (progressEl) progressEl.style.width = pct.toFixed(2) + "%";
+    if (timeEl) timeEl.textContent = _formatTime(cur) + " / " + (dur > 0 ? _formatTime(dur) : "00:00");
+  }
+
+  function _updateBgmStatusFromAudio(audio, trackId) {
+    var currentTrackId = _currentBgmTrackId();
+    if (!currentTrackId || (trackId && trackId !== currentTrackId)) return;
+    _setBgmStatusProgress(audio ? audio.currentTime : 0, _resolveBgmDuration(currentTrackId, audio));
+  }
+
+  function _updateBgmStatusFromTimeline() {
+    var trackId = _currentBgmTrackId();
+    if (!trackId) {
+      _setBgmStatusProgress(0, 0);
+      return;
+    }
+    var audio = _editState._bgmAudio;
+    var dur = _resolveBgmDuration(trackId, audio);
+    var cur = dur > 0 ? ((_editState.globalTime || 0) % dur) : 0;
+    _setBgmStatusProgress(cur, dur);
+  }
+
+  function _bindBgmPreviewProgress(audio, trackId) {
+    if (!audio) return;
+    audio.dataset.statusTrackId = trackId || "";
+    var update = function () {
+      _updateBgmStatusFromAudio(audio, trackId);
+    };
+    audio.ontimeupdate = update;
+    audio.onloadedmetadata = update;
+    audio.onpause = update;
   }
 
   function _formatTime(sec) {
@@ -2614,12 +3305,25 @@ export function syncEditProject(p) {
     }
   }
 
+  function _pickAutoBgmTrack(tracks) {
+    tracks = Array.isArray(tracks) ? tracks : [];
+    if (!tracks.length) return null;
+    var suggestedCat = "";
+    if (_editState.segmentTags && _editState.segmentTags.suggestedBGMCategory) {
+      suggestedCat = String(_editState.segmentTags.suggestedBGMCategory || "").toLowerCase();
+    }
+    var picked = suggestedCat && tracks.find(function (t) {
+      return String(t && t.category || "").toLowerCase() === suggestedCat;
+    });
+    return picked || tracks[0] || null;
+  }
+
   async function _renderBgmSelector() {
     var container = $("editBgmSelector");
     if (!container) return;
     var tracks = await _loadBgmLibrary();
     if (!tracks.length) {
-      container.innerHTML = '<p class="text-[11px] text-on-surface-variant/40">暂无背景音乐，请联系管理员添加</p>';
+      container.innerHTML = '<p class="edit-bgm-selector-empty">暂无背景音乐，请联系管理员添加</p>';
       return;
     }
 
@@ -2629,48 +3333,58 @@ export function syncEditProject(p) {
       suggestedCat = _editState.segmentTags.suggestedBGMCategory;
     }
 
-    var html = '<div class="space-y-1.5">';
+    var html = '<div class="edit-bgm-option-list">';
     tracks.forEach(function (t) {
       var catLabel = CAT_LABELS[t.category] || t.category;
       var isRecommended = suggestedCat && t.category === suggestedCat;
       var isSelected = _editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId === t.id;
       var hasFile = !!t.file;
 
-      html += '<div class="flex items-center gap-2 p-2 rounded-lg hover:bg-surface-container cursor-pointer transition-all' +
-        (isSelected ? ' bg-primary/5 ring-1 ring-primary/20' : '') + '" data-bgm-id="' + t.id + '">' +
-        '<div class="flex-1 min-w-0">' +
-          '<div class="flex items-center gap-1.5">' +
-            '<span class="text-[11px] font-bold text-on-background">' + escapeHtml(t.name) + '</span>' +
-            (isRecommended ? '<span class="text-[8px] px-1 py-0.5 bg-primary/10 text-primary rounded-full font-bold">推荐</span>' : '') +
+      html += '<div class="edit-bgm-option' + (isSelected ? ' is-selected' : '') + '" data-bgm-id="' + t.id + '">' +
+        '<div class="edit-bgm-option-main">' +
+          '<div class="edit-bgm-option-title-row">' +
+            '<span class="edit-bgm-option-name">' + escapeHtml(t.name) + '</span>' +
+            '<div class="edit-bgm-option-title-meta">' +
+              (isRecommended ? '<span class="edit-bgm-recommend-badge">推荐</span>' : '') +
+              '<span class="edit-bgm-chip">' + catLabel + '</span>' +
+              '<span class="edit-bgm-option-duration">' + t.duration + 's</span>' +
+            '</div>' +
           '</div>' +
-          '<div class="flex items-center gap-1.5 mt-0.5">' +
-            '<span class="text-[9px] px-1.5 py-0.5 rounded bg-surface-container text-on-surface-variant/50">' + catLabel + '</span>' +
-            '<span class="text-[9px] text-on-surface-variant/40">' + t.duration + 's</span>' +
-            '<span class="text-[9px] text-on-surface-variant/30">' + t.bpm + ' BPM</span>' +
+          '<div class="edit-bgm-option-bottom-row">' +
+            '<div class="edit-bgm-option-actions">' +
+              (hasFile ? '<button type="button" class="edit-bgm-option-btn edit-bgm-option-btn--preview" data-bgm-preview="' + t.id + '" title="试听">' +
+                '<span class="material-symbols-outlined">play_arrow</span>' +
+                '<span data-bgm-preview-label data-bgm-idle-label="试听">试听</span>' +
+              '</button>' : '') +
+              '<button type="button" class="edit-bgm-option-btn edit-bgm-option-btn--select" data-bgm-select="' + t.id + '" title="选择">' +
+                '<span class="material-symbols-outlined">check</span>' +
+                '<span>选择</span>' +
+              '</button>' +
+            '</div>' +
           '</div>' +
         '</div>' +
-        (hasFile ? '<button type="button" class="bgm-preview-btn w-6 h-6 rounded-full bg-surface-container flex items-center justify-center hover:bg-surface-container-high transition-colors" data-bgm-preview="' + t.id + '">' +
-          '<span class="material-symbols-outlined text-xs text-on-surface-variant/50">play_arrow</span>' +
-        '</button>' : '') +
       '</div>';
     });
     html += '</div>';
 
     container.innerHTML = html;
 
-    container.querySelectorAll("[data-bgm-id]").forEach(function (el) {
-      el.addEventListener("click", function () {
-        var bgmId = el.dataset.bgmId;
+    container.querySelectorAll("[data-bgm-select]").forEach(function (btn) {
+      btn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        var bgmId = btn.dataset.bgmSelect;
         if (_editState.edl) {
-          if (!_editState.edl.bgm) _editState.edl.bgm = {};
+          if (!_editState.edl.bgm || typeof _editState.edl.bgm !== "object") _editState.edl.bgm = {};
           _editState.edl.bgm.trackId = bgmId;
-          // E-4.2：BGM 选择 PATCH bgm-select。
+          _editState.edl.bgm.enabled = true; // 选曲即视为打开
+          // E-4.2：BGM 选择 PATCH bgm-select（后端会把 enabled 置 true）。
           _sendTimelineOp({ op: "bgm-select", trackId: bgmId });
+          var sel = $("editBgmSelector");
+          if (sel) sel.hidden = true; // 选完收起列表
+          _renderBgmStatus();
           _renderBgmSelector();
-          _renderBgmClearButton();
-          // 立即同步到预览的 BGM player —— 用户点完应当立刻能在工作台听到效果
+          // 立即同步预览 BGM player —— 用户点完应当立刻能在工作台听到效果（过程不弹提示，少打扰）
           _syncBgmPlayback();
-          showToast("已选择 BGM，预览即时生效", "ok");
         } else {
           showToast("请先生成剪辑方案", "warn");
         }
@@ -2680,29 +3394,14 @@ export function syncEditProject(p) {
     container.querySelectorAll("[data-bgm-preview]").forEach(function (btn) {
       btn.addEventListener("click", function (ev) {
         ev.stopPropagation();
-        var audio = document.getElementById("_bgmPreviewAudio");
-        if (!audio) {
-          audio = document.createElement("audio");
-          audio.id = "_bgmPreviewAudio";
-          document.body.appendChild(audio);
-        }
-        var id = btn.dataset.bgmPreview;
-        if (audio.dataset.playing === id) {
-          audio.pause();
-          audio.dataset.playing = "";
-          btn.querySelector("span").textContent = "play_arrow";
-        } else {
-          audio.src = "/api/edit/bgm/" + id;
-          audio.play().catch(function () {});
-          audio.dataset.playing = id;
-          btn.querySelector("span").textContent = "pause";
-          audio.onended = function () {
-            btn.querySelector("span").textContent = "play_arrow";
-            audio.dataset.playing = "";
-          };
-        }
+        _previewBgm(btn.dataset.bgmPreview, btn);
       });
     });
+    // 库加载完后刷新状态头部（首次让 trackId 命中曲名/风格）
+    _renderBgmStatus();
+    if (_editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId) {
+      _renderEditTimeline();
+    }
   }
 
   /* ── 转场控制面板（BGM 下方） ── */
@@ -2711,12 +3410,14 @@ export function syncEditProject(p) {
   function _renderTransitionPanel() {
     var summary = $("editTransitionSummary");
     var btn = $("btnEditClearTransitions");
-    if (!summary || !btn) return;
+    if (!btn) return; // summary 已移到标题区，可能不存在，仅作可选展示
 
     var timeline = (_editState.edl && _editState.edl.timeline) || [];
     if (!timeline.length) {
-      summary.textContent = "成片后显示当前转场分布";
-      summary.className = "text-[10px] text-white/40 mb-2";
+      if (summary) {
+        summary.textContent = "成片后显示当前转场分布";
+        summary.className = "text-[10px] text-white/40 mb-2";
+      }
       btn.disabled = true;
       return;
     }
@@ -2731,8 +3432,10 @@ export function syncEditProject(p) {
     var nonCut = counts.fade + counts.dissolve + counts.wipe + counts.other;
 
     if (nonCut === 0) {
-      summary.textContent = "全部硬切（" + (timeline.length - 1) + " 处衔接）";
-      summary.className = "text-[10px] text-white/40 mb-2";
+      if (summary) {
+        summary.textContent = "全部硬切（" + (timeline.length - 1) + " 处衔接）";
+        summary.className = "text-[10px] text-white/40 mb-2";
+      }
       btn.disabled = true;
     } else {
       var parts = [];
@@ -2740,62 +3443,255 @@ export function syncEditProject(p) {
       if (counts.dissolve) parts.push(counts.dissolve + " dissolve");
       if (counts.wipe) parts.push(counts.wipe + " wipe");
       if (counts.other) parts.push(counts.other + " 其它");
-      summary.textContent = "当前 " + nonCut + " 处转场（" + parts.join(" · ") + "）";
-      summary.className = "text-[10px] text-white/55 mb-2";
+      if (summary) {
+        summary.textContent = "当前 " + nonCut + " 处转场（" + parts.join(" · ") + "）";
+        summary.className = "text-[10px] text-white/55 mb-2";
+      }
       btn.disabled = false;
     }
   }
 
-  /** 绑定"去除全部转场" + "去除 BGM"按钮（只绑一次） */
+  /** 绑定"去除全部转场"按钮（只绑一次）。BGM 开关在 _renderBgmStatus 里绑定。 */
   function _wireTransitionControls() {
     var btn = $("btnEditClearTransitions");
     if (btn && btn.dataset.wired !== "1") {
       btn.dataset.wired = "1";
       btn.addEventListener("click", _clearAllTransitions);
     }
-    var bgmBtn = $("btnEditClearBgm");
-    if (bgmBtn && bgmBtn.dataset.wired !== "1") {
-      bgmBtn.dataset.wired = "1";
-      bgmBtn.addEventListener("click", _clearBgm);
-    }
   }
 
-  /** 清空 BGM 选择，停止预览，写盘。可用「撤销」恢复。 */
-  function _clearBgm() {
+  /** 切换 BGM 总开关（开/关）。打开时若尚未选曲，自动按视频分析标签匹配一首。 */
+  async function _setBgmEnabled(enabled) {
     if (!_editState.edl) {
-      showToast("还没有剪辑方案", "warn");
+      var tg = $("editBgmToggle");
+      if (tg) tg.checked = false;
+      showToast("请先生成剪辑方案", "warn");
       return;
     }
-    var hasBgm = _editState.edl.bgm && _editState.edl.bgm.trackId;
-    if (!hasBgm) { showToast("当前未选 BGM", "ok"); return; }
-
     _editSaveUndo();
-    _editState.edl.bgm = { trackId: null };
-
+    if (!_editState.edl.bgm || typeof _editState.edl.bgm !== "object") _editState.edl.bgm = {};
+    var prevBgm = _editState.edl.bgm;
+    var trackId = prevBgm.trackId || "";
+    if (enabled && !trackId) {
+      var tracks = _bgmCatalogCache && _bgmCatalogCache.length ? _bgmCatalogCache : await _loadBgmLibrary();
+      var picked = _pickAutoBgmTrack(tracks);
+      if (!picked) {
+        prevBgm.enabled = false;
+        var toggle = $("editBgmToggle");
+        if (toggle) toggle.checked = false;
+        showToast("BGM 曲库为空，无法自动匹配", "warn");
+        _renderBgmStatus();
+        return;
+      }
+      trackId = picked.id;
+      prevBgm.trackId = trackId;
+      prevBgm.offsetTime = Number(prevBgm.offsetTime) > 0 ? Number(prevBgm.offsetTime) : 0;
+    }
+    prevBgm.enabled = !!enabled;
     if (project) {
       if (!project.editData) project.editData = {};
       project.editData.edl = _editState.edl; // arch-guard:allow-editdata
     }
-    // 后端也支持 bgm-select 把 trackId 置 null（清空选择）
-    _sendTimelineOp({ op: "bgm-select", trackId: null });
-
-    // 立即停止预览 audio
-    var bgmAudio = _editState._bgmAudio;
-    if (bgmAudio) {
-      try { bgmAudio.pause(); bgmAudio.removeAttribute("src"); bgmAudio.load(); } catch (_e) {}
+    if (enabled && trackId) {
+      _sendTimelineOp({ op: "bgm-select", trackId: trackId });
+    } else {
+      _sendTimelineOp({ op: "bgm-toggle", enabled: false });
     }
-
-    _renderBgmSelector();
-    _renderBgmClearButton();
-    showToast("已去除 BGM，可用「撤销」恢复", "ok");
+    _renderBgmStatus();
+    _renderEditTimeline();   // A1 轨道即时反映开/关
+    _syncBgmPlayback();      // 关→停播，开→续播
   }
 
-  /** 根据当前 BGM 选择状态启用/禁用「去除 BGM」按钮 */
-  function _renderBgmClearButton() {
-    var btn = $("btnEditClearBgm");
-    if (!btn) return;
-    var hasBgm = !!(_editState.edl && _editState.edl.bgm && _editState.edl.bgm.trackId);
-    btn.disabled = !hasBgm;
+  // BGM 流用带 token 的 fetch 取回转成 blob objectURL，再喂给 <audio>。
+  // 原因：鉴权走 Authorization: Bearer，而 <audio src> 这类媒体请求带不了自定义 header，
+  // 直接用 /api/edit/bgm/<id> 会被 getCurrentUser 判 401、静默没声音。按 id 缓存避免重复拉取。
+  var _bgmBlobUrlCache = {};
+  function _ensureBgmObjectUrl(id, cb) {
+    if (!id) return;
+    if (_bgmBlobUrlCache[id]) { cb(_bgmBlobUrlCache[id]); return; }
+    var token = "";
+    try { token = localStorage.getItem("sw_auth_token") || ""; } catch (_e) {}
+    fetch("/api/edit/bgm/" + encodeURIComponent(id), {
+      headers: token ? { Authorization: "Bearer " + token } : {}
+    })
+      .then(function (r) { if (!r.ok) throw new Error("bgm " + r.status); return r.blob(); })
+      .then(function (blob) { var u = URL.createObjectURL(blob); _bgmBlobUrlCache[id] = u; cb(u); })
+      .catch(function (e) { console.warn("[bgm] 取流失败:", id, (e && e.message) || e); });
+  }
+
+  /** 试听某首 BGM：再点一次停。单例预览 audio，与列表共用。 */
+  function _previewBgm(id, btn) {
+    var audio = document.getElementById("_bgmPreviewAudio");
+    if (!audio) {
+      audio = document.createElement("audio");
+      audio.id = "_bgmPreviewAudio";
+      document.body.appendChild(audio);
+    }
+    var labelSpan = btn && btn.querySelector("[data-bgm-preview-label]");
+    var iconSpan = btn && btn.querySelector(".material-symbols-outlined");
+    var idleLabel = (labelSpan && labelSpan.dataset && labelSpan.dataset.bgmIdleLabel) || (labelSpan && labelSpan.textContent && labelSpan.textContent.trim()) || "播放";
+    function setBtnState(iconValue, labelValue) {
+      if (iconSpan) iconSpan.textContent = iconValue;
+      if (labelSpan) labelSpan.textContent = labelValue;
+    }
+    if (audio.dataset.playing === id || audio.dataset.pending === id) {
+      try { audio.pause(); } catch (_e) {}
+      audio.dataset.playing = "";
+      audio.dataset.pending = "";
+      setBtnState("play_arrow", idleLabel);
+      _updateBgmStatusFromAudio(audio, id);
+    } else {
+      audio.dataset.pending = id;
+      audio.dataset.playing = "";
+      setBtnState("progress_activity", "加载");
+      _bindBgmPreviewProgress(audio, id);
+      _ensureBgmObjectUrl(id, function (objUrl) {
+        if (audio.dataset.pending !== id) return;
+        audio.src = objUrl;
+        audio.play().then(function () {
+          audio.dataset.pending = "";
+          audio.dataset.playing = id;
+          setBtnState("pause", "暂停");
+          _updateBgmStatusFromAudio(audio, id);
+        }).catch(function (err) {
+          audio.dataset.pending = "";
+          audio.dataset.playing = "";
+          setBtnState("play_arrow", idleLabel);
+          _updateBgmStatusFromAudio(audio, id);
+          console.warn("[bgm] preview play failed:", err);
+        });
+        audio.onended = function () {
+          setBtnState("play_arrow", idleLabel);
+          audio.dataset.playing = "";
+          audio.dataset.pending = "";
+          try { audio.currentTime = 0; } catch (_e) {}
+          _updateBgmStatusFromAudio(audio, id);
+        };
+      });
+    }
+  }
+
+  /** 渲染右侧"背景音乐"状态头部：默认关闭；用户打开后自动匹配一首，之后可换曲。 */
+  function _renderBgmStatus() {
+    var statusEl = $("editBgmStatus");
+    var toggle = $("editBgmToggle");
+    if (!statusEl) return;
+
+    var bgm = (_editState.edl && _editState.edl.bgm) || null;
+    var enabled = !!(bgm && bgm.enabled === true);
+    var panel = statusEl.closest ? statusEl.closest(".edit-bgm-panel") : null;
+    if (panel) {
+      panel.classList.toggle("is-bgm-on", enabled);
+      panel.classList.toggle("is-bgm-off", !enabled);
+    }
+
+    if (toggle) {
+      toggle.checked = enabled;
+      if (toggle.dataset.wired !== "1") {
+        toggle.dataset.wired = "1";
+        toggle.addEventListener("change", function () { _setBgmEnabled(toggle.checked); });
+      }
+    }
+
+    if (!_editState.edl) {
+      statusEl.innerHTML = '<div class="edit-bgm-current edit-bgm-current--empty">' +
+        '<div class="edit-bgm-track-card">' +
+          '<div class="edit-bgm-art edit-bgm-art--dim"><span class="material-symbols-outlined">music_note</span></div>' +
+          '<div class="edit-bgm-track-main">' +
+            '<div class="edit-bgm-track-title-row"><span class="edit-bgm-track-name">背景音乐默认关闭</span></div>' +
+            '<div class="edit-bgm-meta-row"><span class="edit-bgm-meta-pill">OFF</span></div>' +
+          '</div>' +
+          '<div class="edit-bgm-waveform-row"><span class="edit-bgm-waveform edit-bgm-waveform--dim"><span class="edit-bgm-waveform-active" data-bgm-progress></span></span></div>' +
+          '<div class="edit-bgm-time-row"><span data-bgm-time>00:00 / 00:00</span></div>' +
+        '</div>' +
+      '</div>';
+      return;
+    }
+    if (!enabled) {
+      statusEl.innerHTML = '<div class="edit-bgm-current edit-bgm-current--off">' +
+        '<div class="edit-bgm-track-card">' +
+          '<div class="edit-bgm-art edit-bgm-art--off"><span class="material-symbols-outlined">music_off</span></div>' +
+          '<div class="edit-bgm-track-main">' +
+            '<div class="edit-bgm-track-title-row"><span class="edit-bgm-track-name">背景音乐已关闭</span></div>' +
+            '<div class="edit-bgm-meta-row"><span class="edit-bgm-meta-pill">OFF</span></div>' +
+          '</div>' +
+          '<div class="edit-bgm-waveform-row"><span class="edit-bgm-waveform edit-bgm-waveform--dim"><span class="edit-bgm-waveform-active" data-bgm-progress></span></span></div>' +
+          '<div class="edit-bgm-time-row"><span data-bgm-time>00:00 / 00:00</span></div>' +
+        '</div>' +
+      '</div>';
+      return;
+    }
+
+    var CAT_LABELS = { calm: "平静", tense: "紧张", action: "动作", romantic: "浪漫", sad: "悲伤", epic: "史诗", mysterious: "神秘", hopeful: "希望" };
+    var trackId = bgm && bgm.trackId;
+    var entry = trackId ? (_bgmCatalogCache || []).find(function (t) { return t.id === trackId; }) : null;
+
+    if (!entry) {
+      statusEl.innerHTML = '<div class="edit-bgm-current edit-bgm-current--auto">' +
+        '<div class="edit-bgm-track-card">' +
+          '<div class="edit-bgm-art"><span class="material-symbols-outlined">music_note</span></div>' +
+          '<div class="edit-bgm-track-main">' +
+            '<div class="edit-bgm-track-title-row"><span class="edit-bgm-track-name">正在匹配配乐</span></div>' +
+            '<div class="edit-bgm-meta-row"><span class="edit-bgm-meta-pill">AUTO</span></div>' +
+          '</div>' +
+          '<div class="edit-bgm-waveform-row"><span class="edit-bgm-waveform"><span class="edit-bgm-waveform-active" data-bgm-progress></span></span></div>' +
+          '<div class="edit-bgm-time-row"><span data-bgm-time>00:00 / 00:00</span></div>' +
+        '</div>' +
+        '<div class="edit-bgm-actions-row">' +
+          '<button type="button" data-bgm-expand class="edit-bgm-change-btn">换曲</button>' +
+        '</div>' +
+      '</div>';
+    } else {
+      var catLabel = CAT_LABELS[entry.category] || entry.category;
+      var sugCat = _editState.segmentTags && _editState.segmentTags.suggestedBGMCategory;
+      var isRec = sugCat && entry.category === sugCat;
+      var dur = Number(entry.duration) || 0;
+      var durText = dur > 0 ? _formatTime(dur) : "--:--";
+      statusEl.innerHTML =
+        '<div class="edit-bgm-current">' +
+          '<div class="edit-bgm-track-card">' +
+            '<div class="edit-bgm-art"><span class="material-symbols-outlined" style="font-variation-settings:\'FILL\' 1">music_note</span></div>' +
+            '<div class="edit-bgm-track-main">' +
+              '<div class="edit-bgm-track-title-row">' +
+                '<span class="edit-bgm-track-name">' + escapeHtml(entry.name) + '</span>' +
+                (isRec ? '<span class="edit-bgm-recommend-badge">推荐</span>' : '') +
+              '</div>' +
+              '<div class="edit-bgm-meta-row">' +
+                '<span class="edit-bgm-chip">' + escapeHtml(catLabel) + '</span>' +
+                '<span class="edit-bgm-meta-pill">' + durText + '</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="edit-bgm-waveform-row"><span class="edit-bgm-waveform"><span class="edit-bgm-waveform-active" data-bgm-progress></span></span></div>' +
+            '<div class="edit-bgm-time-row"><span data-bgm-time>00:00 / ' + durText + '</span></div>' +
+          '</div>' +
+          '<div class="edit-bgm-actions-row">' +
+            '<button type="button" data-bgm-preview-cur="' + escapeHtml(entry.id) + '" class="edit-bgm-play-btn" title="试听">' +
+              '<span class="material-symbols-outlined" data-bgm-preview-icon>play_arrow</span>' +
+              '<span data-bgm-preview-label data-bgm-idle-label="播放">播放</span>' +
+            '</button>' +
+            '<button type="button" data-bgm-expand class="edit-bgm-change-btn">' +
+              '<span class="material-symbols-outlined">sync</span>' +
+              '<span>换曲</span>' +
+            '</button>' +
+          '</div>' +
+        '</div>';
+    }
+
+    var expandBtn = statusEl.querySelector("[data-bgm-expand]");
+    if (expandBtn) expandBtn.addEventListener("click", function () {
+      var sel = $("editBgmSelector");
+      if (!sel) return;
+      sel.hidden = !sel.hidden;
+      if (!sel.hidden) _renderBgmSelector();
+    });
+    var curPrev = statusEl.querySelector("[data-bgm-preview-cur]");
+    if (curPrev) curPrev.addEventListener("click", function () { _previewBgm(curPrev.dataset.bgmPreviewCur, curPrev); });
+    var previewAudio = document.getElementById("_bgmPreviewAudio");
+    if (previewAudio && previewAudio.dataset.playing === trackId) {
+      _updateBgmStatusFromAudio(previewAudio, trackId);
+    } else {
+      _updateBgmStatusFromTimeline();
+    }
   }
 
   /** 把 timeline 里所有 transitionIn 改成 cut，写盘 + 重渲染。可用 Undo 恢复。 */
@@ -2939,22 +3835,9 @@ export function syncEditProject(p) {
         project.editData.edl = resp.result; // arch-guard:allow-editdata 内存镜像（后端 SSE 已落盘）
       }
 
-      // 自动选 BGM：按片段分析的 suggestedBGMCategory 命中第一首匹配类别的 BGM。
-      // 生成剪辑方案后，工作台可以直接预览 BGM 与字幕。
-      if (!_editState.edl.bgm || !_editState.edl.bgm.trackId) {
-        var bgmList = await _loadBgmLibrary(); // ensure cache populated
-        var sugCat = _editState.segmentTags && _editState.segmentTags.suggestedBGMCategory;
-        var picked = sugCat && bgmList.find(function (t) { return t.category === sugCat; });
-        if (!picked && bgmList.length) picked = bgmList[0]; // 兜底：实在没匹配就拿第一首（hopeful，最通用）
-        if (picked) {
-          _editState.edl.bgm = { trackId: picked.id };
-          _sendTimelineOp({ op: "bgm-select", trackId: picked.id });
-        }
-      }
-
       _renderEditTimeline();
       _renderBgmSelector();
-      _renderBgmClearButton();
+      _renderBgmStatus();
       _syncBgmPlayback();
       _syncEditExportButtonState();
       // 把 LLM 给的剪辑思路一起 toast 出来，方便用户理解成片结构。
@@ -3095,6 +3978,23 @@ export function syncEditProject(p) {
 
   var _exportDownloaded = false;
 
+  function _exportFilenameFromContentDisposition(header) {
+    header = String(header || "");
+    if (!header) return "";
+    var starMatch = header.match(/filename\*\s*=\s*([^;]+)/i);
+    if (starMatch && starMatch[1]) {
+      var encoded = starMatch[1].trim().replace(/^['"]|['"]$/g, "");
+      var utf8Prefix = encoded.match(/^utf-8''(.+)$/i);
+      try {
+        return decodeURIComponent(utf8Prefix ? utf8Prefix[1] : encoded);
+      } catch (_) {}
+    }
+    var quotedMatch = header.match(/filename\s*=\s*"([^"]+)"/i);
+    if (quotedMatch && quotedMatch[1]) return quotedMatch[1].trim();
+    var plainMatch = header.match(/filename\s*=\s*([^;]+)/i);
+    return plainMatch && plainMatch[1] ? plainMatch[1].trim() : "";
+  }
+
   function _downloadExportFile(url, opts) {
     var force = !!(opts && opts.force);
     if (_exportDownloaded && !force) return;
@@ -3103,6 +4003,7 @@ export function syncEditProject(p) {
     fetch(url, { headers: getAuthHeaders() })
       .then(function (resp) {
         if (!resp.ok) throw new Error("下载失败: " + resp.status);
+        fname = _exportFilenameFromContentDisposition(resp.headers.get("Content-Disposition")) || fname;
         return resp.blob();
       })
       .then(function (blob) {
@@ -3135,7 +4036,6 @@ export function syncEditProject(p) {
       return;
     }
     if (state.state === "stale") {
-      showToast("时间线已修改，请先一键成片", "warn");
       _pulseAutoComposeButton();
       return;
     }
@@ -3165,6 +4065,8 @@ export function syncEditProject(p) {
       onCompleted: function (data) {
         var url = (data && (data.downloadUrl || data.resultUrl)) || "";
         var edlVersion = data && data.edlVersion;
+        var edlSignature = data && (data.edlSignature || data.exportedEdlSignature);
+        var edlSignatureMeta = data && data.exportedEdlSignatureMeta;
         if (project && url) {
           if (!project.editData) project.editData = {};
           // E-3.3 前置：exportUrl/exportTaskId 的权威落盘将由后端 _run_export → task_store
@@ -3172,6 +4074,8 @@ export function syncEditProject(p) {
           project.editData.exportUrl = url; // arch-guard:allow-editdata 内存镜像（后端 task_store 是权威源）
           project.editData.exportTaskId = taskId;
           if (typeof edlVersion !== "undefined") project.editData.exportedEdlVersion = edlVersion; // arch-guard:allow-editdata
+          if (edlSignature) project.editData.exportedEdlSignature = edlSignature; // arch-guard:allow-editdata
+          if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
         }
         if (url) {
           _downloadExportFile(url);
@@ -3199,6 +4103,8 @@ export function syncEditProject(p) {
           var isFailed = status.status === "failed" || status.status === "cancelled" || status.status === "timeout";
           var downloadUrl = status.downloadUrl || status.url || "";
           var edlVersion = status.edlVersion;
+          var edlSignature = status.edlSignature || status.exportedEdlSignature;
+          var edlSignatureMeta = status.exportedEdlSignatureMeta;
           var errorMsg = status.error || status.errorMsg || "";
           var restarted = status.restarted || errorMsg === "orphaned by server restart";
           if (isCompleted || isFailed) {
@@ -3208,6 +4114,8 @@ export function syncEditProject(p) {
                 project.editData.exportUrl = downloadUrl; // arch-guard:allow-editdata HTTP 兜底内存镜像
                 project.editData.exportTaskId = taskId;
                 if (typeof edlVersion !== "undefined") project.editData.exportedEdlVersion = edlVersion; // arch-guard:allow-editdata
+                if (edlSignature) project.editData.exportedEdlSignature = edlSignature; // arch-guard:allow-editdata
+                if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
               }
               _downloadExportFile(downloadUrl);
               showToast("成片导出完成，正在下载！", "ok");
@@ -3286,42 +4194,71 @@ export function syncEditProject(p) {
     }
   }
 
-  function _setAutoComposeBlocker(evt) {
-    var box = $("editAutoComposeBlocker");
-    if (!box) return;
-    var show = !!evt;
-    box.hidden = !show;
-    var hintEl = $("editExportHint");
-    if (!show) {
-      // Blocker 隐藏后让 export state 重新接管 hint 显示
-      _syncEditExportButtonState();
-      return;
-    }
-    var title = $("editAutoComposeBlockerTitle");
-    var text = $("editAutoComposeBlockerText");
-    var titleText = "检测到时间线被手工修改";
-    if (title) title.textContent = titleText;
-    // 修 A：当服务端 message/error 与标题完全相同（route.ts 当前就是这样发的），
-    // 回退到默认引导文案，避免标题/正文重复显示同一句话。
-    var rawMsg = evt && (evt.message || evt.error);
-    var msg = (rawMsg && rawMsg !== titleText) ? rawMsg : "请选择如何处理当前时间线，然后再继续一键成片。";
-    if (text) text.textContent = msg;
-    // 修 B：blocker 显示时隐藏 export hint，避免和 "时间线已修改，请先一键成片" 双份警告。
-    if (hintEl) hintEl.hidden = true;
+  // 时间线被手工改过后的轻确认弹窗：只有「确定」会动作（设为新基线并继续成片），
+  // 取消 / 右上角 ✕ / 点弹窗外区域 一律不做事。视觉按剪辑页确认弹窗设计稿收敛。
+  function _confirmOverwriteTimeline() {
+    return new Promise(function (resolve) {
+      var overlay = document.createElement("div");
+      overlay.className = "qd-ow-overlay";
+      overlay.innerHTML =
+        '<div class="qd-ow-card" role="dialog" aria-modal="true" aria-labelledby="qdOverwriteTitle">' +
+          '<button type="button" class="qd-ow-x" aria-label="关闭">' +
+            '<span class="material-symbols-outlined">close</span>' +
+          '</button>' +
+          '<div class="qd-ow-body">' +
+            '<div class="qd-ow-title-row">' +
+              '<span class="material-symbols-outlined qd-ow-warning" aria-hidden="true">warning</span>' +
+              '<h2 id="qdOverwriteTitle">提示：修改前的内容将会被覆盖</h2>' +
+            '</div>' +
+            '<div class="qd-ow-actions">' +
+              '<button type="button" class="qd-ow-cancel">取消</button>' +
+              '<button type="button" class="qd-ow-ok">确定</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>';
+      var settled = false;
+      function onKey(e) { if (e.key === "Escape") done(false); }
+      function done(val) {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKey);
+        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        resolve(val);
+      }
+      overlay.querySelector(".qd-ow-ok").onclick = function () { done(true); };
+      overlay.querySelector(".qd-ow-cancel").onclick = function () { done(false); };
+      overlay.querySelector(".qd-ow-x").onclick = function () { done(false); };
+      overlay.addEventListener("click", function (e) { if (e.target === overlay) done(false); });
+      document.addEventListener("keydown", onKey);
+      document.body.appendChild(overlay);
+    });
   }
 
-  async function _resolveAutoComposeTimeline(action) {
+  // 「确定」分支：把当前（手工改过的）时间线设为新基线，再自动接着成片，
+  // 用户不必再手动点一次「一键成片」。失败则提示并停下。
+  async function _acceptTimelineAndCompose() {
     if (!project || !project.id) return;
     try {
       await apiPost("/api/edit/auto-compose/recovery", {
         projectId: project.id,
-        action: action,
+        action: "accept-current",
       });
-      _setAutoComposeBlocker(null);
       await _resyncEditDataFromServer();
-      showToast(action === "accept-current" ? "已将当前时间线设为新基线" : "已回到上次自动成片", "ok");
     } catch (e) {
       showToast("处理失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+      return;
+    }
+    await _autoComposeEditVideo();
+  }
+
+  // 一键成片进度：按阶段统一显示一句短文案，避免后端下发的长 step 标签把按钮撑爆。
+  function _composePhaseLabel(phase) {
+    switch (phase) {
+      case "preflight": return "检查片段中…";
+      case "analyze": return "分析结构中…";
+      case "edl": return "方案生成中…";
+      case "export": return "导出中…";
+      default: return "处理中…";
     }
   }
 
@@ -3335,10 +4272,10 @@ export function syncEditProject(p) {
       return;
     }
     if (!_editActionStart("btnEditAutoCompose", "editCardAutoCompose", "#fbbf24", "检查片段中…", "Composing")) return;
-    _setAutoComposeBlocker(null);
 
     var capturedError = null;
     var partialHintShown = false;
+    var needOverwriteConfirm = false;
     try {
       var resp = await apiPostStream("/api/edit/auto-compose", {
         projectId: project.id,
@@ -3346,7 +4283,7 @@ export function syncEditProject(p) {
       }, null, function (evt) {
         if (!evt) return;
         if (evt.type === "phase") {
-          _editActionProgress("editCardAutoCompose", evt.message || "处理中");
+          _editActionProgress("editCardAutoCompose", _composePhaseLabel(evt.phase));
         } else if (evt.type === "preflight_result") {
           if (evt.partial && !partialHintShown) {
             partialHintShown = true;
@@ -3361,9 +4298,9 @@ export function syncEditProject(p) {
           }
           _syncEditExportButtonState();
         } else if (evt.type === "export_progress") {
-          _editActionProgress("editCardAutoCompose", "导出成片中 " + (evt.progress || 0) + "%");
+          _editActionProgress("editCardAutoCompose", "导出中 " + (evt.progress || 0) + "%");
         } else if (evt.type === "step") {
-          _editActionProgress("editCardAutoCompose", evt.label || "处理中");
+          _editActionProgress("editCardAutoCompose", _composePhaseLabel(evt.phase));
         } else if (evt.type === "warning") {
           var warnings = Array.isArray(evt.warnings) ? evt.warnings : [];
           if (warnings.length) showToast("剪辑质检提醒 " + warnings.length + " 条，已记录到成片记录", "warn");
@@ -3383,17 +4320,24 @@ export function syncEditProject(p) {
         if (typeof resp.exportedEdlVersion !== "undefined") {
           project.editData.exportedEdlVersion = resp.exportedEdlVersion;
         }
-        _downloadExportFile(resp.exportUrl);
+        if (resp.exportedEdlSignature) {
+          project.editData.exportedEdlSignature = resp.exportedEdlSignature;
+        }
+        if (resp.exportedEdlSignatureMeta) {
+          project.editData.exportedEdlSignatureMeta = resp.exportedEdlSignatureMeta;
+        }
       }
       _syncEditExportButtonState();
       if (resp && resp.partial) {
         showToast("一键成片完成（已跳过部分不可用片段）", "ok");
       } else {
-        showToast("一键成片完成，正在下载！", "ok");
+        showToast("一键成片完成", "ok");
       }
     } catch (e) {
       if (capturedError && capturedError.code === "MANUAL_TIMELINE_EDIT_DETECTED") {
-        _setAutoComposeBlocker(capturedError);
+        // 推迟到本次成片动作完全结束（_editActionEnd 之后）再弹确认，
+        // 否则在 busy 态里递归触发 _autoComposeEditVideo 会被忙碌守卫挡掉。
+        needOverwriteConfirm = true;
       } else if (capturedError && capturedError.code === "ALREADY_RUNNING") {
         showToast("已有一键成片任务正在运行", "warn");
       } else if (capturedError && capturedError.code) {
@@ -3406,6 +4350,13 @@ export function syncEditProject(p) {
     }
     _editActionEnd("btnEditAutoCompose", "editCardAutoCompose", "一键成片");
     _syncEditExportButtonState();
+
+    // 时间线被手工改过：本次成片已停在 preflight。等动作态清干净后再弹确认，
+    // 点「确定」= 设为新基线并自动续跑成片；取消 / ✕ / 点弹窗外 都不做事。
+    if (needOverwriteConfirm) {
+      var ok = await _confirmOverwriteTimeline();
+      if (ok) await _acceptTimelineAndCompose();
+    }
   }
 
   // E-2.2：刷新/切页回来时如果 editData.exportTaskId 还在 running，主动重订 SSE。
@@ -3426,6 +4377,77 @@ export function syncEditProject(p) {
 
   var _mediaActiveTab = "clips";
   var _uploadedMedia = [];
+  var _mediaPreviewBlobCache = {};
+  var _mediaPreviewBlobPending = {};
+
+  function _isProtectedEditMediaUrl(url) {
+    url = String(url || "").trim();
+    if (!url) return false;
+    try {
+      var u = new URL(url, window.location.origin);
+      return u.origin === window.location.origin && u.pathname.indexOf("/api/edit/media/") === 0;
+    } catch (_e) {
+      return url.indexOf("/api/edit/media/") === 0;
+    }
+  }
+
+  function _looksLikeImageUrl(url) {
+    return /\.(jpe?g|png|webp|gif|bmp|avif|heic|heif|svg|tiff?)(\?|#|$)/i.test(String(url || ""));
+  }
+
+  function _resolveMediaPreviewUrl(url) {
+    url = String(url || "").trim();
+    if (!url || !_isProtectedEditMediaUrl(url)) return Promise.resolve(url);
+    if (_mediaPreviewBlobCache[url]) return Promise.resolve(_mediaPreviewBlobCache[url]);
+    if (_mediaPreviewBlobPending[url]) return _mediaPreviewBlobPending[url];
+
+    _mediaPreviewBlobPending[url] = fetch(url, {
+      headers: getAuthHeaders(),
+      cache: "force-cache",
+    })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("素材预览加载失败 (" + resp.status + ")");
+        return resp.blob();
+      })
+      .then(function (blob) {
+        var objectUrl = URL.createObjectURL(blob);
+        _mediaPreviewBlobCache[url] = objectUrl;
+        return objectUrl;
+      })
+      .finally(function () {
+        delete _mediaPreviewBlobPending[url];
+      });
+    return _mediaPreviewBlobPending[url];
+  }
+
+  function _hydrateMediaPreviewElements(root) {
+    if (!root) return;
+    var nodes = [];
+    if (root.matches && root.matches("[data-media-preview-src]")) nodes.push(root);
+    if (root.querySelectorAll) {
+      root.querySelectorAll("[data-media-preview-src]").forEach(function (node) { nodes.push(node); });
+    }
+    nodes.forEach(function (node) {
+      var sourceUrl = node.getAttribute("data-media-preview-src") || "";
+      if (!sourceUrl) return;
+      node.setAttribute("data-media-preview-loading", "true");
+      _resolveMediaPreviewUrl(sourceUrl)
+        .then(function (displayUrl) {
+          if (!displayUrl) return;
+          node.setAttribute("src", displayUrl);
+          node.removeAttribute("data-media-preview-src");
+          node.removeAttribute("data-media-preview-loading");
+          if (node.tagName === "VIDEO") {
+            try { node.load(); } catch (_e) {}
+          }
+        })
+        .catch(function (e) {
+          node.removeAttribute("data-media-preview-loading");
+          node.setAttribute("data-media-preview-error", "true");
+          console.warn("[Edit] 素材卡片预览加载失败:", sourceUrl, (e && e.message) || e);
+        });
+    });
+  }
 
   function _renderMediaLibrary() {
     var list = $("editMediaList");
@@ -3456,15 +4478,20 @@ export function syncEditProject(p) {
         return;
       }
       _uploadedMedia.forEach(function (m, i) {
+        var uploadKind = m.kind || "";
+        var uploadIsImage = uploadKind === "image";
+        var uploadPreviewUrl = m.localPreviewUrl || m.previewUrl || m.url || "";
         var card = _buildMediaCard({
           type: "upload",
           idx: i,
           name: m.name || "素材 " + (i + 1),
-          thumbUrl: m.thumbnailUrl || "",
-          videoUrl: m.url || "",
+          thumbUrl: uploadIsImage ? (m.thumbnailUrl || uploadPreviewUrl) : (m.thumbnailUrl || ""),
+          previewUrl: uploadPreviewUrl,
+          videoUrl: uploadIsImage ? "" : (m.url || ""),
           protectedUrl: m.protectedUrl || m.url || "",
           duration: m.duration || 0,
           mediaId: m.id,
+          kind: uploadKind,
         });
         list.appendChild(card);
       });
@@ -3476,11 +4503,13 @@ export function syncEditProject(p) {
     card.className = "edit-media-card mb-2";
     card.setAttribute("draggable", "true");
 
+    var previewUrl = info.thumbUrl || info.previewUrl || info.videoUrl || "";
+    var previewIsImage = info.kind === "image" || !!info.thumbUrl || _looksLikeImageUrl(previewUrl);
     var thumbHtml;
-    if (info.thumbUrl) {
-      thumbHtml = '<img src="' + escapeHtml(info.thumbUrl) + '" loading="lazy" />';
-    } else if (info.videoUrl) {
-      thumbHtml = '<video src="' + escapeHtml(info.videoUrl) + '" muted preload="metadata"></video>';
+    if (previewUrl && previewIsImage) {
+      thumbHtml = '<img src="' + escapeHtml(previewUrl) + '" loading="lazy" />';
+    } else if (previewUrl) {
+      thumbHtml = '<video data-media-preview-src="' + escapeHtml(previewUrl) + '" muted playsinline preload="metadata"></video>';
     } else {
       thumbHtml = '<div style="aspect-ratio:16/9;background:rgba(0,0,0,0.05);display:flex;align-items:center;justify-content:center"><span class="material-symbols-outlined text-on-surface-variant/20">movie</span></div>';
     }
@@ -3501,6 +4530,9 @@ export function syncEditProject(p) {
       '</div>' +
       deleteIconHtml;
 
+    hydrateProtectedImageElements(card);
+    _hydrateMediaPreviewElements(card);
+
     card.addEventListener("dragstart", function (ev) {
       ev.dataTransfer.setData("application/x-edit-media", JSON.stringify({
         type: info.type,
@@ -3510,6 +4542,7 @@ export function syncEditProject(p) {
         duration: info.duration,
         mediaId: info.mediaId,
         name: info.name,
+        kind: info.kind,
       }));
       ev.dataTransfer.effectAllowed = "copy";
     });
@@ -3544,14 +4577,29 @@ export function syncEditProject(p) {
 
   function _initMediaTabEvents() {
     var tabs = document.querySelectorAll(".edit-media-tab");
+    function syncMediaTabs(activeTab) {
+      tabs.forEach(function (t) {
+        var selected = t.dataset.tab === activeTab;
+        t.classList.toggle("edit-media-tab--active", selected);
+        t.setAttribute("aria-selected", selected ? "true" : "false");
+      });
+    }
+    function activateMediaTab(activeTab) {
+      if (!activeTab) return;
+      var changed = _mediaActiveTab !== activeTab;
+      _mediaActiveTab = activeTab;
+      syncMediaTabs(_mediaActiveTab);
+      if (changed) _renderMediaLibrary();
+    }
     tabs.forEach(function (tab) {
+      tab.addEventListener("pointerdown", function () {
+        activateMediaTab(tab.dataset.tab);
+      });
       tab.addEventListener("click", function () {
-        _mediaActiveTab = tab.dataset.tab;
-        tabs.forEach(function (t) { t.classList.remove("edit-media-tab--active"); });
-        tab.classList.add("edit-media-tab--active");
-        _renderMediaLibrary();
+        activateMediaTab(tab.dataset.tab);
       });
     });
+    syncMediaTabs(_mediaActiveTab);
   }
 
   function _initMediaUpload() {
@@ -3562,31 +4610,68 @@ export function syncEditProject(p) {
       if (!files.length) return;
       input.value = "";
 
+      var uploadedAny = false;
       for (var i = 0; i < files.length; i++) {
+        var file = files[i];
+        if (!_isTimelineUploadVideo(file)) {
+          showToast("剪辑页目前仅支持上传视频素材", "warn");
+          continue;
+        }
         try {
           var fd = new FormData();
-          fd.append("file", files[i]);
+          fd.append("file", file);
           fd.append("projectId", project ? project.id : "default");
+          fd.append("purpose", "edit_timeline");
 
           var resp = await fetch("/api/edit/upload-media", {
             method: "POST",
             headers: { Authorization: "Bearer " + (_getAuthToken() || "") },
             body: fd,
           });
-          if (!resp.ok) throw new Error("上传失败");
+          if (!resp.ok) throw new Error(await _readUploadError(resp));
           var data = await resp.json();
-          _uploadedMedia.push(_normalizeMediaLibraryItem(data));
-          showToast("素材已上传: " + (data.name || files[i].name), "ok");
+          var uploadedItem = _normalizeMediaLibraryItem(data);
+          uploadedItem.name = uploadedItem.name || file.name;
+          uploadedItem.mime = uploadedItem.mime || file.type || "";
+          uploadedItem.kind = uploadedItem.kind || _kindFromMime(uploadedItem.mime);
+          uploadedItem.localPreviewUrl = URL.createObjectURL(file);
+          _uploadedMedia.push(uploadedItem);
+          uploadedAny = true;
+          showToast("素材已上传: " + (data.name || file.name), "ok");
         } catch (e) {
           showToast("上传失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
         }
       }
+      if (!uploadedAny) return;
       _mediaActiveTab = "uploads";
       document.querySelectorAll(".edit-media-tab").forEach(function (t) {
-        t.classList.toggle("edit-media-tab--active", t.dataset.tab === "uploads");
+        var selected = t.dataset.tab === "uploads";
+        t.classList.toggle("edit-media-tab--active", selected);
+        t.setAttribute("aria-selected", selected ? "true" : "false");
       });
       _renderMediaLibrary();
     });
+  }
+
+  function _isTimelineUploadVideo(file) {
+    if (!file) return false;
+    var mime = String(file.type || "").toLowerCase();
+    if (mime) return mime.indexOf("video/") === 0;
+    return /\.(mp4|mov|m4v|webm|avi|mkv)(\?|#|$)/i.test(String(file.name || ""));
+  }
+
+  async function _readUploadError(resp) {
+    try {
+      var data = await resp.clone().json();
+      return data.error || data.detail || data.message || "上传失败";
+    } catch (_e) {
+      try {
+        var text = await resp.text();
+        return text || "上传失败";
+      } catch (_e2) {
+        return "上传失败";
+      }
+    }
   }
 
   async function _loadUploadedMedia() {
@@ -3595,6 +4680,7 @@ export function syncEditProject(p) {
       var resp = await apiGet("/api/edit/media-library/project?projectId=" + encodeURIComponent(project.id));
       _uploadedMedia = (resp.items || resp.media || [])
         .filter(function (item) { return !item.source || item.source === "uploaded"; })
+        .filter(function (item) { return (item.kind || _kindFromMime(item.mime || "")) === "video"; })
         .map(_normalizeMediaLibraryItem);
     } catch (e) {
       _uploadedMedia = [];
@@ -3603,6 +4689,8 @@ export function syncEditProject(p) {
 
   function _normalizeMediaLibraryItem(item) {
     item = item || {};
+    var mime = item.mime || "";
+    var kind = item.kind || _kindFromMime(mime);
     return {
       id: item.mediaId || item.id || "",
       name: item.title || item.name || item.filename || "",
@@ -3610,9 +4698,20 @@ export function syncEditProject(p) {
       protectedUrl: item.protectedUrl || item.url || "",
       thumbnailUrl: item.thumbnailUrl || item.coverUrl || "",
       duration: Number(item.durationSec || item.duration || 0) || 0,
-      kind: item.kind || "",
+      kind: kind,
+      mime: mime,
+      localPreviewUrl: item.localPreviewUrl || "",
+      previewUrl: item.previewUrl || "",
       source: item.source || "uploaded",
     };
+  }
+
+  function _kindFromMime(mime) {
+    mime = String(mime || "").toLowerCase();
+    if (mime.indexOf("image/") === 0) return "image";
+    if (mime.indexOf("video/") === 0) return "video";
+    if (mime.indexOf("audio/") === 0) return "audio";
+    return "";
   }
 
   async function _deleteUploadedMedia(mediaId, idx) {
@@ -3642,33 +4741,89 @@ export function syncEditProject(p) {
   function _initMediaDropOnTimeline() {
     var track = $("editVideoTrack");
     if (!track) return;
+    var acceptsMediaDrag = function (ev) {
+      var types = ev && ev.dataTransfer && ev.dataTransfer.types;
+      if (!types) return false;
+      if (typeof types.indexOf === "function") return types.indexOf("application/x-edit-media") >= 0;
+      if (typeof types.contains === "function") return types.contains("application/x-edit-media");
+      return Array.prototype.indexOf.call(types, "application/x-edit-media") >= 0;
+    };
     track.addEventListener("dragover", function (ev) {
-      if (ev.dataTransfer.types.indexOf("application/x-edit-media") >= 0) {
+      if (acceptsMediaDrag(ev)) {
         ev.preventDefault();
         ev.dataTransfer.dropEffect = "copy";
-        track.style.outline = "2px dashed #3b82f6";
+        _showTimelineInsertCue(_timelineInsertIndexFromClientX(ev.clientX, track), track);
       }
     });
-    track.addEventListener("dragleave", function () { track.style.outline = ""; });
+    track.addEventListener("dragleave", function (ev) {
+      if (!ev.relatedTarget || !track.contains(ev.relatedTarget)) _hideTimelineInsertCue(track);
+    });
     track.addEventListener("drop", function (ev) {
-      track.style.outline = "";
+      var insertIndex = _timelineInsertIndexFromClientX(ev.clientX, track);
+      _hideTimelineInsertCue(track);
       var raw = ev.dataTransfer.getData("application/x-edit-media");
       if (!raw) return;
       ev.preventDefault();
       try {
         var info = JSON.parse(raw);
-        _addMediaToTimeline(info);
+        _addMediaToTimeline(info, insertIndex);
       } catch (e) {}
     });
+    document.addEventListener("dragend", function () { _hideTimelineInsertCue(track); });
   }
 
-  function _addMediaToTimeline(info) {
+  function _addMediaToTimeline(info, insertIndex) {
+    // C：图片素材暂不支持加入时间线——明确拦截，避免“假装加成功”
+    if (_mediaIsImage(info)) {
+      showToast("暂不支持图片素材，请拖入视频片段", "warn");
+      return;
+    }
+    // A2：上传视频后端未落时长，拖入前先探测真实 metadata，探测不到再兜底 5s
+    if (info.type === "upload" && !(Number(info.duration) > 0) && info.videoUrl) {
+      _probeVideoDuration(info.videoUrl, function (dur) {
+        _commitMediaToTimeline(Object.assign({}, info, { duration: dur > 0 ? dur : 5 }), insertIndex);
+      });
+      return;
+    }
+    _commitMediaToTimeline(info, insertIndex);
+  }
+
+  /** 判断拖入素材是否为图片（优先 kind，其次按扩展名兜底） */
+  function _mediaIsImage(info) {
+    if (!info) return false;
+    if (info.kind === "image") return true;
+    if (info.kind === "video" || info.kind === "audio") return false;
+    var s = String(info.videoUrl || "") + " " + String(info.name || "");
+    return /\.(jpe?g|png|webp|gif|bmp|avif|heic|heif|svg|tiff?)(\?|#|$)/i.test(s);
+  }
+
+  /** 探测视频真实时长（拿不到/超时回调 0），用隐藏 video 读 metadata */
+  function _probeVideoDuration(url, cb) {
+    var done = false;
+    var finish = function (d) { if (done) return; done = true; cb(d); };
+    try {
+      var v = document.createElement("video");
+      v.preload = "metadata";
+      v.muted = true;
+      v.addEventListener("loadedmetadata", function () {
+        var d = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+        try { v.removeAttribute("src"); v.load(); } catch (_e) {}
+        finish(d);
+      });
+      v.addEventListener("error", function () { finish(0); });
+      setTimeout(function () { finish(0); }, 4000);
+      v.src = url;
+    } catch (e) { finish(0); }
+  }
+
+  function _commitMediaToTimeline(info, insertIndex) {
     if (!_editState.edl) {
       _editState.edl = { timeline: [], bgm: null, totalDuration: 0 };
     }
     _editSaveUndo();
+    var targetIndex = _normalizeTimelineInsertIndex(insertIndex);
     var newEntry = {
-      groupIdx: info.type === "clip" ? info.idx : 900 + (_editState.edl.timeline.length),
+      groupIdx: info.type === "clip" ? info.idx : _nextExternalMediaGroupIdx(),
       videoUrl: info.videoUrl,
       protectedUrl: info.protectedUrl || _protectedVideoUrlFrom(info.videoUrl) || info.videoUrl,
       _originVideoUrl: info.protectedUrl || _protectedVideoUrlFrom(info.videoUrl) || info.videoUrl,
@@ -3680,31 +4835,53 @@ export function syncEditProject(p) {
       _mediaName: info.name,
       mediaId: info.mediaId || "",
     };
-    _editState.edl.timeline.push(newEntry);
+    _editState.edl.timeline.splice(targetIndex, 0, newEntry);
 
-    // E-4.2：add-media PATCH /api/edit/timeline。后端把 entry 追加进 timeline
-    // 并返回权威 edl；前端乐观更新一份即时渲染。
-    _sendTimelineOp({ op: "add-media", entry: _entryForPersistence(newEntry) });
+    // E-4.2：add-media PATCH /api/edit/timeline。后端按 insertIndex 写入权威 timeline，
+    // 前端先做同位置乐观插入，避免拖到中间却短暂出现在末尾。
+    _sendTimelineOp({ op: "add-media", entry: _entryForPersistence(newEntry), insertIndex: targetIndex });
 
     _buildSegStartTimes();
     _renderEditTimeline();
     _updateEditTimeDisplay();
+    _revealTimelineSeg(targetIndex);
     showToast("已添加到时间线: " + (info.name || ""), "ok");
+  }
+
+  function _revealTimelineSeg(segIdx) {
+    var tl = _editState.edl && _editState.edl.timeline;
+    if (!tl || !tl.length) return;
+    var idx = Math.max(0, Math.min(Number(segIdx) || 0, tl.length - 1));
+    _highlightActiveSeg(idx);
+    var scrollEl = $("editTimelineScroll");
+    if (!scrollEl) return;
+    try {
+      var pps = _editState.pixelsPerSecond * _editState.zoom;
+      var starts = (_editState.segStartTimes && _editState.segStartTimes.length === tl.length)
+        ? _editState.segStartTimes
+        : _timelineStarts(tl).starts;
+      var left = _timelineSegmentLeft(starts[idx] || 0, idx, pps);
+      var right = left + _timelineDurationWidth(_segDuration(tl[idx]), pps);
+      var viewport = Math.max(0, scrollEl.clientWidth - _timelineOriginX(scrollEl) * 2);
+      if (left < scrollEl.scrollLeft) {
+        scrollEl.scrollLeft = Math.max(0, left - 24);
+      } else if (right > scrollEl.scrollLeft + viewport) {
+        scrollEl.scrollLeft = Math.max(0, right - viewport + 24);
+      }
+      _syncTimelineScrollLayers(scrollEl);
+    } catch (_e) {}
+  }
+
+  /** 滚动时间线到末尾并高亮最新加入的片段 */
+  function _revealLastTimelineSeg() {
+    var tl = _editState.edl && _editState.edl.timeline;
+    if (!tl || !tl.length) return;
+    _revealTimelineSeg(tl.length - 1);
   }
 
   function _initEditEvents() {
     var btnAutoCompose = $("btnEditAutoCompose");
     if (btnAutoCompose) btnAutoCompose.addEventListener("click", _autoComposeEditVideo);
-
-    var btnAcceptBaseline = $("btnEditAcceptTimelineBaseline");
-    if (btnAcceptBaseline) btnAcceptBaseline.addEventListener("click", function () {
-      _resolveAutoComposeTimeline("accept-current");
-    });
-
-    var btnRollbackTimeline = $("btnEditRollbackTimeline");
-    if (btnRollbackTimeline) btnRollbackTimeline.addEventListener("click", function () {
-      _resolveAutoComposeTimeline("rollback");
-    });
 
     var btnAnalyze = $("btnEditAnalyze");
     if (btnAnalyze) btnAnalyze.addEventListener("click", _analyzeEditSegments);
@@ -3731,16 +4908,16 @@ export function syncEditProject(p) {
 
       var _xToTimelinePixels = function (clientX) {
         var rect = timelineScroll.getBoundingClientRect();
-        return clientX - rect.left + timelineScroll.scrollLeft - 32;
+        return clientX - rect.left + timelineScroll.scrollLeft - _timelineOriginX(timelineScroll);
       };
 
       var _scrubTo = function (clientX) {
         var x = _xToTimelinePixels(clientX);
         var pps = _editState.pixelsPerSecond * _editState.zoom;
-        var t = Math.max(0, Math.min(x / pps, _editState.totalDuration));
 
         var segs = _getTimelineSegs();
         var starts = _editState.segStartTimes;
+        var t = Math.max(0, Math.min(_timelineXToTime(x, pps, segs, starts), _editState.totalDuration));
         var segIdx = 0;
         for (var i = 0; i < starts.length; i++) {
           var dur = _segDuration(segs[i]);
@@ -3825,19 +5002,16 @@ export function syncEditProject(p) {
       }
 
       timelineScroll.addEventListener("wheel", function (ev) {
-        ev.preventDefault();
         var dx = ev.deltaX || 0;
         var dy = ev.deltaY || 0;
         var shouldPanHorizontally = ev.shiftKey || Math.abs(dx) > Math.abs(dy);
         if (!shouldPanHorizontally) return;
+        ev.preventDefault();
         timelineScroll.scrollLeft += ev.shiftKey ? (dy || dx) : dx;
       }, { passive: false });
 
-      var rulerCanvas = $("editRuler");
       timelineScroll.addEventListener("scroll", function () {
-        if (rulerCanvas) {
-          rulerCanvas.style.transform = "translateX(" + (-timelineScroll.scrollLeft) + "px)";
-        }
+        _syncTimelineScrollLayers(timelineScroll);
         _updatePlayhead();
       });
     }

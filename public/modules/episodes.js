@@ -187,26 +187,16 @@ export async function _createNewEpisode(overlay) {
 
   _saveCurrentEpisode();
 
-  var prevScripts = project.episodes.map(function (ep) { return ep.script || ""; });
-  var existingChars = [];
-  if (project.assets && project.assets.characters) {
-    existingChars = project.assets.characters.map(function (c) {
-      return c.name + (c.appearance ? " | " + c.appearance : "");
-    });
-  }
-
   try {
-    // 前薄后厚：后端 workflow/continue 自己从 project.json 读 episodes +
-    // styleBible + 现有角色，出完剧本后已经把情绪段标好（segments + title
-    // 随 done 返回）。前端负责把新集推入 project.episodes[]（episode 数组
-    // 是前端 UI 状态不是后端 project.json 的职责）。
-    var resp = await apiPostStream("/api/script/workflow/continue", {
+    var resp = await apiPostStream("/api/script/workflow/episode-create", {
       projectId: project.id,
       direction: direction,
+      episodes: project.episodes,
+      currentEpisodeIdx: project.currentEpisodeIdx || 0,
       durationSec: durationStr || project.scriptTargetDurationSec || null,
     }, null, function (evt) {
       if (evt.type === "phase" && statusEl) {
-        if (evt.name === "continue_start") statusEl.textContent = "正在生成续集剧本…";
+        if (evt.name === "episode_create_start") statusEl.textContent = "正在生成续集剧本…";
         else if (evt.name === "tag_emotions_start") statusEl.textContent = "正在标注情绪…";
       } else if (evt.type === "script_chunk" && statusEl) {
         statusEl.textContent = "正在生成续集剧本…";
@@ -215,32 +205,12 @@ export async function _createNewEpisode(overlay) {
 
     if (statusEl) statusEl.textContent = "剧本生成成功，正在创建分集…";
 
-    var newEp = {
-      id: "ep_" + Date.now(),
-	      title: resp.title || ("第 " + (project.episodes.length + 1) + " 集"),
-	      idea: direction || "续写自前集",
-	      script: resp.script,
-	      scriptDraft: resp.script,
-	      scriptTargetDurationSec: resp.durationSec || project.scriptTargetDurationSec,
-      scriptApproved: false,
-      assets: null,
-      assetsApproved: false,
-      shots: [],
-      shotsApproved: false,
-      storyboards: [],
-      imagesApproved: false,
-      videoPrompts: [],
-      videoPromptsApproved: false,
-      narrations: [],
-      emotionSegments: Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [],
-      currentStep: 1,
-    };
-
-    project.episodes.push(newEp);
-    var newIdx = project.episodes.length - 1;
-    _loadEpisode(newIdx);
+    if (!resp || !resp.project || !_ctx.applyServerProject) {
+      throw new Error("后端没有返回完整分集项目");
+    }
+    project = _ctx.applyServerProject(resp.project) || _project();
+    var newIdx = project && Number.isFinite(Number(project.currentEpisodeIdx)) ? Number(project.currentEpisodeIdx) : (resp.currentEpisodeIdx || 0);
     _ctx.resetProjectUI();
-    _ctx.saveProject();
     _ctx.refreshAllPages();
     _ctx.restoreVideoTasks();
     _renderEpisodeTabs();

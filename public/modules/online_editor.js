@@ -26,6 +26,10 @@ var _ORIGIN_VIDEO_ID_RE = /\/api\/videos\/file\/([^/?#]+)/;
 var _exportState = _createDefaultExportState();
 var _exportPollingTimer = null;
 var _exportPollingStartedAt = 0;
+var _lastVevDemoAutoVideoSyncSignature = '';
+var _vevDemoAutoVideoSyncInFlight = null;
+var _vevDemoProjectBindingReady = false;
+var _vevDemoBoundOriginProjectId = '';
 
 const OEV_IFRAME_LOAD_TIMEOUT_MS = 25000;
 const OEV_IFRAME_READY_TIMEOUT_MS = 10000;
@@ -36,6 +40,13 @@ const OEV_EXPORT_STORAGE_UPDATED_KEY = 'oeLastExportUpdatedAt';
 const OEV_EXPORT_STORAGE_STALE_MS = 24 * 60 * 60 * 1000;
 const OEV_EXPORT_POLL_INTERVAL_MS = 3000;
 const OEV_EXPORT_POLL_MAX_MS = 10 * 60 * 1000;
+const OEV_AUTO_VIDEO_SYNC_STORAGE_PREFIX = 'oeVevAutoVideoSync';
+const OEV_MATERIAL_REGISTER_TIMEOUT_MS = 12 * 60 * 1000;
+const OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_MAX_MS = 60 * 60 * 1000;
+const OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_GRACE_MS = 60 * 1000;
+const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MIN_MS = 30000;
+const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_PER_ITEM_MS = 15000;
+const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MAX_MS = 180000;
 
 // ============================================================================
 // 公开 API
@@ -140,6 +151,29 @@ async function _loadVevDemoConfig() {
 function _getConfiguredIframeUrl(config) {
   if (!config) return '';
   return config.iframeProjectUrl || config.iframeUrl || config.iframeBaseUrl || '';
+}
+
+function _materialSyncRequestTimeoutMs(body) {
+  const videoCount = Array.isArray(body?.resourceIds) ? body.resourceIds.length : 0;
+  const bgmCount = Array.isArray(body?.bgmTrackIds) ? body.bgmTrackIds.length : 0;
+  const itemCount = Math.max(1, videoCount + bgmCount);
+  return Math.min(
+    OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_MAX_MS,
+    itemCount * OEV_MATERIAL_REGISTER_TIMEOUT_MS + OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_GRACE_MS,
+  );
+}
+
+async function _postMaterialImport(body, options) {
+  const requestBody = { ...(body || {}) };
+  if (requestBody.autoRegister !== false && requestBody.registerTimeoutMs == null) {
+    requestBody.registerTimeoutMs = OEV_MATERIAL_REGISTER_TIMEOUT_MS;
+  }
+  const timeoutMs = options?.timeoutMs || (
+    requestBody.autoRegister === false
+      ? undefined
+      : _materialSyncRequestTimeoutMs(requestBody)
+  );
+  return await _oeCtx?.apiPost?.('/api/volcengine/import', requestBody, 'POST', { timeoutMs });
 }
 
 function _setConnectionStatus(variant, label) {
@@ -785,6 +819,32 @@ function _createVevDemoFrame(url) {
   `;
   const frame = _vevFrame;
 
+  const backFallback = document.createElement('button');
+  backFallback.type = 'button';
+  backFallback.id = 'oeVevBackFallback';
+  backFallback.className = 'oe-vev-back-fallback';
+  backFallback.style.cssText = `
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 4;
+    width: 96px;
+    height: 48px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: transparent;
+    cursor: pointer;
+  `;
+  backFallback.setAttribute('aria-label', '返回剪辑页');
+  backFallback.setAttribute('title', '返回剪辑页');
+  backFallback.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    _onVevDemoNavBack({ source: 'origin-fallback-hitarea' });
+  });
+
   loadTimer = setTimeout(() => {
     if (iframeLoaded) return;
     failFrameLoad(`编辑器加载超时，请检查 VevDemo 前端是否可访问，以及 Origin CSP frame-src 是否允许 ${url}`);
@@ -819,6 +879,7 @@ function _createVevDemoFrame(url) {
   });
 
   container.appendChild(frame);
+  container.appendChild(backFallback);
 }
 
 function _clearVevDemoAutoRetryTimer() {
@@ -1002,6 +1063,10 @@ function _handleVevMessage(event) {
       _onVevDemoReady(data);
       break;
 
+    case 'vevdemo:navBack':
+      _onVevDemoNavBack(data);
+      break;
+
     case 'vevdemo:exportComplete':
       _onExportComplete(data);
       break;
@@ -1030,6 +1095,10 @@ function _handleVevMessage(event) {
       _onVevDemoStatus(data);
       break;
 
+    case 'vevdemo:originRequest':
+      _handleVevDemoOriginRequest(data);
+      break;
+
     default:
       console.log('[OnlineEditor] 未处理的消息:', type, data);
   }
@@ -1039,18 +1108,76 @@ function _handleVevMessage(event) {
 // VevDemo 消息处理
 // ============================================================================
 
+function _onVevDemoNavBack() {
+  // SDK header「返回」按钮:回到 Origin 剪辑页(在线精修的上一步)。
+  // 等价于顶栏「返回剪辑页」,复用同一套 switchPage,不另搞导航。
+  if (typeof _oeCtx?.switchPage === 'function') {
+    _oeCtx.switchPage('edit');
+  } else {
+    try {
+      window.location.hash = 'workspacePage=edit';
+    } catch (_) {}
+    console.warn('[OnlineEditor] 收到 vevdemo:navBack 但无 switchPage,已写入 edit hash');
+  }
+}
+
+function _confirmVevDemoProjectBindingFromBridge(data, source) {
+  const currentProjectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+  const receivedProjectId = String(data?.originProjectId || '').trim();
+  const explicitProjectId = String(data?.vevProjectId || '').trim();
+  const explicitGroupId = String(data?.vevGroupId || '').trim();
+  const bridgeProjectId = String(data?.projectId || '').trim();
+  const bridgeGroupId = String(data?.groupId || '').trim();
+  const hasExplicitBinding = Boolean(explicitProjectId && explicitGroupId);
+  const hasSwitchedBoundProject = Boolean(data?.projectIsolationReady && bridgeProjectId && bridgeGroupId);
+  const bindingReady = Boolean(
+    currentProjectId
+      && receivedProjectId === currentProjectId
+      && (hasExplicitBinding || hasSwitchedBoundProject)
+  );
+  _vevDemoProjectBindingReady = bindingReady;
+  _vevDemoBoundOriginProjectId = bindingReady ? currentProjectId : '';
+  if (bindingReady) {
+    console.log('[OnlineEditor] VevDemo 项目绑定已确认:', {
+      source,
+      originProjectId: currentProjectId,
+      vevProjectId: explicitProjectId || bridgeProjectId,
+      vevGroupId: explicitGroupId || bridgeGroupId,
+    });
+  }
+  return bindingReady;
+}
+
+function _isCurrentVevDemoProjectBindingReady() {
+  const currentProjectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+  return Boolean(currentProjectId && _vevDemoProjectBindingReady && _vevDemoBoundOriginProjectId === currentProjectId);
+}
+
 function _onVevDemoReady(data) {
+  // VevDemo 可能在一次加载里发多次 ready(桥接就绪 + 应用/工程握手)。
+  // 状态刷新可重复执行；但连接 toast / 工程绑定 / ping 只在「未就绪→就绪」这一次跑，
+  // 否则会出现重复的「视频剪辑服务已连接」提示。真正断线重连时 _isVevDemoReady 已被置回 false，仍会完整执行。
+  const wasReady = _isVevDemoReady;
   _isVevDemoReady = true;
   _resetVevDemoAutoRetryState();
   _setConnectionStatus('ready', '已连接');
   _setOnlineEditorControlsReady(true);
   const diagnostic = document.getElementById('oeVevDiagnostic');
   if (diagnostic) diagnostic.remove();
-  console.log('[OnlineEditor] VevDemo 就绪');
+  console.log('[OnlineEditor] VevDemo 就绪', wasReady ? '(重复 ready，仅刷新状态)' : '');
+  if (wasReady) {
+    if (_confirmVevDemoProjectBindingFromBridge(data, 'ready')) {
+      _autoSyncCurrentEdlVideosToVevDemo();
+    }
+    return;
+  }
+
   if (data && data.uploadWorkflowConfigured === false) {
     _oeCtx?.showToast?.('VevDemo 上传转码工作流未配置，新上传 MP4 可能仍无法拖入轨道', 'warning');
   }
 
+  _vevDemoProjectBindingReady = false;
+  _vevDemoBoundOriginProjectId = '';
   _bindCurrentOriginProjectToVevDemo();
 
   // 发送欢迎消息，确认连接
@@ -1062,6 +1189,8 @@ function _onVevDemoReady(data) {
 async function _bindCurrentOriginProjectToVevDemo() {
   const project = _oeCtx?.getProject?.();
   if (!project?.id) return;
+  _vevDemoProjectBindingReady = false;
+  _vevDemoBoundOriginProjectId = '';
   try {
     const payload = await _oeCtx?.apiPost?.('/api/online-editor/project-binding', {
       projectId: project.id,
@@ -1078,6 +1207,8 @@ async function _bindCurrentOriginProjectToVevDemo() {
     });
   } catch (err) {
     console.error('[OnlineEditor] VevDemo 工程绑定失败:', err);
+    _vevDemoProjectBindingReady = false;
+    _vevDemoBoundOriginProjectId = '';
     _oeCtx?.showToast?.(`VevDemo 工程隔离暂不可用: ${err?.message || 'unknown error'}`, 'warning');
     _sendToVevDemo('origin:setProject', {
       projectId: project.id,
@@ -1174,7 +1305,21 @@ function _onVevDemoStatus(data) {
   const payload = _normalizeVevExportPayload(data);
   if (!_isVevExportStatusPayload(payload)) {
     if (data?.status === 'origin-project-received') {
-      console.warn('[OnlineEditor] VevDemo 已收到 Origin 项目，但当前桥接暂不支持切换底层 VevDemo 项目:', data);
+      console.log('[OnlineEditor] VevDemo 已接收当前 Origin 项目:', data);
+      if (!_confirmVevDemoProjectBindingFromBridge(data, 'status')) {
+        const currentProjectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+        const receivedProjectId = String(data?.originProjectId || '').trim();
+        console.warn('[OnlineEditor] VevDemo 项目绑定未确认，跳过自动同步/铺轨:', {
+          currentProjectId,
+          receivedProjectId,
+          vevProjectId: data?.vevProjectId || null,
+          vevGroupId: data?.vevGroupId || null,
+        });
+        _oeCtx?.showToast?.('VevDemo 项目绑定未确认，已暂停自动同步，避免写入默认工程', 'warning');
+        return;
+      }
+      _autoSyncCurrentEdlVideosToVevDemo();
+      return;
     }
     console.log('[OnlineEditor] VevDemo 状态:', data);
     return;
@@ -1210,6 +1355,62 @@ function _onVevDemoStatus(data) {
     });
   }
   console.log('[OnlineEditor] VevDemo 导出状态:', payload);
+}
+
+async function _handleVevDemoOriginRequest(data) {
+  const requestId = String(data?.requestId || '').trim();
+  const requestType = String(data?.requestType || '').trim();
+  const payload = data?.payload && typeof data.payload === 'object' ? data.payload : {};
+  if (!requestId) return;
+
+  try {
+    let result;
+    switch (requestType) {
+      case 'searchProjectVideos':
+        result = await _searchCurrentProjectVideosForVevDemo(payload);
+        break;
+      case 'registerProjectVideo':
+        result = await _registerProjectVideoForVevDemo(payload);
+        break;
+      default:
+        throw new Error(`不支持的 VevDemo Origin 请求: ${requestType || '(empty)'}`);
+    }
+    _sendToVevDemo('origin:response', { requestId, ok: true, result });
+  } catch (err) {
+    console.error('[OnlineEditor] VevDemo Origin 请求失败:', requestType, err);
+    _sendToVevDemo('origin:response', {
+      requestId,
+      ok: false,
+      error: err?.message || String(err || 'unknown error'),
+    });
+  }
+}
+
+async function _searchCurrentProjectVideosForVevDemo(payload) {
+  const project = _oeCtx?.getProject?.();
+  const requestedProjectId = String(payload?.projectId || '').trim();
+  if (!project?.id) throw new Error('当前项目不存在，无法读取项目视频库');
+  if (requestedProjectId && requestedProjectId !== project.id) {
+    throw new Error('VevDemo 请求的项目与当前 Origin 项目不一致');
+  }
+  return await _oeCtx?.apiGet?.(
+    `/api/tasks/video-by-project?projectId=${encodeURIComponent(project.id)}&scope=all-completed`,
+  );
+}
+
+async function _registerProjectVideoForVevDemo(payload) {
+  const project = _oeCtx?.getProject?.();
+  const videoTaskId = String(payload?.videoTaskId || payload?.resourceId || '').trim();
+  const requestedProjectId = String(payload?.projectId || '').trim();
+  if (!project?.id) throw new Error('当前项目不存在，无法注册项目视频');
+  if (requestedProjectId && requestedProjectId !== project.id) {
+    throw new Error('VevDemo 注册请求的项目与当前 Origin 项目不一致');
+  }
+  if (!videoTaskId) throw new Error('缺 videoTaskId');
+  return await _postMaterialImport({
+    projectId: project.id,
+    resourceIds: [videoTaskId],
+  });
 }
 
 function _normalizeVevExportPayload(data) {
@@ -1431,47 +1632,81 @@ function _requestVevDemoReexport() {
  * 后端会优先补齐 VOD/EditMaterial binding；bridge 收到 vid:// 后会复用或创建 VevDemo 素材。
  * @param {string[]} resourceIds - 素材 ID 数组
  */
-async function importMaterialsToVevDemo(resourceIds) {
+// 素材是否可送进 VevDemo：浏览器侧可达(签名直链) 或 已有云端源(vid:// / tos:// / directurl:// / editMid) 都算可用。
+// 上传素材注册 VOD 后 browserReachable 仍为 false，但有 vevSource，必须放行，否则时间线拿不到它。
+function _isVevUsableMaterial(item) {
+  if (!item) return false;
+  if (item.browserReachable !== false) return true;
+  return Boolean(item.vevSource || item.vevEditMid || (item.vevCreatePayload && item.vevCreatePayload.Source));
+}
+
+async function importMaterialsToVevDemo(resourceIds, options) {
+  options = options || {};
+  const silent = options.silent === true;
   if (!_isVevDemoReady) {
-    _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
-    return;
+    if (!silent) _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
+    return null;
+  }
+  if (!_isCurrentVevDemoProjectBindingReady()) {
+    if (!silent) _oeCtx?.showToast?.('VevDemo 项目绑定未确认，暂不能同步素材，避免写入默认工程', 'warning');
+    console.warn('[OnlineEditor] VevDemo 项目绑定未确认，拒绝同步素材:', {
+      currentProjectId: _oeCtx?.getProject?.()?.id || '',
+      boundOriginProjectId: _vevDemoBoundOriginProjectId,
+      bindingReady: _vevDemoProjectBindingReady,
+    });
+    return null;
   }
   const ids = Array.isArray(resourceIds) && resourceIds.length > 0
     ? resourceIds
     : _collectCurrentVideoResourceIds();
-  if (!ids.length) {
-    _oeCtx?.showToast?.('当前项目没有可同步的视频素材', 'warning');
-    return;
+  const bgmTrackIds = Array.isArray(options.bgmTrackIds)
+    ? options.bgmTrackIds.filter(Boolean)
+    : _collectCurrentBgmTrackIds();
+  if (!ids.length && !bgmTrackIds.length) {
+    if (!silent) _oeCtx?.showToast?.('当前项目没有可同步的视频素材或 BGM', 'warning');
+    return null;
   }
 
   try {
     _setSyncMaterialsBusy(true);
+    if (!silent) {
+      _oeCtx?.showToast?.('首次同步会上传素材并等待转码，可能需要几分钟', 'info');
+    }
     // 调用后端获取素材；缺少 binding 的视频任务会在服务端自动注册到 VOD/VevDemo。
-    const payload = await _oeCtx?.apiPost?.('/api/volcengine/import', {
+    const payload = await _postMaterialImport({
+      projectId: _oeCtx?.getProject?.()?.id,
       resourceIds: ids,
+      bgmTrackIds,
     });
     const materials = Array.isArray(payload.materials) ? payload.materials : [];
     if (!materials.length) {
-      _oeCtx?.showToast?.('没有找到可同步的视频素材', 'warning');
-      return;
+      if (!silent) _oeCtx?.showToast?.('没有找到可同步的视频素材', 'warning');
+      return { materials: [], reachableMaterials: [], payload };
     }
-    const reachableMaterials = materials.filter((item) => item && item.browserReachable !== false);
+    const reachableMaterials = materials.filter((item) => _isVevUsableMaterial(item));
     const skippedCount = materials.length - reachableMaterials.length;
-    if (skippedCount > 0) {
-      _oeCtx?.showToast?.(`${skippedCount} 条素材浏览器侧不可达，已跳过`, 'warning');
+    if (!silent && skippedCount > 0) {
+      _oeCtx?.showToast?.(`${skippedCount} 条素材无法同步到 VevDemo（无云端源），已跳过`, 'warning');
     }
     if (!reachableMaterials.length) {
-      _oeCtx?.showToast?.('没有可发送到 VevDemo 的素材', 'warning');
-      return;
+      if (!silent) _oeCtx?.showToast?.('没有可发送到 VevDemo 的素材', 'warning');
+      return { materials, reachableMaterials: [], payload };
     }
 
     // 发送到 VevDemo bridge：带 vevEditMid 的素材会直接复用；带 vid:// / tos:// / directurl:// 的素材会尝试注册。
     await _sendMaterialsToVevDemo(reachableMaterials);
 
+    const shouldApplyTimeline = options.applyTimeline === true || (!silent && options.applyTimeline !== false);
+    if (shouldApplyTimeline) {
+      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials);
+    }
+
     console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
+    return { materials, reachableMaterials, payload };
   } catch (err) {
     console.error('[OnlineEditor] 同步素材失败:', err);
-    _oeCtx?.showToast?.('同步素材失败: ' + err.message, 'error');
+    if (!silent) _oeCtx?.showToast?.('同步素材失败: ' + err.message, 'error');
+    return { error: err };
   } finally {
     _setSyncMaterialsBusy(false);
   }
@@ -1484,10 +1719,15 @@ function _sendMaterialsToVevDemo(materials) {
       return;
     }
 
+    const itemCount = Array.isArray(materials) ? materials.length : 0;
+    const timeoutMs = Math.min(
+      OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MAX_MS,
+      Math.max(OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MIN_MS, OEV_MATERIAL_IMPORT_ACK_TIMEOUT_PER_ITEM_MS * Math.max(1, itemCount)),
+    );
     const timeout = setTimeout(() => {
       _messageHandlers.delete('vevdemo:materialsImported');
-      reject(new Error('未收到 VevDemo 素材同步回执，请检查 console'));
-    }, 8000);
+      reject(new Error(`未收到 VevDemo 素材同步回执（${Math.round(timeoutMs / 1000)} 秒超时），请检查 console`));
+    }, timeoutMs);
 
     _messageHandlers.set('vevdemo:materialsImported', (data) => {
       clearTimeout(timeout);
@@ -1506,6 +1746,9 @@ function _sendMaterialsToVevDemo(materials) {
 }
 
 function _collectCurrentVideoResourceIds() {
+  const edlIds = _collectCurrentEdlVideoResourceIds();
+  if (edlIds.length) return edlIds;
+
   const project = _oeCtx?.getProject?.();
   const ids = new Set();
   const addFromUrl = (url) => {
@@ -1527,6 +1770,389 @@ function _collectCurrentVideoResourceIds() {
     if (task?.serverTaskId && /^[a-zA-Z0-9-]{16,}$/.test(String(task.serverTaskId))) ids.add(String(task.serverTaskId));
   });
   return Array.from(ids);
+}
+
+function _collectCurrentEdlVideoResourceIds() {
+  const project = _oeCtx?.getProject?.();
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  const ids = new Set();
+  const addId = (value) => {
+    const text = String(value || '').trim();
+    if (text) ids.add(text);
+  };
+  const addFromUrl = (url) => {
+    const match = _ORIGIN_VIDEO_ID_RE.exec(String(url || ''));
+    if (match && match[1]) ids.add(decodeURIComponent(match[1]));
+  };
+  timeline.forEach((entry) => {
+    if (!entry) return;
+    if (entry._isExternalMedia === true) return;
+    let hasEntryResource = false;
+    const addEntryId = (value) => {
+      addId(value);
+      hasEntryResource = hasEntryResource || Boolean(String(value || '').trim());
+    };
+    const addEntryFromUrl = (url) => {
+      const match = _ORIGIN_VIDEO_ID_RE.exec(String(url || ''));
+      addFromUrl(url);
+      hasEntryResource = hasEntryResource || Boolean(match && match[1]);
+    };
+    addEntryId(entry.clipId);
+    addEntryId(entry.videoTaskId);
+    addEntryId(entry.mediaId);
+    addEntryId(entry.resourceId);
+    addEntryFromUrl(entry.videoUrl);
+    addEntryFromUrl(entry.protectedUrl);
+    addEntryFromUrl(entry._originVideoUrl);
+    if (!hasEntryResource && Number.isInteger(Number(entry.groupIdx))) {
+      addId(_currentVideoTaskIdForGroup(Number(entry.groupIdx)));
+    }
+  });
+  return Array.from(ids);
+}
+
+function _collectCurrentBgmTrackIds() {
+  const project = _oeCtx?.getProject?.();
+  const bgm = project?.editData?.edl?.bgm;
+  if (!bgm || bgm.enabled !== true) return [];
+  const trackId = String(bgm.trackId || '').trim();
+  return trackId ? [trackId] : [];
+}
+
+function _currentVideoTaskIdForGroup(groupIdx) {
+  const project = _oeCtx?.getProject?.();
+  if (!project || !Number.isInteger(Number(groupIdx))) return '';
+  const gi = Number(groupIdx);
+  const sb = Array.isArray(project.storyboards) ? project.storyboards[gi] : null;
+  const vt = Array.isArray(project.videoTasks) ? project.videoTasks[gi] : null;
+  const extract = (url) => {
+    const match = _ORIGIN_VIDEO_ID_RE.exec(String(url || ''));
+    return match && match[1] ? decodeURIComponent(match[1]) : '';
+  };
+  return String(
+    sb?.videoTaskId ||
+    vt?.taskId ||
+    vt?.serverTaskId ||
+    vt?.id ||
+    extract(sb?.videoUrl || sb?._originVideoUrl) ||
+    extract(vt?.url || vt?.videoUrl || vt?.protectedUrl) ||
+    ''
+  ).trim();
+}
+
+function _stableVevSyncStringify(value) {
+  if (value == null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(_stableVevSyncStringify).join(',')}]`;
+  return `{${Object.keys(value).sort().map((key) => (
+    `${JSON.stringify(key)}:${_stableVevSyncStringify(value[key])}`
+  )).join(',')}}`;
+}
+
+function _roundVevSyncSec(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const rounded = Math.round(Math.max(0, n) * 1000) / 1000;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+async function _sha256Hex(text) {
+  const input = String(text || '');
+  try {
+    if (window.crypto?.subtle && window.TextEncoder) {
+      const bytes = new TextEncoder().encode(input);
+      const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+      return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch (err) {
+    console.warn('[OnlineEditor] crypto.subtle digest failed, falling back to lightweight hash:', err);
+  }
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+async function _computeCurrentEdlVideoSyncSignature(ids, bgmTrackIds) {
+  const project = _oeCtx?.getProject?.();
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  const bgm = edl?.bgm && typeof edl.bgm === 'object' ? edl.bgm : null;
+  const payload = {
+    version: 1,
+    projectId: project?.id || '',
+    edlVersion: Number(edl?.version) || 0,
+    videoIds: Array.from(new Set(ids || [])).sort(),
+    bgm: {
+      enabled: Boolean(bgm && bgm.enabled === true && bgm.trackId),
+      trackIds: Array.from(new Set(bgmTrackIds || [])).sort(),
+      offsetTime: _roundVevSyncSec(bgm?.offsetTime),
+    },
+    items: timeline.map((entry) => ({
+      clipId: String(entry?.clipId || entry?.videoTaskId || entry?.mediaId || entry?.resourceId || '').trim(),
+      groupIdx: Number.isInteger(Number(entry?.groupIdx)) ? Number(entry.groupIdx) : null,
+      inSec: _roundVevSyncSec(entry?.inPoint ?? entry?.in ?? 0),
+      outSec: _roundVevSyncSec(entry?.outPoint ?? entry?.out ?? entry?.duration ?? 0),
+      transitionInType: String(entry?.transitionIn?.type || entry?.transitionIn || 'cut').trim().toLowerCase() || 'cut',
+      transitionOutType: String(entry?.transitionOut?.type || entry?.transitionOut || 'cut').trim().toLowerCase() || 'cut',
+    })),
+  };
+  return `vev-material-sync-v1:${await _sha256Hex(_stableVevSyncStringify(payload))}`;
+}
+
+function _autoVideoSyncStorageKey(signature) {
+  const project = _oeCtx?.getProject?.();
+  return `${OEV_AUTO_VIDEO_SYNC_STORAGE_PREFIX}:${project?.id || 'no-project'}:${signature}`;
+}
+
+async function _autoSyncCurrentEdlVideosToVevDemo() {
+  if (!_isVevDemoReady) return null;
+  if (!_isCurrentVevDemoProjectBindingReady()) {
+    console.warn('[OnlineEditor] VevDemo 项目绑定未就绪，跳过自动同步/铺轨:', {
+      currentProjectId: _oeCtx?.getProject?.()?.id || '',
+      boundOriginProjectId: _vevDemoBoundOriginProjectId,
+      bindingReady: _vevDemoProjectBindingReady,
+    });
+    return null;
+  }
+  if (_vevDemoAutoVideoSyncInFlight) return _vevDemoAutoVideoSyncInFlight;
+
+  const ids = _collectCurrentEdlVideoResourceIds();
+  const bgmTrackIds = _collectCurrentBgmTrackIds();
+  if (!ids.length && !bgmTrackIds.length) {
+    console.log('[OnlineEditor] 当前 EDL 没有可自动同步的视频素材或 BGM');
+    return null;
+  }
+
+  const signature = await _computeCurrentEdlVideoSyncSignature(ids, bgmTrackIds);
+  const storageKey = _autoVideoSyncStorageKey(signature);
+  try {
+    if (_lastVevDemoAutoVideoSyncSignature === signature || window.sessionStorage?.getItem(storageKey) === 'ok') {
+      console.log('[OnlineEditor] 跳过重复 EDL 视频自动同步:', signature);
+      const payload = await _postMaterialImport({
+        projectId: _oeCtx?.getProject?.()?.id,
+        resourceIds: ids,
+        bgmTrackIds,
+        autoRegister: false,
+      });
+      const materials = Array.isArray(payload?.materials)
+        ? payload.materials.filter((item) => _isVevUsableMaterial(item))
+        : [];
+      if (materials.length) {
+        await _applyCurrentEdlTimelineToVevDemo(materials);
+        return null;
+      }
+      console.warn('[OnlineEditor] 已有自动同步标记但未找到可用 VevDemo binding，重新执行完整同步:', signature);
+      try { window.sessionStorage?.removeItem(storageKey); } catch (_) {}
+    }
+  } catch (err) {
+    console.warn('[OnlineEditor] 自动同步复用 binding 失败，改走完整同步:', err);
+  }
+
+  _vevDemoAutoVideoSyncInFlight = (async () => {
+    const result = await importMaterialsToVevDemo(ids, {
+      silent: true,
+      source: 'auto-edl-material',
+      bgmTrackIds,
+      applyTimeline: false,
+    });
+    if (result?.error) throw result.error;
+    if (Array.isArray(result?.reachableMaterials) && result.reachableMaterials.length > 0) {
+      _lastVevDemoAutoVideoSyncSignature = signature;
+      try { window.sessionStorage?.setItem(storageKey, 'ok'); } catch (_) {}
+      console.log('[OnlineEditor] 当前 EDL 视频已自动同步到 VevDemo:', {
+        count: result.reachableMaterials.length,
+        videoCount: ids.length,
+        bgmCount: bgmTrackIds.length,
+        signature,
+      });
+      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials);
+    }
+    return result;
+  })();
+
+  try {
+    return await _vevDemoAutoVideoSyncInFlight;
+  } catch (err) {
+    console.warn('[OnlineEditor] 当前 EDL 视频自动同步失败，可使用手动同步重试:', err);
+    return { error: err };
+  } finally {
+    _vevDemoAutoVideoSyncInFlight = null;
+  }
+}
+
+function _materialMapById(materials) {
+  const map = new Map();
+  (Array.isArray(materials) ? materials : []).forEach((material) => {
+    const id = String(material?.id || '').trim();
+    if (id) map.set(id, material);
+  });
+  return map;
+}
+
+function _resolveEdlEntryVideoTaskId(entry) {
+  if (!entry || entry._isExternalMedia === true) return '';
+  const direct = String(entry.clipId || entry.videoTaskId || entry.mediaId || entry.resourceId || '').trim();
+  if (direct) return direct;
+  const extract = (url) => {
+    const match = _ORIGIN_VIDEO_ID_RE.exec(String(url || ''));
+    return match && match[1] ? decodeURIComponent(match[1]) : '';
+  };
+  return (
+    extract(entry.videoUrl) ||
+    extract(entry.protectedUrl) ||
+    extract(entry._originVideoUrl) ||
+    (Number.isInteger(Number(entry.groupIdx)) ? _currentVideoTaskIdForGroup(Number(entry.groupIdx)) : '')
+  );
+}
+
+function _buildCurrentVevTimelinePlan(materials) {
+  const project = _oeCtx?.getProject?.();
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  if (!project?.id || !timeline.length) return null;
+
+  const materialMap = _materialMapById(materials);
+  const entries = [];
+  const missingItems = [];
+  let cursorSec = 0;
+  timeline.forEach((entry, index) => {
+    const resourceId = _resolveEdlEntryVideoTaskId(entry);
+    const material = resourceId ? materialMap.get(resourceId) : null;
+    const source = String(material?.vevSource || material?.source || material?.vevCreatePayload?.Source || '').trim();
+    if (!resourceId || !source) {
+      missingItems.push({
+        index,
+        groupIdx: Number.isInteger(Number(entry?.groupIdx)) ? Number(entry.groupIdx) : null,
+        resourceId,
+        reason: resourceId ? 'missing_vev_source' : (entry?._isExternalMedia === true ? 'external_media_not_registered' : 'missing_resource_id'),
+      });
+      return;
+    }
+    const inSec = _roundVevSyncSec(entry?.inPoint ?? entry?.in ?? 0);
+    let outSec = Number(entry?.outPoint ?? entry?.out);
+    if (!Number.isFinite(outSec) || outSec <= inSec) {
+      outSec = Number(entry?.duration) > 0 ? inSec + Number(entry.duration) : inSec;
+    }
+    outSec = _roundVevSyncSec(outSec);
+    const durationSec = Math.max(0.1, outSec - inSec);
+    const transitionIn = entry?.transitionIn && typeof entry.transitionIn === 'object'
+      ? entry.transitionIn
+      : { type: entry?.transitionIn || 'cut', duration: 0 };
+    const transitionOut = entry?.transitionOut && typeof entry.transitionOut === 'object'
+      ? entry.transitionOut
+      : { type: entry?.transitionOut || 'cut', duration: 0 };
+    entries.push({
+      index,
+      resourceId,
+      source,
+      editMid: material?.vevEditMid || '',
+      type: 'video',
+      groupIdx: Number.isInteger(Number(entry?.groupIdx)) ? Number(entry.groupIdx) : null,
+      inSec,
+      outSec,
+      durationSec,
+      targetStartSec: cursorSec,
+      targetEndSec: cursorSec + durationSec,
+      transitionIn: {
+        type: String(transitionIn?.type || 'cut').trim().toLowerCase() || 'cut',
+        durationSec: _roundVevSyncSec(transitionIn?.duration),
+      },
+      transitionOut: {
+        type: String(transitionOut?.type || 'cut').trim().toLowerCase() || 'cut',
+        durationSec: _roundVevSyncSec(transitionOut?.duration),
+      },
+    });
+    cursorSec += durationSec;
+  });
+
+  if (missingItems.length) {
+    return {
+      ok: false,
+      code: 'missing_materials',
+      message: `${missingItems.length} 段素材还没同步到 VevDemo，已取消自动铺轨`,
+      missingTimelineItems: missingItems,
+    };
+  }
+
+  if (!entries.length) return null;
+
+  const bgm = edl?.bgm && typeof edl.bgm === 'object' ? edl.bgm : null;
+  const bgmTrackId = bgm && bgm.enabled === true ? String(bgm.trackId || '').trim() : '';
+  const bgmMaterial = bgmTrackId ? materialMap.get(bgmTrackId) : null;
+  const bgmSource = String(bgmMaterial?.vevSource || bgmMaterial?.source || bgmMaterial?.vevCreatePayload?.Source || '').trim();
+
+  return {
+    projectId: project.id,
+    edlVersion: Number(edl?.version) || 0,
+    totalDurationSec: cursorSec,
+    video: entries,
+    bgm: bgmTrackId && bgmSource ? {
+      resourceId: bgmTrackId,
+      source: bgmSource,
+      editMid: bgmMaterial?.vevEditMid || '',
+      offsetSec: _roundVevSyncSec(bgm?.offsetTime),
+      volume: 0.32,
+    } : null,
+  };
+}
+
+function _sendTimelinePlanToVevDemo(plan) {
+  return new Promise((resolve, reject) => {
+    if (!_isVevDemoReady) {
+      reject(new Error('VevDemo 未就绪'));
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      _messageHandlers.delete('vevdemo:timelineApplied');
+      reject(new Error('未收到 VevDemo 时间线铺轨回执'));
+    }, 15000);
+
+    _messageHandlers.set('vevdemo:timelineApplied', (data) => {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:timelineApplied');
+      if (data?.ok === false) {
+        reject(new Error(data?.error || 'VevDemo 时间线铺轨失败'));
+        return;
+      }
+      resolve(data);
+    });
+
+    const sent = _sendToVevDemo('origin:applyTimeline', { plan });
+    if (!sent) {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:timelineApplied');
+      reject(new Error('发送时间线铺轨消息失败'));
+    }
+  });
+}
+
+async function _applyCurrentEdlTimelineToVevDemo(materials) {
+  const plan = _buildCurrentVevTimelinePlan(materials);
+  if (plan?.ok === false) {
+    console.warn('[OnlineEditor] VevDemo 时间线铺轨已拦截:', plan);
+    _oeCtx?.showToast?.(plan.message || '部分素材还没准备好，已取消自动铺轨', 'warning');
+    return { blocked: true, plan };
+  }
+  if (!plan) {
+    console.log('[OnlineEditor] 当前 EDL 没有可铺到 VevDemo 的 timeline plan');
+    return null;
+  }
+  try {
+    const result = await _sendTimelinePlanToVevDemo(plan);
+    console.log('[OnlineEditor] VevDemo 时间线铺轨完成:', result);
+    return result;
+  } catch (err) {
+    console.warn('[OnlineEditor] VevDemo 时间线铺轨未完成:', err);
+    const message = String(err?.message || '');
+    if (/time unit|时间单位|unverified|conflict|mismatch|ambiguous|does not match/i.test(message)) {
+      _oeCtx?.showToast?.('VevDemo 时间单位未验证或存在冲突，已暂停自动铺轨，避免时间线错乱', 'warning');
+    }
+    return { error: err };
+  }
 }
 
 /**

@@ -3,11 +3,11 @@ import { readFileSync, statSync } from 'node:fs';
 import { getDb } from './db';
 
 export const ASSET_LIBRARY_LIMITS = {
-  hotTotalBytes: 5 * 1024 * 1024 * 1024,
-  hotImageBytes: 1 * 1024 * 1024 * 1024,
-  hotVideoBytes: 4 * 1024 * 1024 * 1024,
-  hotImageCount: 2000,
-  hotVideoCount: 50,
+  hotTotalBytes: 150 * 1024 * 1024 * 1024,
+  hotImageBytes: 30 * 1024 * 1024 * 1024,
+  hotVideoBytes: 100 * 1024 * 1024 * 1024,
+  hotImageCount: 50000,
+  hotVideoCount: 20000,
   videoHardLimitBytes: 200 * 1024 * 1024,
   toolboxRunningLimit: 3,
   staleRunningMinutes: 30,

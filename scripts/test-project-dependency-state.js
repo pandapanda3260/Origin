@@ -9,9 +9,11 @@ const {
   computeScriptHash,
   computeShotPlanSourceHash,
   computeShotPlanSourceSnapshot,
+  computeWorldHash,
   confirmCurrentShotPlanStillValid,
   confirmCurrentShotPlanStillValidWithDownstreamSeed,
   detectShotsManualEdit,
+  diffShotPlanSourceSnapshots,
   hasDownstreamShotPlanStaleFlags,
   markShotPlanStale,
   markVideoTasksOutdatedForShotPlanChange,
@@ -31,6 +33,8 @@ function projectFixture() {
       mood: '压迫',
       colorPalette: ['blue', 'white'],
     },
+    selectedWorldTemplateId: null,
+    worldTemplateSnapshot: null,
     assets: {
       characters: [
         { id: 'c2', name: '乙', entityType: 'non-human', imageUrl: '/api/images/file/nope', clothing: '黑衣' },
@@ -43,8 +47,9 @@ function projectFixture() {
         { id: 'p1', name: '戒指', material: '银' },
       ],
     },
-    emotions: [{ start: 8, end: 12, label: 'rising', text: '紧张' }],
-    shots: [
+	    emotions: [{ start: 8, end: 12, label: 'rising', text: '紧张' }],
+	    planMeta: { version: 4, shotCount: 1, plannedDurationSec: 4 },
+	    shots: [
       { id: 'shot_1', idx: 1, visual: '甲进门', camera: '固定镜头', dialogue: '——', imagePromptGeneratedAt: 'x' },
     ],
   };
@@ -79,8 +84,49 @@ function testSnapshotShape() {
   const snapshot = computeShotPlanSourceSnapshot(projectFixture());
   assert.deepEqual(
     Object.keys(snapshot).sort(),
-    ['assetsHash', 'durationHash', 'emotionHash', 'scriptHash', 'styleBibleHash'].sort(),
+    ['assetsHash', 'durationHash', 'emotionHash', 'scriptHash', 'styleBibleHash', 'worldHash'].sort(),
     'snapshot stores sub hashes only',
+  );
+}
+
+function testWorldHashAndStaleReason() {
+  const emptyA = { ...projectFixture(), selectedWorldTemplateId: null, worldTemplateSnapshot: null };
+  const emptyB = { ...projectFixture(), selectedWorldTemplateId: '', worldTemplateSnapshot: null };
+  assert.equal(computeWorldHash(emptyA), computeWorldHash(emptyB), 'empty world hash is stable');
+
+  const withWorld = {
+    ...emptyA,
+    selectedWorldTemplateId: 'world_city',
+    worldTemplateSnapshot: {
+      id: 'world_city',
+      updatedAt: '2026-06-05T00:00:00.000Z',
+      worldRules: ['城市边界不可离开'],
+      terminology: { 巡界人: '负责巡逻边界的人' },
+    },
+  };
+  assert.notEqual(computeWorldHash(emptyA), computeWorldHash(withWorld), 'first world binding changes world hash');
+  assert.deepEqual(
+    diffShotPlanSourceSnapshots(computeShotPlanSourceSnapshot(emptyA), computeShotPlanSourceSnapshot(withWorld)),
+    ['world_changed'],
+    'first world binding marks world_changed only',
+  );
+  assert.deepEqual(
+    diffShotPlanSourceSnapshots(computeShotPlanSourceSnapshot(withWorld), computeShotPlanSourceSnapshot(emptyA)),
+    ['world_changed'],
+    'world unlink marks world_changed',
+  );
+
+  const changedWorld = {
+    ...withWorld,
+    worldTemplateSnapshot: {
+      ...withWorld.worldTemplateSnapshot,
+      worldRules: ['城市边界不可离开', '夜间不能使用明火'],
+    },
+  };
+  assert.deepEqual(
+    diffShotPlanSourceSnapshots(computeShotPlanSourceSnapshot(withWorld), computeShotPlanSourceSnapshot(changedWorld)),
+    ['world_changed'],
+    'world content change marks world_changed even when style bible is unchanged',
   );
 }
 
@@ -170,12 +216,14 @@ function testGeneratingKeepsStatusButRecordsReason() {
 }
 
 function testManualEditDetection() {
-  const oldShots = [{ id: 's1', idx: 1, visual: '甲进门', imagePromptGeneratedAt: 'old' }];
-  const onlyDownstreamPromptChanged = [{ id: 's1', idx: 1, visual: '甲进门', imagePromptGeneratedAt: 'new' }];
-  const visualChanged = [{ id: 's1', idx: 1, visual: '甲冲进门', imagePromptGeneratedAt: 'old' }];
-  assert.equal(detectShotsManualEdit(oldShots, onlyDownstreamPromptChanged), false, 'downstream generated fields are ignored');
-  assert.equal(detectShotsManualEdit(oldShots, visualChanged), true, 'shot planning field change is manual edit');
-}
+	  const oldShots = [{ id: 's1', idx: 1, visual: '甲进门', imagePromptGeneratedAt: 'old' }];
+	  const onlyDownstreamPromptChanged = [{ id: 's1', idx: 1, visual: '甲进门', imagePromptGeneratedAt: 'new' }];
+	  const visualChanged = [{ id: 's1', idx: 1, visual: '甲冲进门', imagePromptGeneratedAt: 'old' }];
+	  const angleChanged = [{ id: 's1', idx: 1, visual: '甲进门', angle: '俯拍', imagePromptGeneratedAt: 'old' }];
+	  assert.equal(detectShotsManualEdit(oldShots, onlyDownstreamPromptChanged), false, 'downstream generated fields are ignored');
+	  assert.equal(detectShotsManualEdit(oldShots, visualChanged), true, 'shot planning field change is manual edit');
+	  assert.equal(detectShotsManualEdit(oldShots, angleChanged), true, 'new shot planning fields are manual edits');
+	}
 
 function testArchiveAndVideoOutdated() {
   const project = projectFixture();
@@ -185,8 +233,9 @@ function testArchiveAndVideoOutdated() {
     now: '2026-05-19T03:00:00.000Z',
   });
   assert.equal(archived.legacyShotPlanArchive.length, 1, 'archive entry created');
-  assert.equal(archived.legacyShotPlanArchive[0].archiveContext, 'pre_regen', 'archive context recorded');
-  assert.equal(archived.legacyShotPlanArchive[0].shots[0].visual, '甲进门', 'shots snapshot is stored');
+	  assert.equal(archived.legacyShotPlanArchive[0].archiveContext, 'pre_regen', 'archive context recorded');
+	  assert.deepEqual(archived.legacyShotPlanArchive[0].planMeta, project.planMeta, 'planMeta snapshot is stored');
+	  assert.equal(archived.legacyShotPlanArchive[0].shots[0].visual, '甲进门', 'shots snapshot is stored');
 
   const withTasks = {
     ...project,
@@ -218,9 +267,10 @@ function testGenerationStateMachine() {
   assert.equal(started.legacyShotPlanArchive.length, 1, 'begin archives previous shots');
 
   const done = completeShotPlanGenerationPatch(started, {
-    batchId: 'batch_shots_1',
-    shots: [{ id: 'shot_1', idx: 1, visual: '新镜头' }],
-    storyboards: [{ idx: 0, shotIdx: 1, shotIndices: [0] }],
+	    batchId: 'batch_shots_1',
+	    shots: [{ id: 'shot_1', idx: 1, visual: '新镜头' }],
+	    planMeta: { version: 4, shotCount: 1, plannedDurationSec: 4 },
+	    storyboards: [{ idx: 0, shotIdx: 1, shotIndices: [0] }],
     sourceSnapshot,
     sourceHash,
     now: '2026-05-19T06:01:00.000Z',
@@ -229,8 +279,9 @@ function testGenerationStateMachine() {
   assert.equal(done.patch.shotPlanStatus, 'ready', 'completion marks ready when source did not change');
   assert.equal(done.patch._staleFlags.storyboard_0, undefined, 'fresh completion clears old storyboard stale flag');
   assert.equal(done.patch._staleFlags.video_prompt_0, undefined, 'fresh completion clears old video prompt stale flag');
-  assert.equal(done.patch.shotPlanBatchId, undefined, 'active batch id is cleared');
-  assert.equal(done.patch.shotsManuallyEditedAt, null, 'AI full generation clears manual edit marker');
+	  assert.equal(done.patch.shotPlanBatchId, undefined, 'active batch id is cleared');
+	  assert.deepEqual(done.patch.planMeta, { version: 4, shotCount: 1, plannedDurationSec: 4 }, 'completion writes planMeta');
+	  assert.equal(done.patch.shotsManuallyEditedAt, null, 'AI full generation clears manual edit marker');
 
   const staleProject = {
     ...started,
@@ -344,6 +395,7 @@ function testBuildDependencyPatch() {
 
 testStableHashesIgnoreNoise();
 testSnapshotShape();
+testWorldHashAndStaleReason();
 testStaleReasonsAndConfirm();
 testDownstreamSeedHelpers();
 testGeneratingKeepsStatusButRecordsReason();

@@ -16,6 +16,7 @@ type ReapAction = {
   referenceManifest?: any[];
   droppedReferences?: any[];
   completedAt?: string;
+  shotIndices?: number[];
 };
 
 function envInt(name: string, fallback: number, min: number, max: number) {
@@ -66,6 +67,16 @@ function taskGroupIdx(task: any): number | null {
   const groupIdx = Number(raw);
   if (!Number.isFinite(groupIdx) || groupIdx < 0) return null;
   return Math.floor(groupIdx);
+}
+
+function taskShotIndices(task: any): number[] | undefined {
+  const target = parseJson(task?.target_json);
+  const normalized = Array.isArray(target?.shotIndices)
+    ? target.shotIndices
+        .map((idx: any) => Number(idx))
+        .filter((idx: number) => Number.isInteger(idx) && idx >= 0)
+    : [];
+  return normalized.length ? normalized : undefined;
 }
 
 function promptFromResult(result: any): string {
@@ -149,6 +160,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
   const batchStatus = String(row.batch_status || '');
   const result = parseJson(row.result_json);
   const prompt = promptFromResult(result);
+  const shotIndices = taskShotIndices(row);
   if (taskStatus === 'completed') {
     if (prompt) {
       return {
@@ -162,6 +174,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
         referenceManifest: taskReferenceManifest(result),
         droppedReferences: taskDroppedReferences(result),
         completedAt: String(row.updated_at || row.batch_updated_at || ''),
+        shotIndices,
       };
     }
     return {
@@ -172,6 +185,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
       action: 'failed',
       reason: 'completed_task_missing_prompt',
       errorMessage: '系统检测到生成任务完成但缺少提示词，请重新生成',
+      shotIndices,
     };
   }
 
@@ -184,6 +198,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
       action: 'failed',
       reason: `batch_task_${taskStatus}`,
       errorMessage: String(row.error_msg || row.error_message || '系统检测到生成任务未完成，请重新生成').slice(0, 500),
+      shotIndices,
     };
   }
 
@@ -255,7 +270,10 @@ function applyProjectActions(projectId: string, ownerId: number, actions: ReapAc
         skipped += 1;
         continue;
       }
-      const shotIndices = storyboardShotIndices(fresh as any, action.groupIdx, prev, { mode: 'single-shot-strict' });
+      const shotIndices = storyboardShotIndices(fresh as any, action.groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: action.shotIndices,
+      });
       if (action.action === 'ready' && action.prompt) {
         const promptUpdatedAt = action.completedAt || now;
         storyboards[action.groupIdx] = {

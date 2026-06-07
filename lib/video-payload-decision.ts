@@ -1,4 +1,5 @@
 import type { VideoSubmitMode } from './feature-flags';
+import { isMultiShotSegmentEnabled } from './feature-flags';
 
 export type TailFrameReferenceStatus =
   | 'missing'
@@ -137,6 +138,8 @@ export function resolveVideoPayloadDecision(opts: {
   tailFrameUrl?: string | null;
   tailReferenceStatus?: unknown;
   tailIntentRequested: boolean;
+  /** 合并段（多镜头一段）：true 时强制参考模式（首帧+参考图），不进首尾帧。 */
+  multiShotSegment?: boolean;
 }): VideoPayloadDecision {
   const submitMode = normalizeVideoSubmitMode(opts.submitMode, 'auto');
   const firstFramePath = String(opts.firstFramePath || '').trim();
@@ -158,6 +161,12 @@ export function resolveVideoPayloadDecision(opts: {
       'preflight_missing_first_frame',
       '片段缺少可用首帧，请先生成首帧后再生成视频。',
     );
+  }
+
+  // 合并段：恒走参考模式（首帧 + 参考图），不进首尾帧 —— 合并段无尾锚点（方案 §3.0）。
+  // flag OFF 或非合并段时此分支不触发，行为与历史一致。
+  if (opts.multiShotSegment && isMultiShotSegmentEnabled()) {
+    return strictDecision(submitMode, 'reference_images');
   }
 
   if (submitMode === 'strict_first_frame') {

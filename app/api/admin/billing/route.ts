@@ -47,7 +47,7 @@ export const POST = withAdminAudit(async function mutateBilling(_req: NextReques
 
   const user = getDb()
     .prepare<{ id: number }, any>(
-      `SELECT u.id, u.username, u.display_name AS displayName, c.total_credits AS totalCredits
+      `SELECT u.id, u.username, u.phone, u.display_name AS displayName, c.total_credits AS totalCredits
          FROM users u
          LEFT JOIN user_credits c ON c.user_id = u.id
         WHERE u.id = @id`,
@@ -89,6 +89,7 @@ function listCreditUsers(q: string, limit: number) {
   return getDb().prepare<any, any>(
     `SELECT u.id,
             u.username,
+            u.phone,
             u.display_name AS displayName,
             u.email,
             u.disabled_at AS disabledAt,
@@ -105,6 +106,7 @@ function listCreditUsers(q: string, limit: number) {
           @q = ''
           OR CAST(u.id AS TEXT) = @q
           OR u.username LIKE @like
+          OR COALESCE(u.phone, '') LIKE @like
           OR COALESCE(u.email, '') LIKE @like
           OR COALESCE(u.display_name, '') LIKE @like
         )
@@ -118,6 +120,7 @@ function listOrders(q: string, limit: number) {
     `SELECT o.id,
             o.user_id AS userId,
             u.username,
+            u.phone,
             o.kind,
             o.plan_code AS planCode,
             o.provider,
@@ -135,6 +138,7 @@ function listOrders(q: string, limit: number) {
          OR o.provider_ref = @q
          OR CAST(o.user_id AS TEXT) = @q
          OR u.username LIKE @like
+         OR COALESCE(u.phone, '') LIKE @like
       ORDER BY o.created_at DESC
       LIMIT @limit`,
   ).all({ q, like: `%${q}%`, limit });
@@ -145,6 +149,7 @@ function listLedger(q: string, limit: number) {
     `SELECT l.id,
             l.user_id AS userId,
             u.username,
+            u.phone,
             l.amount,
             l.kind,
             l.reason,
@@ -165,6 +170,7 @@ function listLedger(q: string, limit: number) {
          OR l.ref_id = @q
          OR CAST(l.user_id AS TEXT) = @q
          OR u.username LIKE @like
+         OR COALESCE(u.phone, '') LIKE @like
       ORDER BY l.created_at DESC
       LIMIT @limit`,
   ).all({ q, like: `%${q}%`, limit });

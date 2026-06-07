@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { resolveSubtitleLayoutSpec } from '../public/modules/subtitle_format.js';
 
 const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const SUBTITLE_FONT_STACK = [
@@ -245,6 +246,11 @@ export type MediaStreamDurations = {
   audioSec: number;
 };
 
+export type VideoDimensions = {
+  width: number;
+  height: number;
+};
+
 function finitePositiveSeconds(value: unknown): number {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? n : 0;
@@ -276,6 +282,36 @@ export function probeMediaStreamDurations(path: string): Promise<MediaStreamDura
         });
       } catch {
         resolve({ formatSec: 0, videoSec: 0, audioSec: 0 });
+      }
+    });
+  });
+}
+
+export function probeVideoDimensions(path: string): Promise<VideoDimensions> {
+  return new Promise((resolve) => {
+    const probe = process.env.FFPROBE_PATH || 'ffprobe';
+    const child = spawn(probe, [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height',
+      '-of', 'json',
+      path,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.on('error', () => resolve({ width: 0, height: 0 }));
+    child.on('close', () => {
+      try {
+        const parsed = JSON.parse(out || '{}');
+        const stream = Array.isArray(parsed.streams) ? parsed.streams[0] : null;
+        const width = Number(stream?.width);
+        const height = Number(stream?.height);
+        resolve({
+          width: Number.isFinite(width) && width > 0 ? width : 0,
+          height: Number.isFinite(height) && height > 0 ? height : 0,
+        });
+      } catch {
+        resolve({ width: 0, height: 0 });
       }
     });
   });
@@ -386,6 +422,10 @@ function parseSrtTime(s: string): number {
 }
 
 type SrtCue = { start: number; end: number; text: string };
+type SubtitleLayout = { fontSize: number; lines: string[]; lineHeight: number; height: number };
+
+const MIN_SUBTITLE_FONT_SIZE = 34;
+const MAX_SUBTITLE_LINES = 2;
 
 /** 把 SRT 文本拆成 cue 数组 */
 function parseSrt(srt: string): SrtCue[] {
@@ -401,9 +441,88 @@ function parseSrt(srt: string): SrtCue[] {
     const end = parseSrtTime(c);
     const textLines = lines.slice(lines.indexOf(timeLine) + 1).filter(Boolean);
     if (!textLines.length) continue;
-    cues.push({ start, end, text: textLines.join(' ') });
+    cues.push({ start, end, text: textLines.join('\n') });
   }
   return cues;
+}
+
+function subtitleFont(size: number): string {
+  return `bold ${size}px ${SUBTITLE_FONT_STACK}`;
+}
+
+function measureSubtitleLine(ctx: any, text: string): number {
+  return ctx.measureText(text).width || 0;
+}
+
+function wrapSubtitleText(ctx: any, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  const sourceLines = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean);
+  if (!sourceLines.length) return [];
+
+  for (const normalized of sourceLines) {
+    let current = '';
+    for (const ch of Array.from(normalized)) {
+      const candidate = current ? `${current}${ch}` : ch;
+      if (current && measureSubtitleLine(ctx, candidate) > maxWidth) {
+        lines.push(current.trim());
+        current = ch.trimStart();
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.trim()) lines.push(current.trim());
+  }
+
+  return lines.filter(Boolean);
+}
+
+function truncateSubtitleLine(ctx: any, text: string, maxWidth: number): string {
+  const suffix = '...';
+  const normalized = String(text || '').trim();
+  if (!normalized) return suffix;
+  if (measureSubtitleLine(ctx, normalized) <= maxWidth) return normalized;
+  let out = '';
+  for (const ch of Array.from(normalized)) {
+    const candidate = `${out}${ch}${suffix}`;
+    if (measureSubtitleLine(ctx, candidate) > maxWidth) break;
+    out += ch;
+  }
+  return `${out.trimEnd()}${suffix}`;
+}
+
+function layoutSubtitle(ctx: any, text: string, requestedFontSize: number, maxWidth: number): SubtitleLayout {
+  let fontSize = requestedFontSize;
+  let lines: string[] = [];
+
+  while (fontSize >= MIN_SUBTITLE_FONT_SIZE) {
+    ctx.font = subtitleFont(fontSize);
+    lines = wrapSubtitleText(ctx, text, maxWidth);
+    if (lines.length <= MAX_SUBTITLE_LINES) break;
+    fontSize -= 2;
+  }
+
+  if (fontSize < MIN_SUBTITLE_FONT_SIZE) fontSize = MIN_SUBTITLE_FONT_SIZE;
+  ctx.font = subtitleFont(fontSize);
+  lines = wrapSubtitleText(ctx, text, maxWidth);
+  if (lines.length > MAX_SUBTITLE_LINES) {
+    const first = lines[0] || '';
+    const rest = lines.slice(1).join('');
+    lines = [first, truncateSubtitleLine(ctx, rest, maxWidth)].filter(Boolean).slice(0, MAX_SUBTITLE_LINES);
+  }
+
+  const lineHeight = Math.round(fontSize * 1.25);
+  const paddingY = Math.round(fontSize * 0.35);
+  return {
+    fontSize,
+    lines,
+    lineHeight,
+    height: Math.max(lineHeight + paddingY * 2, Math.ceil(lineHeight * lines.length + paddingY * 2)),
+  };
 }
 
 /**
@@ -432,8 +551,9 @@ export async function burnSubtitles(opts: {
 
   const W = opts.width ?? 1920;
   const H = opts.height ?? 1080;
-  const fontSize = opts.fontSize ?? 44;
-  const marginV = opts.marginV ?? 110;
+  const subtitleSpec = resolveSubtitleLayoutSpec({ width: W, height: H, fontSize: opts.fontSize });
+  const fontSize = opts.fontSize ?? subtitleSpec.fontSize;
+  const marginV = opts.marginV ?? Math.round(H * 0.075);
 
   const { readFileSync } = await import('node:fs');
   const srt = readFileSync(opts.srtPath, 'utf-8');
@@ -458,26 +578,33 @@ export async function burnSubtitles(opts: {
   mkdirSync(tmpDir, { recursive: true });
 
   const subPaths: string[] = [];
-  const subWidth = Math.min(W - 80, 1700);
-  const subHeight = Math.round(fontSize * 2.2);
+  const marginX = Math.round(W * subtitleSpec.horizontalMarginRatio);
+  const subWidth = Math.max(120, W - marginX * 2);
 
   try {
     for (let i = 0; i < limited.length; i++) {
       const c = limited[i];
+      const measureCanvas = createCanvas(1, 1);
+      const measureCtx = measureCanvas.getContext('2d');
+      const layout = layoutSubtitle(measureCtx, c.text, fontSize, Math.max(24, subWidth - 16));
+      const subHeight = layout.height;
       const canvas = createCanvas(subWidth, subHeight);
       const ctx = canvas.getContext('2d');
-      ctx.font = `bold ${fontSize}px ${SUBTITLE_FONT_STACK}`;
+      ctx.font = subtitleFont(layout.fontSize);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       const x = subWidth / 2;
-      const y = subHeight / 2;
+      const firstY = subHeight / 2 - ((layout.lines.length - 1) * layout.lineHeight) / 2;
       // 描边（黑色 4px）+ 半透明阴影 → 白色填充
       ctx.lineJoin = 'round';
-      ctx.lineWidth = 6;
+      ctx.lineWidth = Math.max(4, Math.round(layout.fontSize / 8));
       ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-      ctx.strokeText(c.text, x, y);
       ctx.fillStyle = '#FFFFFF';
-      ctx.fillText(c.text, x, y);
+      for (let lineIdx = 0; lineIdx < layout.lines.length; lineIdx++) {
+        const y = firstY + lineIdx * layout.lineHeight;
+        ctx.strokeText(layout.lines[lineIdx], x, y);
+        ctx.fillText(layout.lines[lineIdx], x, y);
+      }
 
       const p = join(tmpDir, `s_${i}.png`);
       const buf = (canvas as any).toBuffer('image/png');
@@ -490,7 +617,11 @@ export async function burnSubtitles(opts: {
     for (const p of subPaths) args.push('-i', p);
 
     const x = `(W-w)/2`;
-    const y = `H-h-${marginV}`;
+    const targetTopY = Math.round(H * subtitleSpec.topRatio);
+    const minBottomMargin = Math.max(0, Math.round(H * 0.02));
+    const y = opts.marginV != null
+      ? `H-h-${marginV}`
+      : `max(0\\,min(${targetTopY}\\,H-h-${minBottomMargin}))`;
 
     const parts: string[] = [];
     let prev = '[0:v]';

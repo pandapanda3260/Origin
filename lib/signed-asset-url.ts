@@ -59,6 +59,49 @@ export function buildSignedVideoUrl(videoId: string, ownerId: number, ttlSeconds
   };
 }
 
+function signUploadPayload(uploadId: string, ownerId: number, exp: number): string {
+  return `upload-url-v1:${uploadId}:${ownerId}:${exp}`;
+}
+
+function uploadDigest(uploadId: string, ownerId: number, exp: number): string {
+  return createHmac('sha256', getSecret())
+    .update(signUploadPayload(uploadId, ownerId, exp))
+    .digest('base64url');
+}
+
+export function buildSignedUploadUrl(uploadId: string, ownerId: number, ttlSeconds = DEFAULT_TTL_SECONDS) {
+  const ttl = normalizeAssetUrlTtl(ttlSeconds);
+  const exp = Math.floor(Date.now() / 1000) + ttl;
+  const sig = uploadDigest(uploadId, ownerId, exp);
+  return {
+    url: `/api/edit/media/${encodeURIComponent(uploadId)}?exp=${exp}&sig=${encodeURIComponent(sig)}`,
+    ttl,
+    expiresAt: exp,
+  };
+}
+
+export function verifySignedUploadUrl(opts: {
+  uploadId: string;
+  ownerId: number;
+  exp: string | null;
+  sig: string | null;
+}) {
+  const exp = Number(opts.exp || 0);
+  if (!Number.isFinite(exp) || exp <= 0) return false;
+  if (exp < Math.floor(Date.now() / 1000)) return false;
+  if (!opts.sig) return false;
+
+  const expected = uploadDigest(opts.uploadId, opts.ownerId, exp);
+  const a = Buffer.from(opts.sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
 export function verifySignedImageUrl(opts: {
   imageId: string;
   ownerId: number;

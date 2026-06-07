@@ -113,6 +113,9 @@ export type MutateCharacterLockContext = {
     | 'resolver_update'
     | 'migration'
     | 'user_confirm'
+    | 'world_template'
+    | 'world_backfill'
+    | 'world_edit'
     | 'system';
   now?: string;
   userConfirmed?: boolean;
@@ -149,6 +152,13 @@ export type MutateCharacterLockResult<TProject extends Record<string, any> = Rec
   versionBumps: VersionBumps;
   statusTransition?: StatusTransition;
   staleHints: CharacterStaleHint[];
+};
+
+export type SyncWorldCharactersResult<TProject extends Record<string, any> = Record<string, any>> = {
+  project: TProject & { consistency: ProjectConsistency };
+  changed: boolean;
+  syncedCharacterIds: string[];
+  conflictReasons: string[];
 };
 
 const SCHEMA: ProjectConsistency['schema'] = 'origin-consistency-v1';
@@ -455,6 +465,7 @@ function normalizeReferenceLock(input: Partial<CharacterReferenceLock> | undefin
   };
   const hasAnyRef = !!(next.sheetUrl || next.headshotUrl || next.frontUrl || next.sideUrl || next.backUrl || next.sourceImageId);
   if (!hasAnyRef) next.referenceStatus = next.referenceStatus === 'failed' ? 'failed' : 'missing';
+  else if (next.referenceStatus === 'missing') next.referenceStatus = 'ready';
   else next.referenceStatus = referenceQualityBucket(next);
   return next;
 }
@@ -601,6 +612,10 @@ function compareJson(a: any, b: any) {
   return JSON.stringify(stableCanonical(a)) === JSON.stringify(stableCanonical(b));
 }
 
+function hasOwn(obj: any, key: string) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 function requiredFieldsComplete(lock: CharacterLock): boolean {
   if (!lock.canonicalName || !lock.identityLock.entityType || !lock.visualLock.appearance) return false;
   if (lock.identityLock.entityType === 'non-human' && !lock.identityLock.species) return false;
@@ -736,6 +751,401 @@ export function mutateCharacterLock<TProject extends Record<string, any>>(
     versionBumps: bumps,
     statusTransition: transition,
     staleHints: staleHintsFor(next.characterId, bumps),
+  };
+}
+
+function stripEmptyObject<T extends Record<string, any>>(value: T): Partial<T> | undefined {
+  const out: Record<string, any> = {};
+  for (const [key, raw] of Object.entries(value || {})) {
+    if (raw === undefined || raw === null) continue;
+    if (Array.isArray(raw)) {
+      const list = cleanList(raw);
+      if (list.length) out[key] = list;
+      continue;
+    }
+    if (typeof raw === 'object') {
+      const nested = stripEmptyObject(raw as Record<string, any>);
+      if (nested && Object.keys(nested).length) out[key] = nested;
+      continue;
+    }
+    const text = cleanText(raw);
+    if (text) out[key] = text;
+  }
+  return Object.keys(out).length ? out as Partial<T> : undefined;
+}
+
+type WorldCharacterPatchInput = {
+  characterId: string;
+  patch: CharacterLockPatch;
+  hardPaths: Set<string>;
+};
+
+function worldCharacterKey(character: any, index: number): string {
+  const key = cleanText(character?.characterId || character?.id || character?.sourceAssetId || character?.name);
+  return key || `world_character_${index + 1}`;
+}
+
+function templateFieldStrength(character: any, field: string, fallback: 'hard' | 'soft') {
+  const meta = character?.fieldMeta && typeof character.fieldMeta === 'object' ? character.fieldMeta[field] : null;
+  const strength = cleanText(meta?.strength).toLowerCase();
+  if (strength === 'hard') return 'hard';
+  if (strength === 'soft') return 'soft';
+  return fallback;
+}
+
+const WORLD_VISUAL_HARD_FIELDS = new Set(['appearance', 'detail', 'description', 'desc', 'scaleRule', 'negativeRules', 'signatureColors', 'canonicalPrompt']);
+
+function worldVisualFieldFallback(field: string): 'hard' | 'soft' {
+  return WORLD_VISUAL_HARD_FIELDS.has(field) ? 'hard' : 'soft';
+}
+
+function worldCharacterPatchFromTemplate(character: any, index: number): WorldCharacterPatchInput | null {
+  if (!character || typeof character !== 'object') return null;
+  const characterId = worldCharacterKey(character, index);
+  const hardPaths = new Set<string>(['canonicalName']);
+  const panels = character.referencePanels || character.panels || {};
+  const referenceUrl = panels.sheetUrl
+    || panels.headshotUrl
+    || panels.frontUrl
+    || character.realPhotoUrl
+    || character.imageUrl
+    || character.rawUrl
+    || character.pencilUrl;
+  const voiceHint = character.voiceHint || {};
+  const identityLock = stripEmptyObject({
+    role: character.role || character.identity || character.description,
+    identity: character.identity || character.description,
+    entityType: character.entityType === 'non-human' ? 'non-human' : character.entityType === 'human' ? 'human' : undefined,
+    species: character.species,
+    gender: character.gender,
+    ageBand: character.ageBand || character.age,
+  }) as Partial<CharacterIdentityLock> | undefined;
+  for (const key of Object.keys(identityLock || {})) hardPaths.add(`identityLock.${key}`);
+  const visualLock = stripEmptyObject({
+    appearance: character.appearance || character.detail || character.description || character.intro,
+    clothing: character.clothing,
+    equipment: character.equipment,
+    scaleRule: character.scaleRule,
+    negativeRules: character.negativeRules,
+    signatureColors: character.signatureColors,
+    canonicalPrompt: character.canonicalPrompt || character.imagePrompt,
+  }) as CharacterLockPatch['visualLock'];
+  for (const key of Object.keys(visualLock || {})) {
+    if (templateFieldStrength(character, key, worldVisualFieldFallback(key)) === 'hard') hardPaths.add(`visualLock.${key}`);
+  }
+  const performanceLock = stripEmptyObject({
+    temperament: character.temperament,
+    actionTraits: character.actionTraits,
+    gestureRules: character.gestureRules,
+  }) as CharacterLockPatch['performanceLock'];
+  const voiceLock = stripEmptyObject({
+    voiceGender: voiceHint.voiceGender || character.voiceGender,
+    voiceAge: voiceHint.voiceAge || character.voiceAge,
+    timbre: voiceHint.timbre || character.timbre,
+    speechStyle: voiceHint.speechStyle || character.speechStyle,
+    accent: voiceHint.accent || character.accent,
+    negativeRules: voiceHint.negativeRules || character.voiceNegativeRules,
+  }) as CharacterLockPatch['voiceLock'];
+  const referenceLock = stripEmptyObject({
+    sheetUrl: panels.sheetUrl || referenceUrl,
+    headshotUrl: panels.headshotUrl,
+    frontUrl: panels.frontUrl,
+    sideUrl: panels.sideUrl,
+    backUrl: panels.backUrl,
+    sourceImageId: panels.sourceImageId,
+    referenceStatus: referenceUrl ? 'ready' : undefined,
+    qualityScore: Number.isFinite(Number(panels.confidence)) ? Number(panels.confidence) : undefined,
+  }) as CharacterLockPatch['referenceLock'];
+  const patch: CharacterLockPatch = {
+    sourceAssetId: cleanText(character.sourceAssetId || character.assetId) || undefined,
+    canonicalName: cleanText(character.name || character.title || characterId) || characterId,
+    aliases: cleanList([character.name, character.title, ...(Array.isArray(character.aliases) ? character.aliases : [])]),
+    ...(identityLock ? { identityLock } : {}),
+    ...(visualLock ? { visualLock } : {}),
+    ...(performanceLock ? { performanceLock } : {}),
+    ...(voiceLock ? { voiceLock } : {}),
+    ...(referenceLock ? { referenceLock } : {}),
+  };
+  return { characterId, patch, hardPaths };
+}
+
+function findCharacterLockForWorldCharacter(locks: CharacterLock[], characterId: string, patch: CharacterLockPatch, claimedLockIds = new Set<string>()): CharacterLock | undefined {
+  const keys = cleanList([
+    characterId,
+    patch.sourceAssetId,
+    patch.canonicalName,
+  ]).map(cleanEnglishToken);
+  if (!keys.length) return undefined;
+  return locks.find((lock) => {
+    if (claimedLockIds.has(lock.characterId)) return false;
+    const lockKeys = cleanList([
+      lock.characterId,
+      lock.sourceAssetId,
+      lock.canonicalName,
+    ]).map(cleanEnglishToken);
+    return lockKeys.some((key) => keys.includes(key));
+  });
+}
+
+function uniqueWorldCharacterLockId(base: string, locks: CharacterLock[], claimedLockIds: Set<string>) {
+  const root = cleanText(base) || 'world_character';
+  const used = new Set([
+    ...locks.map((lock) => lock.characterId).filter(Boolean),
+    ...Array.from(claimedLockIds),
+  ]);
+  if (!used.has(root)) return root;
+  let index = 2;
+  while (used.has(`${root}_${index}`)) index += 1;
+  return `${root}_${index}`;
+}
+
+function mergeAliases(existing: CharacterLock, patch: CharacterLockPatch) {
+  return cleanList([
+    ...(existing.aliases || []),
+    patch.canonicalName,
+    ...(Array.isArray(patch.aliases) ? patch.aliases : []),
+  ]);
+}
+
+function hasWorldTemplateIdentityCollision(existing: CharacterLock, patch: CharacterLockPatch, hardPaths: Set<string>) {
+  const existingName = cleanEnglishToken(existing.canonicalName);
+  const incomingName = cleanEnglishToken(patch.canonicalName);
+  const canonicalNameConflict = !!(
+    hardPaths.has('canonicalName') &&
+    existingName &&
+    incomingName &&
+    existingName !== incomingName
+  );
+  const existingEntityType = cleanText(existing.identityLock?.entityType);
+  const incomingEntityType = cleanText(patch.identityLock?.entityType);
+  const entityTypeConflict = !!(
+    hardPaths.has('identityLock.entityType') &&
+    existingEntityType &&
+    incomingEntityType &&
+    existingEntityType !== incomingEntityType
+  );
+  return canonicalNameConflict || entityTypeConflict;
+}
+
+function filterReviewedNestedPatch(
+  entityLabel: string,
+  domain: string,
+  existing: Record<string, any>,
+  incoming: Record<string, any> | undefined,
+  keys: string[],
+  arrayKeys: Set<string>,
+  hardPaths: Set<string>,
+  conflictReasons: string[],
+) {
+  const out: Record<string, any> = {};
+  for (const key of keys) {
+    if (!incoming || !hasOwn(incoming, key)) continue;
+    const incomingValue = arrayKeys.has(key) ? cleanList(incoming[key]) : cleanText(incoming[key]);
+    const hasIncoming = Array.isArray(incomingValue) ? incomingValue.length > 0 : !!incomingValue;
+    if (!hasIncoming) continue;
+    const existingValue = arrayKeys.has(key) ? cleanList(existing?.[key]) : cleanText(existing?.[key]);
+    const hasExisting = Array.isArray(existingValue) ? existingValue.length > 0 : !!existingValue;
+    if (!hasExisting) {
+      out[key] = incomingValue;
+    } else if (hardPaths.has(`${domain}.${key}`) && !compareJson(existingValue, incomingValue)) {
+      conflictReasons.push(`world_template_conflict:${entityLabel}:${domain}.${key}`);
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function filterPatchForExistingLock(existing: CharacterLock, input: WorldCharacterPatchInput): { patch: CharacterLockPatch; conflictReasons: string[] } {
+  const patch = input.patch;
+  const hardPaths = input.hardPaths;
+  const entityLabel = cleanText(existing.canonicalName || patch.canonicalName || existing.characterId);
+  const conflictReasons: string[] = [];
+  const filtered: CharacterLockPatch = {};
+  const identityCollision = hasWorldTemplateIdentityCollision(existing, patch, hardPaths);
+  if (!identityCollision) {
+    const aliases = mergeAliases(existing, patch);
+    if (!compareJson(existing.aliases, aliases)) filtered.aliases = aliases;
+  }
+
+  if (!existing.sourceAssetId && patch.sourceAssetId) filtered.sourceAssetId = patch.sourceAssetId;
+  if (patch.canonicalName && !cleanText(existing.canonicalName)) {
+    filtered.canonicalName = patch.canonicalName;
+  } else if (hardPaths.has('canonicalName') && patch.canonicalName && cleanText(existing.canonicalName) && cleanEnglishToken(patch.canonicalName) !== cleanEnglishToken(existing.canonicalName)) {
+    conflictReasons.push(`world_template_conflict:${entityLabel}:canonicalName`);
+  }
+
+  const identityLock = filterReviewedNestedPatch(
+    entityLabel,
+    'identityLock',
+    existing.identityLock,
+    patch.identityLock,
+    ['role', 'identity', 'entityType', 'species', 'gender', 'ageBand'],
+    new Set(),
+    hardPaths,
+    conflictReasons,
+  );
+  if (identityLock && !identityCollision) filtered.identityLock = identityLock;
+
+  const visualLock = filterReviewedNestedPatch(
+    entityLabel,
+    'visualLock',
+    existing.visualLock,
+    patch.visualLock,
+    ['appearance', 'clothing', 'equipment', 'scaleRule', 'negativeRules', 'signatureColors'],
+    new Set(['negativeRules', 'signatureColors']),
+    hardPaths,
+    conflictReasons,
+  );
+  if (visualLock && !identityCollision) filtered.visualLock = visualLock;
+  if (!identityCollision && patch.visualLock?.canonicalPrompt && !cleanText(existing.visualLock?.canonicalPrompt)) {
+    filtered.visualLock = { ...(filtered.visualLock || {}), canonicalPrompt: patch.visualLock.canonicalPrompt };
+  }
+
+  const performanceLock = filterReviewedNestedPatch(
+    entityLabel,
+    'performanceLock',
+    existing.performanceLock,
+    patch.performanceLock,
+    ['temperament', 'actionTraits', 'gestureRules'],
+    new Set(['gestureRules']),
+    hardPaths,
+    conflictReasons,
+  );
+  if (performanceLock && !identityCollision) filtered.performanceLock = performanceLock;
+
+  const voiceLock = filterReviewedNestedPatch(
+    entityLabel,
+    'voiceLock',
+    existing.voiceLock,
+    patch.voiceLock,
+    ['voiceGender', 'voiceAge', 'timbre', 'speechStyle', 'accent', 'negativeRules'],
+    new Set(['negativeRules']),
+    hardPaths,
+    conflictReasons,
+  );
+  if (voiceLock && !identityCollision) filtered.voiceLock = voiceLock;
+
+  const referenceLock = filterReviewedNestedPatch(
+    entityLabel,
+    'referenceLock',
+    existing.referenceLock,
+    patch.referenceLock,
+    ['sheetUrl', 'headshotUrl', 'frontUrl', 'sideUrl', 'backUrl', 'sourceImageId', 'referenceStatus'],
+    new Set(),
+    hardPaths,
+    conflictReasons,
+  );
+  if (referenceLock && !identityCollision) filtered.referenceLock = referenceLock;
+
+  return { patch: filtered, conflictReasons };
+}
+
+function clearWorldTemplateConflictReasons(consistency: ProjectConsistency): ProjectConsistency {
+  const reasons = cleanList(consistency.meta?.roleSyncReasons || [])
+    .filter((reason) => !String(reason).startsWith('world_template_conflict:'));
+  const meta = {
+    ...DEFAULT_META,
+    ...(consistency.meta || {}),
+    roleSyncReasons: reasons,
+    needsRoleSync: reasons.length ? true : false,
+  };
+  return { ...consistency, meta };
+}
+
+function applyWorldTemplateConflictReasons<TProject extends Record<string, any>>(
+  project: TProject & { consistency: ProjectConsistency },
+  reasons: string[],
+  now: string,
+): TProject & { consistency: ProjectConsistency } {
+  const existingReasons = cleanList(project.consistency.meta?.roleSyncReasons || [])
+    .filter((reason) => !String(reason).startsWith('world_template_conflict:'));
+  const nextReasons = cleanList([...existingReasons, ...reasons]);
+  const currentReasons = cleanList(project.consistency.meta?.roleSyncReasons || []);
+  if (
+    compareJson(currentReasons, nextReasons)
+    && (!!project.consistency.meta?.needsRoleSync) === (nextReasons.length > 0)
+  ) {
+    return project;
+  }
+  return {
+    ...project,
+    consistency: {
+      ...project.consistency,
+      updatedAt: now,
+      meta: {
+        ...DEFAULT_META,
+        ...(project.consistency.meta || {}),
+        roleSyncReasons: nextReasons,
+        needsRoleSync: nextReasons.length > 0,
+      },
+    },
+  };
+}
+
+export function syncWorldCharactersIntoConsistency<TProject extends Record<string, any>>(
+  project: TProject,
+  context: Omit<MutateCharacterLockContext, 'source'> & { source?: 'world_template' | 'world_backfill' | 'world_edit' } = {},
+): SyncWorldCharactersResult<TProject> {
+  const now = nowIso(context.now);
+  const world = project?.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === 'object'
+    ? project.worldTemplateSnapshot
+    : null;
+  const characters = Array.isArray(world?.characters) ? world.characters : [];
+  const originalConsistency = project?.consistency;
+  let working = ensureProjectConsistency(project, { source: 'migration', now });
+  let changed = !compareJson(originalConsistency, working.consistency);
+  const clearedConsistency = clearWorldTemplateConflictReasons(working.consistency);
+  if (!compareJson(working.consistency, clearedConsistency)) changed = true;
+  working = { ...working, consistency: clearedConsistency };
+  const syncedCharacterIds: string[] = [];
+  const conflictReasons: string[] = [];
+  const claimedLockIds = new Set<string>();
+
+  characters.forEach((character: any, index: number) => {
+    const input = worldCharacterPatchFromTemplate(character, index);
+    if (!input) return;
+    const existing = findCharacterLockForWorldCharacter(working.consistency.characters, input.characterId, input.patch, claimedLockIds);
+    if (existing) claimedLockIds.add(existing.characterId);
+    const targetId = existing?.characterId || uniqueWorldCharacterLockId(input.characterId, working.consistency.characters, claimedLockIds);
+    const patchForMutation = existing
+      ? filterPatchForExistingLock(existing, input)
+      : { patch: input.patch, conflictReasons: [] };
+    conflictReasons.push(...patchForMutation.conflictReasons);
+
+    const patch = patchForMutation.patch;
+    const hasMutation = Object.keys(patch).some((key) => {
+      const value = (patch as any)[key];
+      if (value === undefined || value === null) return false;
+      if (Array.isArray(value)) return value.length > 0;
+      if (typeof value === 'object') return Object.keys(value).length > 0;
+      return cleanText(value);
+    });
+    if (!hasMutation) return;
+
+    const result = mutateCharacterLock(
+      working,
+      targetId,
+      patch,
+      {
+        source: context.source || 'world_template',
+        now,
+        userConfirmed: false,
+      },
+    );
+    working = result.project;
+    claimedLockIds.add(result.character.characterId);
+    changed = changed || result.characterDiff.changedPaths.length > 0 || !!result.statusTransition || !existing;
+    syncedCharacterIds.push(result.character.characterId);
+  });
+
+  const withReasons = applyWorldTemplateConflictReasons(working, conflictReasons, now);
+  if (!compareJson(working.consistency, withReasons.consistency)) changed = true;
+  if (!compareJson(originalConsistency, withReasons.consistency)) changed = true;
+
+  return {
+    project: withReasons,
+    changed,
+    syncedCharacterIds: cleanList(syncedCharacterIds),
+    conflictReasons: cleanList(conflictReasons),
   };
 }
 

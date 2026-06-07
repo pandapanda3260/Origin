@@ -8,6 +8,7 @@ import {
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
+import { projectWorldContextForStage } from '@/lib/world-template-context';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -45,13 +46,20 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    let scriptText = '';
+	    let scriptText = '';
+    const worldContext = proj
+      ? projectWorldContextForStage('script_create', (proj as any).worldTemplateSnapshot, {
+          project: proj,
+          scriptText: oneSentence,
+        })
+      : undefined;
     const scriptMessages = buildFullCreateMessages({
       oneSentence,
       outline,
       durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
       audience,
       creatorPersona: persona,
+      worldContext,
     });
     await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
       scriptText += delta;
@@ -95,6 +103,7 @@ export async function POST(req: NextRequest) {
         script: scriptText,
         emotions,
         scriptApproved: false,
+        scriptReviewState: 'draft',
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
         currentStep: 1,
       });

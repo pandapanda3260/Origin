@@ -8,6 +8,7 @@ import { hashValue } from './project-dependency-state';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
 import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 import type { DroppedReference, ReferenceManifestItem } from './video-reference-manifest';
+import { normalizePlanMetaForHash, resolveShotFieldsForPrompt } from './shot-plan-normalize';
 
 export const VIDEO_PROMPT_SOURCE_HASH_VERSION = 'video_prompt_source_hash_v1';
 export const VIDEO_PROMPT_DRAFT_SCHEMA_VERSION = 'video_prompt_edit_draft_v1';
@@ -173,10 +174,10 @@ function normalizeAssetList(value: unknown, role: 'character' | 'scene' | 'prop'
 }
 
 function normalizeShotForHash(shot: any) {
-  return pickDefined(shot, [
+  const fields = resolveShotFieldsForPrompt(shot);
+  return {
+    ...pickDefined(shot, [
     'idx',
-    'shotType',
-    'camera',
     'visual',
     'description',
     'desc',
@@ -192,7 +193,17 @@ function normalizeShotForHash(shot: any) {
     'sceneId',
     'sceneName',
     'imagePrompt',
-  ]);
+    ]),
+    shotType: fields.shotType,
+    framing: fields.framing,
+    angle: fields.angle,
+    lens: fields.lens,
+    focus: fields.focus,
+    light: fields.light,
+    composition: fields.composition,
+    camera: fields.camera,
+    movement: fields.movement,
+  };
 }
 
 function normalizeReferenceManifestForHash(refs: ReferenceManifestItem[] | undefined) {
@@ -267,7 +278,7 @@ export function computeVideoPromptSourceSnapshot(args: {
   const sb = storyboards[groupIdx] || {};
   const shotIndices = safeShotIndices(project, groupIdx, args.shotIndices);
   const shots = shotIndices.map((idx) => project?.shots?.[idx]).filter(Boolean).map(normalizeShotForHash);
-  const firstFrameUrl = cleanUrlForHash(resolveStoryboardFirstFrameUrl(sb) || sb?.firstFrameUrl || sb?.imageUrl || sb?.rawUrl || sb?.url);
+  const firstFrameUrl = cleanUrlForHash(resolveStoryboardFirstFrameUrl(sb));
   const tailFrameUrl = cleanUrlForHash(sb?.frames?.tail?.url || sb?.tailFrameUrl);
   const assets = project.assets || {};
   const referenceBuild = buildVideoReferenceManifest({
@@ -284,6 +295,7 @@ export function computeVideoPromptSourceSnapshot(args: {
     version: VIDEO_PROMPT_SOURCE_HASH_VERSION,
     groupIdx,
     shotIndices,
+    planMeta: normalizePlanMetaForHash(project.planMeta),
     shots,
     styleBible: styleBibleForVideoPrompt(project.styleBible || {}),
     narrations: Array.isArray(project.narrations) ? project.narrations : [],

@@ -135,14 +135,14 @@
 <body class="bg-background text-on-background">
 <!-- Top Navigation Bar -->
 <nav class="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-8 py-3 bg-white/10 dark:bg-slate-900/10 backdrop-blur-2xl rounded-full mt-6 mx-auto max-w-5xl shadow-[0_0_60px_rgba(90,92,106,0.04)]">
-<a href="#" class="flex items-center gap-2 shrink-0" aria-label="ORIGINRISE">
+<a href="#" class="flex items-center gap-2 shrink-0" aria-label="ORIGIN">
 <img src="./originrise-logo.png" alt="" class="h-[7.15rem] w-[7.15rem] object-contain rounded-xl" />
 <div class="flex flex-col leading-none select-none -ml-1">
-<div class="text-[1.4rem] font-light tracking-[0.18em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk']">ORIGINRISE</div>
+<div class="text-[1.4rem] font-light tracking-[0.18em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk']">ORIGIN</div>
 <div class="text-[9px] mt-1.5 font-medium tracking-[0.3em] uppercase text-slate-500 dark:text-slate-400">Where Imagination Begins</div>
 </div>
 </a>
-<div class="hidden md:flex items-center gap-8">
+<div id="navLinks" class="hidden md:flex items-center gap-8">
 <a class="group flex flex-col items-center gap-0 hover:text-slate-800 dark:hover:text-slate-200 transition-colors" href="#">
   <span class="text-sm font-semibold text-slate-600 dark:text-slate-300 tracking-tight">平台</span>
   <span class="text-[9px] font-light tracking-[0.15em] uppercase text-slate-400/70 font-['Space_Grotesk']">Platform</span>
@@ -235,7 +235,7 @@
 <span class="material-symbols-outlined text-4xl text-primary/20" data-icon="description">description</span>
 </div>
 <div class="absolute bottom-0 right-0 w-3/4 h-2/3 rounded-tl-xl overflow-hidden shadow-2xl translate-y-8 group-hover:translate-y-4 transition-transform duration-500">
-<img class="w-full h-full object-cover" alt="ORIGINRISE 剧本创作界面" src="./showcase-script.png"/>
+<img class="w-full h-full object-cover" alt="ORIGIN 剧本创作界面" src="./showcase-script.png"/>
 </div>
 </div>
 <!-- Step 2: Assets -->
@@ -317,7 +317,7 @@
 <!-- Visual Showcase -->
 <section class="py-32 bg-surface-container-low">
 <div class="max-w-7xl mx-auto px-8 text-center mb-16">
-<h2 class="text-5xl font-extralight tracking-tight mb-3 font-['Space_Grotesk']">ORIGINRISE</h2>
+<h2 class="text-5xl font-extralight tracking-tight mb-3 font-['Space_Grotesk']">ORIGIN</h2>
 <p class="text-on-surface-variant/60 text-sm font-semibold tracking-wide mb-1">想象 · 即电影</p>
 <p class="text-on-surface-variant/30 uppercase tracking-[0.2em] text-[10px] font-light font-['Space_Grotesk']">Where Imagination Becomes Cinema</p>
 </div>
@@ -350,10 +350,10 @@
 <div class="max-w-7xl mx-auto px-8 flex flex-col md:flex-row justify-between items-center">
 <div class="mb-8 md:mb-0">
 <div class="flex items-center justify-center gap-3 mb-3">
-<img src="./originrise-logo.png" alt="ORIGINRISE" class="h-12 w-12 object-contain" />
-<div class="text-lg font-bold text-slate-900 dark:text-white">ORIGINRISE</div>
+<img src="./originrise-logo.png" alt="ORIGIN" class="h-12 w-12 object-contain" />
+<div class="text-lg font-bold text-slate-900 dark:text-white">ORIGIN</div>
 </div>
-<div class="text-sm font-medium tracking-widest uppercase Inter text-slate-600 dark:text-slate-400">© ORIGINRISE · AI 可视化分镜 / 视频工作流</div>
+<div class="text-sm font-medium tracking-widest uppercase Inter text-slate-600 dark:text-slate-400">© ORIGIN · AI 可视化分镜 / 视频工作流</div>
 </div>
 <div class="flex flex-wrap justify-center gap-10">
 <a class="group flex flex-col items-center gap-0 hover:opacity-100 transition-all opacity-70" href="#">
@@ -379,9 +379,16 @@
 <style>
   #authModal { display:none; position:fixed; inset:0; z-index:999; align-items:center; justify-content:center; }
   #authModal.show { display:flex !important; }
+  #authModal [hidden] { display:none !important; }
+  /* 隐藏 Safari 在手机号字段右侧塞的"通讯录自动填充"图标 */
+  #m_loginPhone::-webkit-contacts-auto-fill-button,
+  #m_regPhone::-webkit-contacts-auto-fill-button { visibility:hidden !important; display:none !important; pointer-events:none; position:absolute; right:0; }
+  /* 导航项中文与"登录/注册"同一水平线:英文副标改为绝对定位,不再把中文顶上去 */
+  #navLinks > a { position:relative; }
+  #navLinks > a > span:last-child { position:absolute; top:100%; left:50%; transform:translateX(-50%); margin-top:1px; white-space:nowrap; }
   #authModal .modal-inner { animation: portalIn 0.4s cubic-bezier(0.16,1,0.3,1); width:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; }
   @keyframes portalIn { from{opacity:0;transform:scale(0.92)} to{opacity:1;transform:scale(1)} }
-  .m-portal { position:relative; width:min(580px,88vw); height:min(320px,55vw); min-height:260px; display:flex; align-items:center; justify-content:center; perspective:2000px; margin:0 auto; }
+  .m-portal { position:relative; width:min(620px,90vw); height:min(340px,58vw); min-height:280px; display:flex; align-items:center; justify-content:center; perspective:2000px; margin:0 auto; }
   .m-glass { background:linear-gradient(180deg,rgba(255,255,255,0.12) 0%,rgba(255,255,255,0) 40%); backdrop-filter:blur(24px); border:1px solid rgba(255,255,255,0.15); box-shadow:0 20px 50px rgba(0,0,0,0.3); transform-style:preserve-3d; transition:transform 1.2s cubic-bezier(0.645,0.045,0.355,1); }
   .m-core-btn {
     position:relative;
@@ -401,6 +408,20 @@
   .m-core-btn:hover {
     border-color:rgba(0,229,255,0.55);
     box-shadow:0 24px 60px -12px rgba(0,0,0,0.45),0 0 40px -8px rgba(0,229,255,0.15);
+  }
+  .m-core-btn:focus-visible {
+    outline:2px solid rgba(103,232,249,0.9);
+    outline-offset:5px;
+  }
+  .m-core-btn.is-busy {
+    pointer-events:none;
+    opacity:0.55;
+    cursor:wait;
+    filter:saturate(0.9);
+  }
+  .m-core-btn.is-busy .m-core-energy {
+    opacity:0.75;
+    animation-duration:1.2s;
   }
   .m-core-energy {
     position:absolute; inset:-1px; border-radius:inherit; padding:2px;
@@ -459,128 +480,175 @@
   .m-face-back,.m-btn-back { transform:rotateY(180deg); }
   .m-portal.flipped .m-glass { transform:rotateY(180deg); }
   .m-portal.flipped .m-core-btn { transform:rotateY(180deg); }
-  .m-otp-row { display:flex; gap:6px; width:100%; align-items:center; margin-top:10px; }
-  .m-otp-row input { flex:1 1 auto; min-width:0; }
-  .m-otp-send { flex:0 0 auto; border:1px solid rgba(255,255,255,0.18); border-radius:9999px; padding:7px 10px; color:rgba(255,255,255,0.8); background:rgba(255,255,255,0.06); font-size:9px; font-weight:800; letter-spacing:0.16em; text-transform:uppercase; white-space:nowrap; cursor:pointer; }
+  .m-auth-switch { display:flex; gap:4px; padding:3px; border:1px solid rgba(255,255,255,0.12); border-radius:9999px; background:rgba(255,255,255,0.04); }
+  .m-auth-switch button { min-width:42px; border:0; border-radius:9999px; padding:5px 8px; color:rgba(255,255,255,0.5); background:transparent; font-size:9px; font-weight:800; letter-spacing:0.12em; cursor:pointer; }
+  .m-auth-switch button.is-active { color:#06131b; background:rgba(103,232,249,0.92); }
+  .m-otp-row { display:flex; flex-direction:column; gap:7px; width:min(100%,154px); align-items:stretch; margin-top:10px; }
+  .m-otp-row input { flex:0 0 auto; min-width:0; width:100%; }
+  .m-otp-send { flex:0 0 auto; width:100%; border:1px solid rgba(255,255,255,0.18); border-radius:9999px; padding:6px 8px; color:rgba(255,255,255,0.8); background:rgba(255,255,255,0.06); font-size:8px; font-weight:800; letter-spacing:0.08em; text-transform:uppercase; white-space:nowrap; text-align:center; cursor:pointer; }
   .m-otp-send[disabled] { opacity:0.4; cursor:not-allowed; }
-  #m_msg.err { color:#f87171; } #m_msg.ok { color:#4ade80; }
-  .m-oauth-row { display:flex; gap:8px; justify-content:center; margin-top:14px; }
-  .m-oauth-btn { display:flex; align-items:center; gap:6px; padding:7px 14px; border-radius:9999px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.5); font-size:11px; font-weight:600; cursor:pointer; transition:all 0.2s; }
-  .m-oauth-btn:hover { background:rgba(255,255,255,0.1); color:#fff; }
+  #m_msg { max-width:min(520px,88vw); line-height:1.5; }
+  #m_msg.err { color:#f87171; } #m_msg.ok { color:#4ade80; } #m_msg.info { color:#67e8f9; }
   @media(max-width:768px) {
-    .m-portal { width:92vw; height:280px; min-height:240px; }
-    .m-portal .m-glass { width:150px!important; height:150px!important; }
-    .m-portal .m-core-btn { width:100px!important; height:100px!important; }
-    .m-otp-row { flex-direction:column; align-items:stretch; }
-    .m-otp-send { width:100%; text-align:center; }
-    .m-oauth-row { flex-direction:column; align-items:center; }
+    .m-portal { width:94vw; height:320px; min-height:300px; }
+    .m-portal .m-glass { width:170px!important; height:170px!important; }
+    .m-portal .m-core-btn { width:108px!important; height:108px!important; }
+    .m-otp-row { width:min(100%,130px); gap:6px; }
+    .m-otp-send { padding:5px 7px; font-size:7px; letter-spacing:0.06em; }
   }
 </style>
 
-<div id="authModal" role="dialog" aria-modal="true">
-  <div class="absolute inset-0 bg-[#0a0f18]/85 backdrop-blur-md" onclick="closeAuthModal()"></div>
+<div id="authModal" role="dialog" aria-modal="true" aria-labelledby="authTitle" aria-describedby="m_msg">
+  <div class="absolute inset-0 bg-[#0a0f18]/85 backdrop-blur-md"></div>
+  <button onclick="closeAuthModal()" class="fixed top-8 right-8 z-50 w-10 h-10 rounded-full bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-white/40 hover:text-white transition-all">
+    <span class="material-symbols-outlined text-xl">close</span>
+  </button>
   <div class="relative z-10 p-4 modal-inner">
-    <button onclick="closeAuthModal()" class="absolute top-6 right-6 z-50 w-10 h-10 rounded-full bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-white/40 hover:text-white transition-all">
-      <span class="material-symbols-outlined text-xl">close</span>
-    </button>
+    <span id="authTitle" class="sr-only">登录或注册 ORIGIN</span>
 
     <div class="m-portal" id="m_portalContainer">
-      <!-- Left circle: username (login) / username+email (register) -->
-      <div class="m-glass absolute left-0 w-56 h-56 rounded-full z-20">
+      <!-- Left circle: phone (login) / phone+display name (register) -->
+      <div class="m-glass absolute left-0 w-60 h-60 rounded-full z-20">
         <div class="m-face-front p-7">
-          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">用户名 · Neural ID</label>
-          <input id="m_loginUser" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-lg" placeholder="请输入用户名或邮箱" type="text" autocomplete="username"/>
+          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">手机号 · Phone</label>
+          <input id="m_loginPhone" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-lg" placeholder="请输入手机号" type="tel" inputmode="tel" autocomplete="tel" aria-label="手机号"/>
+          <div class="m-auth-switch mt-4" id="m_loginModeSwitch">
+            <button type="button" id="m_passwordModeBtn" class="is-active" onclick="setLoginMode('password')">密码</button>
+            <button type="button" id="m_otpModeBtn" onclick="setLoginMode('otp')">验证码</button>
+          </div>
           <div class="mt-5 flex flex-col items-center">
-            <button class="text-[8px] font-black uppercase tracking-[0.18em] bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent hover:from-cyan-300 hover:to-blue-300 transition-all" onclick="togglePortal()">注册新账号 · Register →</button>
+            <button type="button" class="text-[8px] font-black uppercase tracking-[0.18em] bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent hover:from-cyan-300 hover:to-blue-300 transition-all" onclick="togglePortal()">注册新账号 · Register →</button>
           </div>
         </div>
         <div class="m-face-back p-6">
           <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">注册信息 · Sign Up</label>
-          <input id="m_regUser" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-base" placeholder="新用户名（中文/字母/数字/下划线）" type="text" autocomplete="username"/>
+          <input id="m_regPhone" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-base" placeholder="手机号" type="tel" inputmode="tel" autocomplete="tel" aria-label="注册手机号"/>
           <div class="mt-3 w-full">
-            <input id="m_regEmail" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-sm" placeholder="注册邮箱" type="email" autocomplete="email"/>
+            <input id="m_regName" class="bg-transparent border-none focus:ring-0 text-center text-white font-medium tracking-tight p-0 placeholder:text-white/25 w-full text-sm" placeholder="昵称（2-20个字符）" type="text" autocomplete="nickname" aria-label="昵称"/>
           </div>
           <div class="mt-4 flex flex-col items-center">
-            <button class="text-[8px] font-black uppercase tracking-[0.18em] text-white/40 hover:text-white transition-colors" onclick="togglePortal()">← 返回登录</button>
+            <button type="button" class="text-[8px] font-black uppercase tracking-[0.18em] text-white/40 hover:text-white transition-colors" onclick="togglePortal()">← 返回登录</button>
           </div>
         </div>
       </div>
 
-      <!-- Right circle: password (login) / password+OTP (register) -->
-      <div class="m-glass absolute right-0 w-56 h-56 rounded-full z-20">
-        <div class="m-face-front p-10">
-          <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">密码 · Access Token</label>
-          <input id="m_loginPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.4em] p-0 placeholder:text-white/20 w-full text-xl" placeholder="••••••••" type="password" autocomplete="current-password"/>
+      <!-- Right circle: password/OTP (login/reset) / password+OTP (register) -->
+      <div class="m-glass absolute right-0 w-60 h-60 rounded-full z-20">
+        <div class="m-face-front p-8">
+          <label id="m_loginSecretLabel" class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">密码 · Password</label>
+          <input id="m_loginPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.4em] p-0 placeholder:text-white/20 w-full text-xl" placeholder="••••••••" type="password" autocomplete="current-password" aria-label="登录密码"/>
+          <div class="m-otp-row mt-4" id="m_loginOtpRow" hidden>
+            <input id="m_loginOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="6位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="登录验证码"/>
+            <button id="m_loginOtpSendBtn" class="m-otp-send" type="button" onclick="handleLoginOtpSend()">发送验证码</button>
+          </div>
+          <div class="m-otp-row mt-4" id="m_resetOtpRow" hidden>
+            <input id="m_resetOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="6位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="重置密码验证码"/>
+            <button id="m_resetOtpSendBtn" class="m-otp-send" type="button" onclick="handleResetOtpSend()">发送验证码</button>
+          </div>
           <div class="mt-5 flex flex-col items-center gap-2">
-            <button class="text-[8px] font-bold uppercase tracking-[0.12em] text-white/30 hover:text-white/60 transition-colors" onclick="showComingSoon('忘记密码')">忘记密码 · Forgot?</button>
+            <button id="m_forgotBtn" type="button" class="text-[8px] font-bold uppercase tracking-[0.12em] text-white/30 hover:text-white/60 transition-colors" onclick="startResetPassword()">忘记密码 · Forgot?</button>
+            <button id="m_resetBackBtn" type="button" class="text-[8px] font-bold uppercase tracking-[0.12em] text-white/30 hover:text-white/60 transition-colors" onclick="cancelResetPassword()" hidden>返回登录 · Back</button>
           </div>
         </div>
         <div class="m-face-back p-7">
           <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">设置密码 · Set Password</label>
-          <input id="m_regPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.25em] p-0 placeholder:text-white/25 w-full text-base" placeholder="••••••••" type="password" autocomplete="new-password"/>
+          <input id="m_regPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.25em] p-0 placeholder:text-white/25 w-full text-base" placeholder="••••••••" type="password" autocomplete="new-password" aria-label="注册密码"/>
           <div class="m-otp-row mt-4">
-            <input id="m_regOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="8位验证码" type="text" inputmode="numeric" autocomplete="one-time-code"/>
+            <input id="m_regOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="6位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="注册验证码"/>
             <button id="m_otpSendBtn" class="m-otp-send" type="button" onclick="handleSendOtp()">发送验证码</button>
           </div>
         </div>
       </div>
 
       <!-- Center button -->
-      <div class="m-core-btn group absolute z-30 w-40 h-40 rounded-full cursor-pointer" id="m_initBtn" onclick="handleAction()">
+      <div class="m-core-btn group absolute z-30 w-40 h-40 rounded-full cursor-pointer" id="m_initBtn" role="button" tabindex="0" aria-disabled="false" aria-busy="false" onclick="handleAction()">
         <div class="m-core-energy"></div>
         <div class="m-holo-shine" aria-hidden="true"></div>
         <div class="m-holo-logo" aria-hidden="true"></div>
         <div class="m-holo-glare" aria-hidden="true"></div>
         <div class="m-face-front pointer-events-none" style="z-index:10">
           <span class="material-symbols-outlined text-white text-4xl mb-1" style="font-variation-settings:'FILL' 1">login</span>
-          <span class="text-white font-black tracking-[0.25em] text-[10px] uppercase">登录 · Init</span>
+          <span id="m_coreFrontLabel" class="text-white font-black tracking-[0.25em] text-[10px] uppercase">登录 · Init</span>
         </div>
         <div class="m-face-back m-btn-back pointer-events-none" style="z-index:10">
           <span class="material-symbols-outlined text-white text-4xl mb-1" style="font-variation-settings:'FILL' 1">person_add</span>
-          <span class="text-white font-black tracking-[0.25em] text-[10px] uppercase">验证码注册</span>
+          <span id="m_coreBackLabel" class="text-white font-black tracking-[0.25em] text-[10px] uppercase">验证码注册</span>
         </div>
       </div>
     </div>
 
     <!-- Message -->
-    <div id="m_msg" class="mt-4 text-center text-sm font-medium tracking-wide min-h-[22px]"></div>
+    <div id="m_msg" class="mt-4 text-center text-sm font-medium tracking-wide min-h-[22px]" role="status" aria-live="polite"></div>
 
-    <!-- OAuth row -->
-    <div class="m-oauth-row mt-2">
-      <button class="m-oauth-btn" onclick="showComingSoon('Discord')">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.36-.698.772-1.362 1.225-1.993a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.12-.094.246-.194.373-.292a.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/></svg>
-        Discord 登录
-      </button>
-      <button class="m-oauth-btn" onclick="showComingSoon('Google')">
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-        Google 登录
-      </button>
-    </div>
   </div>
 </div>
 
 <script>
 var _isLoggedIn = false;
 var _isFlipped = false;
+var _loginMode = 'password';
+var _authMode = 'login';
 var _otpCountdown = 0;
 var _otpTimer = null;
+var _loginOtpCountdown = 0;
+var _loginOtpTimer = null;
+var _resetOtpCountdown = 0;
+var _resetOtpTimer = null;
+var _authBusy = false;
+var _authRedirecting = false;
+var _otpBusy = false;
+var _loginOtpBusy = false;
+var _resetOtpBusy = false;
 
 function _swapFaces(flipped) {
   var fronts = document.querySelectorAll('#m_portalContainer .m-face-front, #m_portalContainer .m-core-btn .m-face-front');
   var backs  = document.querySelectorAll('#m_portalContainer .m-face-back, #m_portalContainer .m-core-btn .m-btn-back');
-  fronts.forEach(function(el) { el.style.visibility = flipped ? 'hidden' : 'visible'; });
-  backs.forEach(function(el)  { el.style.visibility = flipped ? 'visible' : 'hidden'; });
+  function setGroup(list, active) {
+    list.forEach(function(el) {
+      el.style.visibility = active ? 'visible' : 'hidden';
+      el.setAttribute('aria-hidden', active ? 'false' : 'true');
+      el.querySelectorAll('input,button').forEach(function(ctrl) {
+        if (!ctrl.hasAttribute('data-auth-tabindex')) {
+          ctrl.setAttribute('data-auth-tabindex', ctrl.getAttribute('tabindex') || '');
+        }
+        if (active) {
+          var prev = ctrl.getAttribute('data-auth-tabindex');
+          if (prev) ctrl.setAttribute('tabindex', prev);
+          else ctrl.removeAttribute('tabindex');
+        } else {
+          ctrl.setAttribute('tabindex', '-1');
+        }
+      });
+    });
+  }
+  setGroup(fronts, !flipped);
+  setGroup(backs, flipped);
+}
+
+function _focusModeField(delay) {
+  setTimeout(function() {
+    var el = document.getElementById(_isFlipped ? 'm_regPhone' : 'm_loginPhone');
+    if (!el) return;
+    try { el.focus({ preventScroll:true }); } catch (_) { try { el.focus(); } catch (_) {} }
+  }, delay || 0);
+}
+
+function _isAnyOtpBusy() {
+  return _otpBusy || _loginOtpBusy || _resetOtpBusy;
 }
 
 function togglePortal() {
+  if (_authBusy || _isAnyOtpBusy()) return;
+  if (!_isFlipped && _authMode === 'reset') cancelResetPassword();
   _isFlipped = !_isFlipped;
   document.getElementById('m_portalContainer').classList.toggle('flipped', _isFlipped);
   _clearMsg();
-  setTimeout(function() { _swapFaces(_isFlipped); }, 350);
+  setTimeout(function() { _swapFaces(_isFlipped); _focusModeField(0); }, 350);
 }
 
 (function checkAuth() {
-  var token = localStorage.getItem('sw_auth_token');
+  var token = '';
+  try { token = localStorage.getItem('sw_auth_token') || ''; } catch (_) { token = ''; }
   if (!token) return;
   fetch('/api/auth/me', { headers: { Authorization: 'Bearer ' + token } })
     .then(function (r) {
@@ -594,6 +662,7 @@ function togglePortal() {
 })();
 
 _swapFaces(false);
+setLoginMode('password');
 
 (function mountCoreHolo() {
   var el = document.getElementById('m_initBtn');
@@ -635,6 +704,8 @@ function openAuthModal(e) {
   if (_isLoggedIn) { window.location.href = '/workspace'; return; }
   document.getElementById('authModal').classList.add('show');
   document.body.style.overflow = 'hidden';
+  _swapFaces(_isFlipped);
+  _focusModeField(80);
 }
 
 function closeAuthModal() {
@@ -653,6 +724,49 @@ function _showMsg(text, type) {
   el.className = 'mt-4 text-center text-sm font-medium tracking-wide min-h-[22px] ' + type;
 }
 
+async function _readAuthJson(resp) {
+  var text = '';
+  try { text = await resp.text(); } catch (_) {}
+  if (!text) return {};
+  try { return JSON.parse(text); } catch (_) {
+    return { detail: resp.ok ? '服务器返回异常，请刷新后重试' : '服务暂时不可用，请稍后重试' };
+  }
+}
+
+function _authError(data, fallback) {
+  return (data && (data.detail || data.error || data.message)) || fallback;
+}
+
+function _normalizePhoneClient(phone) {
+  var value = String(phone || '').trim().replace(/[\s-]/g, '');
+  if (value.indexOf('+86') === 0) value = value.slice(3);
+  if (value.indexOf('86') === 0 && value.length === 13) value = value.slice(2);
+  return value;
+}
+
+function _validPhone(phone) {
+  return /^1[3-9]\d{9}$/.test(_normalizePhoneClient(phone));
+}
+
+function _validDisplayName(name) {
+  var value = String(name || '').trim();
+  return value.length >= 2 && value.length <= 20;
+}
+
+function _setHidden(id, hidden) {
+  var el = document.getElementById(id);
+  if (el) el.hidden = !!hidden;
+}
+
+function _setAuthBusy(busy) {
+  _authBusy = !!busy;
+  var btn = document.getElementById('m_initBtn');
+  if (!btn) return;
+  btn.classList.toggle('is-busy', _authBusy);
+  btn.setAttribute('aria-busy', _authBusy ? 'true' : 'false');
+  btn.setAttribute('aria-disabled', _authBusy ? 'true' : 'false');
+}
+
 function _persistAuth(data) {
   try {
     localStorage.setItem('sw_auth_token', data.token);
@@ -664,84 +778,298 @@ function _persistAuth(data) {
   }
 }
 
-async function handleAction() {
+function _setLoginOtpPanel(active) {
+  _setHidden('m_loginOtpRow', !active);
+  var input = document.getElementById('m_loginOtp');
+  if (input) input.disabled = !active;
+  var btn = document.getElementById('m_loginOtpSendBtn');
+  if (btn) btn.disabled = !active || _loginOtpBusy || _loginOtpCountdown > 0;
+}
+
+function _setResetOtpPanel(active) {
+  _setHidden('m_resetOtpRow', !active);
+  var input = document.getElementById('m_resetOtp');
+  if (input) input.disabled = !active;
+  var btn = document.getElementById('m_resetOtpSendBtn');
+  if (btn) btn.disabled = !active || _resetOtpBusy || _resetOtpCountdown > 0;
+}
+
+function setLoginMode(mode) {
+  if (_authBusy || _isAnyOtpBusy()) return;
+  _authMode = 'login';
+  _loginMode = mode === 'otp' ? 'otp' : 'password';
+  var pwdBtn = document.getElementById('m_passwordModeBtn');
+  var otpBtn = document.getElementById('m_otpModeBtn');
+  if (pwdBtn) pwdBtn.classList.toggle('is-active', _loginMode === 'password');
+  if (otpBtn) otpBtn.classList.toggle('is-active', _loginMode === 'otp');
+
+  var label = document.getElementById('m_loginSecretLabel');
+  var pwd = document.getElementById('m_loginPwd');
+  if (label) label.textContent = _loginMode === 'otp' ? '验证码 · Code' : '密码 · Password';
+  if (pwd) {
+    pwd.hidden = _loginMode !== 'password';
+    pwd.disabled = _loginMode !== 'password';
+    pwd.type = 'password';
+    pwd.placeholder = '••••••••';
+    pwd.autocomplete = 'current-password';
+    pwd.setAttribute('aria-label', '登录密码');
+  }
+  _setLoginOtpPanel(_loginMode === 'otp');
+  _setResetOtpPanel(false);
+  _setHidden('m_loginModeSwitch', false);
+  _setHidden('m_forgotBtn', false);
+  _setHidden('m_resetBackBtn', true);
+  var core = document.getElementById('m_coreFrontLabel');
+  if (core) core.textContent = _loginMode === 'otp' ? '验证码登录' : '登录 · Init';
+  _updateLoginOtpBtn();
+  _updateResetOtpBtn();
+}
+
+function startResetPassword() {
+  if (_authBusy || _isAnyOtpBusy()) return;
+  _authMode = 'reset';
+  _loginMode = 'password';
   _clearMsg();
-  var btn = document.getElementById('m_initBtn');
-  btn.style.pointerEvents = 'none'; btn.style.opacity = '.4';
+  var label = document.getElementById('m_loginSecretLabel');
+  var pwd = document.getElementById('m_loginPwd');
+  if (label) label.textContent = '新密码 · Reset';
+  if (pwd) {
+    pwd.hidden = false;
+    pwd.disabled = false;
+    pwd.type = 'password';
+    pwd.placeholder = '新密码';
+    pwd.autocomplete = 'new-password';
+    pwd.setAttribute('aria-label', '新密码');
+    try { pwd.focus({ preventScroll:true }); } catch (_) { try { pwd.focus(); } catch (_) {} }
+  }
+  _setHidden('m_loginModeSwitch', true);
+  _setLoginOtpPanel(false);
+  _setResetOtpPanel(true);
+  _setHidden('m_forgotBtn', true);
+  _setHidden('m_resetBackBtn', false);
+  var core = document.getElementById('m_coreFrontLabel');
+  if (core) core.textContent = '重置密码';
+  _showMsg('先发送短信验证码，再输入验证码和新密码', 'info');
+  _updateLoginOtpBtn();
+  _updateResetOtpBtn();
+}
+
+function cancelResetPassword() {
+  _authMode = 'login';
+  _clearMsg();
+  setLoginMode('password');
+}
+
+async function handleAction() {
+  if (_authBusy || _authRedirecting) return;
+  _clearMsg();
+  var shouldUnlock = true;
+  _setAuthBusy(true);
 
   try {
     if (!_isFlipped) {
-      var user = document.getElementById('m_loginUser').value.trim();
-      var pwd  = document.getElementById('m_loginPwd').value;
-      if (!user || !pwd) { _showMsg('请填写用户名/邮箱和密码', 'err'); return; }
-      var resp = await fetch('/api/auth/login', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ username:user, password:pwd })
-      });
-      var data = await resp.json();
-      if (!resp.ok) { _showMsg(data.detail || '登录失败', 'err'); return; }
+      var phone = _normalizePhoneClient(document.getElementById('m_loginPhone').value);
+      if (!_validPhone(phone)) { _showMsg('请输入正确的手机号', 'err'); return; }
+      var resp;
+      if (_authMode === 'reset') {
+        var newPwd = document.getElementById('m_loginPwd').value;
+        var resetCode = document.getElementById('m_resetOtp').value.trim();
+        if (newPwd.length < 6) { _showMsg('新密码至少 6 位', 'err'); return; }
+        if (!/^\d{6}$/.test(resetCode)) { _showMsg('请输入 6 位短信验证码', 'err'); return; }
+        _showMsg('正在重置密码，请稍候…', 'info');
+        resp = await fetch('/api/auth/reset/verify', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ phone:phone, newPassword:newPwd, code:resetCode })
+        });
+      } else if (_loginMode === 'otp') {
+        var loginCode = document.getElementById('m_loginOtp').value.trim();
+        if (!/^\d{6}$/.test(loginCode)) { _showMsg('请输入 6 位短信验证码', 'err'); return; }
+        _showMsg('正在登录，请稍候…', 'info');
+        resp = await fetch('/api/auth/login/otp', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ phone:phone, code:loginCode })
+        });
+      } else {
+        var pwd = document.getElementById('m_loginPwd').value;
+        if (!pwd) { _showMsg('请填写手机号和密码', 'err'); return; }
+        _showMsg('正在登录，请稍候…', 'info');
+        resp = await fetch('/api/auth/login', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ phone:phone, password:pwd })
+        });
+      }
+      var data = await _readAuthJson(resp);
+      if (!resp.ok) { _showMsg(_authError(data, _authMode === 'reset' ? '重置失败，请检查验证码' : '登录失败，请检查手机号和凭证'), 'err'); return; }
       if (!_persistAuth(data)) { _showMsg('浏览器存储不可用', 'err'); return; }
-      _showMsg('登录成功，正在跳转…', 'ok');
+      _showMsg(_authMode === 'reset' ? '密码已重置，正在跳转…' : '登录成功，正在跳转…', 'ok');
+      _authRedirecting = true;
+      shouldUnlock = false;
       setTimeout(function(){ window.location.href = '/workspace'; }, 500);
     } else {
-      var ru = document.getElementById('m_regUser').value.trim();
-      var re = document.getElementById('m_regEmail').value.trim();
+      var regPhone = _normalizePhoneClient(document.getElementById('m_regPhone').value);
+      var displayName = document.getElementById('m_regName').value.trim();
       var rp = document.getElementById('m_regPwd').value;
       var ro = document.getElementById('m_regOtp').value.trim();
-      if (!ru||!re||!rp||!ro) { _showMsg('请填写所有注册字段和验证码', 'err'); return; }
+      if (!regPhone||!displayName||!rp||!ro) { _showMsg('请填写手机号、密码、昵称和验证码', 'err'); return; }
+      if (!_validPhone(regPhone)) { _showMsg('请输入正确的手机号', 'err'); return; }
+      if (!_validDisplayName(displayName)) { _showMsg('昵称长度需为 2-20 个字符', 'err'); return; }
+      if (rp.length < 6) { _showMsg('密码至少 6 位', 'err'); return; }
+      if (!/^\d{6}$/.test(ro)) { _showMsg('请输入 6 位短信验证码', 'err'); return; }
+      _showMsg('正在创建账号，请稍候…', 'info');
       var resp2 = await fetch('/api/auth/register/verify', {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ username:ru, password:rp, email:re, token:ro })
+        body: JSON.stringify({ phone:regPhone, password:rp, displayName:displayName, code:ro })
       });
-      var data2 = await resp2.json();
-      if (!resp2.ok) { _showMsg(data2.detail || '注册失败', 'err'); return; }
+      var data2 = await _readAuthJson(resp2);
+      if (!resp2.ok) { _showMsg(_authError(data2, '注册失败，请检查填写内容'), 'err'); return; }
       if (!_persistAuth(data2)) { _showMsg('浏览器存储不可用', 'err'); return; }
       _showMsg('注册成功，正在跳转…', 'ok');
+      _authRedirecting = true;
+      shouldUnlock = false;
       setTimeout(function(){ window.location.href = '/workspace'; }, 500);
     }
   } catch (err) {
-    _showMsg('网络错误：' + err.message, 'err');
+    _showMsg('请求未完成，请检查网络后重试', 'err');
   } finally {
-    btn.style.pointerEvents = ''; btn.style.opacity = '';
+    if (shouldUnlock) _setAuthBusy(false);
   }
 }
 
 async function handleSendOtp() {
+  if (_otpBusy || _otpCountdown > 0) return;
   _clearMsg();
-  var user = document.getElementById('m_regUser').value.trim();
-  var email = document.getElementById('m_regEmail').value.trim();
+  var phone = _normalizePhoneClient(document.getElementById('m_regPhone').value);
+  var displayName = document.getElementById('m_regName').value.trim();
   var pwd = document.getElementById('m_regPwd').value;
-  if (!user||!email||!pwd) { _showMsg('请先填写用户名、邮箱和密码', 'err'); return; }
-  var btn = document.getElementById('m_otpSendBtn');
-  btn.disabled = true;
+  if (!phone||!displayName||!pwd) { _showMsg('请先填写手机号、昵称和密码', 'err'); return; }
+  if (!_validPhone(phone)) { _showMsg('请输入正确的手机号', 'err'); return; }
+  if (!_validDisplayName(displayName)) { _showMsg('昵称长度需为 2-20 个字符', 'err'); return; }
+  if (pwd.length < 6) { _showMsg('密码至少 6 位', 'err'); return; }
+  _otpBusy = true;
+  _updateOtpBtn();
+  _showMsg('正在发送验证码…', 'info');
   try {
     var resp = await fetch('/api/auth/register/send-code', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ username:user, password:pwd, email:email })
+      body: JSON.stringify({ phone:phone })
     });
-    var data = await resp.json();
-    if (!resp.ok) { _showMsg(data.detail || '验证码发送失败', 'err'); btn.disabled = false; return; }
-    _showMsg('验证码已发送，请查收邮箱', 'ok');
+    var data = await _readAuthJson(resp);
+    if (!resp.ok) { _showMsg(_authError(data, '验证码发送失败，请稍后重试'), 'err'); return; }
+    _showMsg('验证码已发送，请查收短信', 'ok');
     _otpCountdown = 60; _updateOtpBtn();
+    var otpInput = document.getElementById('m_regOtp');
+    if (otpInput) { try { otpInput.focus({ preventScroll:true }); } catch (_) { otpInput.focus(); } }
     if (_otpTimer) clearInterval(_otpTimer);
     _otpTimer = setInterval(function(){ _otpCountdown--; if(_otpCountdown<=0){_otpCountdown=0;clearInterval(_otpTimer);_otpTimer=null;} _updateOtpBtn(); }, 1000);
-  } catch(err) { _showMsg('网络错误：'+err.message,'err'); btn.disabled=false; }
+  } catch(err) {
+    _showMsg('请求未完成，请检查网络后重试','err');
+  } finally {
+    _otpBusy = false;
+    _updateOtpBtn();
+  }
 }
 
 function _updateOtpBtn() {
   var btn = document.getElementById('m_otpSendBtn');
+  if (!btn) return;
+  if (_otpBusy) {
+    btn.disabled = true;
+    btn.textContent = '发送中...';
+    return;
+  }
   btn.disabled = _otpCountdown > 0;
-  btn.textContent = _otpCountdown > 0 ? ('重发 '+_otpCountdown+'s') : '发送验证码';
+  btn.textContent = _otpCountdown > 0 ? ('重发 '+_otpCountdown+'秒') : '发送验证码';
 }
 
-function showComingSoon(provider) {
-  _showMsg(provider + ' 登录即将开放，敬请期待', 'err');
-  setTimeout(_clearMsg, 2500);
+async function handleLoginOtpSend() {
+  if (_loginOtpBusy || _loginOtpCountdown > 0) return;
+  _clearMsg();
+  var phone = _normalizePhoneClient(document.getElementById('m_loginPhone').value);
+  if (!_validPhone(phone)) { _showMsg('请输入正确的手机号', 'err'); return; }
+  _loginOtpBusy = true;
+  _updateLoginOtpBtn();
+  _showMsg('正在发送验证码…', 'info');
+  try {
+    var resp = await fetch('/api/auth/login/send-code', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ phone:phone })
+    });
+    var data = await _readAuthJson(resp);
+    if (!resp.ok) { _showMsg(_authError(data, '验证码发送失败，请稍后重试'), 'err'); return; }
+    _showMsg('验证码已发送，请查收短信', 'ok');
+    _loginOtpCountdown = 60; _updateLoginOtpBtn();
+    var otpInput = document.getElementById('m_loginOtp');
+    if (otpInput) { try { otpInput.focus({ preventScroll:true }); } catch (_) { otpInput.focus(); } }
+    if (_loginOtpTimer) clearInterval(_loginOtpTimer);
+    _loginOtpTimer = setInterval(function(){ _loginOtpCountdown--; if(_loginOtpCountdown<=0){_loginOtpCountdown=0;clearInterval(_loginOtpTimer);_loginOtpTimer=null;} _updateLoginOtpBtn(); }, 1000);
+  } catch(err) {
+    _showMsg('请求未完成，请检查网络后重试','err');
+  } finally {
+    _loginOtpBusy = false;
+    _updateLoginOtpBtn();
+  }
+}
+
+async function handleResetOtpSend() {
+  if (_resetOtpBusy || _resetOtpCountdown > 0) return;
+  _clearMsg();
+  var phone = _normalizePhoneClient(document.getElementById('m_loginPhone').value);
+  if (!_validPhone(phone)) { _showMsg('请输入正确的手机号', 'err'); return; }
+  _resetOtpBusy = true;
+  _updateResetOtpBtn();
+  _showMsg('正在发送验证码…', 'info');
+  try {
+    var resp = await fetch('/api/auth/reset/send-code', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ phone:phone })
+    });
+    var data = await _readAuthJson(resp);
+    if (!resp.ok) { _showMsg(_authError(data, '验证码发送失败，请稍后重试'), 'err'); return; }
+    _showMsg('验证码已发送，请查收短信', 'ok');
+    _resetOtpCountdown = 60; _updateResetOtpBtn();
+    var otpInput = document.getElementById('m_resetOtp');
+    if (otpInput) { try { otpInput.focus({ preventScroll:true }); } catch (_) { otpInput.focus(); } }
+    if (_resetOtpTimer) clearInterval(_resetOtpTimer);
+    _resetOtpTimer = setInterval(function(){ _resetOtpCountdown--; if(_resetOtpCountdown<=0){_resetOtpCountdown=0;clearInterval(_resetOtpTimer);_resetOtpTimer=null;} _updateResetOtpBtn(); }, 1000);
+  } catch(err) {
+    _showMsg('请求未完成，请检查网络后重试','err');
+  } finally {
+    _resetOtpBusy = false;
+    _updateResetOtpBtn();
+  }
+}
+
+function _updateLoginOtpBtn() {
+  var btn = document.getElementById('m_loginOtpSendBtn');
+  if (!btn) return;
+  if (_loginOtpBusy) {
+    btn.disabled = true;
+    btn.textContent = '发送中...';
+    return;
+  }
+  btn.disabled = _authMode !== 'login' || _loginMode !== 'otp' || _loginOtpCountdown > 0;
+  btn.textContent = _loginOtpCountdown > 0 ? ('重发 '+_loginOtpCountdown+'秒') : '发送验证码';
+}
+
+function _updateResetOtpBtn() {
+  var btn = document.getElementById('m_resetOtpSendBtn');
+  if (!btn) return;
+  if (_resetOtpBusy) {
+    btn.disabled = true;
+    btn.textContent = '发送中...';
+    return;
+  }
+  btn.disabled = _authMode !== 'reset' || _resetOtpCountdown > 0;
+  btn.textContent = _resetOtpCountdown > 0 ? ('重发 '+_resetOtpCountdown+'秒') : '发送验证码';
 }
 
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') closeAuthModal();
-  if (e.key === 'Enter' && document.getElementById('authModal').classList.contains('show')) handleAction();
+  var modalOpen = document.getElementById('authModal').classList.contains('show');
+  if (e.key === 'Escape' && modalOpen) closeAuthModal();
+  if (e.key === 'Enter' && modalOpen) { e.preventDefault(); handleAction(); }
+});
+document.getElementById('m_initBtn').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleAction(); }
 });
 document.getElementById('m_initBtn').addEventListener('touchend', function(e) { e.preventDefault(); handleAction(); }, { passive:false });
 </script>

@@ -8,6 +8,10 @@ import {
   renderCharacterLockRosterLine,
   type CharacterLock,
 } from './character-consistency';
+import {
+  buildAssetAuthoritativeCharacterLock,
+  resolveCharacterAssetForEntity,
+} from './character-lock-authority';
 
 export function truncate(value: any, n: number): string {
   const s = String(value || '');
@@ -84,7 +88,9 @@ export function buildCharacterLockRoster(
     const names = [lock.canonicalName, ...lock.aliases].filter(Boolean);
     const mentioned = names.some((name) => charNames.has(name) || contextText.includes(name));
     if (!mentioned) continue;
-    lines.push(renderCharacterLockRosterLine(lock, language));
+    const resolution = resolveCharacterAssetForEntity(project, lock);
+    const projectedLock = buildAssetAuthoritativeCharacterLock(lock, resolution.asset);
+    lines.push(renderCharacterLockRosterLine(projectedLock, language));
   }
   return lines.join('\n');
 }

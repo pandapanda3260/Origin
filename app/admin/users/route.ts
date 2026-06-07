@@ -18,7 +18,7 @@ export async function GET(req: NextRequest) {
     </style>`,
     bodyHtml: `<section class="panel">
       <div class="users-toolbar">
-        <input data-user-search="true" placeholder="搜索 ID / 用户名 / 邮箱 / 昵称" />
+        <input data-user-search="true" placeholder="搜索 ID / 手机号 / 昵称 / 旧邮箱" />
         <button data-user-search-button="true" class="primary">搜索</button>
         <button data-user-refresh="true">刷新</button>
       </div>
@@ -29,7 +29,7 @@ export async function GET(req: NextRequest) {
             <tr>
               <th>ID</th>
               <th>用户</th>
-              <th>邮箱</th>
+              <th>手机号</th>
               <th>积分</th>
               <th>项目</th>
               <th>状态</th>
@@ -85,10 +85,12 @@ export async function GET(req: NextRequest) {
           const actions = u.disabledAt
             ? '<button data-action="restore" data-user-id="' + u.id + '">恢复</button>'
             : '<button class="danger" data-action="disable" data-user-id="' + u.id + '">禁用</button>';
+          const primaryName = u.displayName || u.phone || u.username;
+          const accountLine = u.phone || u.username || '';
           return '<tr>' +
             '<td>' + u.id + '</td>' +
-            '<td><strong>' + esc(u.username) + '</strong><div class="muted">' + esc(u.displayName || '') + '</div></td>' +
-            '<td>' + esc(u.email || '-') + '</td>' +
+            '<td><strong>' + esc(primaryName) + '</strong><div class="muted">' + esc(accountLine) + '</div></td>' +
+            '<td>' + esc(u.phone || '-') + '</td>' +
             '<td>' + Number(u.totalCredits || 0) + '</td>' +
             '<td>' + Number(u.projectCount || 0) + '</td>' +
             '<td>' + status + (u.tokenRevokedAt ? '<div class="muted">已踢：' + esc(fmtDate(u.tokenRevokedAt)) + '</div>' : '') + '</td>' +
@@ -124,7 +126,8 @@ export async function GET(req: NextRequest) {
       async function mutateUser(action, userId) {
         const user = userState.items.find((item) => String(item.id) === String(userId));
         const label = actionLabel(action);
-        const reason = window.prompt(label + '用户 ' + (user?.username || userId) + ' 的原因');
+        const userLabel = user?.displayName || user?.phone || user?.username || userId;
+        const reason = window.prompt(label + '用户 ' + userLabel + ' 的原因');
         if (!reason || !reason.trim()) return;
         const idempotencyKey = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random();
         const payload = { action, userId: Number(userId), reason: reason.trim(), dryRun: true };
@@ -145,7 +148,7 @@ export async function GET(req: NextRequest) {
           setNotice((dryRunData && dryRunData.detail) || '预检查失败', 'error');
           return;
         }
-        const confirmed = window.confirm(label + '用户 ' + (user?.username || userId) + '？此操作会写入审计日志。');
+        const confirmed = window.confirm(label + '用户 ' + userLabel + '？此操作会写入审计日志。');
         if (!confirmed) {
           setNotice('已取消');
           return;

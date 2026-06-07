@@ -1,4 +1,5 @@
 """Phase 1 e2e: real auth + project persistence in browser."""
+import os
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -7,6 +8,8 @@ OUT = ROOT / "phase1-screenshots"
 OUT.mkdir(exist_ok=True)
 LOCAL = "http://localhost:3000"
 CHROME = "/Users/linsen/Library/Caches/ms-playwright/chromium_headless_shell-1217/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+PHONE = os.environ.get("ORIGIN_E2E_PHONE", "19900000000")
+PASSWORD = os.environ.get("ORIGIN_E2E_PASSWORD", "change-me")
 
 
 def main():
@@ -25,11 +28,11 @@ def main():
         print(f"    redirected to: {cur_url}")
         page.screenshot(path=str(OUT / "01-redirect-to-login.png"), full_page=True)
 
-        print("[2] Login with seed account pokerman/joker0606")
+        print("[2] Login with configured phone/password test account")
         page.evaluate("openAuthModal && openAuthModal(new Event('click'))")
         page.wait_for_timeout(500)
-        page.fill("#m_loginUser", "pokerman")
-        page.fill("#m_loginPwd", "joker0606")
+        page.fill("#m_loginPhone", PHONE)
+        page.fill("#m_loginPwd", PASSWORD)
         page.click("#m_initBtn")
         page.wait_for_timeout(2500)
         page.screenshot(path=str(OUT / "02-after-login.png"), full_page=True)

@@ -11,13 +11,13 @@
     <title>Origin</title>
     <script>
       (function () {
-        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "toolbox", "profile", "settings", "onlineEditor"];
+        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "toolbox", "profile", "settings", "onlineEditor"];
         var hashKey = "workspacePage";
         function normalize(page) {
           page = String(page || "");
           if (page === "online-editor") page = "onlineEditor";
           if (page === "images") page = "shots";
-          if (pages.indexOf(page) === -1 || page === "onlineEditor") return "";
+          if (pages.indexOf(page) === -1) return "";
           return page;
         }
         function readStorage(storage, key) {
@@ -32,16 +32,15 @@
           }
         }
         var prefix = currentPrefix();
-        var page = readStorage(window.sessionStorage, prefix + "sw_workspace_active_page");
+        var page = "";
+        try {
+          var hash = String(window.location.hash || "");
+          var hashPrefix = "#" + hashKey + "=";
+          if (hash.indexOf(hashPrefix) === 0) page = decodeURIComponent(hash.slice(hashPrefix.length));
+        } catch (_) {}
+        if (!page) page = readStorage(window.sessionStorage, prefix + "sw_workspace_active_page");
         if (!page) {
           try { page = (window.history && window.history.state && window.history.state.originWorkspaceActivePage) || ""; } catch (_) {}
-        }
-        if (!page) {
-          try {
-            var hash = String(window.location.hash || "");
-            var hashPrefix = "#" + hashKey + "=";
-            if (hash.indexOf(hashPrefix) === 0) page = decodeURIComponent(hash.slice(hashPrefix.length));
-          } catch (_) {}
         }
         if (!page) page = readStorage(window.localStorage, prefix + "sw_workspace_active_page_fallback");
         page = normalize(page);
@@ -61,15 +60,17 @@
       html[data-workspace-boot-page="batch"]:not([data-workspace-boot-ready]) #pageBatch,
       html[data-workspace-boot-page="edit"]:not([data-workspace-boot-ready]) #pageEdit,
       html[data-workspace-boot-page="library"]:not([data-workspace-boot-ready]) #pageLibrary,
+      html[data-workspace-boot-page="characterCustom"]:not([data-workspace-boot-ready]) #pageCharacterCustom,
       html[data-workspace-boot-page="toolbox"]:not([data-workspace-boot-ready]) #pageToolbox,
       html[data-workspace-boot-page="profile"]:not([data-workspace-boot-ready]) #pageProfile,
-      html[data-workspace-boot-page="settings"]:not([data-workspace-boot-ready]) #pageSettings {
+      html[data-workspace-boot-page="settings"]:not([data-workspace-boot-ready]) #pageSettings,
+      html[data-workspace-boot-page="onlineEditor"]:not([data-workspace-boot-ready]) #pageOnlineEditor {
         display: block !important;
       }
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=119" />
+    <link rel="stylesheet" href="styles.css?v=180" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -139,7 +140,7 @@
     <!-- ===== Sidebar ===== -->
     <aside id="sidebar" class="fixed left-0 top-0 h-full w-72 flex flex-col py-8 px-6 bg-[#ffffff]/20 backdrop-blur-xl rounded-r-[3rem] border-r border-[#90A4AE]/10 z-40 shadow-[0px_0px_40px_rgba(11,19,32,0.04)]">
       <div class="flex flex-col items-center gap-1 mb-4 px-1">
-        <img src="originrise-logo.png" alt="ORIGINRISE" class="w-36 h-36 object-contain" />
+        <img src="originrise-logo.png" alt="ORIGIN" class="w-36 h-36 object-contain" />
         <div class="flex flex-col items-center select-none -mt-1">
           <div class="text-[1.05rem] leading-none font-light tracking-[0.25em] text-slate-800 dark:text-slate-100 font-['Space_Grotesk'] whitespace-nowrap">ORIGIN</div>
           <div class="text-[8px] mt-1.5 font-medium tracking-[0.18em] uppercase text-slate-500 dark:text-slate-400 whitespace-nowrap">Where Imagination Begins</div>
@@ -246,9 +247,14 @@
             <span class="material-symbols-outlined">construction</span>
             <span>工具箱</span>
           </button>
-          <button type="button" id="navProfile" data-page="profile" title="创作偏好"
+          <button type="button" id="navCharacterCustom" data-page="characterCustom" title="角色定制"
             class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-            <span class="material-symbols-outlined">face</span>
+            <span class="material-symbols-outlined">frame_person</span>
+            <span>角色定制</span>
+          </button>
+          <button type="button" id="navProfile" data-page="profile" title="创作偏好" hidden
+            class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
+            <span class="material-symbols-outlined">fingerprint</span>
             <span>创作偏好</span>
           </button>
           <button type="button" id="navLegacyStoryboardArchive" title="旧版多镜头生成历史" hidden
@@ -259,15 +265,18 @@
         </div>
 
       <div class="mt-auto shrink-0 pt-4 border-t border-outline-variant/10 relative z-10 pl-6 space-y-1">
-        <button type="button" id="accountBar" data-goto="billing" title="订阅积分"
-          class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-          <span class="material-symbols-outlined">account_circle</span>
-          <span>订阅积分</span>
-        </button>
         <button type="button" id="navSettings" data-page="settings" title="设置" hidden
           class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
           <span class="material-symbols-outlined">settings</span>
           <span>设置</span>
+        </button>
+        <button type="button" id="accountBar" data-goto="billing" title="订阅积分"
+          class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
+          <span class="material-symbols-outlined">account_circle</span>
+          <span class="flex flex-col min-w-0 leading-tight">
+            <span>订阅积分</span>
+            <span id="accountBillingBadge" class="text-[11px] font-medium text-on-surface-variant/60 truncate"></span>
+          </span>
         </button>
       </div>
       </div>
@@ -430,10 +439,10 @@
             <div class="style-workspace-col style-workspace-col--left">
               <section class="style-page-world-templates">
                 <header class="style-section-head">
-                  <div>
-                    <h2>世界观模型</h2>
-                    <p>WORLD MODEL</p>
-                  </div>
+	                  <div>
+	                    <h2>选择世界观</h2>
+	                    <p>WORLD MODEL</p>
+	                  </div>
                   <button type="button" id="btnStyleWorldClear" class="style-mini-btn" data-write-action>清除关联</button>
                 </header>
                 <div id="styleWorldTemplateHint" class="style-template-hint" hidden></div>
@@ -451,7 +460,7 @@
                   <button type="button" id="btnStyleTemplateClear" class="style-mini-btn" data-write-action>清除模板选择</button>
                 </header>
                 <div id="styleTemplateRecommendHint" class="style-template-hint" hidden></div>
-                <div id="stylePageTemplateList" class="style-template-list"></div>
+                <div id="stylePageTemplateList" class="style-template-list"><div class="style-template-library-row" aria-hidden="true"><div class="style-template-card style-template-card--style style-template-card--library style-template-card--loading"></div><div class="style-template-card style-template-card--style style-template-card--library style-template-card--loading"></div><div class="style-template-card style-template-card--style style-template-card--library style-template-card--loading"></div><div class="style-template-card style-template-card--style style-template-card--library style-template-card--loading"></div></div></div>
               </section>
 
               <section class="style-page-aspect">
@@ -499,7 +508,7 @@
             </section>
 
             <div class="style-workspace-col style-workspace-col--right">
-              <section class="style-side-card style-side-card--prompt">
+              <section class="style-side-card style-side-card--prompt" hidden>
                 <header class="style-section-head">
                   <div>
                     <h2>Prompt 输入</h2>
@@ -534,18 +543,10 @@
               </div>
             </div>
             <div class="script-header-actions">
-              <!-- TODO: 历史版本与设置入口保留给后续版本管理/页面配置功能接入。 -->
+              <!-- TODO: 历史版本入口保留给后续版本管理功能接入。 -->
               <button type="button" id="btnScriptHistory" class="script-toolbar-btn" disabled title="历史版本功能待接入">
                 <span class="material-symbols-outlined">history</span>
                 <span>历史版本</span>
-              </button>
-              <button type="button" id="btnScriptSettings" class="script-toolbar-btn" disabled title="剧本设置功能待接入">
-                <span class="material-symbols-outlined">settings</span>
-                <span>设置</span>
-              </button>
-              <button type="button" id="btnNewScript" class="script-toolbar-btn">
-                <span class="material-symbols-outlined">add</span>
-                <span>新建剧本</span>
               </button>
               <button type="button" id="btnUploadScript" class="script-toolbar-btn">
                 <span class="material-symbols-outlined">upload_file</span>
@@ -589,22 +590,26 @@
                         <span class="material-symbols-outlined">upload_file</span>
                         <span>IMPORTED DRAFT</span>
                       </div>
-                      <h3>导入草稿待确认</h3>
+                      <h3>导入内容待处理</h3>
                     </div>
                     <div class="script-draft-meta">
-                      <span>未确认</span>
-                      <small>不会进入下游生成</small>
+                      <span>尚未使用</span>
+                      <small>不会覆盖当前剧本</small>
                     </div>
                   </div>
                   <div class="script-import-draft-notice">
                     <span class="material-symbols-outlined">info</span>
-                    <span>你有一份未确认的导入草稿。确认前不会覆盖当前正式剧本，也不会参与资产、镜头或视频生成。</span>
+                    <span>你有一份导入内容。可以直接作为当前剧本草稿，也可以让 AI 转换成新的剧本草稿；使用前不会覆盖当前正式剧本。</span>
                   </div>
                   <textarea id="scriptDraftPreview" rows="10" class="script-output script-import-draft-textarea"></textarea>
                   <div class="script-import-draft-actions">
                     <button type="button" id="btnApplyImportedDraft" class="script-mini-btn script-mini-btn--primary">
                       <span class="material-symbols-outlined">check</span>
-                      <span>使用此草稿并确认剧本</span>
+                      <span>使用此剧本草稿</span>
+                    </button>
+                    <button type="button" id="btnConvertImportedDraft" class="script-mini-btn">
+                      <span class="material-symbols-outlined">auto_awesome</span>
+                      <span>转换为新的剧本草稿</span>
                     </button>
                     <button type="button" id="btnDiscardImportedDraft" class="script-mini-btn">
                       <span class="material-symbols-outlined">close</span>
@@ -623,12 +628,12 @@
                         <div>
                           <div class="script-draft-brand">
                             <span class="material-symbols-outlined">movie_creation</span>
-                            <span>ORIGINRISE · AI</span>
+                            <span>ORIGIN · AI</span>
                           </div>
                           <h3 id="scriptCardTitle">剧本草稿</h3>
                         </div>
                         <div class="script-draft-meta">
-                          <span>草稿 · 未确认</span>
+                          <span id="scriptDraftStatusBadge" class="is-pending">草稿 · 待确认</span>
                           <small>版本 1.0 · 刚刚</small>
                         </div>
                       </div>
@@ -696,7 +701,7 @@
                 <div class="script-analysis-empty">
                   <span class="material-symbols-outlined">insights</span>
                   <h3>等待剧本草稿</h3>
-                  <p>生成或导入剧本后，这里会展示故事核心、节奏结构、人物驱动和关键看点。</p>
+                  <p>生成或导入剧本后，这里会优先展示镜头数量/结构、角色数量/定位，再补充故事核心和节奏看点。</p>
                 </div>
               </div>
             </aside>
@@ -714,11 +719,11 @@
 	            <div class="flex items-start justify-between">
 	              <div>
 		                <h1 class="text-5xl font-thin tracking-tighter text-on-background">资产图生成</h1>
-	                <p class="text-on-surface-variant max-w-xl text-base leading-relaxed mt-1">定义角色、场景与道具的视觉风格</p>
+	                <div class="flex items-center gap-2 mt-1"><p class="text-on-surface-variant max-w-xl text-base leading-relaxed">定义角色、场景与道具的视觉风格</p><button type="button" id="btnKnowledgeSnapshot" title="项目知识" aria-label="项目知识" class="w-7 h-7 shrink-0 rounded-full bg-surface-container-lowest border border-outline-variant/15 text-on-surface-variant hover:bg-surface-container-high transition-all inline-flex items-center justify-center" hidden><span class="material-symbols-outlined text-[16px]">info</span></button></div>
 	              </div>
 	              <div class="flex items-center gap-3 pt-1">
-	                <button type="button" id="btnKnowledgeSnapshot" class="h-10 px-6 bg-surface-container-lowest border border-outline-variant/15 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2" hidden>
-	                  <span class="material-symbols-outlined text-[16px]">account_tree</span>当前知识
+	                <button type="button" id="btnConfirmPendingWorldFacts" class="h-10 px-4 bg-[#FFF8E6] border border-[#F7D48B] rounded-full text-xs font-bold tracking-wide text-[#8A5A00] hover:bg-[#FFF3D0] transition-all flex items-center gap-2" hidden data-write-action>
+	                  <span class="material-symbols-outlined text-[16px]">priority_high</span>确认世界观更新
 	                </button>
 	                <button type="button" id="btnSaveWorldTemplate" class="h-10 px-6 bg-surface-container-lowest border border-outline-variant/15 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2" hidden data-write-action>
 	                  <span class="material-symbols-outlined text-[16px]">bookmark_add</span>保存世界观
@@ -776,12 +781,12 @@
             <div id="assetsContent" hidden>
               <!-- Characters Section -->
               <section class="mb-20" id="assetCharsSection">
-	                <div class="flex items-end justify-between gap-4 mb-6">
-	                  <div class="flex-1 text-right">
+	                <div class="flex items-end justify-end gap-3 mb-6">
+                  <span class="text-xs font-bold text-on-surface-variant/50 bg-surface-container px-3 py-1 rounded-full" id="assetCharCount">0</span>
+	                  <div>
                     <span class="text-[11px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase">Chapter 01</span>
                     <h3 class="text-3xl font-light tracking-tight text-on-background">角色 Characters</h3>
                   </div>
-                  <span class="text-xs font-bold text-on-surface-variant/50 bg-surface-container px-3 py-1 rounded-full" id="assetCharCount">0</span>
                 </div>
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-8" id="assetCharGrid"></div>
               </section>
@@ -840,7 +845,7 @@
                 <div class="flex items-center gap-3" id="imagesActionBar" hidden>
                   <button type="button" id="btnGenAllImages" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap flex items-center gap-2" data-write-action>
                     <span class="material-symbols-outlined text-sm">auto_fix_high</span>
-                    生成全部首帧图
+                    生成全部关键帧
                   </button>
                 </div>
                 <section id="shotsConfirmArea" class="flex items-start" hidden>
@@ -888,6 +893,7 @@
             <div class="shots-two-col">
               <!-- Main: shot cards, then the legacy storyboard mount until cards own frame slots -->
               <div class="shots-main-col">
+                <div id="sbIndexRail" class="sb-index-rail" hidden aria-label="分镜板快速跳转"></div>
                 <div class="space-y-4">
                   <div id="shotListWrap" class="space-y-4"></div>
                 </div>
@@ -898,7 +904,7 @@
                     <div class="shots-storyboard-shell-head">
                       <div>
                         <p class="text-[10px] font-black tracking-[0.22em] uppercase text-primary">分镜图工作区</p>
-                        <p class="text-xs text-on-surface-variant mt-1" id="imagesHint">基于镜头与资产生成首帧，并管理可选尾帧</p>
+                        <p class="text-xs text-on-surface-variant mt-1" id="imagesHint">基于片段镜头与资产生成关键帧，并管理可选尾帧</p>
                       </div>
                       <div class="flex items-center justify-end gap-2 flex-wrap">
                         <button type="button" id="sbNavPrev" class="hidden" aria-hidden="true" tabindex="-1"></button>
@@ -977,13 +983,9 @@
           <!-- Right: Prompt Engineering Lab -->
           <section id="promptsLabPanel" class="flex-1 p-12 bg-transparent flex flex-col relative overflow-hidden">
             <div id="promptsReady" class="flex-1 min-h-0 flex flex-col" hidden>
-              <!-- Header: Lab title + tags + actions -->
-	              <div class="flex justify-between items-center gap-4 mb-4">
-	                <div class="flex items-center gap-3 min-w-0">
-	                  <h3 class="shrink-0 text-xs font-bold text-primary tracking-widest uppercase">视频提示词</h3>
-	                  <div id="vpPromptTags" class="flex flex-wrap items-center gap-2 min-w-0"></div>
-	                </div>
-	                <div class="flex gap-2 items-center">
+	              <!-- Header: actions -->
+		              <div class="flex justify-end items-center gap-4 mb-4">
+		                <div class="flex gap-2 items-center">
 	                  <button type="button" id="btnGenAllVideoPrompts" class="shrink-0 whitespace-nowrap px-5 py-2.5 rounded-full bg-primary text-on-primary text-xs font-bold flex items-center gap-2 hover:opacity-90 transition-all" data-write-action>
 	                    <span class="material-symbols-outlined text-sm" style="font-variation-settings: 'FILL' 1;">bolt</span>
 	                    <span id="btnGenAllVideoPromptsLabel">生成全部提示词</span>
@@ -1010,12 +1012,11 @@
 
               <!-- Bottom: AI Refine Input -->
               <!-- mt-4 给上面提示词正文区域和这个输入框留 16px 呼吸距离，避免视觉上贴死。 -->
-              <div class="mt-4 mb-2">
-                <div class="bg-white/40 backdrop-blur-[40px] border border-outline-variant/20 rounded-full px-8 py-4 flex items-center gap-4 shadow-2xl">
-                  <span class="material-symbols-outlined text-primary">auto_awesome</span>
-                  <input type="text" id="vpRefineInput" name="video_prompt_refine_instruction" class="flex-grow bg-transparent border-none focus:ring-0 text-sm placeholder:text-outline/60 text-on-surface font-medium" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" data-form-type="other" data-lpignore="true" data-1p-ignore="true" />
-                  <button type="button" id="vpBtnRefine" class="bg-on-background text-background w-10 h-10 rounded-full flex items-center justify-center hover:scale-110 transition-transform active:scale-95" data-write-action>
-                    <span class="material-symbols-outlined text-sm">arrow_upward</span>
+              <div class="vp-refine-command-wrap">
+                <div class="script-command-box vp-refine-command-box">
+                  <input type="text" id="vpRefineInput" name="video_prompt_refine_instruction" class="script-command-input" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" data-form-type="other" data-lpignore="true" data-1p-ignore="true" />
+                  <button type="button" id="vpBtnRefine" class="script-send-btn" title="发送" data-write-action>
+                    <span class="material-symbols-outlined">north</span>
                   </button>
                 </div>
               </div>
@@ -1163,15 +1164,6 @@
                   <label><span class="material-symbols-outlined">water_drop</span><span>水印</span><input type="checkbox" id="batchWatermark" /><span class="batch-switch-status" data-for="batchWatermark">无水印</span></label>
                 </div>
 
-                <div id="outputHistoryCard" class="batch-config-group" hidden>
-                  <label for="outputHistorySelect">历史视频</label>
-                  <select id="outputHistorySelect" class="batch-quality-select"></select>
-                  <button type="button" id="btnApplyHistoryPrompt" class="batch-primary-action batch-primary-action--secondary w-full justify-center mt-3" disabled>
-                    <span class="material-symbols-outlined">restore_page</span>
-                    <span>替换当前提示词</span>
-                  </button>
-                  <p id="outputHistoryPromptHint" class="batch-config-note">只可使用当前项目的历史视频提示词。</p>
-                </div>
 
               </section>
 
@@ -1200,8 +1192,6 @@
                 <div class="batch-table-head" aria-hidden="true">
                   <span>片段信息</span>
                   <span>状态 / 进度</span>
-                  <span>时长 / 剩余时间</span>
-                  <span>基础信息</span>
                   <span>操作</span>
                 </div>
 
@@ -1264,18 +1254,18 @@
 
               <!-- Media library panel (left) -->
               <div class="flex flex-col flex-shrink-0 edit-glass-panel pt-2" id="editMediaPanel" style="width:200px">
-                <div class="flex items-center justify-between px-3 mb-2">
-                  <div>
-                    <span class="text-xs font-medium text-white/80">素材库</span>
-                    <span class="text-[8px] font-bold tracking-[0.12em] text-white/30 uppercase ml-1">Clips</span>
+                <div class="edit-media-panel-head">
+                  <div class="edit-media-title">
+                    <span class="edit-media-title-cn">素材库</span>
+                    <span class="edit-media-title-en">Clips</span>
                   </div>
-                  <label class="material-symbols-outlined text-base text-white/25 hover:text-white/60 cursor-pointer transition-colors" title="上传素材">add_circle
-                    <input type="file" id="editMediaUploadInput" accept="video/*,image/*" multiple hidden />
+                  <label class="edit-media-upload-btn material-symbols-outlined" title="上传视频素材">add_circle
+                    <input type="file" id="editMediaUploadInput" accept="video/*" multiple hidden />
                   </label>
                 </div>
-                <div class="flex items-center gap-1.5 px-3 mb-2">
-                  <button type="button" class="edit-media-tab edit-media-tab--active" data-tab="clips" style="font-size:10px;padding:3px 8px">片段 Clips</button>
-                  <button type="button" class="edit-media-tab" data-tab="uploads" style="font-size:10px;padding:3px 8px">上传 Upload</button>
+                <div class="edit-media-tabs" role="tablist" aria-label="素材来源">
+                  <button type="button" class="edit-media-tab edit-media-tab--active" data-tab="clips" role="tab" aria-selected="true">片段 Clips</button>
+                  <button type="button" class="edit-media-tab" data-tab="uploads" role="tab" aria-selected="false">上传 Upload</button>
                 </div>
                 <div class="flex-1 overflow-y-auto edit-hide-scrollbar px-3 pb-3 space-y-3" id="editMediaList">
                   <p class="text-xs edit-label text-center mt-8" style="letter-spacing:0.15em">暂无素材</p>
@@ -1341,53 +1331,32 @@
 	                        <span class="text-[7px] text-white/30 uppercase tracking-widest font-bold leading-tight">Export</span>
 	                      </div>
 	                    </button>
-	                    <p id="editExportHint" class="absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap text-[10px] font-bold text-rose-200/85" hidden>时间线已修改，请先一键成片</p>
+	                    <p id="editExportHint" class="absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap text-[10px] font-bold text-rose-200/85" hidden></p>
 	                  </div>
 
-	                </div>
-	                <div id="editAutoComposeBlocker" class="mx-auto mt-2 max-w-xl rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-center" hidden>
-	                  <div class="flex items-center justify-center gap-2 text-amber-100 text-sm font-semibold">
-	                    <span class="material-symbols-outlined text-base">warning</span>
-	                    <span id="editAutoComposeBlockerTitle">检测到时间线被手工修改</span>
-	                  </div>
-	                  <p id="editAutoComposeBlockerText" class="text-[11px] leading-relaxed text-amber-50/70 mt-1">请选择如何处理当前时间线，然后再继续一键成片。</p>
-	                  <div class="flex flex-wrap items-center justify-center gap-2 mt-3">
-	                    <button type="button" id="btnEditAcceptTimelineBaseline" class="px-3 py-1.5 rounded-full bg-amber-200 text-[#0B1320] text-[11px] font-bold">保留为新基线</button>
-	                    <button type="button" id="btnEditRollbackTimeline" class="px-3 py-1.5 rounded-full border border-amber-100/30 text-amber-50 text-[11px] font-bold hover:bg-white/10">回到上次自动成片</button>
-	                  </div>
 	                </div>
 	              </div>
 
 	              <!-- Right panel — fixed width, scrollable -->
 	              <div class="flex-shrink-0 edit-glass-panel overflow-y-auto overflow-x-hidden edit-hide-scrollbar" id="editRightPanel" style="width:210px">
-                <!-- Transition control -->
-                <div class="px-3 py-3 edit-hairline-top">
-                  <div class="flex items-center gap-1.5 mb-2">
-                    <span class="w-1 h-1 rounded-full bg-white/15"></span>
-                    <span class="text-xs font-medium text-white/80">转场控制</span>
-                    <span class="text-[8px] font-bold tracking-[0.12em] text-white/30 uppercase">Transition</span>
+                <!-- 背景音乐 BGM -->
+                <div class="edit-bgm-panel">
+                  <div class="edit-bgm-header">
+                    <div class="edit-bgm-title">
+                      <span class="edit-bgm-dot" aria-hidden="true"></span>
+                      <span class="edit-bgm-title-cn">背景音乐</span>
+                      <span class="edit-bgm-title-en">BGM</span>
+                    </div>
+                    <label class="oe-switch edit-bgm-switch" title="背景音乐开关（关掉则导出无音乐）">
+                      <input type="checkbox" id="editBgmToggle" aria-label="背景音乐开关">
+                      <span class="oe-slider-btn"></span>
+                    </label>
                   </div>
-                  <div id="editTransitionSummary" class="text-[10px] text-white/40 mb-2">成片后显示当前转场分布</div>
-                  <button type="button" id="btnEditClearTransitions"
-                          class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md
-                                 border border-white/10 hover:border-white/25 hover:bg-white/5
-                                 text-[11px] font-medium text-white/60 hover:text-white/90
-                                 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                          disabled>
-                    <span class="material-symbols-outlined text-sm">content_cut</span>
-                    <span>去除全部转场</span>
-                  </button>
-                  <p class="text-[9px] text-white/25 mt-1.5 leading-relaxed">把所有转场改为硬切。可用「撤销」恢复</p>
-                  <button type="button" id="btnEditClearBgm"
-                          class="w-full mt-2 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md
-                                 border border-white/10 hover:border-white/25 hover:bg-white/5
-                                 text-[11px] font-medium text-white/60 hover:text-white/90
-                                 transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
-                          disabled>
-                    <span class="material-symbols-outlined text-sm">music_off</span>
-                    <span>去除 BGM</span>
-                  </button>
-                  <p class="text-[9px] text-white/25 mt-1.5 leading-relaxed">清空 BGM 选择，导出无背景音乐版本</p>
+                  <div class="edit-bgm-divider" aria-hidden="true"></div>
+                  <!-- 状态头部：_renderBgmStatus 填充（当前曲 · 风格 · 时长 + 试听 + 换曲） -->
+                  <div id="editBgmStatus" class="edit-bgm-status">背景音乐默认关闭</div>
+                  <!-- 选曲列表（默认折叠，点"换曲/选择"展开）：_renderBgmSelector 填充 -->
+                  <div id="editBgmSelector" class="edit-bgm-selector" hidden></div>
                 </div>
               </div>
             </div>
@@ -1402,20 +1371,35 @@
                     <span class="material-symbols-outlined text-xl" style="font-variation-settings:'FILL' 1">play_arrow</span>
                   </button>
                   <span id="editTimeDisplay" class="text-xs font-mono text-white/40">00:00 / 00:00</span>
-                  <div class="flex items-center gap-1">
-                    <button type="button" id="editUndoBtn" class="material-symbols-outlined text-lg text-white/20 hover:text-white/60 transition-colors" title="撤销 (Ctrl+Z)">history</button>
-                    <button type="button" id="editRedoBtn" class="material-symbols-outlined text-lg text-white/20 hover:text-white/60 transition-colors" title="重做 (Ctrl+Shift+Z)">update</button>
+                  <div class="flex items-center gap-2 mx-3">
+                    <button type="button" id="editUndoBtn" class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-white/45 hover:text-white/90 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent" title="撤销 (Ctrl+Z)">
+                      <span class="material-symbols-outlined text-base">undo</span>
+                      <span>撤销</span>
+                    </button>
+                    <button type="button" id="editRedoBtn" class="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium text-white/45 hover:text-white/90 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent" title="恢复 (Ctrl+Shift+Z)">
+                      <span class="material-symbols-outlined text-base">redo</span>
+                      <span>恢复</span>
+                    </button>
                   </div>
                   <div class="flex items-center gap-2">
                     <button type="button" id="editZoomOut" class="material-symbols-outlined text-base text-white/25 hover:text-white/60 transition-colors">zoom_out</button>
                     <input type="range" id="editZoomSlider" min="0.5" max="4" step="0.1" value="1" class="w-16 h-0.5 accent-cyan-400 opacity-50">
-                    <button type="button" id="editZoomIn" class="material-symbols-outlined text-base text-white/25 hover:text-white/60 transition-colors">zoom_in_map</button>
+                    <button type="button" id="editZoomIn" class="material-symbols-outlined text-base text-white/25 hover:text-white/60 transition-colors">zoom_in</button>
                   </div>
                 </div>
                 <!-- (AI buttons moved to preview panel below) -->
+                <button type="button" id="btnEditClearTransitions" title="把所有转场改为硬切，可用「撤销」恢复"
+                        class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md
+                               border border-white/10 hover:border-white/25 hover:bg-white/5
+                               text-[11px] font-medium text-white/60 hover:text-white/90
+                               transition-all disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent"
+                        disabled>
+                  <span class="material-symbols-outlined text-sm">layers_clear</span>
+                  <span>去除全部转场</span>
+                </button>
               </div>
 
-              <!-- Playhead — starts below header (top:48px for h-12 header), ends at bottom -->
+              <!-- Playhead — vertical position controlled by styles.css (#editPlayhead top) -->
               <div id="editPlayhead" class="absolute bottom-0 w-px z-30 pointer-events-none" style="left:32px; top:48px; background:rgba(255,59,48,0.7)">
                 <div class="absolute top-0 left-1/2 -translate-x-1/2 w-3 h-3 bg-red-500 rounded-full edit-playhead-glow shadow-[0_0_12px_rgba(255,59,48,0.6)]"></div>
                 <div class="absolute inset-y-0 -left-3 w-6 bg-gradient-to-r from-red-500/6 to-transparent pointer-events-none"></div>
@@ -1428,33 +1412,26 @@
 
               <!-- Timeline tracks with neural grid -->
               <div class="relative overflow-x-auto overflow-y-auto px-8 py-3 edit-neural-grid flex-1 min-h-0" id="editTimelineScroll">
+                <div id="editTimelineContent" class="relative">
 
-                <!-- Tag track (emotion / plotRole labels) -->
-                <div class="flex items-center gap-4 mb-0.5">
-                  <span class="w-5 text-[9px] edit-label flex-shrink-0" style="letter-spacing:0;opacity:0.4">TAG</span>
-                </div>
-                <div id="editTagTrack" class="flex items-center gap-0 relative" style="height:24px;display:none"></div>
+                  <!-- Tag track (hidden; row label removed for a tighter timeline) -->
+                  <div id="editTagTrack" class="flex items-center gap-0 relative" style="height:24px;display:none"></div>
 
-                <!-- Video track -->
-                <div class="flex items-center gap-4 mb-1">
-                  <span class="w-5 text-xs edit-label flex-shrink-0" style="letter-spacing:0">V1</span>
-                </div>
-                <div id="editVideoTrack" class="flex items-center gap-0 relative" style="height: 72px">
-                  <p class="absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
-                    <span class="text-xs text-white/25">视频轨道</span>
-                    <span class="text-[10px] font-bold tracking-[0.15em] text-white/15 uppercase">Video Track</span>
-                  </p>
-                </div>
+                  <!-- Video track (row label removed; track keeps its in-track caption) -->
+                  <div id="editVideoTrack" class="flex items-center gap-0 relative" style="height: 72px">
+                    <p class="absolute left-1/2 -translate-x-1/2 flex items-center gap-2">
+                      <span class="text-xs text-white/25">视频轨道</span>
+                      <span class="text-[10px] font-bold tracking-[0.15em] text-white/15 uppercase">Video Track</span>
+                    </p>
+                  </div>
 
-                <!-- Audio track -->
-                <div class="flex items-center gap-4 mt-2 mb-1">
-                  <span class="w-5 text-xs edit-label flex-shrink-0" style="letter-spacing:0">A1</span>
-                </div>
-                <div id="editAudioTrack" class="h-8 rounded-[4px] border border-white/5 bg-white/[0.02] relative flex items-center gap-2 px-3 overflow-hidden">
-                  <p class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-2">
-                    <span class="text-xs text-white/25">BGM 轨道</span>
-                    <span class="text-[10px] font-bold tracking-[0.15em] text-white/15 uppercase">Audio</span>
-                  </p>
+                  <!-- Audio track (row label removed; mt keeps spacing from video track) -->
+                  <div id="editAudioTrack" class="h-8 rounded-[4px] border border-white/5 bg-white/[0.02] relative flex items-center gap-2 px-3 overflow-hidden">
+                    <p class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-2">
+                      <span class="text-xs text-white/25">BGM 轨道</span>
+                      <span class="text-[10px] font-bold tracking-[0.15em] text-white/15 uppercase">Audio</span>
+                    </p>
+                  </div>
                 </div>
               </div><!-- /editTimelineScroll -->
             </footer>
@@ -1486,12 +1463,13 @@
           </section>
 
           <!-- 类型标签 -->
-          <div class="flex items-center justify-between mb-8">
-            <div class="flex gap-10 border-b border-outline-variant/10 w-full">
+          <div id="libTypeTabsRow" class="flex items-center justify-between gap-6 mb-8">
+            <div class="flex gap-10 border-b border-outline-variant/10 min-w-0 flex-1">
               <button class="lib-tab pb-3 text-xs font-bold tracking-[0.15em] uppercase border-b-2 border-transparent transition-colors" data-tab="all">全部 (<span class="lib-count-all">0</span>)</button>
               <button class="lib-tab pb-3 text-xs font-bold tracking-[0.15em] uppercase border-b-2 border-transparent transition-colors" data-tab="image">图片 (<span class="lib-count-image">0</span>)</button>
               <button class="lib-tab pb-3 text-xs font-bold tracking-[0.15em] uppercase border-b-2 border-transparent transition-colors" data-tab="video">视频 (<span class="lib-count-video">0</span>)</button>
             </div>
+            <nav id="libProjectPager" class="lib-project-pager shrink-0" aria-label="项目页码" hidden></nav>
           </div>
 
           <!-- 资产网格 -->
@@ -1516,6 +1494,11 @@
       <!-- ══════ 工具箱 ══════ -->
       <div class="page-scroll p-10 overflow-y-auto" id="pageToolbox" hidden>
         <div id="toolboxRoot" class="toolbox-shell"></div>
+      </div>
+
+      <!-- ══════ 角色定制 ══════ -->
+      <div class="page-scroll p-10 overflow-y-auto" id="pageCharacterCustom" hidden>
+        <div id="characterCustomRoot" class="toolbox-shell"></div>
       </div>
 
       <!-- ══════ 创作偏好 ══════ -->
@@ -1601,6 +1584,39 @@
               <span>退出登录</span>
             </button>
           </header>
+
+          <section class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mb-6">
+            <div class="flex items-center gap-2 mb-5">
+              <span class="material-symbols-outlined text-primary">admin_panel_settings</span>
+              <span class="font-bold text-sm text-on-background">账号安全</span>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <label class="text-xs text-on-surface-variant font-bold tracking-wide">
+                手机号
+                <input id="accountPhone" class="mt-2 w-full bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm text-on-background" readonly />
+              </label>
+              <label class="text-xs text-on-surface-variant font-bold tracking-wide">
+                昵称
+                <input id="accountDisplayName" class="mt-2 w-full bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm text-on-background focus:ring-1 focus:ring-primary/30" maxlength="20" autocomplete="nickname" />
+              </label>
+            </div>
+            <div class="mt-4 flex justify-end">
+              <button type="button" id="btnSaveAccountProfile" class="px-4 py-2.5 rounded-full bg-primary text-on-primary text-xs font-bold tracking-wide hover:opacity-90 transition-all">保存昵称</button>
+            </div>
+            <div class="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <input id="accountOldPassword" type="password" autocomplete="current-password" class="w-full bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm focus:ring-1 focus:ring-primary/30" placeholder="当前密码" />
+              <input id="accountNewPassword" type="password" autocomplete="new-password" class="w-full bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm focus:ring-1 focus:ring-primary/30" placeholder="新密码" />
+              <input id="accountNewPasswordConfirm" type="password" autocomplete="new-password" class="w-full bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm focus:ring-1 focus:ring-primary/30" placeholder="确认新密码" />
+            </div>
+            <div class="mt-4 flex justify-end">
+              <button type="button" id="btnChangePassword" class="px-4 py-2.5 rounded-full border border-outline-variant/20 bg-surface-container-low text-on-surface-variant text-xs font-bold tracking-wide hover:bg-primary/5 hover:text-primary transition-all">修改密码</button>
+            </div>
+            <div class="mt-6 pt-5 border-t border-outline-variant/10 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
+              <input id="accountDeletePassword" type="password" autocomplete="current-password" class="w-full md:max-w-xs bg-surface-container-low border border-outline-variant/20 rounded-lg px-4 py-2.5 text-sm focus:ring-1 focus:ring-error/30" placeholder="输入当前密码确认注销" />
+              <button type="button" id="btnDeactivateAccount" class="shrink-0 px-4 py-2.5 rounded-full border border-error/20 bg-error/5 text-error text-xs font-bold tracking-wide hover:bg-error/10 transition-all">注销账号</button>
+            </div>
+            <div id="accountSecurityNotice" class="mt-4 text-xs text-on-surface-variant min-h-[18px]"></div>
+          </section>
 
           <p class="text-sm text-on-surface-variant mb-8">配置 4 种模型能力，每种只需填写 API 地址、Key 和模型名。如果使用同一个中转服务商，地址和 Key 填一样的，只改模型名即可。</p>
 
@@ -1718,30 +1734,34 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=108",
+        "/modules/assets.js":         "/modules/assets.js?v=135",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
-        "/modules/edit.js":           "/modules/edit.js?v=103",
-        "/modules/episodes.js":       "/modules/episodes.js?v=100",
+        "/modules/edit.js":           "/modules/edit.js?v=137",
+        "/modules/episode_fields.js": "/modules/episode_fields.js?v=100",
+        "/modules/episodes.js":       "/modules/episodes.js?v=101",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/project.js":        "/modules/project.js?v=103",
         "/modules/render_hooks.js":   "/modules/render_hooks.js?v=101",
-        "/modules/script.js":         "/modules/script.js?v=104",
-        "/modules/settings.js":       "/modules/settings.js?v=100",
-        "/modules/shots.js":          "/modules/shots.js?v=102",
+        "/modules/script.js":         "/modules/script.js?v=106",
+        "/modules/settings.js":       "/modules/settings.js?v=101",
+        "/modules/shots.js":          "/modules/shots.js?v=103",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=118",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=130",
+        "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
+        "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
         "/modules/tasks.js":          "/modules/tasks.js?v=100",
-        "/modules/utils.js":          "/modules/utils.js?v=104",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=105",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=111"
+        "/modules/toolbox.js":        "/modules/toolbox.js?v=201",
+        "/modules/utils.js":          "/modules/utils.js?v=202",
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=107",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=115"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
-    <script type="module" src="modules/utils.js?v=104"></script>
-    <script type="module" src="main.js?v=163"></script>
+    <script type="module" src="modules/utils.js?v=202"></script>
+    <script type="module" src="main.js?v=241"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");
@@ -1888,16 +1908,6 @@
   -->
   <div class="oe-app-shell">
     <header class="oe-app-topbar" aria-label="在线精修控制栏">
-      <div class="oe-app-titlebar">
-        <button type="button" data-goto="edit" class="oe-app-nav-btn" title="返回剪辑页" aria-label="返回剪辑页">
-          <span class="material-symbols-outlined">arrow_back</span>
-        </button>
-        <div class="oe-app-project">
-          <span class="oe-app-kicker">Origin Editor</span>
-          <h1>在线精修</h1>
-        </div>
-      </div>
-
       <div class="oe-app-statusbar" aria-live="polite">
         <span id="oeConnectionStatus" class="oe-status-chip oe-status-chip--pending">
           <span class="oe-status-dot"></span>

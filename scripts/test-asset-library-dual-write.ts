@@ -16,7 +16,7 @@ async function main() {
     `INSERT INTO users (id, username, display_name, password_hash)
      VALUES (?, ?, ?, ?)
      ON CONFLICT(id) DO NOTHING`,
-  ).run(ownerId, 'asset-dual-write-user', 'asset-dual-write-user', 'x');
+  ).run(ownerId, 'asset-library-test-user', 'Asset Library Test User', 'x');
 
   db.prepare('DELETE FROM assets WHERE owner_id = ?').run(ownerId);
   db.prepare('DELETE FROM asset_version_groups WHERE owner_id = ?').run(ownerId);

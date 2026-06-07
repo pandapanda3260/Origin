@@ -19,6 +19,169 @@ import {
   type ReferenceManifestItem,
 } from './video-reference-manifest';
 import { styleBibleForShotPrompt, styleBibleForVideoPrompt } from './casting-profile';
+import { resolveShotFieldsForPrompt } from './shot-plan-normalize';
+import {
+  ANGLES,
+  CAMERA_COMPAT_GROUPS,
+  CAMERA_MOVES,
+  COMPOSITION_OPTIONS,
+  COMPOSITION_PRESETS,
+  FOCUS_OPTIONS,
+  LENSES,
+  LIGHT_AXES,
+  SHOT_TYPES,
+  formatCameraCompatGroups,
+  formatShotPlanEnumList,
+} from '../public/modules/shotSchema.js';
+
+function appendWorldContextBlock(
+  parts: string[],
+  worldContext?: WorldContext,
+  label = '世界观事实与软默认',
+  opts: { includeSoft?: boolean; includeStyleBibleCharactersNote?: boolean } = {},
+) {
+  const worldText = formatWorldContextForPrompt(worldContext, opts);
+  if (worldText) parts.push(`${label}：\n${worldText}`);
+}
+
+function formatPromptSeconds(value: number): string {
+  const rounded = Math.round((Number(value) || 0) * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1).replace(/\.0$/, '');
+}
+
+function formatPromptClock(value: number): string {
+  const total = Math.max(0, Math.round((Number(value) || 0) * 10) / 10);
+  const minutes = Math.floor(total / 60);
+  const seconds = total - minutes * 60;
+  const secondsText = Number.isInteger(seconds)
+    ? String(seconds).padStart(2, '0')
+    : `${seconds < 10 ? '0' : ''}${seconds.toFixed(1).replace(/\.0$/, '')}`;
+  return `${minutes}:${secondsText}`;
+}
+
+function formatVideoPromptTimeLabel(startSec: number, endSec: number): string {
+  const start = Math.max(0, Number(startSec) || 0);
+  const end = Math.max(start, Number(endSec) || start);
+  const duration = Math.round((end - start) * 10) / 10;
+  return `${formatPromptSeconds(duration)}秒（${formatPromptClock(start)}-${formatPromptClock(end)}）`;
+}
+
+function formatPromptPace(value: unknown): string {
+  const raw = String(value || '').trim();
+  const map: Record<string, string> = {
+    slow: '慢',
+    normal: '正常',
+    fast: '快',
+    fast_forward: '快进',
+    'fast-forward': '快进',
+    慢节奏: '慢',
+    舒缓: '慢',
+    平稳: '正常',
+    标准: '正常',
+    快节奏: '快',
+    紧凑: '快',
+  };
+  return map[raw] || raw || '正常';
+}
+
+function compactPromptText(value: unknown): string {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function referenceBindingName(ref: ReferenceManifestItem): string {
+  const fallback = ref.role === 'first_frame'
+    ? '首帧'
+    : ref.role === 'scene'
+      ? '场景'
+      : ref.role === 'prop'
+        ? '道具'
+        : '角色';
+  return compactPromptText(ref.assetName || ref.label || fallback).slice(0, 60) || fallback;
+}
+
+function referencePanelBindingText(ref: ReferenceManifestItem): string {
+  const panel = compactPromptText(ref.panelInfo?.panel);
+  if (panel === 'sheet') return '角色设定';
+  if (panel === 'headshot') return '脸部近景';
+  if (panel === 'front') return '正面';
+  if (panel === 'side') return '侧面';
+  if (panel === 'back') return '背面';
+  return '';
+}
+
+function buildCharacterReferenceBindings(refs: ReferenceManifestItem[]): string[] {
+  const groups = new Map<string, ReferenceManifestItem[]>();
+  refs.forEach((ref) => {
+    const name = referenceBindingName(ref);
+    const existing = groups.get(name) || [];
+    existing.push(ref);
+    groups.set(name, existing);
+  });
+  return [...groups.entries()].map(([name, group]) => {
+    const ordered = group.slice().sort((a, b) => Number(a.imageNo) - Number(b.imageNo));
+    const parts = ordered.map((ref) => {
+      const panelText = referencePanelBindingText(ref);
+      return `Image ${Number(ref.imageNo)}${panelText ? ` ${panelText}` : ''}`;
+    });
+    return `${name}（${parts.join('，')}）`;
+  });
+}
+
+export function buildReferenceBindingSummary(refs: ReferenceManifestItem[] | undefined): string {
+  const items = Array.isArray(refs)
+    ? refs
+      .filter((ref) => ref && Number.isInteger(Number(ref.imageNo)) && Number(ref.imageNo) > 0)
+      .slice()
+      .sort((a, b) => Number(a.imageNo) - Number(b.imageNo))
+    : [];
+  if (!items.length) {
+    return '本组没有可用 Image N 参考图；可见正文不要编造 Image 编号。';
+  }
+  const fmt = (ref: ReferenceManifestItem) => `${referenceBindingName(ref)}（Image ${Number(ref.imageNo)}）`;
+  const characterRefs = items.filter((ref) => ref.role === 'character');
+  const otherRefs = items.filter((ref) => ref.role !== 'character');
+  const characterBindings = buildCharacterReferenceBindings(characterRefs);
+  const lines = [
+    '可见正文的 Image 绑定规则：',
+    characterRefs.length
+      ? `角色段只写这些角色绑定：${characterBindings.join('；')}`
+      : '角色段：本组无独立角色参考图；按角色一致性主档和正文人物名执行，不编造 Image 编号。',
+    otherRefs.length
+      ? `非角色参考（禁止写进角色段，只能在场景/镜头/约束中自然引用）：${otherRefs.map(fmt).join('；')}`
+      : '参考绑定：本组无首帧/场景/道具参考图。',
+    `编号集合：${items.map((ref) => `Image ${Number(ref.imageNo)}`).join('、')}。正文必须出现这些编号一次；角色 Image 放在角色段，非角色 Image 放在场景/镜头/约束段，不要新增不存在的 Image 编号。`,
+  ];
+  return lines.join('\n');
+}
+
+function buildShotPerformanceHint(shot: any, fields: ReturnType<typeof resolveShotFieldsForPrompt>): string {
+  const hints: string[] = [];
+  const pace = formatPromptPace(shot?.pace || shot?.narrativePace || 'normal');
+  if (pace === '慢') hints.push('动作拆细，保留眼神停顿、呼吸和手部小动作');
+  else if (pace === '快') hints.push('信息更紧凑，动作直接推进，不加无意义空镜');
+  else if (pace === '快进') hints.push('表现时间压缩感，允许动作连续加速，但主体身份和空间关系不能丢');
+  else hints.push('动作平稳连贯，表演和镜头节奏自然承接');
+
+  const camera = String(fields.camera || '').trim();
+  if (camera.includes('固定')) hints.push('固定机位时靠人物微动作、环境反光和光线波动让画面活起来');
+  else hints.push(`运镜只围绕「${camera || '固定镜头'}」一个核心动作展开，禁止叠加第二种主运镜`);
+
+  const shotType = String(fields.shotType || '');
+  if (/近景|特写|大特写|中近景/.test(shotType)) {
+    hints.push('近景重点写眼神、嘴角、下颌、手指和呼吸，不夸张拉扯脸部比例');
+  }
+
+  const dialogue = compactPromptText(shot?.dialogue || shot?.dialog || '');
+  if (dialogue && dialogue !== '——' && dialogue !== '-' && dialogue !== '无') {
+    hints.push('只写谁开口、语气、口型和听者反应，完整台词见台词表，正文不要逐字抄台词');
+  }
+
+  const emotion = compactPromptText(shot?.emotion || shot?.keyInfo || shot?.visual || shot?.description || '');
+  if (/紧张|压迫|愤怒|崩溃|高潮|climax|冲突/.test(emotion)) {
+    hints.push('增加压低眉眼、下颌收紧、短暂停顿、视线回避或突然直视等微表情过程');
+  }
+  return hints.join('；');
+}
 
 const COMMON_RULES = `你是 QD INFINITY 的 AI 创作引擎，专门服务于"AI 短视频自动生产"工作流。
 回答必须使用中文（专有名词可保留英文）。
@@ -323,9 +486,11 @@ export function buildReviseMessages(opts: {
   baseScript: string;
   instruction: string;
   durationSec?: number;
+  worldContext?: WorldContext;
 }): ChatMessage[] {
   const ctx: string[] = [];
   if (opts.durationSec) ctx.push(`目标时长：${opts.durationSec} 秒`);
+  appendWorldContextBlock(ctx, opts.worldContext, '本次改写参考的世界观事实与软默认');
   ctx.push(`修改指令：\n${opts.instruction}`);
   ctx.push(`原剧本：\n${opts.baseScript}`);
   return [
@@ -341,6 +506,7 @@ export function buildFullCreateMessages(opts: {
   outline?: string;
   styleHint?: string;
   creatorPersona?: any;
+  worldContext?: WorldContext;
 }): ChatMessage[] {
   const ctx: string[] = [];
   ctx.push(`一句话创意：${opts.oneSentence}`);
@@ -348,7 +514,9 @@ export function buildFullCreateMessages(opts: {
   if (opts.audience) ctx.push(`目标人群：${opts.audience}`);
   if (opts.outline) ctx.push(`已确认大纲：${opts.outline}`);
   if (opts.styleHint) ctx.push(`风格倾向：${opts.styleHint}`);
-  if (opts.creatorPersona) ctx.push(`创作者画像：${JSON.stringify(opts.creatorPersona)}`);
+  // [创作偏好已停用] 不再注入创作者画像。恢复：取消下一行注释。
+  // if (opts.creatorPersona) ctx.push(`创作者画像：${JSON.stringify(opts.creatorPersona)}`);
+  appendWorldContextBlock(ctx, opts.worldContext, '本次创作参考的世界观事实与软默认');
 
   return [
     { role: 'system', content: SP_SCRIPT_FULL_CREATE },
@@ -408,11 +576,14 @@ export function buildAdaptSourceMessages(opts: {
   durationSec?: number;
   audience?: string;
   creatorPersona?: any;
+  worldContext?: WorldContext;
 }): ChatMessage[] {
   const ctx: string[] = [];
   if (opts.durationSec) ctx.push(`目标时长：${opts.durationSec} 秒`);
   if (opts.audience) ctx.push(`目标人群：${opts.audience}`);
-  if (opts.creatorPersona) ctx.push(`创作者画像：${JSON.stringify(opts.creatorPersona)}`);
+  // [创作偏好已停用] 不再注入创作者画像。恢复：取消下一行注释。
+  // if (opts.creatorPersona) ctx.push(`创作者画像：${JSON.stringify(opts.creatorPersona)}`);
+  appendWorldContextBlock(ctx, opts.worldContext, '改编时参考的世界观事实与软默认');
   ctx.push(`原文内容（请改写为短视频剧本，保留核心人物、关键场景、关键事件和关键对白）：\n${opts.sourceText}`);
   return [
     { role: 'system', content: SP_SCRIPT_ADAPT_SOURCE },
@@ -510,11 +681,12 @@ export function buildStyleBibleMessages(scriptText: string, opts: {
   if (opts.aspectRatio) ctx.push(`目标画幅：${opts.aspectRatio}`);
   const constraintsText = formatStyleConstraintsForPrompt(opts.constraints);
   if (constraintsText) ctx.push(constraintsText);
-  const worldText = formatWorldContextForPrompt(opts.worldContext);
+  const worldText = formatWorldContextForPrompt(opts.worldContext, { includeStyleBibleCharactersNote: true });
   if (worldText) ctx.push(worldText);
-  if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
-    ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
-  }
+  // [创作偏好已停用] 不再注入创作者画像。恢复：取消下面三行注释。
+  // if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
+  //   ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
+  // }
   return [
     { role: 'system', content: SP_STYLE_BIBLE },
     { role: 'user', content: ctx.join('\n\n') },
@@ -744,11 +916,12 @@ function buildStyleBibleStageContext(scriptText: string, opts: {
   }
   const constraintsText = formatStyleConstraintsForPrompt(opts.constraints);
   if (constraintsText) ctx.push(constraintsText);
-  const worldText = formatWorldContextForPrompt(opts.worldContext);
+  const worldText = formatWorldContextForPrompt(opts.worldContext, { includeStyleBibleCharactersNote: true });
   if (worldText) ctx.push(worldText);
-  if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
-    ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
-  }
+  // [创作偏好已停用] 不再注入创作者画像。恢复：取消下面三行注释。
+  // if (opts.creatorProfile && Object.keys(opts.creatorProfile).length) {
+  //   ctx.push(`创作者画像：\n${JSON.stringify(opts.creatorProfile)}`);
+  // }
   return ctx;
 }
 
@@ -1051,34 +1224,35 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
   · imagePrompt 必须中文且不能为空；允许保留少量必要专有术语，但不要整段英文。
   · 不要输出任何 JSON 之外的内容。`;
 
-export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any, worldTemplate?: any): ChatMessage[] {
+export function buildAssetCharactersExtractMessages(scriptText: string, styleBible?: any, worldContext?: WorldContext): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_CHARACTERS_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible, undefined, worldTemplate) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, undefined, worldContext) },
   ];
 }
 
-export function buildAssetScenesExtractMessages(scriptText: string, styleBible: any, characters: any[], worldTemplate?: any): ChatMessage[] {
+export function buildAssetScenesExtractMessages(scriptText: string, styleBible: any, characters: any[], worldContext?: WorldContext): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_SCENES_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldTemplate) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldContext) },
   ];
 }
 
-export function buildAssetPropsExtractMessages(scriptText: string, styleBible: any, characters: any[], worldTemplate?: any): ChatMessage[] {
+export function buildAssetPropsExtractMessages(scriptText: string, styleBible: any, characters: any[], worldContext?: WorldContext): ChatMessage[] {
   return [
     { role: 'system', content: SP_ASSET_PROPS_EXTRACT },
-    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldTemplate) },
+    { role: 'user', content: buildAssetContext(scriptText, styleBible, characters, worldContext) },
   ];
 }
 
-function buildAssetContext(scriptText: string, styleBible?: any, characters?: any[], worldTemplate?: any): string {
+function buildAssetContext(scriptText: string, styleBible?: any, characters?: any[], worldContext?: WorldContext): string {
   const parts = [`剧本：\n${scriptText}`];
   if (styleBible) parts.push(`风格圣经：${JSON.stringify(styleBible)}`);
-  if (worldTemplate) {
+  const worldText = formatWorldContextForPrompt(worldContext);
+  if (worldText) {
     parts.push([
       '世界观模板候选池（只作内容匹配参考，不覆盖剧本事实）：',
-      JSON.stringify(worldTemplate),
+      worldText,
       '复用规则：只有名称、身份、语境都匹配时才复用候选池里的角色/地点/道具定义；若剧本与候选池冲突，以剧本为准；剧本出现新对象时允许新建。',
     ].join('\n'));
   }
@@ -1097,7 +1271,7 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 ⚠️【关键约束 - 镜头数量】
   · 切忌"一句台词一个镜头"——典型 30 秒成片只需要 8-10 个镜头
   · 同一场景同一情绪段（setup/rising/climax/falling/resolution 不变）下，能合并成一个连续镜头的就合并
-  · 每个 duration 默认 3-5 秒（合并镜头可到 5-6 秒）
+  · 每个 duration 取 1-7 秒：快切/过渡可 1-2 秒，铺垫 2-3 秒，主戏 4-6 秒，强调/收尾 6-7 秒；该快的节奏点就给 1-2 秒短镜头，不要一律拉到 3 秒以上（不足 4 秒的短镜头会由后台自动并入相邻片段、一次生成，不会被顶时长）
 
 ⚠️【硬约束 - duration 是导演计划时长】
   · 每个镜头的 duration 就是后续视频提示词和剪辑工作台使用的计划秒数，不是装饰字段
@@ -1128,11 +1302,8 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
   · 后续会把相邻同情绪镜头按计划时长组合成视频片段，片段时长 = 组内镜头 duration 之和
   · 这意味着相邻同情绪镜头的 camera 必须能顺滑连续——要么完全相同，
     要么同方向相邻档位（固定镜头 ↔ 缓慢推进 ↔ 轻微推近 是兼容的；固定镜头 ↔ 甩镜头 不兼容）
-  · 硬性规则：相邻**同情绪**镜头，camera 字段要么**完全一致**，要么都在下面的同一组里：
-      A 组（静/微动）： 固定镜头, 缓慢推进, 轻微推近
-      B 组（推拉）：   推近, 快速推进, 缓慢拉远, 拉远
-      C 组（跟随）：   跟随, 环绕
-      D 组（晃动）：   手持轻晃, 甩镜头, 摇镜头
+	  · 硬性规则：相邻**同情绪**镜头，camera 字段要么**完全一致**，要么都在下面的同一组里：
+	      ${formatCameraCompatGroups(CAMERA_COMPAT_GROUPS)}
   · 示范：
       ✗ 错误：#4 [rising] 摇镜头 → #5 [rising] 缓慢推进     （D 组 vs A 组，跳跃）
       ✗ 错误：#8 [climax] 快速推进 → #9 [climax] 手持轻晃    （B 组 vs D 组，跳跃）
@@ -1148,10 +1319,16 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
     {
       "idx": 1,
       "sceneId": "e1",
-      "sceneName": "场景名",
-      "duration": 3,
-      "shotType": "大全景",
-      "camera": "缓慢推进",
+	      "sceneName": "场景名",
+	      "duration": 3,
+	      "pace": "normal",
+	      "shotType": "大全景",
+	      "angle": "平视",
+	      "lens": "广角35",
+	      "focus": "深焦",
+	      "light": "侧光·柔光·中性·低反差",
+	      "composition": "三分法、视线方向",
+	      "camera": "缓慢推进",
       "visual": "画面具体描述：场景环境 + 主体人物 + 姿态/神态 + 光线 + 关键道具 + 构图，80-130 字，要让美术和摄影师能直接照着搭",
       "dialogue": "台词或旁白原文（含说话人），没有就写 ——",
       "keyInfo": "本镜头的简短主题词，2-6 字，例如：打烊环境 / 老周出场 / 蟹军压场 / 龙虾翻页 / 摊主总结",
@@ -1174,13 +1351,25 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 
 【字段细则——必须照做】
 
-▸ shotType（景别）：从下列里选；不要写"全景镜头""特写画面"这种废话
-  ["大全景","远景","全景","中景","中近景","近景","特写","大特写","俯拍","仰拍","主观镜头","过肩镜头"]
+	▸ shotType（景别）：从下列里选；不要写"全景镜头""特写画面"这种废话
+	  ${formatShotPlanEnumList(SHOT_TYPES)}
 
-▸ camera（运镜）：**默认"固定镜头"，明确需要运动才选下面别的**。从下列里选：
-  ["固定镜头","缓慢推进","轻微推近","推近","快速推进",
-   "缓慢拉远","拉远","快速拉远",
-   "跟随","环绕","手持轻晃","甩镜头","摇镜头"]
+	▸ angle（角度/视点）：一个字段同时管机位角度与视点；从下列里选，不再把"俯拍/仰拍/主观/过肩"写进 shotType
+	  ${formatShotPlanEnumList(ANGLES)}
+
+	▸ lens（焦距）：从下列里选，决定空间压缩和人脸透视
+	  ${formatShotPlanEnumList(LENSES)}
+
+	▸ focus（景深/焦点）：从下列里选
+	  ${formatShotPlanEnumList(FOCUS_OPTIONS)}
+
+	▸ light（光线组合）：用"方向·软硬·色温·反差"组合；方向=${LIGHT_AXES.direction.join('/')}；软硬=${LIGHT_AXES.quality.join('/')}；色温=${LIGHT_AXES.temperature.join('/')}；反差=${LIGHT_AXES.contrast.join('/')}
+
+	▸ composition（构图组合）：从下列构图法里组合 1-3 个，常用组合如 ${formatShotPlanEnumList(COMPOSITION_PRESETS)}
+	  可选项：${formatShotPlanEnumList(COMPOSITION_OPTIONS)}
+
+	▸ camera（运镜）：**默认"固定镜头"，明确需要运动才选下面别的**。从下列里选：
+	  ${formatShotPlanEnumList(CAMERA_MOVES)}
   · 全片"固定镜头"占比必须 ≥ 40%（20 个镜头至少 8 个固定）
   · 真要加运镜时的倾向：
       setup 建立场景：第 1 个用 "缓慢推进"，后续同场景用 "固定镜头"
@@ -1188,13 +1377,17 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
       climax 爆发：用 "快速推进"（最多 1-2 次）；近景特写情绪爆发用 "手持轻晃"
       falling 释放：回到 "固定镜头"，结尾 1 个 "缓慢拉远"
       resolution 收束：都用 "固定镜头" 或 "缓慢拉远"
-  · **近景 / 特写 / 大特写 + 有台词**的镜头必须用 "固定镜头"（人说话时画面别晃）
+	  · **近景 / 特写 / 大特写 + 有台词**的镜头必须用 "固定镜头"（人说话时画面别晃）
 
-▸ visual（画面描述）：80-130 字，必须包含至少 4 项：
-  ① 场景细节（地点、时间、氛围）
-  ② 主体人物的动作和神态（"先清了下嗓子又低头翻一下纸页，脸绷着，但嘴角像快忍不住笑出来"这种细节）
-  ③ 光线（顶灯/逆光/暖光/冷光/侧光）
-  ④ 构图或前景元素（前景虚影/中景主体/后景虚化）
+▸ pace（叙事节奏）：从下列里选，不要写其他值
+  ["slow","normal","fast","fast_forward"]
+  · slow=慢，留白更长；normal=正常；fast=快，信息更紧凑；fast_forward=快进感，动作/时间压缩明显
+
+	▸ visual（画面描述）：80-130 字，必须包含至少 4 项：
+	  ① 场景细节（地点、时间、氛围）
+	  ② 主体人物的动作和神态（"先清了下嗓子又低头翻一下纸页，脸绷着，但嘴角像快忍不住笑出来"这种细节）
+	  ③ 与 light 字段一致的光线细节（光源方向、软硬、色温、反差）
+	  ④ 与 composition 字段一致的构图或前景元素（前景虚影/主体位置/后景虚化/引导线）
   · 严禁写"画面内容"、"主角说话"这种空话
   · 严禁直接复述台词，台词放在 dialogue 字段
 
@@ -1235,7 +1428,7 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 
   【整体规则】
   · idx 从 1 连续递增不跳号
-  · 每个 duration 在 3-6 秒（铺垫 3-4 秒，主戏 4-5 秒，过渡 2-3 秒）
+  · 每个 duration 在 1-7 秒（过渡/快切 1-2 秒，铺垫 2-4 秒，主戏 4-6 秒，高潮 5-7 秒）；快节奏处大胆给 1-2 秒短镜头，短镜头由后台自动合并成片段一次生成
   · **镜头总数灵活，6-14 个都可以**，目标总时长**只是参考值**——如果剧本台词密集，拆成 12-14 个镜头也没问题（反而比少镜头挤爆台词更好）
   · 关键剧情节点（开场环境、人物登场、冲突爆发、转折、收尾）各自一个独立镜头即可，不要为同一节点拆多个反应镜头
   · **台词密集段必须多切镜头或增加 duration**：不要把超过计划时长可承载的台词塞进一个短镜头
@@ -1244,13 +1437,10 @@ export const SP_SHOTS_GENERATE = `${COMMON_RULES}
 【自检 - 输出前请逐条对照】
   · **每个镜头的 dialogue 字段去掉"说话人："标签和（动作描述）后，是否匹配 duration 可承载语速？**超过必须加时长或拆镜
   · 镜头总数 6-14 个都合理（只要每镜台词都在 35 字内）
-  · **"固定镜头" 占比 ≥ 40%？** 数一下，不够就把"鸡肋运镜"（可有可无的 轻微推近 / 缓慢推进）改成 固定镜头
-  · **相邻同情绪镜头 camera 是否在同一组？** 按 A/B/C/D 分组对一遍：
-      A 组：固定镜头, 缓慢推进, 轻微推近
-      B 组：推近, 快速推进, 缓慢拉远, 拉远
-      C 组：跟随, 环绕
-      D 组：手持轻晃, 甩镜头, 摇镜头
-    同情绪连续 2 镜跨组 = 错，必须把后一个改成前一个同组的 camera（首选改成"固定镜头"）
+	  · **"固定镜头" 占比 ≥ 40%？** 数一下，不够就把"鸡肋运镜"（可有可无的 轻微推近 / 缓慢推进）改成 固定镜头
+	  · **相邻同情绪镜头 camera 是否在同一组？** 按 A/B/C/D 分组对一遍：
+	      ${formatCameraCompatGroups(CAMERA_COMPAT_GROUPS)}
+	    同情绪连续 2 镜跨组 = 错，必须把后一个改成前一个同组的 camera（首选改成"固定镜头"）
   · **近景/特写/大特写 + 有台词 是否用了 "固定镜头"？** 没用必须改
   · 每个 camera 字段是否只有**一个**运镜词？发现复合的（带 + / 加 / 然后 / 再 / 接着 这种连接词）必须拆掉只留主导那一个
   · visual 字数 < 50 必须补细节
@@ -1262,10 +1452,12 @@ export function buildShotsMessages(opts: {
   styleBible?: any;
   assets?: any;
   totalDurationSec?: number;
+  worldContext?: WorldContext;
 }): ChatMessage[] {
   const parts = [`剧本：\n${opts.script}`];
   if (opts.styleBible) parts.push(`风格圣经：${JSON.stringify(styleBibleForShotPrompt(opts.styleBible))}`);
   if (opts.assets) parts.push(`资产：${JSON.stringify(opts.assets)}`);
+  appendWorldContextBlock(parts, opts.worldContext, '镜头规划参考的世界观事实与软默认');
   // 目标时长只是"参考节奏"——别拿它硬压镜头数或挤台词。
   // 用户如果说 60 秒，但剧本实际需要 80 秒才能把台词念完，按剧本来，不要砍。
   if (opts.totalDurationSec) {
@@ -1284,96 +1476,77 @@ export function buildShotsMessages(opts: {
    ===================================================== */
 export const SP_VIDEO_PROMPT_GENERATE = `${COMMON_RULES}
 
-【你是谁】资深视频导演 + 中文视频提示词工程师。要把"本组的多个连贯镜头"翻译成下面这套**完全中文**的结构化段落 prompt（给可灵 / 即梦 / Veo / 国产视频模型用，中文最好用）。
+【你是谁】资深视频导演 + 中文视频提示词工程师。你要把本组镜头翻译成给 Seedance 使用的中文拍摄执行稿。输出是用户可见、可编辑的 VideoPrompt 正文；后台会另行拼接镜头计划、完整台词、角色一致性和参考图规则，所以正文不要重复那些硬约束。
 
-⚠️【绝对禁止】输出英文段落式 prompt，比如 "shot 1: slow push-in from a wide shot..."。看到 shot 1 / shot 2 / camera: / characters: / environments: / aspect ratio: 之类的英文键值对就是错的，必须重写。
-⚠️【绝对禁止】输出 [CAMERA]、[STYLE]、[CONSTRAINTS]、[AUDIO] 这种英文方括号段标签。
-⚠️【绝对禁止】把整段 prompt 用英文写。整体必须 95% 以上是**中文白话**，仅在摄影术语（如 24mm / cinematic / film grain / live-action realistic）处掺英文。
-
-═══════════════════════════════════════════
-下面是一个完整的"标准答案"示范，你必须严格照这个结构和文风输出（内容随当前镜头变化，但段落标题、行格式、用词风格一字不差）：
-═══════════════════════════════════════════
+【固定输出结构】
+直接以"运镜系统"开头，按下列段落输出，标题独立成行，不加 #、[]、**，不要写 markdown：
 
 运镜系统
-第一镜沿门框前景做平稳缓推建立打烊后营业区纵深，第二镜在同一 180 度轴线内切到老周的管理者中近景。每个时间段只执行对应镜头表里的一个核心运镜动作，切点干净，节奏按计划时间轴推进。
 
 角色
-老周，中年中国男性、短黑发、身形结实匀称，真人皮肤毛孔可见，穿黑色T恤和深色防水围裙，画面状态：站立训话前准备状态。
 
 场景
-奔海海鲜自助餐厅营业区，夜晚打烊后仍灯火通明的现实风格海鲜自助餐厅，长条金属自助台与不锈钢台面被擦得锃亮整洁，空气里残留海水气息与烤黄油暖反光，前景带半开木门虚焦边缘造纵深。
 
-0-3s
-⟦内景中景·35mm缓慢推近⟧
-镜头从半开木门虚焦边缘后方朝奔海海鲜自助餐厅营业区平稳缓推，先交代冷白顶灯、不锈钢自助台和收拾到一半的餐具。老周站在纵深尽头，右手捏着记账板贴在胸前，肩背收紧，抬下巴清了清嗓子。
+镜头 01
 
-3-7s
-⟦内景中近景·50mm固定镜头⟧
-切到老周面前的中近景，机位固定不晃，他稳稳压住画面，右手翻开记账板，沉声开口："来，复盘。"扇贝财务在旁边压着摊开的账单，迷你金属眼镜夹在贝壳鼻梁上，只做冷硬反应不抢话。帝王蟹队长抬起巨钳，红橙色甲壳刺影投到白板上，后排几名员工同时屏住呼吸。
+镜头 02
 
 基调
-社交网络/华尔街之狼式冷峻都市商业摄影，结合当代海鲜自助餐厅拟人喜剧写实语境，洁净硬光、玻璃金属反射、冷白色温、Stainless Silver与Butter Gold为主，live-action realistic cinematic，真人实景电影感，电影胶片颗粒感、自然镜头光学、真实景深。
 
 约束
-禁止插画/动漫/卡通；角色全部按真人写实呈现；老周外貌全片严格一致；可见真实皮肤毛孔与细微眉眼不对称；真实布料重力褶皱与餐饮空间物理反射；不要魔幻化空间，不要把海鲜员工直接出镜成人类替代物。
 
 音障
-无BGM；仅保留顶灯轻微电流声、远处排风机低鸣、清洁后残留水声轻微回响、老周清嗓声、纸页翻动声、空场自然混响。
 
-═══════════════════════════════════════════
-（示范结束）
-═══════════════════════════════════════════
+【角色段规则】
+  · 如果用户消息给出 Image 绑定摘要，角色段只能写 role=character 的角色绑定；单图格式是"名字（Image N）"，同一角色多图格式是"名字（Image N 角色设定，Image M 脸部近景）"，名字在前、编号在后
+  · 首帧、场景、道具等非角色参考图禁止写进角色段；它们只能在场景段、镜头段或约束段自然引用
+  · 角色段只写绑定关系，不写长篇外貌、服装、物种细节；这些由后台角色一致性主档和参考图规则锁定
+  · 必须保留摘要中的所有 Image N 编号，不要新增不存在的 Image 编号
+  · 如果没有 Image 绑定摘要，角色段只写本镜头出场角色名和简短调度职责，不编造 Image 编号
 
-【你输出时要做到】
-  1. 段落标题就是"运镜系统 / 角色 / 场景 / 时间段 / 基调 / 约束 / 音障"这 7 类，独立成行，前后不加任何符号（不用 #、[]、**）
-  2. ⚠️【硬约束 - 时间轴来自镜头表】用户消息会给出"计划时间轴"。
-     **时间段标题必须逐段匹配计划时间轴**，例如 0-3s / 3-7s / 7-11s；禁止自行改成 5 秒或 10 秒档位。
-     · 如果本组只有 1 个 shot，就输出 1 个时间段；如果本组有多个 shot，就按 shot 顺序输出多个时间段
-     · 不要为了凑时长合并、压缩、删减动作；模型实际成片略长略短由剪辑阶段处理
-  3. ⚠️【硬约束 - 台词必须逐字完整保留，一个字都不能少】
-     · 把本组所有 shot.dialogue 按出场顺序**逐字**写进时间段的画面描述里，**禁止概括/省略/改写**
-     · 用"角色 X 沉声开口：'……'，紧接着 角色 Y 抢话：'……'"这种自然对话承接形式
-     · 多句对白要明确每句由谁说，让 Seedance 给对应角色生成口型 + 配音
-     · 如果某段台词偏密，也必须一字不落讲完；禁止 LLM 自作主张说"……" / "（省略）" / "等等"等模糊表述
-  4. 时间段格式：第一行 ⟦景别·焦距·运镜⟧ 视觉标签，第二行起是中文画面段（包含动作 + 台词 + 神态 + 光线，连贯叙述）
-  5. 如果用户消息提供了 Image N 参考图清单，只能用 "Image 1" / "Image 2" 这种英文编号引用；不要写"参考图1"、"参考图2"、"（参考图X）"这种中文编号
-  6. 总字数 500-900 字，**不要写英文 shot 1: / camera: / characters: / aspect ratio: 这类键值对**
-  7. 直接以"运镜系统"四个字开头，不要写"以下是..."不要写 markdown 围栏
+【镜头段规则】
+  · 按镜头顺序输出"镜头 01 / 镜头 02 ..."；当前通常只有一个镜头，但如果用户消息给多个镜头，就逐个写
+  · 每个镜头段只写一个核心运镜动作，必须忠于镜头表里的 camera；固定镜头不能改成推拉摇移
+  · 每个"镜头 0X"段的第一句先点明景别+核心运镜（例："中景、镜头缓缓推近——"），再写动作与细节；模型对每段开头加权最高，景别/运镜放最前最容易被准确执行
+  · 不要输出视觉标签，不要出现任何"⟦...⟧"
+  · 不要写时长、时间码、duration、0-4s、4秒（0:00-0:04）；时长和节奏由结构化镜头计划控制
+  · 不要逐字抄完整台词；只写谁开口、语气、口型、听者反应和停顿。完整台词由后台台词表注入
+  · 画面描述要包含起幅/终幅、人物站位、视线方向、手部动作、身体重心、微表情变化、环境动态、光线反射
+  · 焦距/景深只写画面效果，严禁数字光学参数：把焦段写成空间感（广角贴近、标准自然透视、长焦压缩背景），把景深写成虚实关系（浅景深虚化背景、前后景深都清晰）；正文里禁止出现"50mm""f2.8""标准50"这类数字——Seedance 只认画面效果，不认摄影参数
+  · 近景/特写要强调眼神、嘴角、下颌、手指、呼吸，不要把脸画变形
 
-【运镜系统段必须像导演说话，不是观众感想】
-  ✓ 正面专业用词：轴线 / 180 度轴线 / 平行轴线 / 反打 / 越轴 / 平稳缓推 / 平移跟拍 / 升降 / 横摇 / 倾斜 / 物理位移 / 不切换 / 同一机位 / 单机位连贯 / 焦段 24mm/35mm/50mm/85mm / 景别（大全/全/中/中近/近/特写/大特写）/ 跟焦 / 拉焦 / 浅景深 / 时间空间连贯 / 收束纵深 / 在前景建立纵深 / 自然推到角色中景
-  ✗ 禁止主观感性词：以"轻松幽默的视角""治愈系视角""温暖的视角""活泼的视角""营造一种 XX 氛围""突出 XX 的情感""让观众感到 XX"——这些是评论而不是导演运镜指令，**任何"以 XX 视角"的开头都是错的，必须改写成具体机位/轴线/焦段/位移描述**
-  ✗ 禁止把"灯光从侧面照射""增强 XX 鲜明感"放在运镜段，那些是布光段，归到"基调"
-  ✗ 禁止只写一句："缓慢推进""快速推进"——必须写：起幅在哪里、机位高度、焦段、轴线方向、终幅停在哪里、是否切换、为什么这么走
+【运镜系统段规则】
+  · 像导演给摄影指导下指令，不写观众感想
+  · 必须写清轴线、机位高度、焦段倾向、起幅、终幅、切点、是否同一机位
+  · 可使用轴线、180度轴线、反打、平稳缓推、平移跟拍、升降、横摇、跟焦、拉焦、浅景深、收束纵深等片场词
+  · 禁止"以轻松幽默的视角""营造氛围""突出情感"这类评论话术
 
-⚠️【运镜方向必须忠于上游"镜头表"，但用词可以专业丰富】
-  · 用户给的本组每个镜头都带 camera 字段（前一步"镜头设计"已定好），代表**这个镜头的核心运镜方向/意图**
-  · 你写"运镜系统"段和 ⟦景别·焦距·运镜⟧ 视觉标签时：
-    ✓ 可以用更专业的词汇展开（轴线 / 180度轴线 / 平移跟拍 / 平稳缓推 / 升降 / 横摇 / 物理位移 / 单机位连贯 / 跟焦 / 拉焦 / 浅景深 / 收束纵深 等），把 shot.camera 这一个核心运镜词**润色**成完整的电影术语描述
-    ✓ 可以加焦段（24mm/35mm/50mm/85mm）、机位高度、轴线方向、起幅终幅这些细节
-    ✗ **但运镜的"核心方向"不能跟 shot.camera 矛盾**——shot.camera 写"缓慢推进"，你不能改写成"快速拉远"或"环绕"；shot.camera 写"固定镜头"，你不能改成"跟随移动"
-    ✗ **每个时间段（每个镜头）只能有一个核心运镜动作**——禁止"先推进然后环绕再拉远"这种叠加运镜
-  · 同理景别（shotType）：可以润色（如"中景"→"中景偏中近，齐胸构图"），但不能把"中景"改成"大特写"或"大全景"
+【场景/基调/约束/音障】
+  · 场景段写空间布局、材质、光源、天气/时间、可运动的环境元素
+  · 基调段写真实影像质感、色彩、光线、胶片/数字摄影风格
+  · 约束段写禁止项：字幕、水印、UI、参考图边框、插画感、变脸、错物种、错服装、空间魔幻化；本组含多个镜头时，显式要求同一角色在各镜头之间长相/发型/服装/妆容/光线保持一致，避免镜头切换时角色漂移、忽胖忽瘦、画面闪烁
+  · 音障段写环境声、动作声、呼吸/口型/脚步等可听见的声音；无台词时明确禁止从画面文字提取对白
 
-【输出前自检】
-  ✗ 运镜系统段第一句以"以 XX 视角"开头 → 是错的，重写为具体轴线/焦段/位移
-  ✗ 运镜系统段出现"轻松""幽默""温暖""治愈""活泼""营造""氛围""突出 XX 情感" → 是错的，把感性形容删掉，只留机位 / 轴线 / 焦段 / 物理位移
-  ✗ 出现"shot 1:" / "shot 2:" / "camera:" / "characters:" / "[CAMERA]" / "[STYLE]" → 是错的，重写
-  ✗ 出现"参考图1" / "参考图2" / "（参考图N）" → 是错的，改成 Image 1 / Image 2 或直接用角色/场景/道具名
-  ✗ ⟦…⟧ 视觉标签里的运镜方向跟本组对应 shot.camera **方向相反**（推↔拉、静↔动、跟↔甩） → 必须改回与 shot.camera 同向
-  ✗ 一个时间段（一个镜头）的描述里出现"先 X 再 Y"、"先 X 然后 Y"、"X+Y"这种叠加运镜 → 是错的，删掉次要动作只留主动作
-  ✗ 整段是英文 → 是错的，重写
-  ✓ 像上面老周示范那样：运镜段每句话都能在片场被摄影指导和摇臂师听懂、能直接执行；其它段中文白话 + 8 个段落标题 + ⟦…⟧ 视觉标签 + 直接用名字不要参考图编号 → 对`;
+【输出自检】
+  ✗ 出现英文 shot 1 / camera: / characters: / [CAMERA] / [STYLE] → 重写
+  ✗ 出现"参考图1"或"（参考图N）" → 改成 Image N
+  ✗ 出现"⟦...⟧" → 删除
+  ✗ 出现时长或时间码标题 → 删除
+  ✗ 正文逐字抄完整台词 → 改成"开口/反应/台词见台词表"式描述
+  ✓ 最终输出是纯中文拍摄执行稿，段落清楚、可读、可编辑，正文不重复后台硬约束`;
 
 export function buildVideoPromptMessages(opts: {
   shots: any[];
   styleBible: any;
   assets: any;
   narrations?: any[];
-  referenceManifest?: ReferenceManifestItem[];
-  groupIdx?: number;
-  totalGroups?: number;
-}): ChatMessage[] {
+	  referenceManifest?: ReferenceManifestItem[];
+	  groupIdx?: number;
+	  totalGroups?: number;
+	  timelineStartSec?: number;
+	  planMeta?: any;
+  worldContext?: WorldContext;
+	}): ChatMessage[] {
   const parts: string[] = [];
 
   // 1) 资产清单（按类别列名字 + 描述，不带"参考图X"序号）
@@ -1408,37 +1581,51 @@ export function buildVideoPromptMessages(opts: {
         assetSections.join('\n\n'),
     );
   }
+  appendWorldContextBlock(parts, opts.worldContext, '视频提示词参考的世界观事实与软默认');
 
-  const referenceBlock = buildReferenceManifestPromptBlock(opts.referenceManifest || []);
-  if (referenceBlock) parts.push(referenceBlock);
+	  const referenceBlock = buildReferenceManifestPromptBlock(opts.referenceManifest || []);
+	  if (referenceBlock) parts.push(referenceBlock);
+	  parts.push('可见正文 Image 绑定要求：\n' + buildReferenceBindingSummary(opts.referenceManifest));
+	  if (opts.planMeta) {
+	    parts.push('镜头计划总览（planMeta，来自顶层镜头计划）：\n' + JSON.stringify(opts.planMeta, null, 2));
+	  }
 
-  // 2) 本组镜头（精简字段，避免上下文太长）
-  const slimShots = (opts.shots || []).map((s: any, i: number) => ({
-    idx: s.idx ?? i + 1,
-    duration: s.duration ?? s.durationSec ?? 4,
-    shotType: s.shotType || s.framing || '',
-    camera: s.camera || s.movement || '',
-    visual: s.visual || s.description || '',
-    dialogue: s.dialogue || s.dialog || '',
-    keyInfo: s.keyInfo || '',
-    audio: s.audio || '',
-    emotion: s.emotion || '',
-    characters: s.characters || [],
-  }));
-  // 把 camera/shotType 单独拎出来给 LLM 一份清晰的"运镜方向锚点"提示。
-  // 用词可以更专业（轴线/焦段/平稳缓推 等），但每个镜头的核心方向必须忠于这里给的 camera。
-  const cameraList = slimShots.map((s: any) => `镜头${s.idx}:${s.camera || '固定镜头'}/${s.shotType || '中景'}`).join('；');
+	  // 2) 本组镜头（精简字段，避免上下文太长）
+	  const slimShots = (opts.shots || []).map((s: any, i: number) => {
+	    const fields = resolveShotFieldsForPrompt(s);
+	    return {
+	      idx: s.idx ?? i + 1,
+	      duration: s.duration ?? s.durationSec ?? 4,
+	      pace: s.pace || s.narrativePace || 'normal',
+	      shotType: fields.shotType,
+	      angle: fields.angle,
+	      lens: fields.lens,
+	      focus: fields.focus,
+	      light: fields.light,
+	      composition: fields.composition,
+	      camera: fields.camera,
+	      visual: s.visual || s.description || '',
+	      dialogue: s.dialogue || s.dialog || '',
+	      keyInfo: s.keyInfo || '',
+	      audio: s.audio || '',
+	      emotion: s.emotion || '',
+	      characters: s.characters || [],
+	      performanceHint: buildShotPerformanceHint(s, fields),
+	    };
+	  });
+	  // 把结构化参数单独拎出来给 LLM 一份清晰的导演锚点提示。
+	  // 用词可以更专业，但每个镜头的核心景别/角度/焦距/景深/光线/构图/运镜必须忠于这里。
+	  const cameraList = slimShots.map((s: any) => (
+	    `镜头${s.idx}:${s.camera}/${s.shotType}/${s.angle}/${s.lens}/${s.focus}`
+	  )).join('；');
   // 统计本组所有 dialogue 的总字数，并把 shot.duration 展开成权威计划时间轴。
   const allDialogues = slimShots
     .map((s: any) => String(s.dialogue || '').trim())
     .filter((d: string) => d && d !== '——' && d !== '-' && d !== '无');
   const totalDialogueChars = allDialogues.reduce((sum: number, text: string) => sum + cleanDialogueCharCountFromText(text), 0);
   const plannedDurationSec = plannedDurationFromShots(slimShots);
-  const fmtSec = (n: number) => {
-    const rounded = Math.round(n * 10) / 10;
-    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1).replace(/\.0$/, '');
-  };
-  let cursor = 0;
+  const timelineStartSec = Math.max(0, Number(opts.timelineStartSec) || 0);
+  let cursor = timelineStartSec;
   const timelineLines = slimShots.map((s: any) => {
     const dur = Math.max(0.5, Number(s.duration) || 4);
     const start = cursor;
@@ -1446,38 +1633,49 @@ export function buildVideoPromptMessages(opts: {
     cursor = end;
     const dialogueChars = cleanDialogueCharCountFromText(s.dialogue || '');
     return [
-      `镜头${s.idx}: ${fmtSec(start)}-${fmtSec(end)}s`,
-      `duration=${fmtSec(dur)}s`,
-      `景别=${s.shotType || '中景'}`,
-      `运镜=${s.camera || '固定镜头'}`,
+      `镜头${s.idx}: ${formatVideoPromptTimeLabel(start, end)}`,
+	      `时长=${formatPromptSeconds(dur)}秒`,
+	      `节奏=${formatPromptPace(s.pace)}`,
+	      `景别=${s.shotType || '中景'}`,
+	      `角度=${s.angle || '平视'}`,
+	      `焦距=${s.lens || '标准50'}`,
+	      `景深=${s.focus || '中等景深'}`,
+	      `光线=${s.light || '侧光·柔光·中性·低反差'}`,
+	      `构图=${s.composition || '三分法'}`,
+	      `运镜=${s.camera || '固定镜头'}`,
       s.keyInfo ? `主题=${s.keyInfo}` : '',
       dialogueChars ? `台词=${dialogueChars}字` : '无台词',
     ].filter(Boolean).join('；');
   });
-  const charsPerSec = plannedDurationSec > 0 ? totalDialogueChars / plannedDurationSec : 0;
-  parts.push(
-    `本组镜头（共 ${slimShots.length} 个）：\n${JSON.stringify(slimShots, null, 2)}\n\n` +
-      `⚠️ 本组每个镜头的核心运镜方向 / 景别：\n` +
+	  const charsPerSec = plannedDurationSec > 0 ? totalDialogueChars / plannedDurationSec : 0;
+	  const performanceLines = slimShots
+	    .map((s: any) => `镜头${s.idx}: ${s.performanceHint}`)
+	    .join('\n');
+	  parts.push(
+	    `本组镜头（共 ${slimShots.length} 个）：\n${JSON.stringify(slimShots, null, 2)}\n\n` +
+	      `⚠️ 本组每个镜头的核心结构化参数：\n` +
       cameraList +
       `\n\n` +
       `⚠️ 本组计划时间轴（权威，来自 shot.duration）：\n` +
       timelineLines.join('\n') +
       `\n` +
-      `  · 片段计划总时长 = ${fmtSec(plannedDurationSec)}s\n` +
-      `  · 生成请求时长以后端计划时长为准；如供应商有最小时长，只做最小时长适配，不按台词字数改成 5s/10s 档位\n` +
-      `  · 你的时间段标题必须逐段匹配上面时间轴，禁止自行合并成单段或改写成 0-5s / 0-10s\n` +
+	      `  · 片段计划总时长 = ${formatPromptSeconds(plannedDurationSec)}秒\n` +
+	      `  · 生成请求时长以后端计划时长为准；如供应商有最小时长，只做最小时长适配，不按台词字数改成 5s/10s 档位\n` +
+	      `  · 输出正文里只写"镜头 01 / 镜头 02 ..."标题，不要把时长、时间码、duration 字段写进正文；时长/节奏由结构化镜头参数区展示\n` +
       (totalDialogueChars
         ? `  · 本组台词总字数 = ${totalDialogueChars} 字，约 ${charsPerSec.toFixed(1)} 字/秒；不要删字，不要用省略号压缩\n`
         : ``) +
-      `\n` +
-      (allDialogues.length
-        ? `⚠️【台词必须逐字完整保留，一个字都不能少】本组台词清单：\n` +
-          allDialogues.map((d, i) => `   ${i + 1}) ${d}`).join('\n') +
-          `\n   要求：把上面所有台词按出场顺序**逐字**写进对应镜头的时间段画面描述里，` +
-          `用"X 角色开口：'……'，紧接 Y 角色：'……'"形式自然承接。` +
-          `禁止概括 / 省略 / 改写 / 用"……"代替原文。`
-        : `本组无台词，纯画面叙事`),
-  );
+	      `\n` +
+	      `⚠️ 本组表演与画面执行提示：\n` +
+	      performanceLines +
+	      `\n\n` +
+	      (allDialogues.length
+	        ? `⚠️【后台台词表 - 仅用于理解说话人和语速，不要逐字写进可见正文】\n` +
+	          allDialogues.map((d, i) => `   ${i + 1}) ${d}`).join('\n') +
+	          `\n   要求：正文只写"谁开口、语气、口型、听者反应、停顿"，可以写"台词见台词表"；` +
+	          `不要把上面台词逐字抄进 VideoPrompt 正文。生成视频时后端会用独立台词块注入原文。`
+	        : `本组无台词，纯画面叙事`),
+	  );
 
   // 3) 风格圣经精简
   if (opts.styleBible) {
@@ -1524,9 +1722,12 @@ export const SP_VIDEO_PROMPT_REFINE = `${COMMON_RULES}
 
 【任务】根据用户的"修改意图"对现有视频提示词做微调。
 【约束】
-  · 保持原有中文结构化视频提示词格式，段落标题仍使用"运镜系统 / 角色 / 场景 / 计划时间段（如 0-3s / 3-7s） / 基调 / 约束 / 音障"
-  · 严禁修改时间轴、运镜、角色 ID、角色身份、参考图编号
-  · 严禁改写、删减或新增原有台词；如果用户只要求视觉调整，台词必须逐字保留
+  · 保持中文结构化视频提示词格式；段落标题使用"运镜系统 / 角色 / 场景 / 镜头 01 / 镜头 02 / 基调 / 约束 / 音障"
+  · 角色段的"名字（Image N）"或"名字（Image N 角色设定，Image M 脸部近景）"绑定必须完整保留；严禁改动、删除或新增 Image 编号
+  · 严禁修改镜头顺序、核心运镜、角色 ID、角色身份；如果用户要改"时长/节奏"，应提示回到镜头页参数调整，不要在正文里新增时长字段
+  · 不要新增时长、时间码、duration、0-4s、4秒（0:00-0:04）等正文标题
+  · 不要新增或恢复"⟦...⟧"视觉标签
+  · 正文里已有的台词或引号句必须保留；但不要从镜头表/后台台词表额外抄入完整台词。新格式只写谁开口、语气、口型和听者反应
   · 严禁改动角色外貌、服装、物种、声音等主档设定；如果用户要求改角色设定，只能保留原 prompt 并指出该修改应回到资产/角色设定环节处理
   · 只能在用户指定的方面调整（如把镜头放慢、加雾气、改色调）
   · 输出依然是与原版同样结构的中文视频提示词，纯文本
@@ -1537,8 +1738,9 @@ export const SP_VIDEO_PROMPT_REFINE_SANITIZE = `${COMMON_RULES}
 【任务】根据用户的"修改意图"对现有视频提示词做敏感词安全替换。
 【约束】
   · 只替换用户明确列出的敏感词或高风险表达，改成更温和、可过审、语义接近的表达
-  · 本次允许在台词、角色描述、场景、动作或约束段中替换这些敏感词；这是唯一允许覆盖"台词逐字保留"规则的情况
-  · 除敏感词替换外，严禁修改时间轴、运镜、角色 ID、角色身份、参考图编号、段落结构和原有叙事含义
+  · 本次允许在正文已有台词、角色绑定、场景、动作或约束段中替换这些敏感词；这是唯一允许覆盖正文已有台词保留规则的情况
+  · 除敏感词替换外，严禁修改镜头顺序、核心运镜、角色 ID、角色身份、参考图编号、段落结构和原有叙事含义
+  · 不要新增时长、时间码、duration 字段或"⟦...⟧"视觉标签
   · 不得新增台词、删除台词、合并段落或扩写内容；只做必要的词级/短语级替换
   · 输出依然是与原版同样结构的中文视频提示词，纯文本
   · 不要解释，不要 markdown，直接输出新的 prompt`;
@@ -1568,7 +1770,13 @@ export const SP_AGENT_CHAT = `${COMMON_RULES}
 【目标】根据用户提到的具体元素（用 @ 引用的 DOM 元素或字段），给出可执行的修改建议或直接修改。
 【输出协议】
   · 简短回复（≤200 字），最后用一行 [PATCH] 标志说明可以怎样自动改：
-    [PATCH] target=<script|asset:<id>|shot:<idx>|storyboard:<idx>|videoPrompt:<idx>> action=<replace|merge> payload=<JSON>
+    [PATCH] target=<script|asset:char:<idx>|asset:scene:<idx>|asset:prop:<idx>|shot:<idx>|storyboard:<idx>|videoPrompt:<idx>> action=<replace|merge> payload=<JSON>
+  · [PATCH] 是待用户确认的修改方案，正文里不要说"已修改/已完成"，要说"可以应用/建议更新"。
+  · 资产字段名只能用下列英文白名单字段，禁止自造字段名：
+    角色 asset:char → name / role / identity / gender / appearance / clothing / equipment / temperament / actionTraits / description
+    场景 asset:scene → name / location / timeSetting / atmosphere / lighting / elements / description
+    道具 asset:prop → name / propType / function / features / visualFeatures / ownership / description
+  · 道具/场景的"外观/外形/材质/立体感"改动请用 visualFeatures 或 description，不要用 appearance（appearance 只属于角色）。
   · 如果只是聊天没有修改，就不输出 [PATCH] 行。`;
 
 export function buildAgentMessages(opts: { project: any; refs: any[]; userMsg: string }): ChatMessage[] {

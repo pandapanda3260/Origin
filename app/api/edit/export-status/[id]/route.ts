@@ -32,6 +32,8 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   const url = status === 'completed' && hasLocalFile ? `/api/edit/export-file/${row.id}` : null;
   const errorMsg = row.error_msg || '';
   const meta = parseExportMeta(row.edl_json);
+  const exportedEdlSignature = String(meta.exportedEdlSignature || meta.edlSignature || '');
+  const exportedEdlSignatureMeta = meta.exportedEdlSignatureMeta || null;
   const localDownloadStatus = row.local_download_status || meta.vevDemo?.localDownloadStatus || null;
   const needsReviewReason = meta.vevDemo?.needsReviewReason || null;
 
@@ -50,6 +52,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     edlVersion: row.edl_version,
+    edlSignature: exportedEdlSignature,
+    exportedEdlSignature,
+    exportedEdlSignatureMeta,
     done: status === 'completed' || status === 'failed',
     downloadUrl: url,
     error: status === 'failed' ? errorMsg || '导出失败' : '',

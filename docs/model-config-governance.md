@@ -44,6 +44,7 @@ Origin needs to swap models, gateways, and quality/speed tiers frequently. If se
 | `brain` | Creative reasoning, dialogue, script generation | `CLAUDE_*`, then `TEXT_*` |
 | `structured` | Generic JSON repair, validation, extraction | `TEXT_*` |
 | `styleBible` | Style bible extraction | `STYLE_BIBLE_*`, then `TEXT_*` |
+| `projectClassifier` | Early project classification/evaluation, including default style selection and world-model checks | `PROJECT_CLASSIFIER_*`, then task fallback |
 | `profileDerive` | Creator profile derivation | `PROFILE_DERIVE_*`, then `TEXT_*` |
 | `image` | Image generation/editing | `IMAGE_*` |
 | `video` | Video generation | `VIDEO_*` |
@@ -60,7 +61,16 @@ STYLE_BIBLE_REASONING_EFFORT="xhigh"
 
 PROFILE_DERIVE_MODEL="gpt-5.5"
 PROFILE_DERIVE_REASONING_EFFORT="xhigh"
+
+PROJECT_CLASSIFIER_PROVIDER="volcengine_chat"
+PROJECT_CLASSIFIER_API_BASE="https://ark.cn-beijing.volces.com/api/v3"
+PROJECT_CLASSIFIER_API_ENDPOINT="/chat/completions"
+PROJECT_CLASSIFIER_MODEL="doubao-seed-2-0-pro-260215"
+PROJECT_CLASSIFIER_API_KEY="<ark api key>"
 ```
+
+`STYLE_CLASSIFIER_*` remains a backwards-compatible alias for older local env files,
+but new configuration should use `PROJECT_CLASSIFIER_*`.
 
 The shared structured worker remains:
 
@@ -152,6 +162,7 @@ Business routes may set task-intrinsic values:
 - prompt builders
 - `modelRole`
 - 视频参考图预算 / `VIDEO_REFERENCE_IMAGE_BUDGET` 这类 video matcher 策略常量：当它描述的是业务侧参考图选择规则，而不是 provider/model 路由能力时，可以集中放在 matcher 相关代码里；必须保持单点定义，并在这里登记原因。
+  - 2026-06-07：`VIDEO_REFERENCE_IMAGE_BUDGET` 从 7 调整为 9。原因：Seedance 合并片段需要同时提交首帧、场景、关键角色和道具参考图；这是业务侧参考图选择预算，不是 provider/model 路由能力。该常量仍保持在 `lib/video-reference-manifest.ts` 单点定义，并同步影响视频提示词阶段持久化 manifest 与视频提交阶段实际参考图上限。
 
 Business routes must not hardcode global tuning knobs:
 

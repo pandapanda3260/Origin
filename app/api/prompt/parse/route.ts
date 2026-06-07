@@ -9,7 +9,7 @@ export const dynamic = 'force-dynamic';
  * 把视频提示词解析成 { segments: [{time, text}], motionTags, sensitiveHits }
  *
  * 支持两种格式：
- *   1. 中文结构化段落（运镜系统/角色/场景/0-3s/3-5s/基调/约束/音障）— 现行格式
+ *   1. 中文结构化段落（运镜系统/角色/场景/镜头 01/基调/约束/音障）— 现行格式
  *   2. 旧的 [CAMERA]/[STYLE]/... 英文段落 — 兼容
  *   3. 都没有就整段一段
  *
@@ -20,8 +20,10 @@ export const dynamic = 'force-dynamic';
 const CN_SECTION_LABELS = [
   '运镜系统', '角色', '场景', '基调', '约束', '音障', '音效',
 ];
-// 时间段标签（0-3s / 3-5s / 5-10s 等）
-const TIME_SECTION_RE = /^\s*(\d+)\s*[-–~]\s*(\d+)\s*s\s*$/;
+// 镜头段落标签：现行 镜头 01；兼容旧时间段 4秒（0:00-0:04）/ 0-3s。
+const SHOT_SECTION_RE = /^\s*镜头\s*0*(\d+)\s*$/;
+const CLOCK_TIME_SECTION_RE = /^\s*(\d+(?:\.\d+)?)\s*秒\s*[（(]\s*(\d+:\d{2}(?:\.\d+)?)\s*[-–~]\s*(\d+:\d{2}(?:\.\d+)?)\s*[）)]\s*$/;
+const LEGACY_TIME_SECTION_RE = /^\s*(\d+(?:\.\d+)?)\s*[-–~]\s*(\d+(?:\.\d+)?)\s*s\s*$/;
 
 // 老的英文段标签
 const EN_SECTION_RE = /^\s*\[(CAMERA|STYLE|CONSTRAINTS|AUDIO|SCENE)\]/i;
@@ -60,7 +62,8 @@ export async function POST(req: NextRequest) {
 /**
  * 把整段 prompt 按"标题行"切成 segments：
  *   - 中文小节标题（运镜系统/角色/场景/基调/约束/音障）
- *   - 时间段标签（0-3s / 3-5s / 5-10s）
+ *   - 镜头段落标题（镜头 01 / 镜头 02）
+ *   - 时间段标签（4秒（0:00-0:04）/ 旧 0-3s）
  *   - 老的英文 [CAMERA]/[STYLE]/... 段
  */
 function splitIntoSegments(text: string) {
@@ -93,10 +96,24 @@ function splitIntoSegments(text: string) {
       continue;
     }
 
-    // 时间段标签 0-3s / 3-5s
-    const tm = trimmed.match(TIME_SECTION_RE);
-    if (tm) {
-      pushHeader(`${tm[1]}-${tm[2]}s`);
+    // 现行镜头段落标签：镜头 01 / 镜头02
+    const shotSection = trimmed.match(SHOT_SECTION_RE);
+    if (shotSection) {
+      pushHeader(`镜头 ${String(Number(shotSection[1])).padStart(2, '0')}`);
+      continue;
+    }
+
+    // 时间段标签：4秒（0:00-0:04）
+    const clockTime = trimmed.match(CLOCK_TIME_SECTION_RE);
+    if (clockTime) {
+      pushHeader(`${clockTime[1]}秒（${clockTime[2]}-${clockTime[3]}）`);
+      continue;
+    }
+
+    // 兼容旧时间段标签：0-3s / 3-5s
+    const legacyTime = trimmed.match(LEGACY_TIME_SECTION_RE);
+    if (legacyTime) {
+      pushHeader(`${legacyTime[1]}-${legacyTime[2]}s`);
       continue;
     }
 

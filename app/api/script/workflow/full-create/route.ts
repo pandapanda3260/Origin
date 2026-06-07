@@ -14,6 +14,7 @@ import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError }
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { shortKnowledgeHash } from '@/lib/knowledge/hash';
+import { projectWorldContextForStage } from '@/lib/world-template-context';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -81,12 +82,19 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    let scriptText = '';
+	    let scriptText = '';
+    const worldContext = proj
+      ? projectWorldContextForStage('script_create', (proj as any).worldTemplateSnapshot, {
+          project: proj,
+          scriptText: finalBaseScript || sourceText || finalSentence,
+        })
+      : undefined;
     const messages = isRevise
       ? buildReviseMessages({
           baseScript: finalBaseScript,
           instruction,
           durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
+          worldContext,
         })
       : isAdapt
       ? buildAdaptSourceMessages({
@@ -94,12 +102,14 @@ export async function POST(req: NextRequest) {
           durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
           audience,
           creatorPersona: persona,
+          worldContext,
         })
       : buildFullCreateMessages({
           oneSentence: finalSentence,
           durationSec: durationSec || (proj as any)?.scriptTargetDurationSec,
           audience,
           creatorPersona: persona,
+          worldContext,
         });
     try {
       await chatStream(user, messages, {
@@ -178,6 +188,7 @@ export async function POST(req: NextRequest) {
         script: scriptText,
         emotions,
         scriptApproved: false,
+        scriptReviewState: 'draft',
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
         currentStep: 1,
       };

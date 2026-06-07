@@ -4,12 +4,40 @@ import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { dataPath } from '@/lib/runtime-paths';
+import {
+  buildEditExportContentDisposition,
+  buildEditExportDownloadFilename,
+  editExportNameInputFromProject,
+  sanitizeEditExportDownloadFilename,
+} from '@/lib/edit-export-filename';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 function toWebStream(nodeStream: NodeJS.ReadableStream): ReadableStream<Uint8Array> {
   return Readable.toWeb(nodeStream as Readable) as unknown as ReadableStream<Uint8Array>;
+}
+
+function parseJsonObject(value: unknown): any {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveDownloadFilename(row: any): string {
+  const edlMeta = parseJsonObject(row?.edl_json);
+  const projectData = parseJsonObject(row?.project_data_json) || {};
+  const project = {
+    ...projectData,
+    id: row?.project_id || projectData.id,
+    title: row?.project_title || projectData.title,
+  };
+  const fallback = buildEditExportDownloadFilename(editExportNameInputFromProject(project, row?.project_id));
+  return sanitizeEditExportDownloadFilename(edlMeta?.downloadFilename, fallback);
 }
 
 /**
@@ -23,7 +51,12 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) return new Response('bad id', { status: 400 });
 
   const db = getDb();
-  const row = db.prepare<{ id: string }, any>('SELECT * FROM exports WHERE id = @id').get({ id });
+  const row = db.prepare<{ id: string }, any>(
+    `SELECT e.*, p.title AS project_title, p.data_json AS project_data_json
+       FROM exports e
+       LEFT JOIN projects p ON p.id = e.project_id
+      WHERE e.id = @id`,
+  ).get({ id });
   if (!row || !row.filename || row.status !== 'completed') return new Response('not ready', { status: 404 });
   if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
 
@@ -33,6 +66,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   const stat = statSync(fullPath);
   const total = stat.size;
   const range = req.headers.get('range');
+  const contentDisposition = buildEditExportContentDisposition(resolveDownloadFilename(row));
 
   if (range) {
     const m = /bytes=(\d+)-(\d*)/.exec(range);
@@ -56,6 +90,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
           'Content-Range': `bytes ${start}-${end}/${total}`,
           'Accept-Ranges': 'bytes',
           'Content-Length': String(chunkSize),
+          'Content-Disposition': contentDisposition,
           'Cache-Control': 'private, max-age=3600',
         },
       });
@@ -69,7 +104,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       'Content-Type': 'video/mp4',
       'Content-Length': String(total),
       'Accept-Ranges': 'bytes',
-      'Content-Disposition': `inline; filename="${id}.mp4"`,
+      'Content-Disposition': contentDisposition,
       'Cache-Control': 'private, max-age=3600',
     },
   });

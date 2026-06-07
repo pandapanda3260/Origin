@@ -8,7 +8,13 @@ import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { sinicizeColorPalette } from '@/lib/style-bible';
 import { sanitizePromptObject } from '@/lib/content-sanitize';
 import { hashNormalizedScript } from '@/lib/script-style-state';
-import { setRecentWorldStyleMapping } from '@/lib/style-templates-db';
+import {
+  computeStyleTemplateAutoScriptKey,
+  getRecordedStyleTemplateRecommendation,
+  recommendStyleTemplateForScript,
+  recommendStyleTemplateForScriptByRules,
+  setRecentWorldStyleMapping,
+} from '@/lib/style-templates-db';
 import {
   buildStyleBibleConstraintsFromTemplate,
   mergeStyleBibleWithConstraints,
@@ -240,6 +246,77 @@ export async function POST(req: NextRequest) {
     || (proj as any)?.worldTemplateSnapshot
     || null;
   const creatorProfile = body.creatorProfile || (proj as any)?.creatorProfile || {};
+  let autoStyleTemplateRecommendation: any = null;
+
+  const buildAutoStyleTemplateRecommendation = async (currentProject: any) => {
+    if (!shouldAutoSelectStyleTemplate({
+      project: currentProject,
+      styleOptions: effectiveStyleOptions,
+      styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+      requestStyleTemplateSnapshot,
+    })) {
+      return null;
+    }
+    const cacheProject = {
+      ...(currentProject || {}),
+      script: finalScript,
+      selectedStyleTemplateId: cleanTemplateId(effectiveStyleTemplateSnapshot)
+        || currentProject?.selectedStyleTemplateId
+        || null,
+      styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+      styleOptions: effectiveStyleOptions,
+      worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+    };
+    const cached = getRecordedStyleTemplateRecommendation(user.id, cacheProject, {
+      script: finalScript,
+      worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+    });
+    if (cached) return cached;
+    return recommendStyleTemplateForScript(user, {
+      script: finalScript,
+      worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+    });
+  };
+
+  const applyAutoStyleTemplateIfNeeded = (currentProject: any, recommendation: any) => {
+    if (!shouldAutoSelectStyleTemplate({
+      project: currentProject,
+      styleOptions: effectiveStyleOptions,
+      styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+      requestStyleTemplateSnapshot,
+    })) {
+      autoStyleTemplateRecommendation = null;
+      return;
+    }
+    if (!recommendation) {
+      recommendation = recommendStyleTemplateForScriptByRules(user.id, {
+        script: finalScript,
+        worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+      });
+    }
+    const template = recommendation.styleTemplate;
+    if (!template) {
+      autoStyleTemplateRecommendation = null;
+      return;
+    }
+    effectiveStyleTemplateSnapshot = template;
+    effectiveStyleOptions = mergeStyleOptions(effectiveStyleOptions, {
+      styleTemplateSelectionMode: 'auto',
+      styleTemplateSelectionSource: recommendation.source || 'script_auto',
+      styleTemplateSelectedAt: effectiveStyleOptions.styleTemplateSelectedAt || new Date().toISOString(),
+      autoStyleTemplateId: template.id,
+      autoStyleTemplateReason: recommendation.reason || '',
+      autoStyleTemplateScriptKey: recommendation.scriptKey || computeStyleTemplateAutoScriptKey({
+        script: finalScript,
+        selectedWorldTemplateId: currentProject?.selectedWorldTemplateId || '',
+        worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+      }),
+    });
+    autoStyleTemplateRecommendation = recommendation;
+  };
+
+  const preparedAutoStyleTemplateRecommendation = await buildAutoStyleTemplateRecommendation(proj);
+  applyAutoStyleTemplateIfNeeded(proj, preparedAutoStyleTemplateRecommendation);
 
   if (projectId && proj) {
     let locked = false;
@@ -262,9 +339,15 @@ export async function POST(req: NextRequest) {
       effectiveWorldTemplateSnapshot = requestWorldTemplateSnapshot
         || current.worldTemplateSnapshot
         || null;
+      applyAutoStyleTemplateIfNeeded(current, preparedAutoStyleTemplateRecommendation);
+      const autoStyleTemplateId = autoStyleTemplateRecommendation?.styleTemplate?.id || cleanTemplateId(effectiveStyleTemplateSnapshot);
       return {
         allowStyleBibleRunOverwrite: true,
         styleOptions: mergeStyleOptions(current.styleOptions || {}, effectiveStyleOptions),
+        ...(autoStyleTemplateRecommendation ? {
+          selectedStyleTemplateId: autoStyleTemplateId || null,
+          styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+        } : {}),
         styleBibleStatus: 'generating',
         styleBibleError: '',
         styleBibleErrorCode: null,
@@ -293,10 +376,16 @@ export async function POST(req: NextRequest) {
     buildWorldContextFromSnapshot(effectiveWorldTemplateSnapshot),
   ) as WorldContext;
   const styleBibleSourceHash = hashNormalizedScript(finalScript);
+  const effectiveSelectedWorldTemplateId =
+    String(body.selectedWorldTemplateId || (proj as any)?.selectedWorldTemplateId || '').trim() || null;
+  const effectiveSelectedStyleTemplateId =
+    String(body.selectedStyleTemplateId || (proj as any)?.selectedStyleTemplateId || '').trim() || null;
   const styleBibleGenerationContext = buildStyleBibleGenerationContext({
     aspectRatio: effectiveStyleOptions.aspectRatio,
     worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
     styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+    selectedWorldTemplateId: effectiveSelectedWorldTemplateId,
+    selectedStyleTemplateId: effectiveSelectedStyleTemplateId,
   });
   if (projectId && proj) {
     try {
@@ -446,10 +535,12 @@ export async function POST(req: NextRequest) {
         lostLock = true;
         return null;
       }
-      if (current.selectedWorldTemplateId && current.selectedStyleTemplateId) {
+      const autoStyleTemplateId = autoStyleTemplateRecommendation?.styleTemplate?.id || cleanTemplateId(effectiveStyleTemplateSnapshot);
+      const mappedStyleTemplateId = current.selectedStyleTemplateId || autoStyleTemplateId;
+      if (current.selectedWorldTemplateId && mappedStyleTemplateId) {
         recentMapping = {
           worldTemplateId: String(current.selectedWorldTemplateId),
-          styleTemplateId: String(current.selectedStyleTemplateId),
+          styleTemplateId: String(mappedStyleTemplateId),
           worldTemplateOwnerId: current.worldTemplateSnapshot?.ownerId || current.worldTemplateSnapshot?.owner_id,
         };
       }
@@ -457,6 +548,10 @@ export async function POST(req: NextRequest) {
         allowStyleBibleRunOverwrite: true,
         styleBible,
         styleOptions: mergeStyleOptions(current.styleOptions || {}, effectiveStyleOptions),
+        ...(autoStyleTemplateRecommendation ? {
+          selectedStyleTemplateId: autoStyleTemplateId || null,
+          styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+        } : {}),
         styleBibleStatus: 'ready',
         styleBibleError: '',
         styleBibleGeneratedAt,
@@ -503,7 +598,15 @@ export async function POST(req: NextRequest) {
 function mergeStyleOptions(base: any, incoming: any) {
   const next = { ...(base || {}) };
   const src = incoming || {};
-  for (const key of ['aspectRatio'] as const) {
+  for (const key of [
+    'aspectRatio',
+    'styleTemplateSelectionMode',
+    'styleTemplateSelectionSource',
+    'styleTemplateSelectedAt',
+    'autoStyleTemplateId',
+    'autoStyleTemplateReason',
+    'autoStyleTemplateScriptKey',
+  ] as const) {
     if (Object.prototype.hasOwnProperty.call(src, key)) next[key] = src[key];
   }
   if (src.userControls && typeof src.userControls === 'object') {
@@ -515,16 +618,79 @@ function mergeStyleOptions(base: any, incoming: any) {
   delete next.userControls;
   if (!next.aspectRatio) next.aspectRatio = '9:16';
   if (!['16:9', '9:16', '1:1'].includes(String(next.aspectRatio))) next.aspectRatio = '9:16';
+  if (next.styleTemplateSelectionMode && !['auto', 'manual', 'manual_clear'].includes(String(next.styleTemplateSelectionMode))) {
+    delete next.styleTemplateSelectionMode;
+  }
+  if (next.styleTemplateSelectionSource && String(next.styleTemplateSelectionSource).length > 80) {
+    next.styleTemplateSelectionSource = String(next.styleTemplateSelectionSource).slice(0, 80);
+  }
+  if (next.autoStyleTemplateId && String(next.autoStyleTemplateId).length > 100) delete next.autoStyleTemplateId;
+  if (next.autoStyleTemplateReason && String(next.autoStyleTemplateReason).length > 300) {
+    next.autoStyleTemplateReason = String(next.autoStyleTemplateReason).slice(0, 300);
+  }
+  if (next.autoStyleTemplateScriptKey && String(next.autoStyleTemplateScriptKey).length > 80) {
+    next.autoStyleTemplateScriptKey = String(next.autoStyleTemplateScriptKey).slice(0, 80);
+  }
   return next;
+}
+
+function styleSelectionMode(styleOptions: any) {
+  const mode = String(styleOptions?.styleTemplateSelectionMode || '').trim();
+  return ['auto', 'manual', 'manual_clear'].includes(mode) ? mode : '';
+}
+
+function hasManualStyleTemplateSelection(styleOptions: any) {
+  const mode = styleSelectionMode(styleOptions);
+  return mode === 'manual' || mode === 'manual_clear';
+}
+
+function hasGeneratedStyleBible(project: any) {
+  if (!project || typeof project !== 'object') return false;
+  if (project.styleBibleGeneratedAt) return true;
+  if (project.styleBibleGenerationContext?.styleTemplateId) return true;
+  const styleBible = project.styleBible;
+  return !!(styleBible && typeof styleBible === 'object' && Object.keys(styleBible).length > 0);
+}
+
+function projectSelectedStyleTemplateId(project: any, styleTemplateSnapshot: any) {
+  return String(
+    project?.selectedStyleTemplateId
+      || styleTemplateSnapshot?.id
+      || styleTemplateSnapshot?.templateId
+      || styleTemplateSnapshot?.template_id
+      || '',
+  ).trim();
+}
+
+function shouldAutoSelectStyleTemplate(input: {
+  project: any;
+  styleOptions: any;
+  styleTemplateSnapshot: any;
+  requestStyleTemplateSnapshot: any;
+}) {
+  if (hasManualStyleTemplateSelection(input.styleOptions)) return false;
+  const mode = styleSelectionMode(input.styleOptions);
+  if (mode === 'auto') return true;
+  const selectedId = projectSelectedStyleTemplateId(input.project, input.styleTemplateSnapshot);
+  if (!selectedId) return true;
+  if (!input.project && input.requestStyleTemplateSnapshot) return false;
+  return selectedId === 'style_live_action_realistic' && !hasGeneratedStyleBible(input.project);
 }
 
 function buildStyleBibleGenerationContext(input: {
   aspectRatio: any;
   worldTemplateSnapshot: any;
   styleTemplateSnapshot: any;
+  selectedWorldTemplateId?: any;
+  selectedStyleTemplateId?: any;
 }) {
-  const worldId = cleanTemplateId(input.worldTemplateSnapshot);
-  const styleId = cleanTemplateId(input.styleTemplateSnapshot);
+  // 快照缺失时用用户当前选择的模板 id 兜底，保证此处写入的 worldTemplateId/styleTemplateId
+  // 与前端新鲜度对比 _styleCurrentGenerationContext（selectedXxxId || 快照id）口径一致，
+  // 否则重新生成后会一直误报「世界观/风格模板已修改」。
+  const worldId = cleanTemplateId(input.worldTemplateSnapshot)
+    || (String(input.selectedWorldTemplateId || '').trim() || null);
+  const styleId = cleanTemplateId(input.styleTemplateSnapshot)
+    || (String(input.selectedStyleTemplateId || '').trim() || null);
   return {
     aspectRatio: ['16:9', '9:16', '1:1'].includes(String(input.aspectRatio)) ? String(input.aspectRatio) : '9:16',
     worldTemplateId: worldId,

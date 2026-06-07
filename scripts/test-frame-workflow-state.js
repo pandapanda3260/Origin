@@ -29,6 +29,30 @@ function loadFrameWorkflowState() {
     if (id === './image-gen') {
       return { resolveLocalImagePath: () => null };
     }
+    if (id === './segment-planning') {
+      return { planSegments: (shots) => shots.map((_, idx) => [idx]) };
+    }
+    if (id === './feature-flags') {
+      return { isMultiShotSegmentEnabled: () => false };
+    }
+    if (id === './tail-frame-dependency') {
+      const dependencyCompiled = compileTs('lib/tail-frame-dependency.ts');
+      const dependencyModule = { exports: {} };
+      vm.runInNewContext(
+        dependencyCompiled.code,
+        { require: localRequire, module: dependencyModule, exports: dependencyModule.exports, console, process },
+        { filename: dependencyCompiled.sourcePath },
+      );
+      return dependencyModule.exports;
+    }
+    if (id === './project-dependency-state') {
+      return {
+        computeWorldHash: (project) => JSON.stringify({
+          selectedWorldTemplateId: project && project.selectedWorldTemplateId || '',
+          worldTemplateSnapshot: project && project.worldTemplateSnapshot || null,
+        }),
+      };
+    }
     return require(id);
   }
   vm.runInNewContext(
@@ -238,6 +262,23 @@ async function testSingleShotSlotFactoryAndInvariant() {
   mod.assertStoryboardsAlignedWithShots(project, 'factory');
 }
 
+async function testFirstFrameSourceHashIncludesWorld() {
+  const mod = loadFrameWorkflowState();
+  const base = {
+    shots: makeShots(1),
+    storyboards: [{ idx: 0, shotIdx: 1, shotIndices: [0], firstFrameUrl: '/api/images/file/a' }],
+    styleBible: { visualStyle: 'realistic' },
+    selectedWorldTemplateId: 'world-a',
+    worldTemplateSnapshot: { id: 'world-a', worldRules: ['rule A'] },
+  };
+  const hashA = mod.computeFirstFrameSourceHash(base, 1, 0);
+  const hashB = mod.computeFirstFrameSourceHash({
+    ...base,
+    worldTemplateSnapshot: { id: 'world-a', worldRules: ['rule B'] },
+  }, 1, 0);
+  assert(hashA && hashB && hashA !== hashB, 'first frame source hash changes when world snapshot changes');
+}
+
 async function main() {
   const tests = [
     ['migration archives multi-shot and moves single-shot task', testMigrationArchivesMultiShotAndMovesSingleShotTask],
@@ -247,6 +288,7 @@ async function main() {
     ['migration is idempotent after v3', testMigrationIsIdempotentAfterV3],
     ['strict resolver rejects wrong slot', testStrictShotResolverRejectsWrongSlot],
     ['single-shot slot factory and invariant', testSingleShotSlotFactoryAndInvariant],
+    ['first frame source hash includes world', testFirstFrameSourceHashIncludesWorld],
   ];
   let pass = 0;
   for (const [name, fn] of tests) {

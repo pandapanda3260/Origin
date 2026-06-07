@@ -53,6 +53,8 @@ export async function POST(req: NextRequest) {
       updateProjectForUser(projectId, user.id, {
         scriptDraft: cleanScript,
         script: cleanScript,
+        scriptApproved: false,
+        scriptReviewState: 'draft',
       });
     }
 

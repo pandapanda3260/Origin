@@ -21,7 +21,7 @@ const SECRET = (() => {
   return new TextEncoder().encode('dev-jwt-secret-please-change-me-32-bytes-long');
 })();
 
-const TOKEN_TTL = '30d';
+const TOKEN_TTL = '7d';
 const ALG = 'HS256';
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -33,24 +33,25 @@ export async function verifyPassword(plain: string, hashed: string): Promise<boo
 }
 
 export async function signToken(user: UserRow): Promise<string> {
-  const issuedAtMs = Date.now();
-  return new SignJWT({ sub: String(user.id), username: user.username, iat_ms: issuedAtMs })
+  const revokedAtMs = Date.parse(user.token_revoked_at || '');
+  const issuedAtMs = Number.isFinite(revokedAtMs) ? Math.max(Date.now(), revokedAtMs + 1) : Date.now();
+  return new SignJWT({ sub: String(user.id), phone: user.phone || '', iat_ms: issuedAtMs })
     .setProtectedHeader({ alg: ALG })
     .setIssuedAt(Math.floor(issuedAtMs / 1000))
     .setExpirationTime(TOKEN_TTL)
     .sign(SECRET);
 }
 
-export async function verifyToken(token: string): Promise<{ userId: number; username: string } | null> {
+export async function verifyToken(token: string): Promise<{ userId: number; phone: string } | null> {
   try {
     const { payload } = await jwtVerify(token, SECRET, { algorithms: [ALG] });
     const userId = Number(payload.sub);
-    const username = String(payload.username || '');
+    const phone = String(payload.phone || '');
     const issuedAt = Number(payload.iat || 0);
     const issuedAtMs = Number((payload as any).iat_ms || 0);
-    if (!userId || !username) return null;
+    if (!userId) return null;
     if (!isUserTokenStillValid(userId, issuedAt, issuedAtMs)) return null;
-    return { userId, username };
+    return { userId, phone };
   } catch {
     return null;
   }
@@ -112,14 +113,43 @@ export async function findUserByLogin(usernameOrEmail: string): Promise<UserRow 
   return row ?? null;
 }
 
+export async function findUserByPhone(phone: string): Promise<UserRow | null> {
+  const db = getDb();
+  const key = (phone || '').trim();
+  if (!key) return null;
+  const row = db
+    .prepare<{ phone: string }, UserRow>('SELECT * FROM users WHERE phone = @phone LIMIT 1')
+    .get({ phone: key });
+  return row ?? null;
+}
+
 export async function createUser(opts: {
-  username: string;
+  phone?: string;
+  username?: string;
   password: string;
   email?: string;
   displayName?: string;
 }): Promise<UserRow> {
   const db = getDb();
   const passwordHash = await hashPassword(opts.password);
+  const phone = (opts.phone || '').trim();
+  if (phone) {
+    const stmt = db.prepare<
+      { username: string; email: string | null; phone: string; displayName: string; passwordHash: string; emailVerified: number },
+      UserRow
+    >(`INSERT INTO users (username, email, phone, display_name, password_hash, email_verified)
+       VALUES (@username, @email, @phone, @displayName, @passwordHash, @emailVerified)
+       RETURNING *`);
+    return stmt.get({
+      username: phone,
+      email: null,
+      phone,
+      displayName: (opts.displayName || '').trim() || phone,
+      passwordHash,
+      emailVerified: 1,
+    })!;
+  }
+  const username = (opts.username || '').trim();
   const stmt = db.prepare<
     { username: string; email: string | null; displayName: string; passwordHash: string; emailVerified: number },
     UserRow
@@ -127,12 +157,24 @@ export async function createUser(opts: {
      VALUES (@username, @email, @displayName, @passwordHash, @emailVerified)
      RETURNING *`);
   return stmt.get({
-    username: opts.username,
+    username,
     email: opts.email || null,
-    displayName: opts.displayName || opts.username,
+    displayName: opts.displayName || username,
     passwordHash,
     emailVerified: 1,
   })!;
+}
+
+export function revokeUserTokens(userId: number) {
+  getDb()
+    .prepare(
+      `UPDATE users
+          SET token_revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?`,
+    )
+    .run(userId);
+  clearUserAuthCache(userId);
 }
 
 export { userToPublic };

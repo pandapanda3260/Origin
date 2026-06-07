@@ -1,4 +1,4 @@
-import { apiGet, apiPost, escapeHtml, showToast } from './utils.js';
+import { ApiError, apiGet, apiPost, escapeHtml, showToast } from './utils.js';
 import { mountHoloCard } from './holo_card.js';
 
 let _ctx = {};
@@ -6,9 +6,45 @@ let _summary = null;
 let _ledger = [];
 let _pendingOrderNo = '';
 let _paymentMethod = 'wxpay';
+// 防重复提交开关：发起支付 / 兑换 / 取消恢复时置位，避免连点触发多次请求或状态卡死。
+let _checkoutBusy = false;
+let _redeemBusy = false;
+let _subActionBusy = false;
 // 每次 renderBillingPage() 重新渲染前，先销毁上一轮挂在 .plan-card 上的 holo
 // 效果，避免重复绑定 pointer 事件 / 泄漏 rAF。
 let _holoDestroys = [];
+
+// 账务流水时间戳格式化：后端下发 ISO（2026-05-31T04:09:00.000Z），
+// 直接展示给用户不够友好，统一转成本地 "YYYY-MM-DD HH:mm"；解析失败兜底原文。
+function _fmtWhen(raw) {
+  var s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+// 到期日只展示日期（YYYY-MM-DD）：订阅周期末是计费日，不需要精确到分钟，
+// 直接展示后端 ISO 串里的 "T...Z" 既不友好也容易让人误读。解析失败兜底原文。
+function _fmtDate(raw) {
+  var s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+// 账务流水类别中文兜底：仅在后端没下发 reason 文案时使用。
+function _kindLabel(kind) {
+  var map = {
+    text: '文本生成', image: '图片生成', video: '视频生成', export: '导出成片',
+    topup: '积分充值', redeem: '兑换码', refund: '失败退还', gift: '赠送', adjust: '调整',
+  };
+  return map[String(kind || '')] || '账务记录';
+}
 
 export function initBilling(ctx) {
   _ctx = ctx || {};
@@ -76,17 +112,41 @@ export async function loadBillingPlans() {
   }
 }
 
+// 前端支付方式（微信/支付宝）映射到后端 /api/billing/checkout 期望的 provider 字段。
+function _providerFromMethod(method) {
+  return method === 'alipay' ? 'alipay' : 'wechat';
+}
+
 export async function startCheckout(orderType, code, paymentMethod) {
-  var body = {
-    orderType: orderType,
-    paymentMethod: paymentMethod || _paymentMethod || 'wxpay',
-  };
+  var method = paymentMethod || _paymentMethod || 'wxpay';
+  // 对齐后端 checkout 入参：provider + planCode / packCode。
+  var body = { provider: _providerFromMethod(method) };
   if (orderType === 'subscription') body.planCode = code;
-  else body.topupPackCode = code;
-  var order = await apiPost('/api/billing/checkout', body);
-  _pendingOrderNo = (order && order.order_no) || '';
+  else body.packCode = code;
+  var order;
+  try {
+    order = await apiPost('/api/billing/checkout', body);
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    _pendingOrderNo = '';
+    var detail = (e && e.message) ? String(e.message) : '发起支付失败，请稍后重试';
+    showToast(detail, 'warn');
+    renderBillingPage();
+    return { ok: false, detail: detail };
+  }
+  var navigated = submitCheckoutForm(order);
+  if (!navigated) {
+    // 支付通道尚未对接（占位）或未返回可用支付地址：把后端的引导文案如实展示，
+    // 让用户知道下一步该怎么做（例如改用兑换码），而不是抛"支付表单数据不完整"。
+    _pendingOrderNo = '';
+    var msg = (order && order.message) ? String(order.message) : '支付通道维护中，暂时无法发起支付，请稍后再试或使用兑换码。';
+    showToast(msg, 'info');
+    renderBillingPage();
+    return order;
+  }
+  // 真实网关：即将跳转，标记 pending 供返回后轮询/展示。
+  _pendingOrderNo = (order && (order.order_no || order.orderId)) || '';
   renderBillingPage();
-  submitCheckoutForm(order);
   return order;
 }
 
@@ -94,17 +154,21 @@ export async function pollOrder(orderNo) {
   return await apiGet('/api/billing/orders/' + encodeURIComponent(orderNo));
 }
 
+// 返回 true 表示已发起跳转/表单提交（拿到了可用支付地址）；返回 false 表示
+// 没有可用支付目标（占位/未配置），由调用方给出友好提示，而不是抛错。
 export function submitCheckoutForm(order) {
-  var providerPayload = (order && order.providerPayload) || {};
-  var checkoutUrl = providerPayload.checkoutUrl || providerPayload.url || providerPayload.url_qrcode || providerPayload.pay_url || providerPayload.payment_url || providerPayload.cashier_url || providerPayload.code_url || providerPayload.qrcode || providerPayload.qr_url || '';
-  if (checkoutUrl) {
+  order = order || {};
+  var providerPayload = order.providerPayload || {};
+  var checkoutUrl = providerPayload.checkoutUrl || providerPayload.url || providerPayload.url_qrcode || providerPayload.pay_url || providerPayload.payment_url || providerPayload.cashier_url || providerPayload.code_url || providerPayload.qrcode || providerPayload.qr_url || order.payUrl || order.pay_url || '';
+  // 'about:blank' 是后端占位 payUrl，不是真实支付地址，视为不可用。
+  if (checkoutUrl && checkoutUrl !== 'about:blank') {
     window.location.href = String(checkoutUrl);
-    return;
+    return true;
   }
-  var gatewayUrl = (order && order.gateway_url) || '';
-  var fields = (order && order.formFields) || {};
-  if (!gatewayUrl || !fields || typeof fields !== 'object') {
-    throw new Error('支付表单数据不完整');
+  var gatewayUrl = order.gateway_url || '';
+  var fields = order.formFields || {};
+  if (!gatewayUrl || !fields || typeof fields !== 'object' || !Object.keys(fields).length) {
+    return false;
   }
   var form = document.createElement('form');
   form.method = 'POST';
@@ -119,6 +183,29 @@ export function submitCheckoutForm(order) {
   });
   document.body.appendChild(form);
   form.submit();
+  return true;
+}
+
+// 兑换码兑换：后端 /api/billing/redeem 已实现（成功返回 { ok, creditsAdded, message }，
+// 失败返回 { detail }）。这里做前端入口：成功后刷新余额/流水，失败给出明确文案。
+export async function redeemCode(code) {
+  var resp;
+  try {
+    resp = await apiPost('/api/billing/redeem', { code: code });
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e;
+    var failedDetail = (e && e.message) ? String(e.message) : '兑换失败，请检查兑换码后重试';
+    showToast(failedDetail, 'warn');
+    return { ok: false, detail: failedDetail };
+  }
+  if (resp && resp.ok) {
+    await loadBillingSummary();
+    showToast((resp.message ? String(resp.message) : '兑换成功') + (resp.creditsAdded ? '（+' + resp.creditsAdded + ' 积分）' : ''), 'ok');
+    return { ok: true };
+  }
+  var detail = (resp && resp.detail) ? String(resp.detail) : '兑换失败，请检查兑换码后重试';
+  showToast(detail, 'warn');
+  return { ok: false, detail: detail };
 }
 
 export function showBillingPaywall(meta) {
@@ -371,13 +458,40 @@ export function renderBillingPage() {
         return '<span class="plan-feature-badge">' + escapeHtml(label) + '</span>';
       }).join('') + '</div>'
     : '';
+  // 订阅操作（取消续订 / 恢复自动续订）—— 处理器与 .plan-action-btn 样式早已存在，
+  // 但此前从未渲染，导致付费用户无法在账务页取消续订、也看不到"到期停止"状态。
+  // 仅对付费档展示；免费档没有可取消的订阅。
+  var curPlanCode = (_summary.currentPlan && _summary.currentPlan.code) || subscription.plan_code || subscription.planCode || 'free';
+  var isPaidPlan = !!curPlanCode && curPlanCode !== 'free';
+  var subActionHtml = '';
+  if (isPaidPlan) {
+    if (cancelAtPeriodEnd) {
+      subActionHtml =
+        '<div class="flex items-center gap-2 flex-wrap">' +
+          '<span class="text-[10px] font-bold text-amber-300/90 uppercase tracking-wider">' +
+            (periodEnd ? '到期 ' + escapeHtml(_fmtDate(periodEnd)) + ' 后停止' : '到期后停止续订') +
+          '</span>' +
+          '<button type="button" id="btnResumeSubscription" class="plan-action-btn">恢复自动续订</button>' +
+        '</div>';
+    } else {
+      subActionHtml =
+        '<div class="flex items-center gap-2 flex-wrap">' +
+          (periodEnd ? '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-wider">自动续订 · ' + escapeHtml(_fmtDate(periodEnd)) + '</span>' : '') +
+          '<button type="button" id="btnCancelSubscription" class="plan-action-btn">取消续订</button>' +
+        '</div>';
+    }
+  }
   var ledgerRows = (_ledger || []).map(function (item) {
-    var when = item.created_at || item.createdAt || '';
+    // 后端 /api/billing/ledger 与 /api/billing/me 下发字段为 reason / kind / createdAt，
+    // 旧代码读的是 reason_code / entry_type / created_at（均为 undefined），导致每条
+    // 流水都退化成字面量 "ledger"、时间也读不到。这里改读正确字段并格式化时间。
+    var when = _fmtWhen(item.createdAt || item.created_at || '');
+    var label = item.reason || _kindLabel(item.kind || item.entry_type);
     var amount = Number(item.amount || 0);
     var amountText = (amount > 0 ? '+' : '') + amount;
     return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
       '<div class="min-w-0">' +
-        '<div class="text-sm font-medium text-on-surface">' + escapeHtml(item.reason_code || item.entry_type || 'ledger') + '</div>' +
+        '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
         '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + escapeHtml(when) + '</div>' +
       '</div>' +
       '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
@@ -401,7 +515,7 @@ export function renderBillingPage() {
             '<div class="text-[9px] font-bold tracking-[0.3em] text-[#ECEFF1]/50 uppercase">当前套餐 / Current Plan</div>' +
             '<div class="flex items-baseline gap-3 flex-wrap mt-1">' +
               '<span class="text-3xl font-bold plan-price-glow tracking-tighter font-headline uppercase">' + escapeHtml(plan) + '</span>' +
-              '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-widest">' + escapeHtml(statusText) + (periodEnd ? ' · 到期 ' + escapeHtml(periodEnd) : '') + '</span>' +
+              '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-widest">' + escapeHtml(statusText) + (periodEnd ? ' · 到期 ' + escapeHtml(_fmtDate(periodEnd)) : '') + '</span>' +
             '</div>' +
             featureHtml +
             (_pendingOrderNo ? '<div class="text-[11px] text-[#00E5FF] mt-2 font-bold">支付处理中：' + escapeHtml(_pendingOrderNo) + '</div>' : '') +
@@ -412,7 +526,8 @@ export function renderBillingPage() {
             '<div class="plan-balance-cell"><div class="text-[9px] font-bold tracking-widest text-[#ECEFF1]/45 uppercase">常规购买积分</div><div class="text-lg font-bold text-[#ECEFF1] mt-0.5">' + (balances.topupCredits || 0) + '</div></div>' +
           '</div>' +
         '</div>' +
-        '<div class="flex items-center justify-end gap-2 mt-3 flex-wrap">' +
+        '<div class="flex items-center ' + (subActionHtml ? 'justify-between' : 'justify-end') + ' gap-3 mt-3 flex-wrap">' +
+          subActionHtml +
           '<div class="plan-pill-group">' +
             '<button type="button" class="billing-pay-method plan-pill-btn ' + (_paymentMethod === 'wxpay' ? 'is-active' : '') + '" data-pay-method="wxpay">微信</button>' +
             '<button type="button" class="billing-pay-method plan-pill-btn ' + (_paymentMethod === 'alipay' ? 'is-active' : '') + '" data-pay-method="alipay">支付宝</button>' +
@@ -430,6 +545,16 @@ export function renderBillingPage() {
       '<div class="plan-topup-section-title">积分购买 / Credits</div>' +
       '<div class="grid grid-cols-2 gap-3">' + topupCards + '</div>' +
     '</section>' +
+    // 兑换码入口：/api/billing/redeem 早已实现且是当前唯一可用的到账路径
+    // （支付占位 message 也引导用户用兑换码），此前却没有任何前端入口。
+    '<section class="bg-surface-container-lowest rounded-2xl p-6 border border-outline-variant/10 shadow-sm">' +
+      '<div class="text-sm font-bold mb-1">兑换码</div>' +
+      '<div class="text-[11px] text-on-surface-variant/55 mb-4">输入兑换码，积分立即到账。</div>' +
+      '<div class="flex items-center gap-2 flex-wrap">' +
+        '<input id="billingRedeemInput" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="输入兑换码" class="flex-1 min-w-[180px] px-4 py-2.5 rounded-xl border border-outline-variant/30 bg-white/60 text-sm text-on-surface placeholder:text-on-surface-variant/40 focus:outline-none focus:border-primary/60 transition-colors" />' +
+        '<button type="button" id="billingRedeemBtn" class="px-5 py-2.5 rounded-xl text-sm font-bold bg-[#0B1320] text-[#ECEFF1] hover:bg-[#00E5FF] hover:text-[#0B1320] active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed">兑换</button>' +
+      '</div>' +
+    '</section>' +
     '<section class="bg-surface-container-lowest rounded-2xl p-6 border border-outline-variant/10 shadow-sm">' +
       '<div class="text-sm font-bold mb-4">最近账务流水</div>' +
       '<div>' + ledgerRows + '</div>' +
@@ -440,44 +565,83 @@ export function renderBillingPage() {
       renderBillingPage();
     });
   });
-  var resumeBtn = host.querySelector('#btnResumeSubscription');
-  if (resumeBtn) {
-    resumeBtn.addEventListener('click', async function () {
+  // 取消/恢复续订：加 busy 守卫 + 按钮禁用，防止连点重复请求；成功后
+  // loadBillingSummary() 会整页重渲替换按钮，失败则恢复按钮可用。
+  function _bindSubAction(btn, fn, failMsg) {
+    if (!btn) return;
+    btn.addEventListener('click', async function () {
+      if (_subActionBusy) return;
+      _subActionBusy = true;
+      btn.disabled = true;
+      var prev = btn.textContent;
+      btn.textContent = '处理中…';
       try {
-        await resumeSubscription();
+        await fn();
       } catch (e) {
-        showToast(e && e.message ? e.message : '恢复失败', 'error');
+        showToast(e && e.message ? e.message : failMsg, 'error');
+        if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = prev; }
+      } finally {
+        _subActionBusy = false;
       }
     });
   }
-  var cancelBtn = host.querySelector('#btnCancelSubscription');
-  if (cancelBtn) {
-    cancelBtn.addEventListener('click', async function () {
+  _bindSubAction(host.querySelector('#btnResumeSubscription'), resumeSubscription, '恢复失败');
+  _bindSubAction(host.querySelector('#btnCancelSubscription'), cancelSubscription, '取消失败');
+
+  // 发起支付：全局 _checkoutBusy 守卫，避免同时点多个套餐/积分包重复下单；
+  // 点击后按钮禁用 + "处理中…"，startCheckout 内部成功/占位/错误都会重渲。
+  function _bindCheckout(btn, orderType, attr) {
+    btn.addEventListener('click', async function () {
+      if (_checkoutBusy || btn.disabled) return;
+      _checkoutBusy = true;
+      btn.disabled = true;
+      var prev = btn.textContent;
+      btn.textContent = '处理中…';
       try {
-        await cancelSubscription();
+        await startCheckout(orderType, btn.getAttribute(attr), _paymentMethod);
       } catch (e) {
-        showToast(e && e.message ? e.message : '取消失败', 'error');
+        showToast(e && e.message ? e.message : '发起支付失败', 'error');
+      } finally {
+        _checkoutBusy = false;
+        if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = prev; }
       }
     });
   }
   Array.prototype.slice.call(host.querySelectorAll('[data-plan-code]')).forEach(function (btn) {
-    btn.addEventListener('click', async function () {
-      try {
-        await startCheckout('subscription', btn.getAttribute('data-plan-code'), _paymentMethod);
-      } catch (e) {
-        showToast(e && e.message ? e.message : '发起支付失败', 'error');
-      }
-    });
+    _bindCheckout(btn, 'subscription', 'data-plan-code');
   });
   Array.prototype.slice.call(host.querySelectorAll('[data-topup-code]')).forEach(function (btn) {
-    btn.addEventListener('click', async function () {
-      try {
-        await startCheckout('topup', btn.getAttribute('data-topup-code'), _paymentMethod);
-      } catch (e) {
-        showToast(e && e.message ? e.message : '发起支付失败', 'error');
-      }
-    });
+    _bindCheckout(btn, 'topup', 'data-topup-code');
   });
+
+  // 兑换码：点击或回车提交；busy 守卫防连点；成功后整页重渲并清空输入。
+  var redeemBtn = host.querySelector('#billingRedeemBtn');
+  var redeemInput = host.querySelector('#billingRedeemInput');
+  if (redeemBtn && redeemInput) {
+    var doRedeem = async function () {
+      if (_redeemBusy) return;
+      var code = (redeemInput.value || '').trim();
+      if (!code) { showToast('请输入兑换码', 'warn'); try { redeemInput.focus(); } catch (_e) {} return; }
+      _redeemBusy = true;
+      redeemBtn.disabled = true;
+      redeemInput.disabled = true;
+      var prev = redeemBtn.textContent;
+      redeemBtn.textContent = '兑换中…';
+      try {
+        await redeemCode(code);
+      } catch (e) {
+        showToast(e && e.message ? e.message : '兑换失败', 'error');
+      } finally {
+        _redeemBusy = false;
+        if (document.body.contains(redeemBtn)) { redeemBtn.disabled = false; redeemBtn.textContent = prev; }
+        if (document.body.contains(redeemInput)) { redeemInput.disabled = false; }
+      }
+    };
+    redeemBtn.addEventListener('click', doRedeem);
+    redeemInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); doRedeem(); }
+    });
+  }
   // 为每张订阅套餐卡挂 holographic tilt + shine + glare（参考 reactbits
   // profile-card）。纯视觉层，不触碰支付/数据；destroy fn 收集起来下次重渲前
   // 先统一释放，保证 pointer 事件与 rAF 不会叠加。

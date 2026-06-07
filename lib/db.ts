@@ -19,7 +19,6 @@ const DATA_DIR = getDataDir();
 const DB_PATH = process.env.DB_PATH || dataPath('qd.sqlite');
 const DEV_ADMIN_USERNAME = 'origin-admin';
 const DEV_ADMIN_PASSWORD = 'origin-admin-dev-2026!';
-const LEGACY_DEV_ADMIN_USERNAME = 'pokerman';
 
 declare global {
   // eslint-disable-next-line no-var
@@ -55,6 +54,7 @@ function bootstrap(db: Database.Database) {
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       username      TEXT UNIQUE NOT NULL,
       email         TEXT UNIQUE,
+      phone         TEXT,
       display_name  TEXT NOT NULL,
       password_hash TEXT NOT NULL,
       email_verified INTEGER NOT NULL DEFAULT 0,
@@ -445,6 +445,49 @@ function bootstrap(db: Database.Database) {
       ON toolbox_items(owner_id, status, tool_type);
     CREATE INDEX IF NOT EXISTS idx_toolbox_items_parent
       ON toolbox_items(parent_item_id);
+
+    -- 角色定制：独立于项目资产页的自定义角色与版本历史。
+    CREATE TABLE IF NOT EXISTS custom_characters (
+      id                 TEXT PRIMARY KEY,
+      owner_id           INTEGER NOT NULL,
+      project_id         TEXT,
+      current_version_id TEXT,
+      title              TEXT NOT NULL DEFAULT '未命名角色',
+      lifecycle_status   TEXT NOT NULL DEFAULT 'confirmed',
+      confirmed_at       TEXT,
+      created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_custom_characters_owner_project_time
+      ON custom_characters(owner_id, project_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS custom_character_versions (
+      id              TEXT PRIMARY KEY,
+      character_id    TEXT NOT NULL,
+      owner_id        INTEGER NOT NULL,
+      project_id      TEXT,
+      version_no      INTEGER NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'completed',
+      source_type     TEXT NOT NULL DEFAULT 'prompt',
+      prompt          TEXT NOT NULL DEFAULT '',
+      params_json     TEXT NOT NULL DEFAULT '{}',
+      input_refs_json TEXT NOT NULL DEFAULT '[]',
+      fields_json     TEXT NOT NULL DEFAULT '{}',
+      result_image_id TEXT,
+      source_hash     TEXT,
+      error_message   TEXT,
+      created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (character_id) REFERENCES custom_characters(id) ON DELETE CASCADE,
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_custom_character_versions_number
+      ON custom_character_versions(character_id, version_no);
+    CREATE INDEX IF NOT EXISTS idx_custom_character_versions_owner_time
+      ON custom_character_versions(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_custom_character_versions_character_time
+      ON custom_character_versions(character_id, version_no DESC);
 
     -- 素材库 v1：长期资产索引。真实文件型素材才进入 assets；
     -- 生成中、失败槽位、部分成功记录进入 generation_batches / generation_failures。
@@ -966,10 +1009,10 @@ function bootstrap(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_user_activity_last_seen
       ON user_activity(last_seen_at DESC);
 
-    -- 注册邮箱验证码（OTP）
+    -- 注册/登录/重置密码短信验证码（OTP）
     CREATE TABLE IF NOT EXISTS otp_codes (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      email        TEXT NOT NULL,
+      phone        TEXT NOT NULL,
       code_hash    TEXT NOT NULL,
       purpose      TEXT NOT NULL DEFAULT 'register',
       ip           TEXT,
@@ -978,7 +1021,6 @@ function bootstrap(db: Database.Database) {
       expires_at   TEXT NOT NULL,
       created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
-    CREATE INDEX IF NOT EXISTS idx_otp_email ON otp_codes(email, purpose, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_otp_ip ON otp_codes(ip, created_at DESC);
   `);
 
@@ -1002,6 +1044,9 @@ function bootstrap(db: Database.Database) {
   migrateOperationalLinkageColumns(db);
   migrateProjectsVersionColumn(db);
   migrateVideoPromptSnapshotColumn(db);
+  migrateCustomCharacterLifecycleColumns(db);
+  migratePhoneIdentityColumns(db);
+  migrateOtpPhoneIdentityTable(db);
 }
 
 // projects.version：乐观锁版本号迁移。老库没有这一列，给所有现存项目兜底成 1。
@@ -1023,11 +1068,74 @@ function migrateVideoPromptSnapshotColumn(db: Database.Database) {
   }
 }
 
+function migrateCustomCharacterLifecycleColumns(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'custom_characters', 'lifecycle_status', "lifecycle_status TEXT NOT NULL DEFAULT 'confirmed'");
+    addColumnIfMissing(db, 'custom_characters', 'confirmed_at', 'confirmed_at TEXT');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_custom_characters_owner_lifecycle_project_time
+      ON custom_characters(owner_id, lifecycle_status, project_id, updated_at DESC)`);
+  } catch (e) {
+    console.warn('[db] migrateCustomCharacterLifecycleColumns failed:', e);
+  }
+}
+
 function addColumnIfMissing(db: Database.Database, table: string, column: string, ddl: string) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
     console.log(`[db] migrated ${table}: added ${column}`);
+  }
+}
+
+function columnExists(db: Database.Database, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
+}
+
+function migratePhoneIdentityColumns(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'users', 'phone', 'phone TEXT');
+    const seedPhone = normalizeSeedPhone(process.env.SEED_PHONE || '');
+    const seedUser = (process.env.SEED_USER || '').trim();
+    if (seedPhone && seedUser) {
+      db.prepare(
+        `UPDATE users
+            SET phone = @phone,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE phone IS NULL
+            AND username = @username
+            AND NOT EXISTS (SELECT 1 FROM users WHERE phone = @phone)`,
+      ).run({ phone: seedPhone, username: seedUser });
+    }
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_phone ON users(phone) WHERE phone IS NOT NULL`);
+  } catch (e) {
+    console.warn('[db] migratePhoneIdentityColumns failed:', e);
+  }
+}
+
+function migrateOtpPhoneIdentityTable(db: Database.Database) {
+  try {
+    const cols = db.prepare("PRAGMA table_info(otp_codes)").all() as Array<{ name: string }>;
+    if (cols.length && !cols.some((c) => c.name === 'phone')) {
+      db.exec('DROP TABLE IF EXISTS otp_codes');
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS otp_codes (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone        TEXT NOT NULL,
+        code_hash    TEXT NOT NULL,
+        purpose      TEXT NOT NULL DEFAULT 'register',
+        ip           TEXT,
+        used         INTEGER NOT NULL DEFAULT 0,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        expires_at   TEXT NOT NULL,
+        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_otp_phone ON otp_codes(phone, purpose, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_otp_ip ON otp_codes(ip, created_at DESC);
+    `);
+  } catch (e) {
+    console.warn('[db] migrateOtpPhoneIdentityTable failed:', e);
   }
 }
 
@@ -1491,8 +1599,7 @@ function seedDefaultCredits(db: Database.Database) {
     )
     .all();
   for (const u of rows) {
-    // 默认账号 pokerman（id=1）给 5000 积分方便测试，其他人给 100
-    const seedCredits = u.id === 1 ? 5000 : 100;
+    const seedCredits = 100;
     db.prepare(
       `INSERT INTO user_credits (user_id, total_credits, subscription_credits, plan_code)
        VALUES (?, ?, ?, 'free')`,
@@ -1846,21 +1953,39 @@ function seedDefaultUser(db: Database.Database) {
   const count = db.prepare<[], { c: number }>('SELECT COUNT(*) AS c FROM users').get();
   if (count && count.c > 0) return;
 
-  const username = process.env.SEED_USER || 'pokerman';
-  const password = process.env.SEED_PASSWORD || 'joker0606';
-  const email = process.env.SEED_EMAIL || 'demo@local.dev';
+  const phone = normalizeSeedPhone(process.env.SEED_PHONE || '');
+  const password = process.env.SEED_PASSWORD || '';
+  const username = phone;
+  const email = process.env.SEED_EMAIL || null;
+  const displayName = (process.env.SEED_DISPLAY_NAME || '本地测试用户').trim();
+  if (!phone || !password) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[db] users is empty but SEED_PHONE / SEED_PASSWORD are not both set; skipping default frontend user seed.');
+    }
+    return;
+  }
 
-  db.prepare(
-    `INSERT INTO users (username, email, display_name, password_hash, email_verified)
-     VALUES (?, ?, ?, ?, 1)`,
-  ).run(username, email, username, hashSync(password, 10));
+  if (columnExists(db, 'users', 'phone')) {
+    db.prepare(
+      `INSERT INTO users (username, email, phone, display_name, password_hash, email_verified)
+       VALUES (?, ?, ?, ?, ?, 1)`,
+    ).run(username, email, phone, displayName || phone, hashSync(password, 10));
+  } else {
+    db.prepare(
+      `INSERT INTO users (username, email, display_name, password_hash, email_verified)
+       VALUES (?, ?, ?, ?, 1)`,
+    ).run(username, email, displayName || phone, hashSync(password, 10));
+  }
 
-  console.log(`[db] Seeded default user: ${username} / ${password} (email: ${email})`);
+  console.log(`[db] Seeded frontend user for phone: ${phone}`);
+}
+
+function normalizeSeedPhone(raw: string): string | null {
+  const normalized = String(raw || '').replace(/[\s-]/g, '').replace(/^\+?86/, '');
+  return /^1[3-9]\d{9}$/.test(normalized) ? normalized : null;
 }
 
 function seedDefaultAdminUser(db: Database.Database) {
-  migrateLegacyDevAdminCredentials(db);
-
   const count = db.prepare<[], { c: number }>('SELECT COUNT(*) AS c FROM admin_users').get();
   if (count && count.c > 0) return;
 
@@ -1925,6 +2050,7 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
   const legacyColumn = ['is', 'admin'].join('_');
   const cols = db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === legacyColumn)) return;
+  const hasPhone = cols.some((c) => c.name === 'phone');
 
   console.log('[db] migrating users: dropping legacy admin marker column');
   db.pragma('foreign_keys = OFF');
@@ -1935,6 +2061,7 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
           id            INTEGER PRIMARY KEY AUTOINCREMENT,
           username      TEXT UNIQUE NOT NULL,
           email         TEXT UNIQUE,
+          phone         TEXT,
           display_name  TEXT NOT NULL,
           password_hash TEXT NOT NULL,
           email_verified INTEGER NOT NULL DEFAULT 0,
@@ -1944,10 +2071,10 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
           updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         INSERT INTO users_new
-          (id, username, email, display_name, password_hash, email_verified,
+          (id, username, email, phone, display_name, password_hash, email_verified,
            disabled_at, token_revoked_at, created_at, updated_at)
         SELECT
-          id, username, email, display_name, password_hash, email_verified,
+          id, username, email, ${hasPhone ? 'phone' : 'NULL AS phone'}, display_name, password_hash, email_verified,
           disabled_at, token_revoked_at, created_at, updated_at
         FROM users;
         DROP TABLE users;
@@ -1956,41 +2083,6 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
     })();
   } finally {
     db.pragma('foreign_keys = ON');
-  }
-}
-
-function migrateLegacyDevAdminCredentials(db: Database.Database) {
-  if (process.env.NODE_ENV === 'production') return;
-  try {
-    const now = new Date().toISOString();
-    const legacy = db
-      .prepare<{ username: string }, { id: number }>('SELECT id FROM admin_users WHERE username = @username LIMIT 1')
-      .get({ username: LEGACY_DEV_ADMIN_USERNAME });
-    if (!legacy) return;
-    const current = db
-      .prepare<{ username: string }, { id: number }>('SELECT id FROM admin_users WHERE username = @username LIMIT 1')
-      .get({ username: DEV_ADMIN_USERNAME });
-    if (!current) {
-      db.prepare(
-        `UPDATE admin_users
-            SET username = ?,
-                password_hash = ?,
-                disabled_at = NULL,
-                token_revoked_at = ?
-          WHERE id = ?`,
-      ).run(DEV_ADMIN_USERNAME, hashSync(DEV_ADMIN_PASSWORD, 10), now, legacy.id);
-      console.warn(`[db] migrated development admin ${LEGACY_DEV_ADMIN_USERNAME} -> ${DEV_ADMIN_USERNAME}`);
-      return;
-    }
-    db.prepare(
-      `UPDATE admin_users
-          SET disabled_at = COALESCE(disabled_at, ?),
-              token_revoked_at = ?
-        WHERE id = ?`,
-    ).run(now, now, legacy.id);
-    console.warn(`[db] disabled legacy development admin ${LEGACY_DEV_ADMIN_USERNAME}; use ${DEV_ADMIN_USERNAME}.`);
-  } catch (e) {
-    console.warn('[db] migrateLegacyDevAdminCredentials:', e);
   }
 }
 
@@ -2018,6 +2110,7 @@ export type UserRow = {
   id: number;
   username: string;
   email: string | null;
+  phone: string | null;
   display_name: string;
   password_hash: string;
   email_verified: number;
@@ -2054,10 +2147,8 @@ export type ProjectRow = {
 export function userToPublic(u: UserRow) {
   return {
     id: u.id,
-    username: u.username,
+    phone: u.phone || '',
     displayName: u.display_name,
-    email: u.email || '',
-    emailVerified: !!u.email_verified,
     createdAt: u.created_at,
   };
 }

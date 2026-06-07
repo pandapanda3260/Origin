@@ -9,6 +9,7 @@ export const SHOT_PLAN_STALE_REASONS = [
   'assets_changed',
   'duration_changed',
   'emotion_changed',
+  'world_changed',
   'upstream_changed_during_generation',
   'manual_shot_edit',
   'unknown',
@@ -27,6 +28,8 @@ export const SHOT_PLAN_DEPENDENCY_KEYS = [
   'scriptTargetDurationSec',
   'targetDurationSec',
   'durationSec',
+  'selectedWorldTemplateId',
+  'worldTemplateSnapshot',
 ] as const;
 
 export type ShotPlanStatus = typeof SHOT_PLAN_STATUSES[number];
@@ -39,6 +42,7 @@ export type ShotPlanSourceSnapshot = {
   assetsHash: string;
   durationHash: string;
   emotionHash: string;
+  worldHash: string;
 };
 
 const SNAPSHOT_REASON_BY_KEY: Record<keyof ShotPlanSourceSnapshot, ShotPlanStaleReason> = {
@@ -47,6 +51,7 @@ const SNAPSHOT_REASON_BY_KEY: Record<keyof ShotPlanSourceSnapshot, ShotPlanStale
   assetsHash: 'assets_changed',
   durationHash: 'duration_changed',
   emotionHash: 'emotion_changed',
+  worldHash: 'world_changed',
 };
 
 export class ShotPlanConfirmInvalidStateError extends Error {
@@ -239,6 +244,13 @@ export function computeEmotionHash(project: any): string {
   return hashValue(normalizeEmotionsForShotPlan(project));
 }
 
+export function computeWorldHash(project: any): string {
+  return hashValue({
+    selectedWorldTemplateId: normalizeText(project?.selectedWorldTemplateId),
+    worldTemplateSnapshot: project?.worldTemplateSnapshot || null,
+  });
+}
+
 export function computeShotPlanSourceSnapshot(project: any): ShotPlanSourceSnapshot {
   return {
     scriptHash: computeScriptHash(project),
@@ -246,6 +258,7 @@ export function computeShotPlanSourceSnapshot(project: any): ShotPlanSourceSnaps
     assetsHash: computeAssetsSemanticHash(project),
     durationHash: computeDurationHash(project),
     emotionHash: computeEmotionHash(project),
+    worldHash: computeWorldHash(project),
   };
 }
 
@@ -430,6 +443,7 @@ export function beginShotPlanGeneration(project: any, opts: {
 export function completeShotPlanGenerationPatch(project: any, opts: {
   batchId: string;
   shots: any[];
+  planMeta?: any;
   storyboards: any[];
   sourceHash?: string;
   sourceSnapshot?: ShotPlanSourceSnapshot;
@@ -481,6 +495,9 @@ export function completeShotPlanGenerationPatch(project: any, opts: {
     shotPlanStaleReasons: reasons,
     shotPlanStaleAt: isStale ? now : undefined,
   };
+  if (Object.prototype.hasOwnProperty.call(opts, 'planMeta')) {
+    patch.planMeta = opts.planMeta ?? null;
+  }
   if (isStale) {
     const seeded = seedDownstreamStaleForShotPlan({ ...(project || {}), ...patch }, { reasons, now });
     patch = {
@@ -622,9 +639,17 @@ const SHOT_MANUAL_COMPARE_FIELDS = [
   'sceneId',
   'sceneName',
   'scene',
-  'duration',
-  'shotType',
-  'camera',
+	  'duration',
+	  'durationSec',
+	  'shotType',
+	  'framing',
+	  'angle',
+	  'lens',
+	  'focus',
+	  'light',
+	  'composition',
+	  'camera',
+	  'movement',
   'visual',
   'dialogue',
   'keyInfo',
@@ -659,6 +684,7 @@ export function archiveCurrentShotPlan(
     shotPlanGeneratedAt: project?.shotPlanGeneratedAt,
     shotPlanSourceHash: project?.shotPlanSourceHash,
     shotPlanSourceSnapshot: project?.shotPlanSourceSnapshot,
+    planMeta: project?.planMeta ? JSON.parse(JSON.stringify(project.planMeta)) : undefined,
     shots: JSON.parse(JSON.stringify(shots)),
   });
   return {

@@ -93,7 +93,7 @@ assert.match(
 );
 
 const framePromptStart = source.indexOf('function _framePromptForPanel(kind, sb, group) {');
-const framePromptEnd = source.indexOf('\nfunction _framePlanSummaryForPanel', framePromptStart);
+const framePromptEnd = source.indexOf('\nfunction _sbFirstFrameCardPromptStatusInner', framePromptStart);
 assert.ok(framePromptStart >= 0 && framePromptEnd > framePromptStart, 'storyboard frame prompt helper must be present');
 const framePromptForPanelSource = source.slice(framePromptStart, framePromptEnd);
 
@@ -117,7 +117,7 @@ assert.doesNotMatch(
 
 assert.match(
   source,
-  /function _sbFirstFramePromptEditorHtml\(gIdx, text\)[\s\S]*?<textarea class="sb-frame-text-box sb-frame-prompt-editor"[\s\S]*?data-sb-first-prompt-field="content"[\s\S]*?rows="18"/,
+  /function _sbFirstFramePromptEditorHtml\(gIdx, text, opts\)[\s\S]*?<textarea class="sb-frame-text-box sb-frame-prompt-editor[\s\S]*?data-sb-first-prompt-field="content"[\s\S]*?rows="18"/,
   'first-frame card description must render as an editable 18-row textarea bound to draft content',
 );
 
@@ -491,6 +491,42 @@ assert.match(
   source,
   /async function _persistMaterialReferenceSelection\(options\)[\s\S]*?var isEditor = base\.source === 'editor'[\s\S]*?if \(isEditor\)[\s\S]*?_ffeSaveBeforeReferenceMutation[\s\S]*?\/api\/frames\/reference-selection/,
   'reference selection mutation must only flush editor autosave for editor-sourced writes',
+);
+
+assert.match(
+  source,
+  /function _sbApplyFirstFrameCardPromptDraftResponse\(gIdx, resp, options\)[\s\S]*?state\.savedDraftFingerprint = String\(resp\.savedDraftFingerprint \|\| ''\);[\s\S]*?state\.expectedFingerprint = state\.savedDraftFingerprint[\s\S]*?options\.preserveTextarea === true[\s\S]*?_sbRefreshFirstFrameCardPendingDraft\(gIdx\)/,
+  'first-frame card prompt baseline sync must refresh expected fingerprint while preserving active textarea edits',
+);
+
+assert.match(
+  source,
+  /function _ffeApplyDraftSaveResponse\(resp, options\)[\s\S]*?_sbApplyFirstFrameCardPromptDraftResponse\(_firstFrameEditor\.groupIdx, resp, \{ preserveTextarea: true \}\)/,
+  'first-frame modal saves must also update card prompt autosave baseline',
+);
+
+assert.match(
+  source,
+  /async function _persistMaterialReferenceSelection\(options\)[\s\S]*?if \(isEditor\) _ffeApplyDraftSaveResponse\(resp, \{ source: 'reference' \}\);[\s\S]*?else _sbApplyFirstFrameCardPromptDraftResponse\(base\.groupIdx, resp, \{ preserveTextarea: true \}\);[\s\S]*?if \(resp\.firstFrameMaterialPanel\) _applyMaterialMutationPanel/,
+  'shot-card reference selection must sync returned draft fingerprint into the card prompt autosave baseline',
+);
+
+assert.match(
+  source,
+  /async function _sbRunFirstFrameCardPromptSave\(gIdx, options\)[\s\S]*?state\.draftCommitRefreshPending[\s\S]*?_sbRefreshFirstFrameCardPromptBaselineFromServer\(gIdx, \{ preserveTextarea: true \}\)[\s\S]*?postPayload\.code !== 'saved_draft_changed'[\s\S]*?clearDraftCommitRefreshPending: true[\s\S]*?resp = await postSnapshot\(snapshot\)/,
+  'first-frame card autosave must refresh and retry once when generation has committed the edit draft',
+);
+
+assert.match(
+  source,
+  /export async function generateStoryboardSheet\(gIdx, opts\)[\s\S]*?applyEditDraft: opts\.applyEditDraft === true[\s\S]*?if \(opts\.applyEditDraft === true\) _sbMarkFirstFrameCardPromptDraftCommitPending\(gIdx\)[\s\S]*?_sbRefreshFirstFrameCardPromptBaselinesFromServer\(\[\{ groupIdx: gIdx \}\], \{[\s\S]*?clearDraftCommitRefreshPending: true/,
+  'single first-frame generation must mark and clear card prompt draft-commit refresh state',
+);
+
+assert.match(
+  source,
+  /applyEditDraft: true,[\s\S]*?\}\);[\s\S]*?_sbMarkFirstFrameCardPromptDraftCommitPendingForTargets\(targets\)[\s\S]*?_sbRefreshFirstFrameCardPromptBaselinesFromServer\(targets, \{[\s\S]*?clearDraftCommitRefreshPending: true/,
+  'batch first-frame generation must refresh card prompt baselines after applying edit drafts',
 );
 
 assert.match(

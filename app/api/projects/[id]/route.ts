@@ -3,7 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { deleteProjectForUser, getProjectByIdForUser, StaleProjectVersionError, updateProjectForUser } from '@/lib/projects-db';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { attachVideoPromptReadiness } from '@/lib/video-prompt-state';
-import { mutateCharacterLock } from '@/lib/character-consistency';
+import { mutateCharacterLock, syncWorldCharactersIntoConsistency } from '@/lib/character-consistency';
 import { attachAssetLibraryCurrentToProject } from '@/lib/asset-library';
 
 export const runtime = 'nodejs';
@@ -161,6 +161,22 @@ function applyProjectPutCharacterConsistency(current: any, body: any) {
   return changed ? { ...patch, consistency: consistencyProject.consistency } : patch;
 }
 
+function applyProjectPutWorldConsistency(current: any, patch: any) {
+  if (!current || !patch || typeof patch !== 'object') return patch;
+  const worldTouched = Object.prototype.hasOwnProperty.call(patch, 'worldTemplateSnapshot')
+    || Object.prototype.hasOwnProperty.call(patch, 'selectedWorldTemplateId');
+  if (!worldTouched) return patch;
+
+  const nextProject: any = { ...current, ...patch };
+  const result = syncWorldCharactersIntoConsistency(nextProject, { source: 'world_template' });
+  return result.changed ? { ...patch, consistency: result.project.consistency } : patch;
+}
+
+function applyProjectPutConsistency(current: any, body: any) {
+  const withCharacterConsistency = applyProjectPutCharacterConsistency(current, body);
+  return applyProjectPutWorldConsistency(current, withCharacterConsistency);
+}
+
 // `If-Match` 头格式约定：`v<int>`（兼容前端 project.js `_serverSave` 的发送格式）。
 // 不带头 / 解析失败 → 返回 undefined（回退到老的"无版本校验"语义，兼容老客户端）。
 function parseIfMatchVersion(req: NextRequest): number | undefined {
@@ -170,6 +186,18 @@ function parseIfMatchVersion(req: NextRequest): number | undefined {
   if (!m) return undefined;
   const n = Number(m[1]);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function isExplicitTitleUpdate(req: NextRequest, body: any): boolean {
+  const header = String(req.headers.get('x-origin-title-update') || '').trim().toLowerCase();
+  return header === '1' || header === 'true' || body?.__titleUpdate === true;
+}
+
+function removeRouteOnlyFields(patch: any): any {
+  if (!patch || typeof patch !== 'object') return patch;
+  const next = { ...patch };
+  delete next.__titleUpdate;
+  return next;
 }
 
 export async function PUT(req: NextRequest, { params }: { params: { id: string } }) {
@@ -183,13 +211,18 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
   // 前端内存里还停在旧快照，debounced saveProject 拿着旧 storyboards 来 PUT。
   // 老前端 / 老客户端不发 If-Match → expectedVersion=undefined → 走原本的覆盖语义，不破坏现状。
   const expectedVersion = parseIfMatchVersion(req);
+  const allowTitleUpdate = isExplicitTitleUpdate(req, body);
+  const patch = removeRouteOnlyFields(applyProjectPutConsistency(current as any, body));
   let proj: any;
   try {
     proj = updateProjectForUser(
       params.id,
       user.id,
-      applyProjectPutCharacterConsistency(current as any, body),
-      typeof expectedVersion === 'number' ? { expectedVersion } : undefined,
+      patch,
+      {
+        ...(typeof expectedVersion === 'number' ? { expectedVersion } : {}),
+        allowTitleUpdate,
+      },
     );
   } catch (e: any) {
     if (e instanceof StaleProjectVersionError) {

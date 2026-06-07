@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getCurrentUser } from '@/lib/auth';
+import { verifySignedUploadUrl } from '@/lib/signed-asset-url';
 import { dataPath } from '@/lib/runtime-paths';
 
 export const runtime = 'nodejs';
@@ -14,16 +15,28 @@ function toWebStream(nodeStream: NodeJS.ReadableStream): ReadableStream<Uint8Arr
 }
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const user = await getCurrentUser(req);
-  if (!user) return new Response('unauthorized', { status: 401 });
-
   const id = params.id;
   if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) return new Response('bad id', { status: 400 });
 
   const db = getDb();
   const row = db.prepare<{ id: string }, any>('SELECT * FROM uploads WHERE id = @id').get({ id });
   if (!row) return new Response('not found', { status: 404 });
-  if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+
+  // 登录态(Authorization: Bearer) 或 签名 URL(exp/sig) 二选一。
+  // 媒体元素 <video>/<audio>/<img> 带不了 Bearer，所以必须支持签名访问。
+  const user = await getCurrentUser(req);
+  if (user) {
+    if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+  } else {
+    const reqUrl = new URL(req.url);
+    const signedOk = verifySignedUploadUrl({
+      uploadId: id,
+      ownerId: Number(row.owner_id),
+      exp: reqUrl.searchParams.get('exp'),
+      sig: reqUrl.searchParams.get('sig'),
+    });
+    if (!signedOk) return new Response('unauthorized', { status: 401 });
+  }
 
   const fullPath = dataPath('uploads', String(row.owner_id), row.filename);
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });

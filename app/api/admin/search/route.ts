@@ -44,7 +44,7 @@ export async function GET(req: NextRequest) {
 function findUsers(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT u.id, u.username, u.email, u.display_name, u.disabled_at, u.created_at,
+      `SELECT u.id, u.username, u.phone, u.email, u.display_name, u.disabled_at, u.created_at,
               COALESCE(c.total_credits, 0) AS total_credits,
               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id) AS project_count,
               (SELECT COUNT(*) FROM billing_orders o WHERE o.user_id = u.id) AS order_count,
@@ -52,16 +52,17 @@ function findUsers(q: string): SearchItem[] {
          FROM users u
          LEFT JOIN user_credits c ON c.user_id = u.id
         WHERE u.username NOT GLOB '__shadow__*'
-          AND (CAST(u.id AS TEXT) = @q OR u.username = @q OR COALESCE(u.email, '') = @q)
+          AND (CAST(u.id AS TEXT) = @q OR u.username = @q OR COALESCE(u.phone, '') = @q OR COALESCE(u.email, '') = @q)
         LIMIT 10`,
     )
     .all({ q })
     .map((row: any) => ({
       entityType: 'user' as const,
       id: String(row.id),
-      title: row.username,
-      subtitle: row.email || row.display_name || `user#${row.id}`,
+      title: row.phone || row.display_name || row.username,
+      subtitle: row.display_name || row.email || `user#${row.id}`,
       fields: {
+        phone: row.phone,
         displayName: row.display_name,
         email: row.email,
         disabledAt: row.disabled_at,

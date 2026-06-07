@@ -95,6 +95,7 @@ export function initSettings(ctx) {
   }
 
   function refreshSettingsFormFromState() {
+    _refreshAccountSecurityFromStorage();
     _renderModelSlotCards();
     _initImageProviderSelector();
     _initVideoAdapterSelector();
@@ -129,6 +130,203 @@ export function initSettings(ctx) {
 
     var testBtn = $("btnTestAllApis");
     if (testBtn) testBtn.addEventListener("click", _testAllApiConnections);
+    _wireAccountSecurity();
+  }
+
+  function _readStoredAccountUser() {
+    try {
+      var raw = localStorage.getItem("sw_auth_user") || "";
+      if (!raw) return null;
+      var user = JSON.parse(raw);
+      return user && typeof user === "object" ? user : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function _writeStoredAccountUser(user) {
+    if (!user || typeof user !== "object") return;
+    try { localStorage.setItem("sw_auth_user", JSON.stringify(user)); } catch (_) {}
+    var nameEl = $("accountUsername");
+    if (nameEl) nameEl.textContent = user.displayName || user.phone || "";
+  }
+
+  function _setAccountSecurityNotice(message, kind) {
+    var el = $("accountSecurityNotice");
+    if (!el) return;
+    el.textContent = message || "";
+    el.dataset.kind = kind || "";
+  }
+
+  async function _readAccountJson(resp) {
+    var text = "";
+    try { text = await resp.text(); } catch (_) {}
+    if (!text) return {};
+    try { return JSON.parse(text); } catch (_) {
+      return { detail: resp.ok ? "服务器返回异常，请刷新后重试" : "服务暂时不可用，请稍后重试" };
+    }
+  }
+
+  function _accountError(data, fallback) {
+    return (data && (data.detail || data.error || data.message)) || fallback;
+  }
+
+  function _refreshAccountSecurityFromStorage(user) {
+    user = user || _readStoredAccountUser();
+    var phoneEl = $("accountPhone");
+    var nameEl = $("accountDisplayName");
+    if (phoneEl && user) phoneEl.value = user.phone || "";
+    if (nameEl && user) nameEl.value = user.displayName || "";
+  }
+
+  async function _loadAccountSecurityProfile() {
+    var phoneEl = $("accountPhone");
+    if (!phoneEl) return;
+    _refreshAccountSecurityFromStorage();
+    try {
+      var resp = await fetch("/api/auth/me", { headers: _getAuthHeaders(), cache: "no-store" });
+      _checkAuth(resp);
+      if (!resp.ok) return;
+      var user = await resp.json();
+      _writeStoredAccountUser(user);
+      _refreshAccountSecurityFromStorage(user);
+    } catch (_) {}
+  }
+
+  async function _saveAccountProfile() {
+    var input = $("accountDisplayName");
+    var btn = $("btnSaveAccountProfile");
+    var displayName = (input && input.value ? input.value : "").trim();
+    if (displayName.length < 2 || displayName.length > 20) {
+      _setAccountSecurityNotice("昵称长度需为 2-20 个字符", "error");
+      return;
+    }
+    if (btn) btn.disabled = true;
+    _setAccountSecurityNotice("正在保存昵称...", "info");
+    try {
+      var resp = await fetch("/api/auth/account/profile", {
+        method: "POST",
+        headers: _getAuthHeaders(),
+        body: JSON.stringify({ displayName: displayName }),
+      });
+      _checkAuth(resp);
+      var data = await _readAccountJson(resp);
+      if (!resp.ok) {
+        _setAccountSecurityNotice(_accountError(data, "昵称保存失败"), "error");
+        return;
+      }
+      if (data.user) {
+        _writeStoredAccountUser(data.user);
+        _refreshAccountSecurityFromStorage(data.user);
+      }
+      _setAccountSecurityNotice("昵称已保存", "ok");
+      showToast("昵称已保存", "ok");
+    } catch (_) {
+      _setAccountSecurityNotice("请求未完成，请检查网络后重试", "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function _changeAccountPassword() {
+    var oldEl = $("accountOldPassword");
+    var newEl = $("accountNewPassword");
+    var confirmEl = $("accountNewPasswordConfirm");
+    var btn = $("btnChangePassword");
+    var oldPassword = oldEl ? oldEl.value : "";
+    var newPassword = newEl ? newEl.value : "";
+    var confirmPassword = confirmEl ? confirmEl.value : "";
+    if (!oldPassword || !newPassword || !confirmPassword) {
+      _setAccountSecurityNotice("请填写当前密码、新密码和确认密码", "error");
+      return;
+    }
+    if (newPassword.length < 6) {
+      _setAccountSecurityNotice("新密码至少 6 位", "error");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      _setAccountSecurityNotice("两次输入的新密码不一致", "error");
+      return;
+    }
+    if (btn) btn.disabled = true;
+    _setAccountSecurityNotice("正在修改密码...", "info");
+    try {
+      var resp = await fetch("/api/auth/account/change-password", {
+        method: "POST",
+        headers: _getAuthHeaders(),
+        body: JSON.stringify({ oldPassword: oldPassword, newPassword: newPassword }),
+      });
+      _checkAuth(resp);
+      var data = await _readAccountJson(resp);
+      if (!resp.ok) {
+        _setAccountSecurityNotice(_accountError(data, "密码修改失败"), "error");
+        return;
+      }
+      try {
+        if (data.token) localStorage.setItem("sw_auth_token", data.token);
+      } catch (_) {}
+      if (data.user) {
+        _writeStoredAccountUser(data.user);
+        _refreshAccountSecurityFromStorage(data.user);
+      }
+      if (oldEl) oldEl.value = "";
+      if (newEl) newEl.value = "";
+      if (confirmEl) confirmEl.value = "";
+      _setAccountSecurityNotice("密码已修改", "ok");
+      showToast("密码已修改", "ok");
+    } catch (_) {
+      _setAccountSecurityNotice("请求未完成，请检查网络后重试", "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  async function _deactivateAccount() {
+    var input = $("accountDeletePassword");
+    var btn = $("btnDeactivateAccount");
+    var password = input ? input.value : "";
+    if (!password) {
+      _setAccountSecurityNotice("请输入当前密码确认注销", "error");
+      return;
+    }
+    if (!window.confirm("确认注销当前账号？注销后手机号会释放，当前会话会立即失效。")) return;
+    if (btn) btn.disabled = true;
+    _setAccountSecurityNotice("正在注销账号...", "info");
+    try {
+      var resp = await fetch("/api/auth/account/deactivate", {
+        method: "POST",
+        headers: _getAuthHeaders(),
+        body: JSON.stringify({ password: password }),
+      });
+      _checkAuth(resp);
+      var data = await _readAccountJson(resp);
+      if (!resp.ok) {
+        _setAccountSecurityNotice(_accountError(data, "注销失败"), "error");
+        return;
+      }
+      try {
+        localStorage.removeItem("sw_auth_token");
+        localStorage.removeItem("sw_auth_user");
+      } catch (_) {}
+      _setAccountSecurityNotice("账号已注销，正在返回首页...", "ok");
+      window.location.href = "/";
+    } catch (_) {
+      _setAccountSecurityNotice("请求未完成，请检查网络后重试", "error");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function _wireAccountSecurity() {
+    var saveBtn = $("btnSaveAccountProfile");
+    if (!saveBtn || saveBtn.dataset.wired === "1") return;
+    saveBtn.dataset.wired = "1";
+    saveBtn.addEventListener("click", _saveAccountProfile);
+    var changeBtn = $("btnChangePassword");
+    if (changeBtn) changeBtn.addEventListener("click", _changeAccountPassword);
+    var deactivateBtn = $("btnDeactivateAccount");
+    if (deactivateBtn) deactivateBtn.addEventListener("click", _deactivateAccount);
+    _loadAccountSecurityProfile();
   }
 
   async function _testAllApiConnections() {

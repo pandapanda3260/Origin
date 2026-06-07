@@ -79,7 +79,7 @@ export function renderAdminShell(options: AdminShellOptions): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${escapeHtml(options.title)} · ORIGINRISE Admin</title>
+  <title>${escapeHtml(options.title)} · ORIGIN Admin</title>
   <style>
     :root {
       color-scheme: light;
@@ -247,7 +247,7 @@ export function renderAdminShell(options: AdminShellOptions): string {
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">${adminIcon('brand')}</span>
-        <span>ORIGINRISE Admin</span>
+        <span>ORIGIN Admin</span>
       </div>
       <nav>${navHtml}</nav>
       <div class="admin-system-card">

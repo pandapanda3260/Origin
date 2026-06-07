@@ -9,7 +9,8 @@
  * 阶段性范围:
  *   - first_frame: primaryShot = 组内第一个 shot, 作为开场 beat。
  *   - tail_frame:  primaryShot = 组内最末 shot, 作为收尾 beat;
- *                  selfFirstFrame (本片段已生成的首帧图) 作为 slot 1 的连续性锚点。
+ *                  若镜头计划判定依赖首帧, selfFirstFrame 作为 slot 1 连续性锚点;
+ *                  若判定为独立尾帧, 不强制提交首帧参考图。
  *   - referenceManifest 的编号语义 (重要):
  *       · slot     —— 候选序号 (1-based 连续, 含所有候选, 不论 delivery)。
  *       · imageNo  —— 仅 delivery='image' 的 ref 才有, 1-based 连续, 严格对齐
@@ -17,7 +18,7 @@
  *     renderer 的 "Image N = ..." 标签用的是 imageNo, 不是 slot, 避免 scene
  *     走 text_only 时出现 "Image 2 = character" 但 image[0] 其实就是它的错位。
  *   - provider capability 和业务预算分开: modelSnapshot.multiRefImageCap 表示模型能力,
- *     FRAME_IMAGE_REFERENCE_IMAGE_BUDGET=4 表示首/尾帧业务固定最多提交 4 张参考图。
+ *     FRAME_IMAGE_REFERENCE_IMAGE_BUDGET=12 表示首/尾帧业务固定最多提交 12 张参考图。
  */
 
 import { createHash } from 'node:crypto';
@@ -30,17 +31,25 @@ import {
   truncate,
 } from './frame-prompt-helpers';
 import { resolveLocalImagePath as defaultResolveLocalImagePath } from './image-gen';
+import {
+  selectCharacterReferencePanels,
+  type CharacterReferencePanel,
+} from './panel-selection';
+import type { CharacterEntityType, PanelName } from './character-panels';
 import { pickSceneForShots } from './scene-selection';
+import { resolveShotFieldsForPrompt } from './shot-plan-normalize';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 import {
   normalizeStoryboardMaterialRole,
   storyboardMaterialRoleToUiType,
   type StoryboardMaterialRole,
 } from './reference-roles';
+import { computeWorldHash } from './project-dependency-state';
+import { formatWorldContextForPrompt, projectWorldContextForStage } from './world-template-context';
 
 export type FrameType = 'first_frame' | 'tail_frame';
 
-export type FrameRefRole = 'scene' | 'character' | 'prop' | 'prev_tail' | 'self_first_frame';
+export type FrameRefRole = 'scene' | 'character' | 'crowd' | 'prop' | 'prev_tail' | 'self_first_frame';
 
 export type FrameReferenceDelivery = 'image' | 'text_only' | 'dropped';
 
@@ -65,6 +74,11 @@ export type FrameReference = {
   remoteUrl?: string;
   /** 不作为 image 提交时的文字兜底描述。 */
   textFallback: string;
+  /** 角色参考子图类型。sheet=完整角色设定图; headshot/front/side/back=切图。 */
+  panel?: 'sheet' | PanelName;
+  entityType?: CharacterEntityType | string;
+  /** 给 prompt/校验使用的短用途说明，不作为 UI 文案强制展示。 */
+  referencePurpose?: string;
   delivery: FrameReferenceDelivery;
   /** 仅在 text_only / dropped 时可能出现。 */
   droppedReason?: FrameReferenceDroppedReason;
@@ -103,6 +117,8 @@ export type FrameImageGenerationPlan = {
   characterLockText: string;
   sceneLockText: string;
   propLockText: string;
+  worldLockText: string;
+  worldHash: string;
   /** 本组所有 shot 的原始文本拼接 (visual/description/dialogue 等)。
    *  用作 renderer 的用户原文约束区, 不做专项词汇改写。 */
   shotConstraintText: string;
@@ -110,6 +126,14 @@ export type FrameImageGenerationPlan = {
   /** renderer 产出的最终 prompt, 提交前仍可能被 safe-image-gen 的审核恢复二次改写。 */
   finalPrompt: string;
   modelSnapshot: FrameImageModelSnapshot;
+  referenceCapacity: {
+    businessBudget: number;
+    characterBudget: number;
+    contextBudget: number;
+    providerCap: number;
+    effectiveCap: number;
+    warning?: string;
+  };
 };
 
 export type FrameImagePlanSummary = {
@@ -122,12 +146,13 @@ export type FrameImagePlanSummary = {
   characterNames: string[];
   sceneName?: string;
   propNames: string[];
-  sentReferences: Array<{
-    slot: number;
-    imageNo: number;
-    role: FrameRefRole;
-    assetName?: string;
-  }>;
+	  sentReferences: Array<{
+	    slot: number;
+	    imageNo: number;
+	    role: FrameRefRole;
+	    assetName?: string;
+	    panel?: string;
+	  }>;
   textOnlyReferences: Array<{
     slot: number;
     role: FrameRefRole;
@@ -150,7 +175,16 @@ export type FrameImagePlanSummary = {
   };
   finalPromptHash: string;
   finalPromptLength: number;
+  worldHash: string;
   modelSnapshot: FrameImageModelSnapshot;
+  referenceCapacity: {
+    businessBudget: number;
+    characterBudget: number;
+    contextBudget: number;
+    providerCap: number;
+    effectiveCap: number;
+    warning?: string;
+  };
 };
 
 export type BuildFramePlanInput = {
@@ -171,7 +205,9 @@ export type BuildFramePlanInput = {
 };
 
 const MAX_FINAL_PROMPT_CHARS = 5000;
-export const FRAME_IMAGE_REFERENCE_IMAGE_BUDGET = 4;
+export const FRAME_IMAGE_REFERENCE_IMAGE_BUDGET = 12;
+export const FRAME_CHARACTER_REFERENCE_IMAGE_BUDGET = 6;
+export const FRAME_CONTEXT_REFERENCE_IMAGE_BUDGET = 6;
 const DEFAULT_FRAME_ASPECT_RATIO = '9:16';
 const FRAME_ASPECT_RATIOS = new Set(['16:9', '9:16', '1:1']);
 
@@ -214,16 +250,64 @@ function propName(prop: any): string {
   return clean(prop?.name || prop?.propName);
 }
 
+function isCrowdCharacter(ch: any): boolean {
+  if (!ch) return false;
+  if (ch.isCrowd === true) return true;
+  const text = [
+    ch.name,
+    ch.role,
+    ch.identity,
+    ch.description,
+    ch.appearance,
+    ch.category,
+    ch.tags,
+    ch.crowdSize,
+  ].flat().filter(Boolean).join(' ');
+  return /群像|人群|群众|路人|背景人|crowd|extras|background people|group/i.test(text);
+}
+
+function characterPanelPurpose(panel: CharacterReferencePanel): string {
+  const name = panel.characterName || '角色';
+  if (panel.panel === 'sheet') {
+    return panel.entityType === 'non-human'
+      ? `${name}完整角色设定图：锁定物种、身体结构、比例、主轮廓和配色，不能人类化。`
+      : `${name}完整角色设定图：锁定同一人身份、脸型、发型、体型、服装轮廓和主配色。`;
+  }
+  if (panel.panel === 'headshot') {
+    return `${name}脸部近景参考：锁定脸型、五官、眼神、发型和近景表情结构；服装仍以角色设定图/正面图为准。`;
+  }
+  if (panel.panel === 'front') {
+    return `${name}正面参考：锁定服装结构、体型比例、正面轮廓和主要配饰。`;
+  }
+  if (panel.panel === 'side') {
+    return `${name}侧面参考：用于侧脸/侧身角度，锁定侧面轮廓、发型和服装厚度。`;
+  }
+  return `${name}背面参考：用于背影/转身角度，锁定背部服装、发型后轮廓和体态。`;
+}
+
+function fallbackCharacterReferencePurpose(ch: any, role: FrameRefRole): string {
+  const name = characterName(ch) || '角色';
+  if (role === 'crowd') {
+    return `${name}人群/群像参考：只锁定人群规模、服装气质和背景层次，不作为主角脸部身份标准。`;
+  }
+  if (ch?.entityType === 'non-human' || ch?.isNonHuman === true) {
+    return `${name}角色参考：锁定非人/拟人物种、身体结构、比例、材质和配色，不能人类化。`;
+  }
+  return `${name}角色参考：锁定脸部、服装、体型、发型、配饰和整体身份。`;
+}
+
 function assetImageUrl(asset: any): string {
   const reference = resolveAssetReferenceState(asset);
   if (isBlockingReferenceStatus(reference.status)) return '';
   return clean(
-    reference.currentUrl ||
-    reference.lastKnownGoodUrl ||
-    asset?.pencilUrl ||
-    asset?.realPhotoUrl,
-  );
-}
+	    reference.currentUrl ||
+	    reference.lastKnownGoodUrl ||
+	    asset?.imageUrl ||
+	    asset?.rawUrl ||
+	    asset?.pencilUrl ||
+	    asset?.realPhotoUrl,
+	  );
+	}
 
 function assetIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: number): string[] {
   const source = asset || {};
@@ -503,6 +587,16 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     (styleBible.negativePrompt || styleBible.videoNegativePrompt) && `负向风格约束：${styleBible.negativePrompt || styleBible.videoNegativePrompt}`,
     styleBible.era,
   ]);
+  const worldHash = computeWorldHash(project);
+  const worldContext = projectWorldContextForStage(
+    frameType === 'first_frame' ? 'first_frame_image' : 'tail_frame_image',
+    project?.worldTemplateSnapshot,
+    {
+      project,
+      target: { groupIdx, shotIndices: validShotIndices, frameType },
+    },
+  );
+  const worldLockText = formatWorldContextForPrompt(worldContext, { includeSoft: false });
 
   // ---- drift guardrails ----
   const driftGuardrails = buildObservedDriftGuardrails(
@@ -551,23 +645,93 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       };
     });
 
-  const characterCandidates = usedChars.map((c: any): Candidate => {
-    const nm = c.name || c.role;
-    const baseDesc = [c.identity, c.appearance || c.description, c.clothing, c.equipment]
-      .filter(Boolean)
-      .join(', ');
-    const ent =
-      c.entityType === 'non-human'
-        ? '（非人/拟人角色，必须保留原物种身体结构）'
-        : '';
-    return {
-      role: 'character',
-      assetId: c.characterId || c.id || nm,
-      assetName: nm,
-      remoteUrl: assetImageUrl(c) || undefined,
-      textFallback: `${nm}${ent}: ${truncate(baseDesc, 180)}`,
-    };
-  });
+	  const charByName = new Map<string, any>();
+	  availableChars.forEach((ch: any) => {
+	    const nm = characterName(ch);
+	    const key = importanceKey(nm);
+	    if (key && !charByName.has(key)) charByName.set(key, ch);
+	  });
+	  const usedCharKeys = new Set(usedChars.map((ch: any) => importanceKey(characterName(ch))).filter(Boolean));
+	  const selectedPanels = selectCharacterReferencePanels({
+	    project,
+	    ownerId,
+	    groupShotIndices: validShotIndices,
+	    shots: groupShots,
+	    maxSlots: FRAME_CHARACTER_REFERENCE_IMAGE_BUDGET,
+	    perCharacterLimit: 3,
+	    enableFocusCharacterPair: false,
+	    mode: 'frame',
+	  }).filter((panel) => {
+	    const key = importanceKey(panel.characterName);
+	    if (usedCharKeys.size && !usedCharKeys.has(key)) return false;
+	    const ch = charByName.get(key);
+	    return !!ch && !isMaterialAssetExcluded(project, 'character', ch, groupIdx);
+	  });
+	  const panelCoveredCharacterKeys = new Set(selectedPanels.map((panel) => importanceKey(panel.characterName)).filter(Boolean));
+	  const panelCandidates = selectedPanels.map((panel): Candidate => {
+	    const key = importanceKey(panel.characterName);
+	    const ch = charByName.get(key) || {};
+	    const role: FrameRefRole = isCrowdCharacter(ch) ? 'crowd' : 'character';
+	    const baseDesc = [ch.identity, ch.appearance || ch.description, ch.clothing, ch.equipment]
+	      .filter(Boolean)
+	      .join(', ');
+	    const purpose = role === 'crowd'
+	      ? fallbackCharacterReferencePurpose(ch, role)
+	      : characterPanelPurpose(panel);
+	    return {
+	      role,
+	      assetId: panel.assetId || ch.characterId || ch.id || panel.characterName,
+	      assetName: panel.characterName,
+	      remoteUrl: panel.url || assetImageUrl(ch) || undefined,
+	      localPath: panel.path,
+	      panel: panel.panel,
+	      entityType: panel.entityType,
+	      referencePurpose: purpose,
+	      textFallback: `${panel.characterName}: ${truncate([purpose, baseDesc].filter(Boolean).join(' '), 220)}`,
+	    };
+	  });
+	  const fallbackCharacterCandidates = usedChars
+	    .filter((c: any) => !panelCoveredCharacterKeys.has(importanceKey(characterName(c))))
+	    .map((c: any): Candidate => {
+	      const nm = c.name || c.role;
+	      const role: FrameRefRole = isCrowdCharacter(c) ? 'crowd' : 'character';
+	      const baseDesc = [c.identity, c.appearance || c.description, c.clothing, c.equipment]
+	        .filter(Boolean)
+	        .join(', ');
+	      const ent =
+	        c.entityType === 'non-human'
+	          ? '（非人/拟人角色，必须保留原物种身体结构）'
+	          : '';
+	      const purpose = fallbackCharacterReferencePurpose(c, role);
+	      return {
+	        role,
+	        assetId: c.characterId || c.id || nm,
+	        assetName: nm,
+	        remoteUrl: assetImageUrl(c) || undefined,
+	        textFallback: `${nm}${ent}: ${truncate([purpose, baseDesc].filter(Boolean).join(' '), 220)}`,
+	        referencePurpose: purpose,
+	        entityType: c.entityType,
+	      };
+	    });
+	  const usedCharOrder = new Map<string, number>();
+	  usedChars.forEach((ch: any, index: number) => {
+	    const key = importanceKey(characterName(ch));
+	    if (key && !usedCharOrder.has(key)) usedCharOrder.set(key, index);
+	  });
+	  const allCharacterLikeCandidates = [...panelCandidates, ...fallbackCharacterCandidates]
+	    .map((candidate, index) => ({ candidate, index }))
+	    .sort((a, b) => {
+	      const aOrder = usedCharOrder.get(importanceKey(a.candidate.assetName)) ?? Number.MAX_SAFE_INTEGER;
+	      const bOrder = usedCharOrder.get(importanceKey(b.candidate.assetName)) ?? Number.MAX_SAFE_INTEGER;
+	      return (aOrder - bOrder) || (a.index - b.index);
+	    })
+	    .map((item) => item.candidate);
+	  const characterCandidates = allCharacterLikeCandidates
+	    .filter((candidate) => candidate.role === 'character')
+	    .slice(0, FRAME_CHARACTER_REFERENCE_IMAGE_BUDGET);
+	  const crowdCandidates = allCharacterLikeCandidates
+	    .filter((candidate) => candidate.role === 'crowd')
+	    .slice(0, 1);
 
   const propCandidates = usedProps.map((p: any): Candidate => {
     const nm = p.name || p.propName;
@@ -583,32 +747,49 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     };
   });
 
-  const takeCandidate = (candidate: Candidate | null | undefined) => {
-    if (candidate) candidates.push(candidate);
-  };
+	  const pushIf = (list: Candidate[], candidate: Candidate | null | undefined) => {
+	    if (candidate) list.push(candidate);
+	  };
+	  const contextCandidates: Candidate[] = [];
+	  if (frameType === 'tail_frame') pushIf(contextCandidates, selfFirstFrameCandidate);
+	  pushIf(contextCandidates, sceneCandidate);
+	  pushIf(contextCandidates, propCandidates[0]);
+	  pushIf(contextCandidates, supplementalSceneCandidates[0]);
+	  pushIf(contextCandidates, propCandidates[1]);
+	  pushIf(contextCandidates, crowdCandidates[0]);
+	  supplementalSceneCandidates.slice(1).forEach((candidate) => pushIf(contextCandidates, candidate));
+	  propCandidates.slice(2).forEach((candidate) => pushIf(contextCandidates, candidate));
+	  contextCandidates.splice(FRAME_CONTEXT_REFERENCE_IMAGE_BUDGET);
 
-  if (frameType === 'first_frame') {
-    takeCandidate(characterCandidates[0]);
-    takeCandidate(sceneCandidate);
-    supplementalSceneCandidates.forEach(takeCandidate);
-    takeCandidate(characterCandidates[1]);
-    takeCandidate(propCandidates[0]);
-    takeCandidate(characterCandidates[2]);
-    propCandidates.slice(1).forEach(takeCandidate);
-    characterCandidates.slice(3).forEach(takeCandidate);
-  } else {
-    takeCandidate(selfFirstFrameCandidate);
-    takeCandidate(characterCandidates[0]);
-    takeCandidate(sceneCandidate);
-    supplementalSceneCandidates.forEach(takeCandidate);
-    takeCandidate(propCandidates[0]);
-    takeCandidate(characterCandidates[1]);
-    characterCandidates.slice(2).forEach(takeCandidate);
-    propCandidates.slice(1).forEach(takeCandidate);
-  }
+	  const takeBalanced = (index: number) => {
+	    pushIf(candidates, characterCandidates[index]);
+	    pushIf(candidates, contextCandidates[index]);
+	  };
+	  if (frameType === 'tail_frame' && contextCandidates[0]?.role === 'self_first_frame') {
+	    pushIf(candidates, contextCandidates[0]);
+	    pushIf(candidates, characterCandidates[0]);
+	    for (let i = 1; i < Math.max(characterCandidates.length, contextCandidates.length); i += 1) {
+	      pushIf(candidates, contextCandidates[i]);
+	      pushIf(candidates, characterCandidates[i]);
+	    }
+	  } else {
+	    for (let i = 0; i < Math.max(characterCandidates.length, contextCandidates.length); i += 1) {
+	      takeBalanced(i);
+	    }
+	  }
 
   const providerCap = Math.max(0, Math.floor(input.modelSnapshot.multiRefImageCap || 0));
   const cap = Math.min(FRAME_IMAGE_REFERENCE_IMAGE_BUDGET, providerCap);
+  const referenceCapacity = {
+    businessBudget: FRAME_IMAGE_REFERENCE_IMAGE_BUDGET,
+    characterBudget: FRAME_CHARACTER_REFERENCE_IMAGE_BUDGET,
+    contextBudget: FRAME_CONTEXT_REFERENCE_IMAGE_BUDGET,
+    providerCap,
+    effectiveCap: cap,
+    ...(providerCap < FRAME_IMAGE_REFERENCE_IMAGE_BUDGET
+      ? { warning: `当前图像模型参考图能力为 ${providerCap} 张，首尾帧 12 张业务预算将按 ${cap} 张执行。` }
+      : {}),
+  };
   const manifest: FrameReference[] = [];
   let imageBudget = cap;
   let slot = 1;
@@ -646,11 +827,14 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       assetId: cand.assetId,
       assetName: cand.assetName,
       localPath: delivery === 'image' ? resolved : undefined,
-      remoteUrl: cand.remoteUrl,
-      textFallback: cand.textFallback,
-      delivery,
-      droppedReason,
-    });
+	      remoteUrl: cand.remoteUrl,
+	      textFallback: cand.textFallback,
+	      panel: cand.panel,
+	      entityType: cand.entityType,
+	      referencePurpose: cand.referencePurpose,
+	      delivery,
+	      droppedReason,
+	    });
   }
 
   const plan: FrameImageGenerationPlan = {
@@ -705,11 +889,14 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     driftGuardrails,
     characterLockText,
     sceneLockText,
-    propLockText,
+	    propLockText,
+    worldLockText,
+    worldHash,
     shotConstraintText,
     referenceManifest: manifest,
     finalPrompt: '',
     modelSnapshot: input.modelSnapshot,
+    referenceCapacity,
   };
   plan.finalPrompt = renderFramePrompt(plan);
   return plan;
@@ -730,6 +917,10 @@ function tailSignalScore(signals: any, key: string): number {
   return Math.max(0, Math.min(5, Math.round(n)));
 }
 
+function tailFrameUsesSelfFirstFrame(plan: FrameImageGenerationPlan): boolean {
+  return plan.referenceManifest.some((ref) => ref.role === 'self_first_frame' && ref.delivery === 'image');
+}
+
 function buildTailFrameTargetLines(plan: FrameImageGenerationPlan): string[] {
   const shot = plan.primaryShot || {};
   const signals = shot?.tailFrameSignals && typeof shot.tailFrameSignals === 'object'
@@ -739,10 +930,13 @@ function buildTailFrameTargetLines(plan: FrameImageGenerationPlan): string[] {
   const dialogue = clean(shot?.dialogue || shot?.scriptRef);
   const keyInfo = clean(shot?.keyInfo);
   const isSingleShotSegment = plan.shotIndices.length === 1;
+  const hasSelfFirstFrame = tailFrameUsesSelfFirstFrame(plan);
 
   const lines: string[] = [
     '【尾帧目标】',
-    '这是本片段的结束瞬间，发生在 Image 1 / 首帧之后数秒。它不能是首帧的重画或近似重复。',
+    hasSelfFirstFrame
+      ? '这是本片段的结束瞬间，发生在 Image 1 / 首帧之后数秒。它不能是首帧的重画或近似重复。'
+      : '这是本片段的结束瞬间。依据剧本、镜头计划、资产参考和风格约束直接生成，不需要复刻首帧构图。',
     '- 呈现镜头动作推进后的完成状态。',
   ];
 
@@ -768,17 +962,26 @@ function buildTailFrameTargetLines(plan: FrameImageGenerationPlan): string[] {
     lines.push('- 情绪落点：呈现角色情绪反应已经发生后的状态，不要停留在首帧同一个表情瞬间。');
   }
 
-  lines.push(
-    '- 相比 Image 1 必须有可见差异：至少改变一个有意义元素，如姿态、道具/物体位置、面部/情绪状态、前景/背景关系、距离/裁切或环境运动痕迹。',
-  );
-  lines.push(
-    '- 保持身份、服装、地点、光线类型和关键道具连续，但不要复制首帧的完全相同姿态、裁切或构图，除非镜头明确要求没有变化。',
-  );
+  if (hasSelfFirstFrame) {
+    lines.push(
+      '- 相比 Image 1 必须有可见差异：至少改变一个有意义元素，如姿态、道具/物体位置、面部/情绪状态、前景/背景关系、距离/裁切或环境运动痕迹。',
+    );
+    lines.push(
+      '- 保持身份、服装、地点、光线类型和关键道具连续，但不要复制首帧的完全相同姿态、裁切或构图，除非镜头明确要求没有变化。',
+    );
+  } else {
+    lines.push(
+      '- 必须准确呈现剧本指定的收束/揭示画面，不要生成开场画面的近似重复。',
+    );
+    lines.push(
+      '- 保持身份、服装、地点、光线类型和关键道具与资产参考一致，构图以尾帧目标为准。',
+    );
+  }
   return lines;
 }
 
 export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
-  const { frameType, shotIndices, primaryShot, primaryShotIdx, contextShots } = plan;
+  const { frameType, primaryShot, primaryShotIdx } = plan;
   const lines: string[] = [];
 
   // 1. Task + frame goal
@@ -804,6 +1007,32 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
     '无字幕、无说明文字、无可读文字、无水印、无分格边框、无分屏布局。',
   );
 
+  // 1.5 构图规则: 置顶到 任务/画面目标 之后、主镜头之前 (用户要求前三为 任务/画面目标/构图规则)
+  lines.push('');
+  lines.push('【构图规则】');
+  lines.push(`- 目标画幅比例：${plan.aspectRatio}。${plan.compositionGuidance}`);
+  lines.push('- 使用一个完整统一的镜头画面，匹配主镜头的景别和运镜意图。');
+  lines.push(
+    '- 角色身份、服装、物种/体型、场景材质、道具和色彩体系必须与参考保持一致。',
+  );
+  lines.push(
+    '- 如果出现非人/拟人角色，必须保留原物种身体结构和真实尺度，绝不能变成普通人类。',
+  );
+  if (frameType === 'first_frame') {
+    lines.push('- 这张图必须能直接作为视频生成的首帧使用。');
+  } else {
+    lines.push('- 这张图必须能直接作为视频生成的收束尾帧使用。');
+    if (tailFrameUsesSelfFirstFrame(plan)) {
+      lines.push(
+        '- 与首帧保持连续，同时呈现明显更晚的结束状态：地点、光线类型、服装和道具一致，但动作、情绪或物体状态已变化。',
+      );
+    } else {
+      lines.push(
+        '- 按剧本和镜头计划呈现独立的结束状态：地点、角色、道具和风格必须与资产参考一致，但不要求沿用首帧构图。',
+      );
+    }
+  }
+
   // 2. Primary shot + context
   lines.push('');
   lines.push(
@@ -811,11 +1040,22 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
       ? `【主镜头】以镜头 ${primaryShotIdx + 1} 作为开场节拍。`
       : `【主镜头】以镜头 ${primaryShotIdx + 1} 作为结束节拍（这是本片段的最后一个镜头）。`,
   );
-  const pShotType = clean(primaryShot?.shotType || primaryShot?.framing);
-  const pCamera = clean(primaryShot?.camera || primaryShot?.movement);
+  const primaryFields = resolveShotFieldsForPrompt(primaryShot);
+  const pShotType = clean(primaryFields.shotType);
+  const pAngle = clean(primaryFields.angle);
+  const pLens = clean(primaryFields.lens);
+  const pFocus = clean(primaryFields.focus);
+  const pLight = clean(primaryFields.light);
+  const pComposition = clean(primaryFields.composition);
+  const pCamera = clean(primaryFields.camera);
   const pVisual = shotVisualForFramePrompt(primaryShot);
   const pDialogue = clean(primaryShot?.dialogue || primaryShot?.scriptRef);
   if (pShotType) lines.push(`- 景别：${pShotType}`);
+  if (pAngle) lines.push(`- 角度/视点：${pAngle}`);
+  if (pLens) lines.push(`- 焦距：${pLens}`);
+  if (pFocus) lines.push(`- 景深/焦点：${pFocus}`);
+  if (pLight) lines.push(`- 光线组合：${pLight}`);
+  if (pComposition) lines.push(`- 构图组合：${pComposition}`);
   if (pCamera) lines.push(`- 运镜：${pCamera}`);
   if (pVisual) lines.push(`- 画面：${pVisual}`);
   if (pDialogue && pDialogue !== '——') lines.push(`- 台词/声音提示：${pDialogue}`);
@@ -825,41 +1065,44 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
     lines.push(...buildTailFrameTargetLines(plan));
   }
 
-  if (contextShots.length) {
-    lines.push('');
-    lines.push(
-      '【上下文镜头】只用于动作和情绪连续性参考，不要改变主镜头构图。',
-    );
-    for (let i = 0; i < contextShots.length; i += 1) {
-      const sh = contextShots[i];
-      const idx = plan.contextShotIndices[i] + 1;
-      const visual = shotVisualForFramePrompt(sh);
-      if (visual) lines.push(`- 镜头 ${idx}：${truncate(visual, 160)}`);
-    }
-  }
-
   // 3. Reference images (only those actually submitted)
   const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
   if (imageRefs.length) {
-    lines.push('');
-    lines.push('【参考图】');
-    for (const r of imageRefs) {
-      const roleText =
-        r.role === 'scene'
-          ? '场景 - 锁定空间、材质、光线和基调'
-          : r.role === 'character'
-            ? `角色（${r.assetName || ''}）- 锁定脸部、服装、体型和物种特征`
-            : r.role === 'prop'
-              ? `道具（${r.assetName || ''}）- 锁定形状、颜色和材质`
-              : r.role === 'prev_tail'
-                ? '上一片段尾帧 - 连续性锚点'
-                : r.role === 'self_first_frame'
-                  ? '本片段首帧 - 身份和连续性锚点，不是构图复制目标'
-                  : String(r.role);
-      // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
-      lines.push(`- Image ${r.imageNo} = ${roleText}`);
-    }
-  }
+	    lines.push('');
+	    lines.push('【参考图】');
+	    for (const r of imageRefs) {
+	      const panelText =
+	        r.panel === 'sheet'
+	          ? '角色设定图'
+	          : r.panel === 'headshot'
+	            ? '脸部近景'
+	            : r.panel === 'front'
+	              ? '正面图'
+	              : r.panel === 'side'
+	                ? '侧面图'
+	                : r.panel === 'back'
+	                  ? '背面图'
+	                  : '';
+	      const roleText =
+	        r.role === 'scene'
+	          ? `场景（${r.assetName || '场景'}）- 锁定空间布局、材质、光线方向、时间氛围和主色调。`
+	          : r.role === 'character'
+	            ? `角色（${r.assetName || '角色'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '锁定同一人脸部、服装、体型、物种特征和配饰。'}`
+	            : r.role === 'crowd'
+	              ? `人群/群像（${r.assetName || '人群'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '只锁定人群规模、服装气质和背景层次，不替代主角身份参考。'}`
+	              : r.role === 'prop'
+	                ? `道具（${r.assetName || '道具'}）- 锁定形状、颜色、材质、尺度和可识别细节。`
+	                : r.role === 'prev_tail'
+	                  ? '上一片段尾帧 - 连续性锚点，锁定衔接关系，不复制构图。'
+	                  : r.role === 'self_first_frame'
+	                    ? '本片段首帧 - 身份、服装、地点、光线和关键道具连续性锚点，不是构图复制目标。'
+	                    : String(r.role);
+	      // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
+	      lines.push(`- Image ${r.imageNo} = ${roleText}`);
+	    }
+	    lines.push('- 角色设定图负责统一身份和服装；头像/正面/侧面/背面只补充对应角度细节，不能相互冲突。');
+	    lines.push('- 场景和道具参考必须同等执行：不要为了贴近角色而改掉地点、关键道具、材质、光线或空间关系。');
+	  }
 
   // 4. Locks (text)
   if (plan.characterLockText) {
@@ -877,44 +1120,11 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
     lines.push('【道具锁定】');
     lines.push(plan.propLockText);
   }
-  if (plan.styleLock) {
+	  if (plan.styleLock) {
     lines.push('');
     lines.push('【项目风格锁定】');
     lines.push(plan.styleLock);
   }
-
-  // 5. Drift guardrails
-  if (plan.driftGuardrails) {
-    lines.push('');
-    lines.push(plan.driftGuardrails.replace(/^\n+/, ''));
-  }
-
-  if (plan.shotConstraintText) {
-    lines.push('');
-    lines.push('【用户原文约束】');
-    lines.push(truncate(plan.shotConstraintText, 900));
-  }
-
-  // 6. Composition rules
-  lines.push('');
-  lines.push('【构图规则】');
-  lines.push(`- 目标画幅比例：${plan.aspectRatio}。${plan.compositionGuidance}`);
-  lines.push('- 使用一个完整统一的镜头画面，匹配主镜头的景别和运镜意图。');
-  lines.push(
-    '- 角色身份、服装、物种/体型、场景材质、道具和色彩体系必须与参考保持一致。',
-  );
-  lines.push(
-    '- 如果出现非人/拟人角色，必须保留原物种身体结构和真实尺度，绝不能变成普通人类。',
-  );
-  if (frameType === 'first_frame') {
-    lines.push('- 这张图必须能直接作为视频生成的首帧使用。');
-  } else {
-    lines.push('- 这张图必须能直接作为视频生成的收束尾帧使用。');
-    lines.push(
-      '- 与首帧保持连续，同时呈现明显更晚的结束状态：地点、光线类型、服装和道具一致，但动作、情绪或物体状态已变化。',
-    );
-  }
-
   // 7. Hard prohibitions
   lines.push('');
   lines.push('【硬性禁止】');
@@ -944,12 +1154,13 @@ export function summarizePlanForAudit(plan: FrameImageGenerationPlan): FrameImag
     characterNames: plan.characters.map((c) => c.name).filter(Boolean),
     sceneName: plan.scene?.name,
     propNames: plan.props.map((p) => p.name).filter(Boolean),
-    sentReferences: sent.map((r) => ({
-      slot: r.slot,
-      imageNo: r.imageNo as number,
-      role: r.role,
-      assetName: r.assetName,
-    })),
+	    sentReferences: sent.map((r) => ({
+	      slot: r.slot,
+	      imageNo: r.imageNo as number,
+	      role: r.role,
+	      assetName: r.assetName,
+	      panel: r.panel,
+	    })),
     textOnlyReferences: textOnly.map((r) => ({
       slot: r.slot,
       role: r.role,
@@ -964,6 +1175,8 @@ export function summarizePlanForAudit(plan: FrameImageGenerationPlan): FrameImag
     })),
     finalPromptHash: hashText(plan.finalPrompt),
     finalPromptLength: plan.finalPrompt.length,
+    worldHash: plan.worldHash,
     modelSnapshot: plan.modelSnapshot,
+    referenceCapacity: plan.referenceCapacity,
   };
 }

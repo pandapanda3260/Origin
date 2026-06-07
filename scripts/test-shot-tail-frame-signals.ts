@@ -61,7 +61,9 @@ function testSimpleStaticDialogueFallback() {
       shotType: '特写',
       camera: '固定镜头',
       dialogue: '萧南：我等了三年，也查了三年。今天这句话说完，我就不会再回头，也不会再替任何人沉默。你们欠下的每一笔账，我都会一件一件讨回来。',
-      durationSec: 8,
+      // durationSec 跟产品边界保持一致 (3-7 秒, 见 public/modules/shots.js)。
+      // 原值 8 已超出新范围, 测试覆盖意图 (isSimpleStaticDialogue 长台词判断) 用 7 同样能触发。
+      durationSec: 7,
     },
   );
 

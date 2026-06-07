@@ -25,6 +25,13 @@ export type ImageModerationPreflight = {
   hits: ImageModerationPreflightHit[];
 };
 
+export type ImagePromptSafetyHint = {
+  text: string;
+  reason: string;
+  category: ViolationCategory;
+  source: 'preflight' | 'heuristic';
+};
+
 export type ImagePromptModerationRewrite = {
   originalPrompt: string;
   rewrittenPrompt: string;
@@ -84,6 +91,38 @@ function loadImageRules(): Record<string, Rule[]> {
 }
 
 const IMAGE_RULES = loadImageRules();
+
+const IMAGE_SAFETY_HINT_RULES: Array<{
+  category: ViolationCategory;
+  pattern: RegExp;
+  reason: string;
+}> = [
+  {
+    category: 'unknown',
+    pattern: /(脸色发白|惊惧|惊恐|恐惧|骇然|失声|屏住呼吸|窒息|瞪大|嘴微张)/giu,
+    reason: '强惊恐、窒息或失声表情，建议改成紧张、震撼、屏息注视等中性反应',
+  },
+  {
+    category: 'unknown',
+    pattern: /(喷薄而出|爆出|爆发|炸裂|冲破|引信)/giu,
+    reason: '爆炸/冲击意象，建议改成光纹扩散、光芒流动或能量逐渐亮起',
+  },
+  {
+    category: 'unknown',
+    pattern: /(被挤出一道缝|被挤出|争相挤入|围堵|压迫|压顶|巨大暗影)/giu,
+    reason: '人群挤压或强压迫意象，建议改成自然分开、庄严轮廓或厚重背景',
+  },
+  {
+    category: 'unknown',
+    pattern: /((?:十几岁|少年少女|少年)[^。；\n]{0,80}(?:惊惧|惊恐|恐惧|骇然|失声|脸色发白|屏住呼吸|挤|木剑)|(?:惊惧|惊恐|恐惧|骇然|失声|脸色发白|屏住呼吸)[^。；\n]{0,80}(?:十几岁|少年少女|少年))/giu,
+    reason: '年轻角色和惊恐/挤压/武器同句出现，建议弱化为旁观者紧张注视、道具改为练习木剑',
+  },
+  {
+    category: 'unknown',
+    pattern: /(膜拜|跪伏|审判)/giu,
+    reason: '膜拜/审判类仪式化措辞可能偏敏感，建议改成庄严试炼、安静伫立或仪式感场面',
+  },
+];
 
 function uniqueCategories(categories: Array<ViolationCategory | string | null | undefined>): ViolationCategory[] {
   const out: ViolationCategory[] = [];
@@ -170,6 +209,74 @@ export function preflightImageModerationPrompt(prompt: string): ImageModerationP
     categories: Array.from(new Set(hits.map((hit) => hit.category))),
     hits,
   };
+}
+
+function compactSafetyHintText(text: string): string {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[-:：\s]+/, '')
+    .trim()
+    .slice(0, 90);
+}
+
+function safetyHintKey(hint: ImagePromptSafetyHint): string {
+  return `${hint.source}:${hint.category}:${hint.text}:${hint.reason}`;
+}
+
+function extractImageSafetyHintScope(text: string): string {
+  const source = String(text || '');
+  const sections: string[] = [];
+  const sectionRe = /【(主镜头|上下文镜头|用户原文约束)】[\s\S]*?(?=\n【[^】]+】|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = sectionRe.exec(source)) !== null) {
+    sections.push(match[0]);
+  }
+  return sections.length ? sections.join('\n') : source;
+}
+
+export function inferImagePromptSafetyHints(prompt: string, maxHints = 8): ImagePromptSafetyHint[] {
+  const text = extractImageSafetyHintScope(String(prompt || ''));
+  const out: ImagePromptSafetyHint[] = [];
+  const seen = new Set<string>();
+  const push = (hint: ImagePromptSafetyHint) => {
+    const item = {
+      ...hint,
+      text: compactSafetyHintText(hint.text),
+    };
+    if (!item.text) return;
+    const key = safetyHintKey(item);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(item);
+  };
+
+  for (const hit of preflightImageModerationPrompt(text).hits) {
+    push({
+      text: hit.text,
+      reason: hit.reason,
+      category: hit.category,
+      source: 'preflight',
+    });
+  }
+
+  const protectedSpans = collectProtectedImageRewriteSpans(text);
+  for (const rule of IMAGE_SAFETY_HINT_RULES) {
+    let match: RegExpExecArray | null;
+    rule.pattern.lastIndex = 0;
+    while ((match = rule.pattern.exec(text)) !== null) {
+      if (overlapsProtectedSpan(match.index, match.index + match[0].length, protectedSpans)) continue;
+      push({
+        text: match[0],
+        reason: rule.reason,
+        category: rule.category,
+        source: 'heuristic',
+      });
+      if (out.length >= maxHints) return out.slice(0, maxHints);
+      if (!rule.pattern.global) break;
+    }
+  }
+
+  return out.slice(0, maxHints);
 }
 
 export function rewriteImagePromptForModeration(

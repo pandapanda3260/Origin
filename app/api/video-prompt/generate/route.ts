@@ -4,8 +4,11 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream } from '@/lib/llm';
 import { buildVideoPromptMessages } from '@/lib/prompts';
+import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import {
+  plannedTimelineGroupsFromProject,
+  plannedTimelineStartFromGroups,
   VIDEO_REFERENCE_IMAGE_BUDGET,
   type ReferenceManifestItem,
   type VideoReferenceRole,
@@ -25,6 +28,8 @@ import {
   validateCharacterConsistencyForGroup,
   type CharacterConsistencyGateResult,
 } from '@/lib/character-consistency-gate';
+import { buildVideoReferenceManifest } from '@/lib/reference-matcher';
+import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -65,9 +70,16 @@ function normalizeRole(value: unknown): VideoReferenceRole | null {
   return null;
 }
 
+function preflightReasonMessage(reason: string) {
+  if (reason === 'first_frame_missing' || reason === 'missing_first_frame') return '缺少可用首帧，请先生成首帧图';
+  if (reason === 'first_frame_failed') return '首帧生成失败，请先重新生成首帧图';
+  if (reason === 'legacy_sketch_only') return '只有旧版黑白分镜，缺少可用于下游生成的彩色首帧';
+  return reason;
+}
+
 function sentinelBlockMessage(decision: Pick<ArtifactUsageDecision, 'consistency' | 'blockingReasons'>) {
   return decision.consistency?.blockers?.map((b) => b.message).filter(Boolean).join('；') ||
-    decision.blockingReasons.join('、') ||
+    decision.blockingReasons.map(preflightReasonMessage).join('、') ||
     'artifact_usage_blocked';
 }
 
@@ -86,6 +98,7 @@ type MarkVideoPromptFailedArgs = {
   errorCode: string;
   failureStage: string;
   reason: string;
+  shotIndices?: number[];
 };
 
 type VideoPromptStateWriteResult = {
@@ -299,7 +312,10 @@ function markVideoPromptFailedSameRunUnsafe(args: MarkVideoPromptFailedArgs): Vi
       return {};
     }
 
-    const failedShotIndices = storyboardShotIndices(fresh as any, groupIdx, prev, { mode: 'single-shot-strict' });
+    const failedShotIndices = storyboardShotIndices(fresh as any, groupIdx, prev, {
+      mode: 'single-shot-strict',
+      explicitShotIndices: args.shotIndices,
+    });
     const now = new Date().toISOString();
     storyboards[groupIdx] = {
       ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
@@ -580,11 +596,16 @@ export async function POST(req: NextRequest) {
   const styleBible: any = body.styleBible || {};
   const assets: any = body.assets || {};
   const narrations: any[] = Array.isArray(body.narrations) ? body.narrations : [];
+  const allGroupsShots: any[][] = Array.isArray(body.allGroupsShots)
+    ? body.allGroupsShots.map((group: any) => (Array.isArray(group) ? group : []))
+    : [];
   const groupIdx: number = Number.isInteger(body.groupIdx) ? body.groupIdx : 0;
   const totalGroups: number = Number.isInteger(body.totalGroups) ? body.totalGroups : 1;
-  const referenceManifest = buildReferenceManifestFromRequest(body, groupIdx);
-  const droppedReferences = Array.isArray(body.droppedReferences) ? body.droppedReferences : [];
-  const promptRunId = compactText(body.videoPromptRunId) || randomUUID();
+  let timelineStartSec = plannedTimelineStartFromGroups(allGroupsShots, groupIdx);
+  let referenceManifest = buildReferenceManifestFromRequest(body, groupIdx);
+	  let droppedReferences = Array.isArray(body.droppedReferences) ? body.droppedReferences : [];
+	  const promptRunId = compactText(body.videoPromptRunId) || randomUUID();
+	  let planMeta = body.planMeta || null;
   // 用户反馈：videoPrompt 的内容跟 storyboards[i].shotIndices 对不上→视频段
   // 阶段抓不准本组对应的 shot.dialogue。这里把前端传过来的 shotIndices 和
   // 实际入参的 shots 一并落库，video_segments executor 才能拿到正确映射。
@@ -600,14 +621,27 @@ export async function POST(req: NextRequest) {
     writer.step(`正在生成第 ${groupIdx + 1}/${totalGroups} 组提示词…`);
     let projectForKnowledge: any = null;
     let markedGenerating = false;
-    if (projectId) {
-      const proj = getProjectByIdForUser(projectId, user.id);
-      if (proj) {
+	    if (projectId) {
+	      const proj = getProjectByIdForUser(projectId, user.id);
+	      if (proj) {
+	        planMeta = (proj as any).planMeta || planMeta;
+	        timelineStartSec = plannedTimelineStartFromGroups(plannedTimelineGroupsFromProject(proj), groupIdx);
         const sb = Array.isArray((proj as any).storyboards) ? ((proj as any).storyboards[groupIdx] || {}) : {};
         shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
           mode: 'single-shot-strict',
           explicitShotIndices: shotIndices,
         });
+        const canonicalReferenceBuild = buildVideoReferenceManifest({
+          project: proj,
+          assets: (proj as any).assets || assets,
+          shots: Array.isArray((proj as any).shots) ? (proj as any).shots : shots,
+          groupShotIndices: shotIndices,
+          groupIdx,
+          ownerId: user.id,
+          storyboardImageUrl: resolveStoryboardFirstFrameUrl(sb) || null,
+        });
+        referenceManifest = canonicalReferenceBuild.manifest;
+        droppedReferences = canonicalReferenceBuild.droppedReferences;
         const sentinel = describeArtifactStatus(proj as any, {
           projectId,
           targetArtifact: 'video_prompt_generation',
@@ -654,7 +688,11 @@ export async function POST(req: NextRequest) {
 
     let originalMessages: ReturnType<typeof buildVideoPromptMessages>;
     try {
-      originalMessages = buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups });
+      const worldContext = projectWorldContextForStage('video_prompt', (projectForKnowledge as any)?.worldTemplateSnapshot, {
+        project: projectForKnowledge,
+        target: { groupIdx, shotIndices },
+      });
+		      originalMessages = buildVideoPromptMessages({ shots, styleBible, assets, narrations, referenceManifest, groupIdx, totalGroups, timelineStartSec, planMeta, worldContext });
     } catch (e: any) {
       if (projectId && markedGenerating) {
         maybeMarkVideoPromptFailedSameRun({
@@ -666,6 +704,7 @@ export async function POST(req: NextRequest) {
           errorCode: 'VIDEO_PROMPT_PROMPT_BUILD_FAILED',
           failureStage: 'prompt_build',
           reason: 'prompt_build_failed',
+          shotIndices,
         });
       }
       failSingleVideoPrompt(writer, '视频提示词生成准备失败：' + (e?.message || String(e)), {
@@ -792,6 +831,7 @@ export async function POST(req: NextRequest) {
           errorCode: 'VIDEO_PROMPT_LLM_FAILED',
           failureStage: 'llm',
           reason: 'llm_failed',
+          shotIndices,
         });
       }
       failSingleVideoPrompt(writer, '视频提示词生成失败：' + (e?.message || String(e)), {
@@ -812,8 +852,9 @@ export async function POST(req: NextRequest) {
           groupIdx,
           promptRunId,
           errorMessage: emptyMessage,
-          errorCode: 'VIDEO_PROMPT_EMPTY_RESULT',
-          failureStage: 'llm',
+	          errorCode: 'VIDEO_PROMPT_EMPTY_RESULT',
+	          failureStage: 'llm',
+	          shotIndices,
           reason: 'empty_result',
         });
       }
@@ -904,10 +945,11 @@ export async function POST(req: NextRequest) {
           groupIdx,
           promptRunId,
           errorMessage: gateMessage,
-          errorCode: 'VIDEO_PROMPT_CONSISTENCY_GATE_FAILED',
-          failureStage: 'consistency',
-          reason: 'consistency_gate_failed',
-        });
+	          errorCode: 'VIDEO_PROMPT_CONSISTENCY_GATE_FAILED',
+	          failureStage: 'consistency',
+	          reason: 'consistency_gate_failed',
+	          shotIndices,
+	        });
         const stored = readStoredVideoPromptState(failureMark.project || proj, groupIdx);
         logVideoPromptTrace('single_prompt_writeback_rejected', {
           projectId,
@@ -983,10 +1025,11 @@ export async function POST(req: NextRequest) {
             groupIdx,
             promptRunId,
             errorMessage: '视频提示词生成完成，但结果没有成功写回项目，请重试。',
-            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
-            failureStage: 'persist',
-            reason: readyResult.skippedReason || 'writeback_not_applied',
-          });
+	            errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+	            failureStage: 'persist',
+	            reason: readyResult.skippedReason || 'writeback_not_applied',
+	            shotIndices,
+	          });
           logVideoPromptTrace('single_prompt_writeback_rejected', {
             projectId,
             groupIdx,
@@ -1017,10 +1060,11 @@ export async function POST(req: NextRequest) {
           groupIdx,
           promptRunId,
           errorMessage,
-          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
-          failureStage: 'persist',
-          reason: 'writeback_exception',
-        });
+	          errorCode: 'VIDEO_PROMPT_WRITEBACK_NOT_APPLIED',
+	          failureStage: 'persist',
+	          reason: 'writeback_exception',
+	          shotIndices,
+	        });
         logVideoPromptTrace('single_prompt_writeback_result', {
           projectId,
           groupIdx,

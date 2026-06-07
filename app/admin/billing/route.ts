@@ -26,7 +26,7 @@ export async function GET(req: NextRequest) {
     </style>`,
     bodyHtml: `<section class="panel">
       <div class="billing-toolbar">
-        <input data-billing-search="true" placeholder="搜索用户 / 订单 / ledger / refId" />
+        <input data-billing-search="true" placeholder="搜索用户ID / 手机号 / 订单 / ledger / refId" />
         <button data-billing-search-button="true" class="primary">搜索</button>
         <button data-billing-refresh="true">刷新</button>
       </div>
@@ -63,6 +63,7 @@ export async function GET(req: NextRequest) {
       function setNotice(message, kind = '') { notice.textContent = message || ''; notice.dataset.kind = kind; }
       function fmtDate(value) { if (!value) return '-'; try { return new Date(value).toLocaleString('zh-CN', { hour12:false }); } catch { return value; } }
       function yuan(cents) { return (Number(cents || 0) / 100).toFixed(2); }
+      function userLabel(row) { return row?.phone || row?.displayName || row?.username || row?.userId || '-'; }
       function renderMetrics() {
         const cost = state.data?.cost || {};
         const revenue = (cost.revenue || []).map((r) => r.currency + ' ' + yuan(r.amountCents)).join(' / ') || '0.00';
@@ -83,13 +84,13 @@ export async function GET(req: NextRequest) {
         const data = state.data || {};
         if (state.tab === 'users') {
           head.innerHTML = '<tr><th>ID</th><th>用户</th><th>总积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>计划</th><th>更新时间</th></tr>';
-          table.innerHTML = rows(data.users, 8, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(u.username) + '</strong><div class="muted">' + esc(u.email || u.displayName || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
+          table.innerHTML = rows(data.users, 8, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
         } else if (state.tab === 'orders') {
           head.innerHTML = '<tr><th>订单</th><th>用户</th><th>类型</th><th>Provider</th><th>金额</th><th>积分</th><th>状态</th><th>时间</th></tr>';
-          table.innerHTML = rows(data.orders, 8, (o) => '<tr><td class="mono">' + esc(o.id) + '</td><td>' + esc(o.username) + '<div class="muted">' + o.userId + '</div></td><td>' + esc(o.kind + '/' + (o.planCode || '-')) + '</td><td>' + esc(o.provider) + '<div class="muted mono">' + esc(o.providerRef || '') + '</div></td><td>' + esc(o.currency) + ' ' + yuan(o.amountCents) + '</td><td>' + Number(o.creditsAdded || 0) + '</td><td>' + esc(o.status) + '</td><td>' + esc(fmtDate(o.createdAt)) + '</td></tr>');
+          table.innerHTML = rows(data.orders, 8, (o) => '<tr><td class="mono">' + esc(o.id) + '</td><td>' + esc(userLabel(o)) + '<div class="muted">' + o.userId + '</div></td><td>' + esc(o.kind + '/' + (o.planCode || '-')) + '</td><td>' + esc(o.provider) + '<div class="muted mono">' + esc(o.providerRef || '') + '</div></td><td>' + esc(o.currency) + ' ' + yuan(o.amountCents) + '</td><td>' + Number(o.creditsAdded || 0) + '</td><td>' + esc(o.status) + '</td><td>' + esc(fmtDate(o.createdAt)) + '</td></tr>');
         } else if (state.tab === 'ledger') {
           head.innerHTML = '<tr><th>Ledger</th><th>用户</th><th>金额</th><th>类型</th><th>原因</th><th>Ref</th><th>模型/成本</th><th>时间</th></tr>';
-          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(l.username) + '<div class="muted">' + l.userId + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.kind) + (l.adminUsername ? '<div class="muted">admin ' + esc(l.adminUsername) + '</div>' : '') + '</td><td>' + esc(l.reason || '-') + '</td><td class="mono">' + esc(l.refId || '-') + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? (Number(l.costMicros)/1000000).toFixed(6) : '-') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
+          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(userLabel(l)) + '<div class="muted">' + l.userId + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.kind) + (l.adminUsername ? '<div class="muted">admin ' + esc(l.adminUsername) + '</div>' : '') + '</td><td>' + esc(l.reason || '-') + '</td><td class="mono">' + esc(l.refId || '-') + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? (Number(l.costMicros)/1000000).toFixed(6) : '-') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
         } else if (state.tab === 'cost') {
           head.innerHTML = '<tr><th>Provider</th><th>Model</th><th>Role</th><th>实际成本</th><th>消耗积分</th><th>样本</th></tr>';
           table.innerHTML = rows(data.cost?.modelCost, 6, (r) => '<tr><td>' + esc(r.provider) + '</td><td>' + esc(r.model) + '</td><td>' + esc(r.modelRole) + '</td><td>' + (Number(r.costMicros || 0)/1000000).toFixed(6) + '</td><td>' + Number(r.chargedCredits || 0) + '</td><td>' + Number(r.count || 0) + '</td></tr>');

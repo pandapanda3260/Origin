@@ -6,6 +6,8 @@ import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { storyboardShotIndices } from '@/lib/frame-workflow-state';
 import { syncEditProjectClips } from '@/lib/asset-library';
+import { getVevDemoMaterialBinding } from '@/lib/vevdemo-material-bindings';
+import { getVevDemoProjectBinding } from '@/lib/vevdemo-project-bindings';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -45,6 +47,96 @@ function rowBelongsToCurrentSlot(project: any, row: any): boolean {
     vt?.protectedUrl,
     vt?._originVideoUrl,
   ].some((value) => stringContainsTaskId(value, taskId));
+}
+
+function isCompletedVideoTask(row: any): boolean {
+  const status = String(row?.status || '').toLowerCase();
+  return (status === 'succeeded' || status === 'done' || status === 'completed') && Boolean(row?.filename);
+}
+
+function collectCurrentEdlVideoTaskIds(project: any): Set<string> {
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  const ids = new Set<string>();
+  for (const entry of timeline) {
+    [
+      entry?.clipId,
+      entry?.id,
+      entry?.videoTaskId,
+      entry?.mediaId,
+      entry?.resourceId,
+    ].forEach((value) => {
+      const text = String(value || '').trim();
+      if (text) ids.add(text);
+    });
+  }
+  return ids;
+}
+
+function rowBelongsToCurrentEdl(project: any, row: any, currentEdlIds = collectCurrentEdlVideoTaskIds(project)): boolean {
+  const taskId = String(row?.id || '').trim();
+  if (!taskId) return false;
+  if (currentEdlIds.has(taskId)) return true;
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  return timeline.some((entry: any) => (
+    stringContainsTaskId(entry?.videoUrl, taskId) ||
+    stringContainsTaskId(entry?._originVideoUrl, taskId) ||
+    stringContainsTaskId(entry?.protectedUrl, taskId)
+  ));
+}
+
+function getTargetVevProjectId(originProjectId: string): string | undefined {
+  const binding = getVevDemoProjectBinding(originProjectId);
+  return binding?.vevProjectId || undefined;
+}
+
+function toProjectVideoLibraryItem(req: NextRequest, row: any, userId: number, project: any, currentEdlIds: Set<string>) {
+  const taskId = String(row.id);
+  const groupIdx = Number(row.group_idx);
+  const signed = buildSignedVideoUrl(taskId, userId);
+  const protectedUrl = `/api/videos/file/${encodeURIComponent(taskId)}`;
+  const coverUrl = row.cover_image_id ? `/api/images/file/${encodeURIComponent(String(row.cover_image_id))}` : '';
+  const vevProjectId = getTargetVevProjectId(String(row.project_id || project?.id || ''));
+  const binding = getVevDemoMaterialBinding('video_task', taskId, vevProjectId);
+  const absoluteSignedUrl = new URL(signed.url, req.url).toString();
+
+  return {
+    id: taskId,
+    task_id: taskId,
+    taskId,
+    resourceType: 'video_task',
+    title: `片段 ${Number.isInteger(groupIdx) && groupIdx >= 0 ? groupIdx + 1 : taskId}`,
+    groupIdx,
+    group_idx: groupIdx,
+    target_idx: groupIdx,
+    status: row.status,
+    durationSec: row.duration_sec,
+    duration_sec: row.duration_sec,
+    url: absoluteSignedUrl,
+    result_url: absoluteSignedUrl,
+    protectedUrl,
+    protected_url: protectedUrl,
+    coverUrl,
+    cover_url: coverUrl,
+    prompt: row.prompt || '',
+    createdAt: row.created_at,
+    created_at: row.created_at,
+    updatedAt: row.updated_at,
+    updated_at: row.updated_at,
+    rowBelongsToCurrentEdl: rowBelongsToCurrentEdl(project, row, currentEdlIds),
+    is_current: rowBelongsToCurrentSlot(project, row),
+    vevBinding: binding ? {
+      vevSource: binding.vevSource,
+      vevProjectId: binding.vevProjectId,
+      vevGroupId: binding.vevGroupId,
+      vevSpace: binding.vevSpace,
+      vevEditMid: binding.vevEditMid,
+      title: binding.title || '',
+      vid: binding.vid || '',
+      registeredAt: binding.registeredAt || '',
+    } : null,
+  };
 }
 
 function computeReadiness(project: any) {
@@ -106,6 +198,100 @@ export async function GET(req: NextRequest) {
   if (!project) return jsonError('项目不存在', 404);
 
   const db = getDb();
+  const scope = String(url.searchParams.get('scope') || '').trim();
+
+  if (scope === 'all-completed') {
+    const rows = db
+      .prepare<{ uid: number; pid: string }, any>(
+        `SELECT id, project_id, group_idx, status, progress, filename, duration_sec, cover_image_id,
+                error_msg, prompt, created_at, updated_at
+         FROM video_tasks
+         WHERE owner_id = @uid AND project_id = @pid
+         ORDER BY group_idx ASC, created_at DESC`,
+      )
+      .all({ uid: user.id, pid: projectId });
+
+    const currentEdlIds = collectCurrentEdlVideoTaskIds(project);
+    const videos = rows
+      .filter(isCompletedVideoTask)
+      .map((row: any) => toProjectVideoLibraryItem(req, row, user.id, project, currentEdlIds));
+
+    return jsonOk({
+      scope,
+      projectId,
+      videos,
+      items: videos,
+      tasks: videos,
+      total: videos.length,
+    });
+  }
+
+  // ── 历史模式：?groupIdx=N → 返回该片段「全部」成功生成历史（历史视频弹窗用）。
+  //    「仅匹配当前镜头」：当前 slot 仍是合法单镜头才返回历史，否则返回空（前端显示「空」）。
+  //    默认（不带 groupIdx）行为保持不变，给刷新补绑 _reattachVideoTasks 用。──
+  const historyGroupRaw = url.searchParams.get('groupIdx');
+  if (historyGroupRaw != null && historyGroupRaw !== '') {
+    const gi = Number(historyGroupRaw);
+    if (!Number.isInteger(gi) || gi < 0) return jsonError('非法 groupIdx', 400);
+
+    const storyboardsH = Array.isArray(project?.storyboards) ? project.storyboards : [];
+    const sbH = storyboardsH[gi];
+    let slotValid = false;
+    if (sbH) {
+      try {
+        storyboardShotIndices(project, gi, sbH, { mode: 'single-shot-strict' });
+        slotValid = true;
+      } catch {
+        slotValid = false;
+      }
+    }
+    if (!slotValid) return jsonOk({ history: [], total: 0 });
+
+    const histRows = db
+      .prepare<{ uid: number; pid: string; gi: number }, any>(
+        `SELECT id, group_idx, status, duration_sec, filename, cover_image_id, prompt, created_at
+         FROM video_tasks
+         WHERE owner_id = @uid AND project_id = @pid AND group_idx = @gi
+         ORDER BY created_at DESC`,
+      )
+      .all({ uid: user.id, pid: projectId, gi });
+
+    const videoTasksH = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+    const vtH = videoTasksH[gi];
+    const currentIds = [sbH?.videoTaskId, vtH?.taskId, vtH?.serverTaskId, vtH?.id]
+      .map((v: any) => String(v || '').trim())
+      .filter(Boolean);
+    const currentUrls = [sbH?.videoUrl, sbH?._originVideoUrl, vtH?.url, vtH?.protectedUrl].map(
+      (v: any) => String(v || ''),
+    );
+
+    const history = histRows
+      .filter(
+        (r: any) =>
+          (r.status === 'succeeded' || r.status === 'done' || r.status === 'completed') && r.filename,
+      )
+      .map((r: any) => {
+        const taskId = String(r.id);
+        const isCurrent =
+          currentIds.includes(taskId) ||
+          currentUrls.some((u: string) => stringContainsTaskId(u, taskId));
+        return {
+          task_id: r.id,
+          target_idx: gi,
+          status: r.status,
+          duration_sec: r.duration_sec,
+          url: buildSignedVideoUrl(r.id, user.id).url,
+          protected_url: `/api/videos/file/${r.id}`,
+          cover_url: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : '',
+          prompt: r.prompt || '',
+          created_at: r.created_at,
+          is_current: isCurrent,
+        };
+      });
+
+    return jsonOk({ history, total: history.length });
+  }
+
   const rows = db
     .prepare<{ uid: number; pid: string }, any>(
       `SELECT id, group_idx, status, progress, filename, duration_sec, cover_image_id,
@@ -159,6 +345,133 @@ export async function GET(req: NextRequest) {
   }));
 
   return jsonOk({ tasks, items, total: tasks.length });
+}
+
+/**
+ * 把某条历史视频「设为当前」——历史视频弹窗的「替换」按钮走这里。
+ * 写回 storyboards[gi] + videoTasks[gi] 指向选中的历史任务，并同步剪辑时间线里
+ * 该片段的 videoUrl。被替换掉的旧视频仍然留在 video_tasks 表里，下次打开弹窗
+ * 仍会出现在历史列表中。采用专用动作（而非整包 PUT）避免旧版本覆盖，与 DELETE 一致。
+ */
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUser(req);
+  if (!user) return jsonError('unauthorized', 401);
+
+  const body = await req.json().catch(() => ({} as any));
+  const action = String(body?.action || '').trim();
+  if (action !== 'set-current') return jsonError('不支持的 action', 400);
+
+  const projectId = String(body?.projectId || '').trim();
+  const groupIdx = Number(body?.groupIdx);
+  const taskId = String(body?.taskId || '').trim();
+  if (!projectId) return jsonError('缺 projectId', 400);
+  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
+  if (!taskId) return jsonError('缺 taskId', 400);
+
+  const db = getDb();
+  const row = db
+    .prepare<{ id: string; uid: number; pid: string }, any>(
+      `SELECT id, group_idx, status, duration_sec, filename, cover_image_id
+       FROM video_tasks WHERE id = @id AND owner_id = @uid AND project_id = @pid`,
+    )
+    .get({ id: taskId, uid: user.id, pid: projectId });
+  if (!row) return jsonError('历史视频不存在', 404);
+  if (Number(row.group_idx) !== groupIdx) return jsonError('groupIdx 与任务不匹配', 400);
+  const succeeded = row.status === 'succeeded' || row.status === 'done' || row.status === 'completed';
+  if (!succeeded || !row.filename) return jsonError('该历史视频不可用', 400);
+
+  const protectedUrl = `/api/videos/file/${row.id}`;
+  const signedUrl = buildSignedVideoUrl(row.id, user.id).url;
+  const coverUrl = row.cover_image_id ? `/api/images/file/${row.cover_image_id}` : '';
+  const durationSec = Number(row.duration_sec) || 0;
+
+  const patched = patchProjectForUser(projectId, user.id, (fresh: any) => {
+    const storyboards = Array.isArray(fresh?.storyboards) ? [...fresh.storyboards] : [];
+    if (groupIdx >= storyboards.length || !storyboards[groupIdx]) return null;
+
+    const sb = { ...storyboards[groupIdx] };
+    sb.videoUrl = signedUrl;
+    sb._originVideoUrl = protectedUrl;
+    sb.videoTaskId = row.id;
+    if (coverUrl) sb.videoCoverUrl = coverUrl;
+    if (durationSec > 0) sb.videoDurationSec = durationSec;
+    sb.videoStatus = 'done';
+    sb.videoIsCurrent = true;
+    delete sb.videoInvalidatedAt;
+    delete sb.videoInvalidatedReason;
+    delete sb.readyForEdit;
+    // videoAssetId 可能指向旧资源；清掉以免 hydrateProjectAssetUrls 用旧的重签覆盖。
+    delete sb.videoAssetId;
+    storyboards[groupIdx] = sb;
+
+    const videoTasks = Array.isArray(fresh?.videoTasks) ? [...fresh.videoTasks] : [];
+    const prevVt =
+      videoTasks[groupIdx] && typeof videoTasks[groupIdx] === 'object' ? videoTasks[groupIdx] : {};
+    const vt: any = { ...prevVt };
+    vt.groupIdx = groupIdx;
+    vt.taskId = row.id;
+    vt.url = protectedUrl;
+    vt.protectedUrl = protectedUrl;
+    if (durationSec > 0) vt.durationSec = durationSec;
+    vt.status = 'completed';
+    vt.isCurrent = true;
+    delete vt.outdated;
+    delete vt.invalidatedAt;
+    delete vt.invalidatedReason;
+    videoTasks[groupIdx] = vt;
+
+    // 同步剪辑时间线：该片段若已在 timeline，把它的 videoUrl 换成新视频。
+    const editData =
+      fresh?.editData && typeof fresh.editData === 'object' ? { ...fresh.editData } : {};
+    const edl = editData.edl && typeof editData.edl === 'object' ? { ...editData.edl } : null;
+    if (edl && Array.isArray(edl.timeline)) {
+      let touched = false;
+      edl.timeline = edl.timeline.map((entry: any) => {
+        if (entry && Number(entry.groupIdx) === groupIdx) {
+          touched = true;
+          return { ...entry, videoUrl: signedUrl, protectedUrl, _originVideoUrl: protectedUrl };
+        }
+        return entry;
+      });
+      if (touched) edl.version = (Number(edl.version) || 0) + 1;
+      editData.edl = edl;
+    }
+
+    return {
+      storyboards,
+      videoTasks,
+      editData: {
+        ...editData,
+        readiness: computeReadiness({ ...fresh, storyboards, videoTasks }),
+      },
+    };
+  });
+
+  if (!patched) return jsonError('项目不存在或片段不存在', 404);
+
+  const edl = patched?.editData?.edl;
+  try {
+    syncEditProjectClips({
+      ownerId: user.id,
+      projectId,
+      timeline: Array.isArray(edl?.timeline) ? edl.timeline : [],
+    });
+  } catch (clipError) {
+    console.warn('[video-by-project] set-current clip sync skipped:', clipError);
+  }
+
+  return jsonOk({
+    ok: true,
+    groupIdx,
+    taskId: row.id,
+    url: signedUrl,
+    protectedUrl,
+    coverUrl,
+    durationSec,
+    readiness: computeReadiness(patched),
+    edl: edl || null,
+    serverVersion: Number(patched.version) || undefined,
+  });
 }
 
 export async function DELETE(req: NextRequest) {

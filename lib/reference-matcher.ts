@@ -9,6 +9,7 @@ import {
 } from './reference-roles';
 import {
   normalizeReferenceName,
+  buildReferenceBriefLine,
   VIDEO_REFERENCE_IMAGE_BUDGET,
   type DroppedReference,
   type ReferenceManifestItem,
@@ -24,6 +25,10 @@ type Candidate = Omit<ReferenceManifestItem, 'imageNo'> & {
   mentionCount?: number;
   firstMentionIndex?: number;
   relevanceScore?: number;
+  firstShotOrder?: number;
+  closeUpBoost?: number;
+  focusPairKey?: string;
+  focusPairOrder?: number;
 };
 
 export type BuildVideoReferenceManifestInput = {
@@ -205,6 +210,58 @@ function shotText(shots: any[]): string {
   ].filter(Boolean).join(' ')).join(' ');
 }
 
+function shotEntityText(shot: any): string {
+  return [
+    shot?.visual,
+    shot?.description,
+    shot?.desc,
+    shot?.dialogue,
+    shot?.scriptRef,
+    shot?.keyInfo,
+    shot?.focus,
+    shot?.composition,
+    Array.isArray(shot?.characters) ? shot.characters.join(' ') : '',
+  ].filter(Boolean).join(' ');
+}
+
+function isCloseOrFeatureShot(shot: any): boolean {
+  const text = String([
+    shot?.shotType,
+    shot?.cameraType,
+    shot?.camera,
+    shot?.composition,
+    shot?.focus,
+    shot?.visual,
+    shot?.description,
+  ].filter(Boolean).join(' ')).toLowerCase();
+  return /大特写|特写|近景|中近景|半身|脸部|面部|头像|眼神|表情|道具特写|close-up|closeup|close shot|portrait|detail shot/.test(text);
+}
+
+function shotContainsEntity(shot: any, role: VideoReferenceRole, entityName: string): boolean {
+  const norm = normalizeReferenceName(entityName);
+  if (!norm) return false;
+  if (role === 'character' && Array.isArray(shot?.characters)) {
+    if (shot.characters.some((name: any) => normalizeReferenceName(name) === norm)) return true;
+  }
+  return normalizeReferenceName(shotEntityText(shot)).includes(norm);
+}
+
+function firstShotOrderForEntity(shots: any[], role: VideoReferenceRole, entityName: string): number {
+  for (let i = 0; i < shots.length; i++) {
+    if (shotContainsEntity(shots[i], role, entityName)) return i;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function closeUpBoostForEntity(shots: any[], role: VideoReferenceRole, entityName: string): number {
+  if (role !== 'character' && role !== 'prop') return 1;
+  return shots.some((shot) => isCloseOrFeatureShot(shot) && shotContainsEntity(shot, role, entityName)) ? 1.45 : 1;
+}
+
+function shotHitCountForEntity(shots: any[], role: VideoReferenceRole, entityName: string): number {
+  return shots.reduce((sum, shot) => sum + (shotContainsEntity(shot, role, entityName) ? 1 : 0), 0);
+}
+
 function firstChars(shots: any[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -223,13 +280,17 @@ function firstChars(shots: any[]): string[] {
 
 function pushCandidate(list: Candidate[], candidate: Omit<Candidate, '_order'>) {
   if (!candidate.url) return;
-  // The current video-reference policy intentionally pushes at most one image
-  // per character. If future work allows multiple panels for the same character,
-  // this de-dupe key must include panelInfo.panel.
-  const duplicateIdx = list.findIndex((item) => item.url === candidate.url || (
-    item.role === candidate.role &&
-    normalizeReferenceName(item.assetName) === normalizeReferenceName(candidate.assetName)
-  ));
+  const duplicateIdx = list.findIndex((item) => {
+    if (item.url === candidate.url) return true;
+    if (item.role !== candidate.role) return false;
+    if (normalizeReferenceName(item.assetName) !== normalizeReferenceName(candidate.assetName)) return false;
+    if (item.role === 'character') {
+      const itemPanel = compactText(item.panelInfo?.panel);
+      const candidatePanel = compactText(candidate.panelInfo?.panel);
+      if (itemPanel && candidatePanel) return itemPanel === candidatePanel;
+    }
+    return true;
+  });
   if (duplicateIdx >= 0) {
     if ((candidate.score || 0) > (list[duplicateIdx].score || 0)) {
       list[duplicateIdx] = { ...candidate, _order: list[duplicateIdx]._order };
@@ -294,47 +355,102 @@ function addFirstFrameCandidate(candidates: Candidate[], input: BuildVideoRefere
   });
 }
 
+function candidateBaseScore(candidate: Candidate): number {
+  if (candidate.role === 'prop') {
+    return (candidate.relevanceScore ?? 0) + (candidate.mentionCount || 0) * 20 + candidate.score * 0.1;
+  }
+  if (candidate.role === 'scene') {
+    return candidate.score + (candidate.mentionCount || 0) * 18;
+  }
+  if (candidate.role === 'character') {
+    return candidate.score + (candidate.mentionCount || 0) * 8;
+  }
+  return candidate.score;
+}
+
+function sortWithinRole(role: VideoReferenceRole, items: Candidate[]): Candidate[] {
+  return [...items].sort((a, b) => {
+    if (role === 'prop') {
+      return ((b.mentionCount || 0) - (a.mentionCount || 0)) ||
+        ((a.firstMentionIndex ?? Number.MAX_SAFE_INTEGER) - (b.firstMentionIndex ?? Number.MAX_SAFE_INTEGER)) ||
+        ((b.relevanceScore ?? b.score) - (a.relevanceScore ?? a.score)) ||
+        (a._order - b._order);
+    }
+    return (b.score - a.score) ||
+      ((a.firstShotOrder ?? Number.MAX_SAFE_INTEGER) - (b.firstShotOrder ?? Number.MAX_SAFE_INTEGER)) ||
+      (a._order - b._order);
+  });
+}
+
+function normalizedImportanceByRole(candidates: Candidate[]): Map<Candidate, number> {
+  const out = new Map<Candidate, number>();
+  const roles: VideoReferenceRole[] = ['scene', 'character', 'prop'];
+  for (const role of roles) {
+    const items = sortWithinRole(role, candidates.filter((c) => c.role === role));
+    if (!items.length) continue;
+    const scores = items.map(candidateBaseScore);
+    const max = Math.max(...scores);
+    items.forEach((candidate, idx) => {
+      const rankScore = items.length <= 1 ? 1 : 1 - idx / items.length;
+      const valueScore = max > 0 ? candidateBaseScore(candidate) / max : 1;
+      out.set(candidate, Math.max(0, Math.min(1, valueScore * 0.75 + rankScore * 0.25)) * (candidate.closeUpBoost || 1));
+    });
+  }
+  return out;
+}
+
 function slotSelect(candidates: Candidate[], budget: number): { selected: Candidate[]; dropped: DroppedReference[] } {
   const byRole = (role: VideoReferenceRole) => candidates
-    .filter((c) => c.role === role)
-    .sort((a, b) => {
-      if (role === 'prop') {
-        return ((b.mentionCount || 0) - (a.mentionCount || 0)) ||
-          ((a.firstMentionIndex ?? Number.MAX_SAFE_INTEGER) - (b.firstMentionIndex ?? Number.MAX_SAFE_INTEGER)) ||
-          ((b.relevanceScore ?? b.score) - (a.relevanceScore ?? a.score)) ||
-          (a._order - b._order);
-      }
-      return (b.score - a.score) || (a._order - b._order);
-    });
+    .filter((c) => c.role === role);
 
   const selected: Candidate[] = [];
   const selectedKeys = new Set<string>();
-  const take = (candidate?: Candidate) => {
+  const take = (candidate?: Candidate, includeFocusPair = false) => {
     if (!candidate) return;
     const key = `${candidate.role}:${candidate.url}`;
     if (selectedKeys.has(key)) return;
     if (selected.length >= budget) return;
     selected.push(candidate);
     selectedKeys.add(key);
+    if (includeFocusPair && candidate.focusPairKey) {
+      const paired = candidates
+        .filter((item) => item.focusPairKey === candidate.focusPairKey)
+        .sort((a, b) => (a.focusPairOrder || 0) - (b.focusPairOrder || 0) || a._order - b._order);
+      for (const item of paired) take(item, false);
+    }
   };
 
-  const firstFrames = byRole('first_frame');
-  const scenes = byRole('scene');
-  const chars = byRole('character');
-  const props = byRole('prop');
+  const firstFrames = sortWithinRole('first_frame', byRole('first_frame'));
+  take(firstFrames[0]);
 
-  [
-    firstFrames[0],
-    scenes[0],
-    chars[0],
-    chars[1],
-    chars[2],
-    props[0],
-    chars[3],
-    props[1],
-    chars[4],
-    props[2],
-  ].forEach(take);
+  const importance = normalizedImportanceByRole(candidates);
+  const roleCounts = () => selected.reduce((acc, item) => {
+    acc.set(item.role, (acc.get(item.role) || 0) + 1);
+    return acc;
+  }, new Map<VideoReferenceRole, number>());
+  const sortByDynamicPriority = (items: Candidate[]) => {
+    const counts = roleCounts();
+    return [...items].sort((a, b) => {
+      const aScore = (importance.get(a) || 0) * Math.pow(0.8, counts.get(a.role) || 0);
+      const bScore = (importance.get(b) || 0) * Math.pow(0.8, counts.get(b.role) || 0);
+      return (bScore - aScore) ||
+        ((a.firstShotOrder ?? Number.MAX_SAFE_INTEGER) - (b.firstShotOrder ?? Number.MAX_SAFE_INTEGER)) ||
+        (a._order - b._order);
+    });
+  };
+  const remaining = () => candidates.filter((candidate) => {
+    if (candidate.role === 'first_frame') return false;
+    return !selectedKeys.has(`${candidate.role}:${candidate.url}`);
+  });
+
+  take(sortByDynamicPriority(byRole('scene'))[0]);
+  take(sortByDynamicPriority(byRole('character'))[0], true);
+
+  while (selected.length < budget) {
+    const next = sortByDynamicPriority(remaining())[0];
+    if (!next) break;
+    take(next, true);
+  }
 
   const dropped: DroppedReference[] = [];
   for (const c of candidates) {
@@ -377,6 +493,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     shots,
     maxSlots: 5,
     perCharacterLimit: 1,
+    enableFocusCharacterPair: true,
   });
   selectedPanels.forEach((panel, idx) => {
     const ch = findCharacterByName(chars, panel.characterName);
@@ -388,6 +505,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       return;
     }
     const defaults = roleDefaults('character');
+    const panelMentions = countOccurrences(normText, normalizeReferenceName(panel.characterName));
     pushCandidate(candidates, {
       type: 'character',
       role: 'character',
@@ -402,6 +520,12 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       promptHint: `Preserve identity, costume, species/body features, and ${panel.intent} details.`,
       matchReason: `panel selection ${panel.reason}`,
       score: 180 + panel.priority * 5 - idx,
+      mentionCount: panelMentions,
+      firstMentionIndex: firstOccurrenceIndex(normText, normalizeReferenceName(panel.characterName)),
+      firstShotOrder: firstShotOrderForEntity(shots, 'character', panel.characterName),
+      closeUpBoost: closeUpBoostForEntity(shots, 'character', panel.characterName),
+      focusPairKey: panel.focusPair ? normalizeReferenceName(panel.characterName) : undefined,
+      focusPairOrder: panel.focusPair && panel.panel === 'sheet' ? 1 : panel.focusPair && panel.panel === 'headshot' ? 2 : undefined,
       panelInfo: {
         panel: panel.panel,
         intent: panel.intent,
@@ -459,6 +583,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
           ? 'shot.characters exact match'
           : 'group text name match',
       score: (manualMatch ? 520 : explicit ? 100 : 70) + mentions * 5 - idx,
+      mentionCount: mentions,
+      firstMentionIndex: firstOccurrenceIndex(normText, norm),
+      firstShotOrder: firstShotOrderForEntity(shots, 'character', name),
+      closeUpBoost: closeUpBoostForEntity(shots, 'character', name),
     });
   });
 
@@ -481,6 +609,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     const name = assetName(scene, `场景${idx + 1}`);
     const norm = normalizeReferenceName(name);
     const mentions = norm ? countOccurrences(normText, norm) : 0;
+    const hitCount = shotHitCountForEntity(shots, 'scene', name);
     const isMain = !!scene?.isMain;
     const explicitMatch = !!explicitScene && (
       (!!explicitSceneId && assetId(scene) === explicitSceneId) ||
@@ -528,6 +657,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
         : explicitMatch
           ? 260 - idx
           : (mentions ? 85 + mentions * 8 : 45) + (isMain ? 10 : 0) - idx,
+      mentionCount: hitCount || mentions,
+      firstMentionIndex: firstOccurrenceIndex(normText, norm),
+      relevanceScore: explicitMatch ? 100 : manualMatch ? 100 : isMain ? 45 : 30,
+      firstShotOrder: firstShotOrderForEntity(shots, 'scene', name),
     });
   });
   if (!candidates.some((c) => c.role === 'scene')) {
@@ -552,6 +685,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
           promptHint: defaults.promptHint,
           matchReason: 'fallback first scene with image',
           score: 35,
+          mentionCount: shotHitCountForEntity(shots, 'scene', name),
+          firstMentionIndex: firstOccurrenceIndex(normText, normalizeReferenceName(name)),
+          relevanceScore: 25,
+          firstShotOrder: firstShotOrderForEntity(shots, 'scene', name),
         });
       }
     }
@@ -601,11 +738,13 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       mentionCount: mentions,
       firstMentionIndex: firstMention,
       relevanceScore: 80,
+      firstShotOrder: firstShotOrderForEntity(shots, 'prop', name),
+      closeUpBoost: closeUpBoostForEntity(shots, 'prop', name),
     });
   });
 
   const slotResult = slotSelect(candidates, budget);
-  const manifest = slotResult.selected.map((ref, idx) => ({
+  const manifestBase = slotResult.selected.map((ref, idx) => ({
     imageNo: idx + 1,
     role: ref.role,
     assetId: ref.assetId,
@@ -620,6 +759,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     matchReason: ref.matchReason,
     score: ref.score,
     panelInfo: ref.panelInfo,
+  }));
+  const manifest = manifestBase.map((ref) => ({
+    ...ref,
+    referenceBrief: buildReferenceBriefLine(ref, manifestBase),
   }));
 
   return {

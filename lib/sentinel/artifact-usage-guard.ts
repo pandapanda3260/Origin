@@ -17,6 +17,7 @@ import {
   validateCharacterConsistencyForGroup,
   type CharacterConsistencyGateResult,
 } from '../character-consistency-gate';
+import { inferTailFrameDependencyForShots } from '../tail-frame-dependency';
 
 export type TargetArtifact =
   | 'shot_plan'
@@ -381,6 +382,16 @@ function pushStaleFlagWithRelax(
   }
 }
 
+function shouldRequireFirstFrameForStoryboardImage(project: any, input: ArtifactUsageInput, groupIdx: number): boolean {
+  if (input.batchType !== 'tail_frame_images') return true;
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const sb = storyboards[groupIdx] || {};
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  const shotIdxs = groupShotIdxs(project, groupIdx, input.shotIndices);
+  const groupShots = shotIdxs.map((idx) => shots[idx]).filter(Boolean);
+  return inferTailFrameDependencyForShots(groupShots, sb) === 'requires_first_frame';
+}
+
 function repairActionsFor(target: TargetArtifact, groupIdx: number | null, shotPlan: ShotPlanSubDecision): RepairAction[] {
   const actions: RepairAction[] = [];
   if (!shotPlan.usable) {
@@ -452,14 +463,16 @@ export function describeArtifactStatus(project: any, input: ArtifactUsageInput):
       relax: relaxUpstreamStale,
     });
     checkShotPromptFlags();
-    const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
-    const firstFrame = deriveFirstFrameReadiness(storyboards[groupIdx], groupIdx);
-    if (!firstFrame.canStart) {
-      const reason: ArtifactUsageReason = firstFrame.status === 'failed'
-        ? 'first_frame_failed'
-        : 'first_frame_missing';
-      reasons.push(reason);
-      blockingReasons.push(reason);
+    if (shouldRequireFirstFrameForStoryboardImage(project, input, groupIdx)) {
+      const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+      const firstFrame = deriveFirstFrameReadiness(storyboards[groupIdx], groupIdx);
+      if (!firstFrame.canStart) {
+        const reason: ArtifactUsageReason = firstFrame.status === 'failed'
+          ? 'first_frame_failed'
+          : 'first_frame_missing';
+        reasons.push(reason);
+        blockingReasons.push(reason);
+      }
     }
   }
 

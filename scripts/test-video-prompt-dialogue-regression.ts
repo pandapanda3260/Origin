@@ -40,4 +40,25 @@ assert.match(firstLast.finalPrompt, /首尾帧模式生成/, 'first-last prompt 
 assert.doesNotMatch(firstLast.finalPrompt, /--ratio/, 'first-last prompt should not embed top-level ratio');
 assert.match(multiRef.finalPrompt, /--ratio 9:16 --duration 5/, 'multi-ref prompt should keep legacy ratio/duration suffix');
 
+const fixedShotPlan = [{ idx: 1, durationSec: 4, camera: '固定镜头', pace: 'normal' }];
+const fixedMultiRef = buildSeedancePromptParts({
+  prompt: '镜头保持在桌面正前方，角色从第一帧开始有呼吸和眼神变化。',
+  ratio: '16:9',
+  durationSec: 4,
+  shotPlan: fixedShotPlan,
+});
+const fixedFirstLast = buildSeedanceFirstLastFramePromptParts({
+  prompt: '镜头保持在桌面正前方，角色从第一帧开始有呼吸和眼神变化。',
+  durationSec: 4,
+  shotPlan: fixedShotPlan,
+});
+for (const [label, output] of [
+  ['fixed_multi_ref', fixedMultiRef.finalPrompt],
+  ['fixed_first_last', fixedFirstLast.finalPrompt],
+] as const) {
+  assert.match(output, /镜头计划为固定机位/, `${label} should recognize fixed camera`);
+  assert.match(output, /机位必须保持固定/, `${label} should keep camera fixed`);
+  assert.doesNotMatch(output, /按【运镜系统】描述的方向开始物理位移/, `${label} should not force physical camera movement`);
+}
+
 console.log('test-video-prompt-dialogue-regression: ok');

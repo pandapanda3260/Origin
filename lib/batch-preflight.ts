@@ -111,6 +111,9 @@ export function sentinelMessage(decision: ArtifactUsageDecision) {
   }
   if (reason === 'shot_plan_legacy_unknown') return '当前镜头计划来自旧版本，请先确认旧镜头仍可用或重新生成。';
   if (reason === 'storyboard_stale') return `${groupLabel} 分镜图已过期，请先重新生成分镜图。`;
+  if (reason === 'first_frame_missing' || reason === 'missing_first_frame') return `${groupLabel} 缺少可用首帧，请先生成首帧图。`;
+  if (reason === 'first_frame_failed') return `${groupLabel} 首帧生成失败，请先重新生成首帧图。`;
+  if (reason === 'legacy_sketch_only') return `${groupLabel} 只有旧版黑白分镜，缺少可用于下游生成的彩色首帧。`;
   if (reason === 'shot_prompt_stale') return `${groupLabel} 分镜提示词已过期，请先重新生成提示词。`;
   if (reason === 'video_prompt_stale') return `${groupLabel} 视频提示词已过期，请先重新生成视频提示词。`;
   if (reason === 'video_task_outdated' || reason === 'video_task_stale' || reason === 'storyboard_video_not_current') {

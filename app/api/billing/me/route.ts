@@ -36,7 +36,7 @@ export async function GET(req: NextRequest) {
     .all({ uid: user.id });
 
   return jsonOk({
-    user: { id: user.id, username: user.username, displayName: user.display_name },
+	    user: { id: user.id, phone: user.phone, displayName: user.display_name },
     currentPlan: {
       code: plan.code,
       title: plan.title,

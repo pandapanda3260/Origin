@@ -12,6 +12,7 @@ export const dynamic = 'force-dynamic';
 
 const STAGE_LABELS: Record<string, string> = {
   script_create: '剧本生成',
+  episode_create: '分集续写',
   style_bible: '风格圣经',
   assets_extract: '资产抽取',
   shots_generate: '镜头设计',
@@ -93,6 +94,18 @@ function publicCharacterLock(lock: any) {
       referenceStatus: cleanText(reference.referenceStatus, 80),
       qualityScore: Number.isFinite(Number(reference.qualityScore)) ? Number(reference.qualityScore) : null,
     },
+  };
+}
+
+function publicConsistencyMeta(consistency: any) {
+  const meta = consistency?.meta || {};
+  const roleSyncReasons = Array.isArray(meta.roleSyncReasons)
+    ? meta.roleSyncReasons.map((item: any) => cleanText(item, 240)).filter(Boolean).slice(0, 20)
+    : [];
+  return {
+    needsRoleSync: !!meta.needsRoleSync || roleSyncReasons.length > 0,
+    roleSyncReasons,
+    resolverCaseVersion: Number.isFinite(Number(meta.resolverCaseVersion)) ? Number(meta.resolverCaseVersion) : 1,
   };
 }
 
@@ -195,7 +208,13 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
         propCount: Array.isArray(worldSnapshot.props) ? worldSnapshot.props.length : 0,
       } : null,
       drift: driftInfo(worldSnapshot, worldSource),
+      pendingFacts: project.pendingWorldFacts ? {
+        source: cleanText(project.pendingWorldFacts.source, 80),
+        createdAt: cleanText(project.pendingWorldFacts.createdAt, 80),
+        summary: project.pendingWorldFacts.summary || null,
+      } : null,
     },
+    consistency: publicConsistencyMeta(project.consistency),
     characters: locks.map(publicCharacterLock),
     recentStages: listRecentStageSummaries(user.id, project.id),
   });

@@ -22,6 +22,8 @@ import {
   styleBibleForCharacterAsset,
   styleBibleForScenePrompt,
 } from '@/lib/casting-profile';
+import { projectWorldContextForStage } from '@/lib/world-template-context';
+import { mergeProjectFactsIntoWorldSnapshot } from '@/lib/world-templates-db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -46,6 +48,10 @@ export async function POST(req: NextRequest) {
   const styleBibleSource = (proj as any)?.styleBible ? 'project' : (bodyStyleBible ? 'request' : 'none');
   const rawWorldTemplate = (proj as any)?.worldTemplateSnapshot || body.worldTemplateSnapshot || null;
   const worldTemplate = rawWorldTemplate ? sanitizePromptObject(rawWorldTemplate) : null;
+  const worldContext = projectWorldContextForStage('assets_extract', worldTemplate, {
+    project: proj,
+    scriptText: finalScript,
+  });
 
   return sseResponse(async (writer) => {
     if (!finalScript) {
@@ -100,7 +106,7 @@ export async function POST(req: NextRequest) {
       const sceneStyleBible = styleBibleForScenePrompt(styleBible);
       const characters = await chatCompleteJsonWithRetry(
         user,
-        applyKnowledge(buildAssetCharactersExtractMessages(finalScript, characterStyleBible, worldTemplate)),
+        applyKnowledge(buildAssetCharactersExtractMessages(finalScript, characterStyleBible, worldContext)),
         {
           temperature: 0.35,
           maxTokens: 10000,
@@ -135,7 +141,7 @@ export async function POST(req: NextRequest) {
       const [environments, props] = await Promise.all([
         chatCompleteJsonWithRetry(
           user,
-          applyKnowledge(buildAssetScenesExtractMessages(finalScript, sceneStyleBible, characterRefs, worldTemplate)),
+          applyKnowledge(buildAssetScenesExtractMessages(finalScript, sceneStyleBible, characterRefs, worldContext)),
           {
             temperature: 0.35,
             maxTokens: 5000,
@@ -162,7 +168,7 @@ export async function POST(req: NextRequest) {
         ),
         chatCompleteJsonWithRetry(
           user,
-          applyKnowledge(buildAssetPropsExtractMessages(finalScript, sceneStyleBible, characterRefs, worldTemplate)),
+          applyKnowledge(buildAssetPropsExtractMessages(finalScript, sceneStyleBible, characterRefs, worldContext)),
           {
             temperature: 0.35,
             maxTokens: 2500,
@@ -293,6 +299,7 @@ export async function POST(req: NextRequest) {
       scenes: parsed.environments,
       props: parsed.props,
     };
+    let responsePendingWorldFacts: any = undefined;
 
     if (projectId && proj) {
       let consistencyProject: any = {
@@ -336,6 +343,26 @@ export async function POST(req: NextRequest) {
         return { ...character, characterId: result.character.characterId };
       });
       assets.characters = parsed.characters;
+      const worldSnapshotMerge = mergeProjectFactsIntoWorldSnapshot({
+        ...consistencyProject,
+        characters: parsed.characters,
+        environments: parsed.environments,
+        props: parsed.props,
+        assets,
+      });
+      if (worldSnapshotMerge.changed) {
+        responsePendingWorldFacts = {
+          schema: 'origin-pending-world-facts-v1',
+          source: 'assets_extract',
+          createdAt: new Date().toISOString(),
+          worldTemplateSnapshot: worldSnapshotMerge.worldTemplateSnapshot,
+          summary: {
+            characterCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.characters) ? worldSnapshotMerge.worldTemplateSnapshot.characters.length : 0,
+            locationCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.locations) ? worldSnapshotMerge.worldTemplateSnapshot.locations.length : 0,
+            propCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.props) ? worldSnapshotMerge.worldTemplateSnapshot.props.length : 0,
+          },
+        };
+      }
       const staleFlags = { ...(((proj as any)._staleFlags || {}) as Record<string, unknown>) };
       delete staleFlags.assets;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
@@ -345,6 +372,7 @@ export async function POST(req: NextRequest) {
         props: parsed.props,
         assets,
         consistency: consistencyProject.consistency,
+        pendingWorldFacts: responsePendingWorldFacts || null,
         _staleFlags: staleFlags,
         assetsApproved: false,
         currentStep: 2,
@@ -363,6 +391,7 @@ export async function POST(req: NextRequest) {
       characters: parsed.characters,
       environments: parsed.environments,
       props: parsed.props,
+      pendingWorldFacts: responsePendingWorldFacts,
     });
   });
 }
@@ -420,15 +449,60 @@ function normalizeAssetMatchKey(value: any): string {
 
 function assetMatchKeys(item: any): string[] {
   if (!item || typeof item !== 'object') return [];
+  // 只用稳定标识匹配：characterId 是跨抽取保留的一致性 ID；name 是用户视角的稳定锚点。
+  // 不要用 LLM 每次重新生成的 id/sceneId（c1/c2/e1/p1），那是顺序敏感的，
+  // 会导致脚本里增删/换序后串图。
   return [
     item.characterId,
-    item.sceneId,
-    item.id,
     item.name,
   ].map(normalizeAssetMatchKey).filter(Boolean);
 }
 
 type PreserveAssetKind = 'characters' | 'scenes' | 'props';
+
+// 影响图片生成的字段清单：任一字段变化就要重生成图，并把旧版本（图+全套信息）归档到 imageHistory。
+const IMAGE_RELEVANT_FIELDS: Record<PreserveAssetKind, string[]> = {
+  characters: ['name', 'role', 'identity', 'appearance', 'clothing', 'equipment',
+               'temperament', 'actionTraits', 'entityType', 'castingOverride',
+               'imagePrompt', 'description', 'tags'],
+  scenes: ['name', 'description', 'location', 'timeSetting', 'weather', 'lighting',
+           'atmosphere', 'elements', 'imagePrompt'],
+  props: ['name', 'propType', 'features', 'material', 'imagePrompt'],
+};
+
+function _stableStringify(value: any): string {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return '[' + value.map(_stableStringify).join(',') + ']';
+  if (typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return '{' + keys.map((k) => JSON.stringify(k) + ':' + _stableStringify(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+
+function _normalizeFieldForCompare(value: any): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  return _stableStringify(value);
+}
+
+function imageRelevantFieldsChanged(kind: PreserveAssetKind, next: any, prev: any): boolean {
+  const fields = IMAGE_RELEVANT_FIELDS[kind];
+  for (const f of fields) {
+    if (_normalizeFieldForCompare(next?.[f]) !== _normalizeFieldForCompare(prev?.[f])) return true;
+  }
+  return false;
+}
+
+// 给一个老资产 item 抓一份"全套信息"快照，准备塞进 imageHistory。
+function _captureFullInfoSnapshot(kind: PreserveAssetKind, item: any): Record<string, any> {
+  const fields = IMAGE_RELEVANT_FIELDS[kind];
+  const out: Record<string, any> = {};
+  fields.forEach((f) => {
+    if (item?.[f] !== undefined) out[f] = cloneAssetField(item[f]);
+  });
+  return out;
+}
 
 function normalizeCharacterEntityType(value: any): string {
   const text = String(value || '').trim().toLowerCase();
@@ -480,13 +554,44 @@ function preserveGeneratedAssetFields(kind: PreserveAssetKind, nextItems: any[],
     const match = assetMatchKeys(item).map((key) => lookup.get(key)).find(Boolean);
     if (!match) return item;
     if (!canPreserveGeneratedAssetFields(kind, item, match)) return item;
-    const preserved = { ...item };
-    GENERATED_ASSET_FIELDS.forEach((field) => {
-      if (!nonEmptyAssetValue(preserved[field]) && nonEmptyAssetValue(match[field])) {
-        preserved[field] = cloneAssetField(match[field]);
+
+    // 关键：信息没变 → 保留旧图；信息有变 → 把旧版本（图+全套信息）归档进 imageHistory，
+    // 新 item 不带 URL 字段，等前端"生成全部图片"再重生成。
+    const changed = imageRelevantFieldsChanged(kind, item, match);
+
+    if (!changed) {
+      // 字段一字不差 → 保留旧的图片相关字段
+      const preserved = { ...item };
+      GENERATED_ASSET_FIELDS.forEach((field) => {
+        if (!nonEmptyAssetValue(preserved[field]) && nonEmptyAssetValue(match[field])) {
+          preserved[field] = cloneAssetField(match[field]);
+        }
+      });
+      // imageHistory 也一并继承（用户之前的历史栈不丢）
+      if (Array.isArray(match.imageHistory) && match.imageHistory.length && !Array.isArray(preserved.imageHistory)) {
+        preserved.imageHistory = match.imageHistory.map(cloneAssetField);
       }
+      return preserved;
+    }
+
+    // 字段变了 → 旧版本归档；图为空，等重新生成
+    const snapshot: Record<string, any> = {
+      at: Date.now(),
+      source: 'info_changed',
+      info: _captureFullInfoSnapshot(kind, match),
+    };
+    GENERATED_ASSET_FIELDS.forEach((field) => {
+      if (nonEmptyAssetValue(match[field])) snapshot[field] = cloneAssetField(match[field]);
     });
-    return preserved;
+    // 把当时的 URL 也单独提一份到 snapshot.url 顶层，方便前端读
+    const snapUrl = match.imageUrl || match.rawUrl || match.realPhotoUrl || match.pencilUrl || '';
+    if (snapUrl) snapshot.url = snapUrl;
+
+    const prior = Array.isArray(match.imageHistory) ? match.imageHistory.map(cloneAssetField) : [];
+    const nextHistory = [snapshot, ...prior].slice(0, 10);
+
+    const result = { ...item, imageHistory: nextHistory };
+    return result;
   });
 }
 

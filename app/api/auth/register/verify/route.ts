@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
-import { createUser, findUserByLogin, signToken, userToPublic } from '@/lib/auth';
+import { createUser, findUserByPhone, signToken, userToPublic } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { verifyOtpCode } from '@/lib/otp';
+import { normalizePhone, verifyOtpCode } from '@/lib/otp';
 import { isRegistrationEnabled } from '@/lib/system-config';
 
 export const runtime = 'nodejs';
@@ -13,37 +13,33 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json().catch(() => ({} as any));
-  const username = (body.username || '').toString().trim();
-  const email = (body.email || '').toString().trim().toLowerCase();
+  const phone = normalizePhone((body.phone || '').toString());
+  const displayName = (body.displayName || '').toString().trim();
   const password = (body.password || '').toString();
-  const token = (body.token || '').toString().trim();
+  const code = (body.code || body.token || '').toString().trim();
 
-  if (!username || !email || !password || !token) {
+  if (!phone || !displayName || !password || !code) {
     return jsonError('请填写所有注册字段和验证码', 400);
   }
-  if (!/^[\w一-龥]{2,32}$/.test(username)) {
-    return jsonError('用户名只能含中文/字母/数字/下划线，长度 2-32', 400);
-  }
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return jsonError('邮箱格式不正确', 400);
+  if (displayName.length < 2 || displayName.length > 20) return jsonError('昵称长度需为 2-20 个字符', 400);
   if (password.length < 6) return jsonError('密码至少 6 位', 400);
-  if (!/^\d{4,8}$/.test(token)) return jsonError('验证码格式不正确', 400);
+  if (!/^\d{6}$/.test(code)) return jsonError('验证码格式不正确', 400);
+
+  // 先做账号冲突检查，避免验证码被消费后才提示手机号不可用。
+  const existed = await findUserByPhone(phone);
+  if (existed) return jsonError('手机号已注册', 409);
 
   // 真正校验 OTP
-  const otpRes = await verifyOtpCode({ email, code: token, purpose: 'register' });
+  const otpRes = await verifyOtpCode({ phone, code, purpose: 'register' });
   if (!otpRes.ok) return jsonError(otpRes.error || '验证码校验失败', 400);
-
-  const existed = await findUserByLogin(username);
-  if (existed) return jsonError('用户名已被使用', 409);
-  const existedEmail = await findUserByLogin(email);
-  if (existedEmail) return jsonError('邮箱已被使用', 409);
 
   let user;
   try {
-    user = await createUser({ username, password, email });
+    user = await createUser({ phone, password, displayName });
   } catch (e: any) {
     // UNIQUE 竞争兜底 → 409
     if (e && typeof e.message === 'string' && /UNIQUE/i.test(e.message)) {
-      return jsonError('用户名或邮箱已被使用', 409);
+      return jsonError('手机号已注册', 409);
     }
     throw e;
   }

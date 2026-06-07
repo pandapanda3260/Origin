@@ -5,7 +5,7 @@ import { ActiveVideoBatchConflictError, createBatch } from '@/lib/batches';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { assertVideoPromptReadyForGroups, markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { resolveLLMConfig } from '@/lib/llm';
-import { getVideoSubmitMode, isFirstLastFrameVideoModeEnabled } from '@/lib/feature-flags';
+import { getVideoSubmitMode, isFirstLastFrameVideoModeEnabled, isMultiShotSegmentEnabled } from '@/lib/feature-flags';
 import { resolveLocalImagePath } from '@/lib/image-gen';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import {
@@ -51,7 +51,7 @@ function nextActionForConsistencyBlocker(blocker: { code?: string; subReason?: s
 
 function nextActionsForVideoPreflightReason(reason: string): string[] {
   if (reason === 'reference_images_mode') return [];
-  if (reason === 'missing_first_frame' || reason === 'first_frame_failed' || reason === 'legacy_sketch_only') return ['regenerate_first_frame'];
+  if (reason === 'missing_first_frame' || reason === 'first_frame_missing' || reason === 'first_frame_failed' || reason === 'legacy_sketch_only') return ['regenerate_first_frame'];
   if (reason === 'first_frame_degraded') return ['continue_with_last_known_good_reference', 'regenerate_first_frame'];
   if (reason === 'missing_video_prompt' || reason === 'video_prompt_failed') return ['regenerate_video_prompt'];
   if (reason === 'video_prompt_generating') return ['wait_video_prompt'];
@@ -65,7 +65,7 @@ function nextActionsForVideoPreflightReason(reason: string): string[] {
 function videoPreflightMessage(item: any): string {
   const groupLabel = `片段 ${Number(item?.groupIdx ?? 0) + 1}`;
   const reason = String(item?.reason || '');
-  if (reason === 'missing_first_frame') return `${groupLabel} 缺少彩色首帧，请先重新生成首帧。`;
+  if (reason === 'missing_first_frame' || reason === 'first_frame_missing') return `${groupLabel} 缺少彩色首帧，请先重新生成首帧。`;
   if (reason === 'first_frame_failed') return `${groupLabel} 首帧生成失败，请先重新生成首帧。`;
   if (reason === 'legacy_sketch_only') return `${groupLabel} 只有黑白手稿分镜，缺少可用于视频的彩色首帧，请重新生成首帧。`;
   if (reason === 'first_frame_degraded') return `${groupLabel} 正在使用 last known good 首帧，可继续但建议重新生成最新首帧。`;
@@ -191,6 +191,7 @@ function markVideoPromptBatchTargetsStarted(opts: {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
     normalizedTargets.forEach(({ target, groupIdx }) => {
       const prev = storyboards[groupIdx] || {};
       previousByGroup.set(groupIdx, {
@@ -205,10 +206,11 @@ function markVideoPromptBatchTargetsStarted(opts: {
         mode: 'single-shot-strict',
         explicitShotIndices,
       });
+      const firstShotForWrite = shots[freshShotIndices[0]];
       storyboards[groupIdx] = {
         ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', startedAt),
         idx: groupIdx,
-        shotIdx: groupIdx + 1,
+        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
         shotIndices: freshShotIndices,
         videoPromptStatus: 'generating',
         videoPromptRunId: opts.batchId,
@@ -299,6 +301,26 @@ export async function POST(req: NextRequest) {
 
   if (!targets.length) return jsonError('targets 不能为空', 400);
 
+  // 合并段（多镜头一段）走参考模式、无尾锚点 → 不为其生成尾帧。过滤掉合并段的尾帧 target（flag-gated；现网 OFF 不触发）。
+  if (batchType === 'tail_frame_images' && isMultiShotSegmentEnabled()) {
+    const projForTail = getProjectByIdForUser(projectId, user.id);
+    const sbsForTail = projForTail && Array.isArray((projForTail as any).storyboards) ? (projForTail as any).storyboards : [];
+    const beforeCount = targets.length;
+    targets = targets.filter((t: any) => {
+      const g = Number(t?.groupIdx ?? t?.storyboardIdx ?? t?.idx);
+      if (!Number.isFinite(g)) return true;
+      const sb = sbsForTail[Math.floor(g)];
+      const idxs = sb && Array.isArray(sb.shotIndices) ? sb.shotIndices : [];
+      return idxs.length <= 1; // 仅 solo 段保留尾帧
+    });
+    if (targets.length < beforeCount) {
+      console.log(`[batch] tail_frame_images 跳过 ${beforeCount - targets.length} 个合并段（参考模式无尾帧）`);
+    }
+    if (!targets.length) {
+      return jsonOk({ batchId: null, total: 0, skipped: 'merged_no_tail', message: '所选片段均为合并段，参考模式不生成尾帧。' });
+    }
+  }
+
   if (isShotPlanDependentBatchType(batchType)) {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
@@ -374,12 +396,25 @@ export async function POST(req: NextRequest) {
   if (batchType === 'video_segments' || batchType === 'videos') {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
+    const targetShotIndicesByGroup = new Map<number, number[]>();
     const groupIdxs = Array.from(
       new Set(
         targets
-          .map((target: any) => Number(target?.groupIdx ?? target?.storyboardIdx ?? target?.idx))
-          .filter((n: number) => Number.isFinite(n) && n >= 0)
-          .map((n: number) => Math.floor(n)),
+          .map((target: any) => {
+            const n = Number(target?.groupIdx ?? target?.storyboardIdx ?? target?.idx);
+            if (!Number.isFinite(n) || n < 0) return null;
+            const groupIdx = Math.floor(n);
+            if (Array.isArray(target?.shotIndices) && target.shotIndices.length) {
+              targetShotIndicesByGroup.set(
+                groupIdx,
+                target.shotIndices
+                  .map((idx: any) => Number(idx))
+                  .filter((idx: number) => Number.isInteger(idx) && idx >= 0),
+              );
+            }
+            return groupIdx;
+          })
+          .filter((n: number | null): n is number => n != null),
       ),
     );
     const readiness = assertVideoPromptReadyForGroups(proj as any, groupIdxs, 'videoSegment', { skipConsistency: true });
@@ -422,6 +457,10 @@ export async function POST(req: NextRequest) {
     const payloadWarnings: any[] = [];
     groupIdxs.forEach((groupIdx) => {
       const sb = storyboards[groupIdx] || {};
+      const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: targetShotIndicesByGroup.get(groupIdx),
+      });
       const firstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
       const firstFramePath = firstFrameUrl ? (resolveLocalImagePath(firstFrameUrl, user.id) || undefined) : undefined;
       const tailFrameUrl = String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
@@ -435,6 +474,7 @@ export async function POST(req: NextRequest) {
         tailFrameUrl,
         tailReferenceStatus: sb?.tailFrameReferenceStatus || sb?.frames?.tail?.referenceStatus,
         tailIntentRequested: sb?.tailFrameIntent === 'requested',
+        multiShotSegment: shotIndices.length > 1,
       });
       if (decision.hardFail) {
         payloadBlocked.push(formatVideoPayloadPreflightItem({

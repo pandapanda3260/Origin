@@ -1,24 +1,46 @@
 import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from './utils.js';
 import { subscribeBatch } from './backend_stream.js';
+import { segmentInfoForShot } from './frameRecommendations.js?v=1';
+import {
+  ANGLES,
+  CAMERA_MOVES,
+  COMPOSITION_PRESETS,
+  FOCUS_OPTIONS,
+  LENSES,
+  LIGHT_PRESETS,
+  SHOT_TYPES,
+  deriveFocus,
+  legacyShotTypeToAngle,
+  normalizeAngle,
+  normalizeCamera,
+  normalizeComposition,
+  normalizeFocus,
+  normalizeLens,
+  normalizeLight,
+  normalizeShotType,
+} from './shotSchema.js';
 
 let _ctx = {};
 let project = null;
 
-const SHOT_TYPES = [
-  "大全景","远景","全景","中景","中近景","近景","特写","大特写",
-  "俯拍","仰拍","主观镜头","过肩镜头"
-];
-const CAMERA_MOVES = [
-  "固定镜头",
-  "缓慢推进","轻微推近","推近","快速推进",
-  "缓慢拉远","拉远","快速拉远",
-  "左移","右移","上移","下移",
-  "跟随","环绕","摇镜头","手持轻晃","升降","甩镜头"
+export { ANGLES, CAMERA_MOVES, COMPOSITION_PRESETS, FOCUS_OPTIONS, LENSES, LIGHT_PRESETS, SHOT_TYPES };
+// 时长下拉选项: 产品收敛到 1-7 秒。短镜头允许存在, 视频生成阶段会通过片段合并
+// 保证模型下限; 这是镜头页和提示词页共用的单一数据源 (_buildDurationOptions
+// export 出去给 videoPrompts.js 使用), 改这一处两个页面同步生效。
+const SHOT_DURATION_OPTIONS = [1,2,3,4,5,6,7];
+const SHOT_PACE_OPTIONS = [
+  { value: "slow", label: "慢" },
+  { value: "normal", label: "正常" },
+  { value: "fast", label: "快" },
+  { value: "fast_forward", label: "快进" },
 ];
 
 var _shotParaMap = {};
 var _scriptParas = [];
 var _shotHoverBound = false;
+// 镜头参数 chip 折叠态: key = shotIdx, true = 展开全部(否则只显示前四)。按 shotIdx 记忆,
+// 局部 toggle 不走整卡 re-render, 改 dropdown 等 re-render 后也能保持展开/收起状态。
+var _shotSpecsExpanded = {};
 
 export function initShots(ctx) {
   _ctx = ctx || {};
@@ -45,11 +67,35 @@ function _isStale(key) { return _ctx.isStale ? _ctx.isStale(key) : false; }
 function agentInsertRef(type, label, data) { if (_ctx.agentInsertRef) _ctx.agentInsertRef(type, label, data); }
 function emotionBadgeHtml(emotion, intensity) { return _ctx.emotionBadgeHtml ? _ctx.emotionBadgeHtml(emotion, intensity) : ''; }
 
+// 反查某镜头所属"片段(段)"序号：在 project.storyboards[g].shotIndices 里找含 shotIdx 的段。
+// 合并模式下多个镜头同属一段；1:1 / flag OFF 时片段号即镜头号。
+function _segmentNoForShot(shotIdx) {
+  return segmentInfoForShot(project, shotIdx).groupNo;
+}
+
+function _shotStoryboardInitialSlotHtml(shotIdx) {
+  var hasStoryboardPlan = !!(project && Array.isArray(project.storyboards) && project.storyboards.length);
+  var info = segmentInfoForShot(project, shotIdx);
+  var text;
+  if (!hasStoryboardPlan) {
+    text = '等待镜头计划确认';
+  } else if (info.isSegmentFirst) {
+    text = '片段 ' + info.groupNo + ' 首帧将在这里管理';
+  } else {
+    text = '并入片段 ' + info.groupNo + '，首帧在镜头 ' + String(info.anchorShotNo).padStart(2, '0') + ' 管理，无需单独出图';
+  }
+  return '<div class="shot-storyboard-slot-empty">' +
+    '<span class="material-symbols-outlined">image</span>' +
+    '<p>' + escapeHtml(text) + '</p>' +
+  '</div>';
+}
+
 function _applyShotPlanServerProjectSnapshot(proj, snap) {
   if (!proj || !snap) return;
   [
-    "shots",
-    "shotsApproved",
+	    "shots",
+	    "planMeta",
+	    "shotsApproved",
     "storyboards",
     "videoTasks",
     "currentStep",
@@ -437,7 +483,7 @@ export function refreshShotsPage() {
   renderShotList();
 }
 
-function _buildSelectOptions(options, current) {
+export function _buildSelectOptions(options, current) {
   var html = '<option value="">—</option>';
   var matched = false;
   options.forEach(function (opt) {
@@ -449,6 +495,126 @@ function _buildSelectOptions(options, current) {
     html += '<option value="' + escapeHtml(current) + '" selected>' + escapeHtml(current) + '</option>';
   }
   return html;
+}
+
+function _normalizeShotDuration(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n)) n = 4;
+  // clamp 跟 SHOT_DURATION_OPTIONS 同步: 1-7 秒。旧项目里 < 1 / > 7 的镜头打开时会被
+  // normalize 到边界, 写回时也按新范围保存, 等同于一次平滑迁移。
+  return Math.max(1, Math.min(7, Math.round(n)));
+}
+
+function _normalizeShotPace(value) {
+  var raw = String(value || "").trim();
+  var map = {
+    "慢": "slow",
+    "慢节奏": "slow",
+    "舒缓": "slow",
+    "正常": "normal",
+    "平稳": "normal",
+    "标准": "normal",
+    "快": "fast",
+    "快节奏": "fast",
+    "紧凑": "fast",
+    "快进": "fast_forward",
+    "快速推进": "fast_forward",
+    "fast-forward": "fast_forward",
+  };
+  raw = map[raw] || raw;
+  return SHOT_PACE_OPTIONS.some(function (item) { return item.value === raw; }) ? raw : "normal";
+}
+
+export function _buildDurationOptions(current) {
+  var cur = _normalizeShotDuration(current);
+  return SHOT_DURATION_OPTIONS.map(function (sec) {
+    return '<option value="' + sec + '"' + (sec === cur ? ' selected' : '') + '>' + sec + '秒</option>';
+  }).join('');
+}
+
+export function _buildPaceOptions(current) {
+  var cur = _normalizeShotPace(current);
+  return SHOT_PACE_OPTIONS.map(function (item) {
+    return '<option value="' + escapeHtml(item.value) + '"' + (item.value === cur ? ' selected' : '') + '>' + escapeHtml(item.label) + '</option>';
+  }).join('');
+}
+
+export function _shotFieldValue(field, value) {
+  if (field === "duration") return _normalizeShotDuration(value);
+  if (field === "pace") return _normalizeShotPace(value);
+  if (field === "shotType") return normalizeShotType(value);
+  if (field === "angle") return normalizeAngle(value);
+  if (field === "lens") return normalizeLens(value);
+  if (field === "focus") return normalizeFocus(value);
+  if (field === "light") return normalizeLight(value);
+  if (field === "composition") return normalizeComposition(value);
+  if (field === "camera") return normalizeCamera(value);
+  return String(value == null ? "" : value).trim();
+}
+
+export function _shotFieldCurrent(shot, field) {
+  if (field === "duration") return _normalizeShotDuration(shot.duration ?? shot.durationSec);
+  if (field === "pace") return _normalizeShotPace(shot.pace || shot.narrativePace);
+  if (field === "shotType") {
+    var migratedAngle = legacyShotTypeToAngle(shot.shotType);
+    return normalizeShotType(migratedAngle ? shot.framing : (shot.shotType || shot.framing));
+  }
+  if (field === "angle") return normalizeAngle(shot.angle || shot.viewpoint || legacyShotTypeToAngle(shot.shotType));
+  if (field === "lens") return normalizeLens(shot.lens || shot.focalLength || shot.focal);
+  if (field === "focus") {
+    return normalizeFocus(
+      shot.focus || shot.depthOfField || shot.dof,
+      deriveFocus(_shotFieldCurrent(shot, "lens"), _shotFieldCurrent(shot, "shotType")),
+    );
+  }
+  if (field === "light") return normalizeLight(shot.light || shot.lighting);
+  if (field === "composition") return normalizeComposition(shot.composition || shot.compositionalRule);
+  if (field === "camera") return normalizeCamera(shot.camera || shot.movement);
+  return String(shot[field] == null ? "" : shot[field]).trim();
+}
+
+export function _applyShotFieldValue(shot, field, value) {
+  if (field === "duration") {
+    shot.duration = value;
+    shot.durationSec = value;
+    return;
+  }
+  if (field === "pace") {
+    shot.pace = value;
+    return;
+  }
+  if (field === "shotType") {
+    shot.shotType = value;
+    shot.framing = value;
+    return;
+  }
+  if (field === "camera") {
+    shot.camera = value;
+    shot.movement = value;
+    return;
+  }
+  if (field === "lens") {
+    shot.lens = value;
+    if (!shot.focus) shot.focus = deriveFocus(value, _shotFieldCurrent(shot, "shotType"));
+    return;
+  }
+  if (field === "angle" || field === "focus" || field === "light" || field === "composition") {
+    shot[field] = value;
+    return;
+  }
+  shot[field] = value;
+}
+
+function _updateShotSummaryMeta() {
+  var summaryMeta = $("shotSummaryMeta");
+  if (!summaryMeta) return;
+  if (!project || !Array.isArray(project.shots) || !project.shots.length) {
+    summaryMeta.textContent = "";
+    return;
+  }
+  var totalSec = 0;
+  project.shots.forEach(function (s) { totalSec += _normalizeShotDuration(s.duration ?? s.durationSec); });
+  summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · " + totalSec + " 秒";
 }
 
 export function renderShotList() {
@@ -468,7 +634,9 @@ export function renderShotList() {
   var actionBar = $("imagesActionBar"); if (actionBar) actionBar.hidden = false;
 
   var shotPlanStatus = project.shotPlanStatus || "";
-  var shotPlanNeedsAttention = shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown" || shotPlanStatus === "generating" || shotPlanStatus === "failed" || (project._staleFlags && project._staleFlags.shotPlan);
+  var shotPlanNeedsAttention = shotPlanStatus !== "generating" && (
+    shotPlanStatus === "stale" || shotPlanStatus === "legacy_unknown" || shotPlanStatus === "failed" || (project._staleFlags && project._staleFlags.shotPlan)
+  );
   if (shotPlanNeedsAttention) {
     var spb = document.createElement("div");
     // 注：此前用 mx-8 给 banner 左右各留 32px 边距，导致 banner 比下方 shot card 卡片窄。
@@ -477,9 +645,7 @@ export function renderShotList() {
     var reasons = Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
     var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
     var message = "";
-    if (shotPlanStatus === "generating") {
-      message = "镜头计划正在重新生成，请等待完成后再进入下游生成。";
-    } else if (shotPlanStatus === "failed") {
+    if (shotPlanStatus === "failed") {
       message = "镜头计划生成失败，请重新生成。";
     } else if (shotPlanStatus === "legacy_unknown") {
       message = "当前镜头计划来自旧版本，建议校验后继续或重新生成。";
@@ -500,43 +666,25 @@ export function renderShotList() {
   }
 
 
-  var totalSec = 0;
-  project.shots.forEach(function (s) { totalSec += (s.duration || 4); });
-  var summaryMeta = $("shotSummaryMeta");
-  if (summaryMeta) summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · " + totalSec + " 秒";
+  _updateShotSummaryMeta();
 
   project.shots.forEach(function (shot, idx) {
+    var segmentInfo = segmentInfoForShot(project, idx);
     var card = document.createElement("div");
     card.className = "sc-card shot-workbench-card group";
     card.dataset.shotIdx = idx;
 
     card.innerHTML =
       '<header class="shot-card-head">' +
-        // 左对齐: 镜头 NN / SHOT NN  +  3s 时长 pill  +  情绪 badge。
-        // 原本"01"大数字索引和右侧的"时长 3s" pill 已删除——索引信息融进
-        // "镜头 NN"标题, 时长由小型 .shot-card-duration pill 承载。
-        '<div class="shot-card-title">' +
-          '<strong>镜头 ' + String(idx+1).padStart(2,'0') + '</strong>' +
-          '<span class="shot-card-en-label">/ SHOT ' + String(idx+1).padStart(2,'0') + '</span>' +
-          '<span class="shot-card-duration">' + (shot.duration||4) + 's</span>' +
-          (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
-        '</div>' +
-        '<div class="shot-card-meta-actions">' +
-          '<div class="shot-card-specs">' +
-            '<label class="shot-pill-select-wrap">' +
-              '<span>景别</span>' +
-              '<select class="shot-field shot-select shot-pill-select" data-field="shotType">' +
-                _buildSelectOptions(SHOT_TYPES, shot.shotType || "") +
-              '</select>' +
-            '</label>' +
-            '<label class="shot-pill-select-wrap">' +
-              '<span>运镜</span>' +
-              '<select class="shot-field shot-select shot-pill-select" data-field="camera">' +
-                _buildSelectOptions(CAMERA_MOVES, shot.camera || "") +
-              '</select>' +
-            '</label>' +
+        // 第一行: 镜头 NN / SHOT NN + 情绪 badge (左对齐) + @ / 删除 (右对齐)。
+        '<div class="shot-card-head-top">' +
+          '<div class="shot-card-title">' +
+            '<strong>镜头 ' + String(idx+1).padStart(2,'0') + '</strong>' +
+            '<span class="shot-card-en-label">/ SHOT ' + String(idx+1).padStart(2,'0') + '</span>' +
+            (shot.emotion ? '<span class="shot-emotion-tag">' + emotionBadgeHtml(shot.emotion, shot.intensity) + '</span>' : '') +
+            '<span class="shot-segment-tag" title="本镜头所属片段">片段 ' + _segmentNoForShot(idx) + '</span>' +
           '</div>' +
-          // @ / 删除 按钮直接跟在运镜后面, 右对齐 + 常亮 (CSS opacity:1)。
+          // @ / 删除 按钮与标题同一行, 右对齐 + 常亮 (CSS opacity:1)。
           '<div class="shot-card-actions">' +
             '<button type="button" class="shot-icon-btn" data-action="ref-agent" title="引用到 AI 助手">' +
               '<span class="material-symbols-outlined">alternate_email</span>' +
@@ -546,15 +694,89 @@ export function renderShotList() {
             '</button>' +
           '</div>' +
         '</div>' +
-      '</header>' +
-      '<aside class="shot-storyboard-slot" id="shotStoryboardSlot_' + idx + '" data-shot-idx="' + idx + '" data-group-idx="' + idx + '">' +
-        '<div class="shot-storyboard-slot-empty">' +
-          '<span class="material-symbols-outlined">image</span>' +
-          '<p>分镜首尾帧将在这里显示</p>' +
+        // 第二行: 镜头参数 chip 单独占一整行, 放在标题下方。
+        '<div class="shot-card-specs' + (_shotSpecsExpanded[idx] ? ' is-expanded' : '') + '">' +
+          '<label class="shot-pill-select-wrap">' +
+            '<span>时长</span>' +
+            '<select class="shot-field shot-select shot-pill-select" data-field="duration">' +
+              _buildDurationOptions(shot.duration ?? shot.durationSec) +
+            '</select>' +
+          '</label>' +
+          '<label class="shot-pill-select-wrap">' +
+            '<span>节奏</span>' +
+            '<select class="shot-field shot-select shot-pill-select" data-field="pace">' +
+              _buildPaceOptions(shot.pace || shot.narrativePace) +
+            '</select>' +
+          '</label>' +
+          '<label class="shot-pill-select-wrap">' +
+            '<span>景别</span>' +
+            '<select class="shot-field shot-select shot-pill-select" data-field="shotType">' +
+              _buildSelectOptions(SHOT_TYPES, _shotFieldCurrent(shot, "shotType")) +
+            '</select>' +
+          '</label>' +
+          '<label class="shot-pill-select-wrap">' +
+            '<span>运镜</span>' +
+            '<select class="shot-field shot-select shot-pill-select" data-field="camera">' +
+              _buildSelectOptions(CAMERA_MOVES, _shotFieldCurrent(shot, "camera")) +
+            '</select>' +
+          '</label>' +
+          '<span class="shot-specs-extra">' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>角度</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="angle">' +
+                _buildSelectOptions(ANGLES, _shotFieldCurrent(shot, "angle")) +
+              '</select>' +
+            '</label>' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>焦距</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="lens">' +
+                _buildSelectOptions(LENSES, _shotFieldCurrent(shot, "lens")) +
+              '</select>' +
+            '</label>' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>景深</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="focus">' +
+                _buildSelectOptions(FOCUS_OPTIONS, _shotFieldCurrent(shot, "focus")) +
+              '</select>' +
+            '</label>' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>光线</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="light">' +
+                _buildSelectOptions(LIGHT_PRESETS, _shotFieldCurrent(shot, "light")) +
+              '</select>' +
+            '</label>' +
+            '<label class="shot-pill-select-wrap">' +
+              '<span>构图</span>' +
+              '<select class="shot-field shot-select shot-pill-select" data-field="composition">' +
+                _buildSelectOptions(COMPOSITION_PRESETS, _shotFieldCurrent(shot, "composition")) +
+              '</select>' +
+            '</label>' +
+          '</span>' +
+          '<button type="button" class="shot-specs-toggle" data-action="toggle-shot-specs" data-shot-idx="' + idx + '">' +
+            (_shotSpecsExpanded[idx] ? '◁◁◁ 收起' : '▷▷▷ 更多') +
+          '</button>' +
         '</div>' +
+        '</header>' +
+      '<aside class="shot-storyboard-slot" id="shotStoryboardSlot_' + idx + '" data-shot-idx="' + idx + '" data-group-idx="' + segmentInfo.groupIdx + '">' +
+        _shotStoryboardInitialSlotHtml(idx) +
       '</aside>' +
       '<input type="hidden" data-field="audio" value="' + escapeHtml(shot.audio||"") + '" />';
     wrap.appendChild(card);
+  });
+
+  wrap.querySelectorAll(".shot-specs-toggle").forEach(function (btn) {
+    btn.addEventListener("click", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var idx = parseInt(btn.dataset.shotIdx, 10);
+      if (isNaN(idx)) return;
+      var specs = btn.closest(".shot-card-specs");
+      if (!specs) return;
+      var nowExpanded = !specs.classList.contains("is-expanded");
+      _shotSpecsExpanded[idx] = nowExpanded;
+      specs.classList.toggle("is-expanded", nowExpanded);
+      btn.textContent = nowExpanded ? "◁◁◁ 收起" : "▷▷▷ 更多";
+    });
   });
 
   wrap.querySelectorAll(".shot-field").forEach(function (el) {
@@ -565,10 +787,11 @@ export function renderShotList() {
       var idx = parseInt(card.dataset.shotIdx, 10);
       if (isNaN(idx) || !project || !project.shots[idx]) return;
       var field = el.dataset.field;
-      var val = el.value.trim();
-      if (project.shots[idx][field] !== val) {
-        project.shots[idx][field] = val;
+      var val = _shotFieldValue(field, el.value);
+      if (_shotFieldCurrent(project.shots[idx], field) !== val) {
+        _applyShotFieldValue(project.shots[idx], field, val);
         _markDownstreamStale("shot", { idx: idx });
+        if (field === "duration") _updateShotSummaryMeta();
         saveProject();
       }
     });
@@ -1012,9 +1235,9 @@ export function saveShotEdits() {
     var shotChanged = false;
     card.querySelectorAll("[data-field]").forEach(function (el) {
       var field = el.dataset.field;
-      var val = el.value.trim();
-      if (project.shots[idx][field] !== val) shotChanged = true;
-      project.shots[idx][field] = val;
+      var val = _shotFieldValue(field, el.value);
+      if (_shotFieldCurrent(project.shots[idx], field) !== val) shotChanged = true;
+      _applyShotFieldValue(project.shots[idx], field, val);
     });
     if (shotChanged) changed.push(idx);
   });

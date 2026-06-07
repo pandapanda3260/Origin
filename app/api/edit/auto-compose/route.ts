@@ -500,6 +500,8 @@ export async function POST(req: NextRequest) {
     }
 
     let exportTaskId = '';
+    let exportedEdlSignature = '';
+    let exportedEdlSignatureMeta: any = null;
     const exportEdlVersion = Number(project?.editData?.edl?.version) || 0;
     try {
       const exportResult = await startEditExport({
@@ -512,6 +514,8 @@ export async function POST(req: NextRequest) {
         filenameSuffix: partial ? 'partial' : undefined,
       });
       exportTaskId = exportResult.taskId;
+      exportedEdlSignature = String((exportResult as any).exportedEdlSignature || '');
+      exportedEdlSignatureMeta = (exportResult as any).exportedEdlSignatureMeta || null;
       writer.event('export_started', { taskId: exportTaskId });
       patchProjectForUser(projectId, user.id, (current) => {
         const editData = { ...(current.editData || {}) };
@@ -572,6 +576,8 @@ export async function POST(req: NextRequest) {
           editData.exportTaskId = exportTaskId;
           editData.exportUrl = exportUrl;
           editData.exportedEdlVersion = exportedEdlVersion;
+          if (exportedEdlSignature) editData.exportedEdlSignature = exportedEdlSignature;
+          if (exportedEdlSignatureMeta) editData.exportedEdlSignatureMeta = exportedEdlSignatureMeta;
           const updated = updateComposeRun(editData, runId, {
             status: partial ? 'partial' : 'completed',
             phase: 'export',
@@ -582,7 +588,7 @@ export async function POST(req: NextRequest) {
           return { editData: updated.editData };
         });
         if (!writer.isClosed()) {
-          writer.done({ runId, exportTaskId, exportUrl, exportedEdlVersion, partial, warnings });
+          writer.done({ runId, exportTaskId, exportUrl, exportedEdlVersion, exportedEdlSignature, exportedEdlSignatureMeta, partial, warnings });
         }
         return;
       }

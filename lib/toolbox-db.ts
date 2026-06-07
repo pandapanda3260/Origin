@@ -339,6 +339,22 @@ export function countRunningVideoToolboxItems(ownerId: number) {
   return Number(row?.c || 0);
 }
 
+// 图片为同步生成、无 provider 回收轮询；用 staleMs 过滤掉进程异常残留的孤儿 running 项，
+// 仅统计"近期仍可能在跑"的图片项，作为软限流，避免孤儿把用户永久锁死。
+export function countRunningImageToolboxItems(ownerId: number, staleMs: number) {
+  const since = new Date(Date.now() - Math.max(0, staleMs)).toISOString();
+  const row = getDb()
+    .prepare<{ ownerId: number; since: string }, { c: number }>(
+      `SELECT COUNT(*) AS c FROM toolbox_items
+        WHERE owner_id = @ownerId
+          AND tool_type = 'image'
+          AND status = 'running'
+          AND created_at >= @since`,
+    )
+    .get({ ownerId, since });
+  return Number(row?.c || 0);
+}
+
 export function listToolboxItems(opts: {
   ownerId: number;
   toolType?: ToolboxToolType | null;

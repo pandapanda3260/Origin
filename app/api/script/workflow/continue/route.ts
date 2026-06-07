@@ -6,6 +6,7 @@ import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { shortKnowledgeHash } from '@/lib/knowledge/hash';
+import { formatWorldContextForPrompt, projectWorldContextForStage } from '@/lib/world-template-context';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -35,11 +36,25 @@ export async function POST(req: NextRequest) {
     writer.phase('continue_start');
     writer.step('正在续写…');
     let buf = '';
+    const worldContext = proj
+      ? projectWorldContextForStage('script_continue', (proj as any).worldTemplateSnapshot, {
+          project: proj,
+          scriptText: baseScript,
+        })
+      : undefined;
+    const worldText = formatWorldContextForPrompt(worldContext);
     await chatStream(
       user,
       [
         { role: 'system', content: SP_CONTINUE },
-        { role: 'user', content: `已有剧本：\n${baseScript}\n\n续写方向（可空）：${direction}` },
+        {
+          role: 'user',
+          content: [
+            `已有剧本：\n${baseScript}`,
+            worldText ? `本次续写参考的世界观事实与软默认：\n${worldText}` : '',
+            `续写方向（可空）：${direction}`,
+          ].filter(Boolean).join('\n\n'),
+        },
       ],
       { temperature: 0.8, maxTokens: 1200, modelRole: 'brain' },
       (delta) => {
@@ -52,6 +67,8 @@ export async function POST(req: NextRequest) {
       updateProjectForUser(projectId, user.id, {
         scriptDraft: buf,
         script: buf,
+        scriptApproved: false,
+        scriptReviewState: 'draft',
       });
       try {
         const context = buildKnowledgeContextForStage({

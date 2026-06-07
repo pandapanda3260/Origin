@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSyn
 import { dirname } from 'node:path';
 import { dataPath } from './runtime-paths';
 
-export type VevDemoMaterialResourceType = 'video_task' | 'upload';
+export type VevDemoMaterialResourceType = 'video_task' | 'upload' | 'bgm';
 
 export interface VevDemoMaterialBinding {
   resourceType: VevDemoMaterialResourceType;

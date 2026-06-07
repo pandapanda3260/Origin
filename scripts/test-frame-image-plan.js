@@ -7,10 +7,11 @@
  *     和 image[] 数组下标严格对齐;
  *   - multiRefImageCap 控制有多少候选走 image, 其余走 text_only 兜底;
  *   - finalPrompt 含固定结构段（任务/画面目标/主镜头/构图规则/
- *     硬性禁止等）；相同输入 promptHash 一致;
+ *     参考图/锁定段/硬性禁止等），不再渲染上下文镜头、用户原文约束、
+ *     世界观硬事实或历史漂移防护段；相同输入 promptHash 一致;
  *   - tail_frame: primaryShot = 组内最末 shot, selfFirstFrame 作为 slot 1 锚点;
  *   - shotConstraintText 覆盖 visual/description/desc/dialogue/scriptRef/keyInfo/
- *     imagePrompt 字段, 用户原文会进入 finalPrompt 的用户约束区，不做专项改写;
+ *     imagePrompt 字段供审计/计划使用，但不再进入 finalPrompt 的用户约束区;
  *   - 未知 frameType 抛错。
  *
  * 约定与其它 test:xxx 脚本一致, 用 ts.transpileModule + vm.runInNewContext 注入依赖。
@@ -63,11 +64,17 @@ function makeCharacterConsistencyStub() {
 function loadFramePromptHelpers({ contentSanitize, characterConsistency }) {
   const compiled = compileTs('lib/frame-prompt-helpers.ts');
   const moduleObj = { exports: {} };
-  function localRequire(id) {
-    if (id === './content-sanitize') return contentSanitize;
-    if (id === './character-consistency') return characterConsistency;
-    return require(id);
-  }
+	  function localRequire(id) {
+	    if (id === './content-sanitize') return contentSanitize;
+	    if (id === './character-consistency') return characterConsistency;
+	    if (id === './character-lock-authority') {
+	      return {
+	        buildAssetAuthoritativeCharacterLock: () => null,
+	        resolveCharacterAssetForEntity: () => null,
+	      };
+	    }
+	    return require(id);
+	  }
   vm.runInNewContext(
     compiled.code,
     { require: localRequire, module: moduleObj, exports: moduleObj.exports, console, process },
@@ -88,6 +95,60 @@ function makeSceneSelectionStub(sceneToReturn) {
       scene: sceneToReturn || null,
       matchReason: sceneToReturn ? 'sceneName' : 'none',
     }),
+  };
+}
+
+function makePanelSelectionStub(imageGen) {
+  const textForShots = (shots) => shots.map((shot) => [
+    shot && shot.visual,
+    shot && shot.description,
+    shot && Array.isArray(shot.characters) ? shot.characters.join(' ') : '',
+  ].filter(Boolean).join(' ')).join(' ');
+  return {
+    selectCharacterReferencePanels: (opts) => {
+      const shots = Array.isArray(opts.shots) ? opts.shots : [];
+      const text = textForShots(shots);
+      const chars = [
+        ...((opts.project && opts.project.assets && opts.project.assets.characters) || []),
+        ...((opts.project && opts.project.characters) || []),
+      ].slice().sort((a, b) => {
+        const an = String(a.name || a.role || '').trim();
+        const bn = String(b.name || b.role || '').trim();
+        const ai = text.indexOf(an);
+        const bi = text.indexOf(bn);
+        return (ai < 0 ? 10000 : ai) - (bi < 0 ? 10000 : bi);
+      });
+      const out = [];
+      for (const ch of chars) {
+        const name = String(ch.name || ch.role || '').trim();
+        if (!name || (!text.includes(name) && !ch.storyboardMaterialRole)) continue;
+        const panels = ch.panels || {};
+        const panelPairs = opts.mode === 'frame'
+          ? [
+            ['sheet', panels.sheetUrl || ch.imageUrl || ch.rawUrl],
+            ['headshot', panels.headshotUrl],
+            ['front', panels.frontUrl],
+          ]
+          : [['sheet', panels.sheetUrl || ch.imageUrl || ch.rawUrl]];
+        for (const [panel, url] of panelPairs) {
+          const path = url && imageGen.resolveLocalImagePath(url, opts.ownerId);
+          if (!path) continue;
+          out.push({
+            assetId: ch.characterId || ch.id || name,
+            characterName: name,
+            panel,
+            entityType: ch.entityType || 'human',
+            url,
+            path,
+            intent: 'body',
+            priority: 1,
+            reason: `test:${panel}`,
+          });
+          if (out.length >= (opts.maxSlots || 4)) return out;
+        }
+      }
+      return out;
+    },
   };
 }
 
@@ -115,11 +176,55 @@ function loadFrameImagePlan({
   function localRequire(id) {
     if (id === './content-sanitize') return contentSanitize;
     if (id === './character-consistency') return characterConsistency;
-    if (id === './image-gen') return imageGen;
+	    if (id === './image-gen') return imageGen;
+	    if (id === './panel-selection') return makePanelSelectionStub(imageGen);
     if (id === './scene-selection') return sceneSelection;
-    if (id === './frame-prompt-helpers') return frameHelpers;
-    if (id === './reference-roles') return referenceRoles;
-    if (id === './visual-reference-state') {
+	    if (id === './frame-prompt-helpers') return frameHelpers;
+		    if (id === './reference-roles') return referenceRoles;
+    if (id === './project-dependency-state') {
+      return {
+        computeWorldHash: (project) => JSON.stringify({
+          selectedWorldTemplateId: project && project.selectedWorldTemplateId || '',
+          worldTemplateSnapshot: project && project.worldTemplateSnapshot || null,
+        }),
+      };
+    }
+    if (id === './world-template-context') {
+      return {
+        projectWorldContextForStage: (_stage, snapshot) => {
+          if (!snapshot) return undefined;
+          return {
+            worldRules: snapshot.worldRules || [],
+            forbiddenRules: snapshot.forbiddenRules || [],
+            terminology: snapshot.terminology || undefined,
+          };
+        },
+        formatWorldContextForPrompt: (ctx) => {
+          if (!ctx) return '';
+          const parts = [];
+          if (ctx.worldRules && ctx.worldRules.length) parts.push(`世界规则：${ctx.worldRules.join('；')}`);
+          if (ctx.forbiddenRules && ctx.forbiddenRules.length) parts.push(`世界观禁忌：${ctx.forbiddenRules.join('；')}`);
+          if (ctx.terminology && Object.keys(ctx.terminology).length) parts.push(`术语/称谓：${JSON.stringify(ctx.terminology)}`);
+          return parts.join('\n');
+        },
+      };
+    }
+		    if (id === './shot-plan-normalize') {
+	      return {
+	        resolveShotFieldsForPrompt: (shot) => ({
+	          shotType: shot?.shotType || shot?.framing || '中景',
+	          framing: shot?.shotType || shot?.framing || '中景',
+	          angle: shot?.angle || (shot?.shotType === '俯拍' ? '俯拍' : '平视'),
+	          lens: shot?.lens || '标准50',
+	          focus: shot?.focus || '中等景深',
+	          light: shot?.light || '侧光·柔光·中性·低反差',
+	          composition: shot?.composition || '三分法',
+	          camera: shot?.camera || shot?.movement || '固定镜头',
+	          movement: shot?.camera || shot?.movement || '固定镜头',
+	        }),
+	      };
+	    }
+	    if (id === './visual-reference-state') {
       return {
         resolveAssetReferenceState: (asset) => ({
           currentUrl: asset?.reference?.currentUrl || asset?.imageUrl || asset?.rawUrl || '',
@@ -178,6 +283,13 @@ function makeFixtureProject() {
       mood: 'tense',
       lighting: 'low-key rim light',
       compositionGuidance: 'Keep the detective framed in a vertical portrait composition.',
+    },
+    selectedWorldTemplateId: 'world-noir-city',
+    worldTemplateSnapshot: {
+      id: 'world-noir-city',
+      worldRules: ['The city gate must stay closed at night'],
+      forbiddenRules: ['Never show magic resurrection'],
+      terminology: { Gatekeeper: 'licensed night guard' },
     },
     shots: [
       {
@@ -359,9 +471,9 @@ async function testFirstFrameFullyResolved() {
   assertEqual(reasons, [null, 'over_capacity', 'over_capacity'], 'droppedReason pattern');
   assertEqual(plan.referenceManifest[0].localPath, '/local/alice.png', 'character localPath resolved');
 
-  // finalPrompt 必含 8 段关键标题
+  // finalPrompt 必含核心生成段和锁定段; 不再包含上下文/原文/世界观/漂移段。
   const p = plan.finalPrompt;
-  for (const marker of [
+	  for (const marker of [
     '【任务】',
     '【画面目标】',
     '【主镜头】',
@@ -372,13 +484,28 @@ async function testFirstFrameFullyResolved() {
   ]) {
     assert(p.includes(marker), `finalPrompt should contain ${marker}`);
   }
+  for (const marker of [
+    '【上下文镜头】',
+    '【用户原文约束】',
+    '【世界观硬事实】',
+    'OBSERVED DRIFT GUARDRAILS',
+  ]) {
+    assert(!p.includes(marker), `finalPrompt should not contain ${marker}`);
+  }
   // reference 描述中应点名 character 的 assetName
   assert(p.includes('Image 1 = 角色'), 'Image 1 = 角色 line present');
   assert(!p.includes('Image 2 = 场景'), 'scene slot is over_capacity so not shown as Image 2');
   assert(p.includes('目标画幅比例：9:16'), 'prompt should include target aspect ratio');
+  assert(!p.includes('The city gate must stay closed at night'), 'prompt should not render projected world rule');
+  assert(plan.worldHash.includes('world-noir-city'), 'plan records world hash input');
+  // 顺序要求(用户): 前三段为 任务 → 画面目标 → 构图规则, 且都排在主镜头之前。
+  assert(p.indexOf('【任务】') < p.indexOf('【画面目标】'), '任务 应在画面目标之前');
+  assert(p.indexOf('【画面目标】') < p.indexOf('【构图规则】'), '画面目标 应在构图规则之前');
+  assert(p.indexOf('【构图规则】') < p.indexOf('【主镜头】'), '构图规则 应在主镜头之前');
 
   // summary
   const summary = mod.summarizePlanForAudit(plan);
+  assert(summary.worldHash.includes('world-noir-city'), 'summary records world hash');
   assertEqual(summary.aspectRatio, '9:16', 'summary aspect ratio');
   assertEqual(summary.sentReferences.length, 1, 'summary sent = 1');
   assertEqual(summary.textOnlyReferences.length, 2, 'summary text_only = 2');
@@ -556,13 +683,15 @@ async function testTailFramePlanBasic() {
   const roles = plan.referenceManifest.map((r) => r.role);
   assert(!roles.includes('self_first_frame'), 'no selfFirstFrame input → no self_first_frame slot');
   assertEqual(roles[0], 'character', 'without self_first_frame, slot 1 is primary character');
-  // prompt 必含尾帧目标 + 连续性语言
+  // prompt 必含尾帧目标; 未传 selfFirstFrame 时应走独立尾帧语义,
+  // 不再强制按首帧连续性生成。
   assert(plan.finalPrompt.includes('结束节拍'), 'tail prompt mentions closing beat');
   assert(plan.finalPrompt.includes('【尾帧目标】'), 'tail prompt includes explicit tail frame target');
-  assert(plan.finalPrompt.includes('不能是首帧的重画或近似重复'), 'tail prompt forbids redrawing the opening frame');
-  assert(plan.finalPrompt.includes('保持身份、服装、地点'), 'tail target keeps identity continuity while avoiding a copy');
-  // context shot 段按绝对 index 引用
-  assert(plan.finalPrompt.includes('镜头 1：'), 'context shot 1 rendered by absolute index');
+  assert(plan.finalPrompt.includes('不要求沿用首帧构图'), 'tail prompt uses independent ending-frame wording');
+  assert(!plan.finalPrompt.includes('Image 1 / 首帧之后'), 'tail prompt does not force first-frame reference without selfFirstFrame');
+  // contextShots 仍保留在 plan 内部供审计/决策使用, 但不再渲染到图像模型 prompt。
+  assert(!plan.finalPrompt.includes('【上下文镜头】'), 'tail prompt should not render context shot section');
+  assert(!plan.finalPrompt.includes('镜头 1：'), 'tail prompt should not render context shot details');
 }
 
 async function testTailFrameWithSelfFirstFrame() {
@@ -603,11 +732,19 @@ async function testTailFrameWithSelfFirstFrame() {
   assert(plan.finalPrompt.includes('Image 1 = 本片段首帧'), 'prompt labels Image 1 as this segment first frame');
   assert(plan.finalPrompt.includes('不是构图复制目标'), 'self first frame is not treated as a composition copy target');
   assert(plan.finalPrompt.includes('相比 Image 1 必须有可见差异'), 'tail prompt requires visible difference from first frame');
+  for (const marker of [
+    '【上下文镜头】',
+    '【用户原文约束】',
+    '【世界观硬事实】',
+    'OBSERVED DRIFT GUARDRAILS',
+  ]) {
+    assert(!plan.finalPrompt.includes(marker), `tail finalPrompt should not contain ${marker}`);
+  }
 }
 
 async function testShotFieldsPreserveUserConstraints() {
   // shotConstraintText 要覆盖所有用户可能写剧本约束的字段; 在任一字段写
-  // 用户约束都应按原文进入 finalPrompt, 但不再注入补光灯专项硬约束。
+  // 用户约束仍进入 plan 供审计/计划使用, 但不再渲染到 finalPrompt 的用户原文约束区。
   const fields = [
     'visual',
     'description',
@@ -640,14 +777,58 @@ async function testShotFieldsPreserveUserConstraints() {
       modelSnapshot: MODEL_SNAPSHOT_CAP1,
     });
     assert(
-      plan.finalPrompt.includes('不要补光灯'),
-      `finalPrompt should preserve the original user constraint from shot.${field}`,
+      plan.shotConstraintText.includes('不要补光灯'),
+      `shotConstraintText should preserve the original user constraint from shot.${field}`,
     );
+    assert(!plan.finalPrompt.includes('【用户原文约束】'), 'finalPrompt should not render user original constraint section');
+    if (field === 'keyInfo') {
+      assert(
+        !plan.finalPrompt.includes('不要补光灯'),
+        'keyInfo-only constraint should not leak into finalPrompt after user original constraint section removal',
+      );
+    } else {
+      assert(
+        plan.finalPrompt.includes('不要补光灯'),
+        `active primary shot field should still render in finalPrompt for shot.${field}`,
+      );
+    }
     assert(
       !/硬性负向约束：禁止补光灯/.test(plan.finalPrompt),
       `finalPrompt should not inject fill-light hard constraint for shot.${field}`,
     );
   }
+}
+
+async function testFramePromptIncludesStructuredShotFields() {
+  const scene = makeFixtureScene();
+  const mod = loadAll({
+    imageGen: makeImageGenStub({ [scene.imageUrl]: '/local/scene.png' }),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const project = makeFixtureProject();
+  project.shots[0] = {
+    ...project.shots[0],
+    shotType: '近景',
+    angle: '过肩',
+    lens: '中长焦85',
+    focus: '浅景深',
+    light: '侧逆光·硬光·冷色·高反差',
+    composition: '前景框架、视线方向',
+    camera: '固定镜头',
+  };
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0, 1],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: MODEL_SNAPSHOT_CAP1,
+  });
+  assert(plan.finalPrompt.includes('角度/视点：过肩'), 'finalPrompt should include angle/viewpoint');
+  assert(plan.finalPrompt.includes('焦距：中长焦85'), 'finalPrompt should include lens');
+  assert(plan.finalPrompt.includes('景深/焦点：浅景深'), 'finalPrompt should include focus');
+  assert(plan.finalPrompt.includes('光线组合：侧逆光·硬光·冷色·高反差'), 'finalPrompt should include light');
+  assert(plan.finalPrompt.includes('构图组合：前景框架、视线方向'), 'finalPrompt should include composition');
 }
 
 async function testImageNoContinuity() {
@@ -777,7 +958,7 @@ async function testPlanCapFiveCandidatesThree() {
   assert(paths.every((p) => typeof p === 'string' && p.length > 0), 'all paths resolved');
 }
 
-async function testFirstFrameFourImageQualityPack() {
+async function testFirstFrameBalancedTwelveImageQualityPack() {
   const project = makeQualityPackProject();
   const scene = makeQualityPackScene();
   const localMap = {
@@ -799,14 +980,17 @@ async function testFirstFrameFourImageQualityPack() {
   });
 
   const sent = plan.referenceManifest.filter((r) => r.delivery === 'image');
-  assertEqual(sent.length, 4, 'business budget sends exactly 4 refs');
-  assertEqual(sent.map((r) => r.imageNo), [1, 2, 3, 4], 'imageNo 1..4 contiguous');
-  assertEqual(sent.map((r) => r.role), ['character', 'scene', 'character', 'prop'], 'first frame 4-image role order');
-  assertEqual(sent.map((r) => r.assetName), ['Bob', 'Rainy Hall', 'Alice', 'orb'], 'primary, scene, secondary, key prop order');
+  assert(sent.length <= 12, 'business budget sends no more than 12 refs');
+  assert(sent.length > 4, 'raised business budget can send more than the old 4 refs');
+  assertEqual(sent.map((r) => r.imageNo), sent.map((_, idx) => idx + 1), 'imageNo is contiguous');
+  assert(sent.filter((r) => r.role === 'character').length <= 6, 'character refs stay within max 6');
+  assert(sent.filter((r) => r.role !== 'character').length <= 6, 'non-character refs stay within max 6');
+  assert(sent.some((r) => r.role === 'scene' && r.assetName === 'Rainy Hall'), 'scene reference survives larger character set');
+  assert(sent.filter((r) => r.role === 'prop').length >= 2, 'key props are kept as first-class references');
+  assert(sent[0].role === 'character', 'first submitted image remains a character identity anchor');
+  assert(sent[1].role === 'scene', 'scene is promoted before secondary character overflow');
 
   const textOnly = plan.referenceManifest.filter((r) => r.delivery === 'text_only');
-  assert(textOnly.some((r) => r.assetName === 'Charlie'), 'third character falls to text_only');
-  assert(textOnly.some((r) => r.assetName === 'lantern'), 'remaining prop falls to text_only');
   assert(textOnly.every((r) => String(r.textFallback || '').trim().length > 0), 'all text_only refs keep textFallback');
 }
 
@@ -925,13 +1109,14 @@ async function main() {
     ['imagePrompt priority and blank fallback', testImagePromptPriorityAndBlankFallback],
     ['prompt determinism', testPromptDeterminism],
     ['no images available → text_only', testNoImagesAvailable],
-    ['tail_frame plan basic (no self_first_frame)', testTailFramePlanBasic],
-    ['tail_frame with self_first_frame slot 1', testTailFrameWithSelfFirstFrame],
-    ['shot constraint fields preserve user text without fill-light injection', testShotFieldsPreserveUserConstraints],
-    ['imageNo continuity when scene skipped', testImageNoContinuity],
+	    ['tail_frame plan basic (no self_first_frame)', testTailFramePlanBasic],
+	    ['tail_frame with self_first_frame slot 1', testTailFrameWithSelfFirstFrame],
+	    ['shot constraint fields preserve user text without fill-light injection', testShotFieldsPreserveUserConstraints],
+	    ['frame prompt includes structured shot fields', testFramePromptIncludesStructuredShotFields],
+	    ['imageNo continuity when scene skipped', testImageNoContinuity],
     ['plan cap=3 → all 3 candidates as image, imageNo 1/2/3', testPlanCapThreeAllImages],
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],
-    ['first_frame 4-image quality pack order and overflow text_only', testFirstFrameFourImageQualityPack],
+	    ['first_frame balanced 12-image quality pack with 6/6 role caps', testFirstFrameBalancedTwelveImageQualityPack],
     ['manual storyboard materials before fallback', testManualStoryboardMaterialsFirst],
     ['tail_frame unresolvable self_first_frame shifts imageNo', testTailFrameUnresolvableSelfFirstFrameShiftsImageNo],
     ['unknown frameType rejected', testTailFrameUnknownTypeRejected],

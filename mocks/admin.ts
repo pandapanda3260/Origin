@@ -7,11 +7,11 @@ export const MOCK_ADMIN_STATS = {
     { amountCents: 297000, currency: 'CNY' },
   ],
   onlineUsers: [
-    { userId: 1, username: 'pokerman', lastActive: new Date().toISOString() },
+    { userId: 1, phone: '19900000000', lastActive: new Date().toISOString() },
   ],
   userUsage: [
     {
-      username: 'pokerman',
+      phone: '19900000000',
       totalCalls: 142,
       totalTokens: 88500,
       textCalls: 80,
@@ -21,9 +21,9 @@ export const MOCK_ADMIN_STATS = {
     },
   ],
   recentUsers: [
-    { id: 12, username: 'pokerman', displayName: 'pokerman', createdAt: '2024-12-26T14:21:00Z' },
-    { id: 11, username: 'demo_user', displayName: 'demo_user', createdAt: '2024-12-25T09:18:00Z' },
-    { id: 10, username: 'creator_a', displayName: 'Creator A', createdAt: '2024-12-22T20:05:00Z' },
+    { id: 12, phone: '19900000000', displayName: 'Mock User', createdAt: '2024-12-26T14:21:00Z' },
+    { id: 11, phone: '19900000001', displayName: 'Demo User', createdAt: '2024-12-25T09:18:00Z' },
+    { id: 10, phone: '19900000002', displayName: 'Creator A', createdAt: '2024-12-22T20:05:00Z' },
   ],
 };
 
@@ -32,7 +32,7 @@ export const MOCK_ADMIN_LOGS = {
   total: 4,
   lines: [
     `[INFO] ${new Date().toISOString()} mock backend started`,
-    `[INFO] ${new Date().toISOString()} pokerman logged in`,
+    `[INFO] ${new Date().toISOString()} mock user logged in`,
     `[INFO] ${new Date().toISOString()} GET /api/billing/me 200`,
     `[WARN] ${new Date().toISOString()} this is a sample warning entry`,
   ],

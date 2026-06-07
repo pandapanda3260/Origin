@@ -40,7 +40,12 @@ export function factsForRefineGuardMode(
   };
 }
 
-const TIME_RANGE_RE = /\b\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*s\b/g;
+const CLOCK_TIME_RANGE_PATTERN = String.raw`\d+(?:\.\d+)?\s*秒\s*[（(]\s*\d+:\d{2}(?:\.\d+)?\s*[-–~]\s*\d+:\d{2}(?:\.\d+)?\s*[）)]`;
+const LEGACY_TIME_RANGE_PATTERN = String.raw`\b\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*s\b`;
+const CLOCK_TIME_RANGE_RE = new RegExp(CLOCK_TIME_RANGE_PATTERN, 'g');
+const LEGACY_TIME_RANGE_RE = new RegExp(LEGACY_TIME_RANGE_PATTERN, 'g');
+const CLOCK_TIME_RANGE_SINGLE_RE = new RegExp(CLOCK_TIME_RANGE_PATTERN);
+const LEGACY_TIME_RANGE_SINGLE_RE = new RegExp(LEGACY_TIME_RANGE_PATTERN);
 const IMAGE_RE = /\bImage\s*(\d+)\b/gi;
 const ROLE_COLON_RE = /([\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9]{0,20})[：:]/g;
 const QUOTED_TEXT_RE = /[“"‘']([^“”"‘’'\n]{1,240})[”"’']/g;
@@ -82,9 +87,28 @@ function extractQuotedTexts(text: string): string[] {
   QUOTED_TEXT_RE.lastIndex = 0;
   while ((match = QUOTED_TEXT_RE.exec(text)) !== null) {
     const value = String(match[1] || '').trim();
-    if (value && !/\b\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?\s*s\b/.test(value) && !/\bImage\s*\d+\b/i.test(value)) out.push(value);
+    if (value && !isTimeRangeText(value) && !/\bImage\s*\d+\b/i.test(value)) out.push(value);
   }
   return uniqueStrings(out, 40);
+}
+
+function normalizeTimeRangeTitle(value: string): string {
+  const text = String(value || '').trim();
+  const clock = text.match(CLOCK_TIME_RANGE_SINGLE_RE);
+  if (clock) {
+    return clock[0]
+      .replace(/\(/g, '（')
+      .replace(/\)/g, '）')
+      .replace(/[–~]/g, '-')
+      .replace(/\s+/g, '');
+  }
+  const legacy = text.match(LEGACY_TIME_RANGE_SINGLE_RE);
+  if (legacy) return legacy[0].replace(/\s+/g, '').replace(/[–~]/g, '-');
+  return text;
+}
+
+function isTimeRangeText(value: string): boolean {
+  return CLOCK_TIME_RANGE_SINGLE_RE.test(value) || LEGACY_TIME_RANGE_SINGLE_RE.test(value);
 }
 
 function extractDialogueLineTexts(text: string): string[] {
@@ -105,7 +129,12 @@ function extractDialogueLineTexts(text: string): string[] {
 }
 
 export function extractTimeRangeTitles(text: string): string[] {
-  return uniqueStrings(String(text || '').match(TIME_RANGE_RE) || [], 80);
+  const value = String(text || '');
+  const matches = [
+    ...(value.match(CLOCK_TIME_RANGE_RE) || []),
+    ...(value.match(LEGACY_TIME_RANGE_RE) || []),
+  ];
+  return uniqueStrings(matches.map(normalizeTimeRangeTitle), 80);
 }
 
 export function extractImageNumbers(text: string): number[] {
@@ -169,9 +198,6 @@ export function buildImmutableFactsSnapshot(input: {
     : Number.isInteger(input.groupIdx)
       ? [Number(input.groupIdx)]
       : [];
-  const shotDialogues = shotIndices
-    .map((idx) => String(shots[idx]?.dialogue || shots[idx]?.dialog || '').trim())
-    .filter((text) => text && text !== '——' && text !== '-' && text !== '无');
   const shotCharacters = shotIndices.flatMap((idx) => (
     Array.isArray(shots[idx]?.characters) ? shots[idx].characters : []
   ));
@@ -184,7 +210,6 @@ export function buildImmutableFactsSnapshot(input: {
     : [];
   return {
     dialogueTexts: uniqueStrings([
-      ...shotDialogues,
       ...extractDialogueLineTexts(currentPrompt),
       ...extractQuotedTexts(currentPrompt),
     ], 60),

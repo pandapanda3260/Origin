@@ -22,24 +22,74 @@ const MAX_REQUEST_BYTES = MAX_IMAGE_BYTES + 1 * 1024 * 1024;
 
 const ALLOWED_MIME_PREFIX = ['image/'];
 
-function parseCharacterIndex(form: FormData, assetRef: string): number {
-  const direct = form.get('charIdx') ?? form.get('idx') ?? form.get('characterIndex');
+type AssetUploadTarget = {
+  type: 'char' | 'scene' | 'prop';
+  idx: number;
+  cat: 'characters' | 'scenes' | 'props';
+  topKey: 'characters' | 'environments' | 'props';
+  kind: 'character' | 'scene' | 'prop';
+  stage: 'asset_character' | 'asset_scene' | 'asset_prop';
+  assetRef: string;
+};
+
+function normalizeAssetUploadType(value: unknown, assetRef: string): AssetUploadTarget['type'] {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'scene' || raw === 'scenes' || raw === 'environment' || raw === 'environments') return 'scene';
+  if (raw === 'prop' || raw === 'props') return 'prop';
+  if (/^(scenes|environments)\[\d+\]/.test(assetRef)) return 'scene';
+  if (/^props\[\d+\]/.test(assetRef)) return 'prop';
+  return 'char';
+}
+
+function parseAssetIndex(form: FormData, assetRef: string): number {
+  const direct = form.get('idx') ?? form.get('assetIdx') ?? form.get('charIdx') ?? form.get('characterIndex');
   if (direct !== null && direct !== '') {
     const n = Number(String(direct));
     if (Number.isInteger(n) && n >= 0) return n;
   }
-  const m = /characters\[(\d+)\]/.exec(assetRef);
+  const m = /(?:characters|scenes|environments|props)\[(\d+)\]/.exec(assetRef);
   return m ? Number(m[1]) : -1;
 }
 
-function withUploadedReference(character: any, url: string) {
+function buildAssetUploadTarget(form: FormData, assetRef: string): AssetUploadTarget {
+  const type = normalizeAssetUploadType(form.get('assetType') ?? form.get('type') ?? form.get('kind'), assetRef);
+  const idx = parseAssetIndex(form, assetRef);
+  const cat = type === 'char' ? 'characters' : type === 'scene' ? 'scenes' : 'props';
+  const topKey = type === 'char' ? 'characters' : type === 'scene' ? 'environments' : 'props';
+  const kind = type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop';
+  const stage = type === 'char' ? 'asset_character' : type === 'scene' ? 'asset_scene' : 'asset_prop';
+  return {
+    type,
+    idx,
+    cat,
+    topKey,
+    kind,
+    stage,
+    assetRef: assetRef || `${cat}[${idx >= 0 ? idx : 0}]`,
+  };
+}
+
+function withUploadedReference(asset: any, url: string, imageId: string, type: AssetUploadTarget['type']) {
   const next = {
-    ...(character || {}),
-    realPhotoUrl: url,
+    ...(asset || {}),
     rawUrl: url,
     imageUrl: url,
-    pencilUrl: url,
+    assetId: imageId,
+    imageGeneratedAt: new Date().toISOString(),
+    reference: {
+      ...((asset && asset.reference) || {}),
+      currentUrl: url,
+      lastKnownGoodUrl: url,
+      status: 'ready',
+      updatedAt: new Date().toISOString(),
+    },
   };
+  if (type === 'char') {
+    next.realPhotoUrl = url;
+    next.pencilUrl = url;
+  }
+  delete next.imageLastError;
+  delete next.imageFailedAt;
   delete next._pencilFailed;
   return next;
 }
@@ -61,7 +111,7 @@ export async function POST(req: NextRequest) {
     const file = form.get('file') as File | null;
     const projectId = (form.get('projectId') || '').toString();
     const assetRef = (form.get('assetRef') || '').toString();
-    const charIdx = parseCharacterIndex(form, assetRef);
+    const target = buildAssetUploadTarget(form, assetRef);
 
     if (!file) return jsonError('没有上传文件', 400);
     const mime = (file as any).type || 'image/jpeg';
@@ -89,12 +139,13 @@ export async function POST(req: NextRequest) {
     const db = getDb();
     db.prepare(
       `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
-       VALUES (?, ?, ?, 'character', ?, ?, ?, ?, 0, 0, '[uploaded]', null)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '[uploaded]', null)`,
     ).run(
       id,
       user.id,
       projectId || null,
-      assetRef || null,
+      target.kind,
+      target.assetRef || null,
       filename,
       mime,
       buf.length,
@@ -105,7 +156,7 @@ export async function POST(req: NextRequest) {
       projectId: projectId || null,
       assetKind: 'image',
       source: 'uploaded',
-      stage: 'asset_character',
+      stage: target.stage,
       fileUri: localAssetUri('images', user.id, filename),
       thumbUri: `/api/images/file/${id}`,
       fileHash: hashFile(fullPath),
@@ -117,24 +168,26 @@ export async function POST(req: NextRequest) {
 
     const url = `/api/images/file/${id}`;
     const signed = buildSignedImageUrl(id, user.id);
-    if (projectId && charIdx >= 0) {
+    if (projectId && target.idx >= 0) {
       patchProjectForUser(projectId, user.id, (fresh) => {
         if (!fresh) return null;
         const assets = { ...((fresh as any).assets || {}) };
-        const chars = Array.isArray(assets.characters) ? [...assets.characters] : [];
-        const top = Array.isArray((fresh as any).characters) ? [...(fresh as any).characters] : [];
-        const currentChar = chars[charIdx] || top[charIdx];
-        if (!currentChar) return null;
+        const list = Array.isArray(assets[target.cat]) ? [...assets[target.cat]] : [];
+        const top = Array.isArray((fresh as any)[target.topKey]) ? [...(fresh as any)[target.topKey]] : [];
+        const currentAsset = list[target.idx] || top[target.idx];
+        if (!currentAsset) return null;
 
-        chars[charIdx] = withUploadedReference(currentChar, url);
-        top[charIdx] = withUploadedReference(top[charIdx] || chars[charIdx], url);
-        assets.characters = chars;
+        list[target.idx] = withUploadedReference(currentAsset, url, id, target.type);
+        top[target.idx] = withUploadedReference(top[target.idx] || list[target.idx], url, id, target.type);
+        assets[target.cat] = list;
 
-        const patch: any = { assets, characters: top.length ? top : chars };
-        const nextChar = chars[charIdx] || top[charIdx];
+        const patch: any = { assets, [target.topKey]: top.length ? top : list };
+        if (target.type !== 'char') return patch;
+
+        const nextChar = list[target.idx] || top[target.idx];
         const mutation = mutateCharacterLock(
           { ...(fresh as any), ...patch },
-          nextChar.characterId || nextChar.id || nextChar.name || `characters[${charIdx}]`,
+          nextChar.characterId || nextChar.id || nextChar.name || `characters[${target.idx}]`,
           {
             referenceLock: {
               sheetUrl: url,

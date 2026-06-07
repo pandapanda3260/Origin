@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
 import { resolveLocalImagePath } from './image-gen';
 import {
+  FRAME_IMAGE_REFERENCE_IMAGE_BUDGET,
   buildFrameImageGenerationPlan,
   summarizePlanForAudit,
   type FrameImageGenerationPlan,
@@ -229,7 +230,6 @@ export const MAX_PROMPT_OVERRIDE_CHARS = 5000;
 export const MAX_NEGATIVE_PROMPT_CHARS = 500;
 export const MAX_STYLE_RULES = 20;
 export const MAX_STYLE_RULE_CHARS = 200;
-const FIRST_FRAME_REFERENCE_IMAGE_BUDGET = 4;
 
 function cleanText(value: unknown, limit: number): string {
   const text = String(value ?? '').replace(/\s+\n/g, '\n').trim();
@@ -292,7 +292,7 @@ function cleanTileRole(value: unknown): FirstFrameMaterialTileRole | null {
 
 function frameRoleToTileRole(role: unknown): FirstFrameMaterialTileRole | null {
   const raw = String(role || '').trim();
-  if (raw === 'character') return 'char';
+  if (raw === 'character' || raw === 'crowd') return 'char';
   if (raw === 'scene') return 'scene';
   if (raw === 'prop') return 'prop';
   return null;
@@ -881,6 +881,7 @@ export function buildFirstFramePlanPreview(args: {
   groupIdx: number;
   ownerId: number;
   user: any;
+  explicitShotIndices?: any;
 }): {
   plan: FrameImageGenerationPlan;
   planSummary: FrameImagePlanSummary;
@@ -891,9 +892,12 @@ export function buildFirstFramePlanPreview(args: {
   const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
   const sb = storyboards[args.groupIdx] || {};
   const hasExplicitShotBinding = Array.isArray(sb?.shotIndices) && sb.shotIndices.length > 0;
+  const explicitShotIndices = Array.isArray(args.explicitShotIndices) && args.explicitShotIndices.length
+    ? args.explicitShotIndices
+    : (hasExplicitShotBinding ? undefined : [args.groupIdx]);
   const shotIndices = storyboardShotIndices(args.project, args.groupIdx, sb, {
     mode: 'single-shot-strict',
-    explicitShotIndices: hasExplicitShotBinding ? undefined : [args.groupIdx],
+    explicitShotIndices,
   });
   const imgCfg = resolveLLMConfig(args.user, 'image');
   const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
@@ -954,12 +958,14 @@ export function reconcileFirstFramePromptStateInPatch(args: {
   user: any;
   groupIdx: number;
   now?: string;
+  explicitShotIndices?: any;
 }): FirstFramePromptReconcileState {
   const preview = buildFirstFramePlanPreview({
     project: args.project,
     groupIdx: args.groupIdx,
     ownerId: args.user.id,
     user: args.user,
+    explicitShotIndices: args.explicitShotIndices,
   });
   const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
   const slot = storyboards[args.groupIdx] || {};
@@ -1067,7 +1073,7 @@ type InternalReferenceTile = FirstFrameMaterialTile & {
 };
 
 function effectiveReferenceCap(plan: FrameImageGenerationPlan): number {
-  return Math.min(FIRST_FRAME_REFERENCE_IMAGE_BUDGET, Math.max(0, Math.floor(plan.modelSnapshot.multiRefImageCap || 0)));
+  return Math.min(FRAME_IMAGE_REFERENCE_IMAGE_BUDGET, Math.max(0, Math.floor(plan.modelSnapshot.multiRefImageCap || 0)));
 }
 
 export function computeFirstFrameEditSourceHash(
@@ -1102,7 +1108,8 @@ export function computeFirstFrameEditSourceHash(
 
 function tileIdForReference(ref: FrameReference, role: FirstFrameMaterialTileRole, imageId: string): string {
   const identity = cleanId(ref.assetId) || cleanId(ref.assetName) || imageId || String(ref.slot || '');
-  return `ref:${role}:${identity}`;
+  const panel = cleanId((ref as any).panel);
+  return panel ? `ref:${role}:${identity}:${panel}` : `ref:${role}:${identity}`;
 }
 
 function referenceToTile(ref: FrameReference, userId: number, source: FirstFrameMaterialTile['source'] = 'default'): InternalReferenceTile | null {
@@ -1444,8 +1451,8 @@ export function buildFirstFrameMaterialPanel(args: {
       : undefined;
   return {
     sourceHash: args.sourceHash,
-    selectionVersion: materialPanelVersion(args.sourceHash, args.draft, selected.mode, referencePoolVersion),
-    productCap: FIRST_FRAME_REFERENCE_IMAGE_BUDGET,
+	    selectionVersion: materialPanelVersion(args.sourceHash, args.draft, selected.mode, referencePoolVersion),
+	    productCap: FRAME_IMAGE_REFERENCE_IMAGE_BUDGET,
     cap,
     used,
     remaining: Math.max(0, cap - used),

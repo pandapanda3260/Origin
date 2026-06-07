@@ -1,6 +1,8 @@
 import { statSync } from 'node:fs';
 import { isIndependentMultiImageModeEnabled } from './feature-flags';
+import type { TailFrameSignals } from './shot-tail-frame-signals';
 import type { TargetEndStrategy } from './video-provider-capabilities';
+import { buildReferenceBriefLine, type ReferenceManifestItem } from './video-reference-manifest';
 
 export type VideoReferenceImage = {
   role: 'first_frame' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
@@ -11,6 +13,13 @@ export type VideoReferenceImage = {
   assetName?: string;
   promptHint?: string;
   priority?: number;
+  useFor?: string[];
+  immutable?: string[];
+  panelInfo?: {
+    panel: string;
+    intent: string;
+  };
+  referenceBrief?: string;
 };
 
 export type VideoPromptRuleBlock = {
@@ -19,10 +28,27 @@ export type VideoPromptRuleBlock = {
   content: string;
 };
 
+export type VideoPromptShotPlanItem = {
+  idx?: number;
+  durationSec?: number;
+	  pace?: string;
+	  shotType?: string;
+	  angle?: string;
+	  lens?: string;
+	  focus?: string;
+	  light?: string;
+	  composition?: string;
+	  camera?: string;
+	  visual?: string;
+  emotion?: string;
+  tailFrameSignals?: TailFrameSignals;
+		};
+
 export type SeedancePromptInput = {
   prompt: string;
   ratio: string;
   durationSec: number;
+  shotPlan?: VideoPromptShotPlanItem[];
   dialoguePairs?: Array<{ speaker: string; text: string }>;
   characterLockRoster?: string;
   voiceRoster?: string;
@@ -45,17 +71,45 @@ export type SeedancePromptInput = {
   targetEndUnsupportedReason?: string;
 };
 
-function referenceRoleText(role: VideoReferenceImage['role']): string {
-  switch (role) {
-    case 'first_frame': return 'first frame';
-    case 'character': return 'character reference';
-    case 'scene': return 'scene reference';
-    case 'prop': return 'prop reference';
-    case 'previous_tail': return 'previous shot ending frame';
-    case 'target_end': return 'target ending frame';
-    case 'storyboard_sketch': return 'storyboard sketch';
-    default: return 'reference image';
+function panelBindingText(panel: string | undefined): string {
+  if (panel === 'sheet') return '角色设定';
+  if (panel === 'headshot') return '脸部近景';
+  if (panel === 'front') return '正面';
+  if (panel === 'side') return '侧面';
+  if (panel === 'back') return '背面';
+  return '';
+}
+
+function referenceBindingName(ref: ReferenceManifestItem): string {
+  return String(ref.assetName || ref.label || ref.role || 'reference').trim();
+}
+
+function buildIndependentReferenceBindingCorrection(refs: ReferenceManifestItem[]): string {
+  const characterRefs = refs.filter((ref) => ref.role === 'character');
+  if (!characterRefs.length) {
+    return '如果下方可编辑正文里的 Image 编号与本块冲突，必须忽略正文旧编号，以本块为唯一准。';
   }
+  const groups = new Map<string, ReferenceManifestItem[]>();
+  for (const ref of characterRefs) {
+    const name = referenceBindingName(ref);
+    const group = groups.get(name) || [];
+    group.push(ref);
+    groups.set(name, group);
+  }
+  const characterBindings = [...groups.entries()].map(([name, group]) => {
+    const parts = group
+      .slice()
+      .sort((a, b) => Number(a.imageNo) - Number(b.imageNo))
+      .map((ref) => {
+        const panelText = panelBindingText(ref.panelInfo?.panel);
+        return `Image ${ref.imageNo}${panelText ? ` ${panelText}` : ''}`;
+      });
+    return `${name}=${parts.join(' + ')}`;
+  });
+  return [
+    '如果下方可编辑正文里的 Image 编号与本块冲突，必须忽略正文旧编号，以本块为唯一准。',
+    `当前角色绑定：${characterBindings.join('；')}。`,
+  ].join('\n');
 }
 
 export function normalizeIndependentReferenceImages(refs: VideoReferenceImage[] | undefined): VideoReferenceImage[] {
@@ -77,6 +131,7 @@ export function normalizeIndependentReferenceImages(refs: VideoReferenceImage[] 
       path: p,
       label: String(ref.label || ref.role || 'reference image').slice(0, 80),
       promptHint: ref.promptHint ? String(ref.promptHint).slice(0, 180) : undefined,
+      referenceBrief: ref.referenceBrief ? String(ref.referenceBrief).slice(0, 420) : undefined,
     });
     if (out.length >= 9) break;
   }
@@ -85,16 +140,123 @@ export function normalizeIndependentReferenceImages(refs: VideoReferenceImage[] 
 
 export function buildIndependentReferencePromptBlock(refs: VideoReferenceImage[]): string {
   if (!refs.length) return '';
-  const lines = refs.map((ref, idx) => {
-    const hint = ref.promptHint ? ` ${ref.promptHint}` : '';
-    return `Image ${idx + 1}: ${referenceRoleText(ref.role)} - ${ref.label}.${hint}`;
-  });
+  const manifestRefs: ReferenceManifestItem[] = refs.map((ref, idx) => ({
+    imageNo: idx + 1,
+    role: ref.role === 'storyboard_sketch' || ref.role === 'previous_tail' ? 'first_frame' : ref.role,
+    assetId: ref.assetId,
+    assetName: ref.assetName,
+    label: ref.label,
+    url: ref.sourceUrl || ref.path,
+    localPath: ref.path,
+    useFor: Array.isArray(ref.useFor) ? ref.useFor : [],
+    immutable: Array.isArray(ref.immutable) ? ref.immutable : [],
+    promptHint: ref.promptHint,
+    priority: ref.priority,
+    panelInfo: ref.panelInfo,
+    referenceBrief: ref.referenceBrief,
+  }));
+  const lines = manifestRefs.map((ref) => buildReferenceBriefLine(ref, manifestRefs));
+  const bindingCorrection = buildIndependentReferenceBindingCorrection(manifestRefs);
   return [
     '【独立参考图编号 - 必须按顺序理解】',
     ...lines,
+    bindingCorrection,
     'Use each image only for its stated role. Do not render reference-image borders, grids, thumbnails, labels, UI, captions, or subtitles.',
     '',
   ].join('\n');
+}
+
+function formatPlanSeconds(value: unknown): string {
+  const n = Number(value);
+  const rounded = Math.round((Number.isFinite(n) && n > 0 ? n : 4) * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1).replace(/\.0$/, '');
+}
+
+function normalizePlanDuration(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 4;
+  return Math.round(Math.max(1, n) * 10) / 10;
+}
+
+function paceLabel(value: unknown): string {
+  const raw = String(value || '').trim();
+  const map: Record<string, string> = {
+    slow: '慢',
+    normal: '正常',
+    fast: '快',
+    fast_forward: '快进',
+    'fast-forward': '快进',
+    慢节奏: '慢',
+    舒缓: '慢',
+    平稳: '正常',
+    标准: '正常',
+    快节奏: '快',
+    紧凑: '快',
+  };
+  return map[raw] || raw || '正常';
+}
+
+export function stripEditablePromptTimingLines(prompt: unknown): string {
+  const raw = String(prompt ?? '');
+  if (!raw) return '';
+  let shotNo = 1;
+  const out: string[] = [];
+  for (const line of raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')) {
+    const trimmed = line.trim();
+    const isDurationClockHeading = /^\d+(?:\.\d+)?\s*秒\s*[（(]\s*\d+:\d{2}(?:\.\d+)?\s*[-–~]\s*\d+:\d{2}(?:\.\d+)?\s*[）)]$/.test(trimmed);
+    const isLegacySecondsHeading = /^\d+(?:\.\d+)?\s*[-–~]\s*\d+(?:\.\d+)?\s*(?:s|秒)$/i.test(trimmed);
+    const isClockOnlyHeading = /^\d+:\d{2}(?:\.\d+)?\s*[-–~]\s*\d+:\d{2}(?:\.\d+)?$/.test(trimmed);
+    const isDurationOnlyHeading = /^时长\s*[=:：]?\s*\d+(?:\.\d+)?\s*秒$/.test(trimmed);
+    const isTimecodeOnlyHeading = /^时间码\s*[=:：]?\s*\d+:\d{2}(?:\.\d+)?\s*[-–~]\s*\d+:\d{2}(?:\.\d+)?$/.test(trimmed);
+
+    if (isDurationClockHeading || isLegacySecondsHeading || isClockOnlyHeading) {
+      out.push(`镜头 ${String(shotNo++).padStart(2, '0')}`);
+      continue;
+    }
+    if (isDurationOnlyHeading || isTimecodeOnlyHeading) continue;
+    out.push(line);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function buildShotPlanBlock(shotPlan: VideoPromptShotPlanItem[] | undefined, requestDurationSec: number): string {
+  const items = Array.isArray(shotPlan) ? shotPlan.filter(Boolean) : [];
+  if (!items.length) return '';
+  let total = 0;
+  const lines = items.map((item, i) => {
+    const duration = normalizePlanDuration(item.durationSec);
+    total += duration;
+    const shotNo = Number.isFinite(Number(item.idx)) && Number(item.idx) > 0
+      ? Number(item.idx)
+      : i + 1;
+    const parts = [
+      `时长 ${formatPlanSeconds(duration)}秒`,
+	      `节奏 ${paceLabel(item.pace)}`,
+	      item.shotType ? `景别 ${String(item.shotType).trim()}` : '',
+	      item.angle ? `角度 ${String(item.angle).trim()}` : '',
+	      item.lens ? `焦距 ${String(item.lens).trim()}` : '',
+	      item.focus ? `景深 ${String(item.focus).trim()}` : '',
+	      item.light ? `光线 ${String(item.light).trim()}` : '',
+	      item.composition ? `构图 ${String(item.composition).trim()}` : '',
+	      item.camera ? `运镜 ${String(item.camera).trim()}` : '',
+	    ].filter(Boolean);
+    return `  · 镜头 ${String(shotNo).padStart(2, '0')}：${parts.join('；')}`;
+  });
+  const requestRaw = Number(requestDurationSec);
+  const requestDuration = Number.isFinite(requestRaw) && requestRaw > 0
+    ? Math.round(requestRaw * 10) / 10
+    : total;
+  const extraRule = requestDuration > total
+    ? `\n  · 供应商请求时长为 ${formatPlanSeconds(requestDuration)}秒，多出的 ${formatPlanSeconds(requestDuration - total)}秒只做自然收尾或环境延展，禁止新增剧情。`
+    : '';
+  return (
+    `【镜头计划 - 结构化参数为准】\n` +
+    `下面的时长和节奏来自镜头表，是本片段的唯一时长依据；不要从正文里另行推断或改写时长。\n` +
+    lines.join('\n') +
+    `\n  · 镜头计划总时长 ${formatPlanSeconds(total)}秒。` +
+    extraRule +
+    `\n\n`
+  );
 }
 
 function buildDialogueBlock(dialoguePairs: Array<{ speaker: string; text: string }> | undefined): string {
@@ -159,11 +321,31 @@ function buildContinuityBlock(prevTailSummary?: string, nextHeadSummary?: string
     : '';
 }
 
-function buildMotionOpeningBlock(): string {
+function isFixedCameraPlan(item: VideoPromptShotPlanItem): boolean {
+  const camera = String(item?.camera || '').trim();
+  if (!camera) return false;
+  const saysFixed = /固定|静止|锁定|不动/.test(camera);
+  const saysMoving = /推进|推近|拉远|横移|平移|跟随|环绕|摇|甩|升降|移动|手持/.test(camera);
+  return saysFixed && !saysMoving;
+}
+
+function buildMotionOpeningBlock(shotPlan?: VideoPromptShotPlanItem[]): string {
+  const items = Array.isArray(shotPlan) ? shotPlan.filter(Boolean) : [];
+  const hasPlan = items.length > 0;
+  const fixedCount = items.filter(isFixedCameraPlan).length;
+  const allFixed = hasPlan && fixedCount === items.length;
+  const hasFixed = fixedCount > 0;
+
+  const cameraRule = allFixed
+    ? `  · 镜头计划为固定机位：机位必须保持固定，禁止为了"动起来"而擅自推/拉/横移/升降；用角色微动作、环境反光、灯光波动和空气流动制造动态\n`
+    : hasFixed
+      ? `  · 每个镜头按镜头计划的 camera 执行：固定镜头保持机位固定，运动镜头才从第 1 帧按推/拉/横移/跟随等方向开始物理位移\n`
+      : `  · 镜头从第 1 帧就要按镜头计划和【运镜系统】描述的方向开始物理位移（推/拉/横移/跟随等）\n`;
+
   return (
     `【开场动态强制】\n` +
     `视频第 0 帧就必须是动态画面，禁止前 0.3 秒呈现"参考图静帧定格"效果。\n` +
-    `  · 镜头从第 1 帧就要按【运镜系统】描述的方向开始物理位移（推/拉/横移/跟随等）\n` +
+    cameraRule +
     `  · 角色从第 1 帧就要有微动作（呼吸起伏 / 眨眼 / 手部小动作 / 嘴唇微动），不能像照片一样定格\n` +
     `  · 多个视频拼成成片时，每段开头的那一瞬间必须无缝接得上"在动"，不能让人感觉切到一张静态封面\n\n`
   );
@@ -264,11 +446,13 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
   const hasAnyRef = hasIndependentImageRefs || hasColorRefs || !!input.referenceImagePath;
 
   const dialogueBlock = buildDialogueBlock(input.dialoguePairs);
+  const shotPlanBlock = buildShotPlanBlock(input.shotPlan, input.durationSec);
   const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
   const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
   const independentReferenceBlock = buildIndependentReferencePromptBlock(independentReferenceImages);
   const targetEndConstraintBlock = buildTargetEndConstraintBlock(input, independentReferenceImages);
-  const motionOpeningBlock = buildMotionOpeningBlock();
+  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan);
+  const editablePrompt = stripEditablePromptTimingLines(input.prompt);
 
   let styleOverrideBlock = '';
   if (hasIndependentImageRefs) {
@@ -282,6 +466,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
   }
 
   const ruleBlocks: VideoPromptRuleBlock[] = [
+    { id: 'shot-plan', title: '镜头计划参数', content: shotPlanBlock },
     { id: 'dialogue', title: '台词系统规则', content: dialogueBlock },
     { id: 'character-lock', title: '角色一致性主档', content: characterLockBlock },
     { id: 'continuity', title: '前后片段衔接规则', content: continuityBlock },
@@ -292,6 +477,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
   ].filter((block) => block.content);
 
   const promptCore =
+    `${shotPlanBlock}` +
     `${dialogueBlock}` +
     `${characterLockBlock}` +
     `${continuityBlock}` +
@@ -299,7 +485,7 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     `${targetEndConstraintBlock}` +
     `${motionOpeningBlock}` +
     `${styleOverrideBlock}` +
-    `${input.prompt}`;
+    `${editablePrompt}`;
   const finalPrompt = `${promptCore}\n--ratio ${input.ratio} --duration ${input.durationSec}`;
 
   return {
@@ -338,6 +524,8 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
 
 export type SeedanceFirstLastFramePromptInput = {
   prompt: string;
+  durationSec?: number;
+  shotPlan?: VideoPromptShotPlanItem[];
   dialoguePairs?: Array<{ speaker: string; text: string }>;
   characterLockRoster?: string;
   voiceRoster?: string;
@@ -359,12 +547,15 @@ function buildFirstLastFrameConstraintBlock(): string {
 
 export function buildSeedanceFirstLastFramePromptParts(input: SeedanceFirstLastFramePromptInput) {
   const dialogueBlock = buildDialogueBlock(input.dialoguePairs);
+  const shotPlanBlock = buildShotPlanBlock(input.shotPlan, input.durationSec || 0);
   const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
   const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
   const firstLastFrameBlock = buildFirstLastFrameConstraintBlock();
-  const motionOpeningBlock = buildMotionOpeningBlock();
+  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan);
+  const editablePrompt = stripEditablePromptTimingLines(input.prompt || '');
 
   const ruleBlocks: VideoPromptRuleBlock[] = [
+    { id: 'shot-plan', title: '镜头计划参数', content: shotPlanBlock },
     { id: 'dialogue', title: '台词系统规则', content: dialogueBlock },
     { id: 'character-lock', title: '角色一致性主档', content: characterLockBlock },
     { id: 'continuity', title: '前后片段衔接规则', content: continuityBlock },
@@ -373,12 +564,13 @@ export function buildSeedanceFirstLastFramePromptParts(input: SeedanceFirstLastF
   ].filter((block) => block.content);
 
   const promptCore =
+    `${shotPlanBlock}` +
     `${dialogueBlock}` +
     `${characterLockBlock}` +
     `${continuityBlock}` +
     `${firstLastFrameBlock}` +
     `${motionOpeningBlock}` +
-    `${input.prompt || ''}`;
+    `${editablePrompt}`;
 
   // Intentional: no "--ratio X --duration Y" suffix. Those are top-level
   // fields in Builder A's request body.

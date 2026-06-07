@@ -44,7 +44,7 @@ export const MOCK_TOPUP_PACKS = [
 ];
 
 export const MOCK_BILLING_ME = {
-  user: { id: 1, username: 'pokerman', displayName: 'pokerman' },
+  user: { id: 1, phone: '19900000000', displayName: 'Mock User' },
   currentPlan: {
     code: 'free',
     title: 'Free',

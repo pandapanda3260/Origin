@@ -112,6 +112,15 @@ async function testPreflightMissingFirstFrame() {
   assert(/片段 3/.test(msg), 'error message should include 1-based groupIdx (3 = idx 2 + 1)');
 }
 
+async function testPreflightIndependentTailWithoutFirstFramePasses() {
+  const mod = loadVisualReferenceState();
+  assertEqual(
+    mod.checkTailFramePreflight({}, { dependency: 'independent' }),
+    null,
+    'independent tail frame should not require first frame',
+  );
+}
+
 async function testPreflightFirstFrameFailed() {
   const mod = loadVisualReferenceState();
   const sb = {
@@ -162,6 +171,21 @@ async function testNormalizeAndMarkTail() {
   assertEqual(failed.status, 'failed', 'no fallback → failed');
 }
 
+async function testFirstFrameFailureDoesNotFallbackToStoryboardSketch() {
+  const mod = loadVisualReferenceState();
+  const sb = {
+    url: '/api/images/file/00000000-0000-0000-0000-000000000101',
+    imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000101',
+    rawUrl: '/api/images/file/00000000-0000-0000-0000-000000000101',
+    firstFrameLastError: '生成失败',
+  };
+  assertEqual(mod.resolveStoryboardFirstFrameUrl(sb), '', 'generic storyboard URLs must not resolve as first frame');
+  const failed = mod.markFirstFrameFailed(sb, { message: '生成失败' });
+  assertEqual(failed.status, 'failed', 'failed first frame without canonical fallback stays failed');
+  assertEqual(failed.currentUrl, undefined, 'failed first frame must not keep storyboard sketch as currentUrl');
+  assertEqual(failed.lastKnownGoodUrl, undefined, 'failed first frame must not keep storyboard sketch as lastKnownGoodUrl');
+}
+
 async function main() {
   const tests = [
     ['preflight: structured_v1 passes', testPreflightStructuredV1Passes],
@@ -169,9 +193,11 @@ async function main() {
     ['preflight: legacy_pencil rejected with clear msg', testPreflightLegacyPencilRejected],
     ['preflight: legacy_pencil + frames.first.status=ready still rejected', testPreflightLegacyPencilWithReadyStatusStillRejected],
     ['preflight: missing first frame rejected', testPreflightMissingFirstFrame],
+    ['preflight: independent tail without first frame passes', testPreflightIndependentTailWithoutFirstFramePasses],
     ['preflight: first frame failed rejected', testPreflightFirstFrameFailed],
     ['preflight: frames.first.status=ready alone passes', testPreflightFallbackStatusReady],
     ['normalize + markReady + markFailed basics', testNormalizeAndMarkTail],
+    ['first frame failure does not fallback to storyboard sketch', testFirstFrameFailureDoesNotFallbackToStoryboardSketch],
   ];
   let pass = 0;
   for (const [name, fn] of tests) {

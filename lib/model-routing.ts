@@ -5,7 +5,16 @@ import { recordObservabilityEvent } from './observability-events';
 import { MOCK_USER_SETTINGS } from '@/mocks/settings';
 
 export type ModelSlot = 'text' | 'image' | 'video' | 'storyboard';
-export type TextModelRole = 'brain' | 'structured' | 'styleBible' | 'profileDerive' | 'continuity' | 'legacy';
+export type TextModelRole =
+  | 'brain'
+  | 'structured'
+  | 'styleBible'
+  | 'projectClassifier'
+	  | 'styleClassifier'
+	  | 'profileDerive'
+	  | 'continuity'
+	  | 'frameConsistencyCheck'
+	  | 'legacy';
 export type ProviderKind =
   | 'openai_chat'
   | 'openai_responses'
@@ -17,6 +26,7 @@ export type ProviderKind =
   | 'zerail_messages'
   | 'zerail_responses'
   | 'zerail_images'
+  | 'volcengine_chat'
   | 'volcengine_seedream'
   | 'seedance'
   | 'fake';
@@ -111,7 +121,39 @@ export function resolveTextModelConfig(
     }
   }
 
-  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive' || role === 'continuity') {
+  if (role === 'projectClassifier' || role === 'styleClassifier') {
+    const disabled = ['0', 'false', 'off', 'no'].includes(
+      firstEnv('PROJECT_CLASSIFIER_ENABLED', 'STYLE_CLASSIFIER_ENABLED').toLowerCase(),
+    );
+    if (disabled) return fake('text', role);
+
+    const key =
+      secretEnv('PROJECT_CLASSIFIER_API_KEY') ||
+      secretEnv('STYLE_CLASSIFIER_API_KEY') ||
+      secretEnv('ARK_API_KEY') ||
+      secretEnv('VOLCENGINE_ARK_API_KEY') ||
+      secretEnv('DOUBAO_API_KEY');
+    if (!key) return fake('text', role);
+
+    return real({
+      baseUrl: firstEnv('PROJECT_CLASSIFIER_API_BASE', 'STYLE_CLASSIFIER_API_BASE', 'ARK_API_BASE') || 'https://ark.cn-beijing.volces.com/api/v3',
+      apiKey: key,
+      model:
+        env('PROJECT_CLASSIFIER_MODEL') ||
+        env('STYLE_CLASSIFIER_MODEL') ||
+        env('DOUBAO_PROJECT_CLASSIFIER_MODEL') ||
+        env('DOUBAO_STYLE_CLASSIFIER_MODEL') ||
+        env('ARK_MODEL') ||
+        'doubao-seed-2-0-pro-260215',
+      provider: inferProvider(firstEnv('PROJECT_CLASSIFIER_PROVIDER', 'STYLE_CLASSIFIER_PROVIDER', 'ARK_PROVIDER') || 'volcengine_chat', 'text'),
+      endpoint: firstEnv('PROJECT_CLASSIFIER_API_ENDPOINT', 'STYLE_CLASSIFIER_API_ENDPOINT', 'ARK_API_ENDPOINT') || '/chat/completions',
+      role,
+      source: 'env',
+      reasoningEffort: firstEnv('PROJECT_CLASSIFIER_REASONING_EFFORT', 'STYLE_CLASSIFIER_REASONING_EFFORT') || 'none',
+    });
+  }
+
+	  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive' || role === 'continuity' || role === 'frameConsistencyCheck') {
     const prefix = roleEnvPrefix(role);
     const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('OPENAI_API_KEY');
     if (key) {
@@ -125,7 +167,7 @@ export function resolveTextModelConfig(
         endpoint: prefixedEnv(prefix, 'API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses',
         role,
         source: 'env',
-        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
+	        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' || role === 'frameConsistencyCheck' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
       });
       return attachTextFallbackConfigs(cfg, role);
     }
@@ -212,9 +254,12 @@ export function getModelRoutingStatus(user: UserRow | null) {
     brain: redactConfig(resolveTextModelConfig(user, 'brain')),
     structured: redactConfig(resolveTextModelConfig(user, 'structured')),
     styleBible: redactConfig(resolveTextModelConfig(user, 'styleBible')),
-    profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
-    continuity: redactConfig(resolveTextModelConfig(user, 'continuity')),
-    image: redactConfig(resolveSlotModelConfig(user, 'image')),
+    projectClassifier: redactConfig(resolveTextModelConfig(user, 'projectClassifier')),
+	    styleClassifier: redactConfig(resolveTextModelConfig(user, 'styleClassifier')),
+	    profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
+	    continuity: redactConfig(resolveTextModelConfig(user, 'continuity')),
+	    frameConsistencyCheck: redactConfig(resolveTextModelConfig(user, 'frameConsistencyCheck')),
+	    image: redactConfig(resolveSlotModelConfig(user, 'image')),
     video: redactConfig(resolveSlotModelConfig(user, 'video')),
     env: {
       ...loadExternalEnv(),
@@ -382,7 +427,8 @@ function redactConfig(cfg: ResolvedModelConfig): Record<string, unknown> {
 
 function inferProvider(provider: string, slot: ModelSlot): ProviderKind {
   const p = provider.toLowerCase();
-  if (p.includes('seedream') || p.includes('volcengine')) return 'volcengine_seedream';
+  if (p.includes('seedream') || (slot === 'image' && p.includes('volcengine'))) return 'volcengine_seedream';
+  if (p.includes('ark') || p.includes('volcengine') || p.includes('doubao')) return 'volcengine_chat';
   if (p.includes('seedance')) return 'seedance';
   if (p.includes('packy') && p.includes('image')) return 'packy_images';
   if (p.includes('packy') && (p.includes('message') || p.includes('claude'))) return 'packy_messages';
@@ -538,15 +584,19 @@ function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX
   const provider = input.provider;
 
   if (role === 'styleBible') names.push(`STYLE_BIBLE_${suffix}`);
-  else if (role === 'profileDerive') names.push(`PROFILE_DERIVE_${suffix}`);
-  else if (role === 'continuity') names.push(`CONTINUITY_${suffix}`);
-  else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
+  else if (role === 'projectClassifier') names.push(`PROJECT_CLASSIFIER_${suffix}`, `STYLE_CLASSIFIER_${suffix}`);
+	  else if (role === 'styleClassifier') names.push(`STYLE_CLASSIFIER_${suffix}`, `PROJECT_CLASSIFIER_${suffix}`);
+	  else if (role === 'profileDerive') names.push(`PROFILE_DERIVE_${suffix}`);
+	  else if (role === 'continuity') names.push(`CONTINUITY_${suffix}`);
+	  else if (role === 'frameConsistencyCheck') names.push(`FRAME_CONSISTENCY_CHECK_${suffix}`);
+	  else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
   else if (role === 'brain') names.push(`BRAIN_${suffix}`, `CLAUDE_${suffix}`);
 
   if (provider === 'zerail_messages' || provider === 'code80_messages' || provider === 'packy_messages') names.push(`CLAUDE_${suffix}`);
   if (provider === 'openai_chat' || provider === 'openai_responses' || provider === 'packy_responses' || provider === 'zerail_responses') {
     names.push(`TEXT_${suffix}`, `OPENAI_${suffix}`);
   }
+  if (provider === 'volcengine_chat') names.push(`PROJECT_CLASSIFIER_${suffix}`, `STYLE_CLASSIFIER_${suffix}`, `TEXT_${suffix}`);
   if (provider === 'zerail_images' || provider === 'code80_images' || provider === 'packy_images') names.push(`IMAGE_${suffix}`);
   if (provider === 'volcengine_seedream') names.push(`IMAGE_${suffix}`);
   if (provider === 'seedance') names.push(`VIDEO_${suffix}`);
@@ -557,6 +607,9 @@ function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX
 
 function fallbackCapacityForModel(model: string): Pick<ResolvedModelConfig, 'contextWindow' | 'maxOutputTokens'> {
   const m = (model || '').toLowerCase();
+  if (m.includes('doubao-seed-2-0-pro') || m.includes('doubao-seed-2.0-pro')) {
+    return { contextWindow: 256_000, maxOutputTokens: 32_768 };
+  }
   if (m.includes('gpt-5.5')) return { contextWindow: 400_000, maxOutputTokens: 32_768 };
   if (m.includes('gpt-5')) return { contextWindow: 400_000, maxOutputTokens: 32_768 };
   if (m.includes('claude')) return { contextWindow: 200_000, maxOutputTokens: 32_000 };
@@ -570,12 +623,30 @@ function env(name: string): string {
   return (getExternalEnvValue(name) ?? process.env[name] ?? '').trim();
 }
 
-function roleEnvPrefix(role: TextModelRole): string {
-  if (role === 'styleBible') return 'STYLE_BIBLE';
-  if (role === 'profileDerive') return 'PROFILE_DERIVE';
-  if (role === 'continuity') return 'CONTINUITY';
+function firstEnv(...names: string[]): string {
+  for (const name of names) {
+    const value = env(name);
+    if (value) return value;
+  }
   return '';
 }
+
+function secretEnv(name: string): string {
+  const value = env(name);
+  if (!value) return '';
+  if (/^(replace-with|your-|填入|请填|xxx|todo)/i.test(value)) return '';
+  return value;
+}
+
+function roleEnvPrefix(role: TextModelRole): string {
+  if (role === 'styleBible') return 'STYLE_BIBLE';
+  if (role === 'projectClassifier') return 'PROJECT_CLASSIFIER';
+	  if (role === 'styleClassifier') return 'STYLE_CLASSIFIER';
+	  if (role === 'profileDerive') return 'PROFILE_DERIVE';
+	  if (role === 'continuity') return 'CONTINUITY';
+	  if (role === 'frameConsistencyCheck') return 'FRAME_CONSISTENCY_CHECK';
+	  return '';
+	}
 
 function prefixedEnv(prefix: string, suffix: string): string {
   return prefix ? env(`${prefix}_${suffix}`) : '';

@@ -65,6 +65,17 @@ export function isFirstLastFrameVideoModeEnabled(): boolean {
 }
 
 /**
+ * 多镜头片段模式（镜头合并）：
+ * - on: 镜头计划阶段把相邻短镜头合并成"段"（一段 = 一次生成），解决 <下限 的快镜头被顶时长、破坏节奏的问题。
+ * - off: 维持"一个片段 = 一个镜头"的旧行为。
+ *
+ * 默认开启（合并已是默认行为）。如需临时停用，设 ORIGIN_MULTI_SHOT_SEGMENT=0 一键回退，无需改码。
+ */
+export function isMultiShotSegmentEnabled(): boolean {
+  return readBoolEnv('ORIGIN_MULTI_SHOT_SEGMENT', true);
+}
+
+/**
  * 尾帧 caption fallback：
  * 仅作为未来兼容不支持 last_frame 图片输入的 provider 的显式实验开关。
  * 默认关闭，避免视频生成前因为 legacy env 设置而隐式触发额外 vision/caption 调用。

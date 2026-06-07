@@ -744,10 +744,99 @@ assertFailurePreservesOldGood(null, 'missing panel result');
     frameType: 'first_frame',
     modelSnapshot: { provider: 'test', model: 'test', multiRefImageCap: 4 },
     resolveLocalPath: () => '/tmp/ready-character.png',
+	  });
+	  const charRefs = plan.referenceManifest.filter((ref) => ref.role === 'character');
+	  assert.equal(charRefs.length, 2, 'ready character sheet/front panels should appear in reference manifest');
+	  assert.deepEqual(charRefs.map((ref) => ref.panel), ['sheet', 'front']);
+	  assert.equal(charRefs.every((ref) => ref.delivery === 'image'), true, 'ready character panel images should be delivered as image references');
+	}
+
+{
+  const ownerId = 1;
+  const sheetUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fa01');
+  const headshotUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fa02');
+  const frontUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fa03');
+  const sideUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fa04');
+  const backUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fa05');
+  const readyCharacter = {
+    name: '角色B',
+    imageUrl: sheetUrl,
+    rawUrl: sheetUrl,
+    reference: {
+      status: 'ready',
+      currentUrl: sheetUrl,
+      lastKnownGoodUrl: sheetUrl,
+    },
+    panels: {
+      schema: 'human-character-sheet-v1',
+      sheetUrl,
+      headshotUrl,
+      frontUrl,
+      sideUrl,
+      backUrl,
+    },
+  };
+  const project = {
+    assets: { characters: [readyCharacter], scenes: [], props: [] },
+    shots: [{ visual: '角色B 特写看向镜头', description: '角色B face close-up', characters: ['角色B'] }],
+  };
+  const defaultPanels = selectCharacterReferencePanels({
+    project,
+    ownerId,
+    groupShotIndices: [0],
+    maxSlots: 3,
+    perCharacterLimit: 3,
   });
-  const charRefs = plan.referenceManifest.filter((ref) => ref.role === 'character');
-  assert.equal(charRefs.length, 1, 'ready character should appear in reference manifest');
-  assert.equal(charRefs[0].delivery, 'image', 'ready character image should be delivered as image reference');
+  assert.deepEqual(defaultPanels.map((panel) => panel.panel), ['headshot', 'front'], 'default/video mode keeps existing face allocation without sheet');
+
+  const framePanels = selectCharacterReferencePanels({
+    project,
+    ownerId,
+    groupShotIndices: [0],
+    maxSlots: 3,
+    perCharacterLimit: 3,
+    mode: 'frame',
+  });
+  assert.deepEqual(framePanels.map((panel) => panel.panel), ['sheet', 'headshot', 'front'], 'frame mode promotes sheet before face/front crops');
+}
+
+{
+  const ownerId = 1;
+  const sheetUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fb01');
+  const frontUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fb02');
+  const sideUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fb03');
+  const backUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fb04');
+  const nonHuman = {
+    name: '机械兽',
+    entityType: 'non-human',
+    imageUrl: sheetUrl,
+    rawUrl: sheetUrl,
+    reference: {
+      status: 'ready',
+      currentUrl: sheetUrl,
+      lastKnownGoodUrl: sheetUrl,
+    },
+    panels: {
+      schema: 'non-human-character-sheet-v1',
+      sheetUrl,
+      frontUrl,
+      sideUrl,
+      backUrl,
+    },
+  };
+  const project = {
+    assets: { characters: [nonHuman], scenes: [], props: [] },
+    shots: [{ visual: '机械兽 全身穿过街道', description: '机械兽 full body', characters: ['机械兽'] }],
+  };
+  const framePanels = selectCharacterReferencePanels({
+    project,
+    ownerId,
+    groupShotIndices: [0],
+    maxSlots: 3,
+    perCharacterLimit: 3,
+    mode: 'frame',
+  });
+  assert.deepEqual(framePanels.map((panel) => panel.panel), ['sheet', 'front', 'side'], 'non-human frame mode uses sheet/front/side and never requires headshot');
 }
 
 console.log('[test-character-reference-update] all assertions passed');

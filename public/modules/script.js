@@ -111,7 +111,7 @@ export function typewriter(element, text, chunkSize, delayMs) {
 export function chatAutoResize(textarea) {
   if (!textarea) return;
   textarea.style.height = "auto";
-  var nextHeight = Math.max(31, Math.min(textarea.scrollHeight || 31, 110));
+  var nextHeight = Math.max(38, Math.min(textarea.scrollHeight || 38, 110));
   textarea.style.height = nextHeight + "px";
 }
 
@@ -245,6 +245,17 @@ function _syncScriptWelcomeVisibility() {
   );
 }
 
+function _syncScriptDraftMeta() {
+  var badge = $("scriptDraftStatusBadge");
+  if (!badge) return;
+  var approved = !!(project && project.scriptApproved);
+  var modified = !!(project && project.scriptReviewState === "modified");
+  badge.textContent = approved ? "剧本 · 已确认" : (modified ? "剧本 · 已修改" : "草稿 · 待确认");
+  badge.classList.toggle("is-approved", approved);
+  badge.classList.toggle("is-modified", !approved && modified);
+  badge.classList.toggle("is-pending", !approved && !modified);
+}
+
 export function refreshScriptPage() {
   if (!project) return;
   if (_scriptGenerating) return;
@@ -271,6 +282,7 @@ export function refreshScriptPage() {
     if (editArea) editArea.value = "";
   }
   refreshScriptImportDraft();
+  _syncScriptDraftMeta();
   _syncScriptWelcomeVisibility();
 
   renderEmotionSegments();
@@ -348,14 +360,68 @@ async function _applyImportedDraft() {
   var textarea = $("scriptDraftPreview");
   var text = String((textarea && textarea.value) || "").trim();
   if (!text) { showToast("导入草稿为空", "warn"); return; }
-  await _setImportedDraft(text);
+  if (!project || !project.id) return;
+  var originId = project.id;
+  var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+    proj.script = text;
+    proj.scriptDraft = text;
+    proj.scriptApproved = false;
+    proj.scriptReviewState = "draft";
+    proj.currentStep = Math.max(proj.currentStep || 0, 1);
+    proj.emotionSegments = [];
+    proj.emotions = [];
+    proj.scriptAnalysis = null;
+    proj.assets = null;
+    proj.assetsApproved = false;
+    proj.shots = [];
+    proj.shotsApproved = false;
+  });
+  if (!isCurrent) return;
   var scriptOutput = $("scriptOutput");
   if (scriptOutput) scriptOutput.value = text;
   var resultCard = $("scriptResultCard");
-  if (resultCard) resultCard.hidden = false;
+  if (resultCard) {
+    resultCard.hidden = false;
+    _moveScriptResultToEnd();
+  }
   var displayText = $("scriptDisplayText");
   if (displayText) displayText.textContent = text;
-  await confirmScript();
+  showScriptDisplay();
+  refreshScriptImportDraft();
+  _syncScriptDraftMeta();
+  _showScriptConfirmArea();
+  _updateScriptInputPlaceholder();
+  renderEmotionSegments();
+  renderScriptAnalysis();
+  _scrollChatToBottom();
+  showToast("已使用导入内容作为剧本草稿，请确认后进入下一步", "success");
+}
+
+async function _convertImportedDraft() {
+  var textarea = $("scriptDraftPreview");
+  var text = String((textarea && textarea.value) || "").trim();
+  if (!text) { showToast("导入草稿为空", "warn"); return; }
+  if (_scriptGenerating) return;
+  var applyBtn = $("btnApplyImportedDraft");
+  var convertBtn = $("btnConvertImportedDraft");
+  var discardBtn = $("btnDiscardImportedDraft");
+  [applyBtn, convertBtn, discardBtn].forEach(function (btn) { if (btn) btn.disabled = true; });
+  var oldConvertHtml = convertBtn ? convertBtn.innerHTML : "";
+  if (convertBtn) convertBtn.innerHTML = '<span class="material-symbols-outlined">hourglass_top</span><span>转换中</span>';
+  try {
+    var card = $("scriptImportDraftCard");
+    if (card) card.hidden = true;
+    _syncScriptWelcomeVisibility();
+    await generateScript(text, {
+      fromSource: true,
+      userMessage: "将导入内容转换为新的剧本草稿",
+      sourceHint: false,
+    });
+  } finally {
+    if (convertBtn) convertBtn.innerHTML = oldConvertHtml;
+    [applyBtn, convertBtn, discardBtn].forEach(function (btn) { if (btn) btn.disabled = false; });
+    refreshScriptImportDraft();
+  }
 }
 
 function _discardImportedDraft() {
@@ -374,8 +440,6 @@ var _scriptImportEventsBound = false;
 export function initScriptImportEvents() {
   if (_scriptImportEventsBound) return;
   _scriptImportEventsBound = true;
-  var newBtn = $("btnNewScript");
-  if (newBtn) newBtn.addEventListener("click", function () { startNewScript(); });
   var uploadBtn = $("btnUploadScript");
   var fileInput = $("scriptFileInput");
   if (uploadBtn && fileInput) {
@@ -402,6 +466,8 @@ export function initScriptImportEvents() {
   }
   var applyBtn = $("btnApplyImportedDraft");
   if (applyBtn) applyBtn.addEventListener("click", function () { _applyImportedDraft(); });
+  var convertBtn = $("btnConvertImportedDraft");
+  if (convertBtn) convertBtn.addEventListener("click", function () { _convertImportedDraft(); });
   var discardBtn = $("btnDiscardImportedDraft");
   if (discardBtn) discardBtn.addEventListener("click", _discardImportedDraft);
   var analysisBtn = $("btnScriptAnalysisRegen");
@@ -413,6 +479,7 @@ export function showScriptDisplay() {
   var t = $("scriptOutput");
   if (d) d.classList.remove("hidden");
   if (t) t.classList.add("hidden");
+  _syncScriptDraftMeta();
   setScriptEditControls(false);
 }
 
@@ -422,6 +489,7 @@ export function showScriptEdit() {
   var t = $("scriptOutput");
   if (d) d.classList.add("hidden");
   if (t) { t.classList.remove("hidden"); t.focus(); }
+  _syncScriptDraftMeta();
   setScriptEditControls(true);
 }
 
@@ -430,14 +498,17 @@ function setScriptEditControls(editing) {
   var saveBtn = $("btnSaveScriptEdit");
   var cancelBtn = $("btnCancelScriptEdit");
   var confirmBtn = $("btnConfirmScript");
+  var inputWrap = $("scriptInputWrap");
+  var chipWrap = $("scriptExampleChips");
   if (editBtn) editBtn.hidden = !!editing;
   if (saveBtn) saveBtn.hidden = !editing;
   if (cancelBtn) cancelBtn.hidden = !editing;
+  if (inputWrap) inputWrap.hidden = !!editing;
+  if (chipWrap) chipWrap.hidden = !!editing;
   var lockTitle = "请先保存或取消剧本编辑";
   var lockedIds = [
     "btnConfirmScript",
     "btnExpandScript",
-    "btnNewScript",
     "btnUploadScript",
     "btnScriptHeaderRegen",
     "btnGenScript",
@@ -699,6 +770,163 @@ function _analysisPacing() {
   });
 }
 
+function _analysisProjectShots() {
+  var shots = project && Array.isArray(project.shots) ? project.shots : [];
+  return shots.filter(function (shot) { return shot && typeof shot === "object"; });
+}
+
+function _analysisShotDuration(shot) {
+  if (!shot) return 0;
+  var raw = shot.duration;
+  if (raw == null || raw === "") raw = shot.durationSec;
+  var n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function _analysisDefaultPhases() {
+  return [
+    { label: "开场建立", note: "建立空间、主角和第一眼钩子。" },
+    { label: "冲突递进", note: "用动作或对白把问题推到台前。" },
+    { label: "关键转折", note: "集中呈现反转、选择或信息揭示。" },
+    { label: "情绪落点", note: "让人物反应承接高潮后的变化。" },
+    { label: "收束余韵", note: "留出结尾记忆点或下一步悬念。" },
+  ];
+}
+
+function _analysisPhaseForShot(idx, total) {
+  var phases = _analysisDefaultPhases();
+  if (!total) return phases[0];
+  var phaseIdx = Math.min(phases.length - 1, Math.floor((idx / total) * phases.length));
+  return phases[phaseIdx];
+}
+
+function _analysisShotPhaseLabel(shot, idx, total) {
+  var emotion = shot && (shot.emotion || shot.phase || shot.storyPhase || "");
+  if (emotion && EMOTION_LABEL_CN[emotion]) return EMOTION_LABEL_CN[emotion];
+  if (emotion) return _analysisShortText(emotion, "", 12);
+  return _analysisPhaseForShot(idx, total).label;
+}
+
+function _analysisShotNote(shot, fallback) {
+  return _analysisShortText(
+    shot && (shot.keyInfo || shot.sceneName || shot.visual || shot.description || shot.scriptRef || shot.dialogue),
+    fallback || "镜头重点待细化",
+    58
+  );
+}
+
+function _analysisShotPoint(shot) {
+  if (!shot) return "";
+  var raw = shot.keyInfo || shot.sceneName || shot.scriptRef || shot.dialogue || shot.visual || shot.description || "";
+  raw = String(raw || "")
+    .replace(/^[^：:]{1,10}[：:]\s*/, "")
+    .replace(/[“”"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!raw || raw === "——") return "";
+  return _analysisShortText(raw, "", 16);
+}
+
+function _analysisStructureIntent(label, idx) {
+  var s = String(label || "");
+  if (/铺垫|开场|建立|setup/i.test(s)) return "建立空间与规则";
+  if (/升温|递进|rising/i.test(s)) return "加压冲突与期待";
+  if (/过渡|连接|转折/.test(s)) return "衔接关键变化";
+  if (/高潮|climax/i.test(s)) return "集中释放反转";
+  if (/回落|收束|余韵|falling|resolution/i.test(s)) return "承接结果与追问";
+  return ["建立观看入口", "推进事件压力", "承接关键变化", "放大核心看点", "收住情绪落点"][idx] || "补充段落功能";
+}
+
+function _analysisStructureNote(group, idx) {
+  var points = Array.isArray(group.points) ? group.points.slice(0, 3).filter(Boolean).join("、") : "";
+  var duration = group.durationSec ? ("约" + String(group.durationSec) + "s") : "";
+  var intent = _analysisStructureIntent(group.label, idx);
+  var lead = [duration, points].filter(Boolean).join(" · ");
+  if (lead) return _analysisShortText(lead + "；" + intent + "。", "", 72);
+  return _analysisShortText(group.note, intent + "。", 72);
+}
+
+function _analysisDistributeCount(total, bucketCount) {
+  var count = Math.max(1, Math.round(Number(total) || 1));
+  var buckets = Math.max(1, bucketCount || 1);
+  var base = Math.floor(count / buckets);
+  var rem = count % buckets;
+  var out = [];
+  for (var i = 0; i < buckets; i++) out.push(base + (i < rem ? 1 : 0));
+  return out;
+}
+
+function _analysisSuggestedShotCount(lines, stats) {
+  var duration = Number(stats && stats.estimatedDurationSec) || 0;
+  var dialogueCount = Number(stats && stats.dialogueLines) || 0;
+  var byDuration = duration ? Math.round(duration / 5) : 0;
+  var byDialogue = dialogueCount ? Math.ceil(dialogueCount / 2) : 0;
+  var byLines = lines && lines.length ? Math.ceil(lines.length / 3) : 0;
+  var raw = Math.max(byDuration, byDialogue, byLines, 8);
+  var max = duration > 90 ? 24 : 12;
+  return Math.max(6, Math.min(max, raw));
+}
+
+function _analysisActualShotStructure(shots) {
+  var groups = [];
+  var map = {};
+  var total = shots.length;
+  shots.forEach(function (shot, idx) {
+    var label = _analysisShotPhaseLabel(shot, idx, total);
+    var key = label || ("阶段 " + (groups.length + 1));
+    if (!map[key]) {
+      map[key] = { label: key, count: 0, note: "", points: [], durationSec: 0 };
+      groups.push(map[key]);
+    }
+    map[key].count += 1;
+    map[key].durationSec += _analysisShotDuration(shot);
+    var point = _analysisShotPoint(shot);
+    if (point && map[key].points.indexOf(point) === -1 && map[key].points.length < 3) {
+      map[key].points.push(point);
+    }
+    if (!map[key].note) map[key].note = _analysisShotNote(shot, _analysisPhaseForShot(idx, total).note);
+  });
+  return groups.slice(0, 5).map(function (group, idx) {
+    return {
+      label: group.label,
+      count: group.count,
+      durationSec: group.durationSec,
+      note: _analysisStructureNote(group, idx),
+    };
+  });
+}
+
+function _analysisEstimatedShotStructure(count, pacing) {
+  var base = Array.isArray(pacing) && pacing.length ? pacing.slice(0, 5) : _analysisDefaultPhases();
+  var counts = _analysisDistributeCount(count, base.length);
+  return base.map(function (seg, idx) {
+    var fallback = _analysisDefaultPhases()[idx] || _analysisDefaultPhases()[0];
+    return {
+      label: seg.label || fallback.label,
+      count: counts[idx] || 1,
+      note: _analysisShortText((seg.note || fallback.note) + "；" + _analysisStructureIntent(seg.label || fallback.label, idx) + "。", fallback.note, 72),
+    };
+  });
+}
+
+function _analysisShotOverview(lines, stats, pacing) {
+  var shots = _analysisProjectShots();
+  var hasActual = shots.length > 0;
+  var suggestedCount = _analysisSuggestedShotCount(lines, stats);
+  var totalDuration = 0;
+  if (hasActual) {
+    shots.forEach(function (shot) { totalDuration += _analysisShotDuration(shot); });
+  }
+  if (!totalDuration) totalDuration = Number(stats && stats.estimatedDurationSec) || 0;
+  return {
+    source: hasActual ? "镜头计划" : "剧本估算",
+    count: hasActual ? shots.length : suggestedCount,
+    metricLabel: hasActual ? "已生成" : "建议",
+    totalDurationSec: totalDuration,
+    structure: hasActual ? _analysisActualShotStructure(shots) : _analysisEstimatedShotStructure(suggestedCount, pacing),
+  };
+}
+
 function _analysisKeyBeats(lines) {
   var picked = lines.filter(function (line) {
     return /突然|发现|原来|最后|终于|反转|真相|危机|高潮|决定|必须/.test(line);
@@ -738,6 +966,7 @@ function _buildLocalScriptAnalysis() {
     sourceHash: _analysisSourceHash(text),
     generatedAt: null,
     stats: stats,
+    shotOverview: _analysisShotOverview(lines, stats, pacing),
     core: _analysisCore(lines, text),
     pacing: pacing,
     characters: _analysisCharacters(lines),
@@ -774,6 +1003,30 @@ function _renderAnalysisMetrics(stats) {
     '<div><strong>' + escapeHtml(String(stats.estimatedDurationSec || 0)) + 's</strong><span>预计</span></div>' +
     '<div><strong>' + escapeHtml(String(stats.dialogueLines || 0)) + '</strong><span>对白</span></div>' +
     '<div><strong>' + escapeHtml(String(stats.segmentCount || 0)) + '</strong><span>段落</span></div>' +
+  '</div>';
+}
+
+function _renderAnalysisShotOverview(overview) {
+  overview = overview || {};
+  var structure = Array.isArray(overview.structure) ? overview.structure : [];
+  var duration = Number(overview.totalDurationSec) || 0;
+  var rows = structure.length ? structure.map(function (seg) {
+    return '<div class="script-analysis-structure-row">' +
+      '<span class="script-analysis-structure-count">' + escapeHtml(String(seg.count || 0)) + '镜</span>' +
+      '<div class="script-analysis-structure-body">' +
+        '<strong>' + escapeHtml(seg.label || "阶段待定") + '</strong>' +
+        '<p>' + escapeHtml(seg.note || "镜头重点待细化") + '</p>' +
+      '</div>' +
+    '</div>';
+  }).join("") : '<p class="script-analysis-muted">镜头结构待生成，确认剧本后可进入镜头计划细化。</p>';
+  return '<div class="script-analysis-card script-analysis-card--shots">' +
+    _analysisModuleHead('videocam', '镜头结构', 'SHOTS', overview.source || '剧本估算') +
+    '<div class="script-analysis-summary-grid">' +
+      '<div><i class="material-symbols-outlined">track_changes</i><strong>' + escapeHtml(String(overview.count || 0)) + '</strong><span>' + escapeHtml(overview.metricLabel || "建议") + '镜头</span></div>' +
+      '<div><i class="material-symbols-outlined">schedule</i><strong>' + escapeHtml(duration ? String(duration) + "s" : "待定") + '</strong><span>计划时长</span></div>' +
+      '<div><i class="material-symbols-outlined">layers</i><strong>' + escapeHtml(String(structure.length || 0)) + '</strong><span>结构段</span></div>' +
+    '</div>' +
+    '<div class="script-analysis-structure">' + rows + '</div>' +
   '</div>';
 }
 
@@ -826,7 +1079,7 @@ function _renderAnalysisCharacters(chars) {
     body = '<p class="script-analysis-muted">暂未识别到明确角色，可在剧本中使用“角色名：台词”增强识别。</p>';
   }
   return '<div class="script-analysis-card">' +
-    _analysisModuleHead('groups', '人物驱动', 'CHARACTERS', '') +
+    _analysisModuleHead('groups', '角色定位', 'CHARACTERS', chars.length ? (String(chars.length) + ' 角色') : '') +
     body +
   '</div>';
 }
@@ -869,7 +1122,7 @@ export function renderScriptAnalysis() {
     el.innerHTML = '<div class="script-analysis-empty">' +
       '<span class="material-symbols-outlined">insights</span>' +
       '<h3>等待剧本草稿</h3>' +
-      '<p>生成或导入剧本后，这里会展示故事核心、节奏结构、人物驱动和关键看点。</p>' +
+      '<p>生成或导入剧本后，这里会优先展示镜头数量/结构、角色数量/定位，再补充故事核心和节奏看点。</p>' +
     '</div>';
     return;
   }
@@ -877,6 +1130,7 @@ export function renderScriptAnalysis() {
   var cached = _cachedScriptAnalysis(text);
   var analysis = cached || localAnalysis;
   analysis.stats = analysis.stats || localAnalysis.stats;
+  analysis.shotOverview = localAnalysis.shotOverview;
   analysis.core = analysis.core || localAnalysis.core;
   analysis.pacing = Array.isArray(analysis.pacing) ? analysis.pacing : localAnalysis.pacing;
   analysis.characters = Array.isArray(analysis.characters) ? analysis.characters : localAnalysis.characters;
@@ -885,9 +1139,10 @@ export function renderScriptAnalysis() {
   var staleHtml = _hasStaleScriptAnalysis(text) ? _renderAnalysisStaleBanner() : "";
   el.innerHTML =
     staleHtml +
+    _renderAnalysisShotOverview(analysis.shotOverview) +
+    _renderAnalysisCharacters(analysis.characters) +
     _renderAnalysisCore(analysis.core, analysis.stats) +
     _renderAnalysisPacing(analysis.pacing) +
-    _renderAnalysisCharacters(analysis.characters) +
     _renderAnalysisBeats(analysis.keyBeats) +
     _renderAnalysisNotes(analysis.notes);
 }
@@ -1205,6 +1460,7 @@ async function _consultConfirm() {
 		      proj.script = resp.script || "";
 		      proj.scriptDraft = resp.script || "";
 		      proj.scriptApproved = false;
+		      proj.scriptReviewState = "draft";
 	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
 	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
 	      proj.assets = null;
@@ -1217,6 +1473,7 @@ async function _consultConfirm() {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
 	      if (editArea) editArea.value = resp.script;
 	      refreshScriptImportDraft();
+	      _syncScriptDraftMeta();
 	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       _scrollChatToBottom();
@@ -1381,7 +1638,8 @@ export async function generateScript(idea, options) {
   $("btnGenScript").disabled = true;
   $("ideaInput").value = "";
   chatAutoResize($("ideaInput"));
-  var userMsgEl = chatAddMsg("user", escapeHtml(idea));
+  var userMessage = Object.prototype.hasOwnProperty.call(options, "userMessage") ? options.userMessage : idea;
+  var userMsgEl = options.skipUserBubble ? null : chatAddMsg("user", escapeHtml(userMessage));
 
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
@@ -1414,7 +1672,7 @@ export async function generateScript(idea, options) {
   var abortController = fromSource && typeof AbortController !== "undefined" ? new AbortController() : null;
   var sourceAbortToConsult = false;
   var sourceHintEl = null;
-  if (fromSource && userMsgEl) {
+  if (fromSource && userMsgEl && options.sourceHint !== false) {
     sourceHintEl = _appendSourceAdaptHint(userMsgEl, function () {
       sourceAbortToConsult = true;
       _removeSourceAdaptHint(sourceHintEl);
@@ -1445,6 +1703,7 @@ export async function generateScript(idea, options) {
 		      proj.script = resp.script || "";
 		      proj.scriptDraft = resp.script || "";
 		      proj.scriptApproved = false;
+		      proj.scriptReviewState = "draft";
 	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
 	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
       if (fromSource && resp.oneSentenceBrief) {
@@ -1461,6 +1720,7 @@ export async function generateScript(idea, options) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
 	      if (editArea) editArea.value = resp.script;
 	      refreshScriptImportDraft();
+	      _syncScriptDraftMeta();
 	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       _scrollChatToBottom();
@@ -1522,50 +1782,6 @@ function _updateScriptInputPlaceholder() {
     : '聊聊你想拍什么，AI 先陪你把需求聊清楚…';
 }
 
-export function startNewScript() {
-  if (_scriptGenerating) return;
-  _ctx.safeWriteBack(project ? project.id : null, function (proj) {
-    proj.script = "";
-    proj.scriptDraft = "";
-    proj.scriptApproved = false;
-    proj.styleBible = null;
-    proj.styleBibleStatus = "";
-    proj.styleBibleError = "";
-    proj.styleBibleGeneratedAt = null;
-    proj.styleBibleSourceHash = null;
-	    proj.styleBibleStaleReason = null;
-	    proj.styleBibleStaleSince = null;
-	    proj.styleBibleManuallyEditedAt = null;
-	    proj.styleBibleSource = null;
-	    proj.styleBibleRunId = null;
-	    proj.styleBibleStartedAt = null;
-	    proj.styleBibleGenerationContext = null;
-		    proj.styleOptions = { aspectRatio: "9:16", aspectRatioDefaultVersion: "2026-05-14-9x16" };
-	    proj.selectedWorldTemplateId = null;
-	    proj.worldTemplateSnapshot = null;
-	    proj.selectedStyleTemplateId = null;
-	    proj.styleTemplateSnapshot = null;
-    proj.scriptAnalysis = null;
-    proj.assets = null;
-    proj.assetsApproved = false;
-    proj.shots = [];
-    proj.shotsApproved = false;
-    proj.idea = "";
-    // 新一轮创作 → 咨询历史也清掉，避免下一轮看到上次的对话
-    proj.scriptConsult = emptyScriptConsultState();
-  });
-  var chatBox = $("chatMessages");
-  if (chatBox) {
-    var innerWrap = chatBox.querySelector(".max-w-2xl") || chatBox;
-    var msgs = innerWrap.querySelectorAll(".chat-msg:not(#scriptResultCard)");
-    msgs.forEach(function (m) { m.parentNode.removeChild(m); });
-    // 清 sentinel，下次 refreshScriptPage 会重新走回放判定
-    delete chatBox.dataset.consultVersion;
-  }
-  refreshScriptPage();
-  showToast("已新建空白剧本，开始你的创作", "success");
-}
-
 export async function extractStyleBible(options) {
   if (!project || !project.script) return;
   options = options || {};
@@ -1576,6 +1792,8 @@ export async function extractStyleBible(options) {
 	      styleOptions: options.styleOptions || null,
 	      styleTemplateSnapshot: options.styleTemplateSnapshot || project.styleTemplateSnapshot || null,
 	      worldTemplateSnapshot: options.worldTemplateSnapshot || project.worldTemplateSnapshot || null,
+	      selectedWorldTemplateId: project.selectedWorldTemplateId || null,
+	      selectedStyleTemplateId: project.selectedStyleTemplateId || null,
 	      creatorProfile: options.creatorProfile || (_ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null),
 	    };
     var httpResp = await fetch("/api/script/workflow/extract-style-bible", {
@@ -1625,6 +1843,7 @@ export async function confirmScript() {
   if (!project) { showToast("请先生成剧本", "warn"); return; }
   var originId = project.id;
   var oldScript = project.script;
+  var oldReviewState = project.scriptReviewState || "";
   var edited = ($("scriptOutput").value || "").trim();
   var finalScript = edited || project.script;
   if (!finalScript) { showToast("请先生成剧本", "warn"); return; }
@@ -1636,6 +1855,7 @@ export async function confirmScript() {
     proj.script = finalScript;
     proj.scriptDraft = finalScript;
     proj.scriptApproved = true;
+    proj.scriptReviewState = "approved";
     proj.currentStep = Math.max(proj.currentStep || 0, 2);
   });
   if (finalScript !== oldScript) {
@@ -1643,6 +1863,7 @@ export async function confirmScript() {
   }
   _ctx.saveProject && _ctx.saveProject();
   refreshScriptImportDraft();
+  _syncScriptDraftMeta();
 
   try {
     await apiPost("/api/script/workflow/confirm", {
@@ -1654,8 +1875,12 @@ export async function confirmScript() {
     }
   } catch (e) {
     // 后端拒绝（脚本空 / 项目不存在等）——回滚本地 scriptApproved
-    _ctx.safeWriteBack(originId, function (proj) { proj.scriptApproved = false; });
+    _ctx.safeWriteBack(originId, function (proj) {
+      proj.scriptApproved = false;
+      proj.scriptReviewState = oldReviewState || "draft";
+    });
     _ctx.saveProject && _ctx.saveProject();
+    _syncScriptDraftMeta();
     showToast("确认失败: " + ((e && e.message) || e).toString().slice(0, 120), "error");
     return;
   }
@@ -1972,6 +2197,7 @@ export async function reviseScript(instruction) {
 		      proj.script = resp.script || "";
 		      proj.scriptDraft = resp.script || "";
 		      proj.scriptApproved = false;
+		      proj.scriptReviewState = "draft";
 	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
 	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
 	    });
@@ -1980,6 +2206,7 @@ export async function reviseScript(instruction) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
 	      if (editArea) editArea.value = resp.script;
 	      refreshScriptImportDraft();
+	      _syncScriptDraftMeta();
 	      if (editBtn) editBtn.hidden = false;
       if (expandBtn) expandBtn.hidden = false;
       if (stepEl2) stepEl2.hidden = true;

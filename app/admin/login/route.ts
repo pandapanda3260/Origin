@@ -17,7 +17,7 @@ const LOGIN_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ORIGINRISE Admin Login</title>
+  <title>ORIGIN Admin Login</title>
   <style>
     body { margin:0; min-height:100vh; display:grid; place-items:center; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:#0d1117; color:#eef3f8; }
     main { width:min(420px, calc(100vw - 32px)); }
@@ -35,7 +35,7 @@ const LOGIN_HTML = `<!doctype html>
 </head>
 <body>
   <main>
-    <h1>ORIGINRISE Admin</h1>
+    <h1>ORIGIN Admin</h1>
     <p>独立后台入口。普通工作台账号不可登录这里。</p>
     <!--DEV_HINT-->
     <form id="loginForm">

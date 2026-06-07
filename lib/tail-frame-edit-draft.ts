@@ -11,6 +11,7 @@ import {
 import { computeTailFrameSourceHash, storyboardShotIndices } from './frame-workflow-state';
 import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 import { checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
+import { inferTailFrameDependencyForShots } from './tail-frame-dependency';
 
 const MAX_TAIL_FRAME_PROMPT_CHARS = 5000;
 const TAIL_FRAME_HISTORY_LIMIT = 30;
@@ -335,6 +336,7 @@ function buildTailFramePlanPreview(args: {
   groupIdx: number;
   ownerId: number;
   user: any;
+  explicitShotIndices?: any;
 }): {
   plan: FrameImageGenerationPlan | null;
   planSummary: FrameImagePlanSummary | null;
@@ -345,11 +347,18 @@ function buildTailFramePlanPreview(args: {
 } {
   const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
   const slot = storyboards[args.groupIdx] || {};
+  const hasExplicitShotBinding = Array.isArray(slot?.shotIndices) && slot.shotIndices.length > 0;
+  const explicitShotIndices = Array.isArray(args.explicitShotIndices) && args.explicitShotIndices.length
+    ? args.explicitShotIndices
+    : (hasExplicitShotBinding ? undefined : [args.groupIdx]);
   const shotIndices = storyboardShotIndices(args.project, args.groupIdx, slot, {
     mode: 'single-shot-strict',
-    explicitShotIndices: Array.isArray(slot?.shotIndices) && slot.shotIndices.length ? undefined : [args.groupIdx],
+    explicitShotIndices,
   });
-  const firstFramePreflight = checkTailFramePreflight(slot);
+  const shots = Array.isArray(args.project?.shots) ? args.project.shots : [];
+  const groupShots = shotIndices.map((idx) => shots[idx]).filter(Boolean);
+  const dependency = inferTailFrameDependencyForShots(groupShots, slot);
+  const firstFramePreflight = checkTailFramePreflight(slot, { dependency });
   if (firstFramePreflight) {
     return {
       plan: null,
@@ -366,8 +375,10 @@ function buildTailFramePlanPreview(args: {
     };
   }
   const firstFrameUrl = tailFrameFirstFrameUrl(slot);
-  const selfFirstFrameLocal = resolveLocalImagePath(firstFrameUrl, args.ownerId) || undefined;
-  if (!selfFirstFrameLocal) {
+  const selfFirstFrameLocal = dependency === 'requires_first_frame'
+    ? (resolveLocalImagePath(firstFrameUrl, args.ownerId) || undefined)
+    : undefined;
+  if (dependency === 'requires_first_frame' && !selfFirstFrameLocal) {
     return {
       plan: null,
       planSummary: null,
@@ -398,10 +409,12 @@ function buildTailFramePlanPreview(args: {
     ownerId: args.ownerId,
     frameType: 'tail_frame',
     modelSnapshot,
-    selfFirstFrame: {
-      remoteUrl: firstFrameUrl,
-      localPath: selfFirstFrameLocal,
-    },
+    selfFirstFrame: dependency === 'requires_first_frame' && firstFrameUrl
+      ? {
+        remoteUrl: firstFrameUrl,
+        localPath: selfFirstFrameLocal,
+      }
+      : undefined,
   });
   return {
     plan,
@@ -422,6 +435,7 @@ export function reconcileTailFramePromptStateInPatch(args: {
   user: any;
   groupIdx: number;
   now?: string;
+  explicitShotIndices?: any;
 }): TailFramePromptReconcileState {
   const storyboards = Array.isArray(args.project?.storyboards) ? args.project.storyboards : [];
   const slot = storyboards[args.groupIdx] || {};
@@ -457,6 +471,7 @@ export function reconcileTailFramePromptStateInPatch(args: {
     groupIdx: args.groupIdx,
     ownerId: args.user.id,
     user: args.user,
+    explicitShotIndices: args.explicitShotIndices,
   });
 
   if (preview.plan) {

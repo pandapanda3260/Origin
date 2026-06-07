@@ -3,8 +3,14 @@ import { resolveLLMConfig } from './llm';
 import { resolveTextModelConfig } from './model-routing';
 import { buildVideoPromptMessages } from './prompts';
 import { buildSeedancePromptParts, type VideoReferenceImage } from './video-prompt-runtime';
-import { ensureProjectConsistency, renderCharacterLockRosterLine } from './character-consistency';
-import { plannedDurationFromShots, resolveGenerationDurationSec } from './video-reference-manifest';
+import { buildCharacterLockRoster } from './frame-prompt-helpers';
+import {
+  buildReferenceBriefLine,
+  plannedDurationFromShots,
+  plannedTimelineGroupsFromProject,
+  plannedTimelineStartFromGroups,
+  resolveGenerationDurationSec,
+} from './video-reference-manifest';
 import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 import { buildVideoReferenceManifest } from './reference-matcher';
 import {
@@ -15,6 +21,8 @@ import {
   VIDEO_PROMPT_RETRY_TEMPERATURE,
 } from './video-prompt-attempts';
 import { dataPath } from './runtime-paths';
+import { normalizeVideoAspectRatio, resolveVideoAspectRatio } from './aspect-ratio';
+import { projectWorldContextForStage } from './world-template-context';
 
 type AuditOptions = {
   ratio?: string;
@@ -31,31 +39,6 @@ type AuditBlock = {
   description?: string;
   content: string;
 };
-
-function normalizeRatio(ratio?: string): { ratio: string; size: '1080x1920' | '1920x1080' | '1024x1024' } {
-  const r = (ratio || '').trim();
-  if (r === '16:9') return { ratio: '16:9', size: '1920x1080' };
-  if (r === '9:16') return { ratio: '9:16', size: '1080x1920' };
-  if (r === '1:1') return { ratio: '1:1', size: '1024x1024' };
-  if (r === '4:3' || r === '21:9') return { ratio: '16:9', size: '1920x1080' };
-  if (r === '3:4') return { ratio: '9:16', size: '1080x1920' };
-  return { ratio: '9:16', size: '1080x1920' };
-}
-
-function resolveAuditRatio(project: any, opts: AuditOptions): string {
-  const candidates = [
-    opts.ratio,
-    project?.styleOptions?.aspectRatio,
-    project?.styleBible?.aspectRatio,
-    project?.videoAspectRatio,
-    '9:16',
-  ];
-  for (const candidate of candidates) {
-    const value = String(candidate || '').trim();
-    if (['16:9', '9:16', '1:1', '21:9', '4:3', '3:4'].includes(value)) return value;
-  }
-  return '9:16';
-}
 
 function parseDialogue(raw: string): Array<{ speaker: string; text: string }> {
   if (!raw) return [];
@@ -153,6 +136,18 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
 
   const dialogueCharSum = cleanDialogueCharCount(dialoguePairs);
   const durationSec = plannedDurationFromShots(groupShots);
+  const shotPlan = shotIndices.map((si: number) => {
+    const shot = shots[si] || {};
+    const rawDuration = Number(shot.duration ?? shot.durationSec ?? 4);
+    return {
+      idx: si + 1,
+      durationSec: Number.isFinite(rawDuration) && rawDuration > 0 ? Math.round(rawDuration * 10) / 10 : 4,
+      pace: shot.pace || shot.narrativePace || 'normal',
+      shotType: shot.shotType || shot.framing || '',
+      camera: shot.camera || shot.movement || '',
+      visual: shot.visual || shot.description || '',
+    };
+  });
 
   const resolvedFirstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
   const sbImageUrl: string = resolvedFirstFrameUrl
@@ -184,7 +179,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     groupShotIndices: shotIndices,
     groupIdx,
     ownerId: user.id,
-    storyboardImageUrl: sbImageUrl || null,
+    storyboardImageUrl: resolvedFirstFrameUrl || null,
   });
   const manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
   const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
@@ -223,15 +218,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     .map((ref) => ref.assetName || ref.label)
     .filter(Boolean);
 
-  const characterLockRosterLines: string[] = [];
-  const projectWithConsistency = ensureProjectConsistency(project as any, { source: 'migration' });
-  const locks = Array.isArray(projectWithConsistency.consistency?.characters) ? projectWithConsistency.consistency.characters : [];
-  for (const lock of locks) {
-    const names = [lock.canonicalName, ...lock.aliases].filter(Boolean);
-    const mentioned = names.some((name) => charNames.has(name) || groupTextForProps.includes(name));
-    if (!mentioned) continue;
-    characterLockRosterLines.push(renderCharacterLockRosterLine(lock, 'zh'));
-  }
+  const characterLockRoster = buildCharacterLockRoster(project, charNames, 'zh', groupTextForProps);
 
   const firstShotIdxOf = (gi: number): number | null => {
     const item = storyboards[gi];
@@ -267,17 +254,22 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
       assetId: ref.assetId,
       assetName: ref.assetName,
       promptHint: ref.promptHint,
+      useFor: ref.useFor,
+      immutable: ref.immutable,
+      panelInfo: ref.panelInfo,
+      referenceBrief: ref.referenceBrief || buildReferenceBriefLine(ref, manifestInImageOrder),
       priority: ref.priority || ref.score,
     }));
 
   return {
     prompt,
     ratio,
-    durationSec,
-    projectId: project.id,
+	    durationSec,
+    shotPlan,
+	    projectId: project.id,
     groupIdx,
     dialoguePairs,
-    characterLockRoster: characterLockRosterLines.join('\n') || undefined,
+    characterLockRoster: characterLockRoster || undefined,
     prevTailSummary: prevTailSummary || undefined,
     nextHeadSummary: nextHeadSummary || undefined,
     referenceImagePath,
@@ -294,7 +286,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
       chosenSceneName: sceneItem?.assetName || sceneItem?.label || '',
       characterReferenceNames,
       propReferenceNames,
-      referenceImages: referenceImages.map((ref) => ({ role: ref.role, label: ref.label, promptHint: ref.promptHint })),
+      referenceImages: referenceImages.map((ref) => ({ role: ref.role, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief })),
     },
   };
 }
@@ -309,7 +301,7 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
     baseUrl: cfg.baseUrl,
     minDurationSec: cfg.minDurationSec,
   });
-  const { ratio: aspectRatio, size } = normalizeRatio(requestedRatio);
+  const { ratio: aspectRatio, size } = normalizeVideoAspectRatio(requestedRatio);
 
   const blocks: AuditBlock[] = [];
   const negativeNotes: AuditBlock[] = [
@@ -374,7 +366,7 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
           type: 'image_url',
           image_url: { url: '[base64 reference image omitted from audit view]' },
           role: 'reference_image',
-          auditReference: { role: ref.role, label: ref.label, promptHint: ref.promptHint },
+          auditReference: { role: ref.role, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief },
         });
       }
     } else if (seedancePrompt.hasAnyRef) {
@@ -398,7 +390,12 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
         independentReferenceImages: seedancePrompt.independentReferenceImages.map((ref) => ({
           role: ref.role,
           label: ref.label,
+          assetId: ref.assetId,
+          assetName: ref.assetName,
+          sourceUrl: ref.sourceUrl,
           promptHint: ref.promptHint,
+          panelInfo: ref.panelInfo,
+          referenceBrief: ref.referenceBrief,
         })),
       },
     };
@@ -430,16 +427,23 @@ export function buildVideoPromptAudit(user: UserRow, project: any, groupIdx: num
   if (!shotIndices.length) throw new Error(`片段 ${groupIdx + 1} 没有可审阅的镜头索引`);
 
   const groupShots = shotIndices.map((i: number) => shots[i]).filter(Boolean);
+  const timelineStartSec = plannedTimelineStartFromGroups(plannedTimelineGroupsFromProject(project), groupIdx);
   const promptMessages = buildVideoPromptMessages({
     shots: groupShots,
     styleBible: project.styleBible || {},
     assets: project.assets || {},
     narrations: Array.isArray(project.narrations) ? project.narrations : [],
-    groupIdx,
-    totalGroups: storyboards.length || 1,
-  });
+	    groupIdx,
+	    totalGroups: storyboards.length || 1,
+	    timelineStartSec,
+	    planMeta: project.planMeta || null,
+    worldContext: projectWorldContextForStage('video_prompt', project.worldTemplateSnapshot, {
+      project,
+      target: { groupIdx, shotIndices },
+    }),
+	  });
 
-  const ratio = resolveAuditRatio(project, opts);
+  const ratio = resolveVideoAspectRatio(project, opts.ratio);
   const videoInput = buildVideoInput(project, user, groupIdx, shotIndices, ratio);
   const providerAudit = buildProviderAudit(user, videoInput, ratio);
   const textCfg = resolveTextModelConfig(user, 'structured');

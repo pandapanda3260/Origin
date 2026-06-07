@@ -24,10 +24,7 @@ export function resolveStoryboardFirstFrameUrl(storyboard: any): string {
   return cleanUrl(
     storyboard?.firstFrame?.currentUrl ||
       storyboard?.frames?.first?.url ||
-      storyboard?.firstFrameUrl ||
-      storyboard?.url ||
-      storyboard?.imageUrl ||
-      storyboard?.rawUrl,
+      storyboard?.firstFrameUrl,
   );
 }
 
@@ -225,7 +222,11 @@ export type TailFramePreflightError = {
  * 要求首帧是彩色视频首帧 (structured_v1 / multi_ref_v1) 或 frames.first.status='ready',
  * 显式排除 legacy_pencil 手稿图, 避免尾帧以手稿为锚点失去意义。
  */
-export function checkTailFramePreflight(storyboard: any): TailFramePreflightError | null {
+export function checkTailFramePreflight(
+  storyboard: any,
+  opts?: { dependency?: 'requires_first_frame' | 'independent' },
+): TailFramePreflightError | null {
+  if (opts?.dependency === 'independent') return null;
   const sb = storyboard || {};
   const firstFrameUrl: string =
     cleanUrl(sb.firstFrameUrl) ||

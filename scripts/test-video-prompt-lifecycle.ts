@@ -3,11 +3,12 @@ import {
   buildVideoPromptBackupBackfillPatch,
   buildVideoPromptSnapshot,
   computeVideoPromptSourceHash,
+  computeVideoPromptSourceSnapshot,
   currentDisplayVideoPrompt,
   videoPromptDraftFingerprint,
 } from '../lib/video-prompt-lifecycle';
 
-function fixtureProject() {
+function fixtureProject(): any {
   return {
     id: 'proj_test',
     styleBible: { visualStyle: '电影感', castingProfile: { ethnicityType: 'han_chinese' } },
@@ -15,11 +16,17 @@ function fixtureProject() {
       characters: [{ id: 'char_1', name: '老板', appearance: '黑西装', imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000001?sig=abc' }],
       scenes: [{ id: 'scene_1', name: '办公室', imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000002?sig=abc' }],
       props: [{ id: 'prop_1', name: '合同', imageUrl: '/api/images/file/00000000-0000-0000-0000-000000000003?sig=abc' }],
-    },
-    shots: [{
-      idx: 1,
-      shotType: '中景',
-      camera: '缓慢推进',
+	    },
+	    planMeta: { version: 4, shotCount: 1, plannedDurationSec: 5 },
+	    shots: [{
+	      idx: 1,
+	      shotType: '中景',
+	      angle: '平视',
+	      lens: '标准50',
+	      focus: '中等景深',
+	      light: '侧光·柔光·中性·低反差',
+	      composition: '三分法',
+	      camera: '缓慢推进',
       visual: '老板站在办公室里看合同',
       dialogue: '老板：明天翻倍。',
       durationSec: 5,
@@ -57,6 +64,41 @@ const projectC = fixtureProject();
 projectC.shots[0].dialogue = '老板：目标翻三倍。';
 const hashC = computeVideoPromptSourceHash({ project: projectC, groupIdx: 0, ownerId: 1 });
 assert.notEqual(hashA, hashC, 'shot dialogue change should affect source hash');
+
+const projectD = fixtureProject();
+projectD.shots[0].angle = '俯拍';
+const hashD = computeVideoPromptSourceHash({ project: projectD, groupIdx: 0, ownerId: 1 });
+assert.notEqual(hashA, hashD, 'shot angle change should affect source hash');
+
+const projectE = fixtureProject();
+projectE.planMeta.plannedDurationSec = 6;
+const hashE = computeVideoPromptSourceHash({ project: projectE, groupIdx: 0, ownerId: 1 });
+assert.notEqual(hashA, hashE, 'top-level planMeta change should affect source hash');
+
+const projectF = fixtureProject();
+const sketchOnlySbF = projectF.storyboards[0] as any;
+sketchOnlySbF.frames = {};
+sketchOnlySbF.url = '/api/images/file/00000000-0000-0000-0000-000000000020?sig=abc';
+sketchOnlySbF.imageUrl = sketchOnlySbF.url;
+sketchOnlySbF.rawUrl = sketchOnlySbF.url;
+const sketchOnlySnapshot = computeVideoPromptSourceSnapshot({ project: projectF, groupIdx: 0, ownerId: 1 });
+assert.equal(sketchOnlySnapshot.firstFrame.url, '', 'generic storyboard image must not enter firstFrame.url');
+assert.equal(
+  sketchOnlySnapshot.referenceManifest.some((ref: any) => ref.role === 'first_frame'),
+  false,
+  'generic storyboard image must not enter reference manifest as first_frame',
+);
+const projectG = fixtureProject();
+const sketchOnlySbG = projectG.storyboards[0] as any;
+sketchOnlySbG.frames = {};
+sketchOnlySbG.url = '/api/images/file/00000000-0000-0000-0000-000000000021?sig=other';
+sketchOnlySbG.imageUrl = sketchOnlySbG.url;
+sketchOnlySbG.rawUrl = sketchOnlySbG.url;
+assert.equal(
+  computeVideoPromptSourceHash({ project: projectF, groupIdx: 0, ownerId: 1 }),
+  computeVideoPromptSourceHash({ project: projectG, groupIdx: 0, ownerId: 1 }),
+  'generic storyboard image URL changes should not affect video prompt source hash',
+);
 
 assert.equal(
   currentDisplayVideoPrompt({

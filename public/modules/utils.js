@@ -20,15 +20,134 @@ export function getAuthHeaders() {
   return h;
 }
 
-export function checkAuth(resp) {
-  if (resp.status === 401) {
-    try {
-      localStorage.removeItem('sw_auth_token');
-      localStorage.removeItem('sw_auth_user');
-    } catch (_e) {}
-    window.location.href = '/?auth=1';
-    throw new Error('认证已过期，请重新登录');
+let _sessionUser = null;
+let _sessionCheckPromise = null;
+let _sessionRedirecting = false;
+const DEFAULT_SESSION_CHECK_TIMEOUT_MS = 5_000;
+
+function _readStoredAuthUser() {
+  try {
+    const raw = localStorage.getItem('sw_auth_user') || '';
+    if (!raw) return null;
+    const user = JSON.parse(raw);
+    return user && typeof user === 'object' ? user : null;
+  } catch (_e) {
+    return null;
   }
+}
+
+function _writeStoredAuthUser(user) {
+  if (!user || typeof user !== 'object') return;
+  try { localStorage.setItem('sw_auth_user', JSON.stringify(user)); } catch (_e) {}
+}
+
+function _clearStoredSession() {
+  _sessionUser = null;
+  try {
+    localStorage.removeItem('sw_auth_token');
+    localStorage.removeItem('sw_auth_user');
+  } catch (_e) {}
+}
+
+function _redirectToAuth() {
+  if (_sessionRedirecting) return;
+  _sessionRedirecting = true;
+  try { window.location.href = '/?auth=1'; } catch (_e) {}
+}
+
+function _authOnlyHeaders() {
+  const h = {};
+  const t = getAuthToken();
+  if (t) h['Authorization'] = 'Bearer ' + t;
+  return h;
+}
+
+async function _fetchMeBare(timeoutMs) {
+  timeoutMs = _timeoutMs(timeoutMs, DEFAULT_SESSION_CHECK_TIMEOUT_MS);
+  const fetchOptions = { headers: _authOnlyHeaders(), cache: 'no-store' };
+  if (timeoutMs <= 0 || typeof AbortController !== 'function') {
+    return fetch('/api/auth/me', fetchOptions);
+  }
+  const ctl = new AbortController();
+  const timer = setTimeout(function () {
+    try { ctl.abort(); } catch (_e) {}
+  }, timeoutMs);
+  try {
+    return await fetch('/api/auth/me', Object.assign({}, fetchOptions, { signal: ctl.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function getSessionUser() {
+  return _sessionUser;
+}
+
+export function getCachedAuthUser() {
+  return _sessionUser || _readStoredAuthUser();
+}
+
+export async function ensureSession(options) {
+  options = options || {};
+  const token = getAuthToken();
+  const redirectOnInvalid = options.redirectOnInvalid !== false;
+  if (!token) {
+    _clearStoredSession();
+    if (redirectOnInvalid) _redirectToAuth();
+    return { status: 'invalid', user: null, reason: 'missing_token' };
+  }
+  if (!options.force && _sessionUser) {
+    return { status: 'valid', user: _sessionUser };
+  }
+
+  if (!_sessionCheckPromise) {
+    _sessionCheckPromise = (async function () {
+      let resp = null;
+      try {
+        resp = await _fetchMeBare(options.timeoutMs);
+      } catch (e) {
+        return {
+          status: 'unknown',
+          user: _sessionUser || _readStoredAuthUser(),
+          reason: e && e.name === 'AbortError' ? 'timeout' : 'network_error',
+        };
+      }
+
+      if (resp.status === 401 || resp.status === 403) {
+        return { status: 'invalid', user: null, reason: 'unauthorized' };
+      }
+      if (!resp.ok) {
+        return { status: 'unknown', user: _sessionUser || _readStoredAuthUser(), reason: 'server_error', statusCode: resp.status };
+      }
+
+      const data = await resp.json().catch(function () { return null; });
+      if (!data || !data.id) {
+        return { status: 'unknown', user: _sessionUser || _readStoredAuthUser(), reason: 'invalid_payload' };
+      }
+      _sessionUser = data;
+      _writeStoredAuthUser(data);
+      return { status: 'valid', user: data };
+    })().finally(function () {
+      _sessionCheckPromise = null;
+    });
+  }
+
+  const result = await _sessionCheckPromise;
+  if (result && result.status === 'invalid') {
+    _clearStoredSession();
+    if (redirectOnInvalid) _redirectToAuth();
+  }
+  return result;
+}
+
+function _triggerSessionRecheck() {
+  ensureSession({ force: true, redirectOnInvalid: true }).catch(function (err) {
+    try { console.warn('[auth] session recheck failed:', err); } catch (_e) {}
+  });
+}
+
+export function checkAuth(resp) {
+  if (resp && resp.status === 401) _triggerSessionRecheck();
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────
@@ -133,6 +252,7 @@ export async function apiPost(path, body, method, options) {
   );
   checkAuth(resp);
   const data = await _safeJson(resp);
+  if (!resp.ok) throw new ApiError(data.detail || data.error || '请求失败', resp.status, data);
   if (data.error) throw new ApiError(data.error, resp.status, data);
   return data;
 }
@@ -146,8 +266,118 @@ export async function apiGet(path, options) {
   );
   checkAuth(resp);
   const data = await _safeJson(resp);
+  if (!resp.ok) throw new ApiError(data.detail || data.error || '请求失败', resp.status, data);
   if (data.error) throw new ApiError(data.error, resp.status, data);
   return data;
+}
+
+function _hasHeader(headers, name) {
+  name = String(name || '').toLowerCase();
+  return Object.keys(headers || {}).some(function (key) { return key.toLowerCase() === name; });
+}
+
+function _isFormDataBody(body) {
+  return typeof FormData !== 'undefined' && body instanceof FormData;
+}
+
+function _isBlobBody(body) {
+  return typeof Blob !== 'undefined' && body instanceof Blob;
+}
+
+function _isRawBody(body) {
+  return body == null ||
+    typeof body === 'string' ||
+    _isFormDataBody(body) ||
+    _isBlobBody(body) ||
+    (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer);
+}
+
+function _requestHeaders(body, options) {
+  options = options || {};
+  const headers = {};
+  if (options.auth !== false) {
+    const token = getAuthToken();
+    if (token) headers.Authorization = 'Bearer ' + token;
+  }
+  Object.assign(headers, options.headers || {});
+  if (options.json !== false && body != null && !_isFormDataBody(body) && !_isBlobBody(body) && !_hasHeader(headers, 'Content-Type')) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return headers;
+}
+
+function _requestBody(body, options) {
+  options = options || {};
+  if (body == null || options.json === false || _isRawBody(body)) return body;
+  return JSON.stringify(body);
+}
+
+function _payloadFromErrorText(text, status) {
+  text = String(text || '');
+  try { return JSON.parse(text); } catch (_e) {
+    if (text.trim().charAt(0) === '<') return { detail: _diagnoseHttpHtml(status) };
+    return { detail: text.trim() || ('请求失败 (' + status + ')') };
+  }
+}
+
+async function _throwApiErrorFromResponse(resp) {
+  const text = await resp.text().catch(function () { return ''; });
+  const payload = _payloadFromErrorText(text, resp.status);
+  throw new ApiError(payload.detail || payload.error || '请求失败', resp.status, payload);
+}
+
+export async function apiRequest(path, options) {
+  options = options || {};
+  const method = options.method || (options.body == null ? 'GET' : 'POST');
+  const responseType = options.responseType || 'json';
+  const body = _requestBody(options.body, options);
+  const resp = await _fetchWithTimeout(
+    path,
+    {
+      method,
+      headers: _requestHeaders(options.body, options),
+      body,
+      cache: options.cache,
+      signal: options.signal,
+    },
+    options.timeoutMs,
+  );
+  checkAuth(resp);
+
+  if (responseType === 'response') {
+    if (!resp.ok) await _throwApiErrorFromResponse(resp);
+    return resp;
+  }
+  if (responseType === 'blob') {
+    if (!resp.ok) await _throwApiErrorFromResponse(resp);
+    return await resp.blob();
+  }
+  if (responseType === 'text') {
+    const text = await resp.text();
+    if (!resp.ok) {
+      const payload = _payloadFromErrorText(text, resp.status);
+      throw new ApiError(payload.detail || payload.error || '请求失败', resp.status, payload);
+    }
+    return text;
+  }
+
+  const data = await _safeJson(resp);
+  if (!resp.ok) throw new ApiError(data.detail || data.error || '请求失败', resp.status, data);
+  if (data.error) throw new ApiError(data.error, resp.status, data);
+  return data;
+}
+
+export async function apiUpload(path, formData, options) {
+  options = options || {};
+  return await apiRequest(path, {
+    method: options.method || 'POST',
+    body: formData,
+    headers: options.headers,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    responseType: options.responseType || 'json',
+    json: false,
+  });
 }
 
 const _ACTIVE_BATCH_SHARED_TTL_MS = 5000;
@@ -289,8 +519,10 @@ export async function apiPostStream(path, body, onChunk, onEvent, options) {
 
 const _assetUrlCache = new Map();
 const _videoUrlCache = new Map();
+const _uploadUrlCache = new Map();
 const _INTERNAL_IMAGE_RE = /\/api\/images\/file\/([0-9a-fA-F-]{36})/;
 const _INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
+const _INTERNAL_UPLOAD_RE = /\/api\/edit\/media\/([0-9a-fA-F-]{36})/;
 const _protectedImageBlobCache = new Map();
 const _protectedImageBlobPendingCache = new Map();
 const _IMAGE_PERF_ENDPOINT = '/api/telemetry/image-perf';
@@ -454,6 +686,45 @@ export async function fetchVideoSignedUrl(videoUrl, ttl) {
   var ttlSec = Math.max(60, Math.min(parseInt((data && data.ttl) || ttl, 10) || 3600, 7 * 24 * 3600));
   if (url) _videoUrlCache.set(videoId, { url: url, expiresAt: now + Math.max(30000, (ttlSec - 30) * 1000) });
   return url || videoUrl;
+}
+
+// 上传素材版的签名直链获取，对等 fetchVideoSignedUrl，命中 /api/edit/media/<id>。
+// 上传素材 <video>/<img> 带不了 Bearer，需要换成带 exp/sig 的签名 URL。
+export async function fetchUploadSignedUrl(mediaUrl, ttl) {
+  mediaUrl = String(mediaUrl || '').trim();
+  ttl = ttl || 3600;
+  if (!mediaUrl) return '';
+  var m = _INTERNAL_UPLOAD_RE.exec(mediaUrl);
+  if (!m) return mediaUrl;
+  if (_signedUrlStillValid(mediaUrl)) return mediaUrl;
+
+  var mediaId = m[1];
+  var now = Date.now();
+  var cached = _uploadUrlCache.get(mediaId);
+  if (cached && cached.url && cached.expiresAt > now + 5000) return cached.url;
+
+  var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+  var timer = null;
+  if (ctl) {
+    timer = setTimeout(function () { try { ctl.abort(); } catch (_) {} }, 8000);
+  }
+  var data = null;
+  try {
+    var resp = await fetch(
+      '/api/edit/media/' + encodeURIComponent(mediaId) + '/url?ttl=' + encodeURIComponent(String(ttl)),
+      { headers: getAuthHeaders(), signal: ctl ? ctl.signal : undefined },
+    );
+    checkAuth(resp);
+    data = await _safeJson(resp);
+  } catch (_e) {
+    return mediaUrl;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  var url = data && data.url ? data.url : '';
+  var ttlSec = Math.max(60, Math.min(parseInt((data && data.ttl) || ttl, 10) || 3600, 7 * 24 * 3600));
+  if (url) _uploadUrlCache.set(mediaId, { url: url, expiresAt: now + Math.max(30000, (ttlSec - 30) * 1000) });
+  return url || mediaUrl;
 }
 
 function _initImagePerfTelemetry() {
@@ -742,9 +1013,12 @@ function _isProtectedImageUrl(url) {
   if (!url) return false;
   try {
     var u = new URL(url, window.location.origin);
-    return u.origin === window.location.origin && u.pathname.indexOf('/api/images/file/') === 0;
+    if (u.origin !== window.location.origin) return false;
+    // /api/images/file/ 与 /api/edit/media/ 都是需要 Bearer 鉴权的接口，
+    // 普通 <img> 带不了 token，必须走带 token 的 fetch→blob 流程才能显示。
+    return u.pathname.indexOf('/api/images/file/') === 0 || u.pathname.indexOf('/api/edit/media/') === 0;
   } catch (_e) {
-    return url.indexOf('/api/images/file/') === 0;
+    return url.indexOf('/api/images/file/') === 0 || url.indexOf('/api/edit/media/') === 0;
   }
 }
 
@@ -994,6 +1268,93 @@ export function showConfirm(title, message, arg3, arg4) {
     overlay.querySelector('.qd-confirm-ok').onclick = finishOk;
     overlay.addEventListener('click', (e) => { if (e.target === overlay) finishCancel(); });
     document.body.appendChild(overlay);
+  });
+}
+
+// 带输入框的对话框，用来替代原生 prompt()。返回 Promise<string|null>。
+// 选项：
+//   title / message / defaultValue / placeholder / okText / cancelText / icon
+//   showClose       —— 是否显示右上角 X（默认 true）
+//   hideCancel      —— 是否隐藏底部「取消」按钮（默认 false）
+//   commitOnDismiss —— 点 X / 点遮罩 / 按 Esc 时，是否当作确认（resolve 当前输入值）
+//                      而不是取消（resolve null）。默认 false，保持原生 prompt 语义。
+// 样式全部走 styles.css 里的 .qd-prompt-* 组件类，不依赖会被 purge 的 Tailwind 工具类。
+export function showPrompt(opts) {
+  opts = opts || {};
+  const title = opts.title || '请输入';
+  const message = opts.message != null ? String(opts.message) : '';
+  const defaultValue = opts.defaultValue != null ? String(opts.defaultValue) : '';
+  const placeholder = opts.placeholder != null ? String(opts.placeholder) : '';
+  const okText = opts.okText || '好';
+  const cancelText = opts.cancelText || '取消';
+  const icon = opts.icon || 'edit';
+  const showClose = opts.showClose !== false;
+  const hideCancel = !!opts.hideCancel;
+  const commitOnDismiss = !!opts.commitOnDismiss;
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'qd-prompt-overlay';
+    overlay.innerHTML =
+      '<div class="qd-prompt-card" role="dialog" aria-modal="true">' +
+        (showClose ? '<button type="button" class="qd-prompt-close" aria-label="关闭"><span class="material-symbols-outlined">close</span></button>' : '') +
+        '<div class="qd-prompt-body">' +
+          '<div class="qd-prompt-head">' +
+            '<div class="qd-prompt-icon"><span class="material-symbols-outlined">' + escapeHtml(icon) + '</span></div>' +
+            '<div class="qd-prompt-head-text">' +
+              '<div class="qd-prompt-title">' + escapeHtml(title) + '</div>' +
+              (message ? '<div class="qd-prompt-msg">' + escapeHtml(message) + '</div>' : '') +
+            '</div>' +
+          '</div>' +
+          '<input type="text" class="qd-prompt-input" />' +
+        '</div>' +
+        '<div class="qd-prompt-foot">' +
+          (hideCancel ? '' : '<button type="button" class="qd-prompt-btn qd-prompt-btn--cancel">' + escapeHtml(cancelText) + '</button>') +
+          '<button type="button" class="qd-prompt-btn qd-prompt-btn--ok">' + escapeHtml(okText) + '</button>' +
+        '</div>' +
+      '</div>';
+
+    const input = overlay.querySelector('.qd-prompt-input');
+    if (placeholder) input.setAttribute('placeholder', placeholder);
+    input.value = defaultValue;
+
+    let settled = false;
+    const blockScroll = (e) => { e.preventDefault(); };
+    const close = () => {
+      overlay.removeEventListener('wheel', blockScroll);
+      overlay.removeEventListener('touchmove', blockScroll);
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    };
+    const finishOk = () => {
+      if (settled) return; settled = true;
+      const val = input.value;
+      close();
+      resolve(val);
+    };
+    const finishCancel = () => {
+      if (settled) return; settled = true;
+      close();
+      resolve(null);
+    };
+    // 「关闭」类操作（X / 点遮罩 / Esc）：commitOnDismiss 为真时按确认处理，否则按取消。
+    const finishDismiss = () => { commitOnDismiss ? finishOk() : finishCancel(); };
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finishOk(); }
+      else if (e.key === 'Escape') { e.preventDefault(); finishDismiss(); }
+    });
+    const closeBtn = overlay.querySelector('.qd-prompt-close');
+    if (closeBtn) closeBtn.onclick = finishDismiss;
+    const cancelBtn = overlay.querySelector('.qd-prompt-btn--cancel');
+    if (cancelBtn) cancelBtn.onclick = finishCancel;
+    overlay.querySelector('.qd-prompt-btn--ok').onclick = finishOk;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finishDismiss(); });
+    // 弹窗打开时锁住背景滚动，避免页面在弹窗后面滑动。
+    overlay.addEventListener('wheel', blockScroll, { passive: false });
+    overlay.addEventListener('touchmove', blockScroll, { passive: false });
+
+    document.body.appendChild(overlay);
+    setTimeout(() => { input.focus(); input.select(); }, 30);
   });
 }
 

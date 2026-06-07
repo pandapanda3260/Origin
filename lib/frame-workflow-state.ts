@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolveLocalImagePath } from './image-gen';
+import { planSegments } from './segment-planning';
+import { isMultiShotSegmentEnabled } from './feature-flags';
+import { computeWorldHash } from './project-dependency-state';
+import { inferTailFrameDependencyForShots } from './tail-frame-dependency';
 
 export const FRAME_WORKFLOW_SCHEMA_VERSION = 3;
 export type TailFrameIntent = 'none' | 'requested';
@@ -54,10 +58,25 @@ function makeEmptyStoryboardSlot(idx: number): any {
   };
 }
 
+function makeStoryboardSlotForGroup(groupIdx: number, shotIndices: number[]): any {
+  const indices = shotIndices.slice();
+  return {
+    idx: groupIdx,
+    shotIdx: (indices[0] ?? groupIdx) + 1,
+    shotIndices: indices,
+  };
+}
+
 export function makeSingleShotStoryboardSlots(shotsOrProject: any): any[] {
   const shots = Array.isArray(shotsOrProject?.shots)
     ? shotsOrProject.shots
     : (Array.isArray(shotsOrProject) ? shotsOrProject : []);
+  // flag OFF：维持 1:1（与历史完全一致）；flag ON：按时长把相邻短镜头合并成段。
+  // 注意：本函数 flag ON 后会产出 storyboards.length < shots.length，需配合 P2c 放开对齐不变量。
+  if (isMultiShotSegmentEnabled()) {
+    const segments = planSegments(shots);
+    return segments.map((shotIndices, gIdx) => makeStoryboardSlotForGroup(gIdx, shotIndices));
+  }
   return shots.map((_: any, idx: number) => makeEmptyStoryboardSlot(idx));
 }
 
@@ -68,9 +87,47 @@ function isDevAlignmentAssertEnabled(): boolean {
   return process.env.NODE_ENV !== 'production';
 }
 
+function assertGroupsCoverAllShotsOnce(storyboards: any[], shots: any[], context: string): void {
+  const n = shots.length;
+  const seen: boolean[] = new Array(n).fill(false);
+  let expectedNext = 0;
+  for (let g = 0; g < storyboards.length; g += 1) {
+    const sb = storyboards[g];
+    if (!sb || typeof sb !== 'object') {
+      throw new Error(`[frame-workflow] ${context}: storyboards[${g}] is missing`);
+    }
+    const indices = Array.isArray(sb.shotIndices) ? sb.shotIndices : [];
+    if (!indices.length) {
+      throw new Error(`[frame-workflow] ${context}: storyboards[${g}].shotIndices 为空`);
+    }
+    for (let k = 0; k < indices.length; k += 1) {
+      const shotIdx = Number(indices[k]);
+      if (!Number.isInteger(shotIdx) || shotIdx < 0 || shotIdx >= n) {
+        throw new Error(`[frame-workflow] ${context}: storyboards[${g}].shotIndices 含越界下标 ${shotIdx}`);
+      }
+      if (shotIdx !== expectedNext) {
+        throw new Error(`[frame-workflow] ${context}: storyboards[${g}].shotIndices 必须按镜头顺序连续覆盖（期望 ${expectedNext}，得 ${shotIdx}）`);
+      }
+      if (seen[shotIdx]) {
+        throw new Error(`[frame-workflow] ${context}: 镜头 ${shotIdx} 被多个段重复绑定`);
+      }
+      seen[shotIdx] = true;
+      expectedNext += 1;
+    }
+  }
+  if (expectedNext !== n) {
+    throw new Error(`[frame-workflow] ${context}: 段未覆盖全部镜头（覆盖到 ${expectedNext}，共 ${n}）`);
+  }
+}
+
 export function assertStoryboardsAlignedWithShots(project: any, context = 'project'): void {
   const shots = Array.isArray(project?.shots) ? project.shots : [];
   const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  // flag ON：storyboards 是"段"，不再与 shots 1:1；改校验"段按序、无重叠、覆盖全部镜头"。
+  if (isMultiShotSegmentEnabled()) {
+    assertGroupsCoverAllShotsOnce(storyboards, shots, context);
+    return;
+  }
   if (storyboards.length !== shots.length) {
     throw new Error(`[frame-workflow] ${context}: storyboards.length=${storyboards.length} does not match shots.length=${shots.length}`);
   }
@@ -152,6 +209,13 @@ export function storyboardShotIndices(
   const raw = explicit || fromStoryboard;
   const out = normalizedShotIndices(raw, shots.length);
   if (opts.mode === 'single-shot-strict') {
+    // flag ON：段绑定的是一个镜头运行段（≥1），不再强制单镜头 / [groupIdx]。
+    if (isMultiShotSegmentEnabled()) {
+      if (!out.length) {
+        throw new Error(`[frame-workflow] storyboards[${groupIdx}] 绑定的镜头下标无效`);
+      }
+      return out;
+    }
     if (!raw || raw.length !== 1 || out.length !== 1) {
       throw new Error(`[frame-workflow] storyboards[${groupIdx}] must bind exactly one valid shot`);
     }
@@ -163,7 +227,7 @@ export function storyboardShotIndices(
   return out.length ? out : [groupIdx].filter((v) => v >= 0 && v < shots.length);
 }
 
-function computeFirstFrameSourceHashForShotIndices(project: any, shotIndices: number[]): string | null {
+export function computeFirstFrameSourceHashForShotIndices(project: any, shotIndices: number[]): string | null {
   const shots = shotIndices.map((idx) => project?.shots?.[idx]).filter(Boolean);
   if (!shotIndices.length || !shots.length) return null;
   return hashValue({
@@ -171,24 +235,30 @@ function computeFirstFrameSourceHashForShotIndices(project: any, shotIndices: nu
     shotIndices,
     shots,
     styleBible: project?.styleBible || {},
+    worldHash: computeWorldHash(project),
   });
 }
 
-function computeTailFrameSourceHashForShotIndices(project: any, userId: number, storyboard: any, shotIndices: number[]): string | null {
+export function computeTailFrameSourceHashForShotIndices(project: any, userId: number, storyboard: any, shotIndices: number[]): string | null {
+  const shots = shotIndices.map((idx) => project?.shots?.[idx]).filter(Boolean);
+  if (!shotIndices.length || !shots.length) return null;
+  const dependency = inferTailFrameDependencyForShots(shots, storyboard);
   const firstFrameUrl =
     cleanUrl(storyboard?.firstFrameUrl) ||
     cleanUrl(storyboard?.frames?.first?.url) ||
     cleanUrl(storyboard?.firstFrame?.currentUrl);
-  const firstFrameContentHash = imageContentHashForUrl(firstFrameUrl, userId);
-  if (!firstFrameContentHash) return null;
-  const shots = shotIndices.map((idx) => project?.shots?.[idx]).filter(Boolean);
-  if (!shotIndices.length || !shots.length) return null;
+  const firstFrameContentHash = dependency === 'requires_first_frame'
+    ? imageContentHashForUrl(firstFrameUrl, userId)
+    : null;
+  if (dependency === 'requires_first_frame' && !firstFrameContentHash) return null;
   return hashValue({
     frameType: 'tail_frame',
+    dependency,
     firstFrameContentHash,
     shotIndices,
     shots,
     styleBible: project?.styleBible || {},
+    worldHash: computeWorldHash(project),
   });
 }
 
@@ -227,9 +297,14 @@ function validIntent(value: any): TailFrameIntent | null {
   return value === 'requested' || value === 'none' ? value : null;
 }
 
-function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, idx: number): any {
+function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, idx: number, overrideShotIndices?: number[]): any {
   const sb = storyboard && typeof storyboard === 'object' ? storyboard : {};
-  const shotIndices = [idx];
+  const shotsLength = Array.isArray(project?.shots) ? project.shots.length : 0;
+  const overrideIndices = Array.isArray(overrideShotIndices)
+    ? normalizedShotIndices(overrideShotIndices, shotsLength)
+    : [];
+  const shotIndices = overrideIndices.length ? overrideIndices : [idx];
+  const primaryShotIdx = shotIndices[0] ?? idx;
   const url = tailFrameUrl(sb);
   const intent = validIntent(sb?.tailFrameIntent) || (url ? 'requested' : 'none');
   const localPath = url ? resolveProtectedImageFilePath(url, userId) : null;
@@ -291,7 +366,7 @@ function normalizeStoryboardSlot(project: any, userId: number, storyboard: any, 
   return {
     ...sbRest,
     idx,
-    shotIdx: idx + 1,
+    shotIdx: primaryShotIdx + 1,
     shotIndices,
     frames,
     tailFrameIntent: intent,
@@ -405,8 +480,327 @@ function migrateEditDataForSingleShotSlots(editData: any, groupIdxRemap: Map<num
   return { editData: nextEditData, archive };
 }
 
+function shotIndicesEqual(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((v, idx) => v === b[idx]);
+}
+
+function storyboardShotIndicesEvidence(sb: any, shotsLength: number): {
+  top: number[];
+  first: number[][];
+  tail: number[][];
+} {
+  const top = normalizedShotIndices(sb?.shotIndices, shotsLength);
+  return {
+    top,
+    first: [
+      normalizedShotIndices(sb?.firstFramePlanSummary?.shotIndices, shotsLength),
+      normalizedShotIndices(sb?.frames?.first?.shotIndices, shotsLength),
+    ].filter((arr) => arr.length > 0),
+    tail: [
+      normalizedShotIndices(sb?.tailFramePlanSummary?.shotIndices, shotsLength),
+      normalizedShotIndices(sb?.frames?.tail?.shotIndices, shotsLength),
+    ].filter((arr) => arr.length > 0),
+  };
+}
+
+function evidenceMatchesTarget(evidence: number[][], target: number[]): boolean {
+  return evidence.some((arr) => shotIndicesEqual(arr, target));
+}
+
+function summarizeFrameWorkflowCoverage(project: any) {
+  const shotsLength = Array.isArray(project?.shots) ? project.shots.length : 0;
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const groups = storyboards.map((sb: any) => normalizedShotIndices(sb?.shotIndices, shotsLength));
+  const counts = new Map<number, number>();
+  groups.forEach((indices: number[]) => {
+    indices.forEach((idx) => counts.set(idx, (counts.get(idx) || 0) + 1));
+  });
+  const missing: number[] = [];
+  for (let idx = 0; idx < shotsLength; idx += 1) {
+    if (!counts.has(idx)) missing.push(idx);
+  }
+  const duplicate = Array.from(counts.entries())
+    .filter(([, count]) => count > 1)
+    .map(([idx]) => idx);
+  return {
+    shotsLength,
+    slotCount: storyboards.length,
+    groups,
+    missing,
+    duplicate,
+  };
+}
+
+function compactFrameWorkflowSlot(project: any, groupIdx: number) {
+  const shotsLength = Array.isArray(project?.shots) ? project.shots.length : 0;
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
+  const sb = storyboards[groupIdx] || {};
+  const task = videoTasks[groupIdx] || null;
+  return {
+    groupIdx,
+    shotIndices: normalizedShotIndices(sb?.shotIndices, shotsLength),
+    first: [
+      normalizedShotIndices(sb?.firstFramePlanSummary?.shotIndices, shotsLength),
+      normalizedShotIndices(sb?.frames?.first?.shotIndices, shotsLength),
+    ].filter((arr) => arr.length > 0),
+    tail: [
+      normalizedShotIndices(sb?.tailFramePlanSummary?.shotIndices, shotsLength),
+      normalizedShotIndices(sb?.frames?.tail?.shotIndices, shotsLength),
+    ].filter((arr) => arr.length > 0),
+    hasFirstUrl: !!(cleanUrl(sb?.firstFrameUrl) || cleanUrl(sb?.frames?.first?.url)),
+    hasTailUrl: !!(cleanUrl(sb?.tailFrameUrl) || cleanUrl(sb?.frames?.tail?.url)),
+    videoTaskShotIndices: task
+      ? normalizedShotIndices(task?.shotIndices, shotsLength)
+      : [],
+  };
+}
+
+function frameWorkflowRepairChanges(before: any, after: any) {
+  const beforeStoryboards = Array.isArray(before?.storyboards) ? before.storyboards : [];
+  const afterStoryboards = Array.isArray(after?.storyboards) ? after.storyboards : [];
+  const maxLen = Math.max(beforeStoryboards.length, afterStoryboards.length);
+  const changes: any[] = [];
+  for (let groupIdx = 0; groupIdx < maxLen; groupIdx += 1) {
+    const beforeSlot = compactFrameWorkflowSlot(before, groupIdx);
+    const afterSlot = compactFrameWorkflowSlot(after, groupIdx);
+    if (stableStringify(beforeSlot) !== stableStringify(afterSlot)) {
+      changes.push({ groupIdx, before: beforeSlot, after: afterSlot });
+    }
+  }
+  return changes;
+}
+
+function logFrameWorkflowRepair(project: any, patch: any, reason: string, userId: number) {
+  const projectId = String(project?.id || project?.projectId || '').trim();
+  if (!projectId) return;
+  const after = { ...project, ...patch };
+  const archiveBefore = Array.isArray(project?.legacyStoryboardArchive)
+    ? project.legacyStoryboardArchive.length
+    : 0;
+  const archiveAfter = Array.isArray(after?.legacyStoryboardArchive)
+    ? after.legacyStoryboardArchive.length
+    : archiveBefore;
+  const payload = {
+    projectId,
+    userId,
+    reason,
+    before: summarizeFrameWorkflowCoverage(project),
+    after: summarizeFrameWorkflowCoverage(after),
+    changes: [] as any[],
+    changeCount: 0,
+    archivedStoryboardDelta: archiveAfter - archiveBefore,
+  };
+  const changes = frameWorkflowRepairChanges(project, after);
+  payload.changes = changes.slice(0, 30);
+  payload.changeCount = changes.length;
+  try {
+    console.error('[frame-workflow-repair]', JSON.stringify(payload));
+  } catch {
+    console.error('[frame-workflow-repair]', projectId, reason);
+  }
+}
+
+function findStoryboardForShotIndices(storyboards: any[], target: number[], used: Set<number>, shotsLength: number): number | null {
+  let best: { idx: number; score: number } | null = null;
+  for (let idx = 0; idx < storyboards.length; idx += 1) {
+    if (used.has(idx)) continue;
+    const sb = storyboards[idx];
+    if (!hasMeaningfulLegacyValue(sb)) continue;
+    const evidence = storyboardShotIndicesEvidence(sb, shotsLength);
+    let score = 0;
+    if (shotIndicesEqual(evidence.top, target)) score = 100;
+    else if (evidenceMatchesTarget(evidence.first, target)) score = 80;
+    else if (evidenceMatchesTarget(evidence.tail, target)) score = 50;
+    if (!score) continue;
+    if (!best || score > best.score) best = { idx, score };
+  }
+  return best ? best.idx : null;
+}
+
+function stripFirstFrameFields(sb: any): any {
+  const {
+    assetLibraryAssetId: _assetLibraryAssetId,
+    effectiveVisualDescription: _effectiveVisualDescription,
+    firstFrame: _firstFrame,
+    firstFrameBackup: _firstFrameBackup,
+    firstFrameBasePrompt: _firstFrameBasePrompt,
+    firstFrameConsistencyCheck: _firstFrameConsistencyCheck,
+    firstFrameConsistencyStatus: _firstFrameConsistencyStatus,
+    firstFrameEditDraft: _firstFrameEditDraft,
+    firstFrameFailedAt: _firstFrameFailedAt,
+    firstFrameLastError: _firstFrameLastError,
+    firstFrameMode: _firstFrameMode,
+    firstFramePlanSummary: _firstFramePlanSummary,
+    firstFramePrompt: _firstFramePrompt,
+    firstFrameSafetyAudit: _firstFrameSafetyAudit,
+    firstFrameSourceHash: _firstFrameSourceHash,
+    firstFrameUrl: _firstFrameUrl,
+    imagePrompt: _imagePrompt,
+    imageUrl: _imageUrl,
+    originalFirstFramePrompt: _originalFirstFramePrompt,
+    rawUrl: _rawUrl,
+    url: _url,
+    ...rest
+  } = sb || {};
+  return rest;
+}
+
+function stripTailFrameFields(sb: any): any {
+  const {
+    originalTailFramePrompt: _originalTailFramePrompt,
+    tailFrameBackup: _tailFrameBackup,
+    tailFrameBasePrompt: _tailFrameBasePrompt,
+    tailFrameConsistencyCheck: _tailFrameConsistencyCheck,
+    tailFrameConsistencyStatus: _tailFrameConsistencyStatus,
+    tailFrameEditDraft: _tailFrameEditDraft,
+    tailFrameFailedAt: _tailFrameFailedAt,
+    tailFrameHistory: _tailFrameHistory,
+    tailFrameIntent: _tailFrameIntent,
+    tailFrameIntentUpdatedAt: _tailFrameIntentUpdatedAt,
+    tailFrameLastError: _tailFrameLastError,
+    tailFrameMode: _tailFrameMode,
+    tailFramePlanSummary: _tailFramePlanSummary,
+    tailFramePrompt: _tailFramePrompt,
+    tailFrameReferenceStatus: _tailFrameReferenceStatus,
+    tailFrameSafetyAudit: _tailFrameSafetyAudit,
+    tailFrameSourceHash: _tailFrameSourceHash,
+    tailFrameUrl: _tailFrameUrl,
+    ...rest
+  } = sb || {};
+  return rest;
+}
+
+function sanitizeStoryboardForTargetShotIndices(sb: any, target: number[], shotsLength: number): { storyboard: any; sanitized: boolean } {
+  let next = sb && typeof sb === 'object' ? { ...sb } : {};
+  if (next.frames && typeof next.frames === 'object') next.frames = { ...next.frames };
+  const evidence = storyboardShotIndicesEvidence(next, shotsLength);
+  const topMatches = shotIndicesEqual(evidence.top, target);
+  const firstMatches = topMatches || evidenceMatchesTarget(evidence.first, target);
+  const tailMatches = topMatches || evidenceMatchesTarget(evidence.tail, target);
+  let sanitized = false;
+
+  if (!firstMatches) {
+    next = stripFirstFrameFields(next);
+    if (next.frames && typeof next.frames === 'object') {
+      delete next.frames.first;
+    }
+    sanitized = true;
+  }
+  if (!tailMatches) {
+    next = stripTailFrameFields(next);
+    if (next.frames && typeof next.frames === 'object') {
+      delete next.frames.tail;
+    }
+    sanitized = true;
+  }
+  return { storyboard: next, sanitized };
+}
+
+function projectFrameAlignmentOk(project: any): boolean {
+  try {
+    assertStoryboardsAlignedWithShots(project, 'frame-workflow-normalization-check');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildFrameWorkflowAlignmentRepairPatch(project: any, userId: number, reason = 'alignment_repair'): any | null {
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  if (!shots.length) return null;
+  if (projectFrameAlignmentOk(project)) return null;
+
+  const storyboards = Array.isArray(project.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project.videoTasks) ? project.videoTasks : [];
+  const archivedAt = new Date().toISOString();
+  const archive = Array.isArray(project.legacyStoryboardArchive)
+    ? [...project.legacyStoryboardArchive]
+    : [];
+  const expectedSlots = makeSingleShotStoryboardSlots(shots);
+  const usedStoryboards = new Set<number>();
+  const groupIdxRemap = new Map<number, number>();
+  const repairedStoryboards: any[] = [];
+  const repairedVideoTasks: any[] = [];
+  let archivedStoryboardCount = 0;
+
+  expectedSlots.forEach((slot: any, groupIdx: number) => {
+    const target = normalizedShotIndices(slot.shotIndices, shots.length);
+    const oldGroupIdx = findStoryboardForShotIndices(storyboards, target, usedStoryboards, shots.length);
+    const source = oldGroupIdx == null ? slot : storyboards[oldGroupIdx];
+    if (oldGroupIdx != null) {
+      usedStoryboards.add(oldGroupIdx);
+      groupIdxRemap.set(oldGroupIdx, groupIdx);
+    }
+    const sanitized = sanitizeStoryboardForTargetShotIndices(source, target, shots.length);
+    repairedStoryboards[groupIdx] = normalizeStoryboardSlot(project, userId, sanitized.storyboard, groupIdx, target);
+    if (oldGroupIdx != null && hasMeaningfulLegacyValue(videoTasks[oldGroupIdx])) {
+      repairedVideoTasks[groupIdx] = {
+        ...videoTasks[oldGroupIdx],
+        groupIdx,
+        shotIndices: target,
+      };
+    }
+    if (oldGroupIdx != null && sanitized.sanitized) {
+      const beforeCount = archive.length;
+      archiveLegacyStoryboard({
+        archive,
+        oldGroupIdx,
+        oldShotIndices: normalizedShotIndices(storyboards[oldGroupIdx]?.shotIndices, shots.length),
+        storyboard: storyboards[oldGroupIdx],
+        videoTask: videoTasks[oldGroupIdx],
+        archivedAt,
+        archiveReason: `${reason}:sanitized_mismatched_frame_fields`,
+      });
+      if (archive.length > beforeCount) archivedStoryboardCount += 1;
+    }
+  });
+
+  storyboards.forEach((sb: any, oldGroupIdx: number) => {
+    if (usedStoryboards.has(oldGroupIdx)) return;
+    const beforeCount = archive.length;
+    archiveLegacyStoryboard({
+      archive,
+      oldGroupIdx,
+      oldShotIndices: normalizedShotIndices(sb?.shotIndices, shots.length),
+      storyboard: sb,
+      videoTask: videoTasks[oldGroupIdx],
+      archivedAt,
+      archiveReason: `${reason}:unused_or_duplicate_slot`,
+    });
+    if (archive.length > beforeCount) archivedStoryboardCount += 1;
+  });
+
+  const editMigration = migrateEditDataForSingleShotSlots(project.editData, groupIdxRemap, archivedAt);
+  const patch: any = {
+    storyboards: repairedStoryboards,
+    videoTasks: repairedVideoTasks,
+    frameWorkflowSchemaVersion: FRAME_WORKFLOW_SCHEMA_VERSION,
+    frameWorkflowAlignmentRepairedAt: archivedAt,
+  };
+  if (archive.length !== (Array.isArray(project.legacyStoryboardArchive) ? project.legacyStoryboardArchive.length : 0)) {
+    patch.legacyStoryboardArchive = archive;
+    patch.legacyStoryboardArchiveLastMigratedAt = archivedAt;
+    patch.legacyStoryboardArchiveLastCount = archivedStoryboardCount;
+  }
+  if (editMigration.editData) patch.editData = editMigration.editData;
+  if (editMigration.archive) {
+    const timelineArchive = Array.isArray(project.legacyTimelineArchive)
+      ? [...project.legacyTimelineArchive]
+      : [];
+    timelineArchive.push(editMigration.archive);
+    patch.legacyTimelineArchive = timelineArchive;
+  }
+  maybeAssertStoryboardsAlignedWithShots({ ...project, ...patch }, reason);
+  logFrameWorkflowRepair(project, patch, reason, userId);
+  return patch;
+}
+
 export function buildFrameWorkflowNormalizationPatch(project: any, userId: number): any | null {
-  if (!project || Number(project.frameWorkflowSchemaVersion || 0) >= FRAME_WORKFLOW_SCHEMA_VERSION) return null;
+  if (!project) return null;
+  if (Number(project.frameWorkflowSchemaVersion || 0) >= FRAME_WORKFLOW_SCHEMA_VERSION) {
+    return buildFrameWorkflowAlignmentRepairPatch(project, userId, 'frame-workflow-alignment-repair');
+  }
   const previousVersion = Number(project.frameWorkflowSchemaVersion || 0);
   const shots = Array.isArray(project.shots) ? project.shots : [];
   const storyboards = Array.isArray(project.storyboards) ? project.storyboards : [];

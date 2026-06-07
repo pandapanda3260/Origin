@@ -63,13 +63,15 @@ import {
   renderCharacterLockRosterLine,
   type CharacterLock,
 } from './character-consistency';
+import { buildAssetAuthoritativeCharacterLock } from './character-lock-authority';
 import { buildVideoReferenceManifest } from './reference-matcher';
 import { sanitizePromptObject } from './content-sanitize';
 import {
   cleanDialogueCharCount,
-  evaluateDialogueBudget,
+  buildReferenceBriefLine,
   hashString,
-  plannedDurationFromShots,
+  plannedTimelineGroupsFromProject,
+  plannedTimelineStartFromGroups,
   resolveGenerationDurationSec,
   VIDEO_REFERENCE_IMAGE_BUDGET,
   type DialoguePolicy,
@@ -91,11 +93,26 @@ import {
   normalizeVideoPromptContent,
 } from './video-prompt-lifecycle';
 import { buildSeedancePromptParts } from './video-prompt-runtime';
+import {
+  buildEffectiveShotPlanForDuration,
+  buildSegmentShotPlan,
+  buildTailRushedWarning,
+  collectSegmentDialoguePairs,
+  computeSegmentTempoBudget,
+  plannedDurationForSegment,
+  TAIL_RUSHED_WARNING_MESSAGE,
+  type SegmentTempoBudget,
+} from './video-segment-runtime';
 import { validateCharacterConsistencyForGroup } from './character-consistency-gate';
 import { dataPath } from './runtime-paths';
 import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl, checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
-import { pickSceneForShots } from './scene-selection';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit, type FrameImageGenerationPlan } from './frame-image-plan';
+import {
+  buildFrameConsistencyRetryDecision,
+  checkFrameVisualConsistency,
+  type FrameConsistencyCheckResult,
+} from './frame-consistency-check';
+import { inferTailFrameDependencyForShots } from './tail-frame-dependency';
 import {
   applyFirstFrameDraftToPlan,
   currentFirstFrameEditDraft,
@@ -121,9 +138,10 @@ import {
   computeShotPlanSourceHash,
   computeShotPlanSourceSnapshot,
 } from './project-dependency-state';
-import { normalizeTailFrameSignals } from './shot-tail-frame-signals';
+import { formatWorldContextForPrompt, projectWorldContextForStage } from './world-template-context';
+import { normalizeGeneratedShotPlan, resolveShotFieldsForPrompt } from './shot-plan-normalize';
 import {
-  computeFirstFrameSourceHash,
+  computeFirstFrameSourceHashForShotIndices,
   makeSingleShotStoryboardSlots,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
@@ -137,10 +155,11 @@ import {
   type TargetArtifact,
 } from './sentinel';
 import { applyBlockerFilter } from './batch-preflight';
+import { resolveVideoAspectRatio } from './aspect-ratio';
 
 const DEFAULT_PROJECT_ASPECT_RATIO = '9:16';
 const PROJECT_ASPECT_RATIOS = new Set(['16:9', '9:16', '1:1']);
-const VIDEO_RATIOS = new Set(['16:9', '9:16', '1:1', '21:9', '4:3', '3:4']);
+const FRAME_CONSISTENCY_MAX_RETRIES = 2;
 
 function envFlag(name: string, fallback: boolean) {
   const raw = process.env[name] || process.env[`ORIGIN_${name}`];
@@ -168,6 +187,84 @@ function resolveFrameImageQualityForCall(
     });
   }
   return actualQuality;
+}
+
+async function generateFrameImageWithConsistencyCheck(args: {
+  ctx: BatchExecCtx;
+  plan: FrameImageGenerationPlan;
+  prompt: string;
+  imageInput: Omit<ImageGenInput, 'prompt'>;
+  progressMode: 'first_frame' | 'tail_frame';
+  groupIdx: number;
+}): Promise<{
+  result: Awaited<ReturnType<typeof generateImageWithModerationRecovery>>;
+  consistencyCheck: FrameConsistencyCheckResult;
+  consistencyAttempts: Array<{
+    attempt: number;
+    grade: FrameConsistencyCheckResult['grade'];
+    status: FrameConsistencyCheckResult['status'];
+    reasons: string[];
+    retry: boolean;
+  }>;
+}> {
+  let promptForAttempt = args.prompt;
+  let result: Awaited<ReturnType<typeof generateImageWithModerationRecovery>> | null = null;
+  let consistencyCheck: FrameConsistencyCheckResult | null = null;
+  const consistencyAttempts: Array<{
+    attempt: number;
+    grade: FrameConsistencyCheckResult['grade'];
+    status: FrameConsistencyCheckResult['status'];
+    reasons: string[];
+    retry: boolean;
+  }> = [];
+
+  for (let attempt = 1; attempt <= FRAME_CONSISTENCY_MAX_RETRIES + 1; attempt += 1) {
+    if (attempt > 1) {
+      args.ctx.progress({
+        stage: 'calling_image_api',
+        mode: args.progressMode,
+        groupIdx: args.groupIdx,
+        attempt,
+        hint: '重新生成首尾帧以修正视觉一致性偏差…',
+      });
+    }
+    result = await generateImageWithModerationRecovery(args.ctx.user, {
+      ...args.imageInput,
+      prompt: promptForAttempt,
+    });
+
+    const generatedImagePath = resolveLocalImagePath(result.url, args.ctx.user.id) || undefined;
+    args.ctx.progress({
+      stage: 'checking_frame_consistency',
+      mode: args.progressMode,
+      groupIdx: args.groupIdx,
+      attempt,
+      hint: '检查首尾帧与角色、场景、道具参考图的一致性…',
+    });
+    consistencyCheck = await checkFrameVisualConsistency({
+      user: args.ctx.user,
+      plan: { ...args.plan, finalPrompt: promptForAttempt },
+      generatedImagePath,
+    });
+    const decision = buildFrameConsistencyRetryDecision({
+      basePrompt: args.prompt,
+      check: consistencyCheck,
+      attempt,
+      maxRetries: FRAME_CONSISTENCY_MAX_RETRIES,
+    });
+    consistencyAttempts.push({
+      attempt,
+      grade: consistencyCheck.grade,
+      status: consistencyCheck.status,
+      reasons: consistencyCheck.reasons,
+      retry: decision.shouldRetry,
+    });
+    if (!decision.shouldRetry) break;
+    promptForAttempt = decision.nextPrompt;
+  }
+
+  if (!result || !consistencyCheck) throw new Error('首尾帧生成或一致性校验未返回结果');
+  return { result, consistencyCheck, consistencyAttempts };
 }
 
 function shouldDeferSeedanceProviderPolling() {
@@ -227,12 +324,6 @@ function recordBatchKnowledgeAudit(opts: {
   } catch (error) {
     console.warn(`[batch:${opts.stage}] knowledge context audit skipped:`, error);
   }
-}
-
-function normalizeVideoRatio(value: any, project: any): string {
-  const requested = String(value || '').trim();
-  if (VIDEO_RATIOS.has(requested)) return requested;
-  return resolveProjectAspectRatio(project);
 }
 
 function findCharacterLock(project: any, character: any): CharacterLock | null {
@@ -385,6 +476,9 @@ function sentinelBlockedMessage(decision: ArtifactUsageDecision) {
     return '镜头计划所依赖的剧本/风格/资产已变化，请先确认旧镜头仍可用或重新生成。';
   }
   if (reason === 'storyboard_stale') return `${groupLabel} 分镜图已过期，请先重新生成分镜图。`;
+  if (reason === 'first_frame_missing' || reason === 'missing_first_frame') return `${groupLabel} 缺少可用首帧，请先生成首帧图。`;
+  if (reason === 'first_frame_failed') return `${groupLabel} 首帧生成失败，请先重新生成首帧图。`;
+  if (reason === 'legacy_sketch_only') return `${groupLabel} 只有旧版黑白分镜，缺少可用于下游生成的彩色首帧。`;
   if (reason === 'shot_prompt_stale') return `${groupLabel} 分镜提示词已过期，请先重新生成提示词。`;
   if (reason === 'video_prompt_stale') return `${groupLabel} 视频提示词已过期，请先重新生成视频提示词。`;
   if (reason === 'missing_video_prompt') return `${groupLabel} 缺少视频提示词，请先生成视频提示词。`;
@@ -404,13 +498,14 @@ function assertArtifactUsable(
   project: any,
   ctx: BatchExecCtx,
   targetArtifact: TargetArtifact,
-  opts: { groupIdx?: number; shotIndices?: number[] } = {},
+  opts: { groupIdx?: number; shotIndices?: number[]; batchType?: string } = {},
 ) {
   const decision = applyBlockerFilter(describeArtifactStatus(project, {
     projectId: ctx.projectId,
     targetArtifact,
     groupIdx: opts.groupIdx,
     shotIndices: opts.shotIndices,
+    batchType: opts.batchType,
     consumerOperation: `batch_executor:${targetArtifact}`,
   }));
   if (decision.usability === 'BLOCKED') {
@@ -526,7 +621,7 @@ function sleep(ms: number) {
 }
 
 function planReferencesFromManifest(refs: ReferenceManifestItem[]): ReferenceManifestItem[] {
-  return refs
+  const mapped = refs
     .filter((ref) => isPlanReferenceRole(ref.role))
     .map((ref, idx) => {
       const role = ref.role as VideoReferenceRole;
@@ -541,10 +636,14 @@ function planReferencesFromManifest(refs: ReferenceManifestItem[]): ReferenceMan
         promptHint: ref.promptHint || defaults.promptHint,
       };
     });
+  return mapped.map((ref) => ({
+    ...ref,
+    referenceBrief: ref.referenceBrief || buildReferenceBriefLine(ref, mapped),
+  }));
 }
 
 function planReferencesFromAuditRefs(refs: any[]): ReferenceManifestItem[] {
-  return (refs || [])
+  const mapped = (refs || [])
     .filter((ref) => isPlanReferenceRole(ref.role))
     .map((ref, idx) => {
       const role = ref.role as VideoReferenceRole;
@@ -557,11 +656,17 @@ function planReferencesFromAuditRefs(refs: any[]): ReferenceManifestItem[] {
         label: ref.label || `${role} reference`,
         url: ref.sourceUrl || ref.path,
         localPath: ref.path,
-        useFor: defaults.useFor,
-        immutable: defaults.immutable,
+        useFor: Array.isArray(ref.useFor) && ref.useFor.length ? ref.useFor : defaults.useFor,
+        immutable: Array.isArray(ref.immutable) && ref.immutable.length ? ref.immutable : defaults.immutable,
         promptHint: ref.promptHint || defaults.promptHint,
+        panelInfo: ref.panelInfo,
+        referenceBrief: ref.referenceBrief,
       };
 	    });
+  return mapped.map((ref) => ({
+    ...ref,
+    referenceBrief: ref.referenceBrief || buildReferenceBriefLine(ref, mapped),
+  }));
 }
 
 function videoWarningsFromAuditRefs(refs: any[]): any[] {
@@ -580,6 +685,41 @@ function videoWarningsFromAuditRefs(refs: any[]): any[] {
     });
   });
   return warnings;
+}
+
+const REFERENCE_IMAGE_SUBMIT_WARNING = '参考图提交失败，请检查图片或重试';
+
+function videoFallbackWarnings(fallbackReason?: string): any[] {
+  if (!fallbackReason) return [];
+  return [{
+    key: `reference_image_submit_failed:${fallbackReason}`,
+    code: 'reference_image_submit_failed',
+    reason: fallbackReason,
+    level: 'warn',
+    message: REFERENCE_IMAGE_SUBMIT_WARNING,
+  }];
+}
+
+function compactVideoAuditReferenceImages(refs: any[]): any[] {
+  return (Array.isArray(refs) ? refs : []).map((ref) => ({
+    role: ref?.role,
+    path: ref?.path,
+    label: ref?.label,
+    sourceUrl: ref?.sourceUrl,
+    assetId: ref?.assetId,
+    assetName: ref?.assetName,
+    promptHint: ref?.promptHint,
+    useFor: ref?.useFor,
+    immutable: ref?.immutable,
+    panelInfo: ref?.panelInfo,
+    referenceBrief: ref?.referenceBrief,
+    apiRole: ref?.apiRole,
+    apiContentIndex: ref?.apiContentIndex,
+    submittedWidth: ref?.submittedWidth,
+    submittedHeight: ref?.submittedHeight,
+    submittedMime: ref?.submittedMime,
+    warnings: ref?.warnings,
+  }));
 }
 
 function mergeVideoWarnings(...groups: any[][]): any[] {
@@ -605,6 +745,7 @@ function buildVideoPlanSnapshot(opts: {
   payloadMode?: VideoGenerationPlan['payloadMode'];
   modeReason?: VideoGenerationPlan['modeReason'];
   planAuditPayloadModeMismatch?: boolean;
+  tempoBudget?: SegmentTempoBudget;
   videoPromptSource: VideoGenerationPlan['promptAudit']['sourcePrompt']['source'];
   sanitizedFor: string[];
   finalPrompt: { preview: string; hash: string; length: number };
@@ -635,6 +776,7 @@ function buildVideoPlanSnapshot(opts: {
     modeReason: opts.modeReason,
     plannedReferenceRoles: opts.references.map((ref) => ref.role),
     planAuditPayloadModeMismatch: opts.planAuditPayloadModeMismatch || undefined,
+    tempoBudget: opts.tempoBudget,
     promptAudit: {
       sourcePrompt: {
         source: opts.videoPromptSource,
@@ -794,6 +936,61 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
 }
 
 /* ============================================================
+   imageHistory archiving helper — keep old image+info snapshots
+   on the asset itself so polling/reload from server preserves them.
+   ============================================================ */
+const ASSET_IMG_HISTORY_FIELDS: Record<'char' | 'scene' | 'prop', string[]> = {
+  char: ['name','role','identity','appearance','clothing','equipment','temperament','actionTraits','entityType','castingOverride','imagePrompt','description','tags'],
+  scene: ['name','description','location','timeSetting','weather','lighting','atmosphere','elements','imagePrompt'],
+  prop: ['name','propType','features','material','imagePrompt'],
+};
+const MAX_ASSET_IMAGE_HISTORY = 10;
+
+function _captureAssetImageSnapshot(
+  existing: any,
+  type: 'char' | 'scene' | 'prop',
+  source: string,
+): Record<string, any> | null {
+  if (!existing || typeof existing !== 'object') return null;
+  const snap: Record<string, any> = {};
+  if (existing.imageUrl) snap.url = existing.imageUrl;
+  if (existing.rawUrl && existing.rawUrl !== snap.url) snap.rawUrl = existing.rawUrl;
+  if (existing.realPhotoUrl && existing.realPhotoUrl !== snap.url) snap.realPhotoUrl = existing.realPhotoUrl;
+  if (existing.pencilUrl) snap.pencilUrl = existing.pencilUrl;
+  if (!snap.url && !snap.rawUrl && !snap.realPhotoUrl && !snap.pencilUrl) return null;
+  const mainUrl = snap.url || snap.rawUrl || snap.realPhotoUrl || snap.pencilUrl;
+  if (typeof mainUrl === 'string' && mainUrl.startsWith('blob:')) return null;
+  const fields = ASSET_IMG_HISTORY_FIELDS[type];
+  const info: Record<string, any> = {};
+  fields.forEach((f) => {
+    info[f] = existing[f] === undefined ? null : existing[f];
+  });
+  snap.info = info;
+  snap.at = Date.now();
+  snap.source = source;
+  return snap;
+}
+
+function _withArchivedImageHistory(
+  existing: any,
+  next: any,
+  type: 'char' | 'scene' | 'prop',
+  source: string,
+): any {
+  const snap = _captureAssetImageSnapshot(existing, type, source);
+  const prior = Array.isArray(existing?.imageHistory) ? existing.imageHistory : [];
+  if (!snap) {
+    // 没有旧图（首次生成）—— 直接保留已有的 history（来自 extract 时的归档）
+    return prior.length ? { ...next, imageHistory: prior } : next;
+  }
+  const top = prior[0];
+  const isDup = top && top.url === snap.url && top.rawUrl === snap.rawUrl &&
+                top.pencilUrl === snap.pencilUrl && top.realPhotoUrl === snap.realPhotoUrl;
+  const nextHistory = isDup ? prior.slice(0, MAX_ASSET_IMAGE_HISTORY) : [snap, ...prior].slice(0, MAX_ASSET_IMAGE_HISTORY);
+  return { ...next, imageHistory: nextHistory };
+}
+
+/* ============================================================
    1. asset_images executor
    ============================================================ */
 registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
@@ -840,7 +1037,8 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   // 避免旧 imagePrompt 或重写 LLM 把这些细节弱化。气质/动作特征也影响表演
   // 气场（皱眉/手插腰），同样要求图像模型反映出来。
   if (type === 'char') {
-    const lock = findCharacterLock(proj as any, item);
+    const rawLock = findCharacterLock(proj as any, item);
+    const lock = rawLock ? buildAssetAuthoritativeCharacterLock(rawLock, item) : null;
     if (lock) {
       prompt = `${prompt}\n\n=== CHARACTER CONSISTENCY LOCK (authoritative, must match exactly) ===\n${renderCharacterLockRosterLine(lock, 'en')}`;
     } else {
@@ -960,7 +1158,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       delete (nextAsset as any).imageFailedAt;
       if (nextAsset.reference) delete (nextAsset.reference as any).lastError;
     }
-    assets[cat][idx] = nextAsset;
+    // 把旧图 + 旧信息归档进 imageHistory（前端 polling/reload 后也能看到）
+    const archivedAsset = _withArchivedImageHistory(assets[cat][idx], nextAsset, type, 'regen');
+    assets[cat][idx] = archivedAsset;
     // 顶层 characters/environments/props 也同步（前端两种结构都读）
     const topKey = cat === 'characters' ? 'characters' : cat === 'scenes' ? 'environments' : 'props';
     const top = (fresh as any)[topKey] || [];
@@ -996,6 +1196,8 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       delete (nextTop as any).imageFailedAt;
       if (nextTop.reference) delete (nextTop.reference as any).lastError;
     }
+    // 顶层也归档一份（保持 assets.* 和 top.* 两路镜像一致）
+    nextTop = _withArchivedImageHistory(top[idx], nextTop, type, 'regen');
     top[idx] = nextTop;
     const patch: any = { assets, [topKey]: top };
     if (type === 'char') {
@@ -1197,10 +1399,19 @@ const SP_SHOT_TO_IMG_PROMPT = `你是分镜手稿（pre-production storyboard）
 registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
   const proj = getProjectByIdForUser(ctx.projectId, ctx.user.id);
   if (!proj) throw new Error('项目不存在');
-  const idx: number = ctx.target.idx ?? ctx.seq;
-  assertArtifactUsable(proj as any, ctx, 'storyboard_prompt', { shotIndices: [idx] });
-  const shot = (proj as any).shots?.[idx];
-  if (!shot) throw new Error(`找不到 shots[${idx}]`);
+  const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? ctx.seq;
+  const allShots = Array.isArray((proj as any).shots) ? (proj as any).shots : [];
+  const sbForGroup = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards[groupIdx] : undefined;
+  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sbForGroup, {
+    mode: 'single-shot-strict',
+    explicitShotIndices: ctx.target.shotIndices,
+  });
+  // idx 收敛到"段首镜头"= 该段首帧图来源（合并段只有段首出首帧图）。
+  // 1:1 时 shotIndices=[groupIdx]，idx 仍 = 旧值，下游读写完全等价。
+  const idx: number = shotIndices[0] ?? groupIdx;
+  assertArtifactUsable(proj as any, ctx, 'storyboard_prompt', { shotIndices });
+  const shot = allShots[idx];
+  if (!shot) throw new Error(`找不到段 ${groupIdx} 的段首镜头 shots[${idx}]`);
 
   ctx.progress({ stage: 'building_prompt' });
   const styleBible = styleBibleForShotPrompt((proj as any).styleBible || {});
@@ -1216,9 +1427,15 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     (styleBible.negativePrompt || styleBible.videoNegativePrompt) && `禁止:${styleBible.negativePrompt || styleBible.videoNegativePrompt}`,
   ]);
 
-  // 兼容新老字段
-  const shotType = shot.shotType || shot.framing || '';
-  const camera = shot.camera || shot.movement || '';
+  // 兼容新老字段。旧 shotType=俯拍/主观/过肩 会在这里读成 angle，shotType 回落到景别。
+  const shotFields = resolveShotFieldsForPrompt(shot, styleBible);
+  const shotType = shotFields.shotType;
+  const angle = shotFields.angle;
+  const lens = shotFields.lens;
+  const focus = shotFields.focus;
+  const light = shotFields.light;
+  const composition = shotFields.composition;
+  const camera = shotFields.camera;
   const visual = shot.visual || shot.description || shot.desc || '';
   const dialogue = shot.dialogue || shot.dialog || '';
   const characters: string[] = Array.isArray(shot.characters) ? shot.characters : [];
@@ -1255,15 +1472,27 @@ registerExecutor('storyboard_prompts', async (ctx: BatchExecCtx) => {
     }
   }
 
-  const userMsg = [
-    `镜头序号：${shot.idx ?? idx + 1}`,
-    shotType && `景别：${shotType}`,
-    camera && `运镜：${camera}`,
+  const worldContext = projectWorldContextForStage('storyboard_sketch_prompt', (proj as any).worldTemplateSnapshot, {
+    project: proj,
+    target: { groupIdx, shotIndices },
+  });
+  const worldText = formatWorldContextForPrompt(worldContext);
+
+	  const userMsg = [
+	    `镜头序号：${shot.idx ?? idx + 1}`,
+	    shotType && `景别：${shotType}`,
+	    angle && `角度/视点：${angle}`,
+	    lens && `焦距：${lens}`,
+	    focus && `景深/焦点：${focus}`,
+	    light && `光线组合：${light}`,
+	    composition && `构图组合：${composition}`,
+	    camera && `运镜：${camera}`,
     visual && `画面描述：${visual}`,
     dialogue && dialogue !== '——' && `台词/旁白：${dialogue}`,
     keyInfo && `主题词：${keyInfo}`,
     charContext && `本镜头角色（必须保留外观/服装一致性）：${charContext}`,
     nonHumanMentions.length && `画面中提及的其它非人/拟人角色（绝对不能画成真人）：${nonHumanMentions.join(' | ')}`,
+    worldText && `分镜稿参考的世界观事实与软默认：\n${worldText}`,
     styleHint && `整体视觉风格：${styleHint}`,
   ].filter(Boolean).join('\n');
 
@@ -1346,7 +1575,6 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   assertArtifactUsable(proj as any, ctx, 'storyboard_image_generation', { groupIdx, shotIndices });
 
   const groupShots = shotIndices.map((i) => shots[i]);
-  const firstShot = groupShots[0];
 
   ctx.progress({ stage: 'building_prompt' });
 
@@ -1362,11 +1590,15 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     let appliedDraftForFingerprint: any = null;
     let committedBasePrompt = '';
     let generationShotIndices = shotIndices;
-    let generationFirstShot = firstShot;
-    let firstFrameSourceHashForInput = computeFirstFrameSourceHash(proj, ctx.user.id, groupIdx);
+    let firstFrameSourceHashForInput = computeFirstFrameSourceHashForShotIndices(proj, shotIndices);
     patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
       if (!fresh) return null;
-      const promptState = reconcileFirstFramePromptStateInPatch({ project: fresh, user: ctx.user, groupIdx });
+      const promptState = reconcileFirstFramePromptStateInPatch({
+        project: fresh,
+        user: ctx.user,
+        groupIdx,
+        explicitShotIndices: shotIndices,
+      });
       const { draft } = currentFirstFrameEditDraft(fresh, groupIdx);
       let nextPlan = {
         ...promptState.plan,
@@ -1411,8 +1643,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       generationState.finalPlan = nextPlan;
       committedBasePrompt = nextPlan.finalPrompt;
       generationShotIndices = promptState.shotIndices;
-      generationFirstShot = Array.isArray((fresh as any).shots) ? (fresh as any).shots[generationShotIndices[0]] : generationFirstShot;
-      firstFrameSourceHashForInput = computeFirstFrameSourceHash(fresh, ctx.user.id, groupIdx);
+      firstFrameSourceHashForInput = computeFirstFrameSourceHashForShotIndices(fresh, promptState.shotIndices);
       if (!Object.keys(slotPatch).length) return {};
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
       const prev = storyboards[groupIdx] || {};
@@ -1454,17 +1685,27 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       mode: 'first_frame',
       hint: '调用图像 API 生成彩色视频首帧…',
     });
-    const result = await generateImageWithModerationRecovery(ctx.user, {
-      prompt: basePrompt,
-      size: frameImageSize,
-      style: imageStyle,
-      kind: 'storyboard',
-      projectId: ctx.projectId,
-      assetRef: `storyboards[${groupIdx}].firstFrame`,
-      quality: imageQuality,
-      referenceImagePath,
-      referenceImagePaths,
-    });
+	    const frameGeneration = await generateFrameImageWithConsistencyCheck({
+	      ctx,
+	      plan: finalPlan,
+	      prompt: basePrompt,
+	      progressMode: 'first_frame',
+	      groupIdx,
+	      imageInput: {
+	      size: frameImageSize,
+	      style: imageStyle,
+	      kind: 'storyboard',
+	      projectId: ctx.projectId,
+	      assetRef: `storyboards[${groupIdx}].firstFrame`,
+	      quality: imageQuality,
+	      referenceImagePath,
+	      referenceImagePaths,
+	      },
+	    });
+	    const { result, consistencyCheck, consistencyAttempts } = frameGeneration;
+	    (planSummary as any).consistencyCheck = consistencyCheck;
+	    (planSummary as any).consistencyAttempts = consistencyAttempts;
+	    (planSummary as any).consistencyStatus = consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade;
 
     // P1: storyboards[g].frames.first 作为新的结构化对外容器, 与旧的 firstFrameUrl /
     // firstFramePrompt / firstFrameMode / firstFrameSafetyAudit / firstFramePlanSummary
@@ -1478,9 +1719,12 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       mode: 'structured_v1' as const,
       status: 'ready' as const,
       planSummary,
-      safetyAudit: result.safetyAudit,
-      visualAnchorDescription: result.visualAnchorDescription,
-      generatedAt,
+	      safetyAudit: result.safetyAudit,
+	      visualAnchorDescription: result.visualAnchorDescription,
+	      consistencyCheck,
+	      consistencyAttempts,
+	      consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	      generatedAt,
       shotIndices: generationShotIndices,
       sourceHash: firstFrameSourceHash,
     };
@@ -1491,7 +1735,20 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
       if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
-      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+        mode: 'single-shot-strict',
+        explicitShotIndices: generationShotIndices,
+      });
+      const firstShotForWrite = shots[freshShotIndices[0]];
+      const firstFramePlanSummaryForWrite = {
+        ...planSummary,
+        shotIndices: freshShotIndices,
+      };
+      const frameFirstForWrite = {
+        ...frameFirst,
+        planSummary: firstFramePlanSummaryForWrite,
+        shotIndices: freshShotIndices,
+      };
       const {
         videoUrl: _oldVideoUrl,
         videoTaskId: _oldVideoTaskId,
@@ -1509,10 +1766,12 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         rawUrl: result.url,
         firstFrameUrl: result.url,
         firstFrame: {
-          ...markFirstFrameReady(prev, result.url, result.url),
-          safetyAudit: result.safetyAudit,
-          visualAnchorDescription: result.visualAnchorDescription,
-        },
+	          ...markFirstFrameReady(prev, result.url, result.url),
+	          safetyAudit: result.safetyAudit,
+	          visualAnchorDescription: result.visualAnchorDescription,
+	          consistencyCheck,
+	          consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	        },
         firstFramePrompt: result.submittedPrompt,
         firstFrameMode: 'structured_v1',
         firstFrameSourceHash,
@@ -1521,16 +1780,18 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         debugSketchUrl: prev.debugSketchUrl || prev.pencilUrl,
         imagePrompt: result.submittedPrompt,
         originalFirstFramePrompt: committedBasePrompt,
-        firstFrameSafetyAudit: result.safetyAudit,
-        effectiveVisualDescription: result.visualAnchorDescription,
+	        firstFrameSafetyAudit: result.safetyAudit,
+	        firstFrameConsistencyCheck: consistencyCheck,
+	        firstFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	        effectiveVisualDescription: result.visualAnchorDescription,
         idx: groupIdx,
-        shotIdx: generationFirstShot?.idx ?? generationShotIndices[0] + 1,
+        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
         shotIndices: freshShotIndices,
-        firstFramePlanSummary: planSummary,
+        firstFramePlanSummary: firstFramePlanSummaryForWrite,
         frames: {
           ...(prev.frames || {}),
           first: {
-            ...frameFirst,
+            ...frameFirstForWrite,
             originalPrompt: committedBasePrompt,
           },
         },
@@ -1570,8 +1831,10 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
         firstFrameSourceHash,
         shotIndices,
         imagePrompt: result.submittedPrompt,
-        firstFrameSafetyAudit: result.safetyAudit,
-        firstFramePlanSummary: planSummary,
+	        firstFrameSafetyAudit: result.safetyAudit,
+	        firstFrameConsistencyCheck: consistencyCheck,
+	        firstFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	        firstFramePlanSummary: planSummary,
         frames: { first: frameFirst },
       },
       extra: {
@@ -1709,7 +1972,11 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
     if (groupIdx >= shots.length) return null;
     const prev = storyboards[groupIdx] || {};
-    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+      mode: 'single-shot-strict',
+      explicitShotIndices: shotIndices,
+    });
+    const firstShotForWrite = shots[freshShotIndices[0]];
     const prevFirstFrame = normalizeFirstFrameState(prev);
     const at = new Date().toISOString();
     storyboards[groupIdx] = {
@@ -1741,7 +2008,7 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       firstFrameLastError: undefined,
       firstFrameFailedAt: undefined,
       idx: groupIdx,
-      shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
+      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
       shotIndices: freshShotIndices,
     };
     // 用户原则: 首帧变化 (含 legacy_pencil 路径) 不再连带删除 videoTasks[groupIdx],
@@ -1802,24 +2069,28 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   const groupIdx: number = ctx.target.groupIdx ?? ctx.target.idx ?? 0;
   const shots = (proj as any).shots || [];
 
-  // Preflight: 本片段首帧必须已就绪 + 模式是彩色视频首帧, legacy_pencil 手稿图不可做尾帧锚。
+  // Preflight: 只有脚本/镜头计划判定尾帧依赖首帧时, 才要求彩色首帧作为连续性锚点。
   const storyboards = (proj as any).storyboards || [];
   const sb = storyboards[groupIdx] || {};
   const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
     mode: 'single-shot-strict',
     explicitShotIndices: ctx.target.shotIndices,
   });
-  assertArtifactUsable(proj as any, ctx, 'storyboard_image', { groupIdx, shotIndices });
-  const preflightErr = checkTailFramePreflight(sb);
+  const groupShots = shotIndices.map((i) => shots[i]).filter(Boolean);
+  const tailFrameDependency = inferTailFrameDependencyForShots(groupShots, sb);
+  assertArtifactUsable(proj as any, ctx, 'storyboard_image', { groupIdx, shotIndices, batchType: 'tail_frame_images' });
+  const preflightErr = checkTailFramePreflight(sb, { dependency: tailFrameDependency });
   if (preflightErr) {
     throw new Error(formatTailFramePreflightError(groupIdx, preflightErr));
   }
   const firstFrameUrl: string =
     sb.firstFrameUrl || sb.frames?.first?.url || sb.firstFrame?.currentUrl;
 
-  // 首帧图的本地路径; 无法解析时降级为 text_only 锚 (plan 会标 droppedReason='unresolvable')。
-  const selfFirstFrameLocal = resolveLocalImagePath(firstFrameUrl, ctx.user.id) || undefined;
-  if (!selfFirstFrameLocal) {
+  // 依赖首帧时, 首帧图必须能解析为本地文件; 独立尾帧不提交首帧参考图。
+  const selfFirstFrameLocal = tailFrameDependency === 'requires_first_frame'
+    ? (resolveLocalImagePath(firstFrameUrl, ctx.user.id) || undefined)
+    : undefined;
+  if (tailFrameDependency === 'requires_first_frame' && !selfFirstFrameLocal) {
     throw errorWithRecoveryHint(
       '首帧图片文件不可解析，无法生成尾帧。',
       'first_frame_file_unresolvable',
@@ -1844,7 +2115,12 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       at: nowIso(),
       source: 'current_before_tail_frame_regenerate',
     });
-    const promptState = reconcileTailFramePromptStateInPatch({ project: fresh, user: ctx.user, groupIdx });
+    const promptState = reconcileTailFramePromptStateInPatch({
+      project: fresh,
+      user: ctx.user,
+      groupIdx,
+      explicitShotIndices: shotIndices,
+    });
     if (!promptState.plan || !promptState.tailFrameBasePrompt?.content) {
       const code = promptState.preflight.code || 'tail_frame_prompt_unready';
       throw errorWithRecoveryHint(
@@ -1943,17 +2219,27 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     hint: '调用图像 API 生成彩色视频尾帧…',
   });
 
-  const result = await generateImageWithModerationRecovery(ctx.user, {
-    prompt: tailFrameBasePromptContent,
-    size: frameImageSize,
-    style: imageStyle,
-    kind: 'storyboard',
-    projectId: ctx.projectId,
-    assetRef: `storyboards[${groupIdx}].tailFrame`,
-    quality: imageQuality,
-    referenceImagePath,
-    referenceImagePaths,
-  });
+	  const frameGeneration = await generateFrameImageWithConsistencyCheck({
+	    ctx,
+	    plan,
+	    prompt: tailFrameBasePromptContent,
+	    progressMode: 'tail_frame',
+	    groupIdx,
+	    imageInput: {
+	    size: frameImageSize,
+	    style: imageStyle,
+	    kind: 'storyboard',
+	    projectId: ctx.projectId,
+	    assetRef: `storyboards[${groupIdx}].tailFrame`,
+	    quality: imageQuality,
+	    referenceImagePath,
+	    referenceImagePaths,
+	    },
+	  });
+	  const { result, consistencyCheck, consistencyAttempts } = frameGeneration;
+	  (planSummary as any).consistencyCheck = consistencyCheck;
+	  (planSummary as any).consistencyAttempts = consistencyAttempts;
+	  (planSummary as any).consistencyStatus = consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade;
 
   const generatedAt = nowIso();
   const tailFrameSourceHash = tailFrameSourceHashForInput;
@@ -1963,10 +2249,13 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     originalPrompt: tailFrameBasePromptContent,
     mode: 'structured_v1' as const,
     status: 'ready' as const,
-    planSummary,
-    safetyAudit: result.safetyAudit,
-    visualAnchorDescription: result.visualAnchorDescription,
-    generatedAt,
+	    planSummary,
+	    safetyAudit: result.safetyAudit,
+	    visualAnchorDescription: result.visualAnchorDescription,
+	    consistencyCheck,
+	    consistencyAttempts,
+	    consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	    generatedAt,
     shotIndices: generationShotIndices,
     sourceHash: tailFrameSourceHash,
     referenceStatus: 'ready' as const,
@@ -1977,8 +2266,26 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     while (sbs.length <= groupIdx) sbs.push({});
     const prev = sbs[groupIdx] || {};
+    const freshShots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+      mode: 'single-shot-strict',
+      explicitShotIndices: generationShotIndices,
+    });
+    const firstShotForWrite = freshShots[freshShotIndices[0]];
+    const tailFramePlanSummaryForWrite = {
+      ...planSummary,
+      shotIndices: freshShotIndices,
+    };
+    const frameTailForWrite = {
+      ...frameTail,
+      planSummary: tailFramePlanSummaryForWrite,
+      shotIndices: freshShotIndices,
+    };
     sbs[groupIdx] = {
       ...prev,
+      idx: groupIdx,
+      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
+      shotIndices: freshShotIndices,
       tailFrameHistory: nextTailFrameHistory(prev.tailFrameHistory, previousTailFrameHistoryItem, {
         excludeUrls: [result.url],
       }),
@@ -1986,16 +2293,19 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       tailFramePrompt: result.submittedPrompt,
       originalTailFramePrompt: tailFrameBasePromptContent,
       tailFrameMode: 'structured_v1',
-      tailFrameSafetyAudit: result.safetyAudit,
-      tailFramePlanSummary: planSummary,
+	      tailFrameSafetyAudit: result.safetyAudit,
+	      tailFrameConsistencyCheck: consistencyCheck,
+	      tailFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+		      tailFramePlanSummary: tailFramePlanSummaryForWrite,
       tailFrameLastError: undefined,
       tailFrameFailedAt: undefined,
       tailFrameIntent: 'requested',
       tailFrameIntentUpdatedAt: generatedAt,
       tailFrameSourceHash,
       tailFrameReferenceStatus: 'ready',
-      frames: { ...(prev.frames || {}), tail: frameTail },
+      frames: { ...(prev.frames || {}), tail: frameTailForWrite },
     };
+    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards: sbs }, 'tail-frame-image-writeback');
     return { storyboards: sbs };
   });
 
@@ -2025,8 +2335,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       tailFrameMode: 'structured_v1',
       shotIndices: generationShotIndices,
       tailFramePrompt: result.submittedPrompt,
-      tailFrameSafetyAudit: result.safetyAudit,
-      tailFramePlanSummary: planSummary,
+	      tailFrameSafetyAudit: result.safetyAudit,
+	      tailFrameConsistencyCheck: consistencyCheck,
+	      tailFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	      tailFramePlanSummary: planSummary,
       tailFrameIntent: 'requested',
       tailFrameIntentUpdatedAt: generatedAt,
       tailFrameSourceHash,
@@ -2042,8 +2354,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       shotIndices: generationShotIndices,
       tailFramePrompt: result.submittedPrompt,
       originalTailFramePrompt: tailFrameBasePromptContent,
-      tailFrameSafetyAudit: result.safetyAudit,
-      tailFramePlanSummary: planSummary,
+	      tailFrameSafetyAudit: result.safetyAudit,
+	      tailFrameConsistencyCheck: consistencyCheck,
+	      tailFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	      tailFramePlanSummary: planSummary,
       tailFrameIntent: 'requested',
       tailFrameIntentUpdatedAt: generatedAt,
       tailFrameSourceHash,
@@ -2094,7 +2408,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 
   // 提示词来源优先：sb.videoPrompt（视频提示词页生成的）→ shot.imagePrompt → shot.visual
   const shots = (proj as any).shots || [];
-  const shot = shots[groupIdx] || {};
+  // 段首镜头作为代表镜头/视觉兜底；合并段 shots[groupIdx] 不是本段镜头，按 sb.shotIndices[0] 取段首。1:1 等价。
+  const _firstShotIdxForSeg = Array.isArray(sb?.shotIndices) && sb.shotIndices.length ? Number(sb.shotIndices[0]) : groupIdx;
+  const shot = shots[_firstShotIdxForSeg] || {};
   const _shotVisual = shot.visual || shot.description || shot.desc || '';
   let videoPromptSource: VideoGenerationPlan['promptAudit']['sourcePrompt']['source'] = sb.videoPrompt
     ? 'storyboard.videoPrompt'
@@ -2113,6 +2429,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     mode: 'single-shot-strict',
     explicitShotIndices: ctx.target.shotIndices,
   });
+  // P4#5：合并段（一段含多镜头）恒走参考模式、无尾锚点。显式短路尾帧/结尾约束，
+  // 不再依赖"恰好没生成尾帧"的间接规避，防 slot 残留或手动尾帧泄漏出结尾约束。
+  // length>1 只在 flag ON 时才可能出现（合并 slot 仅 flag ON 建），故无需再查 flag。
+  const isMergedSegment = Array.isArray(groupShotIndices) && groupShotIndices.length > 1;
 	  if (!sb.videoPrompt) {
 	    const firstGroupShot = shots[groupShotIndices[0]] || shot || {};
 	    const firstGroupVisual = firstGroupShot.visual || firstGroupShot.description || firstGroupShot.desc || '';
@@ -2129,9 +2449,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	  }
 	  const sanitizedFor: string[] = [];
 
-  const groupShotsForPlan = groupShotIndices.map((si) => shots[si]).filter(Boolean);
-  const plannedDurationSec = plannedDurationFromShots(groupShotsForPlan);
-  const videoCfg = resolveLLMConfig(ctx.user, 'video');
+	  const plannedDurationSec = plannedDurationForSegment(shots, groupShotIndices);
+	  let shotPlan = buildSegmentShotPlan(shots, groupShotIndices);
+	  const videoCfg = resolveLLMConfig(ctx.user, 'video');
   const videoCfgIsGrok = /^grok-video/i.test(videoCfg.model || '');
   const videoCfgIsVolcano =
     /volces\.com|volcengine|ark\.cn-/i.test(videoCfg.baseUrl || '') ||
@@ -2139,89 +2459,22 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 
   // durationSec 是给视频模型的请求时长：源头来自镜头表计划时长，只做模型固定时长/
   // 供应商最小时长适配，不再按台词字数压到 5s / 10s 档位。
-  const durationSec = resolveGenerationDurationSec({
-    plannedDurationSec,
-    model: videoCfg.model,
-    baseUrl: videoCfg.baseUrl,
-    minDurationSec: videoCfg.minDurationSec,
-  });
+  // 后续 tempoBudget.safeDurationSec 只影响生成请求，不进入剪辑时间线。
+	  let durationSec = resolveGenerationDurationSec({
+	    plannedDurationSec,
+	    model: videoCfg.model,
+	    baseUrl: videoCfg.baseUrl,
+	    minDurationSec: videoCfg.minDurationSec,
+	  });
 
-  // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给视频模型
-  // —— 视频提示词页 LLM 经常把对话遗漏/改写，这里直接从源头数据拿。
-  //
-  // 用户反馈："角色说词的时候有把自己名字念出来的 比如老板 明天翻倍"——
-  // shot.dialogue 在 DB 里存的是 "老板：'明天目标，客单翻倍。'" 这种
-  // "说话人：内容" 格式，直接当台词送 Seedance，模型把"老板"也读出来了。
-  // 这里拆成 { speaker, text }：speaker 给 video-gen 当"指定说话人"元信息
-  // （用于选音色/口型），text 才是实际念出来的台词。
-  const dialoguePairs: Array<{ speaker: string; text: string }> = [];
-  // 按"角色名："anchor 切：先用 RegExp.exec 收集所有 speaker 出现位置，
-  // 然后取每两个 speaker 之间的内容作为 text（最后一个 speaker 取到 raw 末尾）。
-  // 旧的"一个大正则一次匹配整段"写法在多句对白里只会匹配最后一句（lookahead lazy bug）。
-  function parseDialogue(raw: string): Array<{ speaker: string; text: string }> {
-    if (!raw) return [];
-    // 角色名 = 最多 24 个非冒号/空白/引号的字符（涵盖中英文、长称谓）。
-    // 字符类用 \u 转义去重：之前字面量引号在多次保存后被规范成 ASCII 引号重复塞进去，
-    // 实际只排除了一两种引号，且 12 字符上限对"XX帝王蟹队长长官大人"之类的长称谓会掉。
-    const SPEAKER_RE = /([^：:\s“”‘’"'「」『』]{1,24})[：:]/g;
-    const anchors: Array<{ speaker: string; textStart: number }> = [];
-    let m: RegExpExecArray | null;
-    while ((m = SPEAKER_RE.exec(raw)) !== null) {
-      anchors.push({ speaker: m[1].trim(), textStart: m.index + m[0].length });
-    }
-    if (anchors.length === 0) {
-      // 没识别出"角色:" 模式，整段作为旁白
-      return [{ speaker: '', text: raw.trim() }];
-    }
-    const pairs: Array<{ speaker: string; text: string }> = [];
-    for (let i = 0; i < anchors.length; i++) {
-      const cur = anchors[i];
-      // 下一个 speaker 在 raw 里的起始位置 = 它的 anchor 字符串前
-      const nextStart =
-        i + 1 < anchors.length
-          ? // 下一个 anchor 的"角色名+冒号"在原文里的起始位置
-            anchors[i + 1].textStart - anchors[i + 1].speaker.length - 1
-          : raw.length;
-      let text = raw.slice(cur.textStart, nextStart).trim();
-      // 去除首尾的引号 / 全角引号
-      text = text
-        .replace(/^[「『""''""''『]+/, '')
-        .replace(/[」』""''""''』]+$/, '')
-        .trim();
-      if (text) pairs.push({ speaker: cur.speaker, text });
-    }
-    return pairs;
-  }
-  for (const si of groupShotIndices) {
-    const sh = shots[si];
-    if (!sh) continue;
-    const raw = String(sh.dialogue || sh.scriptRef || '').trim();
-    if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-    const parsed = parseDialogue(raw);
-    for (const p of parsed) dialoguePairs.push(p);
-  }
-  // 注意：用户明确要求"台词一个字都不能少"，这里不做任何截断/改写/压缩。
-  // 台词字数只用于质量提醒，不再反向决定视频时长。
-  const dialogueCharSum = cleanDialogueCharCount(dialoguePairs);
-  const dialogueBudget = evaluateDialogueBudget(dialogueCharSum, plannedDurationSec);
-  const dialogueWarning = dialogueBudget.level === 'soft_warning'
-    ? {
-        key: 'dialogue_budget_warning',
-        level: 'warn',
-        message: dialogueBudget.message || `本组台词 ${dialogueCharSum} 字，可能语速偏快。`,
-        dialogueChars: dialogueCharSum,
-        durationSec,
-      }
-    : null;
-  const videoWarnings: any[] = [dialogueWarning].filter(Boolean);
-  console.log(
-    `[video_segments] group ${groupIdx} 计划 ${plannedDurationSec}s，台词 ${dialogueCharSum} 字 → ` +
-      `请求 ${durationSec}s 视频（${dialoguePairs.length} 句台词）` +
-      (dialogueWarning ? `；${dialogueWarning.message}` : ''),
-  );
+	  // 收集本组所有 shot 的台词（dialogue / scriptRef），强制传给视频模型。
+	  // 共享解析器只拆 speaker/text，不截断、不改写台词。
+	  const dialoguePairs = collectSegmentDialoguePairs(shots, groupShotIndices);
+	  const dialogueCharSum = cleanDialogueCharCount(dialoguePairs);
+	  const videoWarnings: any[] = [];
 
   // 前端 batchOpts.ratio：'16:9' / '9:16' / '1:1' / '21:9' / '4:3' / '3:4'
-  const userRatio = normalizeVideoRatio((ctx.options as any)?.ratio, proj);
+  const userRatio = resolveVideoAspectRatio(proj, (ctx.options as any)?.ratio);
   const videoResolution = normalizeSeedanceResolution((ctx.options as any)?.resolution || (ctx.options as any)?.quality);
   const generateAudio = normalizeGenerateAudio((ctx.options as any)?.generateAudio ?? (ctx.options as any)?.genAudio, true);
 
@@ -2243,10 +2496,8 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const multiRefMode = isMultiRefVideoModeEnabled();
   const configuredVideoSubmitMode = getVideoSubmitMode();
   const requestedVideoSubmitMode = normalizeVideoSubmitMode((ctx.options as any)?.submitMode, configuredVideoSubmitMode);
-  const independentMultiImageMode =
-    multiRefMode &&
-    isIndependentMultiImageModeEnabled() &&
-    requestedVideoSubmitMode === 'reference_images';
+  const independentMultiImageCapable = multiRefMode && isIndependentMultiImageModeEnabled();
+  let independentMultiImageMode = false;
   const adminAllowsFirstLast = isFirstLastFrameVideoModeEnabled();
   warnIfFirstLastConfigIgnored({ configuredSubmitMode: configuredVideoSubmitMode, adminAllowsFirstLast });
   const firstLastFrameVideoEnabled = computeFirstLastFeatureEnabled({
@@ -2256,12 +2507,14 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   });
   const rawTargetEndStrategy = resolveTargetEndStrategy(videoCfg);
   const targetEndStrategy =
-    rawTargetEndStrategy === 'caption' && !isTailFrameCaptionFallbackEnabled()
+    isMergedSegment
+      ? 'unsupported'
+      : rawTargetEndStrategy === 'caption' && !isTailFrameCaptionFallbackEnabled()
       ? 'unsupported'
       : rawTargetEndStrategy;
   console.log(
     `[video_segments] group ${groupIdx} flags: ` +
-      `multiRef=${multiRefMode} independentMultiImage=${independentMultiImageMode} ` +
+      `multiRef=${multiRefMode} independentMultiImageCapable=${independentMultiImageCapable} ` +
       `hasFirstFrame=${hasFirstFrame} submitMode=${requestedVideoSubmitMode} ` +
       `envIndependent=${String(process.env.ORIGIN_INDEPENDENT_MULTI_IMAGE_MODE || '') || 'default'}`,
   );
@@ -2304,7 +2557,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   let characterReferencePanels: CharacterReferencePanel[] = [];
   let propReferencePaths: string[] = [];
   let targetEndUnsupportedReason: string | undefined;
-  const tailFrameUrl = String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
+  const tailFrameUrl = isMergedSegment ? '' : String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
   const tailFrameLocalPath = tailFrameUrl ? (resolveLocalImagePath(tailFrameUrl, ctx.user.id) || undefined) : undefined;
   const tailCaption = sb?.frames?.tail?.caption;
   let targetEndCaption =
@@ -2346,29 +2599,11 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     groupShotIndices,
     groupIdx,
     ownerId: ctx.user.id,
-    storyboardImageUrl: sbImageUrl || null,
+    storyboardImageUrl: resolvedFirstFrameUrl || null,
   });
   referenceImageBudget = canonicalRefs.budget || VIDEO_REFERENCE_IMAGE_BUDGET;
   let manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
   const canonicalFirstFrame = manifestInImageOrder.find((ref) => ref.role === 'first_frame');
-  if (independentMultiImageMode && !canonicalFirstFrame?.localPath) {
-    throw errorWithFailureStage(
-      `片段 ${groupIdx + 1} 首帧参考图缺失或无法解析为本地文件，已阻止视频生成。` +
-        `请先重新生成该片段首帧，再生成视频。`,
-      'preflight_missing_first_frame',
-    );
-  }
-  if (tailFrameUrl && targetEndStrategy === 'image' && !independentMultiImageMode) {
-    targetEndUnsupportedReason = 'independent_multi_image_mode_disabled';
-  } else if (tailFrameUrl && targetEndStrategy === 'image' && !tailFrameLocalPath) {
-    targetEndUnsupportedReason = 'tail_frame_file_unresolvable';
-  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !tailFrameLocalPath) {
-    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_file_unresolvable';
-  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !targetEndCaption) {
-    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_caption_missing';
-  } else if (tailFrameUrl && targetEndStrategy === 'unsupported') {
-    targetEndUnsupportedReason = 'provider_target_end_unsupported';
-  }
   if (refreshedTailCaption) {
     patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
       if (!fresh) return null;
@@ -2406,7 +2641,71 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 
   const firstFrameItem = manifestInImageOrder.find((ref) => ref.role === 'first_frame' && ref.localPath);
   if (firstFrameItem?.localPath) referenceImagePath = firstFrameItem.localPath;
-  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
+  const videoCapability = resolveVideoModelCapability(videoCfg.model);
+  const payloadDecision: VideoPayloadDecision = resolveVideoPayloadDecision({
+    submitMode: requestedVideoSubmitMode,
+    firstLastFeatureEnabled: firstLastFrameVideoEnabled,
+    tailIntentRequested: sb?.tailFrameIntent === 'requested',
+    capabilityFirstLastSupported: videoCapability.firstLastFrameMode === 'supported',
+    firstFramePath: referenceImagePath,
+    tailFramePath: tailFrameLocalPath,
+    tailFrameUrl,
+    tailReferenceStatus: String(sb?.tailFrameReferenceStatus || '').toLowerCase(),
+    multiShotSegment: groupShotIndices.length > 1,
+  });
+  if (payloadDecision.hardFail) {
+    throw errorWithFailureStage(
+      payloadDecision.failureMessage || '视频生成前置条件不满足。',
+      payloadDecision.failureCode === 'preflight_missing_first_frame'
+        ? 'preflight_missing_first_frame'
+        : 'preflight_video_prompt_not_ready',
+    );
+  }
+  const firstLastFrameMode = payloadDecision.firstLastFrameMode;
+  const payloadModeDecision = payloadDecision.payloadMode;
+  const payloadModeReason = payloadDecision.reason;
+  const effectiveSubmitStrategy =
+    isMergedSegment && payloadDecision.reason === 'reference_images'
+      ? 'reference_images'
+      : requestedVideoSubmitMode;
+  independentMultiImageMode = independentMultiImageCapable && effectiveSubmitStrategy === 'reference_images';
+  if (payloadDecision.warning) videoWarnings.push(payloadDecision.warning);
+  if (independentMultiImageMode && !canonicalFirstFrame?.localPath) {
+    throw errorWithFailureStage(
+      `片段 ${groupIdx + 1} 首帧参考图缺失或无法解析为本地文件，已阻止视频生成。` +
+        `请先重新生成该片段首帧，再生成视频。`,
+      'preflight_missing_first_frame',
+    );
+  }
+  if (tailFrameUrl && targetEndStrategy === 'image' && !independentMultiImageMode) {
+    targetEndUnsupportedReason = 'independent_multi_image_mode_disabled';
+  } else if (tailFrameUrl && targetEndStrategy === 'image' && !tailFrameLocalPath) {
+    targetEndUnsupportedReason = 'tail_frame_file_unresolvable';
+  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !tailFrameLocalPath) {
+    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_file_unresolvable';
+  } else if (tailFrameUrl && targetEndStrategy === 'caption' && !targetEndCaption) {
+    targetEndUnsupportedReason = targetEndUnsupportedReason || 'tail_frame_caption_missing';
+	  } else if (tailFrameUrl && targetEndStrategy === 'unsupported') {
+	    targetEndUnsupportedReason = 'provider_target_end_unsupported';
+	  }
+	  const tempoBudget = computeSegmentTempoBudget({
+	    dialoguePairs,
+	    plannedDurationSec,
+	    durationSec,
+	    shotPlan,
+	    payloadMode: payloadModeDecision,
+	    payloadModeReason,
+	    tailReferenceStatus: String(sb?.tailFrameReferenceStatus || sb?.frames?.tail?.referenceStatus || ''),
+	  });
+		  const requestedDurationSec = durationSec;
+		  // safeDurationSec 是生成请求保护值；剪辑导入仍以真实 videoDurationSec / EDL 为准。
+		  durationSec = tempoBudget.safeDurationSec;
+	  shotPlan = buildEffectiveShotPlanForDuration(shotPlan, durationSec);
+	  console.log(
+	    `[video_segments] group ${groupIdx} 计划 ${plannedDurationSec}s，台词 ${dialogueCharSum} 字 → ` +
+	      `请求 ${durationSec}s 视频（原始 ${requestedDurationSec}s，预算 ${tempoBudget.requiredRawSec}s，${dialoguePairs.length} 句台词）`,
+	  );
+	  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
   sceneReferencePath = sceneItem?.localPath || undefined;
   sceneReferenceLabel = sceneItem?.assetName || sceneItem?.label || sceneReferenceLabel;
   sceneReferenceHint = sceneItem?.promptHint || sceneReferenceHint;
@@ -2438,6 +2737,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       assetName: ref.assetName,
       label: ref.label,
       promptHint: ref.promptHint,
+      useFor: ref.useFor,
+      immutable: ref.immutable,
+      panelInfo: ref.panelInfo,
+      referenceBrief: ref.referenceBrief || buildReferenceBriefLine(ref, manifestInImageOrder),
       priority: ref.priority || ref.score,
     });
   }
@@ -2506,51 +2809,18 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       `dialoguePairs=${dialoguePairs.length} prev=${!!prevTailSummary} next=${!!nextHeadSummary}`,
   );
 
-		  const firstVideoWarning = dialogueWarning;
-		  if (firstVideoWarning) {
-		    ctx.progress({
-		      stage: 'quality_warning',
-		      durationSec,
-		      plannedDurationSec,
-		      warning: firstVideoWarning,
-		      videoWarnings,
-		      hint: firstVideoWarning.message,
-		    });
-		  }
+	  const seedanceImageMode: VideoGenInput['seedanceImageMode'] =
+    effectiveSubmitStrategy === 'reference_images' ? 'reference_images' : 'strict_first_frame';
 
-  const videoCapability = resolveVideoModelCapability(videoCfg.model);
-  const payloadDecision: VideoPayloadDecision = resolveVideoPayloadDecision({
-    submitMode: requestedVideoSubmitMode,
-    firstLastFeatureEnabled: firstLastFrameVideoEnabled,
-    tailIntentRequested: sb?.tailFrameIntent === 'requested',
-    capabilityFirstLastSupported: videoCapability.firstLastFrameMode === 'supported',
-    firstFramePath: referenceImagePath,
-    tailFramePath: tailFrameLocalPath,
-    tailFrameUrl,
-    tailReferenceStatus: String(sb?.tailFrameReferenceStatus || '').toLowerCase(),
-  });
-  if (payloadDecision.hardFail) {
-    throw errorWithFailureStage(
-      payloadDecision.failureMessage || '视频生成前置条件不满足。',
-      payloadDecision.failureCode === 'preflight_missing_first_frame'
-        ? 'preflight_missing_first_frame'
-        : 'preflight_video_prompt_not_ready',
-    );
-  }
-  const firstLastFrameMode = payloadDecision.firstLastFrameMode;
-  const payloadModeDecision = payloadDecision.payloadMode;
-  const payloadModeReason = payloadDecision.reason;
-	  if (payloadDecision.warning) videoWarnings.push(payloadDecision.warning);
-  const seedanceImageMode: VideoGenInput['seedanceImageMode'] =
-    requestedVideoSubmitMode === 'reference_images' ? 'reference_images' : 'strict_first_frame';
-
-  const videoInput = {
-    prompt,
-    ratio: userRatio,
-    resolution: videoResolution,
-    generateAudio,
-	    durationSec,
-	    projectId: ctx.projectId,
+	  const videoInput = {
+	    prompt,
+	    ratio: userRatio,
+	    resolution: videoResolution,
+		    generateAudio,
+			    durationSec,
+	        shotPlan,
+	        tempoBudget,
+			    projectId: ctx.projectId,
 	    groupIdx,
     videoPromptSourceHash: String(sb?.videoPromptSourceHash || '') || null,
 	    idempotencyKey: ctx.idempotencyKey,
@@ -2592,9 +2862,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     groupIdx,
     groupShotIndices,
     submitMode: requestedVideoSubmitMode,
-    payloadMode: payloadModeDecision,
-    modeReason: payloadModeReason,
-    videoPromptSource,
+	    payloadMode: payloadModeDecision,
+	    modeReason: payloadModeReason,
+	    tempoBudget,
+	    videoPromptSource,
     sanitizedFor,
     finalPrompt: {
       preview: plannedFinalPrompt.slice(0, 500),
@@ -2621,24 +2892,119 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       provider: videoCfg.provider || (videoCfgIsGrok ? 'grok' : videoCfgIsVolcano ? 'seedance' : videoCfg.mode),
       model: videoCfg.model,
       filledAfterCall: false,
-    },
-  });
+	    },
+	  });
 
-  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+	  if (tempoBudget.exceedsMaxDuration) {
+	    const blockedWarnings = mergeVideoWarnings(videoWarnings, [buildTailRushedWarning(tempoBudget)]);
+	    videoPlan = buildVideoPlanSnapshot({
+	      projectId: ctx.projectId,
+	      groupIdx,
+	      groupShotIndices,
+	      submitMode: requestedVideoSubmitMode,
+	      payloadMode: payloadModeDecision,
+	      modeReason: payloadModeReason,
+	      tempoBudget,
+	      videoPromptSource,
+	      sanitizedFor,
+	      finalPrompt: {
+	        preview: plannedFinalPrompt.slice(0, 500),
+	        hash: hashString(plannedFinalPrompt),
+	        length: plannedFinalPrompt.length,
+	      },
+	      dialoguePolicy: 'budget_check_only',
+	      references: planReferencesFromManifest(manifestInImageOrder),
+	      droppedReferences: [
+	        ...(Array.isArray(sb.videoReferenceDropped) ? sb.videoReferenceDropped : []),
+	        ...canonicalRefs.droppedReferences,
+	      ],
+	      prompt,
+	      userRatio,
+	      resolution: videoResolution,
+	      generateAudio,
+	      durationSec,
+	      plannedDurationSec,
+	      videoWarnings: blockedWarnings,
+	      dialogueChars: cleanDialogueCharCount(dialoguePairs),
+	      status: 'failed',
+	      failureStage: 'preflight_video_prompt_not_ready',
+	      errorMsg: TAIL_RUSHED_WARNING_MESSAGE,
+	      modelSnapshot: {
+	        modelRole: 'video',
+	        provider: videoCfg.provider || (videoCfgIsGrok ? 'grok' : videoCfgIsVolcano ? 'seedance' : videoCfg.mode),
+	        model: videoCfg.model,
+	        filledAfterCall: false,
+	      },
+	    });
+	    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+	      if (!fresh) return null;
+	      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
+	      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+	      if (groupIdx >= shots.length) return null;
+	      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+	      const sb = storyboards[groupIdx] || {};
+		      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
+		        mode: 'single-shot-strict',
+		        explicitShotIndices: groupShotIndices,
+		      });
+		      const firstShotForWrite = shots[freshShotIndices[0]];
+		      videoTasks[groupIdx] = {
+		        ...(videoTasks[groupIdx] || {}),
+		        groupIdx,
+		        shotIndices: freshShotIndices,
+		        status: 'failed',
+	        errorCode: 'video_duration_budget_blocked',
+	        errorMsg: TAIL_RUSHED_WARNING_MESSAGE,
+	        durationSec,
+	        plannedDurationSec,
+	        tempoBudget,
+	        prompt,
+	        warnings: blockedWarnings,
+	        videoPlan,
+	        isCurrent: false,
+	      };
+	      storyboards[groupIdx] = {
+		        ...sb,
+		        idx: groupIdx,
+		        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
+		        shotIndices: freshShotIndices,
+	        videoWarnings: blockedWarnings,
+	        videoIsCurrent: false,
+	      };
+	      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-segment-budget-blocked');
+	      return { videoTasks, storyboards };
+	    });
+	    const err = errorWithFailureStage(TAIL_RUSHED_WARNING_MESSAGE, 'preflight_video_prompt_not_ready') as Error & {
+	      errorCode?: string;
+	      groupIdx?: number;
+	      videoWarnings?: any[];
+	    };
+	    err.errorCode = 'video_duration_budget_blocked';
+	    err.groupIdx = groupIdx;
+	    err.videoWarnings = blockedWarnings;
+	    throw err;
+	  }
+
+	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
     const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
     if (groupIdx >= shots.length) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
-    storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], { mode: 'single-shot-strict' });
+    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], {
+      mode: 'single-shot-strict',
+      explicitShotIndices: groupShotIndices,
+    });
 	    videoTasks[groupIdx] = {
 	      ...(videoTasks[groupIdx] || {}),
 	      groupIdx,
-		      status: 'submitting',
+	      shotIndices: freshShotIndices,
+	      status: 'submitting',
 		      prompt,
-		      durationSec,
-		      plannedDurationSec,
-		      warnings: videoWarnings,
+			      durationSec,
+			      plannedDurationSec,
+			      tempoBudget,
+			      warnings: videoWarnings,
 	      videoPlan,
 	      consistency: {
 	        ...((videoTasks[groupIdx] || {}).consistency || {}),
@@ -2694,7 +3060,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	          const pendingVideoWarnings = mergeVideoWarnings(
 	            videoWarnings,
 	            videoWarningsFromAuditRefs(result.videoAudit?.referenceImages || []),
-	            result.videoAudit?.fallbackReason ? [{ message: `reference fallback: ${result.videoAudit.fallbackReason}` }] : [],
+	            videoFallbackWarnings(result.videoAudit?.fallbackReason),
 	          );
 	          return {
 	            extra: {
@@ -2703,9 +3069,10 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
               providerTaskId: result.providerTaskId,
               taskId: result.taskId,
 	              groupIdx,
-	              durationSec: result.durationSec,
-	              plannedDurationSec,
-	              videoWarnings: pendingVideoWarnings,
+		              durationSec: result.durationSec,
+		              plannedDurationSec,
+		              tempoBudget,
+		              videoWarnings: pendingVideoWarnings,
 	            },
 	          };
 	        }
@@ -2728,17 +3095,18 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 			    const mergedVideoWarnings = mergeVideoWarnings(
 			      videoWarnings,
 			      videoWarningsFromAuditRefs(failureAudit?.referenceImages || []),
-			      failureAudit?.fallbackReason ? [{ message: `reference fallback: ${failureAudit.fallbackReason}` }] : [],
+			      videoFallbackWarnings(failureAudit?.fallbackReason),
 			    );
 			    videoPlan = buildVideoPlanSnapshot({
 		      projectId: ctx.projectId,
 		      groupIdx,
 		      groupShotIndices,
           submitMode: requestedVideoSubmitMode,
-          payloadMode: payloadModeDecision,
-          modeReason: payloadModeReason,
-          planAuditPayloadModeMismatch,
-		      videoPromptSource,
+	          payloadMode: payloadModeDecision,
+	          modeReason: payloadModeReason,
+	          planAuditPayloadModeMismatch,
+	          tempoBudget,
+			      videoPromptSource,
 		      sanitizedFor,
 		      finalPrompt: {
 		        preview: failureAudit?.finalPromptPreview || videoPlan.promptAudit.finalPrompt.preview,
@@ -2773,19 +3141,32 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
 		      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
 		      if (groupIdx >= shots.length) return null;
-		      const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
-		      storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], { mode: 'single-shot-strict' });
-		      videoTasks[groupIdx] = {
-		        ...(videoTasks[groupIdx] || {}),
-		        groupIdx,
-		        taskId: vgErr?.taskId || videoTasks[groupIdx]?.taskId,
+			      const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
+			      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], {
+			        mode: 'single-shot-strict',
+			        explicitShotIndices: groupShotIndices,
+			      });
+			      videoTasks[groupIdx] = {
+			        ...(videoTasks[groupIdx] || {}),
+			        groupIdx,
+			        shotIndices: freshShotIndices,
+			        taskId: vgErr?.taskId || videoTasks[groupIdx]?.taskId,
 			        status: 'failed',
 			        errorMsg: errMsg.slice(0, 500),
-			        durationSec,
-			        plannedDurationSec,
-			        prompt,
+				        durationSec,
+				        plannedDurationSec,
+				        tempoBudget,
+				        prompt,
 			        warnings: mergedVideoWarnings,
 		        videoPlan,
+		        videoAudit: failureAudit
+		          ? {
+		              payloadMode: failureAudit.payloadMode,
+		              modeReason: failureAudit.modeReason,
+		              capabilityVerifiedAt: failureAudit.capabilityVerifiedAt,
+		              referenceImages: compactVideoAuditReferenceImages(failureAudit.referenceImages || []),
+		            }
+		          : undefined,
 		        isCurrent: true,
 		      };
 		      maybeAssertStoryboardsAlignedWithShots({ ...fresh, videoTasks }, 'video-segment-failure-writeback');
@@ -2808,20 +3189,22 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 				  const planReferences: ReferenceManifestItem[] = actualAuditRefs.length
 				    ? planReferencesFromAuditRefs(actualAuditRefs)
 				    : planReferencesFromManifest(manifestInImageOrder);
-	      const mergedVideoWarnings = mergeVideoWarnings(
-	        videoWarnings,
-	        videoWarningsFromAuditRefs(actualAuditRefs),
-	        result.videoAudit?.fallbackReason ? [{ message: `reference fallback: ${result.videoAudit.fallbackReason}` }] : [],
-	      );
+		      const mergedVideoWarnings = mergeVideoWarnings(
+		        videoWarnings,
+		        videoWarningsFromAuditRefs(actualAuditRefs),
+		        videoFallbackWarnings(result.videoAudit?.fallbackReason),
+		        result.videoWarnings || [],
+		      );
 			  videoPlan = buildVideoPlanSnapshot({
 		    projectId: ctx.projectId,
 		    groupIdx,
 		    groupShotIndices,
         submitMode: requestedVideoSubmitMode,
-        payloadMode: payloadModeDecision,
-        modeReason: payloadModeReason,
-        planAuditPayloadModeMismatch,
-		    videoPromptSource,
+	        payloadMode: payloadModeDecision,
+	        modeReason: payloadModeReason,
+	        planAuditPayloadModeMismatch,
+	        tempoBudget,
+			    videoPromptSource,
 		    sanitizedFor,
 		    finalPrompt: {
 		      preview: result.videoAudit?.finalPromptPreview || plannedFinalPrompt.slice(0, 500),
@@ -2846,9 +3229,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 				    userRatio,
             resolution: videoResolution,
             generateAudio,
-				    durationSec: result.durationSec,
-			    plannedDurationSec,
-				    videoWarnings: mergedVideoWarnings,
+					      durationSec: result.durationSec,
+				      plannedDurationSec,
+						      videoWarnings: mergedVideoWarnings,
 		    dialogueChars: cleanDialogueCharCount(dialoguePairs),
 		    status: 'completed',
 		    modelSnapshot: result.videoAudit
@@ -2870,28 +3253,35 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     if (groupIdx >= shots.length) return null;
     const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     const sb = sbs[groupIdx];
-    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, { mode: 'single-shot-strict' });
-		    videoTasks[groupIdx] = {
-		      groupIdx,
-		      taskId: result.taskId,
+	    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
+	      mode: 'single-shot-strict',
+	      explicitShotIndices: groupShotIndices,
+	    });
+	    const firstShotForWrite = shots[freshShotIndices[0]];
+			    videoTasks[groupIdx] = {
+			      groupIdx,
+			      shotIndices: freshShotIndices,
+			      taskId: result.taskId,
 		      status: 'completed',
 		      url: result.protectedUrl,
 		      coverUrl: result.coverUrl,
-				      durationSec: result.durationSec,
-				      plannedDurationSec,
-				      prompt,
-				      warnings: mergedVideoWarnings,
+					      durationSec: result.durationSec,
+					      plannedDurationSec,
+					      tempoBudget,
+					      prompt,
+					      warnings: mergedVideoWarnings,
 			      videoPlan,
 		      videoAudit: result.videoAudit
 		        ? {
 		            payloadMode: result.videoAudit.payloadMode,
 		            modeReason: result.videoAudit.modeReason,
-		            capabilityVerifiedAt: result.videoAudit.capabilityVerifiedAt,
-		            submittedLastFrameContentHash: result.videoAudit.submittedLastFrameContentHash,
-		            returnedLastFrameUrl: result.videoAudit.returnedLastFrameUrl,
-		            returnedLastFrameContentHash: result.videoAudit.returnedLastFrameContentHash,
-		          }
-		        : undefined,
+			            capabilityVerifiedAt: result.videoAudit.capabilityVerifiedAt,
+			            submittedLastFrameContentHash: result.videoAudit.submittedLastFrameContentHash,
+			            returnedLastFrameUrl: result.videoAudit.returnedLastFrameUrl,
+			            returnedLastFrameContentHash: result.videoAudit.returnedLastFrameContentHash,
+			            referenceImages: compactVideoAuditReferenceImages(result.videoAudit.referenceImages || []),
+			          }
+			        : undefined,
 		      consistency: {
 		        ...((videoTasks[groupIdx] || {}).consistency || {}),
 		        videoSegment: {
@@ -2909,15 +3299,15 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	    // videoDurationSec 是真实生成文件时长；plannedDurationSec 是镜头表计划时长。
 	    // 剪辑工作台优先用真实文件时长，避免生成结果比计划略长时出现时间线错位。
 	    sbs[groupIdx] = {
-	      ...sb,
-	      idx: groupIdx,
-	      shotIdx: groupIdx + 1,
-	      shotIndices: freshShotIndices,
+		      ...sb,
+		      idx: groupIdx,
+		      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
+		      shotIndices: freshShotIndices,
 	      videoUrl: result.protectedUrl,
 	      videoTaskId: result.taskId,
-	      videoDurationSec: result.durationSec,
-	      plannedDurationSec,
-	      videoWarnings,
+		      videoDurationSec: result.durationSec,
+		      plannedDurationSec,
+		      videoWarnings: mergedVideoWarnings,
 	      videoIsCurrent: true,
 	      videoInvalidatedAt: undefined,
 	      videoInvalidatedReason: undefined,
@@ -2941,11 +3331,12 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       mode: result.mode,
       groupIdx,
 	      durationSec: result.durationSec,
-	      plannedDurationSec,
-	      protectedUrl: result.protectedUrl,
-      videoWarnings,
-    },
-  };
+		      plannedDurationSec,
+		      protectedUrl: result.protectedUrl,
+	      tempoBudget,
+	      videoWarnings: mergedVideoWarnings,
+	    },
+	  };
 });
 
 /* ============================================================
@@ -2987,12 +3378,18 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
     };
   })();
 
-  ctx.progress({ stage: 'planning', percent: 18, hint: 'AI 正在分析剧本结构…' });
+	  ctx.progress({ stage: 'planning', percent: 18, hint: 'AI 正在分析剧本结构…' });
+  const projectForWorld = getProjectByIdForUser(ctx.projectId, ctx.user.id);
+  const worldContext = projectWorldContextForStage('shots_generate', (projectForWorld as any)?.worldTemplateSnapshot, {
+    project: projectForWorld,
+    scriptText: script,
+  });
   const messages = buildShotsMessages({
     script,
     styleBible,
     assets: slimAssets,
     totalDurationSec: durationSec || undefined,
+    worldContext,
   });
 
   ctx.progress({ stage: 'writing', percent: 45, hint: 'AI 正在生成镜头表（这一步比较慢，请耐心等）…' });
@@ -3041,124 +3438,15 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
     throw new Error('AI 未返回有效镜头列表（shots 字段为空）');
   }
 
-  /* ---------- 字段映射 / 兜底 ----------
-     前端读：duration / shotType / camera / visual / dialogue / keyInfo / audio / emotion / intensity / scriptRef / characters
-     LLM 偶尔回退到老 schema (durationSec/framing/movement/description/dialog/stylePillar)，
-     这里统一标准化。
-     注意：camera 必须保留 LLM 的细致词（如"缓慢推进"、"轻微推近"），
-     不能再强行吸附到下拉菜单里——前端 _buildSelectOptions 已经会把任意值
-     作为 option 加入，因此细致词可以原样显示。
-  ------------------------------------- */
-  const EMOTIONS = ['setup','rising','climax','falling','resolution','transition'];
-
-  // 只对"明显是老 schema 的粗词"做最小升级，其他值原样保留
-  const upgradeCamera = (raw: string): string => {
-    const map: Record<string, string> = {
-      '推': '推近',
-      '拉': '拉远',
-      '推镜头': '推近',
-      '拉镜头': '拉远',
-      '航拍': '升降',
-      '轨道': '跟随',
-      '固定机位': '固定镜头',
-      '手持': '手持轻晃',
-    };
-    return map[raw] || raw;
-  };
-  const upgradeShotType = (raw: string): string => {
-    const map: Record<string, string> = {
-      '广角全景': '大全景',
-      '广角': '大全景',
-    };
-    return map[raw] || raw;
-  };
-
-  const cleanStr = (...candidates: any[]): string => {
-    for (const c of candidates) {
-      if (c == null) continue;
-      const s = String(c).trim();
-      if (s) return s;
-    }
-    return '';
-  };
-
   const sceneSelectionAssets = slimAssets || assets || {};
-  shotsArr = shotsArr.map((sh, i) => {
-    const dur = Number(sh.duration ?? sh.durationSec ?? 4);
-    const visual = cleanStr(sh.visual, sh.description, sh.desc);
-    const dialogue = cleanStr(sh.dialogue, sh.dialog);
-    let keyInfo = cleanStr(sh.keyInfo, sh.key, sh.stylePillar);
-    // keyInfo 兜底：太长就只保留前 8 个字符（前端期望主题词）
-    if (keyInfo.length > 12) keyInfo = keyInfo.slice(0, 8);
-    const audio = cleanStr(sh.audio, sh.sfx);
-    const characters = Array.isArray(sh.characters)
-      ? sh.characters.filter((x: any) => typeof x === 'string' && x.trim()).map((x: string) => x.trim())
-      : [];
-    const intensityRaw = Number(sh.intensity);
-    const intensity = Number.isFinite(intensityRaw)
-      ? Math.max(1, Math.min(5, Math.round(intensityRaw)))
-      : 3;
-
-    const rawShotType = cleanStr(sh.shotType, sh.framing) || '中景';
-    const rawCamera = cleanStr(sh.camera, sh.movement) || '固定镜头';
-    const shotType = upgradeShotType(rawShotType);
-    const camera = upgradeCamera(rawCamera);
-    const duration = Math.max(2, Math.min(12, Number.isFinite(dur) ? dur : 4));
-    const finalDialogue = dialogue || '——';
-    const rawEmotion = cleanStr(sh.emotion);
-    const pickedScene = pickSceneForShots({
-      assets: sceneSelectionAssets,
-      shots: [sh],
-      text: [
-        sh.sceneId,
-        sh.sceneName,
-        sh.scene,
-        sh.location,
-        visual,
-        sh.description,
-        sh.desc,
-        sh.scriptRef,
-      ].filter(Boolean).join(' '),
-    });
-    const sceneId = cleanStr(pickedScene.scene?.id, pickedScene.scene?.sceneId, sh.sceneId);
-    const sceneName = cleanStr(
-      pickedScene.scene?.name,
-      pickedScene.scene?.sceneName,
-      pickedScene.scene?.location,
-      sh.sceneName,
-      sh.scene,
-      sh.location,
-    );
-
-    return {
-      idx: typeof sh.idx === 'number' && sh.idx > 0 ? sh.idx : i + 1,
-      sceneId,
-      sceneName,
-      scene: sceneName,
-      duration,
-      shotType,
-      camera,
-      visual,
-      dialogue: finalDialogue,
-      keyInfo,
-      audio,
-      emotion: EMOTIONS.includes(rawEmotion) ? rawEmotion : 'rising',
-      intensity,
-      scriptRef: cleanStr(sh.scriptRef),
-      characters,
-      tailFrameSignals: normalizeTailFrameSignals(sh, {
-        shotType,
-        camera,
-        dialogue: finalDialogue,
-        durationSec: duration,
-      }),
-    };
+  const generatedAt = nowIso();
+  const normalizedPlan = normalizeGeneratedShotPlan(shotsArr, {
+    assets: sceneSelectionAssets,
+    styleBible,
+    generatedAt,
   });
-
-  // 过滤掉完全空白的镜头（visual + dialogue 都没有）
-  shotsArr = shotsArr.filter(sh => sh.visual || (sh.dialogue && sh.dialogue !== '——'));
-  // 重新排 idx，避免过滤后跳号
-  shotsArr = shotsArr.map((sh, i) => ({ ...sh, idx: i + 1 }));
+  shotsArr = normalizedPlan.shots;
+  const planMeta = normalizedPlan.planMeta;
 
   if (!shotsArr.length) {
     throw new Error('AI 返回的镜头都没有内容，请稍后重试或换个剧本');
@@ -3194,10 +3482,11 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
     const completion = completeShotPlanGenerationPatch(fresh, {
       batchId: ctx.batchId,
       shots: shotsArr,
+      planMeta,
       storyboards,
       sourceSnapshot,
       sourceHash,
-      now: nowIso(),
+      now: generatedAt,
     });
     if (!completion.ok) {
       console.warn('[shots] skipped stale shot-plan completion write:', {
@@ -3224,7 +3513,7 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
   return {
     patch: { type: 'shots', value: shotsArr },
-    extra: { count: shotsArr.length, shotPlanStaleReasons: completionStaleReasons },
+    extra: { count: shotsArr.length, planMeta, shotPlanStaleReasons: completionStaleReasons },
   };
 });
 
@@ -3265,12 +3554,16 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	      startDecision = 'run_taken_by_other';
 	      return null;
 	    }
-	    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
-	    storyboards[groupIdx] = {
-	      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
-	      idx: groupIdx,
-	      shotIdx: groupIdx + 1,
-	      shotIndices: freshShotIndices,
+		    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
+		      mode: 'single-shot-strict',
+		      explicitShotIndices: shotIndices,
+		    });
+		    const firstShotForWrite = shots[freshShotIndices[0]];
+		    storyboards[groupIdx] = {
+		      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
+		      idx: groupIdx,
+		      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
+		      shotIndices: freshShotIndices,
 	      videoPromptStatus: 'generating',
 	      videoPromptRunId: promptRunId,
 	      videoPromptStartedAt: promptStartedAt,
@@ -3310,13 +3603,14 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    throw error;
 	  }
 
-  const groupShots = shotIndices.map((i) => shots[i]);
-  const promptGroupShots = sanitizePromptObject(groupShots);
+	  const groupShots = shotIndices.map((i) => shots[i]);
+	  const promptGroupShots = sanitizePromptObject(groupShots);
+	  const timelineStartSec = plannedTimelineStartFromGroups(plannedTimelineGroupsFromProject(proj), groupIdx);
 	  const styleBible = (proj as any).styleBible || {};
-  const assets = (proj as any).assets || {};
+	  const assets = (proj as any).assets || {};
 	  const promptStyleBible = sanitizePromptObject(styleBibleForVideoPrompt(styleBible));
-  const promptAssets = sanitizePromptObject(assets);
-  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
+	  const promptAssets = sanitizePromptObject(assets);
+	  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
   const referenceBuild = buildVideoReferenceManifest({
     project: proj,
     assets,
@@ -3331,15 +3625,21 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'preparing', percent: 10, hint: '准备镜头与资产上下文…' });
 
-  const messages = buildVideoPromptMessages({
-    shots: promptGroupShots,
-    styleBible: promptStyleBible,
-    assets: promptAssets,
-    narrations,
-    referenceManifest,
-    groupIdx,
-    totalGroups,
-  });
+	  const messages = buildVideoPromptMessages({
+		    shots: promptGroupShots,
+		    styleBible: promptStyleBible,
+		    assets: promptAssets,
+		    narrations,
+			    referenceManifest,
+			    groupIdx,
+			    totalGroups,
+			    timelineStartSec,
+			    planMeta: sanitizePromptObject((proj as any).planMeta || null),
+        worldContext: projectWorldContextForStage('video_prompt', (proj as any).worldTemplateSnapshot, {
+          project: proj,
+          target: { groupIdx, shotIndices },
+        }),
+			  });
 
   ctx.progress({ stage: 'calling_llm', percent: 35, hint: 'AI 正在写视频提示词…' });
 

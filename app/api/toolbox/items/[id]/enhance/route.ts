@@ -17,9 +17,18 @@ import {
 import { TOOLBOX_VIDEO_RUNNING_LIMIT } from '@/lib/toolbox-limits';
 import { assertToolboxImageRefPath } from '@/lib/toolbox-media';
 import {
+  AssetQuotaError,
+  assertCanStartAssetGeneration,
+  createGenerationBatch,
+  finishGenerationBatch,
+  recordGenerationFailure,
+} from '@/lib/asset-library';
+import {
   buildToolboxVideoPrompt,
   imageSizeForToolboxRatio,
   normalizeToolboxVideoRatio,
+  toolboxImageFriendlyError,
+  toolboxVideoFriendlyError,
   type ToolboxInputRef,
 } from '@/lib/toolbox-modes';
 
@@ -72,6 +81,12 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     if (balance.totalCredits < creditAmount) {
       return jsonError(`积分不足：本次需 ${creditAmount} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
     }
+    try {
+      assertCanStartAssetGeneration(user.id);
+    } catch (error: any) {
+      if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+      throw error;
+    }
     const itemId = randomUUID();
     try {
       chargeToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
@@ -98,6 +113,20 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       resultRefId: null,
       parentItemId: parent.id,
     });
+    const batchId = createGenerationBatch({
+      ownerId: user.id,
+      stage: 'toolbox_image',
+      requestedCount: 1,
+      contextSnapshot: {
+        route: 'api_toolbox_image_enhance',
+        itemId,
+        parentItemId: parent.id,
+        mode: parent.mode,
+        ratio: parentParams.ratio,
+        imageSize,
+      },
+      source: 'toolbox',
+    });
     try {
       const result = await generateImage(user, {
         prompt: parent.prompt,
@@ -107,7 +136,14 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
         kind: 'other',
         assetRef: `toolbox/${itemId}`,
         referenceImagePath: referencePath || undefined,
+        assetLibrary: {
+          batchId,
+          stage: 'toolbox_image',
+          source: 'toolbox',
+          makeCurrent: false,
+        },
       });
+      finishGenerationBatch(batchId, user.id);
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'completed',
         resultRefId: result.id,
@@ -116,10 +152,18 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
     } catch (error: any) {
       const message = String(error?.message || error || '图片重绘失败').slice(0, 1000);
+      console.error('[toolbox][image][enhance] failed', { mode: parent.mode, message });
+      recordGenerationFailure({
+        batchId,
+        ownerId: user.id,
+        failureReason: 'provider_error',
+        errorMessage: message,
+      });
+      finishGenerationBatch(batchId, user.id, 'failed');
       refundToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
       const updated = updateToolboxItem(item.id, user.id, {
         status: 'failed',
-        errorMessage: message,
+        errorMessage: toolboxImageFriendlyError(message),
       });
       return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
     }
@@ -181,44 +225,39 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     resultRefId: videoTaskId,
     parentItemId: parent.id,
   });
-  try {
-    const result = await generateVideo(user, {
-      taskId: videoTaskId,
-      prompt: buildToolboxVideoPrompt(parent.prompt, nextParams),
-      ratio: videoRatio,
-      resolution: '1080p',
-      durationSec: Number(nextParams.durationSec || 4),
-      referenceImagePath: firstFramePath,
-      referenceImageRole: 'first_frame',
-      seedanceImageMode: 'strict_first_frame',
-      firstLastFrameMode: tailFramePath
-        ? {
-          firstFramePath,
-          lastFramePath: tailFramePath,
-          modeReason: 'toolbox_enhance_first_last_frame',
-        }
-        : undefined,
-    });
-    if (result.status === 'completed') {
-      const updated = updateToolboxItem(item.id, user.id, {
-        status: 'completed',
-        errorMessage: null,
+  // 后台异步重绘：请求立即返回 running，完成/失败由后台回调回写并在失败时退款（保留既有产物逻辑，不改主线）。
+  void (async () => {
+    try {
+      const result = await generateVideo(user, {
+        taskId: videoTaskId,
+        prompt: buildToolboxVideoPrompt(parent.prompt, nextParams),
+        ratio: videoRatio,
+        resolution: '1080p',
+        durationSec: Number(nextParams.durationSec || 4),
+        referenceImagePath: firstFramePath,
+        referenceImageRole: 'first_frame',
+        seedanceImageMode: 'strict_first_frame',
+        firstLastFrameMode: tailFramePath
+          ? {
+            firstFramePath,
+            lastFramePath: tailFramePath,
+            modeReason: 'toolbox_enhance_first_last_frame',
+          }
+          : undefined,
       });
-      return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
+      if (result.status === 'completed') {
+        updateToolboxItem(item.id, user.id, { status: 'completed', errorMessage: null });
+      } else {
+        refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
+        updateToolboxItem(item.id, user.id, { status: 'failed', errorMessage: '视频重绘失败，请稍后重试' });
+      }
+    } catch (error: any) {
+      const message = String(error?.message || error || '视频重绘失败').slice(0, 1000);
+      console.error('[toolbox][video][enhance] failed', { mode: parent.mode, message });
+      refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
+      updateToolboxItem(item.id, user.id, { status: 'failed', errorMessage: toolboxVideoFriendlyError(message, parent.mode) });
     }
-    refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
-    const updated = updateToolboxItem(item.id, user.id, {
-      status: 'failed',
-      errorMessage: '视频重绘失败',
-    });
-    return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
-  } catch (error: any) {
-    const message = String(error?.message || error || '视频重绘失败').slice(0, 1000);
-    refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
-    const updated = updateToolboxItem(item.id, user.id, {
-      status: 'failed',
-      errorMessage: message,
-    });
-    return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
-  }
+  })();
+
+  return jsonOk({ ok: true, item: serializeToolboxItem(item) });
 }

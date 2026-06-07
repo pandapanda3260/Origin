@@ -10,12 +10,16 @@ import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-
 export type ShotPanelIntent = 'face' | 'body' | 'profile' | 'back' | 'group';
 
 export type CharacterReferencePanel = {
+  assetId?: string;
   characterName: string;
   panel: PanelName | 'sheet';
+  entityType?: CharacterEntityType;
+  url?: string;
   path: string;
   intent: ShotPanelIntent;
   priority: number;
   reason: string;
+  focusPair?: boolean;
 };
 
 type IntentHit = { intent: ShotPanelIntent; index: number; priority: number };
@@ -103,6 +107,11 @@ function characterDisplayName(ch: any): string {
   return normalizeCharacterName(ch?.name || ch?.role || ch?.id || ch?.label);
 }
 
+function characterAssetId(ch: any, fallbackName: string): string | undefined {
+  const id = normalizeCharacterName(ch?.characterId || ch?.materialId || ch?.id || ch?.assetId);
+  return id || fallbackName || undefined;
+}
+
 function collectCharacters(project: any): any[] {
   const all: any[] = [
     ...((project as any)?.assets?.characters || []),
@@ -131,6 +140,49 @@ function dialogueSpeakers(shot: any, knownNames: string[]): string[] {
     if (re.test(dialogue)) hits.push(name);
   }
   return hits;
+}
+
+function shotText(shot: any): string {
+  return String([
+    shot?.visual,
+    shot?.description,
+    shot?.camera,
+    shot?.shotType,
+    shot?.cameraType,
+    shot?.composition,
+    shot?.focus,
+  ].filter(Boolean).join(' '));
+}
+
+function shotContainsCharacter(shot: any, name: string): boolean {
+  const normalized = normalizeCharacterName(name).toLowerCase();
+  if (!normalized) return false;
+  if (Array.isArray(shot?.characters)) {
+    if (shot.characters.some((item: any) => normalizeCharacterName(item).toLowerCase() === normalized)) return true;
+  }
+  return shotText(shot).toLowerCase().includes(normalized);
+}
+
+function isPrimaryShotCharacter(shot: any, name: string): boolean {
+  const normalized = normalizeCharacterName(name).toLowerCase();
+  const firstCharacter = Array.isArray(shot?.characters) ? normalizeCharacterName(shot.characters[0]).toLowerCase() : '';
+  if (firstCharacter && firstCharacter === normalized) return true;
+  return dialogueSpeakers(shot, [name]).some((speaker) => speaker.toLowerCase() === normalized);
+}
+
+function closeUpStrengthForCharacter(shots: any[], name: string): number {
+  let best = 0;
+  for (const shot of shots) {
+    if (!shotContainsCharacter(shot, name)) continue;
+    const raw = shotText(shot).toLowerCase();
+    const withoutWeak = raw.replace(/中近景/g, '').replace(/半身/g, '');
+    if (/大特写|特写|近景|脸部|面部|表情|眼神|头像|头部|close-up|closeup|close shot|portrait|face|facial|eyes/.test(withoutWeak)) {
+      best = Math.max(best, 2);
+    } else if (/中近景|半身/.test(raw) && isPrimaryShotCharacter(shot, name)) {
+      best = Math.max(best, 1);
+    }
+  }
+  return best;
 }
 
 function scoreCharacters(shots: any[], characters: any[]): ScoredCharacter[] {
@@ -187,6 +239,14 @@ function slotAllocation(characterCount: number, intent: ShotPanelIntent, maxSlot
   return Array.from({ length: Math.min(characterCount, maxSlots) }, () => 1);
 }
 
+function frameSlotAllocation(characterCount: number, intent: ShotPanelIntent, maxSlots: number): number[] {
+  if (characterCount <= 0 || maxSlots <= 0) return [];
+  if (characterCount === 1) return [Math.min(maxSlots, intent === 'face' ? 3 : 3)];
+  if (characterCount === 2) return [Math.min(3, maxSlots), Math.max(0, Math.min(2, maxSlots - 3))];
+  if (characterCount === 3) return [Math.min(3, maxSlots), maxSlots >= 4 ? 1 : 0, maxSlots >= 5 ? 1 : 0];
+  return Array.from({ length: Math.min(characterCount, maxSlots) }, (_, index) => (index === 0 ? Math.min(3, maxSlots) : 1));
+}
+
 function panelsForIntent(intent: ShotPanelIntent, entityType: CharacterEntityType): PanelName[] {
   if (entityType === 'non-human') {
     if (intent === 'profile') return ['side', 'front', 'back'];
@@ -199,11 +259,86 @@ function panelsForIntent(intent: ShotPanelIntent, entityType: CharacterEntityTyp
   return ['front', 'side', 'back', 'headshot'];
 }
 
+function framePanelsForIntent(intent: ShotPanelIntent, entityType: CharacterEntityType): Array<PanelName | 'sheet'> {
+  if (entityType === 'non-human') {
+    if (intent === 'profile') return ['sheet', 'side', 'front', 'back'];
+    if (intent === 'back') return ['sheet', 'back', 'side', 'front'];
+    return ['sheet', 'front', 'side', 'back'];
+  }
+  if (intent === 'face') return ['sheet', 'headshot', 'front', 'side', 'back'];
+  if (intent === 'profile') return ['sheet', 'side', 'headshot', 'front', 'back'];
+  if (intent === 'back') return ['sheet', 'back', 'side', 'front', 'headshot'];
+  if (intent === 'group') return ['sheet', 'front', 'headshot', 'side', 'back'];
+  return ['sheet', 'front', 'side', 'back', 'headshot'];
+}
+
 function fallbackSheetPath(character: any, ownerId: number): string | undefined {
   const reference = resolveAssetReferenceState(character);
   if (isBlockingReferenceStatus(reference.status)) return undefined;
   const url = reference.currentUrl || reference.lastKnownGoodUrl || character?.realPhotoUrl || character?.pencilUrl;
   return resolveLocalImagePath(url, ownerId) || undefined;
+}
+
+function fallbackSheetUrl(character: any): string {
+  const reference = resolveAssetReferenceState(character);
+  if (isBlockingReferenceStatus(reference.status)) return '';
+  return String(
+    reference.currentUrl ||
+      reference.lastKnownGoodUrl ||
+      character?.rawUrl ||
+      character?.imageUrl ||
+      character?.realPhotoUrl ||
+      character?.pencilUrl ||
+      '',
+  ).trim();
+}
+
+function panelUrlForPath(character: any, panel: PanelName | 'sheet', path: string, ownerId: number): string {
+  const panels = character?.panels || {};
+  const key = panel === 'sheet' ? 'sheetUrl' : `${panel}Url`;
+  const urls = [
+    panels?.[key],
+    panel === 'sheet' ? fallbackSheetUrl(character) : '',
+  ].filter(Boolean);
+  for (const url of urls) {
+    if (resolveLocalImagePath(url, ownerId) === path) return String(url);
+  }
+  return String(urls[0] || '');
+}
+
+function selectFocusPairNames(
+  scored: ScoredCharacter[],
+  shots: any[],
+  ownerId: number,
+): Set<string> {
+  const eligible = scored
+    .map((item) => {
+      const reference = resolveAssetReferenceState(item.character);
+      if (isBlockingReferenceStatus(reference.status)) return null;
+      if (inferEntityTypeFromCharacter(item.character) !== 'human') return null;
+      const paths = resolveCharacterPanelPaths(item.character?.panels, ownerId);
+      if (!paths.sheet || !paths.headshot) return null;
+      const closeUpStrength = closeUpStrengthForCharacter(shots, item.name);
+      if (closeUpStrength <= 0) return null;
+      return { item, closeUpStrength };
+    })
+    .filter(Boolean) as Array<{ item: ScoredCharacter; closeUpStrength: number }>;
+
+  eligible.sort((a, b) =>
+    (b.closeUpStrength - a.closeUpStrength) ||
+    (b.item.score - a.item.score) ||
+    (a.item.firstMention - b.item.firstMention)
+  );
+
+  const selected = new Set<string>();
+  if (!eligible.length) return selected;
+  selected.add(eligible[0].item.name.toLowerCase());
+  const topScore = Math.max(1, eligible[0].item.score);
+  const second = eligible[1];
+  if (second && second.item.score >= topScore * 0.8 && second.closeUpStrength >= eligible[0].closeUpStrength) {
+    selected.add(second.item.name.toLowerCase());
+  }
+  return selected;
 }
 
 export function selectCharacterReferencePanels(opts: {
@@ -213,6 +348,8 @@ export function selectCharacterReferencePanels(opts: {
   shots?: any[];
   maxSlots?: number;
   perCharacterLimit?: number;
+  enableFocusCharacterPair?: boolean;
+  mode?: 'video' | 'frame';
 }): CharacterReferencePanel[] {
   const maxSlots = Math.max(0, Math.min(9, Number(opts.maxSlots ?? 4)));
   if (!maxSlots) return [];
@@ -229,48 +366,66 @@ export function selectCharacterReferencePanels(opts: {
   if (!scored.length) return [];
 
   const intent = normalizeShotPanelIntent(shots);
-  const allocations = slotAllocation(scored.length, intent, maxSlots).map((slots) =>
+  const frameMode = opts.mode === 'frame';
+  const focusPairNames = opts.enableFocusCharacterPair
+    ? selectFocusPairNames(scored, shots, opts.ownerId)
+    : new Set<string>();
+  const panelBudget = Math.min(9, maxSlots + focusPairNames.size);
+  const allocations = (frameMode ? frameSlotAllocation(scored.length, intent, maxSlots) : slotAllocation(scored.length, intent, maxSlots)).map((slots) =>
     perCharacterLimit == null ? slots : Math.min(slots, perCharacterLimit),
   );
   const selected: CharacterReferencePanel[] = [];
 
-  for (let i = 0; i < scored.length && selected.length < maxSlots; i++) {
+  for (let i = 0; i < scored.length && selected.length < panelBudget; i++) {
     const item = scored[i];
-    const slots = allocations[i] || 0;
+    const focusPair = focusPairNames.has(item.name.toLowerCase());
+    const slots = focusPair ? Math.max(2, allocations[i] || 0) : (allocations[i] || 0);
     if (!slots) continue;
     const reference = resolveAssetReferenceState(item.character);
     if (isBlockingReferenceStatus(reference.status)) continue;
 
     const entityType = inferEntityTypeFromCharacter(item.character);
     const paths = resolveCharacterPanelPaths(item.character?.panels, opts.ownerId);
-    const wantedPanels = panelsForIntent(intent, entityType);
+    const wantedPanels: Array<PanelName | 'sheet'> = frameMode
+      ? framePanelsForIntent(intent, entityType)
+      : focusPair
+        ? ['sheet', 'headshot', ...panelsForIntent(intent, entityType).filter((panel) => panel !== 'headshot')]
+        : panelsForIntent(intent, entityType);
     let addedForCharacter = 0;
 
     for (const panel of wantedPanels) {
-      if (addedForCharacter >= slots || selected.length >= maxSlots) break;
+      if (addedForCharacter >= slots || selected.length >= panelBudget) break;
       const path = paths[panel];
       if (!path) continue;
       selected.push({
+        assetId: characterAssetId(item.character, item.name),
         characterName: item.name,
         panel,
+        entityType,
+        url: panelUrlForPath(item.character, panel, path, opts.ownerId),
         path,
         intent,
         priority: item.score,
-        reason: `${intent}:${panel}`,
+        reason: frameMode ? `frame:${intent}:${panel}` : focusPair ? `focus-pair:${intent}:${panel}` : `${intent}:${panel}`,
+        focusPair,
       });
       addedForCharacter++;
     }
 
-    if (!addedForCharacter && selected.length < maxSlots) {
+    if (!addedForCharacter && selected.length < panelBudget) {
       const path = paths.sheet || fallbackSheetPath(item.character, opts.ownerId);
       if (!path) continue;
       selected.push({
+        assetId: characterAssetId(item.character, item.name),
         characterName: item.name,
         panel: 'sheet',
+        entityType,
+        url: panelUrlForPath(item.character, 'sheet', path, opts.ownerId),
         path,
         intent,
         priority: item.score,
-        reason: `${intent}:sheet-fallback`,
+        reason: frameMode ? `frame:${intent}:sheet-fallback` : `${intent}:sheet-fallback`,
+        focusPair: false,
       });
     }
   }

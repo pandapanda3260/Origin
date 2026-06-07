@@ -26,6 +26,7 @@ import {
   normalizeToolboxMode,
   normalizeToolboxVideoRatio,
   normalizeToolboxVideoResolution,
+  toolboxVideoFriendlyError,
   type ToolboxInputRef,
 } from '@/lib/toolbox-modes';
 
@@ -131,68 +132,64 @@ export async function POST(req: NextRequest) {
     source: 'toolbox',
   });
 
-  try {
-    const result = await generateVideo(user, {
-      taskId: videoTaskId,
-      prompt: buildToolboxVideoPrompt(prompt, storedParams),
-      ratio: storedParams.ratio,
-      resolution: storedParams.resolution,
-      durationSec: storedParams.durationSec,
-      referenceImagePath: firstFramePath,
-      referenceImageRole: 'first_frame',
-      seedanceImageMode: 'strict_first_frame',
-      firstLastFrameMode: tailFramePath
-        ? {
-          firstFramePath,
-          lastFramePath: tailFramePath,
-          modeReason: 'toolbox_first_last_frame',
-        }
-        : undefined,
-      assetLibrary: {
-        batchId,
-        stage: 'toolbox_video',
-        source: 'toolbox',
-        makeCurrent: false,
-      },
-    });
-    if (result.status === 'failed') {
+  // 后台异步生成：请求立即返回 running，完成/失败由后台回调回写（保留产物落库 + 资产入库等既有逻辑，不改主线）。
+  // generateVideo 在首个 await 前已同步写入 video_tasks 行，故此处返回的 item 能立即关联到该任务。
+  // 进程若中途重启，已带 provider_task 的 video_tasks 会被既有 worker 恢复轮询兜底，
+  // toolbox_item 再经 syncRunningVideoToolboxItems 对账并在失败时退款。
+  void (async () => {
+    try {
+      const result = await generateVideo(user, {
+        taskId: videoTaskId,
+        prompt: buildToolboxVideoPrompt(prompt, storedParams),
+        ratio: storedParams.ratio,
+        resolution: storedParams.resolution,
+        durationSec: storedParams.durationSec,
+        referenceImagePath: firstFramePath,
+        referenceImageRole: 'first_frame',
+        seedanceImageMode: 'strict_first_frame',
+        firstLastFrameMode: tailFramePath
+          ? {
+            firstFramePath,
+            lastFramePath: tailFramePath,
+            modeReason: 'toolbox_first_last_frame',
+          }
+          : undefined,
+        assetLibrary: {
+          batchId,
+          stage: 'toolbox_video',
+          source: 'toolbox',
+          makeCurrent: false,
+        },
+      });
+      if (result.status === 'failed') {
+        recordGenerationFailure({
+          batchId,
+          ownerId: user.id,
+          failureReason: 'provider_error',
+          errorMessage: '视频生成失败',
+        });
+        finishGenerationBatch(batchId, user.id, 'failed');
+        refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
+        updateToolboxItem(item.id, user.id, { status: 'failed', errorMessage: '视频生成失败，请稍后重试' });
+      } else if (result.status === 'completed') {
+        finishGenerationBatch(batchId, user.id);
+        updateToolboxItem(item.id, user.id, { status: 'completed', errorMessage: null });
+      }
+      // 其它（upstream_pending 等）：保持 running，由既有 worker 恢复轮询 + 前端轮询收尾。
+    } catch (error: any) {
+      const message = String(error?.message || error || '视频生成失败').slice(0, 1000);
+      console.error('[toolbox][video] generate failed', { mode, message });
       recordGenerationFailure({
         batchId,
         ownerId: user.id,
         failureReason: 'provider_error',
-        errorMessage: '视频生成失败',
+        errorMessage: message,
       });
       finishGenerationBatch(batchId, user.id, 'failed');
       refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
-      const updated = updateToolboxItem(item.id, user.id, {
-        status: 'failed',
-        errorMessage: '视频生成失败',
-      });
-      return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
+      updateToolboxItem(item.id, user.id, { status: 'failed', errorMessage: toolboxVideoFriendlyError(message, mode) });
     }
-    if (result.status === 'completed') {
-      finishGenerationBatch(batchId, user.id);
-      const updated = updateToolboxItem(item.id, user.id, {
-        status: 'completed',
-        errorMessage: null,
-      });
-      return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
-    }
-    return jsonOk({ ok: true, item: serializeToolboxItem(item) });
-  } catch (error: any) {
-    const message = String(error?.message || error || '视频生成失败').slice(0, 1000);
-    recordGenerationFailure({
-      batchId,
-      ownerId: user.id,
-      failureReason: 'provider_error',
-      errorMessage: message,
-    });
-    finishGenerationBatch(batchId, user.id, 'failed');
-    refundToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
-    const updated = updateToolboxItem(item.id, user.id, {
-      status: 'failed',
-      errorMessage: message,
-    });
-    return jsonOk({ ok: true, item: serializeToolboxItem(updated || item) });
-  }
+  })();
+
+  return jsonOk({ ok: true, item: serializeToolboxItem(item) });
 }

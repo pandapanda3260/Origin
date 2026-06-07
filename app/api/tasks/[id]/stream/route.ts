@@ -6,6 +6,16 @@ import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+function parseExportMeta(value: unknown): Record<string, any> {
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * 单任务 SSE：剪辑页 _attachExportStream 走 backend_stream.subscribeTask，
  * 期望 /api/tasks/<id>/stream 持续推 task_progress / task_completed / task_failed。
@@ -95,12 +105,18 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
             lastStatus = status;
             if (status === 'completed') {
               if (kind === 'export') {
+                const meta = parseExportMeta(row.edl_json);
+                const exportedEdlSignature = String(meta.exportedEdlSignature || meta.edlSignature || '');
+                const exportedEdlSignatureMeta = meta.exportedEdlSignatureMeta || null;
                 send('task_completed', {
                   taskId,
                   progress: 100,
                   downloadUrl: `/api/edit/export-file/${row.id}`,
                   resultUrl: `/api/edit/export-file/${row.id}`,
                   edlVersion: row.edl_version,
+                  edlSignature: exportedEdlSignature,
+                  exportedEdlSignature,
+                  exportedEdlSignatureMeta,
                 });
               } else {
                 const protectedUrl = row.filename ? `/api/videos/file/${row.id}` : '';

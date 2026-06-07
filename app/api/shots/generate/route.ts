@@ -4,7 +4,6 @@ import { sseResponse } from '@/lib/sse';
 import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { buildShotsMessages } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
-import { pickSceneForShots } from '@/lib/scene-selection';
 import { makeSingleShotStoryboardSlots, maybeAssertStoryboardsAlignedWithShots } from '@/lib/frame-workflow-state';
 import { hashNormalizedScript } from '@/lib/script-style-state';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
@@ -12,26 +11,11 @@ import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { maybeInjectKnowledgePromptBlock } from '@/lib/knowledge/inject-messages';
 import type { KnowledgeContextForStage } from '@/lib/knowledge/types';
 import { computeShotPlanSourceHash, computeShotPlanSourceSnapshot } from '@/lib/project-dependency-state';
-import { normalizeTailFrameSignals } from '@/lib/shot-tail-frame-signals';
+import { normalizeGeneratedShotPlan } from '@/lib/shot-plan-normalize';
+import { projectWorldContextForStage } from '@/lib/world-template-context';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-const FRAMINGS = ['大全景','远景','全景','中景','中近景','近景','特写','大特写','俯拍','仰拍','主观镜头','过肩镜头','广角全景'];
-const MOVEMENTS = ['固定镜头','缓慢推进','轻微推近','推近','快速推进','缓慢拉远','拉远','快速拉远','跟随','环绕','手持轻晃','甩镜头','摇镜头','固定机位','推','拉','摇','跟','航拍','手持','轨道'];
-const SHOT_INTERNAL_KEYS = new Set([
-  'reasoning',
-  '__thinking__',
-  'thinking',
-  'thoughts',
-  'chainOfThought',
-  'debug',
-  'debugInfo',
-  'debug_info',
-  '_debug',
-  'internal',
-  'analysis',
-]);
 
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
@@ -53,6 +37,7 @@ export async function POST(req: NextRequest) {
     writer.chunk('分析剧本节奏与情绪曲线…\n');
 
     let shots: any[] = [];
+    let planMeta: any = null;
     const assetsForShots = {
       characters: (proj as any)?.characters || (proj as any)?.assets?.characters || [],
       environments: (proj as any)?.environments || (proj as any)?.assets?.scenes || [],
@@ -60,11 +45,16 @@ export async function POST(req: NextRequest) {
     };
     const scriptHash = hashNormalizedScript(finalScript);
     let knowledgeContext: KnowledgeContextForStage | null = null;
+    const worldContext = projectWorldContextForStage('shots_generate', (proj as any)?.worldTemplateSnapshot, {
+      project: proj,
+      scriptText: finalScript,
+    });
     const originalMessages = buildShotsMessages({
       script: finalScript,
       styleBible: (proj as any)?.styleBible,
       assets: assetsForShots,
       totalDurationSec: totalDurationSec || (proj as any)?.scriptTargetDurationSec,
+      worldContext,
     });
     let finalMessages = originalMessages;
     if (projectId && proj) {
@@ -124,63 +114,18 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 后处理：保证字段齐全 + 枚举值合法
-    shots = shots.map((s, i) => {
-      const description = String(s.visual || s.description || '').slice(0, 300);
-      const pickedScene = pickSceneForShots({
-        assets: assetsForShots,
-        shots: [s],
-        text: [
-          s.sceneId,
-          s.sceneName,
-          s.scene,
-          s.location,
-          s.visual,
-          s.description,
-          s.desc,
-          s.scriptRef,
-        ].filter(Boolean).join(' '),
-      });
-      const sceneId = String(pickedScene.scene?.id || pickedScene.scene?.sceneId || s.sceneId || '').trim();
-      const sceneName = String(
-        pickedScene.scene?.name ||
-          pickedScene.scene?.sceneName ||
-          pickedScene.scene?.location ||
-          s.sceneName ||
-          s.scene ||
-          s.location ||
-          '',
-      ).trim();
-      const base = stripShotInternalFields(s);
-      const dialogue = String(s.dialogue || s.dialog || '——');
-      const durationSec = clampNum(s.duration ?? s.durationSec, 1, 12, 4);
-      const framing = pickEnum(s.shotType ?? s.framing, FRAMINGS, '中景');
-      const movement = pickEnum(s.camera ?? s.movement, MOVEMENTS, '固定镜头');
-      return {
-        ...base,
-        idx: typeof s.idx === 'number' ? s.idx : i + 1,
-        sceneId,
-        sceneName,
-        scene: sceneName,
-        duration: durationSec,
-        durationSec,
-        shotType: framing,
-        framing,
-        camera: movement,
-        movement,
-        visual: description,
-        description,
-        dialogue,
-        dialog: dialogue,
-        stylePillar: String(s.keyInfo || s.stylePillar || '').slice(0, 30),
-        tailFrameSignals: normalizeTailFrameSignals(s, {
-          shotType: framing,
-          camera: movement,
-          dialogue,
-          durationSec,
-        }),
-      };
+    const generatedAt = new Date().toISOString();
+    const normalizedPlan = normalizeGeneratedShotPlan(shots, {
+      assets: assetsForShots,
+      styleBible: (proj as any)?.styleBible,
+      generatedAt,
     });
+    shots = normalizedPlan.shots;
+    planMeta = normalizedPlan.planMeta;
+    if (!shots.length) {
+      writer.error('镜头表生成失败：AI 返回的镜头都没有内容，请稍后重试或换个剧本');
+      return;
+    }
 
     writer.step(`已生成 ${shots.length} 个镜头`);
 
@@ -212,6 +157,7 @@ export async function POST(req: NextRequest) {
       );
       updateProjectForUser(projectId, user.id, {
         shots,
+        planMeta,
         shotsApproved: false,
         imagesApproved: false,
         videoPromptsApproved: false,
@@ -222,7 +168,7 @@ export async function POST(req: NextRequest) {
         shotPlanStatus: 'ready',
         shotPlanSourceHash: sourceHash,
         shotPlanSourceSnapshot: sourceSnapshot,
-        shotPlanGeneratedAt: new Date().toISOString(),
+        shotPlanGeneratedAt: generatedAt,
         shotPlanStaleReason: undefined,
         shotPlanStaleReasons: [],
         shotPlanStaleAt: undefined,
@@ -236,26 +182,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    writer.done({ shots });
+    writer.done({ shots, planMeta });
   });
-}
-
-function clampNum(v: any, min: number, max: number, dflt: number) {
-  const n = Number(v);
-  if (!isFinite(n)) return dflt;
-  return Math.max(min, Math.min(max, Math.round(n)));
-}
-
-function pickEnum(v: any, list: string[], dflt: string) {
-  const s = String(v || '').trim();
-  return list.includes(s) ? s : dflt;
-}
-
-function stripShotInternalFields(input: any) {
-  const out: any = {};
-  if (!input || typeof input !== 'object') return out;
-  for (const key of Object.keys(input)) {
-    if (!SHOT_INTERNAL_KEYS.has(key)) out[key] = input[key];
-  }
-  return out;
 }

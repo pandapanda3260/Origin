@@ -37,6 +37,7 @@ const CHAR_A_IMAGE_ID = '11111111-1111-4111-8111-111111111111';
 const SCENE_A_IMAGE_ID = '22222222-2222-4222-8222-222222222222';
 const PROP_X_IMAGE_ID = '33333333-3333-4333-8333-333333333333';
 const LIBRARY_CHAR_IMAGE_ID = '44444444-4444-4444-8444-444444444444';
+const CHAR_A_HEADSHOT_IMAGE_ID = '66666666-6666-4666-8666-666666666666';
 
 function ensureImageFixture(ownerId: number, imageId: string) {
   const filename = `${imageId}.png`;
@@ -426,7 +427,7 @@ const plan: any = {
     sourceHash,
   });
   assert.equal(panel.cap, 4);
-  assert.equal(panel.productCap, 4);
+  assert.equal(panel.productCap, 12);
   assert.equal(panel.used, 2);
   assert.equal(panel.mode, 'auto');
   assert.equal(panel.groups.char.length, 1);
@@ -454,8 +455,43 @@ const plan: any = {
     draft: null,
     sourceHash,
   });
-  assert.equal(panel.productCap, 4);
-  assert.equal(panel.cap, 4);
+  assert.equal(panel.productCap, 12);
+  assert.equal(panel.cap, 12);
+}
+
+{
+  ensureImageFixture(7, CHAR_A_HEADSHOT_IMAGE_ID);
+  const panelPlan = {
+    ...plan,
+    referenceManifest: [
+      {
+        ...plan.referenceManifest[0],
+        panel: 'sheet',
+      },
+      {
+        ...plan.referenceManifest[0],
+        slot: 2,
+        imageNo: 2,
+        panel: 'headshot',
+        remoteUrl: `/api/images/file/${CHAR_A_HEADSHOT_IMAGE_ID}`,
+        localPath: '/tmp/char-a-headshot.png',
+      },
+    ],
+    modelSnapshot: {
+      ...plan.modelSnapshot,
+      multiRefImageCap: 16,
+    },
+  };
+  const sourceHash = computeFirstFrameEditSourceHash(project, 7, 0, panelPlan);
+  const panel = buildFirstFrameMaterialPanel({
+    project,
+    userId: 7,
+    plan: panelPlan,
+    draft: null,
+    sourceHash,
+  });
+  assert.deepEqual(panel.orderedTileIds, ['ref:char:char-a:sheet', 'ref:char:char-a:headshot']);
+  assert.equal(panel.groups.char.length, 2, 'same character sheet/headshot must remain separate tiles');
 }
 
 {
@@ -546,7 +582,7 @@ const plan: any = {
     sourceHash,
   });
   assert.equal(panel.cap, 1);
-  assert.equal(panel.productCap, 4);
+  assert.equal(panel.productCap, 12);
   assert.equal(panel.used, 1);
   assert.equal(panel.remaining, 0);
 }

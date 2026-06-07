@@ -1,9 +1,7 @@
 export const MOCK_USER = {
   id: 1,
-  username: 'pokerman',
-  displayName: 'pokerman',
-  email: 'demo@local.dev',
-  emailVerified: true,
+  phone: '19900000000',
+  displayName: 'Mock User',
   createdAt: '2024-12-01T08:00:00Z',
 };
 

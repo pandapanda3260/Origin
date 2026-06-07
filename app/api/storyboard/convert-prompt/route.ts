@@ -6,6 +6,8 @@ import { getProjectByIdForUser } from '@/lib/projects-db';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { styleBibleForShotPrompt } from '@/lib/casting-profile';
+import { resolveShotFieldsForPrompt } from '@/lib/shot-plan-normalize';
+import { formatWorldContextForPrompt, projectWorldContextForStage } from '@/lib/world-template-context';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -57,9 +59,15 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 兼容老字段（万一某些镜头还是老 schema）
-    const shotType = shot.shotType || shot.framing || '';
-    const camera = shot.camera || shot.movement || '';
+    // 兼容新老字段。旧 shotType=俯拍/主观/过肩 会在这里读成 angle，shotType 回落到景别。
+    const shotFields = resolveShotFieldsForPrompt(shot, styleBible);
+    const shotType = shotFields.shotType;
+    const angle = shotFields.angle;
+    const lens = shotFields.lens;
+    const focus = shotFields.focus;
+    const light = shotFields.light;
+    const composition = shotFields.composition;
+    const camera = shotFields.camera;
     const visual = shot.visual || shot.description || shot.desc || '';
     const dialogue = shot.dialogue || shot.dialog || '';
     const characters: string[] = Array.isArray(shot.characters) ? shot.characters : [];
@@ -99,15 +107,28 @@ export async function POST(req: NextRequest) {
         .join(' | ');
     }
 
+    const project = projectId ? getProjectByIdForUser(projectId, user.id) : null;
+    const worldContext = projectWorldContextForStage('storyboard_sketch_prompt', (project as any)?.worldTemplateSnapshot, {
+      project,
+      target: { shot, idx },
+    });
+    const worldText = formatWorldContextForPrompt(worldContext);
+
     const userMsg = [
       `镜头序号：${shot.idx ?? idx + 1}`,
       shotType && `景别：${shotType}`,
+      angle && `角度/视点：${angle}`,
+      lens && `焦距：${lens}`,
+      focus && `景深/焦点：${focus}`,
+      light && `光线组合：${light}`,
+      composition && `构图组合：${composition}`,
       camera && `运镜：${camera}`,
       visual && `画面描述：${visual}`,
       dialogue && dialogue !== '——' && `台词/旁白：${dialogue}`,
       keyInfo && `主题词：${keyInfo}`,
       charContext && `本镜头出现的角色（必须保留外观/服装一致性）：${charContext}`,
       styleHint && `整体视觉风格：${styleHint}`,
+      worldText && `分镜稿参考的世界观事实与软默认：\n${worldText}`,
     ].filter(Boolean).join('\n');
 
     let promptText = '';
@@ -138,7 +159,6 @@ export async function POST(req: NextRequest) {
 
     if (projectId) {
       try {
-        const project = getProjectByIdForUser(projectId, user.id);
         if (project) {
           const context = buildKnowledgeContextForStage({
             ownerId: user.id,

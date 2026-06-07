@@ -1,5 +1,5 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, apiGet, getAuthHeaders, getActiveBatchesShared,
-  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=104';
+import { $, escapeHtml, showToast, apiPost, apiPostStream, apiGet, getAuthHeaders, getActiveBatchesShared,
+  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=201';
 import {
   materialPanelCandidateTilesForRole,
   materialPanelOrderedTiles,
@@ -27,6 +27,17 @@ import { attachDiagnostic } from './diagnostic.js';
 import { renderStoryboardCard, renderStoryboardFrameCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
+import {
+  canGenerateTailFrame as _canGenerateTailFrame,
+  firstFrameImageUrl as _firstFrameImageUrl,
+  frameCollapseKeyForGroup as _frameCollapseKeyForGroup,
+  frameRecommendationForGroup as _frameRecommendationForGroup,
+  isTailRequested as _isTailRequested,
+  segmentInfoForShot as _segmentInfoForShot,
+  tailFrameImageUrl as _tailFrameImageUrl,
+  tailFrameGenerationIntentForGroup as _tailFrameGenerationIntentForGroup,
+  tailFrameSuggestionForGroup as _tailFrameSuggestionForGroup,
+} from './frameRecommendations.js?v=1';
 
 let _ctx = {};
 let project = null;
@@ -40,7 +51,7 @@ var _sbCurrentIdx = 0;
 var _sbProgrammaticScrolling = false;
 var _sbScrollSettleTimer = null;
 var _firstFramePreflightState = { key: "", status: "idle", payload: null, message: "", promise: null };
-var FIRST_FRAME_DEFAULT_HINT = "基于镜头与资产生成首帧，并管理可选尾帧";
+var FIRST_FRAME_DEFAULT_HINT = "基于片段镜头与资产生成关键帧，并管理可选尾帧";
 var FIRST_FRAME_REWRITE_CHAT_ENABLED = false;
 var FFE_AUTOSAVE_DEBOUNCE_MS = 800;
 var FFE_AUTOSAVE_MAX_WAIT_MS = 4000;
@@ -118,6 +129,18 @@ var _firstFrameEditorScrollY = 0;
 var _firstFrameCardPromptAutosave = {};
 var _tailFrameCardPromptAutosave = {};
 var _firstFrameCardPromptProjectId = '';
+var _storyboardReattachRunningByBatch = Object.create(null);
+var _storyboardTerminalReloadedByBatch = Object.create(null);
+var _storyboardTerminalReloadPendingByBatch = Object.create(null);
+var _storyboardTerminalReloadScheduledByBatch = Object.create(null);
+var _storyboardTerminalSnapshotHandledByBatch = Object.create(null);
+var _storyboardTerminalReloadInFlight = null;
+var _storyboardBatchReconcilerRegistered = false;
+var _storyboardLastReconcileAt = 0;
+var _storyboardLastBatchActivityAt = 0;
+var STORYBOARD_REATTACH_RECONCILE_THROTTLE_MS = 30000;
+var STORYBOARD_REATTACH_RECONCILE_INTERVAL_MS = 60000;
+var STORYBOARD_REATTACH_RECENT_ACTIVITY_MS = 30 * 60 * 1000;
 
 export function initStoryboard(ctx) {
   _ctx = ctx || {};
@@ -135,6 +158,141 @@ export function syncStoryboardProject(p) {
   setMaterialPanelProject(project && project.id || '', project && project.updatedAt || '');
 }
 
+function _storyboardBatchKey(projectId, batchId) {
+  return String(projectId || '') + ':' + String(batchId || '');
+}
+
+function _storyboardBatchStatus(b) {
+  return String((b && b.status) || (b && b.snapshot && b.snapshot.status) || '').toLowerCase();
+}
+
+function _isStoryboardBatchTerminalStatus(status) {
+  status = String(status || '').toLowerCase();
+  return status === 'completed' || status === 'done' || status === 'partial' ||
+    status === 'failed' || status === 'cancelled' || status === 'canceled';
+}
+
+function _clearStoryboardReattachRunning(projectId, batchId) {
+  if (!projectId || !batchId) return;
+  delete _storyboardReattachRunningByBatch[_storyboardBatchKey(projectId, batchId)];
+}
+
+function _markStoryboardBatchActivity() {
+  _storyboardLastBatchActivityAt = Date.now();
+}
+
+function _hasRecentStoryboardBatchActivity() {
+  return !!(_storyboardLastBatchActivityAt &&
+    Date.now() - _storyboardLastBatchActivityAt < STORYBOARD_REATTACH_RECENT_ACTIVITY_MS);
+}
+
+function _isDocumentVisibleForStoryboardReconcile() {
+  if (typeof document === 'undefined') return true;
+  return document.visibilityState !== 'hidden';
+}
+
+function _markStoryboardTerminalSnapshotHandled(projectId, batchId) {
+  if (!projectId || !batchId) return;
+  _storyboardTerminalSnapshotHandledByBatch[_storyboardBatchKey(projectId, batchId)] = true;
+}
+
+function _shouldSkipStoryboardRunningReattach(projectId, batchId, b) {
+  if (!projectId || !batchId) return true;
+  var key = _storyboardBatchKey(projectId, batchId);
+  if (_isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b))) {
+    _clearStoryboardReattachRunning(projectId, batchId);
+    if (_storyboardTerminalReloadedByBatch[key] ||
+        _storyboardTerminalReloadScheduledByBatch[key] ||
+        _storyboardTerminalSnapshotHandledByBatch[key]) return true;
+    return false;
+  }
+  if (_storyboardReattachRunningByBatch[key]) return true;
+  _storyboardReattachRunningByBatch[key] = true;
+  return false;
+}
+
+function _scheduleStoryboardTerminalProjectReload(projectId, batchId, opts) {
+  if (!projectId || !batchId) return Promise.resolve(false);
+  opts = opts || {};
+  var key = _storyboardBatchKey(projectId, batchId);
+  if (_storyboardTerminalReloadedByBatch[key]) return Promise.resolve(false);
+  _storyboardTerminalReloadScheduledByBatch[key] = true;
+  _storyboardTerminalReloadPendingByBatch[key] = {
+    projectId: projectId,
+    batchId: batchId,
+    reason: opts.reason || '',
+    confirmImages: !!opts.confirmImages,
+  };
+  if (_storyboardTerminalReloadInFlight) return _storyboardTerminalReloadInFlight;
+
+  _storyboardTerminalReloadInFlight = (async function () {
+    try {
+      while (Object.keys(_storyboardTerminalReloadPendingByBatch).length) {
+        var pending = _storyboardTerminalReloadPendingByBatch;
+        _storyboardTerminalReloadPendingByBatch = Object.create(null);
+        var keys = Object.keys(pending);
+        var first = pending[keys[0]];
+        var confirmImages = keys.some(function (k) { return !!(pending[k] && pending[k].confirmImages); });
+        var ok = await _reloadProjectFromServerForStoryboard(first.projectId);
+        if (ok) {
+          keys.forEach(function (k) {
+            _storyboardTerminalReloadedByBatch[k] = true;
+            delete _storyboardTerminalReloadScheduledByBatch[k];
+          });
+          renderImageGrid();
+          if (confirmImages) checkImagesConfirm();
+        } else {
+          keys.forEach(function (k) { delete _storyboardTerminalReloadScheduledByBatch[k]; });
+          console.warn("[StoryboardReattach] terminal project reload failed:", first.reason || first.batchId);
+        }
+      }
+      return true;
+    } catch (e) {
+      Object.keys(_storyboardTerminalReloadPendingByBatch).forEach(function (k) {
+        delete _storyboardTerminalReloadScheduledByBatch[k];
+      });
+      console.warn("[StoryboardReattach] terminal project reload failed:", (e && e.message) || e);
+      return false;
+    }
+  })();
+
+  _storyboardTerminalReloadInFlight.then(function () {
+    _storyboardTerminalReloadInFlight = null;
+  }, function () {
+    _storyboardTerminalReloadInFlight = null;
+  });
+  return _storyboardTerminalReloadInFlight;
+}
+
+function _runStoryboardBatchReconcile(reason) {
+  if (!project || !project.id) return;
+  if (reason === 'interval' && (!_isDocumentVisibleForStoryboardReconcile() || !_hasRecentStoryboardBatchActivity())) return;
+  var now = Date.now();
+  if (_storyboardLastReconcileAt && now - _storyboardLastReconcileAt < STORYBOARD_REATTACH_RECONCILE_THROTTLE_MS) return;
+  _storyboardLastReconcileAt = now;
+  Promise.resolve(reattachStoryboardBatches()).catch(function (e) {
+    console.warn("[StoryboardReattach] reconcile failed:", reason || "unknown", (e && e.message) || e);
+  });
+}
+
+export function registerStoryboardBatchReconciler() {
+  if (_storyboardBatchReconcilerRegistered) return;
+  _storyboardBatchReconcilerRegistered = true;
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', function () {
+      _runStoryboardBatchReconcile('focus');
+    });
+    window.setInterval(function () {
+      _runStoryboardBatchReconcile('interval');
+    }, STORYBOARD_REATTACH_RECONCILE_INTERVAL_MS);
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') _runStoryboardBatchReconcile('visibilitychange');
+    });
+  }
+}
+
 /**
  * 刷新 / 关 tab 后重连后端仍在跑的分镜图 & 分镜提示词 batch。
  * 模仿 videoTasks._reattachVideoBatches / assets.reattachActiveBatches。
@@ -144,15 +302,17 @@ export function syncStoryboardProject(p) {
 export async function reattachStoryboardBatches() {
   _syncRefs();
   if (!project || !project.id) return;
+  var originId = project.id;
   var resp;
   try {
-    resp = await getActiveBatchesShared(project.id);
+    resp = await getActiveBatchesShared(originId);
   } catch (e) {
     console.warn("[StoryboardReattach] /api/batch/active failed:", (e && e.message) || e);
     return;
   }
   var batches = (resp && resp.batches) || [];
   if (!batches.length) return;
+  _markStoryboardBatchActivity();
 
   batches.forEach(function (b) {
     var bt = b.batchType || "";
@@ -160,10 +320,13 @@ export async function reattachStoryboardBatches() {
     if (!batchId) return;
 
     if (bt === "storyboard_images") {
+      if (_shouldSkipStoryboardRunningReattach(originId, batchId, b)) return;
       _reattachImagesBatch(b);
     } else if (bt === "tail_frame_images") {
+      if (_shouldSkipStoryboardRunningReattach(originId, batchId, b)) return;
       _reattachTailFrameBatch(b);
     } else if (bt === "storyboard_prompts") {
+      if (_shouldSkipStoryboardRunningReattach(originId, batchId, b)) return;
       _reattachPromptsBatch(b);
     }
   });
@@ -211,10 +374,15 @@ function _reattachImagesBatch(b) {
     }
   });
 
-  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
+  var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
   if (isComplete) {
+    _clearStoryboardReattachRunning(originId, batchId);
     _imagesGenerating = false;
     checkImagesConfirm();
+    _scheduleStoryboardTerminalProjectReload(originId, batchId, {
+      reason: "storyboard_images_terminal_snapshot",
+      confirmImages: true,
+    });
     return;
   }
 
@@ -299,17 +467,20 @@ function _reattachImagesBatch(b) {
       _renderEtaR();
     },
     onBatchCompleted: function () {
+      _clearStoryboardReattachRunning(originId, batchId);
       (async function () {
         _imagesGenerating = false;
         if (btn) btn.disabled = false;
         _stopTickR();
         _clearEtaR();
-        await _reloadProjectFromServerForStoryboard(originId);
-        renderImageGrid();
-        checkImagesConfirm();
+        await _scheduleStoryboardTerminalProjectReload(originId, batchId, {
+          reason: "storyboard_images_sse_completed",
+          confirmImages: true,
+        });
       })();
     },
     onClose: function () {
+      _clearStoryboardReattachRunning(originId, batchId);
       _imagesGenerating = false;
       if (btn) btn.disabled = false;
       _stopTickR();
@@ -348,15 +519,25 @@ function _reattachTailFrameBatch(b) {
       renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: url });
     } else if (isFailed) {
       var errMsg = _snapshotTaskError(t, 120);
+      var extraRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
+      _clearFailedTailFrameLocally(gIdx, errMsg, extra, originId);
       var displayMsg = _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(project.storyboards[gIdx], errMsg), errMsg);
-      renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: displayMsg });
+      if (_tailFrameSafetyInfo(project.storyboards[gIdx]) || _isImageSafetyBlocked(extraRecord.imageSafetyAudit, extraRecord.message || displayMsg)) renderImageGrid();
+      else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: displayMsg });
     } else {
       renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: "生成尾帧中…" });
     }
   });
 
-  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
-  if (isComplete) return;
+  var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
+  if (isComplete) {
+    _clearStoryboardReattachRunning(originId, batchId);
+    _scheduleStoryboardTerminalProjectReload(originId, batchId, {
+      reason: "tail_frame_images_terminal_snapshot",
+      confirmImages: false,
+    });
+    return;
+  }
 
   // 订阅剩余进度。尾帧批任务通常只有 1 个 target, 不设全局 _imagesGenerating 状态
   // (它是首帧流程的锁, 尾帧不共享)。
@@ -382,14 +563,23 @@ function _reattachTailFrameBatch(b) {
       var gIdx2 = _firstTaskNumber([target.groupIdx, extra.groupIdx, data.targetSeq]);
       var errMsg2 = ((data && data.errorMsg) || '生成失败').toString().slice(0, 120);
       if (typeof gIdx2 !== 'number') return;
-      var displayMsg2 = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsg2), errMsg2);
-      _clearFailedTailFrameLocally(gIdx2, errMsg2, extra);
-      renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
+      var errRecord2 = _tailFrameErrorRecordFromExtra(extra, errMsg2);
+      var displayMsg2 = _tailFrameErrorDisplay(errRecord2, errMsg2);
+      _clearFailedTailFrameLocally(gIdx2, errMsg2, extra, originId);
+      if (_isImageSafetyBlocked(errRecord2.imageSafetyAudit, errRecord2.message || displayMsg2)) renderImageGrid();
+      else renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
     },
     onBatchCompleted: function () {
-      // 数据已本地 apply, 不强制 reload project; 权威状态会在下次 reload 时到位。
+      _clearStoryboardReattachRunning(originId, batchId);
+      _scheduleStoryboardTerminalProjectReload(originId, batchId, {
+        reason: "tail_frame_images_sse_completed",
+        confirmImages: false,
+      });
     },
-    onClose: function () { /* SSE 断开由 polling 兜底, 或由后端最终 snapshot 修正 */ },
+    onClose: function () {
+      _clearStoryboardReattachRunning(originId, batchId);
+      /* SSE 断开由 polling 兜底, 或由后端最终 snapshot 修正 */
+    },
   });
 }
 
@@ -428,10 +618,12 @@ function _reattachPromptsBatch(b) {
     }
   });
 
-  var isComplete = snap.status === "completed" || snap.status === "done" || snap.status === "partial";
+  var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
   if (isComplete) {
+    _clearStoryboardReattachRunning(originId, batchId);
     _promptsConverting = false;
     checkConvertConfirm();
+    _markStoryboardTerminalSnapshotHandled(originId, batchId);
     return;
   }
 
@@ -469,11 +661,13 @@ function _reattachPromptsBatch(b) {
       if (typeof shotIdx === 'number') updatePromptCard(shotIdx, "error", null, errMsg);
     },
     onBatchCompleted: function () {
+      _clearStoryboardReattachRunning(originId, batchId);
       _promptsConverting = false;
       if (btn) btn.disabled = false;
       checkConvertConfirm();
     },
     onClose: function () {
+      _clearStoryboardReattachRunning(originId, batchId);
       _promptsConverting = false;
       if (btn) btn.disabled = false;
     },
@@ -608,6 +802,9 @@ function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndice
     delete existing.firstFrameLastError;
     delete existing.firstFrameFailedAt;
     // 用户原则: 首帧变化不再连带把尾帧标记为 stale, 由用户自己决定要不要重做尾帧。
+    // D: 首帧刚写入/就绪 → 作废该组尾帧就绪缓存, 否则首帧未就绪期拉取的陈旧 preflight
+    // 会残留"首帧未就绪"提示。见 docs/first-frame-url-field-alignment-proposal.md (选项 D)。
+    _invalidateTailFramePromptReadiness(groupIdx);
   }
   if (extra.firstFramePrompt) existing.firstFramePrompt = extra.firstFramePrompt;
   if (extra.imagePrompt) {
@@ -693,48 +890,6 @@ function _applyFrameImagePatch(existing, rawUrl, extra, fallbackShotIndices) {
   return _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndices);
 }
 
-/**
- * 前端 preflight: 尾帧是否可生成。和 lib/visual-reference-state.ts 的
- * checkTailFramePreflight 保持一致 (mode ∈ structured_v1/multi_ref_v1, 或
- * frames.first.status='ready', 且 frames.first.status !== 'failed')。
- * 后端 executor 会再查一次, 前端按钮 disabled 只是 UX 兜底。
- */
-function _canGenerateTailFrame(sb) {
-  if (!sb) return false;
-  var firstUrl =
-    sb.firstFrameUrl ||
-    (sb.frames && sb.frames.first && sb.frames.first.url) ||
-    (sb.firstFrame && sb.firstFrame.currentUrl);
-  if (!firstUrl) return false;
-  var mode = String(sb.firstFrameMode || '');
-  var framesFirstStatus = (sb.frames && sb.frames.first && sb.frames.first.status) || '';
-  var firstFrameStatus = (sb.firstFrame && sb.firstFrame.status) || '';
-  if (framesFirstStatus === 'failed' || firstFrameStatus === 'failed') return false;
-  // 显式拒 legacy_pencil: 即使某些混合数据写了 frames.first.status='ready', 手稿首帧
-  // 仍不能做尾帧锚点。必须先升级到彩色首帧。和 lib/visual-reference-state.ts 的
-  // checkTailFramePreflight 保持同样的 override 顺序。
-  if (mode === 'legacy_pencil') return false;
-  if (mode === 'structured_v1' || mode === 'multi_ref_v1') return true;
-  if (framesFirstStatus === 'ready') return true;
-  return false;
-}
-
-function _firstFrameImageUrl(sb) {
-  sb = sb || {};
-  return (sb.frames && sb.frames.first && sb.frames.first.url) ||
-    sb.firstFrameUrl ||
-    sb.rawUrl ||
-    sb.imageUrl ||
-    sb.url ||
-    '';
-}
-
-function _tailFrameImageUrl(sb) {
-  sb = sb || {};
-  var tail = (sb.frames && sb.frames.tail) || null;
-  return (tail && tail.url) || sb.tailFrameUrl || '';
-}
-
 function _tailFrameErrorRecordFromExtra(extra, fallbackMsg) {
   extra = extra || {};
   var tail = (extra.frames && extra.frames.tail) || {};
@@ -744,6 +899,12 @@ function _tailFrameErrorRecordFromExtra(extra, fallbackMsg) {
     message: String(message || '生成失败').slice(0, 500),
     errorCode: lastError.errorCode || extra.tailFrameErrorCode || extra.errorCode || '',
     recoveryHint: lastError.recoveryHint || extra.tailFrameRecoveryHint || extra.recoveryHint || '',
+    imageSafetyAudit: lastError.imageSafetyAudit ||
+      tail.safetyAudit ||
+      tail.imageSafetyAudit ||
+      extra.tailFrameSafetyAudit ||
+      _imageSafetyAuditFromExtra(extra) ||
+      null,
   };
 }
 
@@ -756,24 +917,353 @@ function _tailFrameErrorRecordFromStoryboard(sb, fallbackMsg) {
     message: String(message || '').slice(0, 500),
     errorCode: lastError.errorCode || sb.tailFrameErrorCode || '',
     recoveryHint: lastError.recoveryHint || sb.tailFrameRecoveryHint || '',
+    imageSafetyAudit: lastError.imageSafetyAudit ||
+      tail.safetyAudit ||
+      tail.imageSafetyAudit ||
+      sb.tailFrameSafetyAudit ||
+      null,
   };
 }
 
 function _tailFrameErrorDisplay(record, fallbackMsg) {
   record = record || {};
-  return (record.recoveryHint || record.message || fallbackMsg || '生成失败').toString().slice(0, 200);
+  if (record.recoveryHint) return record.recoveryHint.toString().slice(0, 200);
+  // message 走一遍诊断: 内容安全审核拦截会被翻成"提示词违规，未通过安全审核"等友好文案。
+  var raw = (record.message || fallbackMsg || '生成失败').toString();
+  return _diagnoseApiError(raw).toString().slice(0, 200);
 }
 
-function _tailFrameUiState(sb) {
+function _clearFailedStoryboardLocally(groupIdx, errMsg, extra, projectId) {
+  if (typeof groupIdx !== 'number' || !project) return;
+  var originProjectId = projectId || (project && project.id);
+  if (!originProjectId) return;
+  var audit = _imageSafetyAuditFromExtra(extra);
+  var msg = _firstFrameFailureDisplay(errMsg || '生成失败', extra).slice(0, 500);
+  _safeWriteBack(originProjectId, function (proj) {
+    if (!proj.storyboards) proj.storyboards = [];
+    var sb = proj.storyboards[groupIdx] || {};
+    // Keep this optimistic client mirror aligned with lib/visual-reference-state.ts markFirstFrameFailed.
+    // Only first-frame-specific fields can be reused here; url/imageUrl/rawUrl are storyboard sketches.
+    var fallbackUrl = (sb.firstFrame && (sb.firstFrame.currentUrl || sb.firstFrame.lastKnownGoodUrl)) ||
+      (sb.frames && sb.frames.first && sb.frames.first.url) ||
+      sb.firstFrameUrl ||
+      "";
+    sb.firstFrameLastError = msg;
+    sb.firstFrameFailedAt = new Date().toISOString();
+    sb.firstFrame = Object.assign({}, sb.firstFrame || {}, {
+      currentUrl: fallbackUrl || undefined,
+      status: fallbackUrl ? "degraded" : "failed",
+      source: fallbackUrl ? "last_known_good" : ((sb.firstFrame && sb.firstFrame.source) || "generated"),
+      lastKnownGoodUrl: fallbackUrl || ((sb.firstFrame && sb.firstFrame.lastKnownGoodUrl) || undefined),
+      lastError: {
+        message: msg,
+        failedAt: sb.firstFrameFailedAt,
+        imageSafetyAudit: audit || undefined
+      },
+      history: (sb.firstFrame && Array.isArray(sb.firstFrame.history)) ? sb.firstFrame.history : []
+    });
+    if (audit) sb.firstFrameSafetyAudit = audit;
+    else delete sb.firstFrameSafetyAudit;
+    proj.storyboards[groupIdx] = sb;
+  });
+}
+
+function _clearFailedTailFrameLocally(groupIdx, errMsg, extra, projectId) {
+  if (typeof groupIdx !== 'number' || !project) return;
+  var originProjectId = projectId || (project && project.id);
+  if (!originProjectId) return;
+  var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
+  var audit = errRecord.imageSafetyAudit || null;
+  var msg = errRecord.message;
+  _safeWriteBack(originProjectId, function (proj) {
+    if (!proj.storyboards) proj.storyboards = [];
+    var sb = proj.storyboards[groupIdx] || {};
+    var prevTail = (sb.frames && sb.frames.tail) || null;
+    var fallbackUrl = (prevTail && (prevTail.url || prevTail.lastKnownGoodUrl)) || sb.tailFrameUrl || "";
+    sb.tailFrameLastError = msg;
+    sb.tailFrameFailedAt = new Date().toISOString();
+    sb.tailFrameIntent = "requested";
+    sb.tailFrameIntentUpdatedAt = sb.tailFrameIntentUpdatedAt || sb.tailFrameFailedAt;
+    sb.tailFrameReferenceStatus = fallbackUrl ? "ready" : "missing";
+    var nextTail = Object.assign({}, prevTail || {}, {
+      url: fallbackUrl || undefined,
+      status: fallbackUrl ? "degraded" : "failed",
+      source: fallbackUrl ? "last_known_good" : ((prevTail && prevTail.source) || "generated"),
+      lastKnownGoodUrl: fallbackUrl || ((prevTail && prevTail.lastKnownGoodUrl) || undefined),
+      referenceStatus: fallbackUrl ? "ready" : "missing",
+      lastError: {
+        message: msg,
+        errorCode: errRecord.errorCode || undefined,
+        recoveryHint: errRecord.recoveryHint || undefined,
+        failedAt: sb.tailFrameFailedAt,
+        imageSafetyAudit: audit || undefined
+      }
+    });
+    if (audit) {
+      nextTail.safetyAudit = audit;
+      sb.tailFrameSafetyAudit = audit;
+    } else {
+      delete nextTail.safetyAudit;
+      delete nextTail.imageSafetyAudit;
+      delete sb.tailFrameSafetyAudit;
+    }
+    sb.frames = Object.assign({}, sb.frames || {}, { tail: nextTail });
+    proj.storyboards[groupIdx] = sb;
+  });
+}
+
+function _imageSafetyAuditFromExtra(extra) {
+  extra = extra || {};
+  return extra.imageSafetyAudit ||
+    (extra.extra && extra.extra.imageSafetyAudit) ||
+    (extra.result && extra.result.imageSafetyAudit) ||
+    null;
+}
+
+function _isImageSafetyModerationCode(code) {
+  return /moderation_blocked|content_policy_violation|safety_violation|policy_violation|content_filter/i.test(String(code || ''));
+}
+
+function _isImageSafetyModerationMessage(msg) {
+  return /moderation_blocked|content_policy|content_filter|safety system|image_generation_user_error|内容安全|内容审核|安全审核|安全系统|未通过(?:内容)?(?:安全)?审核/i.test(String(msg || ''));
+}
+
+function _isImageSafetyBlocked(audit, errMsg) {
+  var attempts = Array.isArray(audit && audit.attempts) ? audit.attempts : [];
+  if (attempts.some(function (attempt) {
+    return _isImageSafetyModerationCode(attempt && attempt.errorCode) ||
+      (Array.isArray(attempt && attempt.safetyViolations) && attempt.safetyViolations.length);
+  })) return true;
+  var diagnostics = audit && audit.safetyDiagnostics || {};
+  var categories = Array.isArray(diagnostics.providerCategory) ? diagnostics.providerCategory : [];
+  if (categories.length) return true;
+  return _isImageSafetyModerationMessage(errMsg);
+}
+
+function _imageSafetyAuditTargets(audit, limit) {
+  var diagnostics = audit && audit.safetyDiagnostics || {};
+  var diagnosticItems = Array.isArray(diagnostics.likelySensitiveFragments)
+    ? diagnostics.likelySensitiveFragments
+    : [];
+  var seenWords = {};
+  var words = [];
+  var pushWord = function (text) {
+    text = String(text || '').trim();
+    if (!text || seenWords[text]) return;
+    seenWords[text] = true;
+    words.push(text);
+  };
+  diagnosticItems.forEach(function (item) {
+    var text = (item && item.text || '').toString().trim();
+    if (!text) return;
+    _extractCompactSafetyWords(text).forEach(pushWord);
+    if (_isCompactSafetyWord(text)) pushWord(text);
+  });
+  if (!words.length) {
+    _imageSafetyRewriteTerms(audit).forEach(function (text) {
+      _extractCompactSafetyWords(text).forEach(pushWord);
+    });
+  }
+  var max = limit || 6;
+  return {
+    words: words.slice(0, max),
+  };
+}
+
+function _isCompactSafetyWord(text) {
+  text = String(text || '').trim();
+  return text.length >= 2 && text.length <= 8 && !/[，,。；;、\s]/.test(text);
+}
+
+function _extractCompactSafetyWords(text) {
+  var source = String(text || '');
+  var out = [];
+  var seen = {};
+  var push = function (term) {
+    term = String(term || '').trim();
+    if (!_isCompactSafetyWord(term) || seen[term]) return;
+    seen[term] = true;
+    out.push(term);
+  };
+  var rules = [
+    /人群挤压|挤出|挤入|拥挤|围堵|推搡|争相/g,
+    /盯着|瞪大|嘴微张|张望|屏住呼吸|屏息/g,
+    /惊恐|惊惧|惊吓|脸色发白|惨白|紧张|震惊|震撼/g,
+    /巨大暗影|暗影|压迫|爆发|喷薄|冲击|裂开|炸裂|引信/g,
+    /膜拜|跪拜|审判|献祭/g,
+  ];
+  rules.forEach(function (re) {
+    re.lastIndex = 0;
+    var match;
+    while ((match = re.exec(source)) !== null) push(match[0]);
+  });
+  return out;
+}
+
+function _imageSafetyRewriteTerms(audit) {
+  var terms = [];
+  var seen = {};
+  var push = function (text) {
+    text = String(text || '')
+      .replace(/\s+/g, ' ')
+      .replace(/^[-:：\s]+/, '')
+      .trim();
+    if (text.length < 2 || text.length > 36 || seen[text]) return;
+    seen[text] = true;
+    terms.push(text);
+  };
+  var visualDiffs = audit &&
+    audit.visualAnchorDescription &&
+    Array.isArray(audit.visualAnchorDescription.rewriteDiff)
+      ? audit.visualAnchorDescription.rewriteDiff
+      : [];
+  var attemptDiffs = [];
+  (Array.isArray(audit && audit.attempts) ? audit.attempts : []).forEach(function (attempt) {
+    (Array.isArray(attempt && attempt.rewriteDiff) ? attempt.rewriteDiff : []).forEach(function (diff) {
+      attemptDiffs.push(diff);
+    });
+  });
+  visualDiffs.concat(attemptDiffs).forEach(function (diff) {
+    var from = diff && (diff.from || diff.fromPreview);
+    var to = diff && (diff.to || diff.toPreview);
+    if (!from || !to) return;
+    _extractChangedSafetyPhrases(from, to).forEach(push);
+  });
+  return terms;
+}
+
+function _extractSafetyUiScope(text) {
+  var source = String(text || '');
+  var sections = [];
+  var sectionRe = /【(主镜头|用户原文约束)】[\s\S]*?(?=\n【[^】]+】|$)/g;
+  var match;
+  while ((match = sectionRe.exec(source)) !== null) sections.push(match[0]);
+  return sections.length ? sections.join('\n') : source;
+}
+
+function _normalizeSafetyCompareText(text) {
+  return String(text || '').replace(/\s+/g, '').replace(/[“”"']/g, '');
+}
+
+function _extractChangedSafetyPhrases(fromText, toText) {
+  var from = _extractSafetyUiScope(fromText);
+  var toNorm = _normalizeSafetyCompareText(_extractSafetyUiScope(toText));
+  var rawParts = from
+    .replace(/【[^】]+】/g, '\n')
+    .split(/[，,。；;、\n]/g);
+  var out = [];
+  var seen = {};
+  rawParts.forEach(function (part) {
+    var text = String(part || '')
+      .replace(/^\s*-\s*/, '')
+      .replace(/^(画面|台词\/声音提示|景别|角度\/视点|焦距|景深\/焦点|光线组合|构图组合|运镜)\s*[：:]/, '')
+      .trim();
+    if (text.length < 2 || text.length > 36) return;
+    if (/^(以镜头\s*\d+|中近景|平视|固定镜头|浅景深|此钟在|路人甲|帝兵惊叹)/.test(text)) return;
+    if (/侧光|柔和|照亮|视线方向/.test(text)) return;
+    var textNorm = _normalizeSafetyCompareText(text);
+    if (!textNorm || toNorm.indexOf(textNorm) >= 0 || seen[text]) return;
+    seen[text] = true;
+    out.push(text);
+  });
+  return out;
+}
+
+function _imageSafetyAuditHint(audit) {
+  var targets = _imageSafetyAuditTargets(audit, 4);
+  if (targets.words.length) return '图像服务没有返回具体拦截词，系统推测可先弱化：' + targets.words.join('、') + '。';
+  var attempts = Array.isArray(audit && audit.attempts) ? audit.attempts : [];
+  var hadRewrite = attempts.some(function (attempt) {
+    return Array.isArray(attempt && attempt.rewriteDiff) && attempt.rewriteDiff.length;
+  });
+  if (hadRewrite) return '系统已自动改写并重试，仍被拦截；请进一步弱化惊恐、压迫、爆发、人群挤压等描写，或减少参考图后重试。';
+  return '图像服务未返回具体拦截词；建议先弱化惊恐/压迫/爆发/人群挤压等描述，或更换、减少参考图后重试。';
+}
+
+function _frameSafetyInfo(kind, sb) {
+  sb = sb || {};
+  var isTail = kind === 'tail';
+  var tail = isTail ? ((sb.frames && sb.frames.tail) || {}) : {};
+  var currentLastError = isTail
+    ? (tail.lastError || null)
+    : (sb.firstFrame && sb.firstFrame.lastError || null);
+  var currentLastErrorAudit = currentLastError && currentLastError.imageSafetyAudit || null;
+  var audit = isTail
+    ? (currentLastErrorAudit || sb.tailFrameSafetyAudit || tail.safetyAudit || tail.imageSafetyAudit || null)
+    : (currentLastErrorAudit || _firstFrameSafetyExtraFromStoryboard(sb).imageSafetyAudit);
+  var rawMsg = isTail
+    ? (sb.tailFrameLastError || (currentLastError && currentLastError.message) || '')
+    : (sb.firstFrameLastError || (currentLastError && currentLastError.message) || '');
+  if (!_isImageSafetyModerationMessage(rawMsg) && !currentLastErrorAudit) return null;
+  if (!_isImageSafetyBlocked(audit, rawMsg)) return null;
+  var targets = _imageSafetyAuditTargets(audit, 8);
+  var words = targets.words;
+  var label = isTail ? '尾帧' : '首帧';
+  return {
+    terms: words,
+    words: words,
+    reasonLine: '原因：图片生成服务判定这次' + label + '请求有敏感内容，已拒绝生成。',
+    termsLine: words.length
+      ? '疑似触发词：' + words.join('、')
+      : '疑似触发词：未能定位到具体词。',
+  };
+}
+
+function _firstFrameSafetyInfo(sb) {
+  return _frameSafetyInfo('first', sb);
+}
+
+function _tailFrameSafetyInfo(sb) {
+  return _frameSafetyInfo('tail', sb);
+}
+
+function _sbFrameSafetyNoticeHtml(info, kind) {
+  if (!info) return '';
+  return '<div class="sb-frame-safety-notice" data-sb-frame-safety-notice="' + escapeHtml(kind || 'first') + '">' +
+    '<div>' + escapeHtml(info.reasonLine) + '</div>' +
+    '<div>' + escapeHtml(info.termsLine) + '</div>' +
+  '</div>';
+}
+
+function _sbFirstFrameSafetyNoticeHtml(info) {
+  return _sbFrameSafetyNoticeHtml(info, 'first');
+}
+
+function _firstFrameFailureDisplay(errMsg, extra) {
+  var audit = _imageSafetyAuditFromExtra(extra);
+  var diagnosed = _diagnoseApiError((errMsg || '生成失败').toString());
+  var hint = (_isImageSafetyModerationMessage(errMsg) && _isImageSafetyBlocked(audit, errMsg)) ? _imageSafetyAuditHint(audit) : '';
+  if (hint && diagnosed === '提示词违规，未通过安全审核') {
+    return ('首帧未通过内容安全审核：' + hint).slice(0, 260);
+  }
+  if (hint && diagnosed.indexOf(hint) < 0 && diagnosed.length < 180) {
+    return (diagnosed + '。' + hint).slice(0, 260);
+  }
+  return diagnosed.toString().slice(0, 260);
+}
+
+function _firstFrameSafetyExtraFromStoryboard(sb) {
+  sb = sb || {};
+  return {
+    imageSafetyAudit: sb.firstFrameSafetyAudit ||
+      (sb.firstFrame && sb.firstFrame.lastError && sb.firstFrame.lastError.imageSafetyAudit) ||
+      (sb.frames && sb.frames.first && sb.frames.first.safetyAudit) ||
+      null
+  };
+}
+
+function _tailFrameUiState(sb, group) {
   sb = sb || {};
   var tail = (sb.frames && sb.frames.tail) || null;
   var tailUrl = _tailFrameImageUrl(sb);
   var tailStatus = (tail && tail.status) || (sb.tailFrameLastError ? 'failed' : (tailUrl ? 'ready' : 'missing'));
-  var canGenerate = _canGenerateTailFrame(sb);
+  var intent = _tailFrameGenerationIntentForGroup(group || {}, sb);
+  var requiresFirstFrame = !!intent.requiresFirstFrame;
+  var canGenerate = !!intent.canGenerate;
   var isLegacyPencil = String(sb.firstFrameMode || '') === 'legacy_pencil';
   var preflightMsg;
-  if (isLegacyPencil) preflightMsg = '当前首帧是手稿版 (legacy_pencil), 需先升级为彩色首帧';
-  else if (!canGenerate) preflightMsg = '需先生成彩色首帧 (structured_v1)';
+  if (requiresFirstFrame && isLegacyPencil) preflightMsg = '当前首帧是手稿版 (legacy_pencil), 需先升级为彩色首帧';
+  else if (requiresFirstFrame && !canGenerate) preflightMsg = '需先生成彩色首帧 (structured_v1)';
   else preflightMsg = '';
 
   var statusText;
@@ -781,12 +1271,12 @@ function _tailFrameUiState(sb) {
   else if (tailStatus === 'failed') statusText = '生成失败';
   else if (tailStatus === 'degraded') statusText = '已降级 (展示上次成功)';
   else if (tailStatus === 'missing') {
-    if (isLegacyPencil) statusText = '需升级首帧';
+    if (requiresFirstFrame && isLegacyPencil) statusText = '需升级首帧';
     else statusText = canGenerate ? '待生成' : '等待首帧';
   } else statusText = tailStatus;
 
   var btnText;
-  if (tailStatus === 'ready' || tailStatus === 'degraded') btnText = '重生成';
+  if (tailStatus === 'ready' || tailStatus === 'degraded') btnText = '重新生成';
   else if (tailStatus === 'failed') btnText = '重试';
   else btnText = '生成尾帧';
 
@@ -796,175 +1286,15 @@ function _tailFrameUiState(sb) {
     statusText: statusText,
     btnText: btnText,
     canGenerate: canGenerate,
+    requiresFirstFrame: requiresFirstFrame,
+    dependency: intent.dependency || 'independent',
     isLegacyPencil: isLegacyPencil,
     preflightMsg: preflightMsg,
     errorMsg: _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(sb, '')),
   };
 }
 
-function _clipNum(v, min, max, dflt) {
-  var n = Number(v);
-  if (!isFinite(n)) return dflt;
-  return Math.max(min, Math.min(max, n));
-}
-
-function _tailFrameSuggestionForGroup(group, sb) {
-  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
-  if (!shots.length) return { level: 'none', score: 0, label: '' };
-  if (_isTailRequested(sb)) return { level: 'requested', score: 100, label: '已选择尾帧' };
-  var weights = {
-    actionLandingNeed: 18,
-    visualTransformationNeed: 16,
-    revealNeed: 16,
-    endingCompositionNeed: 14,
-    emotionPeakNeed: 12,
-    continuityNeed: 0,
-  };
-  var weightTotal = 0;
-  Object.keys(weights).forEach(function (k) { weightTotal += weights[k]; });
-  var weighted = 0;
-  var simpleDialogueCount = 0;
-  var totalDuration = 0;
-  shots.forEach(function (shot) {
-    var sig = (shot && shot.tailFrameSignals) || {};
-    Object.keys(weights).forEach(function (key) {
-      weighted += _clipNum(sig[key], 0, 5, 0) * weights[key];
-    });
-    if (sig.isSimpleStaticDialogue === true) simpleDialogueCount++;
-    totalDuration += _clipNum(shot.duration || shot.durationSec, 0, 120, 4);
-  });
-  var base = weighted / Math.max(1, shots.length * weightTotal * 5) * 100;
-  var durationBonus = _clipNum(totalDuration - 6, 0, 10, 0);
-  var simpleDialoguePenalty = simpleDialogueCount === shots.length ? 15 : 0;
-  var score = Math.round(_clipNum(base + durationBonus - simpleDialoguePenalty, 0, 100, 0));
-  if (score >= 70) return { level: 'strong', score: score, label: '强烈建议尾帧' };
-  if (score >= 45) return { level: 'suggest', score: score, label: '建议尾帧' };
-  return { level: 'none', score: score, label: '' };
-}
-
-// 计算尾帧卡片顶部 advice banner 的展示决策。返回结构:
-//   { kind: 'recommend' | 'discourage' | 'hidden',
-//     label, reasonShort, reasonLong, score }
-// 抑制规则:
-//   - shots 为空 / 全无 tailFrameSignals
-//   - _isTailRequested(sb) === true (已选择 / 已生成)
-//   - tail status === 'ready' | 'degraded' | 'failed' (兜底防御)
-//   - firstFrameMode === 'legacy_pencil' (首帧本身不达标, 谈不上要不要尾帧)
-// 阈值: score >= 45 -> recommend; < 45 -> discourage
-function _tailFrameAdviceForGroup(group, sb) {
-  sb = sb || {};
-  var hidden = { kind: 'hidden', score: 0 };
-  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
-  if (!shots.length) return hidden;
-  if (_isTailRequested(sb)) return hidden;
-  if (String(sb.firstFrameMode || '') === 'legacy_pencil') return hidden;
-  var tailUiStatus = (_tailFrameUiState(sb) || {}).status;
-  if (tailUiStatus === 'ready' || tailUiStatus === 'degraded' || tailUiStatus === 'failed') {
-    return hidden;
-  }
-  var hasAnySignals = shots.some(function (shot) {
-    return shot && shot.tailFrameSignals && typeof shot.tailFrameSignals === 'object';
-  });
-  if (!hasAnySignals) return hidden;
-
-  var suggestion = _tailFrameSuggestionForGroup(group, sb);
-  // requested level 已被上面的 _isTailRequested 拦掉;
-  // 这里只可能是 strong / suggest / none。
-  if (suggestion.level === 'requested') return hidden;
-
-  var signalDefs = [
-    { key: 'actionLandingNeed', label: '动作落点' },
-    { key: 'visualTransformationNeed', label: '视觉转化' },
-    { key: 'revealNeed', label: '揭示节点' },
-    { key: 'endingCompositionNeed', label: '镜头收束' },
-    { key: 'emotionPeakNeed', label: '情绪峰值' },
-  ];
-  var aggMax = {};
-  var simpleDialogueCount = 0;
-  var totalDuration = 0;
-  shots.forEach(function (shot) {
-    var sig = (shot && shot.tailFrameSignals) || {};
-    signalDefs.forEach(function (def) {
-      var v = _clipNum(sig[def.key], 0, 5, 0);
-      if (v > (aggMax[def.key] || 0)) aggMax[def.key] = v;
-    });
-    if (sig.isSimpleStaticDialogue === true) simpleDialogueCount++;
-    totalDuration += _clipNum(shot.duration || shot.durationSec, 0, 120, 4);
-  });
-  var reasonLongParts = signalDefs.map(function (def) {
-    return def.label + ' ' + Math.round((aggMax[def.key] || 0) * 20); // 0-5 → 0-100
-  });
-  var reasonLong = '评分 ' + suggestion.score + '：' + reasonLongParts.join(' / ');
-
-  if (suggestion.level === 'strong' || suggestion.level === 'suggest') {
-    var topSignals = signalDefs
-      .map(function (def) { return { label: def.label, value: aggMax[def.key] || 0 }; })
-      .filter(function (s) { return s.value >= 4; })
-      .sort(function (a, b) { return b.value - a.value; })
-      .slice(0, 2)
-      .map(function (s) { return s.label; });
-    var reasonShortPos = topSignals.length ? topSignals.join(' · ') : '镜头综合评分较高';
-    return {
-      kind: 'recommend',
-      label: '建议生成尾帧',
-      reasonShort: reasonShortPos,
-      reasonLong: reasonLong,
-      score: suggestion.score,
-    };
-  }
-
-  // suggestion.level === 'none' → discourage
-  var negParts = [];
-  if (shots.length > 0 && simpleDialogueCount === shots.length) negParts.push('简单对白镜头');
-  if (totalDuration < 6) negParts.push('时长较短');
-  if (!negParts.length) negParts.push('镜头信号偏弱');
-  return {
-    kind: 'discourage',
-    label: '不建议使用尾帧',
-    reasonShort: negParts.join(' · ') + '，首帧主控更稳',
-    reasonLong: reasonLong,
-    score: suggestion.score,
-  };
-}
-
-// 渲染尾帧卡片顶部的 advice banner。两种状态:
-//   - recommend: 绿色 + 粗体 + lightbulb 图标 + 点击直接走 accept-tail-suggestion
-//   - discourage: 琥珀色 + 常规字重 + info 图标 + 点击弹 confirm, 用户确认后再走 accept
-//     （此前用红色 bg-red-50/text-red-700，色彩过于警示——这是"不建议但可以做"的
-//     提示性语义，不是错误。改用 amber 琥珀色，温和不刺眼，跟绿色保持色相对比。）
-// hidden 时返回空串, 调用方不会在 DOM 上落任何节点。
-function _tailFrameAdviceBannerHtml(advice, gIdx) {
-  if (!advice || advice.kind === 'hidden') return '';
-  var isPositive = advice.kind === 'recommend';
-  var icon = isPositive ? 'tips_and_updates' : 'info';
-  var action = isPositive ? 'accept-tail-suggestion' : 'confirm-tail-advice-override';
-  var labelCls = isPositive ? 'font-bold' : 'font-medium';
-  var toneCls = isPositive
-    ? 'bg-emerald-50 text-emerald-700 border-b border-emerald-100 hover:bg-emerald-100/70 '
-    : 'bg-amber-50 text-amber-700 border-b border-amber-100 hover:bg-amber-100/70 ';
-  var hintTitle = (isPositive
-    ? '点击采纳建议并生成尾帧。'
-    : '点击仍然生成尾帧（系统不建议）。') + advice.reasonLong;
-  return (
-    '<button type="button" ' +
-      // padding 与 head 的 18px 基线对齐由 .tail-advice-banner CSS 控制 (见 styles.css),
-      // 这里的 px-4 只是兜底, 防止 CSS 没加载时 banner 完全没左右内边距。
-      'class="tail-advice-banner w-full flex items-center gap-1.5 px-4 py-1.5 ' +
-        toneCls +
-        'transition-colors cursor-pointer text-[11px] leading-tight text-left" ' +
-      'data-action="' + action + '" data-gidx="' + gIdx + '" ' +
-      'title="' + escapeHtml(hintTitle) + '">' +
-      '<span class="material-symbols-outlined text-[14px] shrink-0">' + icon + '</span>' +
-      '<span class="' + labelCls + ' shrink-0">' + escapeHtml(advice.label) + '</span>' +
-      '<span class="opacity-70 truncate">· ' + escapeHtml(advice.reasonShort) + '</span>' +
-    '</button>'
-  );
-}
-
-// 标记尾帧意图为 requested 并触发后续生成。供:
-//   - accept-tail-suggestion (正向 banner 点击)
-//   - confirm-tail-advice-override (负向 banner 点击 + 用户在 confirm 弹窗里点了"确定")
-// 复用同一套逻辑, 避免行为漂移。
+// 标记尾帧意图为 requested 并触发后续生成。供正向尾帧建议点击复用。
 function _acceptTailFrameSuggestion(gIdx) {
   if (!project.storyboards) project.storyboards = [];
   var suggestSb = project.storyboards[gIdx] || {};
@@ -976,7 +1306,10 @@ function _acceptTailFrameSuggestion(gIdx) {
   saveProject();
   renderImageGrid();
   checkImagesConfirm();
-  if (_canGenerateTailFrame(suggestSb)) {
+  var groups = getStoryboardGroups();
+  var group = groups[gIdx] || {};
+  var intent = _tailFrameGenerationIntentForGroup(group, suggestSb);
+  if (intent.canGenerate) {
     generateStoryboardTailFrame(gIdx).then(function () {
       saveProject();
       checkImagesConfirm();
@@ -984,7 +1317,7 @@ function _acceptTailFrameSuggestion(gIdx) {
       console.warn('[TailFrame] accept suggestion failed:', (err && err.message) || err);
     });
   } else {
-    showToast("已标记这段需要尾帧，请先生成首帧", "info");
+    showToast(intent.requiresFirstFrame ? "已标记这段需要尾帧，请先生成首帧" : "已标记这段需要尾帧", "info");
   }
 }
 
@@ -1282,6 +1615,7 @@ function _sbFirstFrameCardPromptState(gIdx) {
       errorMessage: '',
       staleWasShown: false,
       staleNoticeShown: false,
+      draftCommitRefreshPending: false,
     };
   }
   return _firstFrameCardPromptAutosave[key];
@@ -1316,10 +1650,97 @@ function _sbSetFirstFrameCardPromptStatus(gIdx, status, message, code) {
   node.innerHTML = _sbFirstFrameCardPromptStatusInner(gIdx, state.status);
 }
 
-function _sbFirstFramePromptEditorHtml(gIdx, text) {
-  return '<textarea class="sb-frame-text-box sb-frame-prompt-editor" data-sb-first-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="首帧提示词待生成。">' +
+function _sbFramePromptReadonlyStatusHtml(text) {
+  return '<div class="sb-frame-prompt-status" data-status="readonly">' + escapeHtml(text || '只读展示') + '</div>';
+}
+
+function _sbEscapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _sbFrameSafetyHighlightHtml(text, terms) {
+  text = String(text || '');
+  terms = Array.isArray(terms) ? terms : [];
+  if (!text || !terms.length) return escapeHtml(text);
+  var ranges = [];
+  terms.forEach(function (rawTerm) {
+    var term = String(rawTerm || '').trim();
+    if (term.length < 2) return;
+    var re = new RegExp(_sbEscapeRegExp(term), 'g');
+    var match;
+    while ((match = re.exec(text)) !== null) {
+      ranges.push({ start: match.index, end: match.index + match[0].length });
+      if (match[0].length === 0) re.lastIndex++;
+    }
+  });
+  if (!ranges.length) return escapeHtml(text);
+  ranges.sort(function (a, b) {
+    return a.start === b.start ? b.end - a.end : a.start - b.start;
+  });
+  var merged = [];
+  ranges.forEach(function (range) {
+    var last = merged[merged.length - 1];
+    if (!last || range.start > last.end) merged.push({ start: range.start, end: range.end });
+    else if (range.end > last.end) last.end = range.end;
+  });
+  var html = '';
+  var cursor = 0;
+  merged.forEach(function (range) {
+    html += escapeHtml(text.slice(cursor, range.start));
+    html += '<mark class="sb-frame-safety-mark">' + escapeHtml(text.slice(range.start, range.end)) + '</mark>';
+    cursor = range.end;
+  });
+  html += escapeHtml(text.slice(cursor));
+  return html;
+}
+
+function _sbSyncFramePromptSafetyHighlight(el) {
+  if (!el || !el.matches) return;
+  var isFirstPrompt = el.matches('textarea[data-sb-first-prompt-field="content"]');
+  var isTailPrompt = el.matches('textarea[data-sb-tail-prompt-field="content"]');
+  if (!isFirstPrompt && !isTailPrompt) return;
+  var wrap = el.closest('.sb-frame-prompt-highlight-wrap');
+  if (!wrap) return;
+  var layer = wrap.querySelector('.sb-frame-prompt-highlight');
+  if (!layer) return;
+  var gIdx = parseInt(el.dataset.gidx, 10);
+  var sb = !isNaN(gIdx) && project && project.storyboards ? project.storyboards[gIdx] : null;
+  var info = isTailPrompt ? _tailFrameSafetyInfo(sb || {}) : _firstFrameSafetyInfo(sb || {});
+  var terms = info && Array.isArray(info.terms) ? info.terms : [];
+  layer.innerHTML = _sbFrameSafetyHighlightHtml(el.value || '', terms);
+  layer.scrollTop = el.scrollTop || 0;
+  layer.scrollLeft = el.scrollLeft || 0;
+}
+
+function _sbSyncFramePromptSafetyHighlights(root) {
+  if (!root) return;
+  Array.prototype.slice.call(root.querySelectorAll(
+    'textarea[data-sb-first-prompt-field="content"], textarea[data-sb-tail-prompt-field="content"]'
+  )).forEach(_sbSyncFramePromptSafetyHighlight);
+}
+
+function _sbFirstFramePromptEditorHtml(gIdx, text, opts) {
+  opts = opts || {};
+  var readOnly = opts.readOnly === true;
+  var mirror = opts.mirror === true;
+  var placeholder = opts.placeholder || '首帧提示词待生成。';
+  var safetyInfo = opts.safetyInfo || null;
+  var safetyTerms = safetyInfo && Array.isArray(safetyInfo.terms) ? safetyInfo.terms : [];
+  var useHighlight = !readOnly && !mirror && safetyTerms.length > 0;
+  var dataAttrs = mirror
+    ? ' data-sb-prompt-mirror="first" data-source-gidx="' + escapeHtml(gIdx) + '"'
+    : ' data-sb-first-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '"';
+  var readOnlyAttrs = readOnly
+    ? ' readonly aria-readonly="true" title="' + escapeHtml(opts.title || '此处为片段提示词展示') + '"'
+    : '';
+  var textareaHtml = '<textarea class="sb-frame-text-box sb-frame-prompt-editor' + (useHighlight ? ' has-safety-highlight' : '') + '" ' + dataAttrs + ' maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="' + escapeHtml(placeholder) + '"' + readOnlyAttrs + '>' +
     escapeHtml(text || '') +
   '</textarea>';
+  if (!useHighlight) return textareaHtml;
+  return '<div class="sb-frame-prompt-highlight-wrap" data-sb-safety-highlight-wrap="first" data-gidx="' + escapeHtml(gIdx) + '">' +
+    '<div class="sb-frame-prompt-highlight" aria-hidden="true">' + _sbFrameSafetyHighlightHtml(text || '', safetyTerms) + '</div>' +
+    textareaHtml +
+  '</div>';
 }
 
 function _sbFirstFrameCardBaseDraft(gIdx) {
@@ -1352,6 +1773,112 @@ function _sbFirstFrameCardHasPendingChanges(gIdx) {
   var state = _sbFirstFrameCardPromptState(gIdx);
   _sbRefreshFirstFrameCardPendingDraft(gIdx);
   return state.pendingDraftJson !== state.lastSavedDraftJson;
+}
+
+function _sbApplyFirstFrameCardPromptDraftResponse(gIdx, resp, options) {
+  options = options || {};
+  resp = resp || {};
+  var hasDraft = Object.prototype.hasOwnProperty.call(resp, 'draft');
+  if (project) {
+    if (!project.storyboards) project.storyboards = [];
+    if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+    if (hasDraft) project.storyboards[gIdx].firstFrameEditDraft = resp.draft || null;
+    if (resp.firstFrameBasePrompt) project.storyboards[gIdx].firstFrameBasePrompt = resp.firstFrameBasePrompt;
+    if (resp.firstFrameBackup) project.storyboards[gIdx].firstFrameBackup = resp.firstFrameBackup;
+  }
+
+  var state = _firstFrameCardPromptAutosave[String(gIdx)];
+  if (!state) return;
+  var hadDirtyAt = !!state.dirtyAt;
+  var nextDraft = hasDraft
+    ? _ffeCloneDraft(resp.draft || {})
+    : _ffeCloneDraft(project && project.storyboards && project.storyboards[gIdx] && project.storyboards[gIdx].firstFrameEditDraft || {});
+  if (resp.plan) state.plan = resp.plan;
+  if (Object.prototype.hasOwnProperty.call(resp, 'sourceHash')) state.sourceHash = String(resp.sourceHash || '');
+  if (Object.prototype.hasOwnProperty.call(resp, 'savedDraftFingerprint')) {
+    state.savedDraftFingerprint = String(resp.savedDraftFingerprint || '');
+    state.expectedFingerprint = state.savedDraftFingerprint;
+  }
+  if (options.clearDraftCommitRefreshPending === true || !hasDraft || !resp.draft) {
+    state.draftCommitRefreshPending = false;
+  }
+  state.draft = nextDraft;
+  state.lastSavedDraftJson = _ffeDraftJson(state.draft);
+  state.pendingDraftJson = state.lastSavedDraftJson;
+  state.pendingDraft = _ffeCloneDraft(state.draft);
+  state.hydrated = true;
+
+  if (options.preserveTextarea === true) {
+    var pending = _sbRefreshFirstFrameCardPendingDraft(gIdx);
+    state.dirtyAt = hadDirtyAt && pending.json !== state.lastSavedDraftJson ? (state.dirtyAt || Date.now()) : null;
+  } else {
+    state.dirtyAt = null;
+  }
+
+  state.errorCode = '';
+  state.errorMessage = '';
+  if (state.status !== 'saving') {
+    state.status = _ffeSavedFieldStatus('content', state.draft);
+    _sbSetFirstFrameCardPromptStatus(gIdx, state.status);
+  }
+}
+
+function _sbMarkFirstFrameCardPromptDraftCommitPending(gIdx) {
+  var state = _firstFrameCardPromptAutosave[String(gIdx)];
+  if (!state) return;
+  state.draftCommitRefreshPending = true;
+}
+
+function _sbMarkFirstFrameCardPromptDraftCommitPendingForTargets(targets) {
+  (Array.isArray(targets) ? targets : []).forEach(function (target) {
+    var gIdx = Number(target && target.groupIdx);
+    if (Number.isFinite(gIdx)) _sbMarkFirstFrameCardPromptDraftCommitPending(gIdx);
+  });
+}
+
+async function _sbRefreshFirstFrameCardPromptBaselineFromServer(gIdx, options) {
+  options = options || {};
+  if (!project || !project.id || gIdx == null) return null;
+  var payload = await apiGet('/api/frames/plan?projectId=' + encodeURIComponent(project.id) + '&groupIdx=' + encodeURIComponent(gIdx) + '&frameType=first_frame');
+  _sbApplyFirstFrameCardPromptDraftResponse(gIdx, payload, {
+    preserveTextarea: options.preserveTextarea !== false,
+    clearDraftCommitRefreshPending: options.clearDraftCommitRefreshPending === true,
+  });
+  return payload;
+}
+
+async function _sbRefreshFirstFrameCardPromptBaselinesFromServer(targets, options) {
+  var seen = {};
+  for (var i = 0; i < (Array.isArray(targets) ? targets.length : 0); i += 1) {
+    var gIdx = Number(targets[i] && targets[i].groupIdx);
+    if (!Number.isFinite(gIdx) || seen[gIdx]) continue;
+    seen[gIdx] = true;
+    try {
+      await _sbRefreshFirstFrameCardPromptBaselineFromServer(gIdx, options);
+    } catch (err) {
+      console.warn('[first-frame-card-prompt] baseline refresh after draft commit failed:', {
+        groupIdx: gIdx,
+        error: (err && err.message) || err,
+      });
+    }
+  }
+}
+
+var _sbFirstFramePromptHydrateToast = { message: '', at: 0 };
+
+function _sbShowFirstFramePromptHydrateError(gIdx, err) {
+  var message = '首帧提示词状态加载失败，请稍后重试';
+  var detail = _diagnoseApiError(((err && err.message) || err || '').toString());
+  console.warn('[first-frame-card-prompt] interactive hydrate failed:', {
+    groupIdx: gIdx,
+    detail: detail,
+    error: err,
+  });
+  var now = Date.now();
+  var key = message + '|' + detail;
+  if (_sbFirstFramePromptHydrateToast.message === key && now - _sbFirstFramePromptHydrateToast.at < 3500) return;
+  _sbFirstFramePromptHydrateToast = { message: key, at: now };
+  showToast(message, 'error');
 }
 
 function _sbMergeFirstFrameCardPlanPayload(gIdx, payload) {
@@ -1418,10 +1945,11 @@ async function _sbHydrateFirstFramePromptEditor(gIdx, el) {
     if (currentEl && currentEl === el && !state.dirtyAt && String(currentEl.value || '') === beforeValue) {
       currentEl.value = _sbFirstFrameCardPromptText(gIdx);
     }
+    _sbSyncFramePromptSafetyHighlight(currentEl || el);
     _sbRefreshFirstFrameCardPendingDraft(gIdx);
     _sbSetFirstFrameCardPromptStatus(gIdx, _sbFirstFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
-  } catch (_) {
-    showToast('首帧提示词状态加载失败，请稍后重试', 'error');
+  } catch (err) {
+    _sbShowFirstFramePromptHydrateError(gIdx, err);
   }
 }
 
@@ -1440,6 +1968,7 @@ function _sbHydrateFirstFramePromptEditors(root) {
       if (!state.dirtyAt && String(currentEl.value || '') === beforeValue) {
         currentEl.value = nextText;
       }
+      _sbSyncFramePromptSafetyHighlight(currentEl);
       _sbRefreshFirstFrameCardPendingDraft(gIdx);
       _sbSetFirstFrameCardPromptStatus(gIdx, _sbFirstFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
     }).catch(function (err) {
@@ -1465,33 +1994,38 @@ async function _sbRunFirstFrameCardPromptSave(gIdx, options) {
   state.inFlightPromise = (async function () {
     try {
       await _sbEnsureFirstFrameCardPromptState(gIdx);
+      if (state.draftCommitRefreshPending) {
+        await _sbRefreshFirstFrameCardPromptBaselineFromServer(gIdx, { preserveTextarea: true });
+      }
       var snapshot = _sbRefreshFirstFrameCardPendingDraft(gIdx);
       if (!options.forceSave && snapshot.json === state.lastSavedDraftJson) {
         _sbSetFirstFrameCardPromptStatus(gIdx, _ffeSavedFieldStatus('content', state.draft));
         return { ok: true, skipped: true };
       }
       _sbSetFirstFrameCardPromptStatus(gIdx, 'saving');
-      var resp = await apiPost('/api/frames/edit-draft', {
-        projectId: project.id,
-        groupIdx: gIdx,
-        draft: snapshot.draft || {},
-        expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
-        force: options.force === true,
-      }, 'PUT');
-      state.draft = _ffeCloneDraft(resp.draft || {});
-      state.savedDraftFingerprint = String(resp.savedDraftFingerprint || '');
-      state.expectedFingerprint = state.savedDraftFingerprint;
-      state.lastSavedDraftJson = _ffeDraftJson(state.draft);
-      state.pendingDraftJson = state.lastSavedDraftJson;
-      state.pendingDraft = _ffeCloneDraft(state.draft);
-      state.dirtyAt = null;
-      state.errorCode = '';
-      state.errorMessage = '';
-      if (!project.storyboards) project.storyboards = [];
-      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-      project.storyboards[gIdx].firstFrameEditDraft = resp.draft || null;
-      if (resp.firstFrameBasePrompt) project.storyboards[gIdx].firstFrameBasePrompt = resp.firstFrameBasePrompt;
-      if (resp.firstFrameBackup) project.storyboards[gIdx].firstFrameBackup = resp.firstFrameBackup;
+      var postSnapshot = async function (draftSnapshot) {
+        return await apiPost('/api/frames/edit-draft', {
+          projectId: project.id,
+          groupIdx: gIdx,
+          draft: draftSnapshot.draft || {},
+          expectedSavedDraftFingerprint: state.expectedFingerprint || state.savedDraftFingerprint || '',
+          force: options.force === true,
+        }, 'PUT');
+      };
+      var resp;
+      try {
+        resp = await postSnapshot(snapshot);
+      } catch (postErr) {
+        var postPayload = postErr && postErr.payload || {};
+        if (postPayload.code !== 'saved_draft_changed' || !state.draftCommitRefreshPending || options.force === true) throw postErr;
+        await _sbRefreshFirstFrameCardPromptBaselineFromServer(gIdx, {
+          preserveTextarea: true,
+          clearDraftCommitRefreshPending: true,
+        });
+        snapshot = _sbRefreshFirstFrameCardPendingDraft(gIdx);
+        resp = await postSnapshot(snapshot);
+      }
+      _sbApplyFirstFrameCardPromptDraftResponse(gIdx, resp);
       var nextStatus = _ffeSavedFieldStatus('content', state.draft);
       _sbSetFirstFrameCardPromptStatus(gIdx, nextStatus);
       if (state.staleWasShown && !state.staleNoticeShown) {
@@ -1638,6 +2172,26 @@ function _sbTailFrameCardPromptState(gIdx) {
   return _tailFrameCardPromptAutosave[key];
 }
 
+/**
+ * D (字段对齐方案选项 D): 首帧刚写入/就绪时, 作废该组尾帧提示词的就绪缓存。
+ * _sbEnsureTailFrameCardPromptState 在 hydrated=true 时会短路返回缓存的 preflight
+ * (line 1764); 若该缓存是"首帧未就绪"时拉取的, 首帧补齐后仍会残留陈旧 preflight,
+ * 导致点"生成尾帧"时 _sbRunTailFrameCardPromptSave 仍判 readOnly 并弹出旧的
+ * "片段 N 首帧未就绪"提示 (generateStoryboardTailFrame line 6343)。
+ * 这里清掉缓存的 preflight, 并在安全时 (无在途请求/无未保存草稿) 重置 hydrated,
+ * 强制下次重新向后端拉取真实就绪态。见 docs/first-frame-url-field-alignment-proposal.md。
+ */
+function _invalidateTailFramePromptReadiness(gIdx) {
+  if (gIdx === null || gIdx === undefined) return;
+  var state = _tailFrameCardPromptAutosave[String(gIdx)];
+  if (!state) return;
+  state.preflight = null;
+  // 首帧未就绪期尾帧提示词为只读, 正常不会有脏草稿; 这里仍兜底避免覆盖在途请求/用户编辑。
+  if (!state.hydrating && !state.inFlightPromise && !state.dirtyAt) {
+    state.hydrated = false;
+  }
+}
+
 function _sbTailFrameCardPromptTextarea(gIdx) {
   return document.querySelector('textarea[data-sb-tail-prompt-field="content"][data-gidx="' + String(gIdx) + '"]');
 }
@@ -1650,7 +2204,10 @@ function _sbTailFrameCardPromptStatus(gIdx, sb) {
 
 function _sbTailFramePromptReadOnly(gIdx, sb) {
   sb = sb || (project && project.storyboards && project.storyboards[gIdx]) || {};
-  if (!_canGenerateTailFrame(sb)) return true;
+  var groups = getStoryboardGroups();
+  var group = groups[gIdx] || {};
+  var intent = _tailFrameGenerationIntentForGroup(group, sb);
+  if (!intent.canGenerate) return true;
   var state = _tailFrameCardPromptAutosave[String(gIdx)];
   return !!(state && state.preflight && state.preflight.allowed === false);
 }
@@ -1677,12 +2234,24 @@ function _sbSetTailFrameCardPromptStatus(gIdx, status, message, code) {
 function _sbTailFramePromptEditorHtml(gIdx, text, opts) {
   opts = opts || {};
   var readOnly = opts.readOnly === true;
+  var mirror = opts.mirror === true;
+  var safetyInfo = opts.safetyInfo || null;
+  var safetyTerms = safetyInfo && Array.isArray(safetyInfo.terms) ? safetyInfo.terms : [];
+  var useHighlight = !readOnly && !mirror && safetyTerms.length > 0;
+  var dataAttrs = mirror
+    ? ' data-sb-prompt-mirror="tail" data-source-gidx="' + escapeHtml(gIdx) + '"'
+    : ' data-sb-tail-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '"';
   var readOnlyAttrs = readOnly
     ? ' readonly aria-readonly="true" title="' + escapeHtml(opts.title || '需先完成彩色视频首帧后才能编辑尾帧提示词') + '"'
     : '';
-  return '<textarea class="sb-frame-text-box sb-frame-prompt-editor" data-sb-tail-prompt-field="content" data-gidx="' + escapeHtml(gIdx) + '" maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="尾帧提示词待生成。"' + readOnlyAttrs + '>' +
+  var textareaHtml = '<textarea class="sb-frame-text-box sb-frame-prompt-editor' + (useHighlight ? ' has-safety-highlight' : '') + '" ' + dataAttrs + ' maxlength="' + FFE_PROMPT_OVERRIDE_MAX_CHARS + '" rows="18" placeholder="尾帧提示词待生成。"' + readOnlyAttrs + '>' +
     escapeHtml(text || '') +
   '</textarea>';
+  if (!useHighlight) return textareaHtml;
+  return '<div class="sb-frame-prompt-highlight-wrap" data-sb-safety-highlight-wrap="tail" data-gidx="' + escapeHtml(gIdx) + '">' +
+    '<div class="sb-frame-prompt-highlight" aria-hidden="true">' + _sbFrameSafetyHighlightHtml(text || '', safetyTerms) + '</div>' +
+    textareaHtml +
+  '</div>';
 }
 
 function _sbTailFrameCardBaseDraft(gIdx) {
@@ -2042,51 +2611,6 @@ async function _sbFlushTailFrameCardPromptsForTargets(targets, source) {
   return { ok: true };
 }
 
-function _framePlanSummaryForPanel(kind, sb) {
-  sb = sb || {};
-  var isTail = kind === 'tail';
-  var frame = (sb.frames && sb.frames[isTail ? 'tail' : 'first']) || {};
-  var summary = frame.planSummary || (isTail ? sb.tailFramePlanSummary : sb.firstFramePlanSummary) || null;
-  if (!summary || typeof summary !== 'object') return { chips: [], text: '' };
-  var chips = [];
-  (summary.characterNames || []).forEach(function (name) { if (name) chips.push(name); });
-  if (summary.sceneName) chips.push(summary.sceneName);
-  (summary.propNames || []).forEach(function (name) { if (name) chips.push(name); });
-  var text = String(summary.compositionGuidance || '').trim();
-  return {
-    chips: chips.filter(Boolean).slice(0, 8),
-    text: text,
-  };
-}
-
-function _shotKeywordChipsHtml(group, sb, kind) {
-  var seen = {};
-  var chips = [];
-  function add(value) {
-    value = String(value || '').trim();
-    if (!value || seen[value]) return;
-    seen[value] = true;
-    chips.push(value);
-  }
-  var summary = _framePlanSummaryForPanel(kind, sb);
-  summary.chips.forEach(add);
-  var shots = (group && Array.isArray(group.shots)) ? group.shots : [];
-  shots.forEach(function (shot) {
-    String((shot && shot.keyInfo) || '').split(/[、,，;；|/]/).forEach(add);
-    (Array.isArray(shot && shot.characters) ? shot.characters : []).forEach(add);
-    add(shot && shot.scene);
-    (Array.isArray(shot && shot.props) ? shot.props : []).forEach(add);
-  });
-  if (!chips.length && shots[0]) {
-    add(shots[0].shotType);
-    add(shots[0].camera);
-  }
-  if (!chips.length) return '<span class="sb-frame-empty-note">暂无关键信息</span>';
-  return chips.slice(0, 8).map(function (chip) {
-    return '<span class="sb-frame-key-chip">' + escapeHtml(chip) + '</span>';
-  }).join('');
-}
-
 function _frameDialogueHtml(group) {
   var dialogue = _groupShotText(group, ['dialogue', 'audio'], '\n');
   if (!dialogue || dialogue === '——') dialogue = '---';
@@ -2094,48 +2618,249 @@ function _frameDialogueHtml(group) {
   return '<div class="sb-frame-dialogue-box" tabindex="0">' + escapeHtml(dialogue) + '</div>';
 }
 
-// 首帧/尾帧 card 折叠状态: 模块内存, 不持久化。
-//   key 形式: "<gIdx>:<kind>", value 为 true 表示折叠。
-//   默认: 首帧展开 (false), 尾帧折叠 (true)。re-render (renderImageGrid) 时也读这个 map,
-//   所以状态可以跨 re-render 保留, 用户切换页面 / 重新加载后回到默认。
+// 首帧/尾帧 card 折叠状态: localStorage 持久化用户手动覆盖值。
+//   key 形式绑定 projectId + shotIndices + kind, value 为 true 表示折叠。
+//   默认值仍来自推荐逻辑；用户一旦手动折叠/展开, 刷新页面后继续保留该覆盖值。
 var _frameCardCollapsed = {};
-function _frameCardCollapseKey(gIdx, kind) {
-  return String(gIdx) + ':' + String(kind);
+var _frameCardCollapsedStorageKey = "";
+function _frameCardCollapsedLocalStorageKey() {
+  return String((_ctx && _ctx.uPrefix) || "") + "sw_frame_card_collapsed_v1";
 }
-function _isFrameCardCollapsed(gIdx, kind) {
-  var key = _frameCardCollapseKey(gIdx, kind);
+function _frameCardStorageProjectPrefix() {
+  var projectKey = project && project.id != null ? String(project.id) : "local";
+  return "frame:" + projectKey + ":";
+}
+function _readFrameCardCollapsedStorage(storageKey) {
+  try {
+    var raw = window.localStorage.getItem(storageKey);
+    if (!raw) return {};
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return {};
+    var cleaned = {};
+    Object.keys(parsed).forEach(function (key) {
+      if (typeof key !== "string" || key.indexOf("frame:") !== 0) return;
+      cleaned[key] = !!parsed[key];
+    });
+    return cleaned;
+  } catch (_) {
+    return {};
+  }
+}
+function _ensureFrameCardCollapsedLoaded() {
+  var storageKey = _frameCardCollapsedLocalStorageKey();
+  if (_frameCardCollapsedStorageKey === storageKey) return;
+  _frameCardCollapsedStorageKey = storageKey;
+  _frameCardCollapsed = _readFrameCardCollapsedStorage(storageKey);
+}
+function _persistFrameCardCollapsed() {
+  _ensureFrameCardCollapsedLoaded();
+  try {
+    window.localStorage.setItem(_frameCardCollapsedStorageKey, JSON.stringify(_frameCardCollapsed));
+  } catch (_) {}
+}
+function _frameCardCollapseKey(gIdx, kind, group) {
+  return _frameCollapseKeyForGroup(project && project.id, group, gIdx, kind);
+}
+function _frameCardCollapseKeySet(groups) {
+  var keys = {};
+  (groups || []).forEach(function (group, gIdx) {
+    keys[_frameCardCollapseKey(gIdx, 'first', group)] = true;
+    keys[_frameCardCollapseKey(gIdx, 'tail', group)] = true;
+  });
+  return keys;
+}
+function _pruneFrameCardCollapsed(groups) {
+  _ensureFrameCardCollapsedLoaded();
+  var valid = _frameCardCollapseKeySet(groups);
+  var currentProjectPrefix = _frameCardStorageProjectPrefix();
+  var changed = false;
+  Object.keys(_frameCardCollapsed).forEach(function (key) {
+    if (key.indexOf(currentProjectPrefix) === 0 && !valid[key]) {
+      delete _frameCardCollapsed[key];
+      changed = true;
+    }
+  });
+  if (changed) _persistFrameCardCollapsed();
+}
+function _frameCardDefaultCollapsed(kind, group, sb, opts) {
+  opts = opts || {};
+  if (opts.mergedChild === true || opts.readOnlyActions === true) return true;
+  var recommendation = _frameRecommendationForGroup(group, sb || {});
+  if (kind === 'first') return !!(recommendation.first && recommendation.first.defaultCollapsed);
+  if (kind === 'tail') return !!(recommendation.tail && recommendation.tail.defaultCollapsed);
+  return kind === 'tail';
+}
+function _isFrameCardCollapsed(gIdx, kind, group, sb, opts) {
+  _ensureFrameCardCollapsedLoaded();
+  var key = _frameCardCollapseKey(gIdx, kind, group);
   if (Object.prototype.hasOwnProperty.call(_frameCardCollapsed, key)) {
     return !!_frameCardCollapsed[key];
   }
-  return kind === 'tail';
+  return _frameCardDefaultCollapsed(kind, group, sb, opts);
 }
-function _setFrameCardCollapsed(gIdx, kind, collapsed) {
-  _frameCardCollapsed[_frameCardCollapseKey(gIdx, kind)] = !!collapsed;
+function _setFrameCardCollapsedByKey(key, collapsed) {
+  _ensureFrameCardCollapsedLoaded();
+  if (!key) return;
+  _frameCardCollapsed[key] = !!collapsed;
+  _persistFrameCardCollapsed();
 }
-function _frameCardToggleButtonHtml(gIdx, kind) {
-  var collapsed = _isFrameCardCollapsed(gIdx, kind);
+function _frameCardToggleButtonHtml(gIdx, kind, group, sb, opts) {
+  var key = _frameCardCollapseKey(gIdx, kind, group);
+  var collapsed = _isFrameCardCollapsed(gIdx, kind, group, sb, opts);
   var label = collapsed ? '点击展开' : '点击折叠';
   var icon = collapsed ? 'expand_more' : 'expand_less';
   return '<button type="button" class="sb-frame-toggle" ' +
     'data-action="toggle-frame-card" data-gidx="' + gIdx + '" data-frame="' + escapeHtml(kind) + '" ' +
+    'data-frame-collapse-key="' + escapeHtml(key) + '" ' +
     'aria-expanded="' + (collapsed ? 'false' : 'true') + '">' +
       '<span class="sb-frame-toggle-label">' + label + '</span>' +
       '<span class="material-symbols-outlined sb-frame-toggle-icon">' + icon + '</span>' +
-    '</button>';
+	    '</button>';
 }
 
-function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
+function _setFramePanelCollapsedFromToggle(btn, nextCollapsed) {
+  if (!btn) return false;
+  var toggleGIdx = parseInt(btn.dataset.gidx, 10);
+  var toggleKind = btn.dataset.frame === 'tail' ? 'tail' : 'first';
+  if (isNaN(toggleGIdx)) return false;
+  var toggleGroups = getStoryboardGroups();
+  var toggleGroup = toggleGroups[toggleGIdx];
+  var toggleSb = (project.storyboards && project.storyboards[toggleGIdx]) || {};
+  var collapseKey = btn.dataset.frameCollapseKey || _frameCardCollapseKey(toggleGIdx, toggleKind, toggleGroup);
+  var panel = btn.closest('.sb-frame-panel');
+  if (typeof nextCollapsed !== 'boolean') {
+    var currentCollapsed = Object.prototype.hasOwnProperty.call(_frameCardCollapsed, collapseKey)
+      ? !!_frameCardCollapsed[collapseKey]
+      : (panel ? panel.classList.contains('is-collapsed') : _isFrameCardCollapsed(toggleGIdx, toggleKind, toggleGroup, toggleSb));
+    nextCollapsed = !currentCollapsed;
+  }
+  _setFrameCardCollapsedByKey(collapseKey, nextCollapsed);
+  if (panel) panel.classList.toggle('is-collapsed', nextCollapsed);
+  btn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+  var labelEl = btn.querySelector('.sb-frame-toggle-label');
+  if (labelEl) labelEl.textContent = nextCollapsed ? '点击展开' : '点击折叠';
+  var iconEl = btn.querySelector('.sb-frame-toggle-icon');
+  if (iconEl) iconEl.textContent = nextCollapsed ? 'expand_more' : 'expand_less';
+  return true;
+}
+
+function _frameCompactStatusForPanel(kind, sb, group, opts, state, recommendation) {
+  opts = opts || {};
   sb = sb || {};
   var isTail = kind === 'tail';
-  var imgUrl = isTail ? _tailFrameImageUrl(sb) : _firstFrameImageUrl(sb);
+  var hasFrame = isTail ? !!_tailFrameImageUrl(sb) : !!_firstFrameImageUrl(sb);
+  var mergedChild = opts.mergedChild === true;
+  var readOnlyActions = opts.readOnlyActions === true;
+  var rec = recommendation || _frameRecommendationForGroup(group, sb);
+  if (!isTail && (mergedChild || readOnlyActions)) {
+    var shotRangeText = _storyboardGroupShotRangeText(group);
+    return {
+      text: '无需生成',
+      tone: 'muted',
+      title: shotRangeText
+        ? '此镜头随镜头 ' + shotRangeText + ' 统一生成首帧，无需单独生成。'
+        : '此镜头随片段统一生成首帧，无需单独生成。',
+    };
+  }
+  if (!isTail && _isFirstFrameFailed(sb)) {
+    return {
+      text: '生成失败',
+      tone: 'error',
+      title: sb.firstFrameLastError ? _firstFrameFailureDisplay(sb.firstFrameLastError, _firstFrameSafetyExtraFromStoryboard(sb)) : '首帧图生成失败',
+    };
+  }
+  if (hasFrame) {
+    return {
+      text: '已生成',
+      tone: 'recommended',
+      title: isTail ? '尾帧已生成' : '首帧已生成',
+    };
+  }
+  if (!isTail) {
+    if (rec.first && rec.first.recommended) {
+      return {
+        text: '待生成（建议生成）',
+        tone: 'recommended',
+        title: rec.first.reason || '片段开场锚点',
+      };
+    }
+    return {
+      text: '无需生成',
+      tone: 'muted',
+      title: '当前镜头不需要单独生成首帧',
+    };
+  }
+
+  var tailState = state || _tailFrameUiState(sb, group);
+  if (tailState.status === 'failed') {
+    return {
+      text: '生成失败',
+      tone: 'error',
+      title: tailState.errorMsg || '尾帧生成失败',
+    };
+  }
+  if (tailState.status === 'degraded') {
+    return {
+      text: '已生成',
+      tone: 'recommended',
+      title: '尾帧已生成，当前展示上次成功结果',
+    };
+  }
+  if (mergedChild || readOnlyActions) {
+    return {
+      text: '无需生成',
+      tone: 'muted',
+      title: '此镜头随片段统一处理，不建议单独生成。',
+    };
+  }
+
+  var tailRec = rec.tail || {};
+  var shouldGenerateTail = !!tailRec.requested || !!tailRec.recommended;
+  if (shouldGenerateTail) {
+    if (tailState.canGenerate) {
+      return {
+        text: '待生成（建议生成）',
+        tone: 'recommended',
+        title: tailRec.reason || '建议生成尾帧',
+      };
+    }
+    return {
+      text: '待生成（建议生成 · 等待首帧）',
+      tone: 'recommended',
+      title: tailState.preflightMsg || '需先生成彩色首帧',
+    };
+  }
+
+  return {
+    text: '无需生成',
+    tone: 'muted',
+    title: (tailRec.reason || '当前镜头不建议生成尾帧'),
+  };
+}
+
+function _storyboardFramePanelHtml(kind, sb, gIdx, group, opts) {
+  opts = opts || {};
+  sb = sb || {};
+  var isTail = kind === 'tail';
+  var mergedChild = opts.mergedChild === true;
+  var readOnlyActions = opts.readOnlyActions === true;
+  var frameRecommendation = _frameRecommendationForGroup(group, sb);
+  var sourceImgUrl = isTail ? _tailFrameImageUrl(sb) : _firstFrameImageUrl(sb);
+  var suppressReadOnlyFirstImage = !isTail && (mergedChild || readOnlyActions);
+  var imgUrl = suppressReadOnlyFirstImage ? '' : sourceImgUrl;
   var hasImg = !!imgUrl;
-  var state = isTail ? _tailFrameUiState(sb) : null;
+  var hasSourceImg = !!sourceImgUrl;
+  var state = isTail ? _tailFrameUiState(sb, group) : null;
+  var firstFrameFailed = !isTail && _isFirstFrameFailed(sb);
+  var firstFrameSafetyInfo = firstFrameFailed ? _firstFrameSafetyInfo(sb) : null;
+  var tailFrameSafetyInfo = isTail ? _tailFrameSafetyInfo(sb) : null;
   var label = isTail ? '尾帧' : '首帧';
   var labelEn = isTail ? 'TAIL FRAME' : 'FIRST FRAME';
   var icon = isTail ? 'skip_next' : 'play_arrow';
   var statusText = isTail
     ? state.statusText
-    : (hasImg ? (String(sb.firstFrameMode || '') === 'legacy_pencil' ? '手稿首帧' : '已生成') : '待生成');
+    : (firstFrameFailed ? '生成失败' : (hasSourceImg ? (String(sb.firstFrameMode || '') === 'legacy_pencil' ? '手稿首帧' : '已生成') : '待生成'));
+  var compactStatus = _frameCompactStatusForPanel(kind, sb, group, opts, state, frameRecommendation);
   var primaryAction = isTail ? 'regen-tail' : 'regen-sb';
   var primaryIcon = isTail ? 'skip_next' : 'auto_awesome';
   var primaryText = isTail ? state.btnText : (hasImg ? '重新生成' : '生成首帧');
@@ -2151,18 +2876,22 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   }
 
   var placeholderIcon = isTail ? 'skip_next' : 'image';
+  var placeholderText = firstFrameFailed
+    ? '生成失败，请重新生成'
+    : ((suppressReadOnlyFirstImage && compactStatus && compactStatus.text) ? compactStatus.text : statusText);
+  var placeholderToneClass = ' text-on-surface-variant/25';
   // hover 放大: 不用 Tailwind `group-hover:` — 因为外层 .shot-workbench-card 已经带 `group`,
   // 会让"鼠标在大卡任意位置(画面描述/对白等)"都触发图片放大, 而且图片首次生成出来时,
   // 如果鼠标已经在大卡范围内, 新 img 挂载瞬间就会动一下。
   // 改用纯 CSS `.sb-frame-preview-stage:hover img` 限定只在图片容器上 hover 才触发, 见 styles.css。
   var imgHtml = hasImg
     ? '<img data-frame-img class="w-full h-full object-contain cursor-pointer" data-action="lightbox" loading="lazy" decoding="async" src="' + escapeHtml(imgUrl) + '" />'
-    : '<div class="sb-frame-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container text-on-surface-variant/25" data-img-class="w-full h-full object-contain cursor-pointer">' +
+    : '<div class="sb-frame-placeholder w-full h-full flex flex-col items-center justify-center bg-surface-container' + placeholderToneClass + '" data-img-class="w-full h-full object-contain cursor-pointer">' +
         '<span class="material-symbols-outlined text-5xl mb-2">' + placeholderIcon + '</span>' +
-        '<span class="text-[10px] font-bold uppercase tracking-[0.28em]">' + escapeHtml(statusText) + '</span>' +
+        '<span class="text-[10px] font-bold uppercase tracking-[0.28em]">' + escapeHtml(placeholderText) + '</span>' +
       '</div>';
 
-  var errorMsg = isTail ? state.errorMsg : (sb.firstFrameLastError || '');
+  var errorMsg = isTail ? state.errorMsg : (sb.firstFrameLastError ? _firstFrameFailureDisplay(sb.firstFrameLastError, _firstFrameSafetyExtraFromStoryboard(sb)) : '');
   var errorHtml = '<div class="sb-frame-error absolute inset-0 flex items-center justify-center bg-white/95 p-2 text-center"' +
     ((isTail && state.status === 'failed') ? '' : ' hidden') + '>' +
     '<span class="sb-frame-error-msg text-[10px] text-error leading-snug">' + escapeHtml(errorMsg || '生成失败') + '</span>' +
@@ -2171,7 +2900,18 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
   var buttons = '';
   // 按设计要求, 底部所有按钮统一为 secondary 白底外框样式 (编辑图片同款),
   // 不再单独把"重新生成"做成 primary 黑底, 保持视觉一致。
-  if (isTail && state.isLegacyPencil) {
+  if (readOnlyActions) {
+    if (hasImg) buttons += _frameButtonHtml(isTail ? 'download-tail' : 'download-sb', gIdx, 'download', '下载图片', isTail ? '下载尾帧' : '下载首帧', 'secondary', false);
+    buttons += _frameButtonHtml(
+      '',
+      gIdx,
+      isTail ? 'skip_next' : 'auto_awesome',
+      isTail ? '随片段生成' : '不建议单独生成',
+      isTail ? '此处展示片段尾帧；请在片段起点镜头调整尾帧。' : '此镜头随片段统一生成首帧，不建议单独生成。',
+      'secondary',
+      true
+    );
+  } else if (isTail && state.isLegacyPencil) {
     buttons += _frameButtonHtml('', gIdx, primaryIcon, primaryText, primaryTitle || '当前首帧是旧版手稿图，不能作为尾帧锚点；请重新生成首帧', 'secondary', true);
   } else {
     if (!isTail) buttons += _firstFrameEditButtonHtml(gIdx, sb);
@@ -2197,20 +2937,23 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
     }
   }
 
-  // 尾帧专属 advice banner: 复用 _tailFrameAdviceForGroup 决策, hidden 时为空串。
-  var adviceBannerHtml = '';
-  if (isTail) {
-    adviceBannerHtml = _tailFrameAdviceBannerHtml(_tailFrameAdviceForGroup(group, sb), gIdx);
-  }
   var promptInfo = _framePromptForPanel(kind, sb, group);
   var promptText = promptInfo.text || (isTail ? '尾帧提示词待生成。' : '');
   var promptDisplay = promptText;
-  // 注: "来源：xxx" 行和 sb-frame-plan-note 构图指导段已按产品要求从首尾帧
-  // 卡片移除。promptInfo.source 仍保留在数据层(便于排查), 但不再渲染;
-  // _framePlanSummaryForPanel 仍被 _shotKeywordChipsHtml 用来拿角色/场景/道具
-  // chips, 不能删除函数本身。
+  var firstPromptPlaceholder = (!isTail && !hasImg && !promptDisplay && compactStatus && compactStatus.text === '无需生成')
+    ? '无需首帧图提示词。'
+    : '首帧提示词待生成。';
+  var promptStatusHtml = mergedChild
+    ? _sbFramePromptReadonlyStatusHtml('只读展示')
+    : (isTail ? _sbTailFrameCardPromptStatusHtml(gIdx, sb) : _sbFirstFrameCardPromptStatusHtml(gIdx, sb));
+  var safetyNoticeHtml = (!mergedChild && !readOnlyActions)
+    ? _sbFrameSafetyNoticeHtml(isTail ? tailFrameSafetyInfo : firstFrameSafetyInfo, isTail ? 'tail' : 'first')
+    : '';
+  // 注: "来源：xxx" 行、sb-frame-plan-note 构图指导段, 以及"关键信息"chips 段
+  // 均已按产品要求从首尾帧卡片移除。promptInfo.source / planSummary 仍保留在数据层
+  // (便于排查), 但不再渲染。
 
-  var isCollapsed = _isFrameCardCollapsed(gIdx, kind);
+  var isCollapsed = _isFrameCardCollapsed(gIdx, kind, group, sb, opts);
   return '<section data-frame="' + kind + '" class="sb-frame-panel' + (isCollapsed ? ' is-collapsed' : '') + '">' +
            '<div class="sb-frame-panel-head">' +
              '<div class="sb-frame-panel-title">' +
@@ -2219,34 +2962,41 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
                '<em>' + escapeHtml(labelEn) + '</em>' +
              '</div>' +
              '<div class="sb-frame-head-right">' +
-               '<div class="sb-frame-status">' +
-                 '<span title="' + escapeHtml((isTail && state.preflightMsg) || statusText) + '">' + escapeHtml(statusText) + '</span>' +
+               '<div class="sb-frame-status is-' + escapeHtml(compactStatus.tone || 'muted') + '">' +
+                 '<span title="' + escapeHtml(compactStatus.title || statusText) + '">' + escapeHtml(compactStatus.text || statusText) + '</span>' +
                  tailBadgesHtml +
                '</div>' +
-               _frameCardToggleButtonHtml(gIdx, kind) +
+		               _frameCardToggleButtonHtml(gIdx, kind, group, sb, opts) +
              '</div>' +
            '</div>' +
-           adviceBannerHtml +
            '<div class="sb-frame-layout">' +
              '<div class="sb-frame-copy-col">' +
                '<div class="sb-frame-field-label-row">' +
                  '<div class="sb-frame-field-label">画面描述</div>' +
-                 (isTail ? _sbTailFrameCardPromptStatusHtml(gIdx, sb) : _sbFirstFrameCardPromptStatusHtml(gIdx, sb)) +
+                 promptStatusHtml +
                '</div>' +
                (isTail
                  ? _sbTailFramePromptEditorHtml(gIdx, promptDisplay, {
-                     readOnly: !state.canGenerate,
-                     title: state.preflightMsg,
+                     readOnly: mergedChild || !state.canGenerate,
+                     title: mergedChild ? '此处为片段尾帧提示词展示' : state.preflightMsg,
+                     mirror: mergedChild,
+                     safetyInfo: tailFrameSafetyInfo,
                    })
-                 : _sbFirstFramePromptEditorHtml(gIdx, promptDisplay)) +
+	                 : _sbFirstFramePromptEditorHtml(gIdx, promptDisplay, {
+	                     readOnly: mergedChild,
+	                     title: '此处为片段首帧提示词展示',
+	                     mirror: mergedChild,
+	                     placeholder: firstPromptPlaceholder,
+	                     safetyInfo: firstFrameSafetyInfo,
+	                   })) +
              '</div>' +
              '<div class="sb-frame-context-col">' +
-               '<div class="sb-frame-field-label">关键信息</div>' +
-               '<div class="sb-frame-keywords">' + _shotKeywordChipsHtml(group, sb, kind) + '</div>' +
                '<div class="sb-frame-field-label">参考素材</div>' +
                _storyboardAssetsHtml(group) +
-               '<div class="sb-frame-field-label">对白/旁白（本帧）</div>' +
-               _frameDialogueHtml(group) +
+               (isTail ? '' : (
+                 '<div class="sb-frame-field-label">对白/旁白（本帧）</div>' +
+                 _frameDialogueHtml(group)
+               )) +
              '</div>' +
              '<div class="sb-frame-preview-col">' +
                '<div class="sb-frame-field-label">图片展示</div>' +
@@ -2261,6 +3011,7 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group) {
                  errorHtml +
                '</div>' +
                '<div class="sb-frame-actions">' + buttons + '</div>' +
+               safetyNoticeHtml +
              '</div>' +
            '</div>' +
          '</section>';
@@ -2274,7 +3025,7 @@ function _ffeShort(text, limit) {
 
 function _ffeReferenceLabel(ref) {
   if (!ref) return '参考图';
-  var roleMap = { character: '角色', scene: '场景', prop: '道具', self_first_frame: '首帧', prev_tail: '尾帧' };
+  var roleMap = { character: '角色', crowd: '人群', scene: '场景', prop: '道具', self_first_frame: '首帧', prev_tail: '尾帧' };
   var role = roleMap[ref.role] || ref.role || '参考';
   var name = ref.assetName || ref.assetId || ('#' + (ref.imageNo || ref.slot || ''));
   return role + ' · ' + name;
@@ -3374,6 +4125,7 @@ function _ffeApplyDraftSaveResponse(resp, options) {
   auto.fieldSaving.content = false;
   auto.fieldSaving.negativePromptOverride = false;
   _ffeResetFieldStatusesFromDraft(resp.draft, options.restored === true);
+  _sbApplyFirstFrameCardPromptDraftResponse(_firstFrameEditor.groupIdx, resp, { preserveTextarea: true });
   if (auto.staleWasShown && !auto.staleNoticeShown && options.source && String(options.source).indexOf('autosave') === 0) {
     auto.staleNoticeShown = true;
     showToast('已按当前镜头/资产/风格上下文保存', 'success');
@@ -3803,6 +4555,7 @@ async function _persistMaterialReferenceSelection(options) {
       baseSelectionVersion: base.baseSelectionVersion,
     }, 'PUT');
     if (isEditor) _ffeApplyDraftSaveResponse(resp, { source: 'reference' });
+    else _sbApplyFirstFrameCardPromptDraftResponse(base.groupIdx, resp, { preserveTextarea: true });
     if (resp.firstFrameMaterialPanel) _applyMaterialMutationPanel(base.groupIdx, resp.firstFrameMaterialPanel, resp.sourceHash);
     if (isEditor) await _refreshFirstFrameEditor();
     return { ok: true, resp: resp };
@@ -4709,6 +5462,7 @@ document.addEventListener('input', function (ev) {
   if (target && target.matches && target.matches('textarea[data-sb-first-prompt-field="content"]')) {
     var gIdx = parseInt(target.dataset.gidx, 10);
     if (isNaN(gIdx)) return;
+    _sbSyncFramePromptSafetyHighlight(target);
     _sbRefreshFirstFrameCardPendingDraft(gIdx);
     _sbScheduleFirstFrameCardPromptSave(gIdx, { source: 'card-autosave-input' });
     return;
@@ -4791,6 +5545,7 @@ document.addEventListener('compositionend', function (ev) {
       var cardAuto = _sbFirstFrameCardPromptState(cardGIdx);
       cardAuto.composing = false;
       cardAuto.dirtyAt = null;
+      _sbSyncFramePromptSafetyHighlight(ev.target);
       _sbScheduleFirstFrameCardPromptSave(cardGIdx, { source: 'card-autosave-compositionend' });
     }
     return;
@@ -4837,6 +5592,11 @@ document.addEventListener('blur', function (ev) {
   if (field !== 'content' && field !== 'negativePromptOverride') return;
   if (_ffeAutoSaveState().composing) return;
   _ffeScheduleAutoSave({ source: 'autosave-blur', immediate: true });
+}, true);
+document.addEventListener('scroll', function (ev) {
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+    _sbSyncFramePromptSafetyHighlight(ev.target);
+  }
 }, true);
 window.addEventListener('pagehide', function () {
   _ffeFlushAutoSaveOnPageHide();
@@ -4892,6 +5652,26 @@ document.addEventListener('keydown', function (ev) {
    ================================================================ */
 export function getStoryboardGroups() {
   if (!project || !project.shots) return [];
+  var shots = project.shots;
+  var sbs = Array.isArray(project.storyboards) ? project.storyboards : [];
+  // 合并模式：服务端已按"段"建好 storyboards（某段 shotIndices 含多个镜头）时，按段分组；
+  // 否则（1:1 / flag OFF）回落原先的一镜一组，行为完全不变。
+  var hasMerged = sbs.length && sbs.some(function (sb) {
+    return sb && Array.isArray(sb.shotIndices) && sb.shotIndices.length > 1;
+  });
+  if (hasMerged) {
+    return sbs.map(function (sb, g) {
+      var idxs = (Array.isArray(sb.shotIndices) && sb.shotIndices.length ? sb.shotIndices : [g])
+        .filter(function (i) { return Number.isInteger(i) && i >= 0 && i < shots.length; });
+      var groupShots = idxs.map(function (i) { return shots[i]; });
+      return {
+        groupIdx: g,
+        shotIndices: idxs,
+        shots: groupShots,
+        emotion: (groupShots[0] && groupShots[0].emotion) || 'general',
+      };
+    });
+  }
   return project.shots.map(function (shot, idx) {
     return {
       groupIdx: idx,
@@ -5154,7 +5934,7 @@ export function renderPromptPreviewList() {
     card.className = "prompt-preview-card" + (shot.imagePromptGenerated ? " is-done" : "");
     card.dataset.shotIdx = idx;
     // 此前 stale 状态显示 "⚠ 需更新"（红色警告字 .stale-warn）；用户反馈装饰性"需更新"提示
-    // 一概去掉，stale 状态由"生成全部首帧图"按钮文案集中体现。stale 时仍归为"已生成"。
+    // 一概去掉，stale 状态由"生成全部关键帧"按钮文案集中体现。stale 时仍归为"已生成"。
     var statusHtml = '';
     if (shot.imagePromptGenerated) statusHtml = '<span class="prompt-preview-status ok">&#10003; 已生成</span>';
     else statusHtml = '<span class="prompt-preview-status wait">待生成</span>';
@@ -5394,15 +6174,191 @@ function _shotStoryboardSlotEmptyHtml(text) {
   '</div>';
 }
 
+function _shotStoryboardSlotFallbackHtml(shotIdx) {
+  if (!project || !Array.isArray(project.storyboards) || !project.storyboards.length) {
+    return _shotStoryboardSlotEmptyHtml('等待镜头计划确认');
+  }
+  var info = _segmentInfoForShot(project, shotIdx);
+  if (info && info.isSegmentFirst) {
+    return _shotStoryboardSlotEmptyHtml('片段 ' + info.groupNo + ' 首帧将在这里管理');
+  }
+  return _shotStoryboardSlotEmptyHtml(
+    '并入片段 ' + info.groupNo + '，首帧在镜头 ' + String(info.anchorShotNo).padStart(2, '0') + ' 管理，无需单独出图'
+  );
+}
+
+function _storyboardGroupShotRangeText(group) {
+  var idxs = Array.isArray(group && group.shotIndices) ? group.shotIndices : [];
+  if (!idxs.length) return '';
+  var first = Number(idxs[0]);
+  var last = Number(idxs[idxs.length - 1]);
+  if (!Number.isInteger(first)) return '';
+  if (!Number.isInteger(last) || last === first) return String(first + 1).padStart(2, '0');
+  return String(first + 1).padStart(2, '0') + '-' + String(last + 1).padStart(2, '0');
+}
+
+function _groupAnchorShotIdx(group, fallbackIdx) {
+  var idxs = Array.isArray(group && group.shotIndices) ? group.shotIndices : [];
+  for (var i = 0; i < idxs.length; i++) {
+    var idx = Number(idxs[i]);
+    if (Number.isInteger(idx) && idx >= 0) return idx;
+  }
+  return fallbackIdx;
+}
+
+function _storyboardCardHtml(gIdx, group, sb, opts) {
+  opts = opts || {};
+  var idxs = Array.isArray(group && group.shotIndices) ? group.shotIndices : [];
+  var shots = Array.isArray(group && group.shots) ? group.shots : [];
+  var firstIdx = Number.isInteger(Number(idxs[0])) ? Number(idxs[0]) : gIdx;
+  var lastIdx = Number.isInteger(Number(idxs[idxs.length - 1])) ? Number(idxs[idxs.length - 1]) : firstIdx;
+  var shotLabel = 'SHOT ' + String(firstIdx + 1).padStart(2, '0');
+  if (idxs.length > 1) shotLabel += '-' + String(lastIdx + 1).padStart(2, '0');
+  shotLabel += ' · ' + ((shots[0] && shots[0].shotType) || 'Shot');
+  var shotRangeText = idxs.length ? String(firstIdx + 1) : String(gIdx + 1);
+  if (idxs.length > 1) shotRangeText += '-' + String(lastIdx + 1);
+  return '<div class="shots-storyboard-card-inner">' +
+    '<div class="sb-sheet-loading absolute inset-0 flex items-center justify-center bg-white z-30 rounded-[2rem]" hidden>' +
+      '<div class="text-center">' +
+        '<div class="inline-block w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin mb-3"></div>' +
+        '<span class="block text-xs font-bold text-on-surface-variant">生成中…</span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="sb-sheet-error absolute inset-0 flex flex-col items-center justify-center bg-white z-30 rounded-[2rem] p-8 text-center" hidden>' +
+      '<span class="material-symbols-outlined text-5xl text-error mb-3">error_outline</span>' +
+      '<span class="text-sm font-bold text-error mb-2">首帧图生成失败</span>' +
+      '<span class="sb-error-msg text-xs text-on-surface-variant/80 max-w-md leading-relaxed"></span>' +
+      '<span class="text-[10px] text-on-surface-variant/40 mt-4">点击下方「重新生成」可再次尝试</span>' +
+    '</div>' +
+    '<div class="shots-storyboard-card-head">' +
+      '<div class="min-w-0">' +
+        '<div class="flex items-center gap-3 flex-wrap">' +
+          '<h3>分镜板 ' + (gIdx + 1) + '</h3>' +
+          '<span class="shot-segment-tag" title="归属镜头编号">归属镜头' + escapeHtml(shotRangeText) + '</span>' +
+        '</div>' +
+        '<p>' + escapeHtml(shotLabel) + ' · ' + shots.length + ' 个镜头</p>' +
+      '</div>' +
+      '<div class="shots-storyboard-card-actions">' +
+        (opts.mergedChild ? '' : _historyBtnHtml(sb, "sb")) +
+      '</div>' +
+    '</div>' +
+    '<div class="shots-storyboard-card-body">' +
+      '<div class="sb-frame-stack">' +
+        _storyboardFramePanelHtml('first', sb, gIdx, group, {
+          mergedChild: opts.mergedChild === true,
+          readOnlyActions: opts.mergedChild === true,
+        }) +
+        _storyboardFramePanelHtml('tail', sb, gIdx, group, {
+          mergedChild: opts.mergedChild === true,
+          readOnlyActions: opts.mergedChild === true,
+        }) +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
 function _setTopFirstFrameActionLocked(locked) {
   var actionBar = $("imagesActionBar");
   var btn = $("btnGenAllImages");
   if (actionBar) actionBar.hidden = false;
   if (!btn) return;
-  btn.innerHTML = '<span class="material-symbols-outlined text-sm">auto_fix_high</span>生成全部首帧图';
+  btn.innerHTML = '<span class="material-symbols-outlined text-sm">auto_fix_high</span>生成全部关键帧';
   btn.disabled = !!locked;
   btn.dataset.actionState = locked ? 'locked' : '';
-  btn.title = locked ? '镜头计划可用后可生成全部首帧图' : '';
+  btn.title = locked ? '镜头计划可用后可生成全部关键帧' : '';
+}
+
+function _storyboardIndexRailHasFailure(sb) {
+  sb = sb || {};
+  if (_isFirstFrameFailed(sb)) return true;
+  return _tailFrameUiState(sb).status === 'failed';
+}
+
+function _setStoryboardIndexRailActive(shotIdx) {
+  var rail = $("sbIndexRail");
+  if (!rail) return;
+  rail.querySelectorAll(".sb-index-rail-btn").forEach(function (btn) {
+    btn.classList.toggle("is-active", Number(btn.dataset.shotIdx) === Number(shotIdx));
+  });
+}
+
+function _setStoryboardIndexRailFailureForGroup(gIdx, failed) {
+  var rail = $("sbIndexRail");
+  if (!rail) return;
+  rail.querySelectorAll('.sb-index-rail-btn[data-gidx="' + String(gIdx) + '"]').forEach(function (btn) {
+    btn.classList.toggle("is-failed", !!failed);
+  });
+}
+
+function _positionStoryboardIndexRail() {
+  var rail = $("sbIndexRail");
+  if (!rail || rail.hidden) return;
+  var firstButton = rail.querySelector(".sb-index-rail-btn");
+  var firstCard = document.querySelector('.shot-workbench-card[data-shot-idx="0"]') || document.querySelector(".shot-workbench-card");
+  var sidebar = $("sidebar");
+  if (firstButton && firstCard && sidebar) {
+    var sidebarRight = sidebar.getBoundingClientRect().right;
+    var cardLeft = firstCard.getBoundingClientRect().left;
+    var btnWidth = firstButton.getBoundingClientRect().width || 17;
+    var gapLeft = Math.min(sidebarRight, cardLeft);
+    var gapRight = Math.max(sidebarRight, cardLeft);
+    var centeredLeft = gapLeft + ((gapRight - gapLeft) - btnWidth) / 2;
+    rail.style.left = Math.round(Math.max(0, centeredLeft)) + "px";
+  }
+  var taskShortcut = $("navTaskListWrap") || $("navTaskListShortcut");
+  if (taskShortcut) {
+    rail.style.top = Math.round(taskShortcut.getBoundingClientRect().top) + "px";
+  }
+}
+
+function _scrollToShotCardFromRail(shotIdx) {
+  var selector = '.shot-workbench-card[data-shot-idx="' + String(shotIdx) + '"]';
+  var root = $("shotListWrap");
+  var card = root && root.querySelector(selector);
+  if (!card) card = document.querySelector(selector);
+  if (!card) return;
+  var firstRailBtn = $("sbIndexRail") && $("sbIndexRail").querySelector(".sb-index-rail-btn");
+  var targetTop = firstRailBtn ? firstRailBtn.getBoundingClientRect().top : 112;
+  var cardTop = card.getBoundingClientRect().top;
+  var nextScrollY = window.scrollY + cardTop - targetTop;
+  try {
+    window.scrollTo({ top: Math.max(0, nextScrollY), behavior: "smooth" });
+  } catch (_e) {
+    window.scrollTo(0, Math.max(0, nextScrollY));
+  }
+  _setStoryboardIndexRailActive(shotIdx);
+}
+
+function _renderStoryboardIndexRail(groups, isShotLayout) {
+  var rail = $("sbIndexRail");
+  if (!rail) return;
+  var shots = project && Array.isArray(project.shots) ? project.shots : [];
+  if (!isShotLayout || !shots.length || shots.length < 2) {
+    rail.hidden = true;
+    rail.innerHTML = "";
+    return;
+  }
+  var html = '<div class="sb-index-rail-inner">';
+  for (var i = 0; i < shots.length; i++) {
+    var info = _segmentInfoForShot(project, i) || {};
+    var gIdx = Number.isInteger(Number(info.groupIdx)) ? Number(info.groupIdx) : i;
+    var sb = project && project.storyboards && project.storyboards[gIdx] || {};
+    var failed = _storyboardIndexRailHasFailure(sb);
+    html += '<button type="button" class="sb-index-rail-btn' +
+      (failed ? ' is-failed' : '') +
+      '" data-shot-idx="' + i + '" data-gidx="' + gIdx + '" title="跳到镜头 ' + (i + 1) + '">' + (i + 1) + '</button>';
+  }
+  html += '</div>';
+  rail.hidden = false;
+  rail.innerHTML = html;
+  _positionStoryboardIndexRail();
+  rail.querySelectorAll(".sb-index-rail-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var shotIdx = parseInt(btn.dataset.shotIdx, 10);
+      if (isNaN(shotIdx)) return;
+      _scrollToShotCardFromRail(shotIdx);
+    });
+  });
 }
 
 export function renderImageGrid() {
@@ -5414,98 +6370,61 @@ export function renderImageGrid() {
   var prevScrollLeft = grid.scrollLeft || 0;
   var prevIdx = _sbCurrentIdx || 0;
   grid.innerHTML = "";
+  if (!project.storyboards) project.storyboards = [];
+  var groups = getStoryboardGroups();
+  _pruneFrameCardCollapsed(groups);
   if (isShotLayout && shotListWrap) {
     shotListWrap.querySelectorAll(".shot-storyboard-slot").forEach(function (slot) {
-      slot.innerHTML = _shotStoryboardSlotEmptyHtml("等待分镜生成");
+      var shotIdx = parseInt(slot.dataset.shotIdx, 10);
+      slot.innerHTML = _shotStoryboardSlotFallbackHtml(isNaN(shotIdx) ? 0 : shotIdx);
     });
     shotListWrap.querySelectorAll(".shot-material-slot").forEach(function (slot) {
       slot.innerHTML = '<div class="shot-material-slot-empty">等待素材匹配</div>';
     });
   }
-  if (!project.storyboards) project.storyboards = [];
-  var groups = getStoryboardGroups();
 
   var actionBar = $("imagesActionBar");
   if (actionBar) actionBar.hidden = false;
 
   groups.forEach(function (group, gIdx) {
     var sb = project.storyboards[gIdx] || {};
-    var shotLabel = 'SHOT ' + String(group.shotIndices[0]+1).padStart(2,'0');
-    if (group.shotIndices.length > 1) shotLabel += '-' + String(group.shotIndices[group.shotIndices.length-1]+1).padStart(2,'0');
-    shotLabel += ' · ' + (group.shots[0].shotType || 'Shot');
-    // 画面提示词（调试时折叠展示）
-    var promptText = group.shots.map(function (s) {
-      return s.imagePrompt || '';
-    }).filter(function (p) { return p; }).join('\n---\n');
-
-    // 用户主显示：中文画面描述（拼接同组每个镜头的 visual / shotType）
-    var visualText = group.shots.map(function (s, _i) {
-      var st = s.shotType ? '【' + s.shotType + '】' : '';
-      var v = s.visual || s.description || '';
-      return (st + v).trim();
-    }).filter(function (v) { return v; }).join(' ');
-
-    var shotBriefText = visualText || '';
-    var hasShotBrief = !!String(shotBriefText).trim();
-    var shotBriefSummary = hasShotBrief ? _sbPromptShort(shotBriefText, 120) : "";
-    var firstFrameUrl = _firstFrameImageUrl(sb);
-
     var card = document.createElement("div");
     card.className = "sb-sheet shots-storyboard-card";
     card.dataset.groupIdx = gIdx;
-
-    card.innerHTML =
-      '<div class="shots-storyboard-card-inner">' +
-        '<div class="sb-sheet-loading absolute inset-0 flex items-center justify-center bg-white z-30 rounded-[2rem]" hidden>' +
-          '<div class="text-center">' +
-            '<div class="inline-block w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin mb-3"></div>' +
-            '<span class="block text-xs font-bold text-on-surface-variant">生成中…</span>' +
-          '</div>' +
-        '</div>' +
-        '<div class="sb-sheet-error absolute inset-0 flex flex-col items-center justify-center bg-white z-30 rounded-[2rem] p-8 text-center" hidden>' +
-          '<span class="material-symbols-outlined text-5xl text-error mb-3">error_outline</span>' +
-          '<span class="text-sm font-bold text-error mb-2">首帧图生成失败</span>' +
-          '<span class="sb-error-msg text-xs text-on-surface-variant/80 max-w-md leading-relaxed"></span>' +
-          '<span class="text-[10px] text-on-surface-variant/40 mt-4">点击下方「重新生成」可再次尝试</span>' +
-        '</div>' +
-	        '<div class="shots-storyboard-card-head">' +
-	          '<div class="min-w-0">' +
-	            '<div class="flex items-center gap-3 flex-wrap">' +
-	              '<h3>分镜板 ' + (gIdx + 1) + '</h3>' +
-	              // 此前这里渲染 stale-badge "需更新" 标签（_isStale("storyboard_" + gIdx) 触发）。
-	              // 用户反馈：分镜板顶部"需更新"标签不需要——上游变化提示已经在"生成全部首帧图"
-	              // 按钮文案（"更新 N 项需更新"）和顶部 hint 里集中体现，分镜板上的重复标签是冗余。
-	              // 老的尾帧建议 badge 已迁移到尾帧卡片顶部 (_tailFrameAdviceBannerHtml),
-	              // 这里不再渲染, 避免重复展示。_tailFrameSuggestionBadgeHtml 函数本体
-	              // 暂保留, 方便回滚或后续做项目级总览。
-	            '</div>' +
-            '<p>' + escapeHtml(shotLabel) + ' · ' + group.shots.length + ' 个镜头</p>' +
-          '</div>' +
-          '<div class="shots-storyboard-card-actions">' +
-            _historyBtnHtml(sb, "sb") +
-          '</div>' +
-        '</div>' +
-        '<div class="shots-storyboard-card-body">' +
-          '<div class="sb-frame-stack">' +
-            _storyboardFramePanelHtml('first', sb, gIdx, group) +
-            _storyboardFramePanelHtml('tail', sb, gIdx, group) +
-          '</div>' +
-        '</div>' +
-      '</div>';
+    card.innerHTML = _storyboardCardHtml(gIdx, group, sb);
     if (isShotLayout && shotListWrap) {
-      var materialSlot = $("shotMaterialSlot_" + gIdx);
+      var anchorShotIdx = _groupAnchorShotIdx(group, gIdx);
+      var materialSlot = $("shotMaterialSlot_" + anchorShotIdx);
       var assetPanel = card.querySelector(".shot-material-panel-slot");
       if (materialSlot && assetPanel) {
         materialSlot.innerHTML = "";
         materialSlot.appendChild(assetPanel);
       }
-      var slot = $("shotStoryboardSlot_" + gIdx) || shotListWrap.querySelector('.shot-storyboard-slot[data-group-idx="' + gIdx + '"]');
+      var slot = $("shotStoryboardSlot_" + anchorShotIdx) || shotListWrap.querySelector('.shot-storyboard-slot[data-shot-idx="' + anchorShotIdx + '"]');
       if (slot) {
         slot.innerHTML = "";
         slot.appendChild(card);
       } else {
         grid.appendChild(card);
       }
+      (group.shotIndices || []).forEach(function (shotIdx) {
+        if (Number(shotIdx) === Number(anchorShotIdx)) return;
+        var mirrorSlot = $("shotStoryboardSlot_" + shotIdx);
+        if (!mirrorSlot) return;
+        var mirrorCard = document.createElement("div");
+        mirrorCard.className = "sb-sheet shots-storyboard-card shots-storyboard-card-merged-child";
+        mirrorCard.dataset.groupIdx = gIdx;
+        mirrorCard.dataset.mergedShotIdx = shotIdx;
+        mirrorCard.innerHTML = _storyboardCardHtml(gIdx, group, sb, { mergedChild: true });
+        var mirrorMaterialSlot = $("shotMaterialSlot_" + shotIdx);
+        var mirrorAssetPanel = mirrorCard.querySelector(".shot-material-panel-slot");
+        if (mirrorMaterialSlot && mirrorAssetPanel) {
+          mirrorMaterialSlot.innerHTML = "";
+          mirrorMaterialSlot.appendChild(mirrorAssetPanel);
+        }
+        mirrorSlot.innerHTML = "";
+        mirrorSlot.appendChild(mirrorCard);
+      });
     } else {
       grid.appendChild(card);
     }
@@ -5556,12 +6475,15 @@ export function renderImageGrid() {
 
   _initGalleryDrag(grid);
   hydrateProtectedImageElements(bindRoot);
+  _sbSyncFramePromptSafetyHighlights(bindRoot);
   requestAnimationFrame(function () {
     _sbHydrateFirstFramePromptEditors(bindRoot);
     _sbHydrateTailFramePromptEditors(bindRoot);
+    _sbSyncFramePromptSafetyHighlights(bindRoot);
   });
   _ensureShotMaterialPanels(groups);
   _sbCurrentIdx = groups.length ? Math.min(prevIdx, groups.length - 1) : 0;
+  _renderStoryboardIndexRail(groups, isShotLayout);
   if (!isShotLayout) _updateNavDots(groups.length);
   if (!isShotLayout && prevScrollLeft > 0) {
     requestAnimationFrame(function () {
@@ -5776,27 +6698,19 @@ export function updateStoryboardCard(gIdx, status, imgUrl, errMsg) {
     errMsg: (status === "error") ? errMsg : undefined,
   });
   if (!result.ok) return;
+  if (status === "error") _setStoryboardIndexRailFailureForGroup(gIdx, true);
+  else if (status === "done" || status === "ready" || status === "success") _setStoryboardIndexRailFailureForGroup(gIdx, false);
   if (result.needFullRerender) renderImageGrid();
 }
 
 function _firstFrameUrl(sb) {
-  sb = sb || {};
-  return (sb.frames && sb.frames.first && sb.frames.first.url) ||
-    sb.firstFrameUrl ||
-    sb.imageUrl ||
-    sb.url ||
-    '';
+  return _firstFrameImageUrl(sb);
 }
 
 function _isFirstFrameFailed(sb) {
   sb = sb || {};
   var st = String((sb.frames && sb.frames.first && sb.frames.first.status) || sb.firstFrameStatus || '').toLowerCase();
   return st === 'failed' || st === 'error' || !!sb.firstFrameLastError;
-}
-
-function _isTailRequested(sb) {
-  sb = sb || {};
-  return sb.tailFrameIntent === 'requested' || !!_tailFrameImageUrl(sb);
 }
 
 // 用户原则: 尾帧不再被系统自动判定"需更新"。这里只在尾帧真的处于不可用状态
@@ -5813,6 +6727,53 @@ function _tailNeedsUpdate(sb /*, gIdx */) {
   return false;
 }
 
+function _tailFrameStatusForBatch(sb) {
+  sb = sb || {};
+  var tail = (sb.frames && sb.frames.tail) || null;
+  var tailUrl = _tailFrameImageUrl(sb);
+  return String((tail && tail.status) || (sb.tailFrameLastError ? 'failed' : (tailUrl ? 'ready' : 'missing'))).toLowerCase();
+}
+
+function _isTailKeyframeWanted(group, sb) {
+  var idxs = (group && Array.isArray(group.shotIndices)) ? group.shotIndices : [];
+  if (idxs.length > 1) return false;
+  var intent = _tailFrameGenerationIntentForGroup(group, sb);
+  return !!(intent && intent.wanted);
+}
+
+function _tailKeyframeNeedsGeneration(sb, opts) {
+  opts = opts || {};
+  if (opts.includeReady) return true;
+  var tailStatus = _tailFrameStatusForBatch(sb);
+  return !_tailFrameImageUrl(sb) || tailStatus === 'failed';
+}
+
+function _tailKeyframeCanBeGeneratedNow(group, sb) {
+  return !!_tailFrameGenerationIntentForGroup(group || {}, sb).canGenerate;
+}
+
+function _tailKeyframeCanBePlannedAfterFirst(group, sb) {
+  var intent = _tailFrameGenerationIntentForGroup(group || {}, sb);
+  return !!intent.requiresFirstFrame && (!_firstFrameUrl(sb) || _isFirstFrameFailed(sb));
+}
+
+function _tailKeyframeTargets(groups, opts) {
+  opts = opts || {};
+  groups = groups || getStoryboardGroups();
+  var targets = [];
+  for (var i = 0; i < groups.length; i++) {
+    var group = groups[i];
+    var sb = (project.storyboards && project.storyboards[i]) || {};
+    if (!_isTailKeyframeWanted(group, sb)) continue;
+    var tailStatus = _tailFrameStatusForBatch(sb);
+    if (opts.failedOnly && tailStatus !== 'failed') continue;
+    if (!opts.failedOnly && !_tailKeyframeNeedsGeneration(sb, opts)) continue;
+    if (!_tailKeyframeCanBeGeneratedNow(group, sb)) continue;
+    targets.push({ groupIdx: i, idx: i, shotIndices: (group && group.shotIndices) || [] });
+  }
+  return targets;
+}
+
 function _isFirstFrameStale(gIdx) {
   return !!(project && project._staleFlags && project._staleFlags["storyboard_" + gIdx]);
 }
@@ -5822,8 +6783,10 @@ function _computeImagesBatchState(groups, opts) {
   groups = groups || getStoryboardGroups();
   var missingFirst = [];
   var failedFirst = [];
+  var failedTail = [];
   var staleFirst = [];
   var staleTail = [];
+  var pendingTailKeyframes = [];
   var readyFirstCount = 0;
   for (var i = 0; i < groups.length; i++) {
     var sb = (project.storyboards && project.storyboards[i]) || {};
@@ -5833,45 +6796,56 @@ function _computeImagesBatchState(groups, opts) {
     if (_isFirstFrameFailed(sb)) failedFirst.push(i);
     if (hasFirst && _isFirstFrameStale(i)) staleFirst.push(i);
     if (_tailNeedsUpdate(sb, i)) staleTail.push(i);
+    if (_isTailKeyframeWanted(groups[i], sb) && _tailKeyframeNeedsGeneration(sb)) {
+      var tailStatusForBatch = _tailFrameStatusForBatch(sb);
+      if (tailStatusForBatch === 'failed') failedTail.push(i);
+      if (tailStatusForBatch !== 'failed' && (_tailKeyframeCanBeGeneratedNow(groups[i], sb) || _tailKeyframeCanBePlannedAfterFirst(groups[i], sb))) {
+        pendingTailKeyframes.push(i);
+      }
+    }
   }
   var staleCount = staleFirst.length + staleTail.length;
+  var failedKeyframeCount = failedFirst.length + failedTail.length;
+  var missingKeyframeCount = missingFirst.length + pendingTailKeyframes.length;
   var action = 'generate_all';
-  var label = '生成全部首帧图';
+  var label = '生成全部关键帧';
   // 状态机：
   //   - generating: 启动中… / 生成中…
-  //   - generate_all: 全部缺首帧 → 生成全部首帧图
-  //   - retry_failed: 有失败 → 重试失败项·N个
-  //   - fill_missing: 部分缺 → 补全 N 个首帧
-  //   - regenerate_all: 全部就绪（含 stale-only 场景）→ 重新生成全部首帧图
+  //   - generate_all: 全部缺首帧 → 生成全部关键帧
+  //   - retry_failed: 有失败首帧/建议尾帧 → 重试失败项·N个
+  //   - fill_missing: 部分缺首帧/建议尾帧 → 补全 N 个关键帧
+  //   - regenerate_all: 全部就绪（含 stale-only 场景）→ 重新生成全部关键帧
   // 注：以前有独立的 update_stale 分支，文案"更新 N 项需更新"且只重生 stale 那几张。
-  // 用户决策：stale-only 场景统一显示"重新生成全部首帧图"，点击即全量重生（与 regenerate_all 行为一致），
+  // 用户决策：stale-only 场景统一显示"重新生成全部关键帧"，点击即全量重生（与 regenerate_all 行为一致），
   // 避免按钮文案与"装饰性需更新"挂钩。
   if ((_imagesGenerating || _imagesStarting) && !opts.ignoreGenerating) {
     action = 'generating';
     label = _imagesStarting ? '启动中…' : '生成中…';
   } else if (groups.length > 0 && missingFirst.length === groups.length) {
     action = 'generate_all';
-    label = '生成全部首帧图';
-  } else if (failedFirst.length > 0) {
+    label = '生成全部关键帧';
+  } else if (failedKeyframeCount > 0) {
     action = 'retry_failed';
-    label = '重试失败项·' + failedFirst.length + '个';
-  } else if (missingFirst.length > 0) {
+    label = '重试失败项·' + failedKeyframeCount + '个';
+  } else if (missingKeyframeCount > 0) {
     action = 'fill_missing';
-    label = '补全 ' + missingFirst.length + ' 个首帧';
+    label = '补全 ' + missingKeyframeCount + ' 个关键帧';
   } else if (readyFirstCount > 0) {
     // stale-only 也走这里——staleCount 不再单独分支处理。
     action = 'regenerate_all';
-    label = '重新生成全部首帧图';
+    label = '重新生成全部关键帧';
   }
-  // staleCount 仍计算保留供 dispatch 决定要不要顺带刷尾帧（regenerate_all 路径会 null requestedTailIdxMap）
+  // staleCount 仍计算保留供 dispatch 决定要不要顺带刷尾帧关键帧。
   void staleCount;
   return {
     action: action,
     label: label,
     missingFirst: missingFirst,
     failedFirst: failedFirst,
+    failedTail: failedTail,
     staleFirst: staleFirst,
     staleTail: staleTail,
+    pendingTailKeyframes: pendingTailKeyframes,
   };
 }
 
@@ -5908,7 +6882,7 @@ function _syncMergedStoryboardConfirmState(groups) {
     '<span class="material-symbols-outlined text-base">arrow_forward</span>';
   if (!allFirstFramesReady) {
     topBtn.innerHTML = SHOTS_CONFIRM_HTML;
-    topBtn.title = "请先生成全部首帧图";
+    topBtn.title = "请先生成全部关键帧";
     return;
   }
   topBtn.innerHTML = SHOTS_CONFIRM_HTML;
@@ -5926,10 +6900,10 @@ function _updateImagesActionButton(groups) {
   var state = _computeImagesBatchState(groups);
   var iconName = state.action === 'retry_failed' ? 'refresh' : 'auto_fix_high';
   // 直接使用 _computeImagesBatchState 计算出的精细 label，让按钮文案与真实状态一致：
-  //   - generate_all → 生成全部首帧图
-  //   - fill_missing → 补全 N 个首帧
+  //   - generate_all → 生成全部关键帧
+  //   - fill_missing → 补全 N 个关键帧
   //   - retry_failed → 重试失败项·N个
-  //   - regenerate_all → 重新生成全部首帧图（含 stale-only 场景，全量重生）
+  //   - regenerate_all → 重新生成全部关键帧（含 stale-only 场景，全量重生）
   //   - generating → 启动中… / 生成中…
   var label = state.label;
   var preflightBlocked = preflight.status !== "allowed";
@@ -6022,6 +6996,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
     showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(fErr), "error");
     return;
   }
+  if (opts.applyEditDraft === true) _sbMarkFirstFrameCardPromptDraftCommitPending(gIdx);
 
   return new Promise(function (resolve) {
     var settled = false;
@@ -6044,12 +7019,16 @@ export async function generateStoryboardSheet(gIdx, opts) {
     function finish() { if (!settled) { settled = true; _stopPoll(); eta.stop(); resolve(); } }
     var finishingFromServer = null;
 
-    function _finishAfterServerSync() {
-      if (finishingFromServer) return finishingFromServer;
-      finishingFromServer = (async function () {
-        await _reloadProjectFromServerForStoryboard(originId);
-        var latest = project && project.storyboards && project.storyboards[gIdx];
-        var latestUrl = latest && (latest.rawUrl || latest.imageUrl || latest.url);
+	    function _finishAfterServerSync() {
+	      if (finishingFromServer) return finishingFromServer;
+	      finishingFromServer = (async function () {
+	        await _reloadProjectFromServerForStoryboard(originId);
+	        await _sbRefreshFirstFrameCardPromptBaselinesFromServer([{ groupIdx: gIdx }], {
+	          preserveTextarea: true,
+	          clearDraftCommitRefreshPending: true,
+	        });
+	        var latest = project && project.storyboards && project.storyboards[gIdx];
+        var latestUrl = _firstFrameImageUrl(latest);
         if (latestUrl) {
           _gotResult = true;
           updateStoryboardCard(gIdx, "done", latestUrl);
@@ -6099,8 +7078,14 @@ export async function generateStoryboardSheet(gIdx, opts) {
             _applyResult(url, extra);
           } else if (t.status === 'failed' && !_gotResult) {
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
-            if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgPoll);
-            showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
+            var extraPoll = (t.result && t.result.extra) || t.extra || {};
+            var displayMsgPoll = _firstFrameFailureDisplay(errMsgPoll, extraPoll);
+            if (project && project.id === originId) {
+              _clearFailedStoryboardLocally(gIdx, displayMsgPoll, extraPoll, originId);
+              if (_isImageSafetyBlocked(_imageSafetyAuditFromExtra(extraPoll), displayMsgPoll)) renderImageGrid();
+              else updateStoryboardCard(gIdx, "error", null, displayMsgPoll.slice(0, 120));
+            }
+            showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(displayMsgPoll), "error");
             _gotResult = true;
           }
         }
@@ -6123,8 +7108,14 @@ export async function generateStoryboardSheet(gIdx, opts) {
       },
       onTaskFailed: function (data) {
         var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
-        if (project && project.id === originId) updateStoryboardCard(gIdx, "error", null, errMsgInner);
-        showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgInner), "error");
+        var extraInner = (data && data.extra) || {};
+        var displayMsgInner = _firstFrameFailureDisplay(errMsgInner, extraInner);
+        if (project && project.id === originId) {
+          _clearFailedStoryboardLocally(gIdx, displayMsgInner, extraInner, originId);
+          if (_isImageSafetyBlocked(_imageSafetyAuditFromExtra(extraInner), displayMsgInner)) renderImageGrid();
+          else updateStoryboardCard(gIdx, "error", null, displayMsgInner.slice(0, 120));
+        }
+        showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(displayMsgInner), "error");
         _gotResult = true;
       },
       onBatchCompleted: function () {
@@ -6229,7 +7220,7 @@ async function _uploadFrameImage(gIdx, file, kind) {
     if (!resp.ok || data.error) {
       var errMsg = (data && data.error) || '上传失败';
       renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'error', { errMsg: errMsg });
-      if (isTail) _clearFailedTailFrameLocally(gIdx, errMsg);
+      if (isTail) _clearFailedTailFrameLocally(gIdx, errMsg, null, originId);
       showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传失败: ' + errMsg, 'error');
       return;
     }
@@ -6297,7 +7288,7 @@ async function _uploadFrameImage(gIdx, file, kind) {
   } catch (e) {
     var msg = ((e && e.message) || e).toString().slice(0, 200);
     renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'error', { errMsg: msg });
-    if (isTail) _clearFailedTailFrameLocally(gIdx, msg);
+    if (isTail) _clearFailedTailFrameLocally(gIdx, msg, null, originId);
     showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传失败: ' + msg, 'error');
   }
 }
@@ -6325,7 +7316,8 @@ export async function generateStoryboardTailFrame(gIdx) {
     return;
   }
 
-  if (!_canGenerateTailFrame(sb)) {
+  var tailIntent = _tailFrameGenerationIntentForGroup(group, sb);
+  if (!tailIntent.canGenerate) {
     sb.tailFrameIntent = "requested";
     sb.tailFrameIntentUpdatedAt = new Date().toISOString();
     sb.tailFrameReferenceStatus = _tailFrameImageUrl(sb) ? "ready" : "missing";
@@ -6333,14 +7325,14 @@ export async function generateStoryboardTailFrame(gIdx) {
     saveProject();
     renderImageGrid();
     checkImagesConfirm();
-    showToast("已标记这段需要尾帧，请先生成彩色首帧", "info");
+    showToast(tailIntent.requiresFirstFrame ? "已标记这段需要尾帧，请先生成彩色首帧" : "已标记这段需要尾帧", "info");
     return;
   }
   var tailFlushResult = await _sbRunTailFrameCardPromptSave(gIdx, { source: 'regen-tail-flush' });
   if (tailFlushResult && tailFlushResult.ok === false) {
     if (tailFlushResult.readOnly) {
       var tailState = _sbTailFrameCardPromptState(gIdx);
-      showToast((tailState.preflight && tailState.preflight.message) || '请先完成彩色视频首帧，再生成尾帧。', 'warn');
+      showToast((tailState.preflight && tailState.preflight.message) || '尾帧提示词未就绪，请稍后重试。', 'warn');
     }
     renderImageGrid();
     checkImagesConfirm();
@@ -6367,14 +7359,14 @@ export async function generateStoryboardTailFrame(gIdx) {
     if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
       if (project && project.id === originId) {
         renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: '积分不足' });
-        _clearFailedTailFrameLocally(gIdx, '积分不足');
+        _clearFailedTailFrameLocally(gIdx, '积分不足', null, originId);
       }
       showBillingPaywall(e.billing || null);
       return;
     }
     if (project && project.id === originId) {
       renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errMsg });
-      _clearFailedTailFrameLocally(gIdx, errMsg);
+      _clearFailedTailFrameLocally(gIdx, errMsg, null, originId);
     }
     showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsg), "error");
     return;
@@ -6382,7 +7374,7 @@ export async function generateStoryboardTailFrame(gIdx) {
   if (!startResp || !startResp.batchId) {
     var fErr = (startResp && startResp.error) || "未能创建批量任务";
     renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: fErr });
-    _clearFailedTailFrameLocally(gIdx, fErr);
+    _clearFailedTailFrameLocally(gIdx, fErr, null, originId);
     return;
   }
 
@@ -6447,12 +7439,19 @@ export async function generateStoryboardTailFrame(gIdx) {
             _applyResult(url, extra);
           } else if (t.status === 'failed' && !_gotResult) {
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
+            var extraPoll = _snapshotTaskExtra(t);
             if (project && project.id === originId) {
               var synced = await _reloadProjectFromServerForStoryboard(originId);
-              if (!synced) _clearFailedTailFrameLocally(gIdx, errMsgPoll);
+              var extraRecordPoll = _tailFrameErrorRecordFromExtra(extraPoll, errMsgPoll);
+              if (!synced || extraRecordPoll.imageSafetyAudit) _clearFailedTailFrameLocally(gIdx, errMsgPoll, extraPoll, originId);
               var latestSb = project && project.storyboards && project.storyboards[gIdx];
-              var errDisplayPoll = _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(latestSb, errMsgPoll), errMsgPoll);
-              renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayPoll });
+              var errRecordPoll = _tailFrameErrorRecordFromStoryboard(latestSb, errMsgPoll);
+              var errDisplayPoll = _tailFrameErrorDisplay(errRecordPoll, errMsgPoll);
+              if (_tailFrameSafetyInfo(latestSb) || _isImageSafetyBlocked(extraRecordPoll.imageSafetyAudit || errRecordPoll.imageSafetyAudit, errMsgPoll)) {
+                renderImageGrid();
+              } else {
+                renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayPoll });
+              }
             }
             showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errMsgPoll), "error");
             _gotResult = true;
@@ -6478,10 +7477,12 @@ export async function generateStoryboardTailFrame(gIdx) {
       onTaskFailed: function (data) {
         var extra = (data && data.extra) || {};
         var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
-        var errDisplayInner = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsgInner), errMsgInner);
+        var errRecordInner = _tailFrameErrorRecordFromExtra(extra, errMsgInner);
+        var errDisplayInner = _tailFrameErrorDisplay(errRecordInner, errMsgInner);
         if (project && project.id === originId) {
-          renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayInner });
-          _clearFailedTailFrameLocally(gIdx, errMsgInner, extra);
+          _clearFailedTailFrameLocally(gIdx, errMsgInner, extra, originId);
+          if (_isImageSafetyBlocked(errRecordInner.imageSafetyAudit, errRecordInner.message || errDisplayInner)) renderImageGrid();
+          else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayInner });
         }
         showToast("尾帧 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(errDisplayInner), "error");
         _gotResult = true;
@@ -6496,7 +7497,7 @@ export async function generateStoryboardTailFrame(gIdx) {
 
 /**
  * 批量生成所有可生成的尾帧 (P2.5b.T2)。
- * 筛选: _canGenerateTailFrame(sb) === true 且 (无尾帧 or 尾帧 failed) 的组。
+ * 筛选: 最终推荐/用户请求 且 当前依赖条件可生成 且 (无尾帧 or 尾帧 failed) 的组。
  * 不做脏数据清理, 不动主分镜/首帧; 用一个 batchType='tail_frame_images' 批提交全部,
  * 复用尾帧单生成的 SSE/polling pattern。
  */
@@ -6509,10 +7510,18 @@ export async function generateAllTailFrames(opts) {
 
   var targets = Array.isArray(opts.targets) ? opts.targets.slice() : [];
   var skipNoFirst = 0;
+  var skipMerged = 0;
+  var skipLowScore = 0;
   if (!targets.length) {
     for (var i = 0; i < groups.length; i++) {
       var sb = project.storyboards[i] || {};
-      if (!_canGenerateTailFrame(sb)) { skipNoFirst++; continue; }
+      // P3：一键(自动)只跟随"solo 且分值达标"。合并段恒无尾锚点 → 跳过;
+      // 低分 solo 不自动跟随(用户仍可在尾帧卡手动生成,手动不拦)。
+      var _idxs = (groups[i] && groups[i].shotIndices) || [];
+      if (_idxs.length > 1) { skipMerged++; continue; }
+      var tailIntent = _tailFrameGenerationIntentForGroup(groups[i], sb);
+      if (!tailIntent.wanted) { skipLowScore++; continue; }
+      if (!tailIntent.canGenerate) { skipNoFirst++; continue; }
       var tailUrl = (sb.frames && sb.frames.tail && sb.frames.tail.url) || sb.tailFrameUrl;
       var tailStatus = (sb.frames && sb.frames.tail && sb.frames.tail.status) || '';
       var shouldGen = !tailUrl || tailStatus === 'failed';
@@ -6522,8 +7531,12 @@ export async function generateAllTailFrames(opts) {
     }
   }
   if (!targets.length) {
-    var hintMsg = skipNoFirst > 0
-      ? '全部片段已有尾帧, 或缺少彩色首帧 (' + skipNoFirst + ' 个片段跳过)'
+    var _skipParts = [];
+    if (skipNoFirst > 0) _skipParts.push(skipNoFirst + ' 个缺彩色片段首帧');
+    if (skipMerged > 0) _skipParts.push(skipMerged + ' 个合并片段(不建议尾帧)');
+    if (skipLowScore > 0) _skipParts.push(skipLowScore + ' 个低分 solo 片段(可在尾帧卡手动生成)');
+    var hintMsg = _skipParts.length
+      ? '没有需要自动生成尾帧的片段:' + _skipParts.join('、')
       : '全部片段已有尾帧, 无需重新生成';
     showToast(hintMsg, 'info');
     return;
@@ -6568,7 +7581,7 @@ export async function generateAllTailFrames(opts) {
     }
     targets.forEach(function (t) {
       renderStoryboardFrameCard(t.groupIdx, 'tail', 'error', { errMsg: errMsg });
-      _clearFailedTailFrameLocally(t.groupIdx, errMsg);
+      _clearFailedTailFrameLocally(t.groupIdx, errMsg, null, originId);
     });
     if (btn) btn.disabled = false;
     return;
@@ -6578,7 +7591,7 @@ export async function generateAllTailFrames(opts) {
     showToast(fErr, 'error');
     targets.forEach(function (t) {
       renderStoryboardFrameCard(t.groupIdx, 'tail', 'error', { errMsg: fErr });
-      _clearFailedTailFrameLocally(t.groupIdx, fErr);
+      _clearFailedTailFrameLocally(t.groupIdx, fErr, null, originId);
     });
     if (btn) btn.disabled = false;
     return;
@@ -6641,9 +7654,11 @@ export async function generateAllTailFrames(opts) {
     function _failOne(extra, errMsg) {
       var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
       if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
-      var errDisplay = _tailFrameErrorDisplay(_tailFrameErrorRecordFromExtra(extra, errMsg), errMsg);
-      _clearFailedTailFrameLocally(gIdx, errMsg, extra);
-      renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
+      var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
+      var errDisplay = _tailFrameErrorDisplay(errRecord, errMsg);
+      _clearFailedTailFrameLocally(gIdx, errMsg, extra, originId);
+      if (_isImageSafetyBlocked(errRecord.imageSafetyAudit, errRecord.message || errDisplay)) renderImageGrid();
+      else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
       completedIdx[gIdx] = 'failed';
       failCount++;
     }
@@ -6663,7 +7678,8 @@ export async function generateAllTailFrames(opts) {
             if (url) _applyOne(extra, url);
           } else if (t.status === 'failed') {
             var target = t.target || {};
-            var extraF = { groupIdx: target.groupIdx };
+            var extraF = _snapshotTaskExtra(t);
+            if (typeof extraF.groupIdx !== 'number') extraF.groupIdx = target.groupIdx;
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
             _failOne(extraF, errMsgPoll);
           }
@@ -6716,7 +7732,7 @@ export async function generateAllImages() {
     return;
   }
   _imagesStarting = true;
-  if (hint) hint.textContent = "正在准备首帧生成…";
+  if (hint) hint.textContent = "正在准备关键帧生成…";
   _updateImagesActionButton(groups);
   var accepted = await _acceptShotPlanForStoryboard();
   if (!accepted) {
@@ -6759,7 +7775,7 @@ export async function generateAllImages() {
   // 注: 不再 blanket 给所有 group 打 "准备首帧…" loading 浮窗——那会让"补全 1 张" /
   // "重试失败" 这类只重生一部分的场景, 所有 card 都莫名挂上 loading。
   // 真正会重生的 group 在下面 targets 算出来后再打 loading 状态。
-  if (hint) hint.textContent = "准备生成视频首帧…";
+  if (hint) hint.textContent = "准备生成视频关键帧…";
 
   // Step 2：过滤仍缺图的组
   // 同时**裁剪 storyboards 数组**到当前分组数：之前用旧分组算法生成的
@@ -6796,41 +7812,47 @@ export async function generateAllImages() {
 
   var buttonState = _computeImagesBatchState(groups, { ignoreGenerating: true });
   var targets = [];
-  var runRequestedTailsAfterFirst = false;
-  var requestedTailIdxMap = null; // null = all requested tails (regenerate_all only)
+  var tailKeyframeMode = 'pending';
   if (buttonState.action === 'retry_failed') {
     targets = buttonState.failedFirst.map(function (gIdx) {
       return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
     });
+    tailKeyframeMode = 'failed';
   } else if (buttonState.action === 'fill_missing') {
     targets = buttonState.missingFirst.map(function (gIdx) {
       return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
     });
   } else {
     // regenerate_all（含此前独立的 stale-only 场景）：全量重生所有 group 首帧，
-    // requestedTailIdxMap=null 让后续 tail 阶段在每个 group 上单独判断 _isTailRequested。
+    // 随后同步重生已请求/已生成/被建议的尾帧关键帧。
     targets = groups.map(function (g, idx) {
       return { groupIdx: idx, idx: idx, shotIndices: g.shotIndices || [] };
     });
-    runRequestedTailsAfterFirst = buttonState.action === 'regenerate_all';
+    tailKeyframeMode = buttonState.action === 'regenerate_all' ? 'all' : 'pending';
   }
-  if (!targets.length && runRequestedTailsAfterFirst) {
+  var runTailKeyframesAfterFirst = buttonState.pendingTailKeyframes.length > 0 ||
+    buttonState.failedTail.length > 0 ||
+    buttonState.action === 'regenerate_all';
+  if (!targets.length) {
+    var tailOnlyTargets = _tailKeyframeTargets(groups, {
+      failedOnly: tailKeyframeMode === 'failed',
+      includeReady: tailKeyframeMode === 'all',
+    });
     _imagesGenerating = false;
     _imagesStarting = false;
     if (btn) btn.disabled = false;
-    await generateAllTailFrames({
-      targets: Object.keys(requestedTailIdxMap || {}).map(function (gIdx) {
-        gIdx = Number(gIdx);
-        return { groupIdx: gIdx, idx: gIdx, shotIndices: groups[gIdx].shotIndices || [] };
-      }),
-      buttonId: 'btnGenAllImages',
-    });
+    if (tailOnlyTargets.length) {
+      if (hint) hint.textContent = "正在生成 " + tailOnlyTargets.length + " 张尾帧关键帧…";
+      await generateAllTailFrames({ targets: tailOnlyTargets, buttonId: 'btnGenAllImages' });
+    } else {
+      _updateImagesActionButton(groups);
+    }
     checkImagesConfirm();
     return;
   }
   var totalCount = targets.length;
-  if (hint) hint.textContent = "正在生成 " + totalCount + " 张首帧图…";
-  targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成首帧图中…"); });
+  if (hint) hint.textContent = "正在生成 " + totalCount + " 张关键帧…";
+  targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成关键帧中…"); });
 
   // —— 倒计时区域 ——
   // 用户反馈："这个位置改成倒计时吧 还有多久能生成完"。
@@ -6876,7 +7898,7 @@ export async function generateAllImages() {
   // 用户可重试或点单张重新生成；硬回滚靠 git revert。
   var startResp;
   try {
-    // 批量入口 ("重新生成全部首帧图" / "补全 N 张") 也带 applyEditDraft: true,
+    // 批量入口 ("重新生成全部关键帧" / "补全 N 张") 也带 applyEditDraft: true,
     // 让用户在画面描述里的草稿在批量重生时被采用, 而不仅仅是首帧编辑器弹窗。
     // 后端有 `&& draft` 守卫, 没编辑过的 group 不受影响。
     startResp = await apiPost('/api/batch/start', {
@@ -6885,6 +7907,7 @@ export async function generateAllImages() {
       targets: targets,
       applyEditDraft: true,
     });
+    _sbMarkFirstFrameCardPromptDraftCommitPendingForTargets(targets);
   } catch (e) {
     console.error('[generateAllImages] /api/batch/start failed:', e);
     if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
@@ -6917,27 +7940,33 @@ export async function generateAllImages() {
     finished = true;
     _stopEtaTick();
     _clearEta();
-    var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
-    if (hint) hint.textContent = done + "/" + groups.length + " 张首帧图已生成";
-    var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
-    if (allSbDone && groups.length > 0) showToast("全部首帧图已生成", "success");
-    if (failCount > 0) showToast(failCount + " 张首帧图生成失败，请手动重试", "warn");
     var requestedTailTargets = [];
-    if (runRequestedTailsAfterFirst && failCount === 0) {
-      for (var ti = 0; ti < groups.length; ti++) {
-        if (requestedTailIdxMap && !requestedTailIdxMap[ti]) continue;
-        var tailSb = project.storyboards[ti] || {};
-        if (!_isTailRequested(tailSb)) continue;
-        if (!_canGenerateTailFrame(tailSb)) continue;
-        requestedTailTargets.push({ groupIdx: ti, idx: ti, shotIndices: groups[ti].shotIndices || [] });
-      }
+    if (runTailKeyframesAfterFirst) {
+      var latestGroups = getStoryboardGroups();
+      requestedTailTargets = _tailKeyframeTargets(latestGroups, {
+        failedOnly: tailKeyframeMode === 'failed',
+        includeReady: tailKeyframeMode === 'all',
+      });
     }
+    var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
+    if (hint) hint.textContent = done + "/" + groups.length + " 张关键帧已生成";
+    var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
+    if (allSbDone && groups.length > 0 && !requestedTailTargets.length) showToast("全部关键帧已生成", "success");
+    if (failCount > 0) showToast(failCount + " 张关键帧生成失败，请手动重试", "warn");
     if (requestedTailTargets.length) {
-      if (hint) hint.textContent = "正在同步重新生成 " + requestedTailTargets.length + " 张尾帧…";
+      if (hint) hint.textContent = "正在生成 " + requestedTailTargets.length + " 张尾帧关键帧…";
       generateAllTailFrames({ targets: requestedTailTargets, buttonId: 'btnGenAllImages' })
         .finally(function () {
           _imagesGenerating = false;
           if (btn) btn.disabled = false;
+          var finalGroups = getStoryboardGroups();
+          var finalAllFirstDone = finalGroups.every(function (_, i) {
+            return project.storyboards[i] && project.storyboards[i].imageUrl;
+          });
+          var remainingTailTargets = _tailKeyframeTargets(finalGroups);
+          if (finalAllFirstDone && finalGroups.length > 0 && !remainingTailTargets.length) {
+            showToast("全部关键帧已生成", "success");
+          }
           checkImagesConfirm();
           setTimeout(function () { _checkAndSuggest("images"); }, 1000);
         });
@@ -6985,76 +8014,16 @@ export async function generateAllImages() {
     _renderEta();
   }
 
-  function _clearFailedStoryboardLocally(groupIdx, errMsg) {
-    if (typeof groupIdx !== 'number' || !project) return;
-    var msg = (errMsg || '生成失败').toString().slice(0, 500);
-    _safeWriteBack(originId, function (proj) {
-      if (!proj.storyboards) proj.storyboards = [];
-      var sb = proj.storyboards[groupIdx] || {};
-      // Keep this optimistic client mirror aligned with lib/visual-reference-state.ts markFirstFrameFailed.
-      // The next server snapshot remains authoritative; this only prevents the UI from flashing a missing reference.
-      var fallbackUrl = (sb.firstFrame && (sb.firstFrame.currentUrl || sb.firstFrame.lastKnownGoodUrl)) || sb.firstFrameUrl || sb.url || sb.imageUrl || sb.rawUrl || "";
-      sb.firstFrameLastError = msg;
-      sb.firstFrameFailedAt = new Date().toISOString();
-      sb.firstFrame = Object.assign({}, sb.firstFrame || {}, {
-        currentUrl: fallbackUrl || undefined,
-        status: fallbackUrl ? "degraded" : "failed",
-        source: fallbackUrl ? "last_known_good" : ((sb.firstFrame && sb.firstFrame.source) || "generated"),
-        lastKnownGoodUrl: fallbackUrl || ((sb.firstFrame && sb.firstFrame.lastKnownGoodUrl) || undefined),
-        lastError: {
-          message: msg,
-          failedAt: sb.firstFrameFailedAt
-        },
-        history: (sb.firstFrame && Array.isArray(sb.firstFrame.history)) ? sb.firstFrame.history : []
-      });
-      proj.storyboards[groupIdx] = sb;
-    });
-  }
-
-  /**
-   * 本地乐观写 tail 失败态, 对称 _clearFailedStoryboardLocally 但只动 tailFrame* 字段
-   * 和 frames.tail, 绝不触碰首帧/主分镜字段。server 端 batches.ts 的 _clearFailedTailFrameImageState
-   * 也会写同样一份, 这里只是在 server snapshot 到达前让 UI 立刻切到 failed/degraded 态。
-   */
-  function _clearFailedTailFrameLocally(groupIdx, errMsg, extra) {
-    if (typeof groupIdx !== 'number' || !project) return;
-    var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
-    var msg = errRecord.message;
-    _safeWriteBack(originId, function (proj) {
-      if (!proj.storyboards) proj.storyboards = [];
-      var sb = proj.storyboards[groupIdx] || {};
-      var prevTail = (sb.frames && sb.frames.tail) || null;
-      var fallbackUrl = (prevTail && (prevTail.url || prevTail.lastKnownGoodUrl)) || sb.tailFrameUrl || "";
-      sb.tailFrameLastError = msg;
-      sb.tailFrameFailedAt = new Date().toISOString();
-      sb.tailFrameIntent = "requested";
-      sb.tailFrameIntentUpdatedAt = sb.tailFrameIntentUpdatedAt || sb.tailFrameFailedAt;
-      sb.tailFrameReferenceStatus = fallbackUrl ? "ready" : "missing";
-      var nextTail = Object.assign({}, prevTail || {}, {
-        url: fallbackUrl || undefined,
-        status: fallbackUrl ? "degraded" : "failed",
-        source: fallbackUrl ? "last_known_good" : ((prevTail && prevTail.source) || "generated"),
-        lastKnownGoodUrl: fallbackUrl || ((prevTail && prevTail.lastKnownGoodUrl) || undefined),
-        referenceStatus: fallbackUrl ? "ready" : "missing",
-        lastError: {
-          message: msg,
-          errorCode: errRecord.errorCode || undefined,
-          recoveryHint: errRecord.recoveryHint || undefined,
-          failedAt: sb.tailFrameFailedAt
-        }
-      });
-      sb.frames = Object.assign({}, sb.frames || {}, { tail: nextTail });
-      proj.storyboards[groupIdx] = sb;
-    });
-  }
-
-  function _applyTaskFailed(groupIdx, errMsg) {
+  function _applyTaskFailed(groupIdx, errMsg, extra) {
     if (typeof groupIdx !== 'number') return;
     if (_seenFailed[groupIdx] || _seenDone[groupIdx]) return;
     _seenFailed[groupIdx] = true;
     failCount++;
-    _clearFailedStoryboardLocally(groupIdx, errMsg);
-    updateStoryboardCard(groupIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
+    var displayMsg = _firstFrameFailureDisplay(errMsg || '生成失败', extra);
+    _clearFailedStoryboardLocally(groupIdx, displayMsg, extra, originId);
+    var audit = _imageSafetyAuditFromExtra(extra);
+    if (_isImageSafetyBlocked(audit, displayMsg)) renderImageGrid();
+    else updateStoryboardCard(groupIdx, "error", null, displayMsg.slice(0, 120));
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
     _renderEta();
   }
@@ -7069,16 +8038,20 @@ export async function generateAllImages() {
   function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
   var finishingFromServer = null;
 
-  function _finishAfterServerSync() {
-    if (finished) return Promise.resolve();
-    if (finishingFromServer) return finishingFromServer;
-    finishingFromServer = (async function () {
-      pollSettled = true;
-      _stopPoll();
-      await _reloadProjectFromServerForStoryboard(originId);
-      renderImageGrid();
-      finish();
-    })();
+	  function _finishAfterServerSync() {
+	    if (finished) return Promise.resolve();
+	    if (finishingFromServer) return finishingFromServer;
+	    finishingFromServer = (async function () {
+	      pollSettled = true;
+	      _stopPoll();
+	      await _reloadProjectFromServerForStoryboard(originId);
+	      await _sbRefreshFirstFrameCardPromptBaselinesFromServer(targets, {
+	        preserveTextarea: true,
+	        clearDraftCommitRefreshPending: true,
+	      });
+	      renderImageGrid();
+	      finish();
+	    })();
     return finishingFromServer;
   }
 
@@ -7100,7 +8073,7 @@ export async function generateAllImages() {
           _applyTaskCompleted(gIdx, url, extra);
         } else if (t.status === 'failed') {
           var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
-          _applyTaskFailed(gIdx2, t.errorMsg);
+          _applyTaskFailed(gIdx2, t.errorMsg, _snapshotTaskExtra(t));
         }
       });
       if (snap.status === 'completed' || snap.status === 'failed' ||
@@ -7137,7 +8110,7 @@ export async function generateAllImages() {
     onTaskFailed: function (data) {
       var extra = data.extra || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      _applyTaskFailed(groupIdx, data.errorMsg);
+      _applyTaskFailed(groupIdx, data.errorMsg, extra);
     },
     onBatchCompleted: function () {
       _finishAfterServerSync();
@@ -7226,8 +8199,22 @@ export async function confirmImages() {
 
 export async function handleImageAction(e) {
   if (!project) return;
-  var btn = e.target.closest("[data-action]");
-  if (!btn) return;
+  var target = e.target;
+  var btn = target && target.closest ? target.closest("[data-action]") : null;
+  if (!btn) {
+    var frameHead = target && target.closest ? target.closest(".sb-frame-panel-head") : null;
+    if (frameHead) {
+      var headPanel = frameHead.closest(".sb-frame-panel");
+      var headToggle = headPanel && headPanel.querySelector('.sb-frame-toggle[data-action="toggle-frame-card"]');
+      if (_setFramePanelCollapsedFromToggle(headToggle)) return;
+    }
+    var collapsedPanel = target && target.closest ? target.closest(".sb-frame-panel.is-collapsed") : null;
+    if (collapsedPanel) {
+      var collapsedToggle = collapsedPanel.querySelector('.sb-frame-toggle[data-action="toggle-frame-card"]');
+      if (_setFramePanelCollapsedFromToggle(collapsedToggle, false)) return;
+    }
+    return;
+  }
   var action = btn.dataset.action;
 
   if (action === "edit-first-frame") {
@@ -7268,20 +8255,8 @@ export async function handleImageAction(e) {
 
   if (action === "toggle-frame-card") {
     // 折叠/展开首帧 / 尾帧 card。仅切 CSS class + 改按钮文案/图标, 不走完整 re-render,
-    // 避免破坏画面描述 textarea 的焦点/输入态。状态写进 _frameCardCollapsed map,
-    // 下次 renderImageGrid 时也会读到, 所以跨 re-render 不会丢。
-    var toggleGIdx = parseInt(btn.dataset.gidx, 10);
-    var toggleKind = btn.dataset.frame === 'tail' ? 'tail' : 'first';
-    if (isNaN(toggleGIdx)) return;
-    var nextCollapsed = !_isFrameCardCollapsed(toggleGIdx, toggleKind);
-    _setFrameCardCollapsed(toggleGIdx, toggleKind, nextCollapsed);
-    var panel = btn.closest('.sb-frame-panel');
-    if (panel) panel.classList.toggle('is-collapsed', nextCollapsed);
-    btn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
-    var labelEl = btn.querySelector('.sb-frame-toggle-label');
-    if (labelEl) labelEl.textContent = nextCollapsed ? '点击展开' : '点击折叠';
-    var iconEl = btn.querySelector('.sb-frame-toggle-icon');
-    if (iconEl) iconEl.textContent = nextCollapsed ? 'expand_more' : 'expand_less';
+    // 避免破坏画面描述 textarea 的焦点/输入态。折叠状态会持久化到 localStorage。
+    _setFramePanelCollapsedFromToggle(btn);
     return;
   }
 
@@ -7418,16 +8393,6 @@ export async function handleImageAction(e) {
     });
   } else if (action === "accept-tail-suggestion") {
     _acceptTailFrameSuggestion(gIdx);
-  } else if (action === "confirm-tail-advice-override") {
-    // 负向状态 (不建议使用尾帧) 仍允许用户强制走尾帧, 但要弹一道确认,
-    // 避免用户误点 banner。确认后复用 accept-tail-suggestion 的全流程。
-    showConfirm(
-      '仍要生成尾帧？',
-      '系统不建议本段使用尾帧 (镜头偏简单或时长偏短)。若仍坚持生成，可能影响视频画面控制。',
-      function () {
-        _acceptTailFrameSuggestion(gIdx);
-      },
-    );
   } else if (action === "regen-tail") {
     // 尾帧独立生成: 不清首帧, 不 archive 主图, 生成完只刷新尾帧格 (renderStoryboardFrameCard
     // 内部处理)。前端和后端都有 preflight 挡 legacy_pencil / 缺首帧的 case。
