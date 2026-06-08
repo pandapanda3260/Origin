@@ -6,7 +6,7 @@
  * callbacks through initVideoTasks(ctx).
  */
 import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=201';
-import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from './edit.js?v=125';
+import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { getBackgroundStylizeCount } from './assets.js';
 import { showBillingPaywall } from './billing.js';
@@ -141,6 +141,21 @@ function switchPage(page) { if (_ctx.switchPage) return _ctx.switchPage(page); }
 function _diagnoseApiError(msg) { return _ctx.diagnoseApiError ? _ctx.diagnoseApiError(msg) : msg; }
 function sleep(ms) { return _ctx.sleep ? _ctx.sleep(ms) : new Promise(function (r) { setTimeout(r, ms); }); }
 function refreshOverview() { if (_ctx.refreshOverview) return _ctx.refreshOverview(); }
+function _normalizeBatchStatus(status) {
+  return String(status || "").trim().toLowerCase();
+}
+function isTerminalBatchStatus(status) {
+  var normalized = _normalizeBatchStatus(status);
+  return normalized === "completed" ||
+    normalized === "succeeded" ||
+    normalized === "failed" ||
+    normalized === "cancelled" ||
+    normalized === "partial";
+}
+function isRunningBatchStatus(status) {
+  var normalized = _normalizeBatchStatus(status);
+  return normalized === "queued" || normalized === "running";
+}
 function _setBatchStartDisabled(disabled) {
   ["btnStartBatch", "btnGenerateAllSegments"].forEach(function (id) {
     var btn = $(id);
@@ -427,7 +442,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       showToast("已导入 " + imported + " 个片段" + (already ? "，跳过已导入 " + already + " 个" : ""), "ok");
     } else if (already > 0 && skipped === 0 && failed === 0) {
       showToast("所有已生成片段都已导入剪辑工作台", "info");
-    } else if (skipped > 0 || failed > 0) {
+    } else if (failed > 0) {
+      showToast("导入失败，请重试或刷新", "warn");
+    } else if (skipped > 0) {
       showToast("暂无新的可导入片段，未生成或未就绪的片段已跳过", "warn");
     } else {
       showToast("暂无可导入片段，请先生成片段视频", "warn");
@@ -450,7 +467,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       switchPage("edit");
       return result;
     }
-    if (result && (result.skipped > 0 || result.failed > 0)) {
+    if (result && result.failed > 0) {
+      showToast("片段导入失败，请刷新后重试", "warn");
+    } else if (result && result.skipped > 0) {
       showToast("还有片段未生成或未就绪，暂不能进入剪辑", "warn");
     } else {
       showToast("暂无可进入剪辑的片段，请先生成片段视频", "warn");
@@ -699,7 +718,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();
         renderBatchClipList();
 
-        if (snap.completedAt) return;
+        var batchStatus = b.status || snap.status || "";
+        if (isTerminalBatchStatus(batchStatus)) return;
+        if (!isRunningBatchStatus(batchStatus)) return;
 
         var hint = $("batchHint");
         _setBatchStartDisabled(true);
@@ -839,9 +860,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
                 }
               });
             }
-            if (snap.status === "succeeded" || snap.status === "failed" ||
-                snap.status === "completed" || snap.status === "cancelled" ||
-                snap.status === "partial") {
+            if (isTerminalBatchStatus(snap.status)) {
               _stopReatPoll();
               _setBatchStartDisabled(false);
               if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
@@ -3949,9 +3968,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             }
           });
         }
-	        if (snap.status === "succeeded" || snap.status === "failed" ||
-	            snap.status === "completed" || snap.status === "cancelled" ||
-	            snap.status === "partial") {
+	        if (isTerminalBatchStatus(snap.status)) {
 	          _stopPoll();
 	          _setBatchStartDisabled(false);
 	          if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +

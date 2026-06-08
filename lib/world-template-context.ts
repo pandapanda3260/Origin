@@ -58,6 +58,29 @@ function scalarString(value: any): string {
   return '';
 }
 
+function worldCharacterKey(character: any) {
+  if (!isRecord(character)) return scalarString(character).toLowerCase();
+  return scalarString(character.characterId || character.id || character.sourceAssetId || character.name || character.title || character.role).toLowerCase();
+}
+
+function mergeWorldCharacterPools(...pools: any[]) {
+  const byKey = new Map<string, any>();
+  const out: any[] = [];
+  for (const pool of pools) {
+    if (!Array.isArray(pool)) continue;
+    for (const character of pool) {
+      const key = worldCharacterKey(character);
+      if (!key) {
+        out.push(character);
+        continue;
+      }
+      const existing = byKey.get(key);
+      byKey.set(key, existing ? { ...character, ...existing } : character);
+    }
+  }
+  return [...byKey.values(), ...out];
+}
+
 function uniqueStrings(values: any, max = 12): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -228,7 +251,8 @@ export function buildWorldContextFromSnapshot(snapshot: any): WorldContext {
   };
   const locations = uniqueStrings([raw.locations, raw.scenes, raw.environments, raw.places], 12);
   const props = uniqueStrings([raw.props, raw.items, raw.keyItems, raw.artifacts], 12);
-  const characterCandidates = normalizeCharacters(raw.characters || raw.characterCandidates);
+  const worldCharacters = mergeWorldCharacterPools(raw.characters, raw.characterCandidates);
+  const characterCandidates = normalizeCharacters(worldCharacters);
   const terminology = normalizeTerminology(raw.terminology || raw.terms || raw.titles);
   const semanticFacts = { hard: [] as string[], soft: [] as string[] };
   if (era) pushFact(semanticFacts, 'hard', `时代/世界背景：${era}`);
@@ -248,7 +272,7 @@ export function buildWorldContextFromSnapshot(snapshot: any): WorldContext {
   if (storyRules.toneBoundaries.length) pushFact(semanticFacts, 'hard', `语气边界：${storyRules.toneBoundaries.join('；')}`);
   if (forbiddenRules.length) pushFact(semanticFacts, 'hard', `世界观禁忌：${forbiddenRules.join('；')}`);
   if (terminology) pushFact(semanticFacts, 'hard', `术语/称谓：${JSON.stringify(terminology)}`);
-  const characterFacts = summarizeEntityFacts('角色', raw.characters || raw.characterCandidates, 'soft', 18);
+  const characterFacts = summarizeEntityFacts('角色', worldCharacters, 'soft', 18);
   const locationFacts = summarizeEntityFacts('地点', raw.locations || raw.scenes || raw.environments || raw.places, 'soft', 10);
   const propFacts = summarizeEntityFacts('道具', raw.props || raw.items || raw.keyItems || raw.artifacts, 'soft', 10);
   semanticFacts.hard.push(...characterFacts.hard, ...locationFacts.hard, ...propFacts.hard);

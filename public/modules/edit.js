@@ -7,8 +7,8 @@ import { subscribeTask, subscribeBatch } from './backend_stream.js';
 import { showBillingPaywall } from './billing.js';
 import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js';
 
-// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 116" 才能确认新代码加载到。
-console.log('%c[EDIT_JS_VERSION] 116 —— BGM 默认关闭并按开关自动匹配', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 117" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 117 —— 下载按钮状态按导出完成态收口', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
 
 let _ctx = {};
 let project = null;
@@ -299,11 +299,32 @@ function _exportMatchesAutoBgmSignature(exportedSignature) {
   });
 }
 
+var AUTO_COMPOSE_RUNNING_STALE_MS = 10 * 60 * 1000;
+
+function _isFreshAutoComposeRun(run) {
+  var raw = String((run && (run.heartbeatAt || run.updatedAt || run.createdAt)) || "");
+  var ts = raw ? Date.parse(raw) : NaN;
+  if (!Number.isFinite(ts)) return false;
+  return Date.now() - ts <= AUTO_COMPOSE_RUNNING_STALE_MS;
+}
+
+function _isComposeRunCoveredByExport(run, editData) {
+  if (!run || !editData || !editData.exportUrl) return false;
+  if (run.exportUrl) return true;
+  var runTaskId = String(run.exportTaskId || "").trim();
+  var currentTaskId = String(editData.exportTaskId || "").trim();
+  return !!(runTaskId && currentTaskId && runTaskId === currentTaskId);
+}
+
 function _isAutoComposeRunning() {
   if (_editActionBusy && _editActionBusy.btnEditAutoCompose) return true;
-  var runs = _getEditData().composeRuns;
+  var editData = _getEditData();
+  var runs = editData.composeRuns;
   return Array.isArray(runs) && runs.some(function (run) {
-    return run && run.status === "running";
+    return run
+      && run.status === "running"
+      && _isFreshAutoComposeRun(run)
+      && !_isComposeRunCoveredByExport(run, editData);
   });
 }
 
@@ -4078,8 +4099,7 @@ export function syncEditProject(p) {
           if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
         }
         if (url) {
-          _downloadExportFile(url);
-          showToast("成片导出完成，正在下载！", "ok");
+          showToast("成片导出完成，点击「下载成片」保存文件", "ok");
         }
         _editActionEnd("btnEditExport", "editCardExport", "下载导出");
         _exportStreamHandle = null;
@@ -4117,8 +4137,7 @@ export function syncEditProject(p) {
                 if (edlSignature) project.editData.exportedEdlSignature = edlSignature; // arch-guard:allow-editdata
                 if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
               }
-              _downloadExportFile(downloadUrl);
-              showToast("成片导出完成，正在下载！", "ok");
+              showToast("成片导出完成，点击「下载成片」保存文件", "ok");
             } else if (restarted) {
               showToast("服务刚刚重启了，这次导出中断了，点「下载导出」重试一次就好", "warn");
             } else if (isFailed || errorMsg) {
@@ -4276,6 +4295,8 @@ export function syncEditProject(p) {
     var capturedError = null;
     var partialHintShown = false;
     var needOverwriteConfirm = false;
+    var observedExportTaskId = "";
+    var shouldResumeExportStream = false;
     try {
       var resp = await apiPostStream("/api/edit/auto-compose", {
         projectId: project.id,
@@ -4291,6 +4312,7 @@ export function syncEditProject(p) {
             if (skipped > 0) showToast("将跳过 " + skipped + " 个不可用片段继续成片", "warn");
           }
         } else if (evt.type === "export_started") {
+          observedExportTaskId = String(evt.taskId || "");
           if (project) {
             if (!project.editData) project.editData = {};
             project.editData.exportTaskId = evt.taskId;
@@ -4327,7 +4349,6 @@ export function syncEditProject(p) {
           project.editData.exportedEdlSignatureMeta = resp.exportedEdlSignatureMeta;
         }
       }
-      _syncEditExportButtonState();
       if (resp && resp.partial) {
         showToast("一键成片完成（已跳过部分不可用片段）", "ok");
       } else {
@@ -4343,13 +4364,22 @@ export function syncEditProject(p) {
       } else if (capturedError && capturedError.code) {
         showToast("一键成片失败: " + _diagnoseApiError(capturedError.message || capturedError.error || capturedError.code), "error");
       } else {
-        showToast("一键成片失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+        var activeExportTaskId = observedExportTaskId || (project && project.editData && project.editData.exportTaskId) || "";
+        if (activeExportTaskId && !(project && project.editData && project.editData.exportUrl)) {
+          shouldResumeExportStream = true;
+          showToast("成片导出仍在后台进行，完成后可下载", "warn");
+        } else {
+          showToast("一键成片失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
+        }
       }
       await _resyncEditDataFromServer();
-      _syncEditExportButtonState();
+      if (observedExportTaskId || (project && project.editData && project.editData.exportTaskId && !project.editData.exportUrl)) {
+        shouldResumeExportStream = true;
+      }
     }
     _editActionEnd("btnEditAutoCompose", "editCardAutoCompose", "一键成片");
     _syncEditExportButtonState();
+    if (shouldResumeExportStream) setTimeout(_tryResumeExportStream, 0);
 
     // 时间线被手工改过：本次成片已停在 preflight。等动作态清干净后再弹确认，
     // 点「确定」= 设为新基线并自动续跑成片；取消 / ✕ / 点弹窗外 都不做事。

@@ -210,21 +210,13 @@ function _getShotPlanActionState() {
   };
 }
 
-function _shotPlanActionIcon(label) {
-  var s = String(label || "");
-  if (s.indexOf("生成中") !== -1) return "progress_activity";
-  if (s.indexOf("重新生成") !== -1) return "refresh";
-  return "movie_filter";
-}
-
 function _refreshShotPlanActionState(override) {
   var btn = $("btnGenShots");
   var hint = $("shotsHint");
   var state = override || _getShotPlanActionState();
   if (btn) {
-    var iconName = _shotPlanActionIcon(state.label);
     btn.innerHTML =
-      '<span class="material-symbols-outlined text-sm">' + iconName + '</span>' +
+      '<span class="shots-step-number">1</span>' +
       '<span>' + escapeHtml(state.label || "") + '</span>';
     btn.disabled = !!state.disabled;
   }

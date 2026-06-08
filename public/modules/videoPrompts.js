@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning } from './utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js';
 import { attachDiagnostic } from './diagnostic.js';
 import { renderVpCard } from './render_hooks.js';
 import { subscribeBatch } from './backend_stream.js';
@@ -19,6 +19,9 @@ let _vpAutoSaveTimer = null;
 let _vpAutoSaveSeq = 0;
 let _vpFlushPromises = {};
 let _vpParseTimers = {};
+let _vpAttachedBatchesByKey = Object.create(null);
+let _vpTerminalHandledByKey = Object.create(null);
+let _vpReattachRefreshTimer = null;
 
 const _HL_CLASS = {
   motion: 'font-bold border-b border-primary/30',
@@ -966,6 +969,17 @@ export function refreshPromptsPage() {
   renderVideoPromptList();
   _updateVideoPromptBulkButtonLabel();
   checkVideoPromptsConfirm();
+  _scheduleVideoPromptBatchReattach("refresh");
+}
+
+function _scheduleVideoPromptBatchReattach(reason) {
+  if (_vpReattachRefreshTimer) return;
+  _vpReattachRefreshTimer = setTimeout(function () {
+    _vpReattachRefreshTimer = null;
+    reattachVideoPromptBatches(reason).catch(function (e) {
+      console.warn("[VideoPromptReattach] scheduled reattach failed:", (e && e.message) || e);
+    });
+  }, 750);
 }
 
 // 片段条展示导演计划时长：直接累加镜头表里的 duration。
@@ -1538,6 +1552,10 @@ function _isVideoPromptBatchTerminalStatus(status) {
     status === 'canceled' || status === 'partial' || status === 'done' || status === 'succeeded';
 }
 
+function _vpBatchKey(projectId, batchId) {
+  return String(projectId || '') + '::' + String(batchId || '');
+}
+
 function _attachVideoPromptBatch(opts) {
   opts = opts || {};
   _syncRefs();
@@ -1552,6 +1570,7 @@ function _attachVideoPromptBatch(opts) {
   var source = opts.source || 'start';
   var terminalAtAttach = !!opts.terminalAtAttach;
   var silent = source === 'reattach';
+  var attachKey = opts.attachKey || '';
   var btn = $("btnGenAllVideoPrompts");
   var hint = $("videoPromptsHint");
 
@@ -1609,21 +1628,26 @@ function _attachVideoPromptBatch(opts) {
     if (finished) return;
     finished = true;
     _stopPoll();
+    var reloadOk = true;
     try {
       if (_ctx.reloadProjectFromServer) {
         await _ctx.reloadProjectFromServer();
         _syncRefs();
       }
-    } catch (_e) {}
-    if (!terminalAtAttach) _videoPromptsGenerating = false;
-    if (btn) btn.disabled = false;
+    } catch (_e) {
+      reloadOk = false;
+    }
+    if (!terminalAtAttach) {
+      _videoPromptsGenerating = false;
+      if (btn) btn.disabled = false;
+    }
 
     var done = 0;
     for (var j = 0; j < groups.length; j++) {
       if (_isVideoPromptReady(project && project.storyboards && project.storyboards[j])) done++;
     }
     var missingLabels = _missingVideoPromptLabels(groups);
-    if (hint) {
+    if (!terminalAtAttach && hint) {
       hint.textContent = missingLabels.length
         ? done + "/" + groups.length + " 条已生成，缺少镜头 " + missingLabels.join("、")
         : done + "/" + groups.length + " 条已生成";
@@ -1636,7 +1660,7 @@ function _attachVideoPromptBatch(opts) {
     var allDone = groups.length > 0 && groups.every(function (_, k) {
       return _isVideoPromptReady(project && project.storyboards && project.storyboards[k]);
     });
-    _updateVideoPromptBulkButtonLabel(groups);
+    if (!terminalAtAttach) _updateVideoPromptBulkButtonLabel(groups);
     if (!silent) {
       if (allDone) {
         showToast(regenerateAll ? "全部视频提示词已重新生成" : "全部视频提示词已生成", "success");
@@ -1650,6 +1674,8 @@ function _attachVideoPromptBatch(opts) {
     }
     checkVideoPromptsConfirm();
     if (!silent) setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);
+    if (terminalAtAttach && attachKey && reloadOk) _vpTerminalHandledByKey[attachKey] = true;
+    if (attachKey) delete _vpAttachedBatchesByKey[attachKey];
   }
 
   function _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extraData) {
@@ -1677,6 +1703,12 @@ function _attachVideoPromptBatch(opts) {
     doneCount++;
 
     if (currentSb && currentSb.videoPromptStatus === "ready" && _vpStripEditableTimingLines(currentSb.videoPrompt || '') === cleaned) {
+      updateVpCard(gIdx, "done", cleaned);
+      _refreshRunningHint();
+      return;
+    }
+
+    if (silent && terminalAtAttach) {
       updateVpCard(gIdx, "done", cleaned);
       _refreshRunningHint();
       return;
@@ -1729,6 +1761,11 @@ function _attachVideoPromptBatch(opts) {
     failureStats[failureKind] = (failureStats[failureKind] || 0) + 1;
     if (!project.storyboards) project.storyboards = [];
     if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+    if (silent && terminalAtAttach && project.storyboards[gIdx].videoPromptStatus === "failed") {
+      updateVpCard(gIdx, "error", null, (errMsg || project.storyboards[gIdx].videoPromptLastError || '生成失败').toString().slice(0, 120));
+      _refreshRunningHint();
+      return;
+    }
     _setVideoPromptStatus(gIdx, "failed", { videoPromptRunId: incomingRunId, errorMsg: (errMsg || '生成失败').toString().slice(0, 120) });
     _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
     updateVpCard(gIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
@@ -1849,9 +1886,161 @@ function _attachVideoPromptBatch(opts) {
   return {
     close: function () {
       _stopPoll();
+      if (attachKey) delete _vpAttachedBatchesByKey[attachKey];
       if (streamHandle && streamHandle.close) streamHandle.close();
     },
   };
+}
+
+function _videoPromptBatchStatus(b) {
+  return String((b && (b.status || (b.snapshot && b.snapshot.status))) || '').toLowerCase();
+}
+
+async function _reconcileOrphanVideoPromptGenerating(originId, activeBatchIds) {
+  activeBatchIds = activeBatchIds || {};
+  var storyboards = project && Array.isArray(project.storyboards) ? project.storyboards : [];
+  var hasGenerating = storyboards.some(function (sb) { return sb && sb.videoPromptStatus === "generating"; });
+  if (!hasGenerating) return false;
+
+  if (_ctx.reloadProjectFromServer) {
+    await _ctx.reloadProjectFromServer();
+    _syncRefs();
+  }
+
+  var now = Date.now();
+  var orphanAfterMs = 30 * 60 * 1000;
+  var staleGroups = [];
+  storyboards = project && Array.isArray(project.storyboards) ? project.storyboards : [];
+  storyboards.forEach(function (sb, gIdx) {
+    if (!sb || sb.videoPromptStatus !== "generating") return;
+    var runId = String(sb.videoPromptRunId || '');
+    if (runId && activeBatchIds[runId]) return;
+    var startedAt = sb.videoPromptStartedAt ? new Date(sb.videoPromptStartedAt).getTime() : NaN;
+    if (!Number.isFinite(startedAt) || now - startedAt > orphanAfterMs) staleGroups.push(gIdx);
+  });
+  if (!staleGroups.length) return false;
+
+  var staleSet = {};
+  staleGroups.forEach(function (gIdx) { staleSet[gIdx] = true; });
+  var failedAt = new Date().toISOString();
+  var message = "后台提示词任务已失联，请单条重新生成";
+  var isCurrent = _safeWriteBack(originId, function (proj) {
+    if (!proj.storyboards) proj.storyboards = [];
+    Object.keys(staleSet).forEach(function (key) {
+      var gIdx = Number(key);
+      var sb = proj.storyboards[gIdx] || {};
+      if (sb.videoPromptStatus !== "generating") return;
+      sb.videoPromptStatus = "failed";
+      sb.videoPromptFailedAt = failedAt;
+      sb.videoPromptLastError = message;
+      sb.videoIsCurrent = false;
+      sb.videoInvalidatedAt = failedAt;
+      sb.videoInvalidatedReason = "video_prompt_lost";
+      proj.storyboards[gIdx] = sb;
+    });
+  });
+  if (isCurrent) {
+    _videoPromptsGenerating = false;
+    var hint = $("videoPromptsHint");
+    if (hint) hint.textContent = message;
+    Object.keys(staleSet).forEach(function (key) {
+      updateVpCard(Number(key), "error", null, message);
+    });
+    _updateVideoPromptBulkButtonLabel();
+    checkVideoPromptsConfirm();
+  }
+  return !!isCurrent;
+}
+
+export async function reattachVideoPromptBatches(reason) {
+  _syncRefs();
+  if (!project || !project.id) return { reattached: 0 };
+  var originId = project.id;
+  var resp;
+  try {
+    resp = await getActiveBatchesShared(originId);
+  } catch (e) {
+    console.warn("[VideoPromptReattach] /api/batch/active failed:", (e && e.message) || e);
+    return { reattached: 0, err: e };
+  }
+
+  var batches = (resp && resp.batches) || [];
+  var groups = getStoryboardGroups();
+  var runningBatchIds = {};
+  var reattached = 0;
+  var runningFound = false;
+
+  batches.forEach(function (b) {
+    if (!b || b.batchType !== "video_prompts" || !b.batchId) return;
+    var batchId = b.batchId;
+    var status = _videoPromptBatchStatus(b);
+    var key = _vpBatchKey(originId, batchId);
+    var snap = b.snapshot || {};
+    var tasks = Array.isArray(b.tasks) ? b.tasks : (Array.isArray(snap.tasks) ? snap.tasks : []);
+    var seqToGroupIdx = {};
+    var totalCount = Number(snap.total || tasks.length || groups.length || 0);
+    if (_isVideoPromptBatchTerminalStatus(status)) {
+      if (_vpTerminalHandledByKey[key] || _vpAttachedBatchesByKey[key]) return;
+      _vpAttachedBatchesByKey[key] = true;
+      _attachVideoPromptBatch({
+        batchId: batchId,
+        originId: originId,
+        groups: groups,
+        seqToGroupIdx: seqToGroupIdx,
+        totalCount: totalCount,
+        regenerateAll: false,
+        source: 'reattach',
+        terminalAtAttach: true,
+        snapshotTasks: tasks,
+        attachKey: key,
+      });
+      reattached++;
+      return;
+    }
+
+    if (status !== "queued" && status !== "running") return;
+    runningBatchIds[batchId] = true;
+    runningFound = true;
+    if (_vpAttachedBatchesByKey[key]) return;
+    _videoPromptsGenerating = true;
+    _setVideoPromptBulkButtonDisabled(true);
+    _setVideoPromptBulkButtonLabel("生成中…");
+    var hint = $("videoPromptsHint");
+    if (hint && totalCount) {
+      hint.textContent = "生成中… " + ((snap.succeeded || 0) + (snap.failed || 0)) + "/" + totalCount;
+    }
+    tasks.forEach(function (t) {
+      var taskStatus = String(t && t.status || '').toLowerCase();
+      if (taskStatus !== 'queued' && taskStatus !== 'running') return;
+      var target = (t && t.target) || {};
+      var gIdx = typeof target.groupIdx === 'number'
+        ? target.groupIdx
+        : (typeof target.idx === 'number' ? target.idx : null);
+      if (typeof gIdx === 'number') updateVpCard(gIdx, "loading", null, "生成中…");
+    });
+    _vpAttachedBatchesByKey[key] = _attachVideoPromptBatch({
+      batchId: batchId,
+      originId: originId,
+      groups: groups,
+      seqToGroupIdx: seqToGroupIdx,
+      totalCount: totalCount,
+      regenerateAll: false,
+      source: 'reattach',
+      terminalAtAttach: false,
+      snapshotTasks: tasks,
+      attachKey: key,
+    }) || true;
+    reattached++;
+  });
+
+  if (!runningFound) {
+    try {
+      await _reconcileOrphanVideoPromptGenerating(originId, runningBatchIds);
+    } catch (e) {
+      console.warn("[VideoPromptReattach] orphan generating reconcile failed:", (e && e.message) || e);
+    }
+  }
+  return { reattached: reattached, reason: reason || "" };
 }
 
 export async function generateAllVideoPrompts(opts) {

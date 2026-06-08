@@ -22,7 +22,7 @@ import {
 } from './frame-workflow-state';
 import { buildShotPlanDependencyPatch } from './project-dependency-state';
 import { maybeMarkStyleBibleStale } from './script-style-state';
-import { markExportFailureInEditData } from './edit-auto-compose-state';
+import { cleanStaleRunningComposeRuns, markExportFailureInEditData } from './edit-auto-compose-state';
 import {
   emptyScriptConsultState,
   isEmptyScriptConsultState,
@@ -407,6 +407,13 @@ function buildFailedExportTaskCleanupPatch(project: any, userId: number) {
   };
 }
 
+function buildStaleComposeRunCleanupPatch(project: any) {
+  const editData = project?.editData;
+  if (!editData) return null;
+  const cleaned = cleanStaleRunningComposeRuns(editData);
+  return cleaned.changed ? { editData: cleaned.editData } : null;
+}
+
 export function listProjectsByUser(userId: number) {
   const db = getDb();
   const rows = db
@@ -440,10 +447,13 @@ export function getProjectByIdForUser(id: string, userId: number) {
   const backfilledProject = { ...normalizedProject, ...(backfillPatch || {}) };
   const staleExportPatch = buildFailedExportTaskCleanupPatch(backfilledProject, userId);
   const tStaleExport = perfDiag ? performance.now() : 0;
-  const combinedPatch = normalizationPatch || backfillPatch || staleExportPatch
-    ? { ...(normalizationPatch || {}), ...(backfillPatch || {}), ...(staleExportPatch || {}) }
+  const staleExportProject = { ...backfilledProject, ...(staleExportPatch || {}) };
+  const staleComposePatch = buildStaleComposeRunCleanupPatch(staleExportProject);
+  const tStaleCompose = perfDiag ? performance.now() : 0;
+  const combinedPatch = normalizationPatch || backfillPatch || staleExportPatch || staleComposePatch
+    ? { ...(normalizationPatch || {}), ...(backfillPatch || {}), ...(staleExportPatch || {}), ...(staleComposePatch || {}) }
     : null;
-  let tUpdate = tStaleExport;
+  let tUpdate = tStaleCompose;
   if (combinedPatch) {
     const applied = applyPatchToRow(row, combinedPatch);
     const updateInfo = db.prepare(
@@ -470,11 +480,13 @@ export function getProjectByIdForUser(id: string, userId: number) {
           + ` normalizationPatch=${fmt(tNorm - tRowToPublic)}ms`
           + ` backfillPatch=${fmt(tBackfill - tNorm)}ms`
           + ` staleExportPatch=${fmt(tStaleExport - tBackfill)}ms`
-          + ` update=${fmt(tUpdate - tStaleExport)}ms`
+          + ` staleComposePatch=${fmt(tStaleCompose - tStaleExport)}ms`
+          + ` update=${fmt(tUpdate - tStaleCompose)}ms`
           + ` patches=${[
               normalizationPatch ? 'norm' : '',
               backfillPatch ? 'backfill' : '',
               staleExportPatch ? 'staleExport' : '',
+              staleComposePatch ? 'staleCompose' : '',
             ].filter(Boolean).join('+') || 'none'}`,
       );
     }
@@ -486,12 +498,13 @@ export function getProjectByIdForUser(id: string, userId: number) {
   if (perfDiag) {
     const fmt = (n: number) => n.toFixed(0);
     console.log(
-      `[perf-diag] WIP getProjectByIdForUser id=${id} uid=${userId} total=${fmt(tStaleExport - t0)}ms`
+      `[perf-diag] WIP getProjectByIdForUser id=${id} uid=${userId} total=${fmt(tStaleCompose - t0)}ms`
         + ` select=${fmt(tSelect - t0)}ms`
         + ` rowToPublic=${fmt(tRowToPublic - tSelect)}ms`
         + ` normalizationPatch=${fmt(tNorm - tRowToPublic)}ms`
         + ` backfillPatch=${fmt(tBackfill - tNorm)}ms`
         + ` staleExportPatch=${fmt(tStaleExport - tBackfill)}ms`
+        + ` staleComposePatch=${fmt(tStaleCompose - tStaleExport)}ms`
         + ` update=0ms patches=none`,
     );
   }

@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const storyboard = fs.readFileSync(path.join(REPO_ROOT, 'public/modules/storyboard.js'), 'utf8');
 const main = fs.readFileSync(path.join(REPO_ROOT, 'public/main.js'), 'utf8');
+const workspace = fs.readFileSync(path.join(REPO_ROOT, 'public/workspace.html'), 'utf8');
 
 const passed = [];
 const failed = [];
@@ -66,6 +67,23 @@ record('recent batch activity is learned from /api/batch/active results', () => 
   const block = section(storyboard, 'export async function reattachStoryboardBatches()', 'function _reattachImagesBatch');
   assert(block.includes('if (!batches.length) return;'));
   assert(block.includes('_markStoryboardBatchActivity();'));
+});
+
+record('live storyboard completion delegates tail-frame continuation to the shared helper', () => {
+  const block = section(storyboard, 'function finish() {', '// 已经在本地标记完成的 groupIdx');
+  assert(block.includes('_maybeAutoStartTailFramesFromCurrentProject(originId, startResp.batchId, {'));
+  assert(block.includes("failedOnly: tailKeyframeMode === 'failed'"));
+  assert(block.includes("includeReady: tailKeyframeMode === 'all'"));
+  assert(block.includes('var remainingTailTargets = _tailKeyframeTargets(finalGroups);'));
+  assert(!block.includes('generateAllTailFrames({ targets: requestedTailTargets'));
+});
+
+record('main storyboard import version stays aligned with workspace importmap', () => {
+  const mainMatch = main.match(/from '\.\/modules\/storyboard\.js\?v=(\d+)'/);
+  assert(mainMatch, 'main.js must import storyboard.js with an explicit cache version');
+  const importMapMatch = workspace.match(/"\/modules\/storyboard\.js":\s*"\/modules\/storyboard\.js\?v=(\d+)"/);
+  assert(importMapMatch, 'workspace importmap must pin storyboard.js with an explicit cache version');
+  assert.equal(mainMatch[1], importMapMatch[1], 'main.js storyboard version must match workspace importmap');
 });
 
 record('main init imports and registers the reconciler after initial reattach', () => {

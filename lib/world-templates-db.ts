@@ -128,6 +128,40 @@ function previewUrlsFromEntities(items: any[], max = 4) {
     .slice(0, max);
 }
 
+function worldCharacterKey(character: any) {
+  if (!character || typeof character !== 'object') return firstText(character).toLowerCase();
+  return firstText(character.characterId, character.id, character.sourceAssetId, character.name, character.title, character.role).toLowerCase();
+}
+
+function mergeWorldCharacterPools(...pools: any[]) {
+  const byKey = new Map<string, any>();
+  const out: any[] = [];
+  for (const pool of pools) {
+    if (!Array.isArray(pool)) continue;
+    for (const character of pool) {
+      const key = worldCharacterKey(character);
+      if (!key) {
+        out.push(character);
+        continue;
+      }
+      const existing = byKey.get(key);
+      byKey.set(key, existing ? { ...character, ...existing } : character);
+    }
+  }
+  return [...byKey.values(), ...out];
+}
+
+function removeCharactersAlreadyInPool(pool: any, authoritativePool: any) {
+  const authoritativeKeys = new Set(
+    mergeWorldCharacterPools(authoritativePool).map(worldCharacterKey).filter(Boolean),
+  );
+  if (!authoritativeKeys.size) return Array.isArray(pool) ? pool : [];
+  return (Array.isArray(pool) ? pool : []).filter((character) => {
+    const key = worldCharacterKey(character);
+    return !key || !authoritativeKeys.has(key);
+  });
+}
+
 function preferredStyleTemplateIdFrom(value: any) {
   const preference = value?.styleTemplatePreference;
   return cleanString(
@@ -190,7 +224,7 @@ function rowToPublic(row: WorldTemplateRow) {
 
 function rowToSummary(row: WorldTemplateRow) {
   const data = parseData(row);
-  const characters = firstArray(data.characters, data.characterCandidates);
+  const characters = mergeWorldCharacterPools(data.characters, data.characterCandidates);
   const locations = firstArray(data.locations, data.scenes, data.environments, data.places);
   const props = firstArray(data.props, data.items, data.keyItems, data.artifacts);
   const characterPreviewUrls = previewUrlsFromEntities(characters, 4);
@@ -512,7 +546,10 @@ function mergeEntityArrayByKey(current: any, incoming: any, opts: { source: stri
 
 function filterTemplateInclude(input: any, include: BuildWorldTemplateInclude | undefined) {
   const out = { ...(input && typeof input === 'object' ? input : {}) };
-  if (include?.characters === false) out.characters = [];
+  if (include?.characters === false) {
+    out.characters = [];
+    out.characterCandidates = [];
+  }
   if (include?.locations === false) out.locations = [];
   if (include?.props === false) out.props = [];
   if (include?.terminology === false) out.terminology = {};
@@ -574,37 +611,58 @@ function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
   };
 }
 
-function mapCharactersFromProject(project: any, characterIds?: string[]) {
+function mapCharacterAssetToWorldCharacter(asset: any) {
+  return {
+    id: firstText(asset.characterId, asset.id),
+    characterId: firstText(asset.characterId, asset.id),
+    name: firstText(asset.name, asset.role),
+    role: firstText(asset.role),
+    identity: firstText(asset.identity),
+    entityType: asset.entityType === 'non-human' ? 'non-human' : 'human',
+    appearance: firstText(asset.appearance, asset.detail, asset.intro),
+    clothing: firstText(asset.clothing),
+    equipment: firstText(asset.equipment),
+    realPhotoUrl: firstText(asset.realPhotoUrl, asset.imageUrl, asset.rawUrl) || undefined,
+    imageUrl: firstText(asset.imageUrl, asset.rawUrl) || undefined,
+  };
+}
+
+function splitWorldCharactersFromProject(project: any, characterIds?: string[]) {
   const allowed = characterIds?.length ? new Set(characterIds.map(String)) : null;
   const assets = listCharacterAssetsForAuthority(project);
   const locks = Array.isArray(project?.consistency?.characters) ? project.consistency.characters : [];
   if (locks.length) {
-    return locks
-      .filter((lock: any) => {
-        const explicitlySelected = !!allowed && (
-          allowed.has(String(lock?.characterId || '')) ||
-          allowed.has(String(lock?.canonicalName || ''))
-        );
-        if (allowed) return explicitlySelected;
-        return lock?.status === 'locked';
-      })
-      .map((lock: any) => mapCharacterLockToWorldCharacter(lock, resolveCharacterAssetForEntity(project, lock).asset));
+    const characters: any[] = [];
+    const characterCandidates: any[] = [];
+    for (const lock of locks) {
+      const explicitlySelected = !!allowed && (
+        allowed.has(String(lock?.characterId || '')) ||
+        allowed.has(String(lock?.canonicalName || ''))
+      );
+      if (allowed && !explicitlySelected) continue;
+      const mapped = mapCharacterLockToWorldCharacter(lock, resolveCharacterAssetForEntity(project, lock).asset);
+      if (allowed || lock?.status === 'locked') {
+        characters.push(mapped);
+      } else {
+        characterCandidates.push(mapped);
+      }
+    }
+    return {
+      characters: mergeWorldCharacterPools(characters),
+      characterCandidates: removeCharactersAlreadyInPool(mergeWorldCharacterPools(characterCandidates), characters),
+    };
   }
-  return assets
+  const characters = assets
     .filter((asset: any) => !allowed || allowed.has(String(asset?.characterId || '')) || allowed.has(String(asset?.id || '')) || allowed.has(String(asset?.name || '')))
-    .map((asset: any) => ({
-      id: firstText(asset.characterId, asset.id),
-      characterId: firstText(asset.characterId, asset.id),
-      name: firstText(asset.name, asset.role),
-      role: firstText(asset.role),
-      identity: firstText(asset.identity),
-      entityType: asset.entityType === 'non-human' ? 'non-human' : 'human',
-      appearance: firstText(asset.appearance, asset.detail, asset.intro),
-      clothing: firstText(asset.clothing),
-      equipment: firstText(asset.equipment),
-      realPhotoUrl: firstText(asset.realPhotoUrl, asset.imageUrl, asset.rawUrl) || undefined,
-      imageUrl: firstText(asset.imageUrl, asset.rawUrl) || undefined,
-    }));
+    .map(mapCharacterAssetToWorldCharacter);
+  return {
+    characters: mergeWorldCharacterPools(characters),
+    characterCandidates: [],
+  };
+}
+
+function mapCharactersFromProject(project: any, characterIds?: string[]) {
+  return splitWorldCharactersFromProject(project, characterIds).characters;
 }
 
 function applyAssetAuthorityToSnapshotCharacters(project: any, characters: any) {
@@ -661,6 +719,9 @@ export function buildWorldTemplateFromProject(project: any, opts: { templateId?:
   const props = Array.isArray(project?.props) ? project.props : [];
   const include = opts.include || {};
   const preferredStyleFields = preferredStyleTemplateFromProject(project);
+  const characterSplit = includeEnabled(include, 'characters')
+    ? splitWorldCharactersFromProject(project)
+    : { characters: [], characterCandidates: [] };
   const setting = {
     era: firstText(worldRulesRaw.era, styleBible.era),
     geography: firstText(worldRulesRaw.geography, styleBible.geography),
@@ -685,7 +746,8 @@ export function buildWorldTemplateFromProject(project: any, opts: { templateId?:
     },
     terminology: includeEnabled(include, 'terminology') ? (styleBible.terminology || styleBible.terms || {}) : {},
     forbiddenRules: cleanList([styleBible.forbiddenRules, worldRulesRaw.forbiddenRules], 16),
-    characters: includeEnabled(include, 'characters') ? mapCharactersFromProject(project) : [],
+    characters: characterSplit.characters,
+    characterCandidates: characterSplit.characterCandidates,
     locations: includeEnabled(include, 'locations') ? environments.map((env: any) => ({
       id: firstText(env.id, env.sceneId),
       name: firstText(env.name, env.sceneName, env.title),
@@ -716,9 +778,17 @@ export function buildWorldTemplateFromProjectSnapshot(
     || (opts.mode === 'create' ? `world_${cleanId(project?.id || randomUUID())}` : firstText(snapshot.id))
     || `world_${cleanId(project?.id || randomUUID())}`;
   const preferredStyleFields = preferredStyleTemplateFromProject(project);
+  const projectCharacterSplit = splitWorldCharactersFromProject(project);
+  const snapshotCharacters = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characters);
+  const snapshotCandidates = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characterCandidates);
+  const characterCandidates = removeCharactersAlreadyInPool(
+    mergeWorldCharacterPools(snapshotCandidates, projectCharacterSplit.characterCandidates),
+    snapshotCharacters,
+  );
   const projectedSnapshot = {
     ...snapshot,
-    characters: applyAssetAuthorityToSnapshotCharacters(project, snapshot.characters),
+    characters: snapshotCharacters,
+    characterCandidates,
   };
   return filterTemplateInclude({
     ...projectedSnapshot,
@@ -753,7 +823,14 @@ export function mergeWorldTemplateSnapshotIntoSource(
 
   for (const key of Object.keys(incoming)) {
     if (['id', 'name', 'sourceProjectId', 'source_project_id', 'coverImageId', 'cover_image_id', 'schemaVersion', 'schema_version', 'source'].includes(key)) continue;
-    if (key === 'characters' || key === 'locations' || key === 'props') {
+    if ((key === 'characters' || key === 'characterCandidates') && opts.include?.characters === false) {
+      if (!Array.isArray((next as any)[key]) || (next as any)[key].length) {
+        (next as any)[key] = [];
+        changed = true;
+      }
+      continue;
+    }
+    if (key === 'characters' || key === 'characterCandidates' || key === 'locations' || key === 'props') {
       const merged = mergeEntityArrayByKey((next as any)[key], incoming[key], {
         source: 'snapshot_sync',
         strength: 'soft',

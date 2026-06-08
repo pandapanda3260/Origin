@@ -50,6 +50,7 @@
     "test:video-payload-decision": "tsx scripts/test-video-payload-decision.js",
     "test:video-reference-manifest": "node scripts/test-video-reference-manifest.js",
     "test:video-prompt-lifecycle": "tsx scripts/test-video-prompt-lifecycle.ts",
+    "test:video-prompt-reattach": "tsx scripts/test-video-prompt-batch-reattach.ts",
     "test:video-prompt-dialogue-regression": "tsx scripts/test-video-prompt-dialogue-regression.ts",
     "test:visual-reference-state": "node scripts/test-visual-reference-state.js",
     "test:style-bible-runs": "tsx scripts/test-style-bible-runs.ts",

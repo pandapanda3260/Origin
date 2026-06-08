@@ -37,6 +37,7 @@ record('running guard state and helpers exist', () => {
   assert.match(src, /var _storyboardReattachRunningByBatch = Object\.create\(null\);/);
   assert.match(src, /var _storyboardTerminalReloadScheduledByBatch = Object\.create\(null\);/);
   assert.match(src, /var _storyboardTerminalSnapshotHandledByBatch = Object\.create\(null\);/);
+  assert.match(src, /var _storyboardTailAutoStartedBySourceBatch = Object\.create\(null\);/);
   assert.match(src, /function _storyboardBatchKey\(projectId, batchId\)/);
   assert.match(src, /function _shouldSkipStoryboardRunningReattach\(projectId, batchId, b\)/);
 });
@@ -80,6 +81,26 @@ record('prompts failed/cancelled terminal snapshots do not subscribe repeatedly'
   assert(block.includes('_markStoryboardTerminalSnapshotHandled(originId, batchId);'));
   assert(subscribeIdx > -1, 'prompts reattach still subscribes for running batches');
   assert(terminalIdx < subscribeIdx, 'terminal check must run before prompt subscribeBatch');
+});
+
+record('automatic tail-frame continuation is guarded once per source storyboard batch', () => {
+  const helper = section('async function _maybeAutoStartTailFramesFromCurrentProject', 'function _runStoryboardBatchReconcile');
+  const guardIdx = helper.indexOf('if (_storyboardTailAutoStartedBySourceBatch[key]) return false;');
+  const markIdx = helper.indexOf('_storyboardTailAutoStartedBySourceBatch[key] = true;');
+  const targetIdx = helper.indexOf('var targets = _tailKeyframeTargets(getStoryboardGroups(), {');
+  assert(guardIdx > -1, 'helper must skip already handled source batches');
+  assert(markIdx > guardIdx, 'helper must mark after checking the source batch guard');
+  assert(targetIdx > markIdx, 'helper must mark before computing targets so empty targets are not retried forever');
+});
+
+record('tail-frame running state participates in the shared image button state', () => {
+  assert.match(src, /var _tailFramesGenerating = false;/);
+  assert.match(src, /function _setTailFramesGenerating\(active\)/);
+  const state = section('function _computeImagesBatchState', 'function _allFirstFramesReady');
+  assert(state.includes('_imagesGenerating || _imagesStarting || _tailFramesGenerating'));
+  const tail = section('function _reattachTailFrameBatch', 'function _reattachPromptsBatch');
+  assert(tail.includes('_setTailFramesGenerating(true);'));
+  assert(tail.includes('_setTailFramesGenerating(false);'));
 });
 
 if (failed.length) {

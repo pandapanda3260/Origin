@@ -841,6 +841,14 @@ body.is-online-editor-page .agent-panel {
   min-width: 0;
 }
 
+.oe-sync-hint {
+  font-size: 12px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.46);
+  white-space: nowrap;
+  user-select: none;
+}
+
 .oe-sync-btn {
   display: inline-flex;
   align-items: center;
@@ -952,6 +960,10 @@ body.is-online-editor-page .agent-panel {
   }
 
   .oe-sync-btn span:last-child {
+    display: none;
+  }
+
+  .oe-sync-hint {
     display: none;
   }
 }
@@ -3490,6 +3502,18 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 .batch-primary-action:hover { opacity: 0.94; transform: translateY(-1px); }
 .batch-primary-action:active { transform: translateY(0) scale(0.98); }
 .batch-primary-action .material-symbols-outlined { font-size: 16px; }
+.batch-primary-action .batch-action-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
 .batch-redesign-hero-actions {
   display: inline-flex;
   align-items: center;
@@ -4544,6 +4568,18 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   min-width: 190px;
 }
 
+.asset-step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 850;
+  line-height: 1;
+}
+
 /* ============================================================
    Project Style Page
    ============================================================ */
@@ -4658,6 +4694,8 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   border-radius: 999px;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  text-align: center;
   color: #425566;
   background: rgba(255,255,255,0.76);
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.84), 0 14px 32px rgba(15,23,42,0.05);
@@ -8945,6 +8983,15 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 #shotsTopActions {
   position: relative;
+}
+.shots-step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 780;
+  line-height: 1;
+  flex-shrink: 0;
 }
 #shotsTopActions > #shotsHint {
   position: absolute;
@@ -18028,4 +18075,21 @@ body.first-frame-editor-lock {
   .vh-body { grid-template-columns: 1fr; }
   .vh-player { aspect-ratio: 16 / 10; }
   .vh-right { max-height: 40vh; }
+}
+
+/* ───────────────────────────────────────────────────────────────
+   侧边导航光点（#sidebarNavDot）左侧被裁修复
+   -------------------------------------------------------------
+   光点贴在最左侧的竖线（left:2px）上，自带一圈发光（box-shadow 模糊
+   14px + 扩散 4px）。它的滚动容器 #sidebarNavTrackHost 用了
+   overflow-y-auto —— 一旦纵向是 auto，横向 overflow-x 也会被强制成
+   auto，于是光点左半边 + 整圈左侧光晕被裁在容器左内边那条线上，
+   看起来就是"半个点"。z-index 没用（这是裁剪不是层叠）。
+   做法：负 margin 把容器左边界顶到侧栏最左，再用等量 padding 把内容
+   推回原位、calc 加宽补回右边界 —— 裁剪框左移、内部一切位置不变，
+   纵向滚动保留，光点和光晕完整显示。1.5rem = 侧栏 px-6。 */
+#sidebarNavTrackHost {
+  margin-left: -1.5rem;
+  padding-left: 1.5rem;
+  width: calc(100% + 1.5rem);
 }

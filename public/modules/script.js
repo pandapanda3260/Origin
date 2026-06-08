@@ -1145,9 +1145,9 @@ export function renderScriptAnalysis() {
   var staleHtml = _hasStaleScriptAnalysis(text) ? _renderAnalysisStaleBanner() : "";
   el.innerHTML =
     staleHtml +
+    _renderAnalysisCore(analysis.core, analysis.stats) +
     _renderAnalysisShotOverview(analysis.shotOverview) +
     _renderAnalysisCharacters(analysis.characters) +
-    _renderAnalysisCore(analysis.core, analysis.stats) +
     _renderAnalysisPacing(analysis.pacing) +
     _renderAnalysisBeats(analysis.keyBeats) +
     _renderAnalysisNotes(analysis.notes);

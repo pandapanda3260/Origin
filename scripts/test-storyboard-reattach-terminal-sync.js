@@ -57,6 +57,23 @@ record('storyboard_images reattached SSE completion uses terminal reload schedul
   assert(block.includes('await _scheduleStoryboardTerminalProjectReload(originId, batchId, {'));
 });
 
+record('storyboard_images terminal reload gates automatic tail-frame continuation', () => {
+  const block = section('function _reattachImagesBatch', 'function _reattachTailFrameBatch');
+  assert(block.includes('var terminalReloadKey = _storyboardBatchKey(originId, batchId);'));
+  assert(block.includes('if (_storyboardTerminalReloadedByBatch[terminalReloadKey])'));
+  assert(block.includes('_maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {'));
+  assert(block.includes('requireTerminalReload: true'));
+});
+
+record('automatic tail-frame helper reuses current project filters and existing generator', () => {
+  const helper = section('async function _maybeAutoStartTailFramesFromCurrentProject', 'function _runStoryboardBatchReconcile');
+  assert(helper.includes('if (_storyboardTailAutoStartedBySourceBatch[key]) return false;'));
+  assert(helper.includes('if (opts.requireTerminalReload && !_storyboardTerminalReloadedByBatch[key]) return false;'));
+  assert(helper.includes('_storyboardTailAutoStartedBySourceBatch[key] = true;'));
+  assert(helper.includes('var targets = _tailKeyframeTargets(getStoryboardGroups(), {'));
+  assert(helper.includes('await generateAllTailFrames({'));
+});
+
 record('tail_frame_images terminal snapshot schedules authoritative reload without confirm check', () => {
   const block = section('function _reattachTailFrameBatch', 'function _reattachPromptsBatch');
   assert(block.includes('var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));'));

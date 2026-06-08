@@ -7,7 +7,7 @@ import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   hydrateProtectedImageElements } from './modules/utils.js?v=201';
 import { appStore } from './modules/store.js';
 import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js';
-import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from './modules/edit.js?v=136';
+import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js';
 import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
   refreshSettingsFormFromState, wireSettingsPageOnce } from './modules/settings.js';
 import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modules/tasks.js';
@@ -24,12 +24,13 @@ import { initEpisodes, syncEpisodesProject,
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js?v=116';
+  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
   refineVideoPrompt, handleVideoPromptAction,
-  getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave } from './modules/videoPrompts.js';
+  getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave,
+  reattachVideoPromptBatches } from './modules/videoPrompts.js';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
   _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=104';
@@ -39,7 +40,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=131';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=132';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -64,7 +65,7 @@ import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/t
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
 import { mountPixelCard } from './modules/pixel_card.js';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor } from './modules/online_editor.js?v=6';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
@@ -2089,6 +2090,8 @@ var _scriptEditInitialText = "";
         project.name = newName;
         project.title = newName;
         if (updated && typeof updated.version === "number") project.version = updated.version;
+        try { syncOnlineEditorProjectTitle(); }
+        catch (e) { console.warn("[OnlineEditor] sync title after rename failed:", e); }
       }
     } catch (e) {
       console.warn("[RenameProject] server failed:", e);
@@ -4426,6 +4429,36 @@ var _scriptEditInitialText = "";
 	    return 0;
 	  }
 
+	  function _styleWorldTemplateCharacterKey(item) {
+	    if (!item || typeof item !== "object") return String(item || "").trim().toLowerCase();
+	    return String(item.characterId || item.id || item.sourceAssetId || item.name || item.title || item.role || "").trim().toLowerCase();
+	  }
+
+	  function _styleWorldTemplateCharacters(tpl) {
+	    var byKey = {};
+	    var keys = [];
+	    var loose = [];
+	    [tpl && tpl.characters, tpl && tpl.characterCandidates].forEach(function (list) {
+	      if (!Array.isArray(list)) return;
+	      list.forEach(function (item) {
+	        var key = _styleWorldTemplateCharacterKey(item);
+	        if (!key) {
+	          loose.push(item);
+	          return;
+	        }
+	        if (!Object.prototype.hasOwnProperty.call(byKey, key)) keys.push(key);
+	        byKey[key] = byKey[key] ? Object.assign({}, item, byKey[key]) : item;
+	      });
+	    });
+	    return keys.map(function (key) { return byKey[key]; }).concat(loose);
+	  }
+
+	  function _styleWorldTemplateCharacterCount(tpl) {
+	    var num = Number(tpl && tpl.characterCount);
+	    if (Number.isFinite(num) && num >= 0) return Math.floor(num);
+	    return _styleWorldTemplateCharacters(tpl).length;
+	  }
+
 	  function _styleWorldTemplateEntityPreviewUrl(item) {
 	    if (!item || typeof item !== "object") return "";
 	    return String(
@@ -4543,7 +4576,7 @@ var _scriptEditInitialText = "";
 
 	  function _styleWorldTemplateSubtitle(tpl) {
 	    return [
-	      _styleWorldTemplateCount(tpl, "characterCount", ["characters", "characterCandidates"]) + "个角色",
+	      _styleWorldTemplateCharacterCount(tpl) + "个角色",
 	      _styleWorldTemplateCount(tpl, "locationCount", ["locations", "scenes", "environments", "places"]) + "个场景",
 	      _styleWorldTemplateCount(tpl, "propCount", ["props", "items", "keyItems", "artifacts"]) + "个道具",
 	      _styleWorldTemplateStyleLabel(tpl)
@@ -7284,6 +7317,8 @@ var _scriptEditInitialText = "";
     if (project && project.id) {
       try { _restoreAssetGenStatus(); }
       catch (e) { console.warn("[Init] restoreAssetGenStatus (post-sync) failed:", e); }
+      try { reattachVideoPromptBatches("init"); }
+      catch (e) { console.warn("[Init] reattachVideoPromptBatches failed:", e); }
       try { reattachStoryboardBatches(); }
       catch (e) { console.warn("[Init] reattachStoryboardBatches failed:", e); }
       try { registerStoryboardBatchReconciler(); }

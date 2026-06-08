@@ -44,6 +44,7 @@ let project = null;
 
 var _imagesGenerating = false;
 var _imagesStarting = false;
+var _tailFramesGenerating = false;
 var _promptsConverting = false;
 var IMG_PARALLEL = 3;
 var MAX_SHOTS_PER_GROUP = 5;
@@ -134,6 +135,7 @@ var _storyboardTerminalReloadedByBatch = Object.create(null);
 var _storyboardTerminalReloadPendingByBatch = Object.create(null);
 var _storyboardTerminalReloadScheduledByBatch = Object.create(null);
 var _storyboardTerminalSnapshotHandledByBatch = Object.create(null);
+var _storyboardTailAutoStartedBySourceBatch = Object.create(null);
 var _storyboardTerminalReloadInFlight = null;
 var _storyboardBatchReconcilerRegistered = false;
 var _storyboardLastReconcileAt = 0;
@@ -141,6 +143,15 @@ var _storyboardLastBatchActivityAt = 0;
 var STORYBOARD_REATTACH_RECONCILE_THROTTLE_MS = 30000;
 var STORYBOARD_REATTACH_RECONCILE_INTERVAL_MS = 60000;
 var STORYBOARD_REATTACH_RECENT_ACTIVITY_MS = 30 * 60 * 1000;
+
+function _setTailFramesGenerating(active) {
+  var next = !!active;
+  if (_tailFramesGenerating === next) return;
+  _tailFramesGenerating = next;
+  if (project && project.id) {
+    try { _updateImagesActionButton(getStoryboardGroups()); } catch (_) {}
+  }
+}
 
 export function initStoryboard(ctx) {
   _ctx = ctx || {};
@@ -264,6 +275,34 @@ function _scheduleStoryboardTerminalProjectReload(projectId, batchId, opts) {
   return _storyboardTerminalReloadInFlight;
 }
 
+async function _maybeAutoStartTailFramesFromCurrentProject(projectId, sourceBatchId, opts) {
+  if (!projectId || !sourceBatchId || !project || project.id !== projectId) return false;
+  opts = opts || {};
+  var key = _storyboardBatchKey(projectId, sourceBatchId);
+  if (_storyboardTailAutoStartedBySourceBatch[key]) return false;
+  if (opts.requireTerminalReload && !_storyboardTerminalReloadedByBatch[key]) return false;
+  _storyboardTailAutoStartedBySourceBatch[key] = true;
+
+  var targets = _tailKeyframeTargets(getStoryboardGroups(), {
+    failedOnly: !!opts.failedOnly,
+    includeReady: !!opts.includeReady,
+  });
+  if (!targets.length) return false;
+  var hint = opts.hintId === false ? null : $(opts.hintId || 'imagesHint');
+  if (hint) hint.textContent = "正在生成 " + targets.length + " 张尾帧关键帧…";
+
+  try {
+    await generateAllTailFrames({
+      targets: targets,
+      buttonId: opts.buttonId || 'btnGenAllImages',
+    });
+    return true;
+  } catch (e) {
+    console.warn('[StoryboardTailAuto] auto tail-frame start failed:', (e && e.message) || e);
+    return false;
+  }
+}
+
 function _runStoryboardBatchReconcile(reason) {
   if (!project || !project.id) return;
   if (reason === 'interval' && (!_isDocumentVisibleForStoryboardReconcile() || !_hasRecentStoryboardBatchActivity())) return;
@@ -379,9 +418,17 @@ function _reattachImagesBatch(b) {
     _clearStoryboardReattachRunning(originId, batchId);
     _imagesGenerating = false;
     checkImagesConfirm();
+    var terminalReloadKey = _storyboardBatchKey(originId, batchId);
     _scheduleStoryboardTerminalProjectReload(originId, batchId, {
       reason: "storyboard_images_terminal_snapshot",
       confirmImages: true,
+    }).then(function () {
+      if (_storyboardTerminalReloadedByBatch[terminalReloadKey]) {
+        _maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {
+          requireTerminalReload: true,
+          buttonId: 'btnGenAllImages',
+        });
+      }
     });
     return;
   }
@@ -473,10 +520,17 @@ function _reattachImagesBatch(b) {
         if (btn) btn.disabled = false;
         _stopTickR();
         _clearEtaR();
+        var terminalReloadKey = _storyboardBatchKey(originId, batchId);
         await _scheduleStoryboardTerminalProjectReload(originId, batchId, {
           reason: "storyboard_images_sse_completed",
           confirmImages: true,
         });
+        if (_storyboardTerminalReloadedByBatch[terminalReloadKey]) {
+          await _maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {
+            requireTerminalReload: true,
+            buttonId: 'btnGenAllImages',
+          });
+        }
       })();
     },
     onClose: function () {
@@ -532,6 +586,7 @@ function _reattachTailFrameBatch(b) {
   var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
   if (isComplete) {
     _clearStoryboardReattachRunning(originId, batchId);
+    _setTailFramesGenerating(false);
     _scheduleStoryboardTerminalProjectReload(originId, batchId, {
       reason: "tail_frame_images_terminal_snapshot",
       confirmImages: false,
@@ -539,8 +594,8 @@ function _reattachTailFrameBatch(b) {
     return;
   }
 
-  // 订阅剩余进度。尾帧批任务通常只有 1 个 target, 不设全局 _imagesGenerating 状态
-  // (它是首帧流程的锁, 尾帧不共享)。
+  // 订阅剩余进度。尾帧不复用首帧 _imagesGenerating 锁, 但需要独立标记全局按钮为生成中。
+  _setTailFramesGenerating(true);
   subscribeBatch(batchId, {
     onTaskCompleted: function (data) {
       var extra = (data && data.extra) || {};
@@ -571,6 +626,7 @@ function _reattachTailFrameBatch(b) {
     },
     onBatchCompleted: function () {
       _clearStoryboardReattachRunning(originId, batchId);
+      _setTailFramesGenerating(false);
       _scheduleStoryboardTerminalProjectReload(originId, batchId, {
         reason: "tail_frame_images_sse_completed",
         confirmImages: false,
@@ -578,6 +634,7 @@ function _reattachTailFrameBatch(b) {
     },
     onClose: function () {
       _clearStoryboardReattachRunning(originId, batchId);
+      _setTailFramesGenerating(false);
       /* SSE 断开由 polling 兜底, 或由后端最终 snapshot 修正 */
     },
   });
@@ -6311,7 +6368,7 @@ function _setTopFirstFrameActionLocked(locked) {
   var btn = $("btnGenAllImages");
   if (actionBar) actionBar.hidden = false;
   if (!btn) return;
-  btn.innerHTML = '<span class="material-symbols-outlined text-sm">auto_fix_high</span>生成全部关键帧';
+  btn.innerHTML = '<span class="shots-step-number">2</span><span>生成全部关键帧</span>';
   btn.disabled = !!locked;
   btn.dataset.actionState = locked ? 'locked' : '';
   btn.title = locked ? '镜头计划可用后可生成全部关键帧' : '';
@@ -6867,7 +6924,7 @@ function _computeImagesBatchState(groups, opts) {
   // 注：以前有独立的 update_stale 分支，文案"更新 N 项需更新"且只重生 stale 那几张。
   // 用户决策：stale-only 场景统一显示"重新生成全部关键帧"，点击即全量重生（与 regenerate_all 行为一致），
   // 避免按钮文案与"装饰性需更新"挂钩。
-  if ((_imagesGenerating || _imagesStarting) && !opts.ignoreGenerating) {
+  if ((_imagesGenerating || _imagesStarting || _tailFramesGenerating) && !opts.ignoreGenerating) {
     action = 'generating';
     label = _imagesStarting ? '启动中…' : '生成中…';
   } else if (groups.length > 0 && missingFirst.length === groups.length) {
@@ -6923,10 +6980,10 @@ function _syncMergedStoryboardConfirmState(groups) {
   topBtn.classList.toggle("hover:opacity-90", allFirstFramesReady);
   topBtn.classList.toggle("hover:opacity-50", !allFirstFramesReady);
   // 统一文案：不论 allFirstFramesReady / imagesApproved 状态，都展示"确认分镜图，进入下一步"，
-  // 禁用态由 disabled + opacity 区分；图标/箭头结构与其他确认按钮保持一致，避免每次 setText 把
-  // workspace.html 里的 icon 子节点冲掉（这是上一版按钮 icon 丢失的根因）。
+  // 禁用态由 disabled + opacity 区分；编号/箭头结构与 workspace.html 保持一致，
+  // 避免每次刷新时把按钮子节点冲回旧结构。
   var SHOTS_CONFIRM_HTML =
-    '<span class="material-symbols-outlined text-base">image</span>' +
+    '<span class="shots-step-number">3</span>' +
     '<span>确认分镜图，进入下一步</span>' +
     '<span class="material-symbols-outlined text-base">arrow_forward</span>';
   if (!allFirstFramesReady) {
@@ -6947,7 +7004,6 @@ function _updateImagesActionButton(groups) {
   var materialBlockMessage = _materialLimitBlockMessage(groups);
   var preflight = _getFirstFramePreflightState(groups);
   var state = _computeImagesBatchState(groups);
-  var iconName = state.action === 'retry_failed' ? 'refresh' : 'auto_fix_high';
   // 直接使用 _computeImagesBatchState 计算出的精细 label，让按钮文案与真实状态一致：
   //   - generate_all → 生成全部关键帧
   //   - fill_missing → 补全 N 个关键帧
@@ -6958,11 +7014,11 @@ function _updateImagesActionButton(groups) {
   var preflightBlocked = preflight.status !== "allowed";
   var preflightMessage = preflight.message || "";
   var hint = $("imagesHint");
-  btn.innerHTML = '<span class="material-symbols-outlined text-sm">' + iconName + '</span>' + escapeHtml(label);
+  btn.innerHTML = '<span class="shots-step-number">2</span><span>' + escapeHtml(label) + '</span>';
   btn.disabled = state.action === 'generating' || !!materialBlockMessage || preflightBlocked;
   btn.dataset.actionState = materialBlockMessage ? 'material_limit' : (preflightBlocked ? preflight.status : state.action);
   btn.title = materialBlockMessage || preflightMessage || '';
-  if (hint && !_imagesGenerating && !_imagesStarting) {
+  if (hint && !_imagesGenerating && !_imagesStarting && !_tailFramesGenerating) {
     hint.textContent = materialBlockMessage || preflightMessage || FIRST_FRAME_DEFAULT_HINT;
   }
 }
@@ -7591,21 +7647,29 @@ export async function generateAllTailFrames(opts) {
     showToast(hintMsg, 'info');
     return;
   }
-  await _ensureMaterialPanelsForChecks(groups, targets.map(function (t) { return t.groupIdx; }));
-  var materialBlockMessage = _materialLimitBlockMessage(groups, targets.map(function (t) { return t.groupIdx; }));
-  if (materialBlockMessage) {
-    showToast(materialBlockMessage, 'warn');
-    renderImageGrid();
-    return;
-  }
-  var tailFlushResult = await _sbFlushTailFrameCardPromptsForTargets(targets, 'tail-frame-batch-flush');
-  if (tailFlushResult && tailFlushResult.ok === false) {
-    if (tailFlushResult.readOnly) {
-      showToast('部分尾帧暂不可编辑或生成，请先完成对应彩色视频首帧。', 'warn');
+  _setTailFramesGenerating(true);
+  try {
+    await _ensureMaterialPanelsForChecks(groups, targets.map(function (t) { return t.groupIdx; }));
+    var materialBlockMessage = _materialLimitBlockMessage(groups, targets.map(function (t) { return t.groupIdx; }));
+    if (materialBlockMessage) {
+      showToast(materialBlockMessage, 'warn');
+      renderImageGrid();
+      _setTailFramesGenerating(false);
+      return;
     }
-    renderImageGrid();
-    checkImagesConfirm();
-    return;
+    var tailFlushResult = await _sbFlushTailFrameCardPromptsForTargets(targets, 'tail-frame-batch-flush');
+    if (tailFlushResult && tailFlushResult.ok === false) {
+      if (tailFlushResult.readOnly) {
+        showToast('部分尾帧暂不可编辑或生成，请先完成对应彩色视频首帧。', 'warn');
+      }
+      renderImageGrid();
+      checkImagesConfirm();
+      _setTailFramesGenerating(false);
+      return;
+    }
+  } catch (e) {
+    _setTailFramesGenerating(false);
+    throw e;
   }
 
   var btn = opts.buttonId ? $(opts.buttonId) : null;
@@ -7634,6 +7698,7 @@ export async function generateAllTailFrames(opts) {
       _clearFailedTailFrameLocally(t.groupIdx, errMsg, null, originId);
     });
     if (btn) btn.disabled = false;
+    _setTailFramesGenerating(false);
     return;
   }
   if (!startResp || !startResp.batchId) {
@@ -7644,6 +7709,7 @@ export async function generateAllTailFrames(opts) {
       _clearFailedTailFrameLocally(t.groupIdx, fErr, null, originId);
     });
     if (btn) btn.disabled = false;
+    _setTailFramesGenerating(false);
     return;
   }
 
@@ -7662,6 +7728,7 @@ export async function generateAllTailFrames(opts) {
       settled = true;
       _stopPoll();
       if (btn) btn.disabled = false;
+      _setTailFramesGenerating(false);
       if (failCount === 0) {
         showToast('批量尾帧生成完成 (' + doneCount + ' 张)', 'success');
       } else if (failCount === totalCount) {
@@ -7769,7 +7836,7 @@ export async function generateAllTailFrames(opts) {
 }
 
 export async function generateAllImages() {
-  if (_imagesGenerating || _imagesStarting) return;
+  if (_imagesGenerating || _imagesStarting || _tailFramesGenerating) return;
   if (!project || !project.shots || !project.shots.length) return;
   var groups = getStoryboardGroups();
   var btn = $("btnGenAllImages");
@@ -7990,22 +8057,17 @@ export async function generateAllImages() {
     finished = true;
     _stopEtaTick();
     _clearEta();
-    var requestedTailTargets = [];
-    if (runTailKeyframesAfterFirst) {
-      var latestGroups = getStoryboardGroups();
-      requestedTailTargets = _tailKeyframeTargets(latestGroups, {
-        failedOnly: tailKeyframeMode === 'failed',
-        includeReady: tailKeyframeMode === 'all',
-      });
-    }
     var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
     if (hint) hint.textContent = done + "/" + groups.length + " 张关键帧已生成";
     var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
-    if (allSbDone && groups.length > 0 && !requestedTailTargets.length) showToast("全部关键帧已生成", "success");
     if (failCount > 0) showToast(failCount + " 张关键帧生成失败，请手动重试", "warn");
-    if (requestedTailTargets.length) {
-      if (hint) hint.textContent = "正在生成 " + requestedTailTargets.length + " 张尾帧关键帧…";
-      generateAllTailFrames({ targets: requestedTailTargets, buttonId: 'btnGenAllImages' })
+    if (runTailKeyframesAfterFirst) {
+      _maybeAutoStartTailFramesFromCurrentProject(originId, startResp.batchId, {
+        failedOnly: tailKeyframeMode === 'failed',
+        includeReady: tailKeyframeMode === 'all',
+        buttonId: 'btnGenAllImages',
+        hintId: 'imagesHint',
+      })
         .finally(function () {
           _imagesGenerating = false;
           if (btn) btn.disabled = false;
@@ -8022,6 +8084,7 @@ export async function generateAllImages() {
         });
       return;
     }
+    if (allSbDone && groups.length > 0) showToast("全部关键帧已生成", "success");
     _imagesGenerating = false;
     if (btn) btn.disabled = false;
     checkImagesConfirm();

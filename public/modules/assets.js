@@ -4910,6 +4910,64 @@ export async function confirmPendingWorldFacts() {
   showToast("世界观更新已确认", "success");
 }
 
+function _worldTemplateCharacterKey(item) {
+  if (!item || typeof item !== "object") return String(item || "").trim().toLowerCase();
+  return String(item.characterId || item.id || item.sourceAssetId || item.name || item.title || item.role || "").trim().toLowerCase();
+}
+
+function _worldTemplateCharacters(tpl) {
+  var byKey = {};
+  var keys = [];
+  var loose = [];
+  [tpl && tpl.characters, tpl && tpl.characterCandidates].forEach(function (list) {
+    if (!Array.isArray(list)) return;
+    list.forEach(function (item) {
+      var key = _worldTemplateCharacterKey(item);
+      if (!key) {
+        loose.push(item);
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(byKey, key)) keys.push(key);
+      byKey[key] = byKey[key] ? Object.assign({}, item, byKey[key]) : item;
+    });
+  });
+  return keys.map(function (key) { return byKey[key]; }).concat(loose);
+}
+
+function _worldTemplateCharacterCount(tpl) {
+  var num = Number(tpl && tpl.characterCount);
+  if (Number.isFinite(num) && num >= 0) return Math.floor(num);
+  return _worldTemplateCharacters(tpl).length;
+}
+
+function _worldTemplateCharacterPreviewUrls(tpl, limit) {
+  var previewUrls = Array.isArray(tpl && tpl.characterPreviewUrls) ? tpl.characterPreviewUrls.filter(Boolean) : [];
+  if (previewUrls.length) return previewUrls.slice(0, limit);
+  return _worldTemplateCharacters(tpl).map(function (ch) {
+    return ch && (ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "");
+  }).filter(Boolean).slice(0, limit);
+}
+
+function _worldTemplateSaveCharacterStats() {
+  var locks = project && project.consistency && Array.isArray(project.consistency.characters) ? project.consistency.characters : [];
+  var assetCount = project && project.assets && Array.isArray(project.assets.characters) ? project.assets.characters.length : 0;
+  var lockedCount = 0;
+  var candidateCount = 0;
+  if (locks.length) {
+    locks.forEach(function (lock) {
+      if (lock && lock.status === "locked") lockedCount += 1;
+      else if (lock) candidateCount += 1;
+    });
+  } else {
+    lockedCount = assetCount;
+  }
+  return {
+    lockedCount: lockedCount,
+    candidateCount: candidateCount,
+    totalCount: lockedCount + candidateCount
+  };
+}
+
 function _openSaveTemplateDialog() {
   var existing = document.getElementById("saveTplDialog");
   if (existing) existing.remove();
@@ -4923,14 +4981,7 @@ function _openSaveTemplateDialog() {
   var defaultName = (project.name || "未命名") + " · 世界观";
   var templates = _getWorldTemplates();
   var currentWorldId = (project.worldTemplateSnapshot && project.worldTemplateSnapshot.id) || project.selectedWorldTemplateId || "";
-  var lockedCount = 0;
-  var draftCount = 0;
-  var locks = project.consistency && Array.isArray(project.consistency.characters) ? project.consistency.characters : [];
-  locks.forEach(function (lock) {
-    if (lock && lock.status === "locked") lockedCount += 1;
-    else if (lock) draftCount += 1;
-  });
-  var charCount = lockedCount || ((project.assets && project.assets.characters) ? project.assets.characters.length : 0);
+  var characterStats = _worldTemplateSaveCharacterStats();
 
   var charPreviewHtml = "";
   if (project.assets && project.assets.characters) {
@@ -4973,13 +5024,15 @@ function _openSaveTemplateDialog() {
         '</div>' +
         '<div class="bg-[#F8F9FA] rounded-xl p-4 space-y-2.5">' +
           '<div class="flex items-center justify-between text-[11px]">' +
-            '<span class="text-[#90A4AE] font-medium">locked 角色</span>' +
+            '<span class="text-[#90A4AE] font-medium">锁定角色</span>' +
             '<div class="flex items-center gap-2">' +
               (charPreviewHtml ? '<div class="flex items-center">' + charPreviewHtml + '</div>' : '') +
-              '<span class="text-[#2C3E50] font-bold">' + charCount + ' 个</span>' +
+              '<span class="text-[#2C3E50] font-bold">' + characterStats.lockedCount + ' 个</span>' +
             '</div>' +
           '</div>' +
-          (draftCount ? '<p class="text-[10px] text-[#8A6D3B]">另有 ' + draftCount + ' 个 draft / needs_review 角色，默认不会保存。</p>' : '') +
+          (characterStats.candidateCount ? '<div class="flex items-center justify-between text-[11px]"><span class="text-[#90A4AE] font-medium">候选角色</span><span class="text-[#2C3E50] font-bold">' + characterStats.candidateCount + ' 个</span></div>' : '') +
+          '<div class="flex items-center justify-between text-[11px] pt-2 border-t border-[#E0E0E0]"><span class="text-[#607D8B] font-bold">保存总计</span><span class="text-[#2C3E50] font-bold">' + characterStats.totalCount + ' 个</span></div>' +
+          (characterStats.candidateCount ? '<p class="text-[10px] text-[#8A6D3B]">draft / needs_review 角色将作为候选参考保存，不进入锁定角色池。</p>' : '') +
           '<div class="grid grid-cols-2 gap-2 pt-2 border-t border-[#E0E0E0]">' +
             '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeCharacters" checked /> 包含角色</label>' +
             '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeLocations" checked /> 包含场景</label>' +
@@ -5091,7 +5144,7 @@ export function _applyWorldTemplate(tpl) {
 
   _saveAssetsProject();
 
-  var charCount = (tpl.characters || []).length;
+  var charCount = _worldTemplateCharacterCount(tpl);
   showToast("已应用世界观模板：世界观来源已记录，" + charCount + " 个角色将进入一致性对账", "success");
 
   _ctx.refreshOverview();
@@ -5181,14 +5234,9 @@ export function _openTemplateImportModal() {
 
   var gridHtml = "";
   templates.forEach(function (tpl, i) {
-    var charCount = typeof tpl.characterCount === "number" ? tpl.characterCount : (tpl.characters || []).length;
+    var charCount = _worldTemplateCharacterCount(tpl);
     var charImgs = "";
-    var previewUrls = Array.isArray(tpl.characterPreviewUrls) ? tpl.characterPreviewUrls : [];
-    if (!previewUrls.length) {
-      previewUrls = (tpl.characters || []).slice(0, 3).map(function (ch) {
-        return ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-      }).filter(Boolean);
-    }
+    var previewUrls = _worldTemplateCharacterPreviewUrls(tpl, 3);
     previewUrls.slice(0, 3).forEach(function (src) {
       charImgs += '<img src="' + escapeHtml(src) + '" class="w-8 h-8 rounded-full object-cover border-2 border-white -ml-2 first:ml-0" />';
     });
@@ -5748,14 +5796,9 @@ function _renderLibraryTemplates(container, templates) {
 
   var html = "";
   templates.forEach(function (tpl, i) {
-    var charCount = typeof tpl.characterCount === "number" ? tpl.characterCount : (tpl.characters || []).length;
+    var charCount = _worldTemplateCharacterCount(tpl);
     var charImgs = "";
-    var previewUrls = Array.isArray(tpl.characterPreviewUrls) ? tpl.characterPreviewUrls : [];
-    if (!previewUrls.length) {
-      previewUrls = (tpl.characters || []).slice(0, 4).map(function (ch) {
-        return ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-      }).filter(Boolean);
-    }
+    var previewUrls = _worldTemplateCharacterPreviewUrls(tpl, 4);
     previewUrls.slice(0, 4).forEach(function (src) {
       charImgs += '<img src="' + escapeHtml(src) + '" class="w-9 h-9 rounded-full object-cover border-2 border-white -ml-2 first:ml-0 shadow-sm" />';
     });
