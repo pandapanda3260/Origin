@@ -1,5 +1,5 @@
 import { $, apiRequest, apiUpload, escapeHtml, hydrateProtectedImageElements, showConfirm } from './utils.js?v=201';
-import { deriveAssetCardState } from './assets.js?v=121';
+import { deriveAssetCardState } from './assets.js?v=136';
 
 var _ctx = {};
 var _wired = false;
@@ -347,7 +347,7 @@ function _characterCardHtml(item) {
             '</div>' +
             tagsHtml +
             '<div class="p-3 bg-surface-container-lowest rounded-lg border border-outline-variant/10 mt-5">' +
-              '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">三视图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
+              '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">角色设定图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
               statusPreview +
               (cardState.statusMessage ? '<p class="mt-2 text-[11px] leading-relaxed text-on-surface-variant/60">' + escapeHtml(cardState.statusMessage) + '</p>' : '') +
             '</div>' +
@@ -1113,7 +1113,7 @@ async function _regenerateConfirmedEditor() {
       _toast((data.error || '这次角色没有生成成功') + '，当前角色仍保留上一版', 'warn');
       return;
     }
-    _toast(data.referenceStatus === 'degraded' ? '角色已重新生成，但三视图采用兜底切片' : '角色已重新生成', data.referenceStatus === 'degraded' ? 'warn' : 'ok');
+    _toast(data.referenceStatus === 'degraded' ? '角色已重新生成，但参考切片采用兜底切分' : '角色已重新生成', data.referenceStatus === 'degraded' ? 'warn' : 'ok');
   } finally {
     _setBusy(false);
     _render();
@@ -1168,7 +1168,7 @@ async function _generate() {
       _toast((data.error || '这次角色没有生成成功') + '，本次尝试已存入历史记录', 'warn');
       return;
     }
-    _toast(data.referenceStatus === 'failed' ? '角色图已生成，但三视图自动裁切没成功，可重新生成试试' : '角色生成完成', data.referenceStatus === 'failed' ? 'warn' : 'ok');
+    _toast(data.referenceStatus === 'failed' ? '角色图已生成，但参考切片自动裁切没成功，可重新生成试试' : '角色生成完成', data.referenceStatus === 'failed' ? 'warn' : 'ok');
   } finally {
     _setBusy(false);
     _render();
@@ -1194,7 +1194,7 @@ async function _regenerateCard(id) {
       return;
     }
     await _loadList({ force: true });
-    _toast(data.referenceStatus === 'degraded' ? '角色已重新生成，但三视图采用兜底切片' : '角色已重新生成', data.referenceStatus === 'degraded' ? 'warn' : 'ok');
+    _toast(data.referenceStatus === 'degraded' ? '角色已重新生成，但参考切片采用兜底切分' : '角色已重新生成', data.referenceStatus === 'degraded' ? 'warn' : 'ok');
   } finally {
     _setBusy(false);
     _regeneratingCardId = null;

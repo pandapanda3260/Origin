@@ -650,11 +650,11 @@ async function generateRealImageBuffer(
         } else if (status === 402) {
           friendly = `图像 API 余额不足（402），请到中转站充值后再试`;
         } else if (aborted) {
-          friendly = `图像生成超时（>${Math.round(attemptTimeoutMs / 1000)}s 未返回），中转站可能在排队，请稍后重试`;
+          friendly = '网络不稳定，请重新提交';
         } else if (!status && isTransientNetworkError(e)) {
-          friendly = `图像生成网络连接失败，${NETWORK_MAX_ATTEMPTS} 次重试均失败，请稍后再试：${reason}`;
+          friendly = '网络不稳定，请重新提交';
         } else if (status && status >= 500 && status < 600) {
-          friendly = `中转站服务异常（${status}），${TRANSIENT_MAX_ATTEMPTS} 次重试均失败，请稍后再试`;
+          friendly = '网络不稳定，请重新提交';
         } else {
           friendly = '图像生成失败：' + reason;
         }

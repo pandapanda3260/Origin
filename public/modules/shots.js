@@ -50,6 +50,7 @@ export function initShots(ctx) {
 export function syncShotsProject(p) {
   project = p || null;
   _shotHoverBound = false;
+  _syncShotsProgressBanner();
 }
 
 function _syncRefs() {
@@ -199,7 +200,7 @@ function _getShotPlanActionState() {
     return {
       label: "重新生成镜头计划",
       disabled: false,
-      hint: "当前已有镜头计划，重新生成会更新镜头表。",
+      hint: "",
     };
   }
   return {
@@ -460,6 +461,7 @@ export function _syncSingleShotSlotsAfterInsert(insertIdx) {
    ================================================================ */
 export function refreshShotsPage() {
   _syncRefs();
+  _syncShotsProgressBanner();
   var needScript = $("shotsNeedScript");
   var ready = $("shotsReady");
   var topActions = $("shotsTopActions");
@@ -619,6 +621,7 @@ function _updateShotSummaryMeta() {
 
 export function renderShotList() {
   _syncRefs();
+  _syncShotsProgressBanner();
   var wrap = $("shotListWrap");
   if (!wrap) return;
   wrap.innerHTML = "";
@@ -925,6 +928,33 @@ function _setShotsProgress(pct, title, hint) {
   if (banner) banner.hidden = false;
   if (titleEl && title) titleEl.textContent = title;
   if (hintEl && hint) hintEl.textContent = hint;
+}
+
+function _hideShotsProgressBanner() {
+  var bar = $("shotsGenProgress");
+  var banner = $("shotsGenBanner");
+  var titleEl = $("shotsGenTitle");
+  var hintEl = $("shotsGenHint");
+  if (banner) {
+    banner.hidden = true;
+    var icon = banner.querySelector(".material-symbols-outlined");
+    if (icon) {
+      icon.classList.add("animate-spin");
+      icon.textContent = "progress_activity";
+    }
+  }
+  if (bar) {
+    bar.style.width = "0%";
+    bar.classList.remove("extract-bar-pulse");
+  }
+  if (titleEl) titleEl.textContent = "AI 正在设计镜头…";
+  if (hintEl) hintEl.textContent = "分析剧本、资产、情绪曲线，生成完整镜头表";
+}
+
+function _syncShotsProgressBanner() {
+  if (!project || project.shotPlanStatus !== "generating") {
+    _hideShotsProgressBanner();
+  }
 }
 
 /* ----------------------------------------------------------------

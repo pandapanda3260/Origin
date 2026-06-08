@@ -24,7 +24,7 @@ import { initEpisodes, syncEpisodesProject,
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js?v=115';
+  confirmSegmentsAndEnterEdit } from './modules/videoTasks.js?v=116';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
@@ -32,7 +32,7 @@ import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave } from './modules/videoPrompts.js';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=103';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=104';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
@@ -59,9 +59,9 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=135';
+  _openLightbox } from './modules/assets.js?v=136';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=201';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
 import { mountPixelCard } from './modules/pixel_card.js';
 import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor } from './modules/online_editor.js?v=6';

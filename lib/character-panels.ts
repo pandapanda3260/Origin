@@ -256,6 +256,7 @@ function panelQuality(
   let reason = '';
   if (nonWhiteRatio < minInk) reason = 'too-much-white';
   else if (nonWhiteRatio > 0.85) reason = 'too-much-ink';
+  else if (panel === 'headshot' && height / width < 1.15) reason = 'headshot-too-short';
   else if (bboxH / height < minHeight) reason = 'subject-too-short';
   else if (Math.abs(bboxCenterX - 0.5) > 0.34) reason = 'subject-off-center';
 
@@ -274,7 +275,7 @@ function computeHeadshotVerticalCrop(
   width: number,
   height: number,
 ): { top: number; height: number } {
-  const targetH = Math.min(height, Math.max(1, Math.round(width * 0.85)));
+  const targetH = Math.min(height, Math.max(1, Math.round(Math.max(width * 1.25, height * 0.72))));
   if (targetH >= height) return { top: 0, height };
 
   const bounds = detectContentBounds(data, width, height);
@@ -287,7 +288,7 @@ function computeHeadshotVerticalCrop(
 
   // Headshot panels are meant to stabilize face identity, so bias upward:
   // keep a small margin above the subject and crop away lower blank/body area.
-  const marginTop = Math.round(targetH * 0.08);
+  const marginTop = Math.round(targetH * 0.04);
   const preferredTop = bounds.top - marginTop;
   const maxTop = height - targetH;
   return {

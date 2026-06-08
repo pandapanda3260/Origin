@@ -1532,6 +1532,328 @@ export async function generateGroupVideoPrompt(gIdx) {
 	  }
 	}
 
+function _isVideoPromptBatchTerminalStatus(status) {
+  status = String(status || '').toLowerCase();
+  return status === 'completed' || status === 'failed' || status === 'cancelled' ||
+    status === 'canceled' || status === 'partial' || status === 'done' || status === 'succeeded';
+}
+
+function _attachVideoPromptBatch(opts) {
+  opts = opts || {};
+  _syncRefs();
+  var batchId = opts.batchId;
+  var originId = opts.originId || (project && project.id);
+  if (!batchId || !originId) return null;
+
+  var groups = opts.groups || getStoryboardGroups();
+  var seqToGroupIdx = opts.seqToGroupIdx || {};
+  var totalCount = opts.totalCount || 0;
+  var regenerateAll = !!opts.regenerateAll;
+  var source = opts.source || 'start';
+  var terminalAtAttach = !!opts.terminalAtAttach;
+  var silent = source === 'reattach';
+  var btn = $("btnGenAllVideoPrompts");
+  var hint = $("videoPromptsHint");
+
+  if (!terminalAtAttach) {
+    _videoPromptsGenerating = true;
+    if (btn) btn.disabled = true;
+    _updateVideoPromptBulkButtonLabel(groups);
+  }
+
+  var doneCount = 0;
+  var failCount = 0;
+  var finished = false;
+  var _seenDone = Object.create(null);
+  var _seenFailed = Object.create(null);
+  var failureStats = { character: 0, ownership: 0, writeback: 0, empty: 0, project: 0, model: 0 };
+  var pollTimer = null;
+  var streamHandle = null;
+
+  function _stopPoll() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function _refreshRunningHint() {
+    if (!hint) return;
+    var total = totalCount || groups.length || 0;
+    hint.textContent = "生成中… " + (doneCount + failCount) + "/" + total;
+  }
+
+  function _videoPromptFailureToast() {
+    if (failureStats.character > 0) return "角色一致性检查未通过，请先确认角色信息";
+    if (failureStats.ownership > 0) return failureStats.ownership + " 条提示词已被新的生成请求接管，页面会保留最新任务结果";
+    if (failureStats.writeback > 0) return failureStats.writeback + " 条提示词生成后写回失败，请刷新项目状态后重试";
+    if (failureStats.empty > 0) return failureStats.empty + " 条提示词返回为空，请单条重新生成";
+    if (failureStats.project > 0) return "项目已不存在或无法访问，请刷新项目列表";
+    return failCount + " 条提示词生成失败，请在缺失镜头里单条重试";
+  }
+
+  async function _rescueFromServerForGroup(gIdx) {
+    if (!_ctx.reloadProjectFromServer) return '';
+    try {
+      await _ctx.reloadProjectFromServer();
+      _syncRefs();
+      var sb = project && project.storyboards && project.storyboards[gIdx];
+      return _isVideoPromptReady(sb) ? (sb.videoPrompt || '') : '';
+    } catch (e) {
+      console.warn('[VideoPrompt] _rescueFromServerForGroup failed:', e);
+      return '';
+    }
+  }
+
+  async function finish() {
+    if (finished) return;
+    finished = true;
+    _stopPoll();
+    try {
+      if (_ctx.reloadProjectFromServer) {
+        await _ctx.reloadProjectFromServer();
+        _syncRefs();
+      }
+    } catch (_e) {}
+    if (!terminalAtAttach) _videoPromptsGenerating = false;
+    if (btn) btn.disabled = false;
+
+    var done = 0;
+    for (var j = 0; j < groups.length; j++) {
+      if (_isVideoPromptReady(project && project.storyboards && project.storyboards[j])) done++;
+    }
+    var missingLabels = _missingVideoPromptLabels(groups);
+    if (hint) {
+      hint.textContent = missingLabels.length
+        ? done + "/" + groups.length + " 条已生成，缺少镜头 " + missingLabels.join("、")
+        : done + "/" + groups.length + " 条已生成";
+    }
+
+    for (var jj = 0; jj < groups.length; jj++) {
+      var sbJ = project && project.storyboards && project.storyboards[jj];
+      if (_isVideoPromptReady(sbJ)) updateVpCard(jj, "done", sbJ.videoPrompt);
+    }
+    var allDone = groups.length > 0 && groups.every(function (_, k) {
+      return _isVideoPromptReady(project && project.storyboards && project.storyboards[k]);
+    });
+    _updateVideoPromptBulkButtonLabel(groups);
+    if (!silent) {
+      if (allDone) {
+        showToast(regenerateAll ? "全部视频提示词已重新生成" : "全部视频提示词已生成", "success");
+      } else if (done === 0 && failCount === 0) {
+        showToast("批量已结束，但没有收到任务明细；请刷新项目状态后重试", "error");
+      } else if (failCount > 0) {
+        showToast(_videoPromptFailureToast(), failureStats.writeback > 0 ? "error" : "warn");
+      } else if (done < groups.length) {
+        showToast("已完成 " + done + "/" + groups.length + " 条，缺少镜头 " + missingLabels.join("、") + "，可单条补齐", "warn");
+      }
+    }
+    checkVideoPromptsConfirm();
+    if (!silent) setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);
+  }
+
+  function _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extraData) {
+    if (typeof gIdx !== 'number') return;
+    if (_seenDone[gIdx]) return;
+    var incomingRunId = extraData && extraData.videoPromptRunId;
+    var currentSb = project && project.storyboards && project.storyboards[gIdx];
+    if (incomingRunId && currentSb && currentSb.videoPromptRunId && currentSb.videoPromptRunId !== incomingRunId) {
+      console.warn('[VideoPrompt] ignored stale completion for group ' + gIdx + ' run=' + incomingRunId + ' current=' + currentSb.videoPromptRunId);
+      _reloadVideoPromptProjectFromServer();
+      return;
+    }
+    if (!cleaned) {
+      _rescueFromServerForGroup(gIdx).then(function (vp) {
+        if (vp) {
+          _applyTaskCompleted(gIdx, vp, narrationsUsed, extraData);
+        } else if (!_seenFailed[gIdx] && !_seenDone[gIdx]) {
+          _applyTaskFailed(gIdx, '后端任务返回为空', { errorCode: 'VIDEO_PROMPT_EMPTY_RESULT' });
+        }
+      });
+      return;
+    }
+
+    _seenDone[gIdx] = true;
+    doneCount++;
+
+    if (currentSb && currentSb.videoPromptStatus === "ready" && _vpStripEditableTimingLines(currentSb.videoPrompt || '') === cleaned) {
+      updateVpCard(gIdx, "done", cleaned);
+      _refreshRunningHint();
+      return;
+    }
+
+    var referenceManifest = null;
+    var droppedReferences = null;
+    if (extraData) {
+      if (Array.isArray(extraData.referenceManifest)) referenceManifest = extraData.referenceManifest;
+      else if (Array.isArray(extraData.videoReferenceManifest)) referenceManifest = extraData.videoReferenceManifest;
+      if (Array.isArray(extraData.droppedReferences)) droppedReferences = extraData.droppedReferences;
+      else if (Array.isArray(extraData.videoReferenceDropped)) droppedReferences = extraData.videoReferenceDropped;
+    }
+
+    var isCurrent = _safeWriteBack(originId, function (proj) {
+      if (!proj.storyboards) proj.storyboards = [];
+      if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
+      proj.storyboards[gIdx].videoPrompt = cleaned;
+      proj.storyboards[gIdx].videoPromptStatus = "ready";
+      if (incomingRunId) proj.storyboards[gIdx].videoPromptRunId = incomingRunId;
+      if (extraData && extraData.videoPromptSourceHash) proj.storyboards[gIdx].videoPromptSourceHash = extraData.videoPromptSourceHash;
+      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
+      delete proj.storyboards[gIdx].videoPromptEditDraft;
+      delete proj.storyboards[gIdx].videoPromptFailedAt;
+      delete proj.storyboards[gIdx].videoPromptLastError;
+      proj.storyboards[gIdx]._vpCache = null;
+      _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
+      if (Array.isArray(narrationsUsed)) proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
+      if (referenceManifest !== null) proj.storyboards[gIdx].videoReferenceManifest = referenceManifest;
+      if (droppedReferences !== null) proj.storyboards[gIdx].videoReferenceDropped = droppedReferences;
+      if (proj._staleFlags) delete proj._staleFlags["video_prompt_" + gIdx];
+    });
+    if (isCurrent) updateVpCard(gIdx, "done", cleaned);
+    _refreshRunningHint();
+  }
+
+  function _applyTaskFailed(gIdx, errMsg, meta) {
+    if (typeof gIdx !== 'number') return;
+    if (_seenFailed[gIdx] || _seenDone[gIdx]) return;
+    meta = meta || {};
+    var incomingRunId = meta.incomingRunId || meta.videoPromptRunId;
+    if (_isVideoPromptOwnershipMeta(meta) || (incomingRunId && !_isStillOwnerOfShot(gIdx, incomingRunId))) {
+      console.warn('[VideoPrompt] ignored stale failure for group ' + gIdx + ' run=' + (incomingRunId || '?') + ' reason=' + (meta.skippedReason || meta.errorCode || 'ownership'));
+      _reloadVideoPromptProjectFromServer();
+      return;
+    }
+    _seenFailed[gIdx] = true;
+    failCount++;
+    var failureKind = _classifyVideoPromptFailureKind(errMsg, meta);
+    failureStats[failureKind] = (failureStats[failureKind] || 0) + 1;
+    if (!project.storyboards) project.storyboards = [];
+    if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+    _setVideoPromptStatus(gIdx, "failed", { videoPromptRunId: incomingRunId, errorMsg: (errMsg || '生成失败').toString().slice(0, 120) });
+    _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
+    updateVpCard(gIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
+    _refreshRunningHint();
+  }
+
+  function _applySnapshotTask(t) {
+    if (!t || !t.status) return;
+    if (t.status === 'completed') {
+      var result = t.result || {};
+      var extra = result.extra || {};
+      var patch = result.patch || {};
+      if (!extra.videoPromptRunId) extra.videoPromptRunId = result.videoPromptRunId || batchId;
+      var gIdx = (typeof extra.groupIdx === 'number')
+        ? extra.groupIdx
+        : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
+      var cleaned = _vpStripEditableTimingLines((extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, ""));
+      var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
+      if (!Array.isArray(extra.referenceManifest) && Array.isArray(patch.videoReferenceManifest)) {
+        extra.referenceManifest = patch.videoReferenceManifest;
+      }
+      if (!Array.isArray(extra.droppedReferences) && Array.isArray(patch.videoReferenceDropped)) {
+        extra.droppedReferences = patch.videoReferenceDropped;
+      }
+      _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extra);
+    } else if (t.status === 'failed') {
+      var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
+      var failedResult = t.result || {};
+      var failedExtra = failedResult.extra || {};
+      _applyTaskFailed(gIdx2, t.errorMsg, {
+        failureStage: failedResult.failureStage || failedExtra.failureStage,
+        errorCode: failedResult.errorCode || failedExtra.errorCode,
+        incomingRunId: failedExtra.videoPromptRunId || failedResult.videoPromptRunId || batchId,
+        videoPromptRunId: failedExtra.videoPromptRunId || failedResult.videoPromptRunId || batchId,
+        skippedReason: failedResult.skippedReason || failedExtra.skippedReason,
+        failureApplied: Object.prototype.hasOwnProperty.call(failedResult, 'failureApplied')
+          ? failedResult.failureApplied
+          : failedExtra.failureApplied,
+        storedRunId: failedResult.storedRunId || failedExtra.storedRunId,
+        storedStatus: failedResult.storedStatus || failedExtra.storedStatus,
+      });
+    }
+  }
+
+  async function _pollOnce() {
+    if (finished) return;
+    try {
+      var snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
+      if (!snap || finished) return;
+      var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+      tasks.forEach(_applySnapshotTask);
+      if (_isVideoPromptBatchTerminalStatus(snap.status)) {
+        console.log('[VideoPrompt] poll detected batch finished status=' + snap.status);
+        finish();
+      }
+    } catch (e) {
+      console.warn('[VideoPrompt] poll failed:', (e && e.message) || e);
+    }
+  }
+
+  if (Array.isArray(opts.snapshotTasks)) {
+    opts.snapshotTasks.forEach(_applySnapshotTask);
+  }
+  if (terminalAtAttach) {
+    finish();
+    return { close: function () {} };
+  }
+
+  pollTimer = setInterval(_pollOnce, 5000);
+
+  streamHandle = subscribeBatch(batchId, {
+    onSnapshot: function (snap) {
+      if (hint && snap && typeof snap.total === 'number') {
+        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
+      }
+      if (snap && Array.isArray(snap.tasks)) snap.tasks.forEach(_applySnapshotTask);
+    },
+    onTaskStarted: function (data) {
+      var extra = data.target || {};
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
+      if (typeof gIdx === 'number' && !_seenDone[gIdx]) {
+        updateVpCard(gIdx, "loading", null, "生成中…");
+      }
+    },
+    onTaskCompleted: function (data) {
+      var extra = data.extra || {};
+      var patch = data.patch || {};
+      if (!extra.videoPromptRunId) extra.videoPromptRunId = data.videoPromptRunId || batchId;
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
+      var cleaned = _vpStripEditableTimingLines((extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, ""));
+      var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
+      _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extra);
+    },
+    onTaskFailed: function (data) {
+      var extra = data.extra || {};
+      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
+      _applyTaskFailed(gIdx, data.errorMsg, {
+        failureStage: data.failureStage || extra.failureStage,
+        errorCode: data.errorCode || extra.errorCode,
+        incomingRunId: extra.videoPromptRunId || data.videoPromptRunId || batchId,
+        videoPromptRunId: extra.videoPromptRunId || data.videoPromptRunId || batchId,
+        skippedReason: data.skippedReason || extra.skippedReason,
+        failureApplied: Object.prototype.hasOwnProperty.call(data, 'failureApplied')
+          ? data.failureApplied
+          : extra.failureApplied,
+        storedRunId: data.storedRunId || extra.storedRunId,
+        storedStatus: data.storedStatus || extra.storedStatus,
+      });
+    },
+    onBatchCompleted: function () {
+      finish();
+    },
+    onClose: function () {
+      // SSE 断开不立即 finish，让 polling 接管。
+    },
+  });
+
+  return {
+    close: function () {
+      _stopPoll();
+      if (streamHandle && streamHandle.close) streamHandle.close();
+    },
+  };
+}
+
 export async function generateAllVideoPrompts(opts) {
   // Phase 3-B-3：后端 batch_runner 编排，前端只负责 UI + subscribeBatch。
   // 已删除：plan-batch 前端回退、vpParallel/VP_FALLBACK、vpFailed 重试队列。
@@ -1565,10 +1887,6 @@ export async function generateAllVideoPrompts(opts) {
       });
     }
   }
-  // hint 文案要和实际跑什么对得上：
-  //   - regenerateAll：12/12 全 ready 用户点了重新生成，全部要重跑
-  //   - targets.length === groups.length：0 个 ready，全部初次生成
-  //   - 中间态：targets.length < groups.length，是在补缺，要说清楚补几条
   if (hint && targets.length) {
     if (regenerateAll) hint.textContent = "正在重新生成全部视频提示词…";
     else if (targets.length === groups.length) hint.textContent = "正在批量生成视频提示词…";
@@ -1587,7 +1905,6 @@ export async function generateAllVideoPrompts(opts) {
     _updateVideoPromptBulkButtonLabel(groups);
     return;
   }
-	  var totalCount = targets.length;
 
   var seqToGroupIdx = {};
   targets.forEach(function (t, seq) { seqToGroupIdx[seq] = t.groupIdx; });
@@ -1603,11 +1920,11 @@ export async function generateAllVideoPrompts(opts) {
     showConsistencyAggregateWarning(startResp);
   } catch (e) {
     console.error('[generateAllVideoPrompts] /api/batch/start failed:', e);
-	    var preflightPayload = _getVideoPromptPreflightPayload(e);
-	    if (preflightPayload) {
-	      if (hint) hint.textContent = _videoPromptPreflightHint(preflightPayload);
-	      showToast(_videoPromptPreflightToast(preflightPayload), "warn");
-	      _videoPromptsGenerating = false;
+    var preflightPayload = _getVideoPromptPreflightPayload(e);
+    if (preflightPayload) {
+      if (hint) hint.textContent = _videoPromptPreflightHint(preflightPayload);
+      showToast(_videoPromptPreflightToast(preflightPayload), "warn");
+      _videoPromptsGenerating = false;
       if (btn) btn.disabled = false;
       _updateVideoPromptBulkButtonLabel(groups);
       await _handleVideoPromptPreflightBlocked(preflightPayload, runOpts, hint, btn);
@@ -1615,15 +1932,15 @@ export async function generateAllVideoPrompts(opts) {
     }
     var errMsg0 = ((e && e.message) || e).toString();
     if (hint) hint.textContent = "启动失败：" + errMsg0;
-	    showToast("批量生成启动失败：" + _diagnoseApiError(errMsg0), "error");
-	    targets.forEach(function (t) {
-	      if (regenerateAll) {
-	        var rollbackSb = project.storyboards && project.storyboards[t.groupIdx];
-	        updateVpCard(t.groupIdx, "done", rollbackSb && rollbackSb.videoPrompt);
-	        return;
-	      }
-	      _setVideoPromptStatus(t.groupIdx, "failed", { errorMsg: "启动失败" });
-	      updateVpCard(t.groupIdx, "error", null, "启动失败");
+    showToast("批量生成启动失败：" + _diagnoseApiError(errMsg0), "error");
+    targets.forEach(function (t) {
+      if (regenerateAll) {
+        var rollbackSb = project.storyboards && project.storyboards[t.groupIdx];
+        updateVpCard(t.groupIdx, "done", rollbackSb && rollbackSb.videoPrompt);
+        return;
+      }
+      _setVideoPromptStatus(t.groupIdx, "failed", { errorMsg: "启动失败" });
+      updateVpCard(t.groupIdx, "error", null, "启动失败");
     });
     _videoPromptsGenerating = false;
     if (btn) btn.disabled = false;
@@ -1631,284 +1948,20 @@ export async function generateAllVideoPrompts(opts) {
     return;
   }
 
-	  targets.forEach(function (t) {
-	    _setVideoPromptStatus(t.groupIdx, "generating", { videoPromptRunId: startResp.batchId });
-	    _invalidateVideoForGroup(t.groupIdx, project.storyboards[t.groupIdx]);
-	    updateVpCard(t.groupIdx, "loading", null, "AI 分析图片与剧本…");
-	  });
+  targets.forEach(function (t) {
+    _setVideoPromptStatus(t.groupIdx, "generating", { videoPromptRunId: startResp.batchId });
+    _invalidateVideoForGroup(t.groupIdx, project.storyboards[t.groupIdx]);
+    updateVpCard(t.groupIdx, "loading", null, "AI 分析图片与剧本…");
+  });
 
-  var doneCount = 0;
-  var failCount = 0;
-  var finished = false;
-  // 去重保护：SSE + polling 同时跑，避免一个 group 处理两次
-  var _seenDone = Object.create(null);
-  var _seenFailed = Object.create(null);
-  var firstFailureMsg = "";
-  var failureStats = { character: 0, ownership: 0, writeback: 0, empty: 0, project: 0, model: 0 };
-
-	  function _classifyVideoPromptFailure(errMsg, meta) {
-	    return _classifyVideoPromptFailureKind(errMsg, meta);
-	  }
-
-  function _videoPromptFailureToast() {
-    if (failureStats.character > 0) return "角色一致性检查未通过，请先确认角色信息";
-    if (failureStats.ownership > 0) return failureStats.ownership + " 条提示词已被新的生成请求接管，页面会保留最新任务结果";
-    if (failureStats.writeback > 0) return failureStats.writeback + " 条提示词生成后写回失败，请刷新项目状态后重试";
-    if (failureStats.empty > 0) return failureStats.empty + " 条提示词返回为空，请单条重新生成";
-    if (failureStats.project > 0) return "项目已不存在或无法访问，请刷新项目列表";
-    return failCount + " 条提示词生成失败，请在缺失镜头里单条重试";
-  }
-
-  // 当 SSE 报"任务完成"但 extra.videoPrompt 是空字符串时（旧版 silent-drop bug），
-  // 强制从服务器重读 project，把后端 executor 已经写入 DB 的 videoPrompt 拉回来。
-  // 旧逻辑下 cleaned='' → _applyTaskCompleted 早 return → 既不算成功也不算失败 →
-  // 用户看到 "0/5 条已生成" + 无任何 toast，体感"提示生成完了但啥也没有"。
-  async function _rescueFromServerForGroup(gIdx) {
-    if (!_ctx.reloadProjectFromServer) return '';
-    try {
-      await _ctx.reloadProjectFromServer();
-	      _syncRefs();
-	      var sb = project && project.storyboards && project.storyboards[gIdx];
-	      return _isVideoPromptReady(sb) ? (sb.videoPrompt || '') : '';
-    } catch (e) {
-      console.warn('[VideoPrompt] _rescueFromServerForGroup failed:', e);
-      return '';
-    }
-  }
-
-  async function finish() {
-    if (finished) return;
-    finished = true;
-    // 在最终统计前，再做一次权威同步——后端 executor 是先写 DB 再返回 extra，
-    // 所以即使所有 SSE 事件都丢了，DB 里也应该是最新的；这一步把 UI 拉回真相。
-    try {
-      if (_ctx.reloadProjectFromServer) {
-        await _ctx.reloadProjectFromServer();
-        _syncRefs();
-      }
-    } catch (_e) {}
-    _videoPromptsGenerating = false;
-    if (btn) btn.disabled = false;
-    var done = 0;
-    for (var j = 0; j < groups.length; j++) {
-	      if (_isVideoPromptReady(project.storyboards[j])) done++;
-    }
-    var missingLabels = _missingVideoPromptLabels(groups);
-    if (hint) {
-      hint.textContent = missingLabels.length
-        ? done + "/" + groups.length + " 条已生成，缺少镜头 " + missingLabels.join("、")
-        : done + "/" + groups.length + " 条已生成";
-    }
-    // 可能 reload 之后 done > 0 而 doneCount 还是 0（SSE 全丢的情况）——把卡片状态也刷一遍
-    for (var jj = 0; jj < groups.length; jj++) {
-	      var sbJ = project.storyboards[jj];
-	      if (_isVideoPromptReady(sbJ)) updateVpCard(jj, "done", sbJ.videoPrompt);
-	    }
-	    var allDone = groups.length > 0 && groups.every(function (_, k) {
-	      return _isVideoPromptReady(project.storyboards[k]);
-	    });
-    _updateVideoPromptBulkButtonLabel(groups);
-    if (allDone) {
-      showToast(regenerateAll ? "全部视频提示词已重新生成" : "全部视频提示词已生成", "success");
-    } else if (done === 0 && failCount === 0) {
-      // 既没成功也没失败 = 后端任务都"completed"了但内容空 / SSE 全丢且 DB 也没写 → 一定是后端故障
-      showToast("批量已结束，但没有收到任务明细；请刷新项目状态后重试", "error");
-    } else if (failCount > 0) {
-      showToast(_videoPromptFailureToast(), failureStats.writeback > 0 ? "error" : "warn");
-    } else if (done < groups.length) {
-      showToast("已完成 " + done + "/" + groups.length + " 条，缺少镜头 " + missingLabels.join("、") + "，可单条补齐", "warn");
-    }
-    checkVideoPromptsConfirm();
-    setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);
-  }
-
-	  function _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extraData) {
-	    if (typeof gIdx !== 'number') return;
-	    if (_seenDone[gIdx]) return;
-	    var incomingRunId = extraData && extraData.videoPromptRunId;
-	    var currentSb = project && project.storyboards && project.storyboards[gIdx];
-	    if (incomingRunId && currentSb && currentSb.videoPromptRunId && currentSb.videoPromptRunId !== incomingRunId) {
-	      console.warn('[VideoPrompt] ignored stale completion for group ' + gIdx + ' run=' + incomingRunId + ' current=' + currentSb.videoPromptRunId);
-	      _reloadVideoPromptProjectFromServer();
-	      return;
-	    }
-	    if (!cleaned) {
-      // SSE/polling 报告任务完成但 extra/patch 都空——后端 executor 已经写过 DB，
-      // 拉回来兜底；如果 DB 里也没有，标记为失败让用户能看到"重新生成"按钮。
-      _rescueFromServerForGroup(gIdx).then(function (vp) {
-        if (vp) {
-	          _applyTaskCompleted(gIdx, vp, narrationsUsed, extraData);
-        } else if (!_seenFailed[gIdx] && !_seenDone[gIdx]) {
-          _applyTaskFailed(gIdx, '后端任务返回为空', { errorCode: 'VIDEO_PROMPT_EMPTY_RESULT' });
-        }
-      });
-      return;
-    }
-    _seenDone[gIdx] = true;
-    doneCount++;
-    var referenceManifest = null;
-    var droppedReferences = null;
-    if (extraData) {
-      if (Array.isArray(extraData.referenceManifest)) referenceManifest = extraData.referenceManifest;
-      else if (Array.isArray(extraData.videoReferenceManifest)) referenceManifest = extraData.videoReferenceManifest;
-      if (Array.isArray(extraData.droppedReferences)) droppedReferences = extraData.droppedReferences;
-      else if (Array.isArray(extraData.videoReferenceDropped)) droppedReferences = extraData.videoReferenceDropped;
-    }
-
-    var isCurrent = _safeWriteBack(originId, function (proj) {
-	      if (!proj.storyboards) proj.storyboards = [];
-	      if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-		      proj.storyboards[gIdx].videoPrompt = cleaned;
-		      proj.storyboards[gIdx].videoPromptStatus = "ready";
-			      if (incomingRunId) proj.storyboards[gIdx].videoPromptRunId = incomingRunId;
-			      if (extraData && extraData.videoPromptSourceHash) proj.storyboards[gIdx].videoPromptSourceHash = extraData.videoPromptSourceHash;
-			      proj.storyboards[gIdx].videoPromptUpdatedAt = new Date().toISOString();
-		      delete proj.storyboards[gIdx].videoPromptEditDraft;
-		      delete proj.storyboards[gIdx].videoPromptFailedAt;
-		      delete proj.storyboards[gIdx].videoPromptLastError;
-		      proj.storyboards[gIdx]._vpCache = null;
-	      _invalidateVideoForGroup(gIdx, proj.storyboards[gIdx]);
-      if (Array.isArray(narrationsUsed)) proj.storyboards[gIdx].narrationsUsed = narrationsUsed;
-      if (referenceManifest !== null) proj.storyboards[gIdx].videoReferenceManifest = referenceManifest;
-      if (droppedReferences !== null) proj.storyboards[gIdx].videoReferenceDropped = droppedReferences;
-      if (proj._staleFlags) delete proj._staleFlags["video_prompt_" + gIdx];
-    });
-    if (isCurrent) updateVpCard(gIdx, "done", cleaned);
-    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
-  }
-
-  function _applyTaskFailed(gIdx, errMsg, meta) {
-    if (typeof gIdx !== 'number') return;
-    if (_seenFailed[gIdx] || _seenDone[gIdx]) return;
-    meta = meta || {};
-    var incomingRunId = meta.incomingRunId || meta.videoPromptRunId;
-    if (_isVideoPromptOwnershipMeta(meta) || (incomingRunId && !_isStillOwnerOfShot(gIdx, incomingRunId))) {
-      console.warn('[VideoPrompt] ignored stale failure for group ' + gIdx + ' run=' + (incomingRunId || '?') + ' reason=' + (meta.skippedReason || meta.errorCode || 'ownership'));
-      _reloadVideoPromptProjectFromServer();
-      return;
-    }
-	    _seenFailed[gIdx] = true;
-	    failCount++;
-	    if (!firstFailureMsg && errMsg) firstFailureMsg = String(errMsg);
-	    var failureKind = _classifyVideoPromptFailure(errMsg, meta);
-	    failureStats[failureKind] = (failureStats[failureKind] || 0) + 1;
-	    if (!project.storyboards) project.storyboards = [];
-	    if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
-	    _setVideoPromptStatus(gIdx, "failed", { videoPromptRunId: incomingRunId, errorMsg: (errMsg || '生成失败').toString().slice(0, 120) });
-	    _invalidateVideoForGroup(gIdx, project.storyboards[gIdx]);
-	    updateVpCard(gIdx, "error", null, (errMsg || '生成失败').toString().slice(0, 120));
-    if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
-  }
-
-  function _applySnapshotTask(t) {
-    if (!t || !t.status) return;
-    if (t.status === 'completed') {
-      var result = t.result || {};
-      var extra = result.extra || {};
-      var patch = result.patch || {};
-      if (!extra.videoPromptRunId) extra.videoPromptRunId = result.videoPromptRunId || startResp.batchId;
-      var gIdx = (typeof extra.groupIdx === 'number')
-        ? extra.groupIdx
-        : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
-      var cleaned = _vpStripEditableTimingLines((extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, ""));
-      var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
-      if (!Array.isArray(extra.referenceManifest) && Array.isArray(patch.videoReferenceManifest)) {
-        extra.referenceManifest = patch.videoReferenceManifest;
-      }
-      if (!Array.isArray(extra.droppedReferences) && Array.isArray(patch.videoReferenceDropped)) {
-        extra.droppedReferences = patch.videoReferenceDropped;
-      }
-      _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extra);
-    } else if (t.status === 'failed') {
-      var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
-      var failedResult = t.result || {};
-      var failedExtra = failedResult.extra || {};
-      _applyTaskFailed(gIdx2, t.errorMsg, {
-        failureStage: failedResult.failureStage || failedExtra.failureStage,
-        errorCode: failedResult.errorCode || failedExtra.errorCode,
-        incomingRunId: failedExtra.videoPromptRunId || failedResult.videoPromptRunId || startResp.batchId,
-        videoPromptRunId: failedExtra.videoPromptRunId || failedResult.videoPromptRunId || startResp.batchId,
-        skippedReason: failedResult.skippedReason || failedExtra.skippedReason,
-        failureApplied: Object.prototype.hasOwnProperty.call(failedResult, 'failureApplied')
-          ? failedResult.failureApplied
-          : failedExtra.failureApplied,
-        storedRunId: failedResult.storedRunId || failedExtra.storedRunId,
-        storedStatus: failedResult.storedStatus || failedExtra.storedStatus,
-      });
-    }
-  }
-
-  // ============================================================
-  // 兜底轮询：每 5 秒主动 GET /api/batch/<id>。SSE 不稳定时由它兜底。
-  // ============================================================
-  var pollTimer = null;
-  function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-
-  async function _pollOnce() {
-    if (finished) return;
-    try {
-      var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
-      if (!snap || finished) return;
-      var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
-      tasks.forEach(_applySnapshotTask);
-      if (snap.status === 'completed' || snap.status === 'failed' ||
-          snap.status === 'cancelled' || snap.status === 'partial') {
-        console.log('[VideoPrompt] poll detected batch finished status=' + snap.status);
-        _stopPoll();
-        finish();
-      }
-    } catch (e) {
-      console.warn('[VideoPrompt] poll failed:', (e && e.message) || e);
-    }
-  }
-  pollTimer = setInterval(_pollOnce, 5000);
-
-  subscribeBatch(startResp.batchId, {
-    onSnapshot: function (snap) {
-      if (hint && snap && typeof snap.total === 'number') {
-        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
-      }
-      if (snap && Array.isArray(snap.tasks)) snap.tasks.forEach(_applySnapshotTask);
-    },
-    onTaskStarted: function (data) {
-      var extra = data.target || {};
-      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      if (typeof gIdx === 'number' && !_seenDone[gIdx]) {
-        updateVpCard(gIdx, "loading", null, "生成中…");
-      }
-    },
-    onTaskCompleted: function (data) {
-      var extra = data.extra || {};
-      var patch = data.patch || {};
-      if (!extra.videoPromptRunId) extra.videoPromptRunId = data.videoPromptRunId || startResp.batchId;
-      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      var cleaned = _vpStripEditableTimingLines((extra.videoPrompt || patch.value || '').toString().trim().replace(/^["']|["']$/g, ""));
-      var narrationsUsed = Array.isArray(extra.narrationsUsed) ? extra.narrationsUsed : [];
-	      _applyTaskCompleted(gIdx, cleaned, narrationsUsed, extra);
-    },
-    onTaskFailed: function (data) {
-      var extra = data.extra || {};
-      var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
-      _applyTaskFailed(gIdx, data.errorMsg, {
-        failureStage: data.failureStage || extra.failureStage,
-        errorCode: data.errorCode || extra.errorCode,
-        incomingRunId: extra.videoPromptRunId || data.videoPromptRunId || startResp.batchId,
-        videoPromptRunId: extra.videoPromptRunId || data.videoPromptRunId || startResp.batchId,
-        skippedReason: data.skippedReason || extra.skippedReason,
-        failureApplied: Object.prototype.hasOwnProperty.call(data, 'failureApplied')
-          ? data.failureApplied
-          : extra.failureApplied,
-        storedRunId: data.storedRunId || extra.storedRunId,
-        storedStatus: data.storedStatus || extra.storedStatus,
-      });
-    },
-    onBatchCompleted: function () {
-      _stopPoll();
-      finish();
-    },
-    onClose: function () {
-      // SSE 断开不立即 finish，让 polling 接管
-    },
+  _attachVideoPromptBatch({
+    batchId: startResp.batchId,
+    originId: originId,
+    groups: groups,
+    seqToGroupIdx: seqToGroupIdx,
+    totalCount: targets.length,
+    regenerateAll: regenerateAll,
+    source: 'start',
   });
 }
 

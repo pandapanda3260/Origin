@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared } from './utils.js?v=201';
+import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from './utils.js?v=203';
 import { loadProjectData } from './project.js';
 import { subscribeBatch, subscribeTask } from './backend_stream.js';
 import { renderAssetCard } from './render_hooks.js';
@@ -909,7 +909,7 @@ function _renderCharCards(container, items) {
         ? '<p class="mt-2 text-[11px] leading-relaxed text-amber-500/80">' + escapeHtml(cardState.statusMessage) + '</p>'
         : '';
       statusHtml =
-        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">三视图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
+        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">角色设定图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
         '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
           '<img src="' + escapeHtml(thumbSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover object-[right_center]" />' +
         '</div>' +
@@ -1813,6 +1813,8 @@ export function _diagnoseApiError(msg) {
   var raw = String(msg == null ? "" : msg);
   try { if (raw) console.debug('[diagnoseApiError] raw:', raw.slice(0, 400)); } catch (_e) {}
   var s = raw.toLowerCase();
+  var transientGatewayText = friendlyGatewayTransientError(raw);
+  if (transientGatewayText) return transientGatewayText;
   if (s.indexOf("quota is not enough") >= 0 || s.indexOf("insufficient_quota") >= 0 || s.indexOf("insufficient quota") >= 0 || s.indexOf("billing") >= 0) {
     return "中转站/账户余额不足，请到中转站充值或换一个 Key";
   }
@@ -1841,13 +1843,13 @@ export function _diagnoseApiError(msg) {
     return "剧本/上下文太长超出模型限制，可考虑换更大上下文的模型";
   }
   if (s.indexOf("timeout") >= 0 || s.indexOf("etimedout") >= 0 || s.indexOf("aborterror") >= 0 || s.indexOf("超时") >= 0) {
-    return "请求超时（中转站响应太慢），请重试或换中转站";
+    return "网络不稳定，请重新提交";
   }
   if (s.indexOf("econnrefused") >= 0 || s.indexOf("enotfound") >= 0 || s.indexOf("network") >= 0 || s.indexOf("fetch failed") >= 0) {
-    return "无法连接到中转站，请检查网络或中转站地址";
+    return "网络不稳定，请重新提交";
   }
   if (/\b5\d\d\b/.test(s)) {
-    return "中转站服务异常（5xx），请稍后重试或换中转站";
+    return "网络不稳定，请重新提交";
   }
   // 都没匹配上 → 截断原文（去掉前缀的"图像生成失败：" 之类，更干净）
   var cleaned = raw.replace(/^([\u4e00-\u9fa5]+(?:失败)?[:：]\s*)+/, "").trim();
@@ -4154,7 +4156,7 @@ async function _uploadCharImage(charIdx, file) {
       return;
     }
 
-    showToast("角色图上传成功，正在自动处理（三视图→转绘→读图更新描述）...", "success");
+    showToast("角色图上传成功，正在自动处理（角色设定图→转绘→读图更新描述）...", "success");
     _charUploadStreams[charIdx] = true;
     renderAssets();
 
@@ -4164,8 +4166,8 @@ async function _uploadCharImage(charIdx, file) {
         var pct = ev.progress || 0;
         var labels = {
           "upload_done": "上传完成",
-          "triview": "生成三视图...",
-          "triview_done": "三视图完成",
+          "triview": "生成角色设定图...",
+          "triview_done": "角色设定图完成",
           "stylize": "转绘中...",
           "stylize_done": "转绘完成",
           "vision_read": "AI 读图分析...",

@@ -1504,7 +1504,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
                   '<p class="text-[9px] font-mono text-on-surface-variant/40">sha256 ' + escapeHtml(returnedHashDisplay) + '</p>' +
                 '</div>' +
               '</div>' +
-              '<p class="px-4 pb-3 text-[10px] text-on-surface-variant/50">若两者视觉差异明显，建议点上方「重新生成」重跑视频。</p>' +
+              '<p class="px-4 pb-3 text-[10px] text-on-surface-variant/50">如果差异明显，请点上方「重新生成」重跑视频。</p>' +
             '</details>';
         }
       } catch (_auditErr) {

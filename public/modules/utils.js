@@ -406,6 +406,43 @@ export function getActiveBatchesShared(projectId) {
   return entry.promise;
 }
 
+export const NETWORK_UNSTABLE_RETRY_TEXT = '网络不稳定，请重新提交';
+
+export function friendlyGatewayTransientError(rawMsg) {
+  const raw = String(rawMsg || '').trim();
+  if (!raw) return '';
+  const s = raw.toLowerCase();
+  const hasGatewaySignal =
+    s.indexOf('中转站') >= 0 ||
+    s.indexOf('gateway') >= 0 ||
+    s.indexOf('upstream') >= 0 ||
+    s.indexOf('llm') >= 0 ||
+    s.indexOf('bad_response') >= 0;
+  const isUpstreamBadResponse =
+    (s.indexOf('invalid response') >= 0 && s.indexOf('upstream') >= 0) ||
+    s.indexOf('server received an invalid response') >= 0 ||
+    s.indexOf('bad_response') >= 0;
+  const isTransientStatus =
+    /\bllm\s*5\d\d\b/.test(s) ||
+    (/\b5\d\d\b/.test(s) && hasGatewaySignal);
+  const isNetworkTransient =
+    s.indexOf('timeout') >= 0 ||
+    s.indexOf('etimedout') >= 0 ||
+    s.indexOf('aborterror') >= 0 ||
+    s.indexOf('fetch failed') >= 0 ||
+    s.indexOf('econnrefused') >= 0 ||
+    s.indexOf('enotfound') >= 0 ||
+    s.indexOf('network') >= 0 ||
+    s.indexOf('超时') >= 0 ||
+    s.indexOf('无法连接到中转站') >= 0 ||
+    s.indexOf('中转站响应太慢') >= 0 ||
+    s.indexOf('中转站可能在排队') >= 0 ||
+    s.indexOf('中转站服务异常') >= 0;
+  return (isUpstreamBadResponse || isTransientStatus || isNetworkTransient)
+    ? NETWORK_UNSTABLE_RETRY_TEXT
+    : '';
+}
+
 /**
  * 对外错误文案一刀切：任何生成类失败，用户只看到「生成失败，请稍后重试」。
  * 真实原因只写入 console.debug 给开发排查，不暴露给用户。
@@ -413,6 +450,8 @@ export function getActiveBatchesShared(projectId) {
 export function friendlyModelError(rawMsg) {
   const msg = String(rawMsg || '').trim();
   try { if (msg) console.debug('[friendlyModelError] raw:', msg); } catch (_e) {}
+  const gatewayText = friendlyGatewayTransientError(msg);
+  if (gatewayText) return gatewayText;
   // 历史实现是一个非常窄的白名单：只有 4 个关键词（Responses 输出不完整 /
   // max_output_tokens / reason= / 资产抽取失败）能透传，其它一律归零成
   // "生成失败，请稍后重试"。后果是单镜头/批量真实失败时（LLM 5xx、网络抖、上游
@@ -459,6 +498,7 @@ export async function apiPostStream(path, body, onChunk, onEvent, options) {
     if (!resp.ok) {
       const text = await resp.text();
       if (text.trim().charAt(0) === '<') throw new Error(_diagnoseHttpHtml(resp.status));
+      if (resp.status >= 500) throw new Error(NETWORK_UNSTABLE_RETRY_TEXT);
       throw new Error('生成失败，请稍后重试');
     }
     const reader = resp.body.getReader();

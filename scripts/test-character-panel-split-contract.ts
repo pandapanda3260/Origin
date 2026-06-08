@@ -95,13 +95,26 @@ async function runCase(entityType: CharacterEntityType, buffer: Buffer) {
       const quality: { usable?: boolean } | undefined = qualityMap[name];
       assert.equal(quality?.usable, true, `${entityType}.${name} should be usable`);
     }
-    for (const panelId of result.panelImageIds) {
-      const meta = db.prepare('SELECT filename FROM images WHERE id = ?').get(panelId) as { filename: string } | undefined;
+    const panelRows = result.panelImageIds
+      .map((panelId) => db.prepare('SELECT id, asset_ref, filename, width, height FROM images WHERE id = ?').get(panelId) as {
+        id: string;
+        asset_ref: string;
+        filename: string;
+        width: number;
+        height: number;
+      } | undefined)
+      .filter((row): row is { id: string; asset_ref: string; filename: string; width: number; height: number } => Boolean(row));
+    if (entityType === 'human') {
+      const headshot = panelRows.find((row) => String(row.asset_ref || '').endsWith('.panels.headshot'));
+      assert.ok(headshot, 'human headshot panel should be written to images table');
+      assert.ok(headshot.height / headshot.width >= 1.15, `human headshot should keep a full face/shoulder crop, got ${headshot.width}x${headshot.height}`);
+    }
+    for (const meta of panelRows) {
       if (meta) {
         const panelPath = join(ownerDir, meta.filename);
         if (existsSync(panelPath)) unlinkSync(panelPath);
       }
-      db.prepare('DELETE FROM images WHERE id = ?').run(panelId);
+      db.prepare('DELETE FROM images WHERE id = ?').run(meta.id);
     }
   } finally {
     db.prepare('DELETE FROM images WHERE id = ?').run(id);

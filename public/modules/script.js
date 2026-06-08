@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders } from './utils.js';
+import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from './utils.js?v=203';
 import { emptyScriptConsultState, isEmptyScriptConsultState } from './script_consult_state.js';
 
 var _ctx = {};
@@ -27,6 +27,12 @@ var _activeScriptRequest = null;
 
 export function isScriptGenerating() {
   return _scriptGenerating;
+}
+
+function _scriptErrorText(err, limit) {
+  var raw = ((err && err.message) || err || "").toString();
+  var friendly = friendlyGatewayTransientError(raw);
+  return (friendly || raw || "生成失败，请稍后重试").slice(0, limit || 150);
 }
 
 var EMOTION_LABEL_CN = {
@@ -1179,7 +1185,7 @@ export async function runScriptAnalysis() {
       }
     }
   } catch (e) {
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     showToast("剧本分析失败: " + errText, "error");
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
@@ -1354,7 +1360,7 @@ async function _consultTurn(userMsg, options) {
     }
   } catch (e) {
     if (!_isScriptRequestCurrent(guard) || (e && e.name === "AbortError")) return;
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     if (bubble) bubble.textContent = "";
     chatAddMsg("status", '<span class="chat-status-err">咨询失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
@@ -1491,7 +1497,7 @@ async function _consultConfirm() {
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     chatAddMsg("status", '<span class="chat-status-err">生成失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
@@ -1754,7 +1760,7 @@ export async function generateScript(idea, options) {
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
     _removeSourceAdaptHint(sourceHintEl);
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     chatAddMsg("status", '<span class="chat-status-err">生成失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
@@ -1830,7 +1836,7 @@ export async function extractStyleBible(options) {
 			    }
 			  } catch (e) {
     if (e && e.status === 409) throw e;
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     _ctx.safeWriteBack(originId, function (proj) {
       proj.styleBibleStatus = "failed";
       proj.styleBibleError = errText;
@@ -2223,7 +2229,7 @@ export async function reviseScript(instruction) {
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
-    var errText = ((e && e.message) || e).toString().slice(0, 150);
+    var errText = _scriptErrorText(e);
     chatAddMsg("status", '<span class="chat-status-err">修改失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);
   } finally {
