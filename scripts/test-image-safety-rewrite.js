@@ -55,11 +55,19 @@ async function run() {
   await test('LLM 改写: 返回不同文本 → changed=true', async () => {
     const original = '【主镜头】- 画面：满地跪伏的人群，夕阳下的圣地高台，群像膜拜';
     const rewritten = '【主镜头】- 画面：广场上站着许多人，夕阳下的开阔高台，人群安静伫立';
-    const out = await rw.rewriteImagePromptForModerationLLM(null, original, { chatImpl: async () => rewritten });
+    let callOpts = null;
+    const out = await rw.rewriteImagePromptForModerationLLM(null, original, {
+      chatImpl: async (_user, _messages, opts) => {
+        callOpts = opts;
+        return rewritten;
+      },
+    });
     assert(out.changed === true, 'changed should be true');
     assert(out.rewrittenPrompt === rewritten, 'rewritten prompt used');
     assertEqual(out.rewriteDiff.length, 1, 'one diff');
     assertEqual(out.visualAnchorDescription.source, 'sanitized', 'source sanitized');
+    assertEqual(callOpts.reasoningEffort, 'none', 'safety rewrite disables reasoning');
+    assertEqual(callOpts.traceName, 'image-moderation-rewrite', 'default safety rewrite trace');
   });
 
   await test('LLM 改写: 空输出 → changed=false', async () => {
@@ -77,10 +85,15 @@ async function run() {
 
   await test('LLM 改写: 抛错 → changed=false(吞掉异常)', async () => {
     const out = await rw.rewriteImagePromptForModerationLLM(null, 'B'.repeat(50), {
-      chatImpl: async () => { throw new Error('llm down'); },
+      chatImpl: async () => {
+        const err = new Error('LLM 输出不完整（reason=max_output_tokens）：请提高 maxTokens 或降低 reasoningEffort');
+        err.incompleteReason = 'max_output_tokens';
+        throw err;
+      },
     });
     assert(out.changed === false, 'changed false on throw');
     assertEqual(out.invalidReason, 'llm_error', 'throw reason');
+    assertEqual(out.invalidDetail, 'max_output_tokens', 'throw detail');
   });
 
   await test('LLM 改写: 保护区保持原文且硬性禁止可改 → changed=true', async () => {
@@ -292,7 +305,7 @@ async function run() {
           generateImageImpl: async () => { n += 1; throw new Error('Image API 400 MODERATION blocked'); },
           rewriteLLMImpl: async () => {
             rewriteN += 1;
-            return { changed: false, invalidReason: 'no_change', rewrittenPrompt: '', rewriteDiff: [], visualAnchorDescription: {} };
+            return { changed: false, invalidReason: 'llm_error', invalidDetail: 'max_output_tokens', rewrittenPrompt: '', rewriteDiff: [], visualAnchorDescription: {} };
           },
         },
       );
@@ -303,7 +316,8 @@ async function run() {
     assert(threw, 'should throw when unrecoverable');
     assertEqual(n, 1, 'only one image attempt without an effective rewrite');
     assertEqual(rewriteN, 2, 'LLM should be retried once before giving up');
-    assertEqual(thrown.imageSafetyAudit.attempts[0].rewriteFailureReason, 'rewrite_failed:no_change', 'audit records rewrite failure reason');
+    assertEqual(thrown.imageSafetyAudit.attempts[0].rewriteFailureReason, 'rewrite_failed:llm_error:max_output_tokens', 'audit records rewrite failure reason');
+    assertEqual(thrown.imageSafetyAudit.attempts[0].rewriteAttemptNotes[1].invalidDetail, 'max_output_tokens', 'audit records detailed invalid reason');
   });
 
   console.log(`\n${pass}/${pass} passed`);

@@ -44,6 +44,7 @@ export type ImageSafetyLLMRewrite = {
   /** true = LLM 给出了与原文不同的改写;false = 空/异常/与原文相同,视为没救回。 */
   changed: boolean;
   invalidReason?: ImageSafetyRewriteInvalidReason;
+  invalidDetail?: string;
   rewriteDiff: RewriteDiff[];
   visualAnchorDescription: {
     originalText: string;
@@ -97,16 +98,26 @@ function hasForbiddenSection(text: string): boolean {
   return FORBIDDEN_SECTION_RE.test(String(text || ''));
 }
 
+function extractLLMErrorDetail(err: any): string | undefined {
+  const directReason = String(err?.incompleteReason || err?.incompleteDetails?.reason || '').trim();
+  if (directReason) return directReason.slice(0, 120);
+  const message = String(err?.message || err || '').trim();
+  const match = message.match(/reason=([A-Za-z0-9_-]+)/i) || message.match(/reason[:：]\s*([A-Za-z0-9_-]+)/i);
+  if (match?.[1]) return match[1].slice(0, 120);
+  return message ? message.slice(0, 160) : undefined;
+}
+
 export async function rewriteImagePromptForModerationLLM(
   user: UserRow | null,
   prompt: string,
   opts: { traceName?: string; chatImpl?: typeof chatComplete } = {},
 ): Promise<ImageSafetyLLMRewrite> {
   const original = String(prompt || '');
-  const noChange = (invalidReason?: ImageSafetyRewriteInvalidReason): ImageSafetyLLMRewrite => ({
+  const noChange = (invalidReason?: ImageSafetyRewriteInvalidReason, invalidDetail?: string): ImageSafetyLLMRewrite => ({
     rewrittenPrompt: original,
     changed: false,
     invalidReason,
+    invalidDetail,
     rewriteDiff: [],
     visualAnchorDescription: {
       originalText: original,
@@ -128,6 +139,7 @@ export async function rewriteImagePromptForModerationLLM(
       ],
       {
         modelRole: 'structured',
+        reasoningEffort: 'none',
         temperature: 0.3,
         // maxTokens 是期望产出预算,最终由统一预算层按模型上限夹取。改写后长度≈原文。
         maxTokens: Math.min(4096, Math.max(1024, Math.ceil(original.length * 1.6))),
@@ -136,7 +148,7 @@ export async function rewriteImagePromptForModerationLLM(
     );
   } catch (err: any) {
     console.warn('[image-safety-rewrite] LLM rewrite failed:', (err && err.message) || err);
-    return noChange('llm_error');
+    return noChange('llm_error', extractLLMErrorDetail(err));
   }
 
   const rewritten = String(raw || '').trim();

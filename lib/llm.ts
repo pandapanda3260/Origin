@@ -134,6 +134,20 @@ const TASK_OUTPUT_POLICIES: Record<string, TaskOutputPolicy> = {
     retryTimeoutMs: 420_000,
     allowOutputIncompleteRetry: true,
   },
+  'image-moderation-rewrite': {
+    baseMaxTokens: 12_000,
+    retryMaxTokens: 16_000,
+    timeoutMs: 300_000,
+    retryTimeoutMs: 300_000,
+    allowOutputIncompleteRetry: true,
+  },
+  'image-moderation-rewrite-retry': {
+    baseMaxTokens: 12_000,
+    retryMaxTokens: 16_000,
+    timeoutMs: 300_000,
+    retryTimeoutMs: 300_000,
+    allowOutputIncompleteRetry: true,
+  },
   'retag.emotions': {
     baseMaxTokens: 8_000,
     retryMaxTokens: 12_000,

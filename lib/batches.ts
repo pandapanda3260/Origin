@@ -27,7 +27,7 @@ import {
   requestTaskCancel,
   transitionTaskStatus,
 } from './durable-tasks';
-import { patchProjectForUser } from './projects-db';
+import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
 import { markFirstFrameFailed, markTailFrameFailed } from './visual-reference-state';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
@@ -1574,8 +1574,12 @@ export async function runBatch(opts: {
           }
         }
 
+        const serverVersion = Number(getProjectByIdForUser(opts.projectId, opts.user.id)?.version) || undefined;
+        const resultForStore = serverVersion
+          ? { ...(result || {}), serverVersion }
+          : (result || {});
         db.prepare(`UPDATE batch_tasks SET result_json=?, error_msg=NULL, updated_at=? WHERE id=?`)
-          .run(JSON.stringify(result || {}), _nowIso(), t.id);
+          .run(JSON.stringify(resultForStore), _nowIso(), t.id);
         transitionTaskStatus({
           taskId: t.id,
           from: 'running',
@@ -1591,9 +1595,10 @@ export async function runBatch(opts: {
           taskId: t.id,
           targetSeq: t.seq,
           target,
-          resultUrl: result?.resultUrl,
-          patch: result?.patch,
-          extra: result?.extra,
+          resultUrl: resultForStore?.resultUrl,
+          patch: resultForStore?.patch,
+          extra: resultForStore?.extra,
+          serverVersion,
         });
       } catch (e: any) {
         const msg = e?.message || String(e);

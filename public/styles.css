@@ -16644,11 +16644,29 @@ body.first-frame-editor-lock {
 
   #firstFrameEditorRoot .ffe-material-strip {
     display: grid;
+    /* 保持原有"按槽位(slot-count=cap+1)固定 tile 宽排列"的设计不变；
+     * 此前没有溢出控制，槽位排不下时整条 strip 会撑宽素材面板、溢出到中列盖住
+     * 图片标题，右对齐的预算/下载也被一起顶过去。加 overflow-x:auto + min-width:0：
+     * 排不下时改为横向滚动，strip 盒宽收敛到面板宽，右边界与提示词面板对齐。
+     * （空槽来自 slot-count=cap+1，如需让滚动只显示真实图块，需另调
+     *  material_image_panel.js 的 slotCount，属共享改动单列。） */
     grid-template-columns: repeat(var(--ffe-material-slot-count), var(--ffe-material-tile-size));
     gap: 7px;
     align-items: start;
     justify-content: start;
     min-height: var(--ffe-material-tile-size);
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+    padding-bottom: 2px;
+  }
+
+  /* "添加素材"的角色下拉在素材条内绝对定位向下展开；横向滚动容器会裁掉它，
+   * 展开时（条内出现 .ffe-material-role-picker）临时放开溢出。 */
+  #firstFrameEditorRoot .ffe-material-strip:has(.ffe-material-role-picker) {
+    overflow: visible;
   }
 
   #firstFrameEditorRoot .ffe-material-panel .sb-material-thumb-image,

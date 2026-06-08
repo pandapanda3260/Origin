@@ -77,6 +77,21 @@ function _findStoryboardCard(gIdx) {
   return (grid && grid.querySelector(selector)) || document.querySelector(selector);
 }
 
+function _setLayerHidden(el, hidden) {
+  if (!el) return;
+  hidden = !!hidden;
+  el.hidden = hidden;
+  el.classList.toggle('hidden', hidden);
+  if (el.style) el.style.display = hidden ? 'none' : '';
+}
+
+function _clearFrameErrorLayer(error) {
+  if (!error) return;
+  _setLayerHidden(error, true);
+  var msgSpan = error.querySelector('.sb-frame-error-msg');
+  if (msgSpan) msgSpan.textContent = '';
+}
+
 /**
  * 更新分镜组卡片状态。
  * @param {number} gIdx
@@ -187,15 +202,15 @@ export function renderStoryboardFrameCard(gIdx, kind, status, payload) {
   var loadingText = loading ? loading.querySelector("span") : null;
 
   if (status === "loading") {
-    if (loading) loading.hidden = false;
-    if (error) error.hidden = true;
+    _setLayerHidden(loading, false);
+    _clearFrameErrorLayer(error);
     if (loadingText) loadingText.textContent = payload.loadingText || "生成中…";
     return { ok: true };
   }
 
   if (status === "done") {
-    if (loading) loading.hidden = true;
-    if (error) error.hidden = true;
+    _setLayerHidden(loading, true);
+    _clearFrameErrorLayer(error);
     if (payload.imgUrl) {
       var updated = _updateFrameImageInPlace(frame, payload.imgUrl);
       return { ok: true, needFullRerender: !updated };
@@ -204,9 +219,9 @@ export function renderStoryboardFrameCard(gIdx, kind, status, payload) {
   }
 
   if (status === "error") {
-    if (loading) loading.hidden = true;
+    _setLayerHidden(loading, true);
     if (error) {
-      error.hidden = false;
+      _setLayerHidden(error, false);
       var msgSpan = error.querySelector('.sb-frame-error-msg');
       var msg = (payload.errMsg || "生成失败，请稍后重试").slice(0, 200);
       if (msgSpan) {
@@ -225,9 +240,12 @@ export function renderStoryboardFrameCard(gIdx, kind, status, payload) {
  * 在一个 [data-frame] 容器内替换 img/placeholder 的 src/data-img, 不动兄弟容器。
  */
 function _updateFrameImageInPlace(frame, imgUrl) {
-  var img = frame.querySelector('img');
+  var preview = frame.querySelector('.sb-frame-preview-stage');
+  var img = preview
+    ? (preview.querySelector('[data-frame-img]') || preview.querySelector('img'))
+    : frame.querySelector('[data-frame-img]');
   if (!img) {
-    var placeholder = frame.querySelector('.sb-frame-placeholder');
+    var placeholder = preview ? preview.querySelector('.sb-frame-placeholder') : null;
     if (!placeholder) return false;
     img = document.createElement('img');
     img.className = placeholder.dataset.imgClass || 'w-full h-full object-cover';
@@ -243,7 +261,7 @@ function _updateFrameImageInPlace(frame, imgUrl) {
     img.decoding = 'async';
     img.src = imgUrl;
   }
-  var zoomEls = frame.querySelectorAll('[data-img]');
+  var zoomEls = preview ? preview.querySelectorAll('[data-img]') : [];
   for (var i = 0; i < zoomEls.length; i += 1) {
     zoomEls[i].dataset.img = imgUrl;
     hydrateProtectedImageElements(zoomEls[i]);

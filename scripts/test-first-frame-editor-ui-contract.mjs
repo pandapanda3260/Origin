@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('../public/modules/storyboard.js', import.meta.url), 'utf8');
 const materialPanelSource = readFileSync(new URL('../public/modules/material_image_panel.js', import.meta.url), 'utf8');
+const renderHooksSource = readFileSync(new URL('../public/modules/render_hooks.js', import.meta.url), 'utf8');
 const styles = readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
 const assetsSource = readFileSync(new URL('../public/modules/assets.js', import.meta.url), 'utf8');
 const utilsSource = readFileSync(new URL('../public/modules/utils.js', import.meta.url), 'utf8');
@@ -12,6 +13,18 @@ assert.match(
   source,
   /var FIRST_FRAME_REWRITE_CHAT_ENABLED = false;/,
   'first-frame rewrite chat must be disabled by default',
+);
+
+assert.match(
+  renderHooksSource,
+  /function _updateFrameImageInPlace\(frame, imgUrl\)[\s\S]*?frame\.querySelector\('\.sb-frame-preview-stage'\)[\s\S]*?preview\.querySelector\('\[data-frame-img\]'\)/,
+  'frame image updates must be scoped to the preview stage, not the first reference-material image in the frame panel',
+);
+
+assert.doesNotMatch(
+  renderHooksSource,
+  /function _updateFrameImageInPlace\(frame, imgUrl\)[\s\S]*?var img = frame\.querySelector\('img'\)/,
+  'frame image updates must not grab the first img from the whole frame panel',
 );
 
 assert.match(

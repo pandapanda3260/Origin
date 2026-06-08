@@ -20,6 +20,7 @@ type RewriteAttemptNote = {
   attempt: number;
   changed: boolean;
   invalidReason?: ImageSafetyRewriteInvalidReason | string;
+  invalidDetail?: string;
 };
 
 export type ImageGenerationSafetyAudit = {
@@ -352,6 +353,7 @@ export async function generateImageWithModerationRecovery(
           attempt: 1,
           changed: !!llm.changed,
           invalidReason: llm.invalidReason,
+          invalidDetail: llm.invalidDetail,
         });
         if (!llm.changed) {
           llm = await rewriteLLM(user, submittedPrompt, {
@@ -362,11 +364,13 @@ export async function generateImageWithModerationRecovery(
             attempt: 2,
             changed: !!llm.changed,
             invalidReason: llm.invalidReason,
+            invalidDetail: llm.invalidDetail,
           });
         }
         if (!llm.changed) {
           const reason = llm.invalidReason || 'no_change';
-          markRewriteFailure(audit, `rewrite_failed:${reason}`);
+          const detail = llm.invalidDetail ? `:${llm.invalidDetail}` : '';
+          markRewriteFailure(audit, `rewrite_failed:${reason}${detail}`);
           persistImageGenerationAudit(user, input, {
             ...audit,
             finalSubmittedPrompt: submittedPrompt,

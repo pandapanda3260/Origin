@@ -133,7 +133,7 @@ export async function POST(req: NextRequest) {
     let uploadedTailFrameSourceHash: string | null = null;
     let uploadedFirstFrameSourceHash: string | null = null;
 
-    patchProjectForUser(projectId, user.id, (fresh) => {
+    const updated = patchProjectForUser(projectId, user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards)
         ? [...(fresh as any).storyboards]
@@ -238,6 +238,7 @@ export async function POST(req: NextRequest) {
       tailFrameSourceHash: isTail ? uploadedTailFrameSourceHash : undefined,
       tailFrameReferenceStatus: isTail ? 'ready' : undefined,
       firstFrameSourceHash: !isTail ? uploadedFirstFrameSourceHash : undefined,
+      serverVersion: Number((updated as any)?.version) || undefined,
       message: '上传成功',
     });
   } catch (e: any) {

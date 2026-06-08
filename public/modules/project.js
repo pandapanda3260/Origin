@@ -761,11 +761,37 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
     return info;
   }
 
+  function _canonicalStoryboardFirstFrameUrl(item) {
+    if (!item || typeof item !== "object") return "";
+    return (item.frames && item.frames.first && item.frames.first.url) ||
+      item.firstFrameUrl ||
+      (item.firstFrame && item.firstFrame.currentUrl) ||
+      item.url ||
+      item.imageUrl ||
+      item.rawUrl ||
+      "";
+  }
+
+  function _canonicalStoryboardFirstFrameRawUrl(item, canonicalUrl) {
+    if (!item || typeof item !== "object") return "";
+    return (item.firstFrame && item.firstFrame.rawUrl) ||
+      item.rawUrl ||
+      canonicalUrl ||
+      "";
+  }
+
   function _archiveOldImage(item, source) {
     if (!item || typeof item !== "object") return;
     var snap = {};
-    if (item.imageUrl) snap.url = item.imageUrl;
-    if (item.rawUrl && item.rawUrl !== snap.url) snap.rawUrl = item.rawUrl;
+    if (source === "storyboard") {
+      var canonicalUrl = _canonicalStoryboardFirstFrameUrl(item);
+      var canonicalRawUrl = _canonicalStoryboardFirstFrameRawUrl(item, canonicalUrl);
+      if (canonicalUrl) snap.url = canonicalUrl;
+      if (canonicalRawUrl && canonicalRawUrl !== snap.url) snap.rawUrl = canonicalRawUrl;
+    } else {
+      if (item.imageUrl) snap.url = item.imageUrl;
+      if (item.rawUrl && item.rawUrl !== snap.url) snap.rawUrl = item.rawUrl;
+    }
     if (item.realPhotoUrl && item.realPhotoUrl !== snap.url) snap.realPhotoUrl = item.realPhotoUrl;
     if (item.pencilUrl) snap.pencilUrl = item.pencilUrl;
     if (!snap.url && !snap.rawUrl && !snap.realPhotoUrl && !snap.pencilUrl) return;

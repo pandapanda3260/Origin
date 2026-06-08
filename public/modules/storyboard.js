@@ -1506,12 +1506,13 @@ function _storyboardAssetsHtml(group) {
   '</div>';
 }
 
-function _frameButtonHtml(action, gIdx, icon, text, title, variant, disabled) {
+function _frameButtonHtml(action, gIdx, icon, text, title, variant, disabled, extraAttrs) {
   var cls = variant === 'primary'
     ? 'bg-primary text-on-primary border-primary/20 shadow-sm hover:opacity-90'
     : 'bg-white/80 text-on-surface-variant border-white/60 hover:bg-white';
   return '<button type="button" class="flex items-center gap-1.5 px-3 py-2 rounded-full text-[10px] font-bold tracking-widest uppercase border backdrop-blur-md transition-all active:scale-95 ' + cls + '"' +
     (action ? ' data-action="' + action + '" data-gidx="' + gIdx + '"' : '') +
+    (extraAttrs ? ' ' + extraAttrs : '') +
     (title ? ' title="' + escapeHtml(title) + '"' : '') +
     (disabled ? ' disabled' : '') +
     '>' +
@@ -2920,7 +2921,7 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group, opts) {
     if (isTail && Array.isArray(sb.tailFrameHistory) && sb.tailFrameHistory.length) {
       buttons += _frameButtonHtml('show-tail-history', gIdx, 'history', '历史', '查看尾帧历史版本', 'secondary', false);
     }
-    buttons += _frameButtonHtml((canPrimary && !materialBlocked) ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'secondary', !canPrimary || materialBlocked);
+    buttons += _frameButtonHtml((canPrimary && !materialBlocked) ? primaryAction : '', gIdx, primaryIcon, primaryText, primaryTitle, 'secondary', !canPrimary || materialBlocked, 'data-frame-primary="' + (isTail ? 'tail' : 'first') + '"');
     // Tail-only: 删除按钮 = 清图 + 清意图。只有"已生成尾帧"或"已请求但尚未生成"才暴露该按钮。
     if (isTail && (hasImg || sb.tailFrameIntent === 'requested')) {
       buttons += _frameButtonHtml('delete-tail', gIdx, 'delete', '删除', '删除该尾帧并清除"需要尾帧"的意图（下次批量重做不会再生成）', 'secondary', false);
@@ -3461,7 +3462,8 @@ function _ffeImageAlertHtml(payload) {
   });
 
   // stale (severity: warn)
-  if (_ffeIsImageStale(payload)) {
+  // 生成进行中时不显示"提示词/素材已改变，请重新生成"——此刻正在重新生成，再催一遍自相矛盾。
+  if (_ffeIsImageStale(payload) && !_firstFrameEditor.generating) {
     var staleKey = 'stale:' + _ffeStaleDismissKey(payload);
     if (!dismissed[staleKey]) {
       items.push({
@@ -3738,7 +3740,7 @@ function _ffeModalHtml(payload, gIdx) {
           '</div>' +
           _ffeImageAlertHtml(payload) +
           '<div class="ffe-image-actions">' +
-            '<button type="button" class="ffe-action-secondary" data-ffe-action="download-current" data-url="' + escapeHtml(currentUrl) + '"' + (currentUrl ? '' : ' disabled') + '><span class="material-symbols-outlined">download</span><span>下载图片</span></button>' +
+            '<button type="button" class="ffe-action-secondary" data-ffe-action="download-current" data-url="' + escapeHtml(currentUrl) + '"' + (currentUrl && !generatingPreview ? '' : ' disabled') + '><span class="material-symbols-outlined">download</span><span>下载图片</span></button>' +
             '<span class="ffe-draft-actions">' +
               '<button type="button" class="ffe-action-ghost" data-ffe-action="restore-initial"' + (payload.draft ? '' : ' disabled') + '><span class="material-symbols-outlined">settings_backup_restore</span><span>恢复初始</span></button>' +
               '<button type="button" class="ffe-action-secondary" data-ffe-action="generate-draft" disabled><span class="material-symbols-outlined">refresh</span><span>重新生成</span></button>' +
@@ -5757,7 +5759,9 @@ function _requestFirstFramePreflight(groups, key, force) {
       message: payload && payload.allowed ? "" : _firstFramePreflightMessage(payload),
       promise: null,
     };
-    _updateImagesActionButton(getStoryboardGroups());
+    var nextGroups = getStoryboardGroups();
+    _updateImagesActionButton(nextGroups);
+    _syncFirstFramePrimaryButtons(nextGroups);
     return _firstFramePreflightState;
   }).catch(function (e) {
     if (_firstFramePreflightState.key !== key) return;
@@ -5769,7 +5773,9 @@ function _requestFirstFramePreflight(groups, key, force) {
       message: "镜头计划检查失败，请稍后重试。",
       promise: null,
     };
-    _updateImagesActionButton(getStoryboardGroups());
+    var nextGroups = getStoryboardGroups();
+    _updateImagesActionButton(nextGroups);
+    _syncFirstFramePrimaryButtons(nextGroups);
     return _firstFramePreflightState;
   });
   _firstFramePreflightState.promise = promise;
@@ -5896,6 +5902,49 @@ function _isFirstFramePreflightAllowedNow(groups) {
 function _firstFramePreflightTitleNow(groups) {
   var preflight = _getFirstFramePreflightState(groups);
   return preflight.status === "allowed" ? "" : (preflight.message || "正在检查镜头计划…");
+}
+
+function _firstFramePrimaryButtonState(gIdx, sb, groups, preflight) {
+  groups = groups || getStoryboardGroups();
+  preflight = preflight || _getFirstFramePreflightState(groups);
+  var materialBlockMessage = _materialLimitBlockMessage(groups, [gIdx]);
+  var preflightAllowed = preflight && preflight.status === "allowed";
+  var hasImg = !!_firstFrameImageUrl(sb);
+  var disabled = !!materialBlockMessage || !preflightAllowed;
+  return {
+    action: disabled ? "" : "regen-sb",
+    disabled: disabled,
+    icon: "auto_awesome",
+    text: hasImg ? "重新生成" : "生成首帧",
+    title: materialBlockMessage || (preflightAllowed ? "" : ((preflight && preflight.message) || "正在检查镜头计划…")),
+  };
+}
+
+function _syncFirstFramePrimaryButtons(groups) {
+  if (!project || typeof document === "undefined") return;
+  groups = groups || getStoryboardGroups();
+  var expectedKey = _firstFramePreflightKey(groups);
+  var preflight = _firstFramePreflightState.key === expectedKey
+    ? _firstFramePreflightState
+    : _getFirstFramePreflightState(groups);
+  groups.forEach(function (_group, gIdx) {
+    var buttons = document.querySelectorAll('.sb-sheet[data-group-idx="' + gIdx + '"] .sb-frame-panel[data-frame="first"] [data-frame-primary="first"]');
+    if (!buttons.length) return;
+    var sb = (project.storyboards && project.storyboards[gIdx]) || {};
+    var state = _firstFramePrimaryButtonState(gIdx, sb, groups, preflight);
+    buttons.forEach(function (btn) {
+      btn.disabled = !!state.disabled;
+      btn.dataset.gidx = String(gIdx);
+      if (state.action) btn.dataset.action = state.action;
+      else btn.removeAttribute("data-action");
+      if (state.title) btn.setAttribute("title", state.title);
+      else btn.removeAttribute("title");
+      var iconEl = btn.querySelector(".material-symbols-outlined");
+      if (iconEl) iconEl.textContent = state.icon;
+      var labelEl = btn.querySelector("span:not(.material-symbols-outlined)");
+      if (labelEl) labelEl.textContent = state.text;
+    });
+  });
 }
 
 /* ================================================================
@@ -6924,6 +6973,7 @@ export function checkImagesConfirm() {
   if (!project.storyboards) project.storyboards = [];
   _syncMergedStoryboardConfirmState(groups);
   _updateImagesActionButton(groups);
+  _syncFirstFramePrimaryButtons(groups);
 }
 
 /**
@@ -7040,7 +7090,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
       return finishingFromServer;
     }
 
-    function _applyResult(rawUrl, extra) {
+    function _applyResult(rawUrl, extra, serverVersion) {
       if (!rawUrl || _gotResult) return;
       _gotResult = true;
       var isTail = _isTailPatchExtra(extra);
@@ -7051,7 +7101,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
         _applyFrameImagePatch(existing, rawUrl, extra, group.shotIndices);
         proj.storyboards[gIdx] = existing;
         if (proj._staleFlags) delete proj._staleFlags["storyboard_" + gIdx];
-      });
+      }, serverVersion);
       if (isCurrent) {
         if (isTail) {
           renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
@@ -7075,7 +7125,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
             var extra = result.extra || {};
             var patch = result.patch || {};
             var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
-            _applyResult(url, extra);
+            _applyResult(url, extra, result.serverVersion);
           } else if (t.status === 'failed' && !_gotResult) {
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
             var extraPoll = (t.result && t.result.extra) || t.extra || {};
@@ -7104,7 +7154,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
         var extra = (data && data.extra) || {};
         var patch = (data && data.patch) || {};
         var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || (data && data.resultUrl) || "";
-        _applyResult(rawUrl, extra);
+        _applyResult(rawUrl, extra, data && data.serverVersion);
       },
       onTaskFailed: function (data) {
         var errMsgInner = ((data && data.errorMsg) || "生成失败").toString().slice(0, 120);
@@ -7281,7 +7331,7 @@ async function _uploadFrameImage(gIdx, file, kind) {
       var existing = proj.storyboards[gIdx] || {};
       _applyFrameImagePatch(existing, url, extra, null);
       proj.storyboards[gIdx] = existing;
-    });
+    }, data && data.serverVersion);
     renderStoryboardFrameCard(gIdx, isTail ? 'tail' : 'first', 'done', { imgUrl: displayUrl });
     saveProject();
     showToast(frameLabel + ' #' + (gIdx + 1) + ' 上传成功', 'success');
@@ -7409,7 +7459,7 @@ export async function generateStoryboardTailFrame(gIdx) {
       return finishingFromServer;
     }
 
-    function _applyResult(rawUrl, extra) {
+    function _applyResult(rawUrl, extra, serverVersion) {
       if (!rawUrl || _gotResult) return;
       _gotResult = true;
       var isCurrent = _safeWriteBack(originId, function (proj) {
@@ -7417,7 +7467,7 @@ export async function generateStoryboardTailFrame(gIdx) {
         var existing = proj.storyboards[gIdx] || {};
         _applyFrameImagePatch(existing, rawUrl, extra, group.shotIndices);
         proj.storyboards[gIdx] = existing;
-      });
+      }, serverVersion);
       if (isCurrent) {
         renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
       }
@@ -7436,7 +7486,7 @@ export async function generateStoryboardTailFrame(gIdx) {
             var extra = result.extra || {};
             var patch = result.patch || {};
             var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
-            _applyResult(url, extra);
+            _applyResult(url, extra, result.serverVersion);
           } else if (t.status === 'failed' && !_gotResult) {
             var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
             var extraPoll = _snapshotTaskExtra(t);
@@ -7472,7 +7522,7 @@ export async function generateStoryboardTailFrame(gIdx) {
         var extra = (data && data.extra) || {};
         var patch = (data && data.patch) || {};
         var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || (data && data.resultUrl) || "";
-        _applyResult(rawUrl, extra);
+        _applyResult(rawUrl, extra, data && data.serverVersion);
       },
       onTaskFailed: function (data) {
         var extra = (data && data.extra) || {};
@@ -7982,7 +8032,7 @@ export async function generateAllImages() {
   var _seenDone = Object.create(null);
   var _seenFailed = Object.create(null);
 
-  function _applyTaskCompleted(groupIdx, rawUrl, extra) {
+  function _applyTaskCompleted(groupIdx, rawUrl, extra, serverVersion) {
     if (typeof groupIdx !== 'number' || !rawUrl) return;
     if (_seenDone[groupIdx]) return;  // 已处理过
     _seenDone[groupIdx] = true;
@@ -8001,7 +8051,7 @@ export async function generateAllImages() {
       proj.storyboards[groupIdx] = existing;
       if (proj._staleFlags) delete proj._staleFlags["storyboard_" + groupIdx];
       if (isTail && proj._staleFlags) delete proj._staleFlags["tail_frame_" + groupIdx];
-    });
+    }, serverVersion);
     if (isCurrent) {
       if (isTail) {
         renderStoryboardFrameCard(groupIdx, 'tail', 'done', { imgUrl: rawUrl });
@@ -8070,7 +8120,7 @@ export async function generateAllImages() {
             ? extra.groupIdx
             : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
           var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
-          _applyTaskCompleted(gIdx, url, extra);
+          _applyTaskCompleted(gIdx, url, extra, result.serverVersion);
         } else if (t.status === 'failed') {
           var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
           _applyTaskFailed(gIdx2, t.errorMsg, _snapshotTaskExtra(t));
@@ -8105,7 +8155,7 @@ export async function generateAllImages() {
       var patch = data.patch || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : seqToGroupIdx[data.targetSeq];
       var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || patch.value || data.resultUrl || '';
-      _applyTaskCompleted(groupIdx, rawUrl, extra);
+      _applyTaskCompleted(groupIdx, rawUrl, extra, data && data.serverVersion);
     },
     onTaskFailed: function (data) {
       var extra = data.extra || {};

@@ -3,14 +3,14 @@ export type ReferenceStatus = 'ready' | 'degraded' | 'missing' | 'failed' | 'leg
 export type FirstFrameHistoryItem = {
   url: string;
   at: string;
-  source: 'generated' | 'last_known_good';
+  source: 'generated' | 'last_known_good' | 'uploaded' | 'history_restore';
 };
 
 export type FirstFrameState = {
   currentUrl?: string;
   rawUrl?: string;
   status: ReferenceStatus;
-  source: 'generated' | 'last_known_good';
+  source: 'generated' | 'last_known_good' | 'uploaded' | 'history_restore';
   lastKnownGoodUrl?: string;
   lastError?: any;
   history: FirstFrameHistoryItem[];
@@ -22,17 +22,35 @@ function cleanUrl(value: any): string {
 
 export function resolveStoryboardFirstFrameUrl(storyboard: any): string {
   return cleanUrl(
-    storyboard?.firstFrame?.currentUrl ||
-      storyboard?.frames?.first?.url ||
-      storyboard?.firstFrameUrl,
+    storyboard?.frames?.first?.url ||
+      storyboard?.firstFrameUrl ||
+      storyboard?.firstFrame?.currentUrl,
   );
+}
+
+function normalizeFirstFrameSource(value: any): FirstFrameHistoryItem['source'] {
+  const raw = cleanUrl(value);
+  if (raw === 'last_known_good' || raw === 'uploaded' || raw === 'history_restore') return raw;
+  return 'generated';
+}
+
+function firstFrameHistoryAt(storyboard: any, existing: any): string {
+  const raw = existing?.generatedAt ||
+    storyboard?.frames?.first?.generatedAt ||
+    storyboard?.firstFrameGeneratedAt ||
+    storyboard?.updatedAt;
+  if (raw) {
+    const date = new Date(raw);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+  return new Date(0).toISOString();
 }
 
 export function normalizeFirstFrameState(storyboard: any): FirstFrameState {
   const existing = storyboard?.firstFrame && typeof storyboard.firstFrame === 'object'
     ? storyboard.firstFrame
     : {};
-  const currentUrl = cleanUrl(existing.currentUrl || resolveStoryboardFirstFrameUrl(storyboard));
+  const currentUrl = cleanUrl(resolveStoryboardFirstFrameUrl(storyboard) || existing.currentUrl);
   const lastKnownGoodUrl = cleanUrl(existing.lastKnownGoodUrl || currentUrl);
   const legacyError = storyboard?.firstFrameLastError
     ? {
@@ -50,19 +68,31 @@ export function normalizeFirstFrameState(storyboard: any): FirstFrameState {
           .map((item: any) => ({
             url: cleanUrl(item?.url),
             at: item?.at ? new Date(item.at).toISOString() : new Date(0).toISOString(),
-            source: 'generated' as const,
+            source: normalizeFirstFrameSource(item?.source),
           }))
           .filter((item: FirstFrameHistoryItem) => cleanUrl(item.url))
       : [];
+  const currentSource = normalizeFirstFrameSource(
+    existing.source ||
+      storyboard?.frames?.first?.source ||
+      storyboard?.firstFrameMode,
+  );
+  const historyWithCurrent = currentUrl && !history.some((item: FirstFrameHistoryItem) => cleanUrl(item.url) === currentUrl)
+    ? [{
+        url: currentUrl,
+        at: firstFrameHistoryAt(storyboard, existing),
+        source: currentSource,
+      }, ...history]
+    : history;
 
   return {
     currentUrl: currentUrl || undefined,
     rawUrl: cleanUrl(existing.rawUrl || storyboard?.rawUrl) || undefined,
     status,
-    source: existing.source === 'last_known_good' ? 'last_known_good' : 'generated',
+    source: currentSource,
     lastKnownGoodUrl: lastKnownGoodUrl || undefined,
     lastError,
-    history,
+    history: historyWithCurrent,
   };
 }
 
