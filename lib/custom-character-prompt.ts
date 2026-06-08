@@ -7,6 +7,7 @@ import { applyTokenBudget, chatComplete } from './llm';
 import { resolveTextModelConfig } from './model-routing';
 import { postJsonWithProxySupport } from './proxy-fetch';
 import { getExternalEnvValue } from './env';
+import { normalizeCrowdFlag, normalizeCrowdSize } from './crowd-character';
 
 export type CustomCharacterEntityType = 'auto' | 'human' | 'non-human';
 type ResolvedCustomCharacterEntityType = 'human' | 'non-human';
@@ -16,12 +17,16 @@ export type CustomCharacterParams = {
   entityType: CustomCharacterEntityType;
   gender: 'auto' | 'male' | 'female' | 'unspecified';
   ageRange: 'auto' | 'teen' | 'young' | 'middle' | 'elder' | 'unspecified';
+  isCrowd: boolean;
+  crowdSize: string;
 };
 
 const DEFAULT_PARAMS: CustomCharacterParams = {
   entityType: 'auto',
   gender: 'auto',
   ageRange: 'auto',
+  isCrowd: false,
+  crowdSize: '',
 };
 
 function cleanText(value: any, max = 500) {
@@ -65,10 +70,13 @@ function normalizeAgeRange(value: any): CustomCharacterParams['ageRange'] {
 }
 
 export function normalizeCustomCharacterParams(raw: any): CustomCharacterParams {
+  const isCrowd = normalizeCrowdFlag(raw?.isCrowd ?? raw?.is_crowd) === true;
   return {
     entityType: normalizeEntityType(raw?.entityType ?? raw?.entity_type ?? DEFAULT_PARAMS.entityType),
     gender: normalizeGender(raw?.gender ?? DEFAULT_PARAMS.gender),
     ageRange: normalizeAgeRange(raw?.ageRange ?? raw?.age_range ?? DEFAULT_PARAMS.ageRange),
+    isCrowd,
+    crowdSize: isCrowd ? normalizeCrowdSize(raw?.crowdSize ?? raw?.crowd_size) : '',
   };
 }
 
@@ -163,10 +171,12 @@ function paramsHint(params: CustomCharacterParams) {
     `实体类型：${params.entityType === 'auto' ? '自动识别' : params.entityType === 'non-human' ? '非人' : '真人'}`,
     `性别呈现：${params.gender === 'auto' ? '自动识别' : params.gender === 'male' ? '男' : params.gender === 'female' ? '女' : '不限定'}`,
     `年龄段：${params.ageRange === 'auto' ? '自动识别' : params.ageRange === 'teen' ? '少年' : params.ageRange === 'middle' ? '中年' : params.ageRange === 'elder' ? '老年' : params.ageRange === 'unspecified' ? '不限定' : '青年'}`,
+    `群体角色：${params.isCrowd ? `是（${params.crowdSize || '一群'}）` : '否'}`,
   ].join('；');
 }
 
 function fallbackName(prompt: string, params: CustomCharacterParams) {
+  if (params.isCrowd) return '自定义群像';
   if (params.entityType === 'non-human') return '自定义非人角色';
   const text = cleanText(prompt, 16);
   return text ? text.replace(/[，。,.！!？?].*$/, '').slice(0, 12) : '自定义角色';
@@ -179,9 +189,11 @@ function fallbackFields(prompt: string, params: CustomCharacterParams, imageCapt
   const entityType: ResolvedCustomCharacterEntityType = params.entityType === 'non-human' ? 'non-human' : 'human';
   return normalizeCustomCharacterFields({
     name: fallbackName(prompt || imageCaption, params),
-    role: entityType === 'non-human' ? '非人叙事实体' : '自定义角色',
-    identity: subject.slice(0, 40) || '可用于项目创作的角色参考',
+    role: params.isCrowd ? '匿名群体' : entityType === 'non-human' ? '非人叙事实体' : '自定义角色',
+    identity: params.isCrowd ? '不锁单脸的匿名群体资产' : subject.slice(0, 40) || '可用于项目创作的角色参考',
     entityType,
+    isCrowd: params.isCrowd,
+    crowdSize: params.crowdSize,
     appearance: [ageText, genderText, subject].filter(Boolean).join('，').slice(0, 120),
     description: subject || '根据输入生成的角色设定',
     clothing: entityType === 'non-human' ? '' : '服装与整体气质遵循输入描述',
@@ -200,6 +212,8 @@ const FIELD_SCHEMA_HINT = `
   "role": "在故事或创作中的身份角色",
   "identity": "一句话身份定位",
   "entityType": "human 或 non-human",
+  "isCrowd": false,
+  "crowdSize": "仅 isCrowd=true 时填写：几人 / 十几人 / 成群",
   "appearance": "外貌描述，30-80 字",
   "description": "整体角色描述，30-80 字，必须输出",
   "clothing": "服装描述，20-60 字；非人无服装可为空字符串",
@@ -239,7 +253,7 @@ async function structureTextCharacter(user: UserRow, prompt: string, params: Cus
         `基础参数：${paramsHint(params)}`,
         `用户提示词：${prompt || '未填写'}`,
         FIELD_SCHEMA_HINT,
-        '要求：基础参数为“自动识别”时，由用户提示词判断；基础参数为明确值时，作为用户显式约束；description 必须有值；imagePrompt 不得包含风格、背景、白底、三视图、四视图等格式规则。',
+        '要求：基础参数为“自动识别”时，由用户提示词判断；基础参数为明确值时，作为用户显式约束；description 必须有值；imagePrompt 不得包含风格、背景、白底、三视图、四视图等格式规则；isCrowd=true 时只描述群体气质、规模、密度、年龄段、服装统一性和神态分布，禁止写成单人肖像。',
       ].join('\n\n'),
     },
   ], {
@@ -267,7 +281,7 @@ async function structureVisionCharacter(user: UserRow, imagePath: string, prompt
     `基础参数：${paramsHint(params)}`,
     prompt ? `用户补充提示词：${prompt}` : '用户补充提示词：未填写',
     FIELD_SCHEMA_HINT,
-    '要求：基础参数为“自动识别”时，由参考图判断；基础参数为明确值时，作为用户显式约束；description 必须有值；imagePrompt 不得包含风格、背景、白底、三视图、四视图等格式规则。',
+    '要求：基础参数为“自动识别”时，由参考图判断；基础参数为明确值时，作为用户显式约束；description 必须有值；imagePrompt 不得包含风格、背景、白底、三视图、四视图等格式规则；isCrowd=true 时只描述群体气质、规模、密度、年龄段、服装统一性和神态分布，禁止写成单人肖像。',
   ].join('\n\n');
   const timeoutMs = Number(
     getExternalEnvValue('IMAGE_CAPTION_TIMEOUT_MS') ||
@@ -340,6 +354,9 @@ async function structureVisionCharacter(user: UserRow, imagePath: string, prompt
 
 export function normalizeCustomCharacterFields(raw: any, params: CustomCharacterParams) {
   const entityType = resolveEntityTypeFromFields(raw, params);
+  const explicitCrowd = normalizeCrowdFlag(raw?.isCrowd ?? raw?.is_crowd);
+  const isCrowd = params.isCrowd || explicitCrowd === true;
+  const crowdSize = isCrowd ? normalizeCrowdSize(raw?.crowdSize ?? raw?.crowd_size ?? params.crowdSize) : '';
   const appearance = cleanText(raw?.appearance, 240);
   const description = cleanText(raw?.description, 240) || appearance || cleanText(raw?.imagePrompt, 180);
   const clothing = cleanText(raw?.clothing, 180);
@@ -350,9 +367,11 @@ export function normalizeCustomCharacterFields(raw: any, params: CustomCharacter
     : [];
   return {
     name: cleanText(raw?.name, 60) || fallbackName(imagePrompt, params),
-    role: cleanText(raw?.role, 80) || (entityType === 'non-human' ? '非人叙事实体' : '自定义角色'),
-    identity: cleanText(raw?.identity, 100) || description.slice(0, 60) || '可用于项目创作的角色参考',
+    role: cleanText(raw?.role, 80) || (isCrowd ? '匿名群体' : entityType === 'non-human' ? '非人叙事实体' : '自定义角色'),
+    identity: cleanText(raw?.identity, 100) || (isCrowd ? '不锁单脸的匿名群体资产' : description.slice(0, 60) || '可用于项目创作的角色参考'),
     entityType,
+    isCrowd,
+    crowdSize: isCrowd ? crowdSize : undefined,
     appearance,
     description,
     clothing,
@@ -434,6 +453,7 @@ export function buildCustomCharacterImagePrompt(input: {
 }) {
   const fields = input.fields || {};
   const hasReference = input.sourceType === 'image' || input.sourceType === 'image_prompt';
+  const isCrowd = normalizeCrowdFlag(fields.isCrowd) === true;
   const styleLockContext = buildAssetStyleLock(input.styleBible || {}, 'char');
   let prompt = cleanText(fields.imagePrompt, 1200) || [
     fields.name && `Subject: ${fields.name}.`,
@@ -441,16 +461,19 @@ export function buildCustomCharacterImagePrompt(input: {
     fields.clothing && `Clothing: ${fields.clothing}.`,
   ].filter(Boolean).join('\n');
   const charMeta: string[] = [];
-  if (fields.appearance) charMeta.push(`Current appearance (authoritative override): ${fields.appearance}.`);
-  if (fields.clothing) charMeta.push(`Current clothing (authoritative override): ${fields.clothing}.`);
+  if (fields.appearance) charMeta.push(`${isCrowd ? 'Current group appearance' : 'Current appearance'} (authoritative override): ${fields.appearance}.`);
+  if (fields.clothing) charMeta.push(`${isCrowd ? 'Current group clothing system' : 'Current clothing'} (authoritative override): ${fields.clothing}.`);
+  if (isCrowd && fields.crowdSize) charMeta.push(`Approximate crowd size: ${fields.crowdSize}.`);
   if (fields.equipment) charMeta.push(`Holding / wearing: ${fields.equipment}.`);
-  if (fields.temperament) charMeta.push(`Temperament keywords (must show in face/posture): ${fields.temperament}.`);
-  if (fields.actionTraits) charMeta.push(`Signature gestures (pose hints for the front view): ${fields.actionTraits}.`);
+  if (fields.temperament) charMeta.push(`${isCrowd ? 'Group temperament distribution' : 'Temperament keywords'} (must show in face/posture): ${fields.temperament}.`);
+  if (fields.actionTraits) charMeta.push(`${isCrowd ? 'Shared action/posture traits' : 'Signature gestures (pose hints for the front view)'}: ${fields.actionTraits}.`);
   if (charMeta.length) {
     prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image, override conflicting hints above) ===\n${charMeta.join('\n')}`;
   }
   if (hasReference) {
-    prompt = `${prompt}\n\n=== REFERENCE PRESERVATION LOCK (authoritative uploaded character baseline) ===\nUse the uploaded reference image as the primary identity and visual baseline. Preserve the visible face structure, species/body plan, hairstyle, clothing silhouette, colors, materials, accessories, and overall temperament unless the user prompt explicitly changes that trait.`;
+    prompt = isCrowd
+      ? `${prompt}\n\n=== REFERENCE PRESERVATION LOCK (authoritative uploaded group baseline) ===\nUse the uploaded reference image as the primary group visual baseline. Preserve the collective clothing system, species/body plan when non-human, density, colors, materials, accessories, and overall temperament unless the user prompt explicitly changes that trait. Do not lock or clone any individual face.`
+      : `${prompt}\n\n=== REFERENCE PRESERVATION LOCK (authoritative uploaded character baseline) ===\nUse the uploaded reference image as the primary identity and visual baseline. Preserve the visible face structure, species/body plan, hairstyle, clothing silhouette, colors, materials, accessories, and overall temperament unless the user prompt explicitly changes that trait.`;
   }
   const castingFields = hasReference && fields.entityType === 'human'
     ? { ...fields, castingOverride: { ethnicityType: 'unspecified' } }

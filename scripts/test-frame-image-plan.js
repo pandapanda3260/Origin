@@ -73,6 +73,25 @@ function loadFramePromptHelpers({ contentSanitize, characterConsistency }) {
 	        resolveCharacterAssetForEntity: () => null,
 	      };
 	    }
+	    if (id === './crowd-character') {
+	      return {
+	        isAnonymousCrowdAsset: (asset) => {
+	          if (!asset) return false;
+	          if (Object.prototype.hasOwnProperty.call(asset, 'isCrowd')) return asset.isCrowd === true;
+	          return /群像|人群|群众|群演|路人|背景人|crowd|extras|background people|group/i.test([
+	            asset.name,
+	            asset.role,
+	            asset.identity,
+	            asset.description,
+	            asset.appearance,
+	            asset.category,
+	            asset.tags,
+	            asset.crowdSize,
+	          ].flat().filter(Boolean).join(' '));
+	        },
+	        isLegacyCrowdText: (value) => /群像|人群|群众|群演|路人|背景人|crowd|extras|background people|group/i.test(String(value || '')),
+	      };
+	    }
 	    return require(id);
 	  }
   vm.runInNewContext(
@@ -181,6 +200,24 @@ function loadFrameImagePlan({
     if (id === './scene-selection') return sceneSelection;
 	    if (id === './frame-prompt-helpers') return frameHelpers;
 		    if (id === './reference-roles') return referenceRoles;
+    if (id === './crowd-character') {
+      return {
+        isAnonymousCrowdAsset: (asset) => {
+          if (!asset) return false;
+          if (Object.prototype.hasOwnProperty.call(asset, 'isCrowd')) return asset.isCrowd === true;
+          return /群像|人群|群众|群演|路人|背景人|crowd|extras|background people|group/i.test([
+            asset.name,
+            asset.role,
+            asset.identity,
+            asset.description,
+            asset.appearance,
+            asset.category,
+            asset.tags,
+            asset.crowdSize,
+          ].flat().filter(Boolean).join(' '));
+        },
+      };
+    }
     if (id === './project-dependency-state') {
       return {
         computeWorldHash: (project) => JSON.stringify({

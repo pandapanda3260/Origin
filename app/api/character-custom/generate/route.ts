@@ -20,8 +20,9 @@ import {
 } from '@/lib/custom-character-prompt';
 import { generateImageWithModerationRecovery } from '@/lib/safe-image-gen';
 import { splitCharacterPanels } from '@/lib/character-panels';
-import { deriveCharacterReferenceUpdate } from '@/lib/character-reference-update';
+import { deriveCharacterReferenceUpdate, deriveCrowdReferenceUpdate } from '@/lib/character-reference-update';
 import { resolveLLMConfig } from '@/lib/llm';
+import { characterAssetModeFor, isAnonymousCrowdAsset } from '@/lib/crowd-character';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -143,6 +144,7 @@ export async function POST(req: NextRequest) {
       params,
       sourceType,
     });
+    const isCrowd = isAnonymousCrowdAsset(structuredFields);
     const rawStyleBible = (project as any)?.styleBible || {};
     const script = (project as any)?.script || (project as any)?.scriptDraft || '';
     const { prompt: imagePrompt, styleLockContext } = buildCustomCharacterImagePrompt({
@@ -164,6 +166,7 @@ export async function POST(req: NextRequest) {
       style: 'natural',
       kind: 'character',
       entityType: structuredFields.entityType,
+      characterAssetMode: characterAssetModeFor(structuredFields),
       projectId: projectId || undefined,
       assetRef,
       quality: 'medium',
@@ -184,7 +187,7 @@ export async function POST(req: NextRequest) {
       },
     });
 
-    const panelResult = await splitCharacterPanels({
+    const panelResult = isCrowd ? null : await splitCharacterPanels({
       user,
       projectId,
       assetRef,
@@ -193,16 +196,19 @@ export async function POST(req: NextRequest) {
       prompt: result.submittedPrompt,
       version: versionNo,
     });
-    const referenceUpdate = deriveCharacterReferenceUpdate(
-      {
-        ...structuredFields,
-        imagePrompt: structuredFields.imagePrompt,
-      },
-      result,
-      panelResult,
-      structuredFields.entityType,
-      styleMeta,
-    );
+    const referenceBase = {
+      ...structuredFields,
+      imagePrompt: structuredFields.imagePrompt,
+    };
+    const referenceUpdate = isCrowd
+      ? deriveCrowdReferenceUpdate(referenceBase, result, styleMeta)
+      : deriveCharacterReferenceUpdate(
+          referenceBase,
+          result,
+          panelResult,
+          structuredFields.entityType,
+          styleMeta,
+        );
     const fields = {
       ...referenceUpdate.nextAsset,
       id: characterId,
@@ -228,7 +234,7 @@ export async function POST(req: NextRequest) {
       version: serializeCustomCharacterVersion(version),
       referenceStatus: referenceUpdate.referenceStatus,
       accepted: referenceUpdate.accepted,
-      panelError: panelResult.ok ? null : panelResult.error,
+      panelError: panelResult && !panelResult.ok ? panelResult.error : null,
     });
   } catch (error: any) {
     console.error('[character-custom] generate failed:', error?.message || error);

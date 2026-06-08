@@ -22,6 +22,7 @@ import { getDataDir } from './runtime-paths';
 import { DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT, getGlobalImageConcurrencyLimit } from './system-config';
 import { createAssetRecord, hashFile, localAssetUri } from './asset-library';
 import { getExternalEnvValue } from './env';
+import type { CharacterAssetMode } from './crowd-character';
 
 export type ImageGenInput = {
   prompt: string;
@@ -37,6 +38,7 @@ export type ImageGenInput = {
   // 默认 'human'：走"白底+真人摄影+三视图"风格；
   // 'non-human' 时换成"白底+实物写实+保留生物形态"风格，避免把蟹盾画成真人。
   entityType?: 'human' | 'non-human';
+  characterAssetMode?: CharacterAssetMode;
   projectId?: string;
   assetRef?: string; // e.g. 'characters[0]' / 'storyboards[2]'
   correlationId?: string;
@@ -830,10 +832,45 @@ function isPngBuffer(buffer: Buffer): boolean {
 function forceStyleSuffix(
   kind: ImageGenInput['kind'],
   entityType: ImageGenInput['entityType'] = 'human',
-  opts: Pick<ImageGenInput, 'styleLockApplied' | 'styleBackdropColor'> = {},
+  opts: Pick<ImageGenInput, 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode'> = {},
 ): string {
   if (kind === 'character') {
     const styleLocked = !!opts.styleLockApplied;
+    if (opts.characterAssetMode === 'anonymous_crowd') {
+      if (entityType === 'non-human') {
+        return [
+          styleLocked
+            ? '=== MANDATORY ANONYMOUS NON-HUMAN CROWD REFERENCE RULES (must follow) ==='
+            : '=== MANDATORY ANONYMOUS NON-HUMAN CROWD STYLE OVERRIDE (must follow) ===',
+          styleLocked
+            ? 'Style: high-detail creature/species group reference that follows the PROJECT CHARACTER STYLE LOCK above. Do not introduce a conflicting default model style.'
+            : 'Style: photorealistic creature/object group reference photography, sharp focus, high detail, production reference quality.',
+          'Layout: ONE single continuous image of a group. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+          'Subject: multiple individuals of the same non-human species/type, shown together as an anonymous group. Preserve the species, body plan, anatomy, material surface, scale cues, and natural posture from the prompt.',
+          'Variation: individuals may vary slightly in size, markings, shell/fur/material texture, pose, and spacing; do NOT clone one identical subject repeatedly.',
+          'Composition: slightly wide front-facing group reference, enough context to read group size, density, silhouette distribution, and shared visual identity.',
+          'Background: simple neutral production-reference background; keep the group readable and isolated from distracting environments.',
+          'CRITICAL: this is NOT a single subject model sheet. Do NOT generate front/side/back panels. Do NOT require the same subject to appear multiple times.',
+          'STRICTLY NOT allowed: turning the subjects into human people, adding human faces, human bodies, clothes, shoes, or human hands unless explicitly requested.',
+          'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels, names.',
+        ].join('\n');
+      }
+      return [
+        styleLocked
+          ? '=== MANDATORY ANONYMOUS CROWD REFERENCE RULES (must follow) ==='
+          : '=== MANDATORY ANONYMOUS CROWD STYLE OVERRIDE (must follow) ===',
+        styleLocked
+          ? 'Style: high-detail anonymous group reference that follows the PROJECT CHARACTER STYLE LOCK above. Do not introduce a conflicting default model style.'
+          : 'Style: photorealistic group reference photography, sharp focus, high detail, professional production reference quality.',
+        'Layout: ONE single continuous image of an anonymous group. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+        'Subject: multiple unnamed people as a crowd/group asset. Capture the collective visual identity: approximate group size, density, age range, clothing system, posture distribution, and shared temperament.',
+        'Faces: faces must be varied and natural. Do NOT make everyone the same person. Do NOT clone one face across the group. No individual face is an identity target.',
+        'Composition: slightly wide front-facing group reference, enough room to read scale, clothing rhythm, density, and emotional distribution.',
+        'Background: simple neutral production-reference background; keep the group readable and isolated from distracting environments.',
+        'CRITICAL: this is NOT a character model sheet. Do NOT generate headshot/front/side/back panels. Do NOT require the same person to appear multiple times.',
+        'STRICTLY NOT allowed: any text, watermark, logo, frame, border, panel labels, names.',
+      ].join('\n');
+    }
     if (entityType === 'non-human') {
       // 非人实体（拟人化海鲜、机甲、动物、异形）：保留生物本来的形态，
       // 不能强行画成真人；白底+写实摄影+三视图（前/严格 90° 侧/背），不要头部特写。
@@ -945,7 +982,7 @@ function forceStyleSuffix(
 }
 
 export function composeFinalImagePrompt(
-  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType' | 'styleLockApplied' | 'styleBackdropColor'>,
+  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType' | 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode'>,
 ): string {
   if (input.style === 'pencil') {
     const PENCIL_PREFIX = [

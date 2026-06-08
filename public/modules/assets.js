@@ -1428,6 +1428,7 @@ function _autoRecoverOrphanPencils() {
   var orphans = [];
   project.assets.characters.forEach(function (item, idx) {
     if (!item) return;
+    if (item.isCrowd) return;
     var et = (item.entityType || "human").toString().toLowerCase();
     if (et === "non-human") return;
     if (item.realPhotoUrl && !item.pencilUrl && !_backgroundStylizeTasks.has(idx)) {
@@ -1910,6 +1911,7 @@ function _updateStylizeBadge() {
   var total = 0;
   var done = 0;
   chars.forEach(function (c) {
+    if (c && c.isCrowd) return;
     var et = (c.entityType || "human").toString().toLowerCase();
     if (et === "non-human") return;  // 不需要转绘
     if (!c.realPhotoUrl) return;      // 第一步都没完成
@@ -1967,6 +1969,7 @@ function _summarizeAssetImageGeneration(hint) {
     });
   });
   (project.assets.characters || []).forEach(function (item) {
+    if (item && item.isCrowd) return;
     var et = (item.entityType || "human").toString().toLowerCase();
     if (et === "non-human") return;
     if (item.realPhotoUrl && !item.pencilUrl) pencil_pending++;
@@ -2793,6 +2796,11 @@ function _attachStylizeBatchForReattach(opts) {
       var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
       if (tgt.type !== "char" || typeof tgt.idx !== "number") return;
       var idx = tgt.idx;
+      if (extra.skippedReason === 'anonymous_crowd_no_stylize') {
+        _backgroundStylizeTasks.delete(idx);
+        _updateStylizeBadge();
+        return;
+      }
       var url = extra.pencilUrl || extra.rawUrl || "";
       if (!url) return;
       _ctx.safeWriteBack(originId, function (proj) {
@@ -3540,7 +3548,7 @@ function _showCharMenu(anchor, type, idx) {
   menu.className = "fixed z-50 min-w-[200px] bg-white rounded-2xl overflow-hidden border border-black/[0.06]";
   menu.style.cssText = "box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);";
   var _charItem = project.assets.characters[idx];
-  var _hasPencilIssue = _charItem && _charItem.realPhotoUrl && !_charItem.pencilUrl;
+  var _hasPencilIssue = _charItem && !_charItem.isCrowd && _charItem.realPhotoUrl && !_charItem.pencilUrl;
   var _menuEntityType = (((_charItem || {}).entityType) || 'human').toString().toLowerCase();
   var _isNonHumanMenu = _menuEntityType === 'non-human';
   var _retryLabel = _isNonHumanMenu ? '重试实体概念图' : '重试风格转换';
@@ -3879,6 +3887,12 @@ export async function _retryPencilConversion(idx) {
   var item = project.assets.characters[idx];
   if (!item || !item.realPhotoUrl) {
     showToast("该实体没有原始参考图，请先重新生成", "warn");
+    return;
+  }
+  if (item.isCrowd) {
+    showToast("群像使用整体参考图，不需要风格转换", "info");
+    delete item._pencilFailed;
+    _updateStylizeBadge();
     return;
   }
   var originId = project.id;

@@ -22,6 +22,12 @@ import {
   styleBibleForCharacterAsset,
   styleBibleForScenePrompt,
 } from '@/lib/casting-profile';
+import {
+  isAnonymousCrowdAsset,
+  normalizeCrowdFlag,
+  normalizeCrowdFlagForCompare,
+  normalizeCrowdSize,
+} from '@/lib/crowd-character';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { mergeProjectFactsIntoWorldSnapshot } from '@/lib/world-templates-db';
 
@@ -208,9 +214,14 @@ export async function POST(req: NextRequest) {
     // 兜底：如果 LLM 漏了某些必填字段，用其他字段拼一个，免得前端卡片显示空白
     parsed.characters = parsed.characters.map((c: any) => {
       const entityType = (c.entityType === 'non-human' ? 'non-human' : 'human') as 'human' | 'non-human';
-      return {
+      const explicitCrowd = normalizeCrowdFlag(c.isCrowd ?? c.is_crowd);
+      const isCrowd = explicitCrowd === undefined ? isAnonymousCrowdAsset(c) : explicitCrowd;
+      const crowdSize = normalizeCrowdSize(c.crowdSize ?? c.crowd_size ?? c.groupSize);
+      const normalized: any = {
         ...c,
         entityType,
+        isCrowd,
+        crowdSize: isCrowd && crowdSize ? crowdSize : undefined,
         // role / identity 是前端卡片小字一行；缺了就拿 intro 顶上，否则空
         role: c.role || c.intro || '',
         identity: c.identity || c.intro || '',
@@ -223,8 +234,15 @@ export async function POST(req: NextRequest) {
         actionTraits: c.actionTraits || '',
         tags: Array.isArray(c.tags) ? c.tags : [],
         castingOverride: normalizeCastingProfile(c.castingOverride || c.casting_override) || undefined,
-        imagePrompt: appendCharacterCastingPrompt(c.imagePrompt || buildCharacterPrompt(c, styleBible), c, styleBible, { script: finalScript }),
       };
+      normalized.imagePrompt = appendCharacterCastingPrompt(
+        c.imagePrompt || buildCharacterPrompt(normalized, styleBible),
+        normalized,
+        styleBible,
+        { script: finalScript },
+      );
+      if (!isCrowd) delete normalized.crowdSize;
+      return normalized;
     });
     let mainAssigned = false;
     const usedSceneIds = new Set<string>();
@@ -464,7 +482,7 @@ type PreserveAssetKind = 'characters' | 'scenes' | 'props';
 const IMAGE_RELEVANT_FIELDS: Record<PreserveAssetKind, string[]> = {
   characters: ['name', 'role', 'identity', 'appearance', 'clothing', 'equipment',
                'temperament', 'actionTraits', 'entityType', 'castingOverride',
-               'imagePrompt', 'description', 'tags'],
+               'imagePrompt', 'description', 'tags', 'isCrowd', 'crowdSize'],
   scenes: ['name', 'description', 'location', 'timeSetting', 'weather', 'lighting',
            'atmosphere', 'elements', 'imagePrompt'],
   props: ['name', 'propType', 'features', 'material', 'imagePrompt'],
@@ -486,10 +504,16 @@ function _normalizeFieldForCompare(value: any): string {
   return _stableStringify(value);
 }
 
+function _normalizeAssetFieldForCompare(kind: PreserveAssetKind, field: string, value: any): string {
+  if (kind === 'characters' && field === 'isCrowd') return normalizeCrowdFlagForCompare(value);
+  if (kind === 'characters' && field === 'crowdSize') return normalizeCrowdSize(value);
+  return _normalizeFieldForCompare(value);
+}
+
 function imageRelevantFieldsChanged(kind: PreserveAssetKind, next: any, prev: any): boolean {
   const fields = IMAGE_RELEVANT_FIELDS[kind];
   for (const f of fields) {
-    if (_normalizeFieldForCompare(next?.[f]) !== _normalizeFieldForCompare(prev?.[f])) return true;
+    if (_normalizeAssetFieldForCompare(kind, f, next?.[f]) !== _normalizeAssetFieldForCompare(kind, f, prev?.[f])) return true;
   }
   return false;
 }

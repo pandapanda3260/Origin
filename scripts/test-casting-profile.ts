@@ -29,4 +29,33 @@ const styleBible = { castingProfile: { ethnicityType: 'han_chinese' } };
   assert.equal(twice, once, 'non-human casting block should be idempotent');
 }
 
+{
+  const prompt = appendCharacterCastingPrompt(
+    [
+      'Base crowd prompt',
+      '=== CHARACTER CASTING LOCK (authoritative ethnicity/face baseline) ===',
+      'Casting lock: Han Chinese person, Chinese facial features.',
+    ].join('\n'),
+    { name: '考核少年少女群像', entityType: 'human', isCrowd: true },
+    styleBible,
+  );
+  assert.match(prompt, /ANONYMOUS CROWD CASTING RULES/);
+  assert.match(prompt, /Broad population baseline/);
+  assert.match(prompt, /faces must be varied/i);
+  assert.doesNotMatch(prompt, /authoritative ethnicity\/face baseline/);
+  assert.doesNotMatch(prompt, /Casting lock:/);
+}
+
+{
+  const prompt = appendCharacterCastingPrompt(
+    'Base non-human crowd prompt',
+    { name: '一排帝王蟹群像', entityType: 'non-human', isCrowd: true },
+    styleBible,
+  );
+  assert.match(prompt, /NON-HUMAN CHARACTER CASTING LOCK/);
+  assert.match(prompt, /ANONYMOUS NON-HUMAN CROWD VARIATION RULES/);
+  assert.match(prompt, /Preserve the species/);
+  assert.doesNotMatch(prompt, /Han Chinese person/);
+}
+
 console.log('[test-casting-profile] all assertions passed');

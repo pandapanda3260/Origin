@@ -6,6 +6,7 @@ import {
   type PanelName,
 } from './character-panels';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
+import { isAnonymousCrowdAsset } from './crowd-character';
 
 export type ShotPanelIntent = 'face' | 'body' | 'profile' | 'back' | 'group';
 
@@ -386,6 +387,23 @@ export function selectCharacterReferencePanels(opts: {
 
     const entityType = inferEntityTypeFromCharacter(item.character);
     const paths = resolveCharacterPanelPaths(item.character?.panels, opts.ownerId);
+    if (isAnonymousCrowdAsset(item.character)) {
+      const path = paths.sheet || fallbackSheetPath(item.character, opts.ownerId);
+      if (!path) continue;
+      selected.push({
+        assetId: characterAssetId(item.character, item.name),
+        characterName: item.name,
+        panel: 'sheet',
+        entityType,
+        url: panelUrlForPath(item.character, 'sheet', path, opts.ownerId),
+        path,
+        intent: 'group',
+        priority: item.score,
+        reason: frameMode ? 'frame:crowd:sheet-only' : 'crowd:sheet-only',
+        focusPair: false,
+      });
+      continue;
+    }
     const wantedPanels: Array<PanelName | 'sheet'> = frameMode
       ? framePanelsForIntent(intent, entityType)
       : focusPair

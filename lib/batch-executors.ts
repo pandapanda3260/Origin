@@ -48,7 +48,7 @@ import {
   splitCharacterPanels,
   type SplitCharacterPanelsResult,
 } from './character-panels';
-import { deriveCharacterReferenceUpdate } from './character-reference-update';
+import { deriveCharacterReferenceUpdate, deriveCrowdReferenceUpdate } from './character-reference-update';
 import { buildAssetStyleLock, type AssetStyleType } from './asset-style-lock';
 import {
   appendCharacterCastingPrompt,
@@ -64,6 +64,7 @@ import {
   type CharacterLock,
 } from './character-consistency';
 import { buildAssetAuthoritativeCharacterLock } from './character-lock-authority';
+import { characterAssetModeFor, isAnonymousCrowdAsset } from './crowd-character';
 import { buildVideoReferenceManifest } from './reference-matcher';
 import { sanitizePromptObject } from './content-sanitize';
 import {
@@ -999,6 +1000,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
 
   const { item, type, idx, cat } = resolveAssetTarget(proj, ctx.target);
   if (!item) throw new Error(`找不到 ${cat}[${idx}]`);
+  const isCrowdCharacterAsset = type === 'char' && isAnonymousCrowdAsset(item);
 
   ctx.progress({ stage: 'building_prompt' });
   const rawStyleBible = (proj as any).styleBible || {};
@@ -1038,16 +1040,17 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   // 气场（皱眉/手插腰），同样要求图像模型反映出来。
   if (type === 'char') {
     const rawLock = findCharacterLock(proj as any, item);
-    const lock = rawLock ? buildAssetAuthoritativeCharacterLock(rawLock, item) : null;
+    const lock = rawLock && !isCrowdCharacterAsset ? buildAssetAuthoritativeCharacterLock(rawLock, item) : null;
     if (lock) {
       prompt = `${prompt}\n\n=== CHARACTER CONSISTENCY LOCK (authoritative, must match exactly) ===\n${renderCharacterLockRosterLine(lock, 'en')}`;
     } else {
       const charMeta: string[] = [];
-      if (item.appearance) charMeta.push(`Current appearance (authoritative override): ${item.appearance}.`);
-      if (item.clothing) charMeta.push(`Current clothing (authoritative override): ${item.clothing}.`);
+      if (item.appearance) charMeta.push(`${isCrowdCharacterAsset ? 'Current group appearance' : 'Current appearance'} (authoritative override): ${item.appearance}.`);
+      if (item.clothing) charMeta.push(`${isCrowdCharacterAsset ? 'Current group clothing system' : 'Current clothing'} (authoritative override): ${item.clothing}.`);
+      if (isCrowdCharacterAsset && item.crowdSize) charMeta.push(`Approximate crowd size: ${item.crowdSize}.`);
       if (item.equipment) charMeta.push(`Holding / wearing: ${item.equipment}.`);
-      if (item.temperament) charMeta.push(`Temperament keywords (must show in face/posture): ${item.temperament}.`);
-      if (item.actionTraits) charMeta.push(`Signature gestures (pose hints for the front view): ${item.actionTraits}.`);
+      if (item.temperament) charMeta.push(`${isCrowdCharacterAsset ? 'Group temperament distribution' : 'Temperament keywords'} (must show in face/posture): ${item.temperament}.`);
+      if (item.actionTraits) charMeta.push(`${isCrowdCharacterAsset ? 'Shared action/posture traits' : 'Signature gestures (pose hints for the front view)'}: ${item.actionTraits}.`);
       if (charMeta.length) {
         prompt = `${prompt}\n\n=== CHARACTER METADATA (must reflect in image, override conflicting hints above) ===\n${charMeta.join('\n')}`;
       }
@@ -1083,6 +1086,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     style: 'natural',
     kind: type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop',
     entityType: type === 'char' ? entityType : undefined,
+    characterAssetMode: type === 'char' ? characterAssetModeFor(item) : undefined,
     projectId: ctx.projectId,
     assetRef: `${cat}[${idx}]`,
     // 角色参考图和场景主环境图细节多，低画质会糊掉脸和场景纹理；
@@ -1100,7 +1104,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   });
 
   let panelResult: SplitCharacterPanelsResult | null = null;
-  if (type === 'char') {
+  if (type === 'char' && !isCrowdCharacterAsset) {
     ctx.progress({ stage: 'splitting_character_panels' });
     panelResult = await splitCharacterPanels({
       user: ctx.user,
@@ -1116,7 +1120,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     }
   }
   const eventReferenceUpdate = type === 'char'
-    ? deriveCharacterReferenceUpdate(item, result, panelResult, entityType, styleReferenceMeta, undefined, findCharacterLock(proj, item)?.referenceLock)
+    ? isCrowdCharacterAsset
+      ? deriveCrowdReferenceUpdate(item, result, styleReferenceMeta)
+      : deriveCharacterReferenceUpdate(item, result, panelResult, entityType, styleReferenceMeta, undefined, findCharacterLock(proj, item)?.referenceLock)
     : null;
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
@@ -1135,7 +1141,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     };
     const assetReferenceLock = type === 'char' ? findCharacterLock(fresh, baseAsset)?.referenceLock : undefined;
     const charAssetUpdate = type === 'char'
-      ? deriveCharacterReferenceUpdate(baseAsset, result, panelResult, entityType, styleReferenceMeta, undefined, assetReferenceLock)
+      ? isAnonymousCrowdAsset(baseAsset)
+        ? deriveCrowdReferenceUpdate(baseAsset, result, styleReferenceMeta)
+        : deriveCharacterReferenceUpdate(baseAsset, result, panelResult, entityType, styleReferenceMeta, undefined, assetReferenceLock)
       : null;
     let nextAsset = charAssetUpdate ? charAssetUpdate.nextAsset : {
       ...baseAsset,
@@ -1174,7 +1182,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     };
     const topReferenceLock = type === 'char' ? findCharacterLock(fresh, baseTop)?.referenceLock : undefined;
     const charTopUpdate = type === 'char'
-      ? deriveCharacterReferenceUpdate(baseTop, result, panelResult, entityType, styleReferenceMeta, undefined, topReferenceLock)
+      ? isAnonymousCrowdAsset(baseTop)
+        ? deriveCrowdReferenceUpdate(baseTop, result, styleReferenceMeta)
+        : deriveCharacterReferenceUpdate(baseTop, result, panelResult, entityType, styleReferenceMeta, undefined, topReferenceLock)
       : null;
     let nextTop = charTopUpdate ? charTopUpdate.nextAsset : {
       ...baseTop,
@@ -1200,7 +1210,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     nextTop = _withArchivedImageHistory(top[idx], nextTop, type, 'regen');
     top[idx] = nextTop;
     const patch: any = { assets, [topKey]: top };
-    if (type === 'char') {
+    if (type === 'char' && !isAnonymousCrowdAsset(nextAsset)) {
       const mutation = mutateCharacterLock(
         { ...(fresh as any), ...patch },
         nextAsset.characterId || nextAsset.id || nextAsset.name || `characters[${idx}]`,
@@ -1241,7 +1251,11 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       referenceStatus: eventReferenceUpdate?.referenceStatus,
       lastAttemptUrl: eventReferenceUpdate && !eventReferenceUpdate.accepted ? result.url : undefined,
       lastError: eventReferenceUpdate && !eventReferenceUpdate.accepted ? eventReferenceUpdate.lastError : undefined,
-      panels: eventReferenceUpdate?.accepted && panelResult?.ok ? panelResult.panels : undefined,
+      panels: eventReferenceUpdate?.accepted
+        ? isCrowdCharacterAsset
+          ? eventReferenceUpdate.nextAsset?.panels
+          : panelResult?.ok ? panelResult.panels : undefined
+        : undefined,
       panelsError: eventReferenceUpdate && !eventReferenceUpdate.accepted
         ? (eventReferenceUpdate.lastError?.message || eventReferenceUpdate.lastError?.reason)
         : undefined,
@@ -1269,6 +1283,27 @@ registerExecutor('asset_stylize', async (ctx: BatchExecCtx) => {
     '',
   ).trim();
   if (!sourceUrl) throw new Error(`角色 ${idx + 1} 缺少可转绘的参考图`);
+
+  if (isAnonymousCrowdAsset(item)) {
+    return {
+      resultUrl: sourceUrl,
+      patch: {
+        type: 'asset_stylize',
+        cat,
+        idx,
+        skipped: true,
+        reason: 'anonymous_crowd_no_stylize',
+      },
+      extra: {
+        type,
+        idx,
+        rawUrl: sourceUrl,
+        skippedStylize: true,
+        skippedReason: 'anonymous_crowd_no_stylize',
+        mode: 'crowd-noop',
+      },
+    };
+  }
 
   const sourcePath = resolveLocalImagePath(sourceUrl, ctx.user.id);
   let pencilUrl = sourceUrl;

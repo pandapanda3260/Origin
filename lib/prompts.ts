@@ -1135,6 +1135,8 @@ const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
       "role": "在故事中的身份角色",
       "identity": "一句话身份定位",
       "entityType": "human 或 non-human",
+      "isCrowd": false,
+      "crowdSize": "仅 isCrowd=true 时填写：几人 / 十几人 / 成群；普通单体角色不要填写",
       "appearance": "外貌描述，30-60 字；只写年龄/体型/神态/发型/职业气质等，不写中国人/欧美人/白人/东亚人/华人/外国人",
       "clothing": "服装描述，20-40 字",
       "castingOverride": {"ethnicityType": "仅当该角色与风格圣经 castingProfile 不一致时输出；否则不要输出"},
@@ -1153,6 +1155,10 @@ const SP_ASSET_CHARACTERS_EXTRACT = `${COMMON_RULES}
   · role + identity 不能空。
   · entityType 必填：真人外形填 human，拟人化动物/海鲜/机甲/异形/AI 生物填 non-human。
   · 非人角色必须写真实物种/形态，不要画成人。
+  · isCrowd 必填布尔值：一群无名同类人/生物/路人/围观者/考核群像/弟子群像填 true；能点名、有独立戏份、需要跨镜头锁脸/锁体态的个体填 false。
+  · isCrowd=true 时，name 可写"考核少年少女群像""围观弟子群像"这类集合名；crowdSize 只写粗档，不建成员清单。
+  · isCrowd=true 时，appearance / clothing / imagePrompt 必须描述群体气质、规模、密度、年龄段、服装统一性、神态分布；禁止写成单人肖像，禁止暗示所有人同一张脸。
+  · 反复出现且需要保持同一张脸的"三师兄弟"这类对象必须拆成三个普通角色，不要放进群像。
   · 风格圣经里的 castingProfile 是全局默认人物外观；普通继承全局的角色不要写 castingOverride。
   · 只有剧本明确该角色是外国人/欧美人/混血/外籍等，且与全局 castingProfile 不一致时，才输出 castingOverride.ethnicityType。
   · appearance 不写人群/民族/国籍外观，这些只由 castingProfile / castingOverride 表达。

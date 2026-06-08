@@ -10,6 +10,7 @@ import {
   type CharacterEntityType,
 } from '@/lib/character-panels';
 import { mutateCharacterLock } from '@/lib/character-consistency';
+import { isAnonymousCrowdAsset } from '@/lib/crowd-character';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -62,6 +63,9 @@ export async function POST(req: NextRequest) {
 
   const character = proj?.assets?.characters?.[idx] ?? proj?.characters?.[idx];
   if (!character) return jsonError(`找不到 characters[${idx}]`, 404);
+  if (isAnonymousCrowdAsset(character)) {
+    return jsonError('匿名群体不支持四视图切分，请使用整体群像参考图', 409);
+  }
 
   const sourceImageUrl = pickSourceImageUrl(body, character);
   if (!sourceImageUrl) return jsonError('角色缺少可切分的图片 URL', 400);

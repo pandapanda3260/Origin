@@ -35,6 +35,7 @@ import {
   selectCharacterReferencePanels,
   type CharacterReferencePanel,
 } from './panel-selection';
+import { isAnonymousCrowdAsset } from './crowd-character';
 import type { CharacterEntityType, PanelName } from './character-panels';
 import { pickSceneForShots } from './scene-selection';
 import { resolveShotFieldsForPrompt } from './shot-plan-normalize';
@@ -251,19 +252,7 @@ function propName(prop: any): string {
 }
 
 function isCrowdCharacter(ch: any): boolean {
-  if (!ch) return false;
-  if (ch.isCrowd === true) return true;
-  const text = [
-    ch.name,
-    ch.role,
-    ch.identity,
-    ch.description,
-    ch.appearance,
-    ch.category,
-    ch.tags,
-    ch.crowdSize,
-  ].flat().filter(Boolean).join(' ');
-  return /群像|人群|群众|路人|背景人|crowd|extras|background people|group/i.test(text);
+  return isAnonymousCrowdAsset(ch);
 }
 
 function characterPanelPurpose(panel: CharacterReferencePanel): string {

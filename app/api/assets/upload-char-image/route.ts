@@ -10,6 +10,7 @@ import { buildSignedImageUrl } from '@/lib/signed-asset-url';
 import { mutateCharacterLock } from '@/lib/character-consistency';
 import { getDataDir } from '@/lib/runtime-paths';
 import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
+import { isAnonymousCrowdAsset } from '@/lib/crowd-character';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -185,6 +186,7 @@ export async function POST(req: NextRequest) {
         if (target.type !== 'char') return patch;
 
         const nextChar = list[target.idx] || top[target.idx];
+        if (isAnonymousCrowdAsset(nextChar)) return patch;
         const mutation = mutateCharacterLock(
           { ...(fresh as any), ...patch },
           nextChar.characterId || nextChar.id || nextChar.name || `characters[${target.idx}]`,

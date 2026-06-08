@@ -26,6 +26,8 @@ var _form = {
     entityType: 'auto',
     gender: 'auto',
     ageRange: 'auto',
+    isCrowd: false,
+    crowdSize: '',
   },
 };
 
@@ -125,7 +127,7 @@ function _scrollPreviewIntoView() {
 }
 
 function _baseParams(params) {
-  return Object.assign({ entityType: 'auto', gender: 'auto', ageRange: 'auto' }, params || {});
+  return Object.assign({ entityType: 'auto', gender: 'auto', ageRange: 'auto', isCrowd: false, crowdSize: '' }, params || {});
 }
 
 function _characterMetaTagsHtml(fields, cardId) {
@@ -229,7 +231,12 @@ function _paramRowsHtml() {
       _paramButton('middle', p.ageRange, 'data-character-param-age', '中年') +
       _paramButton('elder', p.ageRange, 'data-character-param-age', '老年') +
       _paramButton('unspecified', p.ageRange, 'data-character-param-age', '不限定') +
-    '</div></div>';
+    '</div></div>' +
+    '<div class="toolbox-field"><span>群体角色</span><div class="toolbox-choice-row character-choice-row">' +
+      _paramButton('0', p.isCrowd ? '1' : '0', 'data-character-param-crowd', '单体') +
+      _paramButton('1', p.isCrowd ? '1' : '0', 'data-character-param-crowd', '群体') +
+    '</div></div>' +
+    (p.isCrowd ? '<label class="toolbox-field"><span>群体规模</span><input id="characterCrowdSizeInput" value="' + escapeHtml(p.crowdSize || '') + '" placeholder="如：三人 / 一群 / 十余人" /></label>' : '');
 }
 
 function _refHtml() {
@@ -965,7 +972,7 @@ function _startNew() {
   _form = {
     name: '',
     prompt: '',
-    params: { entityType: 'auto', gender: 'auto', ageRange: 'auto' },
+    params: { entityType: 'auto', gender: 'auto', ageRange: 'auto', isCrowd: false, crowdSize: '' },
   };
   _render();
   _scrollEditorTop();
@@ -977,6 +984,8 @@ function _syncFormFromDom() {
   if (prompt) _form.prompt = prompt.value;
   var name = $('characterNameInput');
   if (name) _form.name = name.value;
+  var crowdSize = $('characterCrowdSizeInput');
+  if (crowdSize) _form.params.crowdSize = crowdSize.value;
 }
 
 async function _uploadReference(file) {
@@ -1348,6 +1357,14 @@ export function _initCharacterCustomEvents() {
     if (age) {
       _syncFormFromDom();
       _form.params.ageRange = age.getAttribute('data-character-param-age') || 'auto';
+      _render();
+      return;
+    }
+    var crowd = ev.target.closest('[data-character-param-crowd]');
+    if (crowd) {
+      _syncFormFromDom();
+      _form.params.isCrowd = crowd.getAttribute('data-character-param-crowd') === '1';
+      if (!_form.params.isCrowd) _form.params.crowdSize = '';
       _render();
       return;
     }

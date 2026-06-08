@@ -12,6 +12,7 @@ import {
   buildAssetAuthoritativeCharacterLock,
   resolveCharacterAssetForEntity,
 } from './character-lock-authority';
+import { isAnonymousCrowdAsset, isLegacyCrowdText } from './crowd-character';
 
 export function truncate(value: any, n: number): string {
   const s = String(value || '');
@@ -89,6 +90,7 @@ export function buildCharacterLockRoster(
     const mentioned = names.some((name) => charNames.has(name) || contextText.includes(name));
     if (!mentioned) continue;
     const resolution = resolveCharacterAssetForEntity(project, lock);
+    if (resolution.asset ? isAnonymousCrowdAsset(resolution.asset) : isLegacyCrowdText(names.join(' '))) continue;
     const projectedLock = buildAssetAuthoritativeCharacterLock(lock, resolution.asset);
     lines.push(renderCharacterLockRosterLine(projectedLock, language));
   }

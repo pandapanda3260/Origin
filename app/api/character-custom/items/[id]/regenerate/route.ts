@@ -17,9 +17,10 @@ import {
 } from '@/lib/custom-character-prompt';
 import { generateImageWithModerationRecovery } from '@/lib/safe-image-gen';
 import { splitCharacterPanels } from '@/lib/character-panels';
-import { deriveCharacterReferenceUpdate } from '@/lib/character-reference-update';
+import { deriveCharacterReferenceUpdate, deriveCrowdReferenceUpdate } from '@/lib/character-reference-update';
 import { resolveLLMConfig } from '@/lib/llm';
 import { resolveLocalImagePath } from '@/lib/image-gen';
+import { characterAssetModeFor, isAnonymousCrowdAsset } from '@/lib/crowd-character';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -96,6 +97,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
   const body = await req.json().catch(() => ({} as any));
   const previousFields = JSON.parse(currentVersion.fields_json || '{}');
   const fields = normalizeCustomCharacterEditableFields(previousFields, body.fields || {});
+  const isCrowd = isAnonymousCrowdAsset(fields);
   const projectId = character.project_id || null;
   const project = projectId ? getProjectByIdForUser(projectId, user.id) : null;
   const rawStyleBible = (project as any)?.styleBible || {};
@@ -127,6 +129,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       style: 'natural',
       kind: 'character',
       entityType: entityTypeOf(fields),
+      characterAssetMode: characterAssetModeFor(fields),
       projectId: projectId || undefined,
       assetRef,
       quality: 'medium',
@@ -147,7 +150,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       },
     });
 
-    const panelResult = await splitCharacterPanels({
+    const panelResult = isCrowd ? null : await splitCharacterPanels({
       user,
       projectId,
       assetRef,
@@ -156,7 +159,9 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       prompt: result.submittedPrompt,
       version: versionNo,
     });
-    const referenceUpdate = deriveCharacterReferenceUpdate(fields, result, panelResult, entityTypeOf(fields), styleMeta);
+    const referenceUpdate = isCrowd
+      ? deriveCrowdReferenceUpdate(fields, result, styleMeta)
+      : deriveCharacterReferenceUpdate(fields, result, panelResult, entityTypeOf(fields), styleMeta);
 
     if (!referenceUpdate.accepted) {
       const failedFields = failedRegenerateFields(fields, referenceUpdate.lastError || '角色设定图切片失败', result.url);
@@ -212,7 +217,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       version: serializeCustomCharacterVersion(version),
       referenceStatus: referenceUpdate.referenceStatus,
       accepted: referenceUpdate.accepted,
-      panelError: panelResult.ok ? null : panelResult.error,
+      panelError: panelResult && !panelResult.ok ? panelResult.error : null,
     });
   } catch (error: any) {
     const failedFields = failedRegenerateFields(fields, error);

@@ -7,6 +7,8 @@ import {
 import { resolveCharacterMentions } from './character-mention-resolver';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 import { storyboardShotIndices } from './frame-workflow-state';
+import { resolveCharacterAssetForEntity } from './character-lock-authority';
+import { isAnonymousCrowdAsset, isLegacyCrowdText } from './crowd-character';
 
 export type CharacterConsistencyTarget = 'videoPrompt' | 'videoSegment';
 
@@ -120,6 +122,12 @@ function lockNames(lock: CharacterLock): string[] {
   return [lock.canonicalName, ...lock.aliases].map(normalizeText).filter(Boolean);
 }
 
+function isCrowdLockForGate(project: any, lock: CharacterLock): boolean {
+  const resolution = resolveCharacterAssetForEntity(project, lock);
+  if (resolution.asset) return isAnonymousCrowdAsset(resolution.asset);
+  return isLegacyCrowdText(lockNames(lock).join(' '));
+}
+
 function versionSnapshot(lock: CharacterLock, deps: VersionKey[]): Partial<CharacterVersions> {
   const out: Partial<CharacterVersions> = {};
   deps.forEach((key) => {
@@ -229,9 +237,10 @@ export function validateCharacterConsistencyForGroup(
   },
 ): CharacterConsistencyGateResult {
   const projectWithConsistency = ensureProjectConsistency(project || {}, { source: 'migration' });
-  const locks: CharacterLock[] = Array.isArray(projectWithConsistency.consistency?.characters)
+  const allLocks: CharacterLock[] = Array.isArray(projectWithConsistency.consistency?.characters)
     ? projectWithConsistency.consistency.characters
     : [];
+  const locks = allLocks.filter((lock) => !isCrowdLockForGate(projectWithConsistency, lock));
   const deps = TARGET_VERSION_DEPS[opts.target];
   const text = groupText(project, opts.groupIdx, opts.shotIndices);
   const warnings: CharacterConsistencyFinding[] = [];

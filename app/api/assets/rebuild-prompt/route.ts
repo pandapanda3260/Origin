@@ -4,6 +4,7 @@ import { chatComplete } from '@/lib/llm';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { sanitizePromptObject } from '@/lib/content-sanitize';
 import { appendCharacterCastingPrompt, omitCastingProfileFromStyleBible } from '@/lib/casting-profile';
+import { isAnonymousCrowdAsset } from '@/lib/crowd-character';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -38,6 +39,20 @@ const SP_REBUILD = `你是 AI 图像生成提示词工程师，专为"白底+写
 
 直接输出 prompt 段落。`;
 
+const SP_REBUILD_CROWD = `你是 AI 图像生成提示词工程师，专为"匿名群体"参考图写中文 prompt。
+
+【任务】根据用户给的群像资产数据，重写一段 80-220 字的中文 imagePrompt。
+
+【硬性要求】
+- 中文为主，纯文本，不要 markdown 围栏 / 不要"prompt:"前缀 / 不要解释。
+- 只描述群体本身：人群规模、密度、年龄段、服装系统、姿态分布、神态分布、集体气质、随身物。
+- 不写单个具名成员，不写"同一个人"，不写需要锁定某张脸的描述。
+- 明确表达人脸/个体应自然多样，但服装、时代、职业或阵营基调统一。
+- 不写风格、光线、背景、三视图、四视图、reference sheet、split-screen、grid、model sheet。
+- 不写中国人/欧美人/白人/东亚人/华人/外国人等人群身份；人物 casting 由系统统一注入。
+
+直接输出 prompt 段落。`;
+
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
@@ -61,7 +76,7 @@ export async function POST(req: NextRequest) {
     prompt = await chatComplete(
       user,
       [
-        { role: 'system', content: SP_REBUILD },
+        { role: 'system', content: (target === 'char' || target === 'character') && isAnonymousCrowdAsset(item) ? SP_REBUILD_CROWD : SP_REBUILD },
         { role: 'user', content: ctx.join('\n\n') },
       ],
       { temperature: 0.5, maxTokens: 400, modelRole: 'structured' },

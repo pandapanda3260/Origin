@@ -1,3 +1,5 @@
+import { isAnonymousCrowdAsset } from './crowd-character';
+
 export type CastingEthnicityType =
   | 'han_chinese'
   | 'east_asian'
@@ -216,16 +218,35 @@ export function formatCharacterCastingPromptBlock(
   styleBible: any,
   opts: { script?: any } = {},
 ): string {
+  const isCrowd = isAnonymousCrowdAsset(character);
   if (isNonHumanCharacter(character)) {
-    return [
+    const lines = [
       '=== NON-HUMAN CHARACTER CASTING LOCK (authoritative subject baseline) ===',
       'Subject lock: non-human subject only. Preserve the species, body plan, scale, shell/fur/skin/material surface, limb count, posture, and natural movement cues from the role, identity, appearance, clothing, and equipment fields.',
       'Subject negative prompt: no human, no humanoid body, no human face portrait, no suit, no shirt, no bow tie, no dress, no shoes, no human hands, no human hairstyle, no anthropomorphic expression unless explicitly requested.',
-    ].join('\n');
+    ];
+    if (isCrowd) {
+      lines.push(
+        '=== ANONYMOUS NON-HUMAN CROWD VARIATION RULES ===',
+        'Group lock: render multiple individuals of the same non-human species/type, not one subject repeated as a model sheet.',
+        'Variation rule: preserve the species baseline while allowing natural differences in size, markings, texture, pose, and spacing. Do not clone one identical body.',
+      );
+    }
+    return lines.join('\n');
   }
   const fallback = normalizeCastingProfile(styleBible?.castingProfile || styleBible?.casting_profile)
     || inferFallbackCastingProfile({ script: opts.script });
   const type = effectiveCharacterCasting(character, styleBible, fallback);
+  if (isCrowd) {
+    const positive = formatCastingLockPrompt(type).replace(/^Casting lock:\s*/i, '').replace(/[.。]\s*$/, '').trim();
+    const negative = formatCastingNegativePrompt(type);
+    return [
+      '=== ANONYMOUS CROWD CASTING RULES (broad population baseline, no face lock) ===',
+      positive ? `Broad population baseline: ${positive}.` : '',
+      negative ? `Broad casting negative prompt: ${negative}.` : '',
+      'Face rule: faces must be varied and natural across the group. Do NOT clone one face, do NOT make everyone the same person, and do NOT treat any individual face as a continuity target.',
+    ].filter(Boolean).join('\n');
+  }
   const positive = formatCastingLockPrompt(type);
   const negative = formatCastingNegativePrompt(type);
   const lines = [
@@ -239,15 +260,27 @@ export function formatCharacterCastingPromptBlock(
   ].join('\n');
 }
 
+function stripSingleFaceCastingBlocks(prompt: string): string {
+  return prompt
+    .replace(/\n*\n?=== CHARACTER CASTING LOCK \(authoritative ethnicity\/face baseline\) ===[\s\S]*?(?=\n\n=== |\s*$)/g, '')
+    .replace(/\n*\n?Casting lock:[^\n]*(?:\nCasting negative prompt:[^\n]*)?/gi, '')
+    .trim();
+}
+
 export function appendCharacterCastingPrompt(
   prompt: any,
   character: any,
   styleBible: any,
   opts: { script?: any } = {},
 ): string {
-  const base = String(prompt || '').trim();
+  let base = String(prompt || '').trim();
   const block = formatCharacterCastingPromptBlock(character, styleBible, opts);
   if (!block) return base;
+  if (isAnonymousCrowdAsset(character)) {
+    if (base.includes('ANONYMOUS CROWD CASTING RULES') || base.includes('ANONYMOUS NON-HUMAN CROWD VARIATION RULES')) return base;
+    if (!isNonHumanCharacter(character)) base = stripSingleFaceCastingBlocks(base);
+    return [base, block].filter(Boolean).join('\n\n');
+  }
   if (base.includes('CHARACTER CASTING LOCK') || base.includes('Casting lock:')) return base;
   return [base, block].filter(Boolean).join('\n\n');
 }

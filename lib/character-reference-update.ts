@@ -401,3 +401,57 @@ export function deriveCharacterReferenceUpdate(
     lastError,
   };
 }
+
+export function deriveCrowdReferenceUpdate(
+  prevAsset: any,
+  generated: GeneratedImageLike,
+  styleMeta: CharacterReferenceStyleMeta = {},
+  nowIso = new Date().toISOString(),
+): CharacterReferenceUpdate {
+  const previous = prevAsset && typeof prevAsset === 'object' ? prevAsset : {};
+  const reference = cleanReferenceSuccess({
+    ...(previous.reference || {}),
+    currentUrl: generated.url,
+    lastKnownGoodUrl: generated.url,
+    status: 'ready',
+    updatedAt: nowIso,
+    styleBibleSignature: styleMeta.styleBibleSignature,
+    styleLockVersion: styleMeta.styleLockVersion,
+    resolvedBackdropColor: styleMeta.resolvedBackdropColor,
+  });
+  const nextAsset = {
+    ...previous,
+    imageUrl: generated.url,
+    rawUrl: generated.url,
+    realPhotoUrl: generated.url,
+    pencilUrl: generated.url,
+    skippedStylize: true,
+    reference,
+    panels: {
+      schema: 'anonymous-crowd-reference-v1',
+      sourceImageId: generated.id,
+      sourceImageUrl: generated.url,
+      sheetUrl: generated.url,
+      cropMethod: 'crowd-single-image',
+      confidence: 1,
+      version: Number(previous?.panels?.version || 0) + 1,
+      generatedAt: nowIso,
+    },
+    imageGeneratedAt: nowIso,
+  };
+  delete nextAsset.imageLastError;
+  delete nextAsset.imageFailedAt;
+  delete nextAsset.panelsError;
+  delete nextAsset.panelsErrorAt;
+  return {
+    accepted: true,
+    referenceStatus: 'ready',
+    nextAsset,
+    referenceLock: {
+      sheetUrl: generated.url,
+      sourceImageId: generated.id,
+      referenceStatus: 'ready',
+      qualityScore: 1,
+    },
+  };
+}

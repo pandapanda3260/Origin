@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deriveCharacterReferenceUpdate } from '../lib/character-reference-update';
+import { deriveCharacterReferenceUpdate, deriveCrowdReferenceUpdate } from '../lib/character-reference-update';
 import type { SplitCharacterPanelsResult } from '../lib/character-panels';
 import { buildFrameImageGenerationPlan } from '../lib/frame-image-plan';
 import { selectCharacterReferencePanels } from '../lib/panel-selection';
@@ -21,7 +21,17 @@ function ensureResolvableTestImage(ownerId: number, id: string): string {
   const filename = `${id}.png`;
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, filename), Buffer.from([0]));
-  getDb().prepare(
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO users (id, username, display_name, password_hash, email_verified)
+     VALUES (?, ?, ?, ?, 1)`,
+  ).run(
+    ownerId,
+    `reference-test-owner-${ownerId}`,
+    `Reference Test Owner ${ownerId}`,
+    'test-hash',
+  );
+  db.prepare(
     `INSERT OR REPLACE INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
      VALUES (?, ?, ?, 'character', ?, ?, 'image/png', ?, ?, ?, ?, ?)`,
   ).run(
@@ -90,6 +100,50 @@ const previous = {
     frontUrl: '/old-front.png',
   },
 };
+
+{
+  const update = deriveCrowdReferenceUpdate(
+    {
+      name: '考核少年少女群像',
+      isCrowd: true,
+      imageUrl: '/old.png',
+      rawUrl: '/old.png',
+      reference: {
+        currentUrl: '/old.png',
+        lastKnownGoodUrl: '/old.png',
+        status: 'ready',
+      },
+      panels: {
+        schema: 'human-character-sheet-v1',
+        sheetUrl: '/old-sheet.png',
+        headshotUrl: '/old-head.png',
+        frontUrl: '/old-front.png',
+        sideUrl: '/old-side.png',
+        backUrl: '/old-back.png',
+        version: 3,
+      },
+    },
+    { url: '/new-crowd.png', id: 'new-crowd-id' },
+    styleMeta,
+    now,
+  );
+  assert.equal(update.accepted, true);
+  assert.equal(update.referenceStatus, 'ready');
+  assert.equal(update.nextAsset.imageUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.rawUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.realPhotoUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.pencilUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.skippedStylize, true);
+  assert.equal(update.nextAsset.reference.status, 'ready');
+  assert.equal(update.nextAsset.reference.currentUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.panels.schema, 'anonymous-crowd-reference-v1');
+  assert.equal(update.nextAsset.panels.sheetUrl, '/new-crowd.png');
+  assert.equal(update.nextAsset.panels.headshotUrl, undefined);
+  assert.equal(update.nextAsset.panels.frontUrl, undefined);
+  assert.equal(update.referenceLock?.sheetUrl, '/new-crowd.png');
+  assert.equal(update.referenceLock?.frontUrl, undefined);
+  assert.equal(update.referenceLock?.referenceStatus, 'ready');
+}
 
 {
   const update = deriveCharacterReferenceUpdate(previous, { url: '/new.png', id: 'new-id' }, okPanel(), 'human', styleMeta, now);
@@ -837,6 +891,49 @@ assertFailurePreservesOldGood(null, 'missing panel result');
     mode: 'frame',
   });
   assert.deepEqual(framePanels.map((panel) => panel.panel), ['sheet', 'front', 'side'], 'non-human frame mode uses sheet/front/side and never requires headshot');
+}
+
+{
+  const ownerId = 1;
+  const sheetUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fc01');
+  const headshotUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fc02');
+  const frontUrl = ensureResolvableTestImage(ownerId, '00000000-0000-0000-0000-00000000fc03');
+  const crowd = {
+    name: '考核少年少女群像',
+    isCrowd: true,
+    crowdSize: '十几人',
+    imageUrl: sheetUrl,
+    rawUrl: sheetUrl,
+    reference: {
+      status: 'ready',
+      currentUrl: sheetUrl,
+      lastKnownGoodUrl: sheetUrl,
+    },
+    panels: {
+      schema: 'human-character-sheet-v1',
+      sheetUrl,
+      headshotUrl,
+      frontUrl,
+      sideUrl: frontUrl,
+      backUrl: frontUrl,
+    },
+  };
+  const project = {
+    assets: { characters: [crowd], scenes: [], props: [] },
+    shots: [{ visual: '考核少年少女群像 聚集在广场上', description: 'group shot', characters: ['考核少年少女群像'] }],
+  };
+  const panels = selectCharacterReferencePanels({
+    project,
+    ownerId,
+    groupShotIndices: [0],
+    maxSlots: 4,
+    perCharacterLimit: 4,
+    mode: 'frame',
+    enableFocusCharacterPair: true,
+  });
+  assert.deepEqual(panels.map((panel) => panel.panel), ['sheet'], 'crowd selection must ignore leftover headshot/front/side/back panels');
+  assert.equal(panels[0]?.path.includes('fc01'), true, 'crowd selection should use the sheet image');
+  assert.equal(panels[0]?.focusPair, false, 'crowd should not consume focus-pair multi-panel slots');
 }
 
 console.log('[test-character-reference-update] all assertions passed');
