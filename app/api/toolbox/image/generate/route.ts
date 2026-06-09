@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { getBalance, InsufficientCreditsError } from '@/lib/credits';
+import { getBalance } from '@/lib/credits';
 import { generateImage } from '@/lib/image-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { chargeToolboxCredits, refundToolboxCredits, toolboxCreditPrice } from '@/lib/toolbox-billing';
@@ -55,10 +55,9 @@ export async function POST(req: NextRequest) {
   if (!ratio) return jsonError('图片比例无效', 400);
   const imageSize = imageSizeForToolboxRatio(ratio);
 
-  const totalCost = toolboxCreditPrice('image') * count;
   const balance = getBalance(user.id);
-  if (balance.totalCredits < totalCost) {
-    return jsonError(`积分不足：本次需 ${totalCost} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
+  if (balance.totalCredits <= 0) {
+    return jsonError(`积分不足：当前余额 ${balance.totalCredits} 积分，请充值后再试`, 402);
   }
   try {
     assertCanStartAssetGeneration(user.id);
@@ -83,17 +82,7 @@ export async function POST(req: NextRequest) {
   for (let i = 0; i < count; i += 1) {
     const itemId = randomUUID();
     const creditAmount = toolboxCreditPrice('image');
-    try {
-      chargeToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
-    } catch (error: any) {
-      if (error instanceof InsufficientCreditsError) {
-        if (items.length > 0) {
-          return jsonOk({ ok: true, items, partial: true, error: error.message });
-        }
-        return jsonError(error.message, error.status);
-      }
-      throw error;
-    }
+    chargeToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
     const item = createToolboxItem({
       id: itemId,
       ownerId: user.id,

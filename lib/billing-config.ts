@@ -17,8 +17,8 @@ export const PLANS = [
     features: { models: ['基础模型'], priority: 'normal', support: '社区' },
   },
   {
-    code: 'pro',
-    title: 'Pro',
+    code: 'plus',
+    title: 'Plus',
     description: '专业创作者',
     price_cents: 9900,
     billing_cycle: 'month',
@@ -27,8 +27,8 @@ export const PLANS = [
     features: { models: ['全部模型'], priority: 'fast', support: '邮件' },
   },
   {
-    code: 'studio',
-    title: 'Studio',
+    code: 'pro',
+    title: 'Pro',
     description: '工作室与团队',
     price_cents: 29900,
     billing_cycle: 'month',

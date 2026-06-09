@@ -15,6 +15,7 @@ import { extname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
 import { recordModelCallEvent } from './model-routing';
+import { recordUsageEventAndSettleCharge } from './usage-billing';
 import { getDb } from './db';
 import type { UserRow } from './db';
 import { fetchViaProxy } from './proxy-fetch';
@@ -201,6 +202,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
   let width = 1024;
   let height = 1024;
   let mode: 'real' | 'fake' = 'real';
+  let billingCfg: ImageRuntimeConfig | null = null;
 
   // 拼接风格关键词
   //   - storyboard 用 pencil 手稿
@@ -230,13 +232,14 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       message: 'image fake fallback',
       meta: imageCallTraceMeta(input, { fallbackUsed: true }),
     });
-  } else {
-    const generated = await generateRealImageBuffer(cfg, input, finalPrompt, w, h);
-    writeFileSync(fullPath, generated.buffer);
-    bytes = generated.buffer.length;
-    width = generated.width;
-    height = generated.height;
-  }
+	  } else {
+	    const generated = await generateRealImageBuffer(cfg, input, finalPrompt, w, h);
+	    writeFileSync(fullPath, generated.buffer);
+	    bytes = generated.buffer.length;
+	    width = generated.width;
+	    height = generated.height;
+	    billingCfg = generated.cfg;
+	  }
 
   // 落 DB
   const db = getDb();
@@ -279,8 +282,46 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
       predecessorVersionAssetId: input.assetLibrary?.predecessorVersionAssetId || null,
       makeCurrent: input.assetLibrary?.makeCurrent ?? !!input.projectId,
     });
-  } catch (error) {
-    console.warn('[image-gen] asset library indexing skipped:', id, error);
+	  } catch (error) {
+	    console.warn('[image-gen] asset library indexing skipped:', id, error);
+	  }
+
+  if (mode === 'real' && billingCfg) {
+    const stage = input.assetLibrary?.stage || imageAssetStage(input.kind, input.assetRef);
+    try {
+      recordUsageEventAndSettleCharge({
+        userId: user.id,
+        usernameSnapshot: user.username || null,
+        kind: 'image',
+        reason: imageBillingLabel(stage),
+        refId: id,
+        chargeRefId: `usage:image:${id}`,
+        provider: billingCfg.provider,
+        model: billingCfg.model,
+        modelRole: billingCfg.role || null,
+        operationModule: imageBillingModule(stage),
+        operationFeature: stage,
+        operationLabel: imageBillingLabel(stage),
+        consumptionType: 'image_count',
+        quantity: 1,
+        projectId: input.projectId || null,
+        billingSessionId: null,
+        operationKey: input.assetRef || id,
+        callItemType: 'image',
+        callItemId: id,
+        callItemLabel: input.assetRef || input.kind,
+        batchId: input.assetLibrary?.batchId || null,
+        status: 'ok',
+        meta: {
+          source: input.assetLibrary?.source || null,
+          size: input.size || null,
+          width,
+          height,
+        },
+      });
+    } catch (error) {
+      console.error('[image-gen] usage billing failed:', id, error);
+    }
   }
 
   return {
@@ -310,6 +351,26 @@ function imageAssetStage(kind: ImageGenInput['kind'], assetRef: string | undefin
   return 'image';
 }
 
+function imageBillingModule(stage: string): string {
+  if (stage.startsWith('toolbox')) return 'toolbox';
+  if (stage === 'storyboard' || stage === 'first_frame' || stage === 'tail_frame') return 'storyboard';
+  if (stage.startsWith('asset_')) return 'assets';
+  return 'assets';
+}
+
+function imageBillingLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    asset_character: '角色图生成',
+    asset_scene: '场景图生成',
+    asset_prop: '道具图生成',
+    storyboard: '分镜图生成',
+    first_frame: '首帧图生成',
+    tail_frame: '尾帧图生成',
+    toolbox_image: '工具箱图片生成',
+  };
+  return labels[stage] || '图片生成';
+}
+
 export function isCharacterImageInput(input: Pick<ImageGenInput, 'kind' | 'assetRef' | 'assetLibrary'>): boolean {
   return input.kind === 'character'
     || input.assetLibrary?.stage === 'asset_character'
@@ -333,6 +394,7 @@ type RealImageBufferResult = {
   buffer: Buffer;
   width: number;
   height: number;
+  cfg: ImageRuntimeConfig;
 };
 
 async function generateRealImageBuffer(
@@ -574,7 +636,7 @@ async function generateRealImageBuffer(
           traceName: input.kind,
           meta: imageCallTraceMeta(input, { attempt, refCount: effectiveRefPaths.length, transport: imageTransport, fallbackUsed: isFallback }),
         });
-        return { buffer: buf, width, height };
+	        return { buffer: buf, width, height, cfg };
       } catch (e: any) {
         const elapsed = Date.now() - tA;
         const aborted = e?.name === 'AbortError';

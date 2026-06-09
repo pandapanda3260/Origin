@@ -7,6 +7,7 @@ import { assertVideoPromptReadyForGroups, markStoryboardVideoOutdated, markVideo
 import { resolveLLMConfig } from '@/lib/llm';
 import { getVideoSubmitMode, isFirstLastFrameVideoModeEnabled, isMultiShotSegmentEnabled } from '@/lib/feature-flags';
 import { resolveLocalImagePath } from '@/lib/image-gen';
+import { InsufficientCreditsError } from '@/lib/credits';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import {
   computeFirstLastFeatureEnabled,
@@ -561,10 +562,13 @@ export async function POST(req: NextRequest) {
         ? { allowed: true, blocked: [], warnings: batchPreflightWarnings }
         : undefined,
     });
-  } catch (e: any) {
-    if (e instanceof ActiveVideoBatchConflictError) {
-      return jsonError(e.message, 409);
+	  } catch (e: any) {
+	    if (e instanceof ActiveVideoBatchConflictError) {
+	      return jsonError(e.message, 409);
+	    }
+    if (e instanceof InsufficientCreditsError) {
+      return jsonError(e.message, 402);
     }
-    return jsonError('创建 batch 失败：' + (e?.message || String(e)), 500);
-  }
+	    return jsonError('创建 batch 失败：' + (e?.message || String(e)), 500);
+	  }
 }

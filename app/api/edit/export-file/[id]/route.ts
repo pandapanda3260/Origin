@@ -3,6 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { Readable } from 'node:stream';
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { verifySignedExportUrl } from '@/lib/signed-asset-url';
 import { dataPath } from '@/lib/runtime-paths';
 import {
   buildEditExportContentDisposition,
@@ -44,9 +45,6 @@ function resolveDownloadFilename(row: any): string {
  * 下载/预览导出的成片 mp4。支持 Range 请求，流式返回。
  */
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
-  const user = await getCurrentUser(req);
-  if (!user) return new Response('unauthorized', { status: 401 });
-
   const id = params.id;
   if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) return new Response('bad id', { status: 400 });
 
@@ -58,7 +56,22 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       WHERE e.id = @id`,
   ).get({ id });
   if (!row || !row.filename || row.status !== 'completed') return new Response('not ready', { status: 404 });
-  if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+
+  // 鉴权：登录用户（必须是属主）或带有效签名的地址。后者用于 <video src>/<a download>
+  // 这类带不了 Authorization 头的场景（任务页右侧预览播放/下载合成片）。
+  const user = await getCurrentUser(req);
+  if (user) {
+    if (Number(row.owner_id) !== Number(user.id)) return new Response('forbidden', { status: 403 });
+  } else {
+    const u = new URL(req.url);
+    const signedOk = verifySignedExportUrl({
+      exportId: id,
+      ownerId: Number(row.owner_id),
+      exp: u.searchParams.get('exp'),
+      sig: u.searchParams.get('sig'),
+    });
+    if (!signedOk) return new Response('unauthorized', { status: 401 });
+  }
 
   const fullPath = dataPath('exports', String(row.owner_id), row.filename);
   if (!existsSync(fullPath)) return new Response('file missing', { status: 404 });

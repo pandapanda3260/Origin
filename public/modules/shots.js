@@ -154,8 +154,12 @@ function _hasAnyAssetData() {
   );
 }
 
+function _hasAnyShots() {
+  return !!(project && Array.isArray(project.shots) && project.shots.length);
+}
+
 function _getShotPlanActionState() {
-  var hasShots = !!(project && Array.isArray(project.shots) && project.shots.length);
+  var hasShots = _hasAnyShots();
   var status = (project && project.shotPlanStatus) || "";
   var hasShotPlanFlag = !!(project && project._staleFlags && project._staleFlags.shotPlan);
   var reasons = project && Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
@@ -212,6 +216,7 @@ function _getShotPlanActionState() {
 
 function _refreshShotPlanActionState(override) {
   var btn = $("btnGenShots");
+  var emptyBtn = $("btnGenShotsEmpty");
   var hint = $("shotsHint");
   var state = override || _getShotPlanActionState();
   if (btn) {
@@ -219,6 +224,10 @@ function _refreshShotPlanActionState(override) {
       '<span class="shots-step-number">I</span>' +
       '<span>' + escapeHtml(state.label || "") + '</span>';
     btn.disabled = !!state.disabled;
+  }
+  if (emptyBtn) {
+    emptyBtn.textContent = state.label || "生成镜头计划";
+    emptyBtn.disabled = !!state.disabled;
   }
   if (hint) hint.textContent = state.hint || "";
 }
@@ -455,10 +464,15 @@ export function refreshShotsPage() {
   _syncRefs();
   _syncShotsProgressBanner();
   var needScript = $("shotsNeedScript");
+  var needPlan = $("shotsNeedPlan");
   var ready = $("shotsReady");
   var topActions = $("shotsTopActions");
-  if (!project || !_hasAnyAssetData()) {
+  var hasAssets = !!(project && _hasAnyAssetData());
+  var hasShots = _hasAnyShots();
+  var isGenerating = !!(project && project.shotPlanStatus === "generating");
+  if (!hasAssets) {
     if (needScript) needScript.hidden = false;
+    if (needPlan) needPlan.hidden = true;
     if (ready) ready.hidden = true;
     if (topActions) topActions.hidden = true;
     var actionBar = $("imagesActionBar");
@@ -470,9 +484,23 @@ export function refreshShotsPage() {
     _refreshShotPlanActionState();
     return;
   }
-  needScript.hidden = true;
-  ready.hidden = false;
-  if (topActions) topActions.hidden = false;
+  if (needScript) needScript.hidden = true;
+  if (hasAssets && !hasShots && !isGenerating) {
+    if (needPlan) needPlan.hidden = false;
+    if (ready) ready.hidden = true;
+    if (topActions) topActions.hidden = true;
+    var emptyActionBar = $("imagesActionBar");
+    if (emptyActionBar) emptyActionBar.hidden = true;
+    var emptyWrap = $("shotListWrap");
+    if (emptyWrap) emptyWrap.innerHTML = "";
+    var emptyConfirm = $("shotsConfirmArea");
+    if (emptyConfirm) emptyConfirm.hidden = true;
+    _refreshShotPlanActionState();
+    return;
+  }
+  if (needPlan) needPlan.hidden = true;
+  if (ready) ready.hidden = false;
+  if (topActions) topActions.hidden = !hasShots;
   _refreshShotPlanActionState();
   renderShotList();
 }
@@ -622,9 +650,24 @@ export function renderShotList() {
     if (emptySummaryMeta) emptySummaryMeta.textContent = "";
     var ca = $("shotsConfirmArea"); if (ca) ca.hidden = true;
     var emptyActionBar = $("imagesActionBar"); if (emptyActionBar) emptyActionBar.hidden = true;
+    var emptyTopActions = $("shotsTopActions"); if (emptyTopActions && !(project && project.shotPlanStatus === "generating")) emptyTopActions.hidden = true;
+    var emptyNeedPlan = $("shotsNeedPlan");
+    var emptyReady = $("shotsReady");
+    if (project && _hasAnyAssetData()) {
+      if (project.shotPlanStatus === "generating") {
+        if (emptyNeedPlan) emptyNeedPlan.hidden = true;
+        if (emptyReady) emptyReady.hidden = false;
+      } else {
+        if (emptyNeedPlan) emptyNeedPlan.hidden = false;
+        if (emptyReady) emptyReady.hidden = true;
+      }
+    }
     _refreshShotPlanActionState();
     return;
   }
+  var needPlan = $("shotsNeedPlan"); if (needPlan) needPlan.hidden = true;
+  var ready = $("shotsReady"); if (ready) ready.hidden = false;
+  var topActions = $("shotsTopActions"); if (topActions) topActions.hidden = false;
   _refreshShotPlanActionState();
   var actionBar = $("imagesActionBar"); if (actionBar) actionBar.hidden = false;
 
@@ -977,6 +1020,12 @@ export async function generateShots(opts) {
 
   var originId = project.id;
   var btn = $("btnGenShots");
+  var needPlan = $("shotsNeedPlan");
+  var ready = $("shotsReady");
+  var topActions = $("shotsTopActions");
+  if (needPlan) needPlan.hidden = true;
+  if (ready) ready.hidden = false;
+  if (topActions) topActions.hidden = !_hasAnyShots();
   _refreshShotPlanActionState({
     label: "镜头计划生成中…",
     disabled: true,
@@ -1078,7 +1127,7 @@ export async function generateShots(opts) {
       if (serverShots && serverShots.length) {
         _setShotsProgress(100, "镜头设计完成", "共生成 " + serverShots.length + " 个镜头");
         setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 1200);
-        renderShotList();
+        refreshShotsPage();
         showToast("镜头设计完成：共 " + serverShots.length + " 个镜头", "success");
       }
       finish();
@@ -1209,7 +1258,7 @@ export async function generateShots(opts) {
           "success",
         );
         setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 2000);
-        renderShotList();
+        refreshShotsPage();
         finish();
       }
     },

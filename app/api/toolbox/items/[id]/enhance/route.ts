@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { getBalance, InsufficientCreditsError } from '@/lib/credits';
+import { getBalance } from '@/lib/credits';
 import { generateImage } from '@/lib/image-gen';
 import { generateVideo } from '@/lib/video-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
@@ -78,8 +78,8 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
     }
     const creditAmount = toolboxCreditPrice('image');
     const balance = getBalance(user.id);
-    if (balance.totalCredits < creditAmount) {
-      return jsonError(`积分不足：本次需 ${creditAmount} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
+    if (balance.totalCredits <= 0) {
+      return jsonError(`积分不足：当前余额 ${balance.totalCredits} 积分，请充值后再试`, 402);
     }
     try {
       assertCanStartAssetGeneration(user.id);
@@ -88,12 +88,7 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
       throw error;
     }
     const itemId = randomUUID();
-    try {
-      chargeToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
-    } catch (error: any) {
-      if (error instanceof InsufficientCreditsError) return jsonError(error.message, error.status);
-      throw error;
-    }
+    chargeToolboxCredits({ userId: user.id, itemId, toolType: 'image', amount: creditAmount });
     const item = createToolboxItem({
       id: itemId,
       ownerId: user.id,
@@ -200,16 +195,11 @@ export async function POST(req: NextRequest, { params }: { params: { id: string 
   const creditAmount = toolboxCreditPrice('video');
   nextParams.billing = { creditAmount };
   const balance = getBalance(user.id);
-  if (balance.totalCredits < creditAmount) {
-    return jsonError(`积分不足：本次需 ${creditAmount} 积分，当前余额 ${balance.totalCredits} 积分`, 402);
+  if (balance.totalCredits <= 0) {
+    return jsonError(`积分不足：当前余额 ${balance.totalCredits} 积分，请充值后再试`, 402);
   }
   const itemId = randomUUID();
-  try {
-    chargeToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
-  } catch (error: any) {
-    if (error instanceof InsufficientCreditsError) return jsonError(error.message, error.status);
-    throw error;
-  }
+  chargeToolboxCredits({ userId: user.id, itemId, toolType: 'video', amount: creditAmount });
   const videoTaskId = randomUUID();
   const item = createToolboxItem({
     id: itemId,

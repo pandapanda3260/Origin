@@ -462,21 +462,6 @@ function entityFieldMeta(entity: any, key: string) {
     : null;
 }
 
-const CHARACTER_HARD_BACKFILL_FIELDS = new Set([
-  'appearance',
-  'detail',
-  'description',
-  'desc',
-  'scaleRule',
-  'negativeRules',
-  'signatureColors',
-  'canonicalPrompt',
-]);
-
-function characterBackfillFieldStrength(key: string): 'hard' | 'soft' {
-  return CHARACTER_HARD_BACKFILL_FIELDS.has(key) ? 'hard' : 'soft';
-}
-
 function mergeMissingEntityFields(current: any, incoming: any, opts: { source: string; strength: 'hard' | 'soft'; now: string; fieldStrength?: (key: string) => 'hard' | 'soft' }) {
   if (!current || typeof current !== 'object' || !incoming || typeof incoming !== 'object') return { value: current, changed: false };
   let changed = false;
@@ -851,93 +836,6 @@ export function mergeWorldTemplateSnapshotIntoSource(
   }
 
   return { template: next, changed };
-}
-
-function assetsByAnyKey(project: any) {
-  const assets = Array.isArray(project?.characters)
-    ? project.characters
-    : Array.isArray(project?.assets?.characters)
-      ? project.assets.characters
-      : [];
-  const map = new Map<string, any>();
-  for (const asset of assets) {
-    for (const key of [asset?.characterId, asset?.id, asset?.name, asset?.role]) {
-      const clean = firstText(key).toLowerCase();
-      if (clean) map.set(clean, asset);
-    }
-  }
-  return map;
-}
-
-export function mergeProjectFactsIntoWorldSnapshot(project: any, opts: { now?: string } = {}) {
-  const snapshot = project?.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === 'object'
-    ? clonePlain(project.worldTemplateSnapshot)
-    : null;
-  if (!snapshot) return { worldTemplateSnapshot: null, changed: false };
-  const now = opts.now || new Date().toISOString();
-  let changed = false;
-  const locks = Array.isArray(project?.consistency?.characters) ? project.consistency.characters : [];
-  const incomingCharacters = locks.map((lock: any) => {
-    return mapCharacterLockToWorldCharacter(lock, resolveCharacterAssetForEntity(project, lock).asset);
-  });
-  const characterMerge = mergeEntityArrayByKey(snapshot.characters, incomingCharacters, {
-    source: 'project_backfill',
-    strength: 'soft',
-    fieldStrength: characterBackfillFieldStrength,
-    now,
-    appendMissing: false,
-  });
-  if (characterMerge.changed) {
-    snapshot.characters = characterMerge.value;
-    changed = true;
-  }
-
-  const incomingLocations = Array.isArray(project?.environments)
-    ? project.environments
-    : Array.isArray(project?.assets?.scenes)
-      ? project.assets.scenes
-      : [];
-  const locationMerge = mergeEntityArrayByKey(snapshot.locations, incomingLocations.map((env: any) => ({
-    id: firstText(env.id, env.sceneId),
-    name: firstText(env.name, env.sceneName, env.title),
-    description: firstText(env.description, env.detail, env.intro),
-    atmosphere: firstText(env.atmosphere, env.mood),
-    imageUrl: firstText(env.imageUrl, env.rawUrl) || undefined,
-  })), {
-    source: 'project_backfill',
-    strength: 'soft',
-    now,
-    appendMissing: false,
-  });
-  if (locationMerge.changed) {
-    snapshot.locations = locationMerge.value;
-    changed = true;
-  }
-
-  const incomingProps = Array.isArray(project?.props)
-    ? project.props
-    : Array.isArray(project?.assets?.props)
-      ? project.assets.props
-      : [];
-  const propMerge = mergeEntityArrayByKey(snapshot.props, incomingProps.map((prop: any) => ({
-    id: firstText(prop.id, prop.propId),
-    name: firstText(prop.name, prop.title),
-    function: firstText(prop.function, prop.description, prop.detail),
-    ownership: firstText(prop.ownership, prop.owner),
-    visualFeatures: firstText(prop.visualFeatures, prop.appearance),
-    imageUrl: firstText(prop.imageUrl, prop.rawUrl) || undefined,
-  })), {
-    source: 'project_backfill',
-    strength: 'soft',
-    now,
-    appendMissing: false,
-  });
-  if (propMerge.changed) {
-    snapshot.props = propMerge.value;
-    changed = true;
-  }
-
-  return { worldTemplateSnapshot: snapshot, changed };
 }
 
 export function mergeProjectCharacterLocksIntoWorldTemplate(

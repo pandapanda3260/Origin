@@ -2,6 +2,8 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { generateImage } from '@/lib/image-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
+import { InsufficientCreditsError } from '@/lib/credits';
+import { assertCanStartPaidOperation } from '@/lib/usage-billing';
 import {
   AssetQuotaError,
   assertCanStartAssetGeneration,
@@ -50,12 +52,14 @@ export async function POST(req: NextRequest) {
   // 角色非人/真人区分（从 body.entityType 显式传入；不传默认 human）
   const entityType: 'human' | 'non-human' | undefined =
     kind === 'character' ? (body.entityType === 'non-human' ? 'non-human' : 'human') : undefined;
-  try {
-    assertCanStartAssetGeneration(user.id);
-  } catch (error: any) {
-    if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
-    throw error;
-  }
+	  try {
+	    assertCanStartAssetGeneration(user.id);
+      assertCanStartPaidOperation(user.id);
+	  } catch (error: any) {
+	    if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+      if (error instanceof InsufficientCreditsError) return jsonError(error.message, 402);
+	    throw error;
+	  }
   const batchId = createGenerationBatch({
     ownerId: user.id,
     projectId: projectId || null,

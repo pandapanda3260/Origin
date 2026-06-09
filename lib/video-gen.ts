@@ -50,6 +50,7 @@ import { createAssetRecord, finishGenerationBatch, hashFile, localAssetUri } fro
 import { getExternalEnvValue } from './env';
 import { buildVideoPromptSnapshot } from './video-prompt-lifecycle';
 import { normalizeVideoAspectRatio } from './aspect-ratio';
+import { recordUsageEventAndSettleCharge } from './usage-billing';
 
 export type VideoGenInput = {
   prompt: string;
@@ -170,6 +171,8 @@ export type VideoGenInput = {
     makeCurrent?: boolean;
     predecessorVersionAssetId?: string | null;
   };
+  billingSessionId?: string | null;
+  billingContext?: Record<string, unknown> | null;
 };
 
 export type { VideoReferenceImage };
@@ -785,32 +788,37 @@ export async function generateVideo(
   let mode: 'real' | 'fake' = 'real';
   let videoAudit: VideoGenCompletedResult['videoAudit'] | undefined;
 
-  const videoPromptSnapshotJson = input.projectId && Number.isInteger(input.groupIdx)
-    ? JSON.stringify(buildVideoPromptSnapshot({
-        content: input.prompt,
-        sourceHash: input.videoPromptSourceHash || null,
+	  const videoPromptSnapshotJson = input.projectId && Number.isInteger(input.groupIdx)
+	    ? JSON.stringify(buildVideoPromptSnapshot({
+	        content: input.prompt,
+	        sourceHash: input.videoPromptSourceHash || null,
         projectId: input.projectId,
         groupIdx: input.groupIdx as number,
         videoTaskId: taskId,
-      }))
-    : '{}';
+	      }))
+	    : '{}';
+  const billingContextJson = JSON.stringify(input.billingContext || {});
 
-  // 入库登记
-  const db = getDb();
-  db.prepare(
-    `INSERT INTO video_tasks (id, owner_id, project_id, group_idx, prompt, video_prompt_snapshot_json, provider, status, progress, filename, duration_sec)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?)`,
-  ).run(
-    taskId,
-    user.id,
+	  // 入库登记
+	  const db = getDb();
+	  db.prepare(
+	    `INSERT INTO video_tasks
+        (id, owner_id, project_id, group_idx, prompt, video_prompt_snapshot_json,
+         provider, status, progress, filename, duration_sec, billing_session_id, billing_context_json)
+	     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)`,
+	  ).run(
+	    taskId,
+	    user.id,
     input.projectId || null,
     input.groupIdx ?? null,
     input.prompt.slice(0, 4000),
-    videoPromptSnapshotJson,
-    cfg.mode === 'fake' ? 'fake' : (cfg.model || 'openai'),
-    filename,
-    dur,
-  );
+	    videoPromptSnapshotJson,
+	    cfg.mode === 'fake' ? 'fake' : (cfg.model || 'openai'),
+	    filename,
+	    dur,
+      input.billingSessionId || null,
+      billingContextJson,
+	  );
 
   // 选择适配器：grok（中转） / 火山引擎 Seedance / OpenAI Sora / fake
 
@@ -1169,18 +1177,22 @@ export async function generateVideo(
           console.warn('[video-gen][seedance][first-last] extract cover failed:', e?.message);
         }
 
-		        const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
-		        const finalDurationSec = tempoProbe.realDurationSec || dur;
-		        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
-		        const completeInfo = db.prepare(
-	          `UPDATE video_tasks SET status='completed', progress=100,
-	             duration_sec=?,
-	             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
-	        ).run(finalDurationSec, taskId);
-        if (completeInfo.changes <= 0) {
-          console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
-          return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode, videoAudit };
-        }
+			        const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
+			        const finalDurationSec = tempoProbe.realDurationSec || dur;
+			        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+			        const completeInfo = markVideoCompletedAndSettle({
+            user,
+            taskId,
+            durationSec: finalDurationSec,
+            cfg,
+            input,
+            filename,
+            coverImageId,
+          });
+	        if (!completeInfo.completed) {
+	          console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
+	          return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode, videoAudit };
+	        }
 
         onProgress?.(100, '完成');
         const protectedUrl = `/api/videos/file/${taskId}`;
@@ -1790,18 +1802,22 @@ export async function generateVideo(
     console.warn('[video-gen] extract cover failed:', e?.message);
   }
 
-		  const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
-		  const finalDurationSec = tempoProbe.realDurationSec || dur;
-		  patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
-		  const completeInfo = db.prepare(
-	    `UPDATE video_tasks SET status='completed', progress=100,
-	       duration_sec=?,
-	       updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`,
-	  ).run(finalDurationSec, taskId);
-  if (completeInfo.changes <= 0) {
-    console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
-    return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode };
-  }
+			  const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
+			  const finalDurationSec = tempoProbe.realDurationSec || dur;
+			  patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+			  const completeInfo = markVideoCompletedAndSettle({
+      user,
+      taskId,
+      durationSec: finalDurationSec,
+      cfg,
+      input,
+      filename,
+      coverImageId,
+    });
+	  if (!completeInfo.completed) {
+	    console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
+	    return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode };
+	  }
 
   onProgress?.(100, '完成');
 
@@ -2329,12 +2345,12 @@ async function recoverOneRunningVideoTask(user: UserRow, row: any) {
 
     dbUpdateVideoProgress(taskId, progress);
 
-    if (status === 'succeeded') {
-      if (!videoUrl) throw new Error('Seedance 恢复成功但没返回 video_url');
-      await finalizeRecoveredVideoTask(user, row, videoUrl);
-      console.warn(`[video-recover] recovered Seedance task local=${taskId} remote=${remoteId}`);
-      return;
-    }
+	    if (status === 'succeeded') {
+	      if (!videoUrl) throw new Error('Seedance 恢复成功但没返回 video_url');
+	      await finalizeRecoveredVideoTask(user, row, videoUrl, cfg);
+	      console.warn(`[video-recover] recovered Seedance task local=${taskId} remote=${remoteId}`);
+	      return;
+	    }
 
     if (status === 'failed' || status === 'cancelled') {
       const reason =
@@ -2375,7 +2391,139 @@ function markVideoTaskFailed(taskId: string, message: string) {
   ).run(message, taskId);
 }
 
-async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: string) {
+type VideoCompletionConfig = {
+  mode?: string | null;
+  provider?: string | null;
+  model?: string | null;
+};
+
+function markVideoCompletedAndSettle(opts: {
+  user: UserRow;
+  taskId: string;
+  durationSec: number;
+  cfg?: VideoCompletionConfig | null;
+  input?: VideoGenInput | null;
+  row?: any;
+  filename?: string | null;
+  coverImageId?: string | null;
+  clearError?: boolean;
+}) {
+  const db = getDb();
+  const params: Record<string, unknown> = {
+    taskId: opts.taskId,
+    durationSec: Number(opts.durationSec) || 0,
+  };
+  const sets = [
+    `status='completed'`,
+    `progress=100`,
+    `duration_sec=@durationSec`,
+  ];
+  const filename = String(opts.filename || '').trim();
+  if (filename) {
+    sets.push(`filename=@filename`);
+    params.filename = filename;
+  }
+  const coverImageId = String(opts.coverImageId || '').trim();
+  if (coverImageId) {
+    sets.push(`cover_image_id=@coverImageId`);
+    params.coverImageId = coverImageId;
+  }
+  if (opts.clearError) {
+    sets.push(`error_msg=NULL`);
+  }
+  sets.push(`updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+  const completeInfo = db.prepare(
+    `UPDATE video_tasks
+     SET ${sets.join(', ')}
+     WHERE id=@taskId AND status IN ('queued','running')`,
+  ).run(params);
+	  if (completeInfo.changes <= 0) {
+	    return { completed: false };
+	  }
+  try {
+    settleCompletedVideoUsage(opts);
+  } catch (error) {
+    console.warn('[video-gen] usage billing settlement skipped after completion:', opts.taskId, error);
+  }
+	  return { completed: true };
+	}
+
+function settleCompletedVideoUsage(opts: {
+  user: UserRow;
+  taskId: string;
+  durationSec: number;
+  cfg?: VideoCompletionConfig | null;
+  input?: VideoGenInput | null;
+  row?: any;
+  filename?: string | null;
+  coverImageId?: string | null;
+}) {
+  const cfg = opts.cfg || {};
+  if (cfg.mode === 'fake') return;
+  const model = String(cfg.model || opts.row?.provider || '').trim();
+  if (!model) return;
+  const context = opts.input?.billingContext || safeParseVideoTaskJson(opts.row?.billing_context_json);
+  const projectId = opts.input?.projectId || opts.row?.project_id || null;
+  const groupIdx = opts.input?.groupIdx ?? opts.row?.group_idx ?? null;
+  const stage = String(
+    opts.input?.assetLibrary?.stage ||
+    context.stage ||
+    (projectId ? 'video_segment' : 'toolbox_video'),
+  );
+  const label = videoBillingLabel(stage);
+  recordUsageEventAndSettleCharge({
+    userId: opts.user.id,
+    usernameSnapshot: opts.user.username,
+    kind: 'video',
+    reason: label,
+    refId: opts.taskId,
+    chargeRefId: `usage:video:${opts.taskId}`,
+    provider: cfg.provider || null,
+    model,
+    operationModule: videoBillingModule(stage),
+    operationFeature: stage,
+    operationLabel: label,
+    consumptionType: 'video_second',
+    quantity: Number(opts.durationSec) || 0,
+    durationSec: Number(opts.durationSec) || 0,
+    projectId,
+    routeName: String(context.routeName || context.route || ''),
+    requestPath: String(context.requestPath || ''),
+    billingSessionId: opts.input?.billingSessionId || opts.row?.billing_session_id || null,
+    billingScope: 'billable',
+    operationKey: String(context.operationKey || `video:${opts.taskId}`),
+    callItemType: 'video_task',
+    callItemId: opts.taskId,
+    callItemLabel: groupIdx == null ? label : `${label} #${Number(groupIdx) + 1}`,
+    batchId: opts.input?.assetLibrary?.batchId || context.batchId || null,
+    taskId: opts.taskId,
+    status: 'ok',
+    meta: {
+      groupIdx,
+      stage,
+      filename: opts.filename || opts.row?.filename || null,
+      coverImageId: opts.coverImageId || opts.row?.cover_image_id || null,
+      providerTask: opts.row?.provider_task || null,
+    },
+  });
+}
+
+function videoBillingModule(stage: string) {
+  if (/toolbox/i.test(stage)) return 'toolbox';
+  if (/batch/i.test(stage)) return 'batch';
+  return 'video';
+}
+
+function videoBillingLabel(stage: string) {
+  const map: Record<string, string> = {
+    video_segment: '视频段生成',
+    toolbox_video: '工具箱视频生成',
+    first_last_frame_video: '首尾帧视频生成',
+  };
+  return map[stage] || '视频生成';
+}
+
+async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: string, cfg?: VideoCompletionConfig | null) {
   const db = getDb();
   const taskId = String(row.id);
   const ownerDir = join(VIDEOS_DIR, String(user.id));
@@ -2416,21 +2564,20 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 	  const tempoProbe = await probeVideoTempoBudget(fullPath, tempoBudget);
 	  const durationSec = tempoProbe.realDurationSec || Number(row.duration_sec) || 0;
 
-	  const completeInfo = db.prepare(
-	    `UPDATE video_tasks
-	     SET status='completed',
-	         progress=100,
-	         filename=?,
-	         cover_image_id=?,
-	         duration_sec=?,
-	         error_msg=NULL,
-	         updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-	     WHERE id=? AND status IN ('queued','running')`,
-	  ).run(filename, coverImageId, durationSec, taskId);
-  if (completeInfo.changes <= 0) {
-    console.warn('[video-recover] completion ignored because task is no longer active:', taskId);
-    return {
+		  const completeInfo = markVideoCompletedAndSettle({
+      user,
       taskId,
+      durationSec,
+      cfg,
+      row,
+      filename,
+      coverImageId,
+      clearError: true,
+    });
+	  if (!completeInfo.completed) {
+	    console.warn('[video-recover] completion ignored because task is no longer active:', taskId);
+	    return {
+	      taskId,
       status: 'cancelled',
       url: '',
       protectedUrl: '',
@@ -2580,11 +2727,11 @@ export function createSeedanceVideoProviderAdapter(): ProviderTaskAdapter {
       const progress = seedanceProgressFromStatus(status, Number(videoRow.progress || 0));
       dbUpdateVideoProgress(String(videoRow.id), progress);
 
-      if (status === 'succeeded') {
-        const videoUrl = j?.content?.video_url || j?.video_url || '';
-        if (!videoUrl) return { status: 'failed', reason: 'Seedance 完成但没返回 video_url', raw: j };
-        const final = await finalizeRecoveredVideoTask(user, videoRow, videoUrl);
-        return {
+	      if (status === 'succeeded') {
+	        const videoUrl = j?.content?.video_url || j?.video_url || '';
+	        if (!videoUrl) return { status: 'failed', reason: 'Seedance 完成但没返回 video_url', raw: j };
+	        const final = await finalizeRecoveredVideoTask(user, videoRow, videoUrl, cfg);
+	        return {
           status: 'completed',
           result: {
             resultUrl: final.protectedUrl,

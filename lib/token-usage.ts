@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { ResolvedModelConfig, TextModelRole } from './model-routing';
+import { settleUsageCharge, type BillingScope } from './usage-billing';
 
 export type TokenUsageContext = {
   ownerId?: number | null;
@@ -21,8 +22,12 @@ export type TokenUsageContext = {
   runId?: string | null;
   correlationId?: string | null;
   promptHash?: string | null;
-  responseHash?: string | null;
-  meta?: Record<string, unknown> | null;
+	  responseHash?: string | null;
+	  billingSessionId?: string | null;
+	  billingScope?: BillingScope | null;
+	  operationKey?: string | null;
+	  operationLabel?: string | null;
+	  meta?: Record<string, unknown> | null;
 };
 
 export type TokenUsageEventInput = {
@@ -88,8 +93,18 @@ export type TokenUsageEventRow = {
   billableTokens: number | null;
   usageSource: string;
   promptHash: string | null;
-  responseHash: string | null;
-  batchId: string | null;
+	  responseHash: string | null;
+	  billingSessionId: string | null;
+	  billingScope: string | null;
+	  operationKey: string | null;
+	  operationLabel: string | null;
+	  consumptionType: string | null;
+	  quantity: number | null;
+	  durationSec: number | null;
+	  billingStatus: string | null;
+	  ledgerId: string | null;
+	  providerResponseHash: string | null;
+	  batchId: string | null;
   taskId: string | null;
   runId: string | null;
   correlationId: string | null;
@@ -102,29 +117,35 @@ let lastWriteErrorLogAt = 0;
 
 export function recordTokenUsageEvent(input: TokenUsageEventInput): string | null {
   try {
-    const usage = normalizeUsage(input.usage);
-    const ctx = input.tokenContext || {};
-    const classified = classifyTokenUsageContext(input.traceName, ctx);
-    const id = randomUUID();
-    getDb()
-      .prepare(
-        `INSERT INTO token_usage_events
+	    const usage = normalizeUsage(input.usage);
+	    const ctx = input.tokenContext || {};
+	    const classified = classifyTokenUsageContext(input.traceName, ctx);
+	    const billingScope = resolveBillingScope(input, ctx);
+	    const billingStatus = initialBillingStatus(input.status, billingScope, usage);
+	    const id = randomUUID();
+	    getDb()
+	      .prepare(
+	        `INSERT INTO token_usage_events
           (id, created_at, owner_id, username_snapshot, project_id, project_title_snapshot,
            request_path, route_name, trace_name, module_key, module_label, feature_key,
            feature_label, call_item_type, call_item_id, call_item_label, provider, model,
-           model_role, slot, status, status_code, error_code, latency_ms, input_tokens,
-           output_tokens, reasoning_tokens, cached_tokens, total_tokens, billable_tokens,
-           usage_source, prompt_hash, response_hash, batch_id, task_id, run_id,
-           correlation_id, meta_json)
-         VALUES
+	           model_role, slot, status, status_code, error_code, latency_ms, input_tokens,
+	           output_tokens, reasoning_tokens, cached_tokens, total_tokens, billable_tokens,
+	           usage_source, billing_session_id, billing_scope, operation_key, operation_label,
+	           consumption_type, quantity, duration_sec, billing_status, provider_response_hash,
+	           prompt_hash, response_hash, batch_id, task_id, run_id,
+	           correlation_id, meta_json)
+	         VALUES
           (@id, @createdAt, @ownerId, @usernameSnapshot, @projectId, @projectTitleSnapshot,
            @requestPath, @routeName, @traceName, @moduleKey, @moduleLabel, @featureKey,
            @featureLabel, @callItemType, @callItemId, @callItemLabel, @provider, @model,
-           @modelRole, @slot, @status, @statusCode, @errorCode, @latencyMs, @inputTokens,
-           @outputTokens, @reasoningTokens, @cachedTokens, @totalTokens, @billableTokens,
-           @usageSource, @promptHash, @responseHash, @batchId, @taskId, @runId,
-           @correlationId, @metaJson)`,
-      )
+	           @modelRole, @slot, @status, @statusCode, @errorCode, @latencyMs, @inputTokens,
+	           @outputTokens, @reasoningTokens, @cachedTokens, @totalTokens, @billableTokens,
+	           @usageSource, @billingSessionId, @billingScope, @operationKey, @operationLabel,
+	           @consumptionType, @quantity, @durationSec, @billingStatus, @providerResponseHash,
+	           @promptHash, @responseHash, @batchId, @taskId, @runId,
+	           @correlationId, @metaJson)`,
+	      )
       .run({
         id,
         createdAt: input.createdAt || new Date().toISOString(),
@@ -154,25 +175,86 @@ export function recordTokenUsageEvent(input: TokenUsageEventInput): string | nul
         outputTokens: usage.outputTokens,
         reasoningTokens: usage.reasoningTokens,
         cachedTokens: usage.cachedTokens,
-        totalTokens: usage.totalTokens,
-        billableTokens: usage.billableTokens,
-        usageSource: usage.usageSource,
-        promptHash: nullableHash(ctx.promptHash),
-        responseHash: nullableHash(ctx.responseHash),
+	        totalTokens: usage.totalTokens,
+	        billableTokens: usage.billableTokens,
+	        usageSource: usage.usageSource,
+	        billingSessionId: nullableString(ctx.billingSessionId, 160),
+	        billingScope,
+	        operationKey: nullableString(ctx.operationKey || ctx.runId || ctx.taskId || ctx.callItemId, 180),
+	        operationLabel: nullableString(ctx.operationLabel || classified.featureLabel, 240),
+	        consumptionType: 'text_token',
+	        quantity: usage.totalTokens,
+	        durationSec: null,
+	        billingStatus,
+	        providerResponseHash: nullableHash(ctx.responseHash),
+	        promptHash: nullableHash(ctx.promptHash),
+	        responseHash: nullableHash(ctx.responseHash),
         batchId: nullableString(ctx.batchId, 120),
         taskId: nullableString(ctx.taskId, 120),
         runId: nullableString(ctx.runId, 160),
         correlationId: nullableString(ctx.correlationId, 160),
         metaJson: cappedJson({
           ...(ctx.meta || {}),
-          ...(input.meta || {}),
-        }),
-      });
-    return id;
+	          ...(input.meta || {}),
+	        }),
+	      });
+	    maybeSettleTextUsageEvent(id, input, ctx, classified, usage, billingScope);
+	    return id;
   } catch (error) {
     maybeLogTokenUsageWriteError(error);
     return null;
   }
+}
+
+function maybeSettleTextUsageEvent(
+  id: string,
+  input: TokenUsageEventInput,
+  ctx: TokenUsageContext,
+  classified: ReturnType<typeof classifyTokenUsageContext>,
+  usage: ReturnType<typeof normalizeUsage>,
+  billingScope: BillingScope,
+) {
+  if (billingScope !== 'billable') return;
+  if (String(input.status || '').toLowerCase() !== 'ok') return;
+  const ownerId = intOrNull(ctx.ownerId);
+  if (!ownerId) return;
+  try {
+    settleUsageCharge({
+      userId: ownerId,
+      kind: 'text',
+      reason: classified.featureLabel || input.traceName || '文本 API 调用',
+      refId: ctx.callItemId || ctx.taskId || ctx.batchId || ctx.runId || id,
+      chargeRefId: `usage:text:${id}`,
+      provider: input.cfg.provider,
+      model: input.cfg.model,
+      modelRole: input.modelRole || input.cfg.role || null,
+      operationModule: classified.moduleKey,
+      operationFeature: classified.featureKey,
+      consumptionType: 'text_token',
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cachedTokens: usage.cachedTokens,
+      reasoningTokens: usage.reasoningTokens,
+      usageEventIds: [id],
+    });
+  } catch (error) {
+    maybeLogTokenUsageWriteError(error);
+  }
+}
+
+function resolveBillingScope(input: TokenUsageEventInput, ctx: TokenUsageContext): BillingScope {
+  if (ctx.billingScope) return ctx.billingScope;
+  if (input.cfg.mode !== 'real') return 'non_billable';
+  if (!intOrNull(ctx.ownerId)) return 'non_billable';
+  return 'billable';
+}
+
+function initialBillingStatus(status: string, billingScope: BillingScope, usage: ReturnType<typeof normalizeUsage>) {
+  if (billingScope === 'internal_admin') return 'internal';
+  if (billingScope === 'non_billable') return 'not_billable';
+  if (String(status || '').toLowerCase() !== 'ok') return 'not_billable';
+  if (usage.totalTokens === null) return 'unsettled';
+  return 'pending';
 }
 
 export function listTokenUsageEvents(filters: TokenUsageFilters = {}): { rows: TokenUsageEventRow[]; total: number } {
@@ -404,9 +486,19 @@ const TOKEN_USAGE_SELECT = `
   reasoning_tokens AS reasoningTokens,
   cached_tokens AS cachedTokens,
   total_tokens AS totalTokens,
-  billable_tokens AS billableTokens,
-  usage_source AS usageSource,
-  prompt_hash AS promptHash,
+	  billable_tokens AS billableTokens,
+	  usage_source AS usageSource,
+	  billing_session_id AS billingSessionId,
+	  billing_scope AS billingScope,
+	  operation_key AS operationKey,
+	  operation_label AS operationLabel,
+	  consumption_type AS consumptionType,
+	  quantity,
+	  duration_sec AS durationSec,
+	  billing_status AS billingStatus,
+	  ledger_id AS ledgerId,
+	  provider_response_hash AS providerResponseHash,
+	  prompt_hash AS promptHash,
   response_hash AS responseHash,
   batch_id AS batchId,
   task_id AS taskId,
@@ -568,8 +660,18 @@ function decodeTokenUsageRow(row: any): TokenUsageEventRow {
     cachedTokens: row.cachedTokens == null ? null : Number(row.cachedTokens),
     totalTokens: row.totalTokens == null ? null : Number(row.totalTokens),
     billableTokens: row.billableTokens == null ? null : Number(row.billableTokens),
-    usageSource: row.usageSource || 'missing',
-    promptHash: row.promptHash || null,
+	    usageSource: row.usageSource || 'missing',
+	    billingSessionId: row.billingSessionId || null,
+	    billingScope: row.billingScope || null,
+	    operationKey: row.operationKey || null,
+	    operationLabel: row.operationLabel || null,
+	    consumptionType: row.consumptionType || null,
+	    quantity: row.quantity == null ? null : Number(row.quantity),
+	    durationSec: row.durationSec == null ? null : Number(row.durationSec),
+	    billingStatus: row.billingStatus || null,
+	    ledgerId: row.ledgerId || null,
+	    providerResponseHash: row.providerResponseHash || null,
+	    promptHash: row.promptHash || null,
     responseHash: row.responseHash || null,
     batchId: row.batchId || null,
     taskId: row.taskId || null,

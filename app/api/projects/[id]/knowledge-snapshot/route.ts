@@ -208,11 +208,6 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
         propCount: Array.isArray(worldSnapshot.props) ? worldSnapshot.props.length : 0,
       } : null,
       drift: driftInfo(worldSnapshot, worldSource),
-      pendingFacts: project.pendingWorldFacts ? {
-        source: cleanText(project.pendingWorldFacts.source, 80),
-        createdAt: cleanText(project.pendingWorldFacts.createdAt, 80),
-        summary: project.pendingWorldFacts.summary || null,
-      } : null,
     },
     consistency: publicConsistencyMeta(project.consistency),
     characters: locks.map(publicCharacterLock),

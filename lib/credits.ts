@@ -1,16 +1,8 @@
 /**
- * 积分系统：余额查询 / 预扣 / 退还 / 入账 / 明细
+ * 积分系统：余额查询 / 扣减 / 退还 / 入账 / 明细。
  *
- * 计费表（单位：积分）：
- *   text       1 积分/请求      （剧本/资产抽取/镜头/EDL/Agent 等所有 LLM 文本）
- *   image      30 积分/张        （角色/场景/道具/分镜图）
- *   video      150 积分/段       （单段视频生成；时长 ≤6s 算一段）
- *   export     5 积分/次         （FFmpeg 导出成片）
- *
- * 这是一份示例计费，可以在这里集中调整。
- *
- * 并发安全：所有修改余额的操作都放进 db.transaction(...) 并使用条件 UPDATE，
- * 即使多进程 / 未来改异步也不会出现 TOCTOU 双花。
+ * CREDIT_PRICES 只保留给迁移期 legacy 固定扣费路径和旧任务退款使用；
+ * 新的 API 用量计费走 usage-billing.ts + api_price_catalog。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -38,11 +30,16 @@ export class InsufficientCreditsError extends Error {
 }
 
 function rowToBalance(row: any) {
+  const subscriptionCredits = Number(row.subscription_credits || 0);
+  const topupCredits = Number(row.topup_credits || 0);
+  const bonusCredits = Number(row.bonus_credits || 0);
+  const overdraftCredits = Number(row.overdraft_credits || 0);
   return {
-    totalCredits: row.total_credits || 0,
-    subscriptionCredits: row.subscription_credits || 0,
-    topupCredits: row.topup_credits || 0,
-    bonusCredits: row.bonus_credits || 0,
+    totalCredits: subscriptionCredits + topupCredits + bonusCredits - overdraftCredits,
+    subscriptionCredits,
+    topupCredits,
+    bonusCredits,
+    overdraftCredits,
     planCode: row.plan_code || 'free',
     planStatus: row.plan_status || 'active',
     periodEnd: row.period_end,
@@ -54,8 +51,9 @@ export function getBalance(userId: number): {
   totalCredits: number;
   subscriptionCredits: number;
   topupCredits: number;
-  bonusCredits: number;
-  planCode: string;
+	  bonusCredits: number;
+	  overdraftCredits: number;
+	  planCode: string;
   planStatus: string;
   periodEnd: string | null;
   cancelAtPeriodEnd: boolean;
@@ -89,6 +87,7 @@ export function getBalance(userId: number): {
       subscriptionCredits: 100,
       topupCredits: 0,
       bonusCredits: 0,
+      overdraftCredits: 0,
       planCode: 'free',
       planStatus: 'active',
       periodEnd: null,
@@ -99,10 +98,59 @@ export function getBalance(userId: number): {
 }
 
 /**
- * 预扣积分。如果余额不足抛 InsufficientCreditsError。
- * 返回 ledger entry id（可用于失败时退还）。
+ * 到期降级（惰性结算）。
  *
- * 所有读-改-写放在一个 IMMEDIATE 事务中，并对 total_credits >= amount 做条件 UPDATE。
+ * 当用户已申请到期取消（cancel_at_period_end=1）、当前是付费档、且 period_end 已过时，
+ * 把订阅降级为 free：清零订阅积分、plan_code 回 free、复位取消标记、清空 period_end，
+ * 并写一条 kind='adjust' 流水留痕。返回是否真的发生了降级。
+ *
+ * 设计取舍：只在"读取入口"（如 GET /api/billing/me）调用，**不** 放进 chargeCredits/
+ * refundCredits 等扣费路径——避免扩大对正常计费逻辑的影响面，也避免事务嵌套。
+ * 只回收订阅桶；topup / bonus / overdraft 桶不动，total 按 sub+topup+bonus-overdraft 重算。
+ */
+export function settleExpiredSubscription(userId: number): boolean {
+  const db = getDb();
+  const row = db
+    .prepare<{ uid: number }, any>(
+      `SELECT plan_code, period_end, cancel_at_period_end,
+              subscription_credits, topup_credits, bonus_credits, overdraft_credits
+       FROM user_credits WHERE user_id = @uid`,
+    )
+    .get({ uid: userId });
+  if (!row) return false;
+  if (!row.cancel_at_period_end) return false;
+  if (!row.plan_code || row.plan_code === 'free') return false;
+  if (!row.period_end) return false;
+  const end = Date.parse(String(row.period_end));
+  if (!Number.isFinite(end) || end > Date.now()) return false;
+
+  const subCredits = Number(row.subscription_credits || 0);
+  const newTotal =
+    Number(row.topup_credits || 0) + Number(row.bonus_credits || 0) - Number(row.overdraft_credits || 0);
+  let downgraded = false;
+  const txn = db.transaction(() => {
+    // 条件 UPDATE：仍是"已申请取消的该付费档"才生效，避免与并发 resume / 后台改档打架。
+    const info = db.prepare(
+      `UPDATE user_credits SET
+         plan_code = 'free', subscription_credits = 0, total_credits = ?,
+         cancel_at_period_end = 0, period_end = NULL,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE user_id = ? AND cancel_at_period_end = 1 AND plan_code = ?`,
+    ).run(newTotal, userId, row.plan_code);
+    if (info.changes !== 1) return;
+    db.prepare(
+      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after)
+       VALUES (?, ?, ?, 'adjust', ?, ?, ?)`,
+    ).run(randomUUID(), userId, -subCredits, '订阅到期降级为免费版', null, newTotal);
+    downgraded = true;
+  });
+  txn.immediate();
+  return downgraded;
+}
+
+/**
+ * 迁移期 legacy 扣减。只在余额 <= 0 时拦截，允许本次扣减后变成负余额。
+ * 新 API 用量扣费优先使用 usage-billing.ts。
  */
 export function chargeCredits(opts: {
   userId: number;
@@ -132,8 +180,8 @@ export function chargeCredits(opts: {
     }
 
     const cur = getBalance(opts.userId);
-    if (cur.totalCredits < opts.amount) {
-      throw new InsufficientCreditsError(opts.amount, cur.totalCredits);
+    if (cur.totalCredits <= 0) {
+      throw new InsufficientCreditsError(1, cur.totalCredits);
     }
 
     // 扣减优先级：bonus > topup > subscription
@@ -144,31 +192,31 @@ export function chargeCredits(opts: {
     remaining -= topupUse;
     const subUse = Math.min(remaining, cur.subscriptionCredits);
     remaining -= subUse;
-    if (remaining > 0) throw new InsufficientCreditsError(opts.amount, cur.totalCredits);
+    const overdraftUse = remaining;
 
     const newBonus = cur.bonusCredits - bonusUse;
     const newTopup = cur.topupCredits - topupUse;
     const newSub = cur.subscriptionCredits - subUse;
-    const newTotal = newBonus + newTopup + newSub;
+    const newOverdraft = cur.overdraftCredits + overdraftUse;
+    const newTotal = newBonus + newTopup + newSub - newOverdraft;
 
-    // 条件 UPDATE：只在原余额仍不少于 amount 时才生效；changes=0 说明中途被别的事务扣掉了
+    // 条件 UPDATE：仍校验旧桶值，避免并发写覆盖；不再要求 total_credits >= amount。
     const info = db.prepare(
       `UPDATE user_credits SET
-        bonus_credits = ?, topup_credits = ?, subscription_credits = ?, total_credits = ?,
+        bonus_credits = ?, topup_credits = ?, subscription_credits = ?, overdraft_credits = ?, total_credits = ?,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE user_id = ?
          AND bonus_credits = ?
          AND topup_credits = ?
          AND subscription_credits = ?
-         AND total_credits >= ?`,
+         AND overdraft_credits = ?`,
     ).run(
-      newBonus, newTopup, newSub, newTotal,
+      newBonus, newTopup, newSub, newOverdraft, newTotal,
       opts.userId,
-      cur.bonusCredits, cur.topupCredits, cur.subscriptionCredits,
-      opts.amount,
+      cur.bonusCredits, cur.topupCredits, cur.subscriptionCredits, cur.overdraftCredits,
     );
     if (info.changes !== 1) {
-      throw new InsufficientCreditsError(opts.amount, cur.totalCredits);
+      throw new Error('积分余额更新冲突，请重试');
     }
 
     const ledgerId = randomUUID();
@@ -176,6 +224,7 @@ export function chargeCredits(opts: {
       bonus: bonusUse,
       topup: topupUse,
       subscription: subUse,
+      overdraft: overdraftUse,
     });
     db.prepare(
       `INSERT INTO credit_ledger
@@ -222,7 +271,7 @@ export function refundCredits(opts: {
   const db = getDb();
 
   // 解析退款分布
-  let refund = { bonus: 0, topup: 0, subscription: 0 };
+  let refund = { bonus: 0, topup: 0, subscription: 0, overdraft: 0 };
   if (opts.bucket) {
     refund[opts.bucket] = opts.amount;
   } else if (opts.refId) {
@@ -236,22 +285,23 @@ export function refundCredits(opts: {
     if (src && src.buckets_json) {
       try {
         const b = JSON.parse(src.buckets_json);
-        const origTotal = Number(b.bonus || 0) + Number(b.topup || 0) + Number(b.subscription || 0);
-        if (origTotal > 0) {
+          const origTotal = Number(b.bonus || 0) + Number(b.topup || 0) + Number(b.subscription || 0) + Number(b.overdraft || 0);
+          if (origTotal > 0) {
           // 按原 charge 的桶比例退：多数情况 opts.amount === origTotal，就是完全还原
           const ratio = opts.amount / origTotal;
-          refund.bonus = Math.round(Number(b.bonus || 0) * ratio);
-          refund.topup = Math.round(Number(b.topup || 0) * ratio);
-          refund.subscription = opts.amount - refund.bonus - refund.topup;
-          if (refund.subscription < 0) refund.subscription = 0;
-        }
+            refund.bonus = Math.round(Number(b.bonus || 0) * ratio);
+            refund.topup = Math.round(Number(b.topup || 0) * ratio);
+            refund.overdraft = Math.round(Number(b.overdraft || 0) * ratio);
+            refund.subscription = opts.amount - refund.bonus - refund.topup - refund.overdraft;
+            if (refund.subscription < 0) refund.subscription = 0;
+          }
       } catch (_) {}
     }
   }
   // 兜底
-  const total = refund.bonus + refund.topup + refund.subscription;
+  const total = refund.bonus + refund.topup + refund.subscription + refund.overdraft;
   if (total !== opts.amount) {
-    refund = { bonus: opts.amount, topup: 0, subscription: 0 };
+    refund = { bonus: opts.amount, topup: 0, subscription: 0, overdraft: 0 };
   }
 
   const txn = db.transaction(() => {
@@ -271,17 +321,20 @@ export function refundCredits(opts: {
     }
 
     const cur = getBalance(opts.userId);
+    const overdraftReduction = Math.min(cur.overdraftCredits, refund.overdraft);
+    const overflowFromOverdraft = refund.overdraft - overdraftReduction;
     const newSub = cur.subscriptionCredits + refund.subscription;
     const newTop = cur.topupCredits + refund.topup;
-    const newBon = cur.bonusCredits + refund.bonus;
-    const newTotal = newSub + newTop + newBon;
+    const newBon = cur.bonusCredits + refund.bonus + overflowFromOverdraft;
+    const newOverdraft = cur.overdraftCredits - overdraftReduction;
+    const newTotal = newSub + newTop + newBon - newOverdraft;
 
     db.prepare(
       `UPDATE user_credits SET
-        subscription_credits = ?, topup_credits = ?, bonus_credits = ?, total_credits = ?,
+        subscription_credits = ?, topup_credits = ?, bonus_credits = ?, overdraft_credits = ?, total_credits = ?,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE user_id = ?`,
-    ).run(newSub, newTop, newBon, newTotal, opts.userId);
+    ).run(newSub, newTop, newBon, newOverdraft, newTotal, opts.userId);
 
     const ledgerId = randomUUID();
     db.prepare(
@@ -324,17 +377,20 @@ export function grantCredits(opts: {
     let newSub = cur.subscriptionCredits;
     let newTop = cur.topupCredits;
     let newBon = cur.bonusCredits;
-    if (bucket === 'subscription') newSub += opts.amount;
-    else if (bucket === 'topup') newTop += opts.amount;
-    else newBon += opts.amount;
-    const newTotal = newSub + newTop + newBon;
+    const overdraftReduction = Math.min(cur.overdraftCredits, opts.amount);
+    const remainingGrant = opts.amount - overdraftReduction;
+    const newOverdraft = cur.overdraftCredits - overdraftReduction;
+    if (bucket === 'subscription') newSub += remainingGrant;
+    else if (bucket === 'topup') newTop += remainingGrant;
+    else newBon += remainingGrant;
+    const newTotal = newSub + newTop + newBon - newOverdraft;
 
     db.prepare(
       `UPDATE user_credits SET
-        subscription_credits = ?, topup_credits = ?, bonus_credits = ?, total_credits = ?,
+        subscription_credits = ?, topup_credits = ?, bonus_credits = ?, overdraft_credits = ?, total_credits = ?,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE user_id = ?`,
-    ).run(newSub, newTop, newBon, newTotal, opts.userId);
+    ).run(newSub, newTop, newBon, newOverdraft, newTotal, opts.userId);
 
     db.prepare(
       `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after)

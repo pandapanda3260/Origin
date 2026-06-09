@@ -252,6 +252,10 @@ function refundProviderFailedTask(taskId: string, reason: string) {
   if (!row) return { refunded: false, reason: 'task_owner_missing' };
   const amount = costForBatchType(row.batch_type);
   if (amount <= 0) return { refunded: false, reason: 'zero_cost' };
+  const hasLegacyCharge = getDb()
+    .prepare<{ ref: string }, any>('SELECT id FROM credit_ledger WHERE charge_ref_id = @ref LIMIT 1')
+    .get({ ref: `charge:${taskId}` });
+  if (!hasLegacyCharge) return { refunded: false, reason: 'legacy_charge_missing' };
   refundTaskLedger({
     userId: row.owner_id,
     taskId,

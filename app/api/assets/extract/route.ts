@@ -29,7 +29,7 @@ import {
   normalizeCrowdSize,
 } from '@/lib/crowd-character';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
-import { mergeProjectFactsIntoWorldSnapshot } from '@/lib/world-templates-db';
+import { injectWorldTemplateIntoAssets, normalizeAssetMatchKey } from '@/lib/world-asset-injection';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -306,6 +306,65 @@ export async function POST(req: NextRequest) {
         (proj as any)?.props,
       );
     }
+    if (worldTemplate) {
+      const injection = injectWorldTemplateIntoAssets({
+        assets: {
+          characters: parsed.characters,
+          scenes: parsed.environments,
+          props: parsed.props,
+        },
+        worldTemplateSnapshot: worldTemplate,
+      });
+      const injectedCharacterIndexes = new Set<number>();
+      const injectedSceneIndexes = new Set<number>();
+      const injectedPropIndexes = new Set<number>();
+      for (const log of injection.logs) {
+        if (log.action !== 'injected') continue;
+        if (log.kind === 'characters') injectedCharacterIndexes.add(log.index);
+        else if (log.kind === 'scenes') injectedSceneIndexes.add(log.index);
+        else if (log.kind === 'props') injectedPropIndexes.add(log.index);
+      }
+      parsed.characters = injection.assets.characters.map((character: any, index: number) => {
+        if (!injectedCharacterIndexes.has(index)) return character;
+        const next = { ...character };
+        next.imagePrompt = appendCharacterCastingPrompt(
+          buildCharacterPrompt(next, styleBible),
+          next,
+          styleBible,
+          { script: finalScript },
+        );
+        return next;
+      });
+      parsed.environments = injection.assets.scenes.map((scene: any, index: number) => {
+        if (!injectedSceneIndexes.has(index)) return scene;
+        return {
+          ...scene,
+          imagePrompt: buildScenePrompt(scene, styleBible),
+        };
+      });
+      parsed.props = injection.assets.props.map((prop: any, index: number) => {
+        if (!injectedPropIndexes.has(index)) return prop;
+        return {
+          ...prop,
+          imagePrompt: buildPropPrompt(prop, styleBible),
+        };
+      });
+      const injectedCount = injection.stats.characters.injected + injection.stats.scenes.injected + injection.stats.props.injected;
+      const imageFilledCount = injection.stats.characters.imageFilled + injection.stats.scenes.imageFilled + injection.stats.props.imageFilled;
+      if (injectedCount || imageFilledCount) {
+        console.info(
+          `[assets/extract] world asset injection projectId=${projectId || 'none'} ` +
+          `injected=${injectedCount} imageFilled=${imageFilledCount}`,
+        );
+      }
+      for (const log of injection.logs) {
+        if (log.action !== 'skipped') continue;
+        console.info(
+          `[assets/extract] world asset injection skipped projectId=${projectId || 'none'} ` +
+          `kind=${log.kind} index=${log.index} name=${log.name || ''} reason=${log.reason || ''}`,
+        );
+      }
+    }
 
     writer.step('已识别角色 ' + parsed.characters.length + ' 个');
     writer.step('已识别场景 ' + parsed.environments.length + ' 个');
@@ -317,7 +376,6 @@ export async function POST(req: NextRequest) {
       scenes: parsed.environments,
       props: parsed.props,
     };
-    let responsePendingWorldFacts: any = undefined;
 
     if (projectId && proj) {
       let consistencyProject: any = {
@@ -361,26 +419,6 @@ export async function POST(req: NextRequest) {
         return { ...character, characterId: result.character.characterId };
       });
       assets.characters = parsed.characters;
-      const worldSnapshotMerge = mergeProjectFactsIntoWorldSnapshot({
-        ...consistencyProject,
-        characters: parsed.characters,
-        environments: parsed.environments,
-        props: parsed.props,
-        assets,
-      });
-      if (worldSnapshotMerge.changed) {
-        responsePendingWorldFacts = {
-          schema: 'origin-pending-world-facts-v1',
-          source: 'assets_extract',
-          createdAt: new Date().toISOString(),
-          worldTemplateSnapshot: worldSnapshotMerge.worldTemplateSnapshot,
-          summary: {
-            characterCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.characters) ? worldSnapshotMerge.worldTemplateSnapshot.characters.length : 0,
-            locationCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.locations) ? worldSnapshotMerge.worldTemplateSnapshot.locations.length : 0,
-            propCount: Array.isArray(worldSnapshotMerge.worldTemplateSnapshot?.props) ? worldSnapshotMerge.worldTemplateSnapshot.props.length : 0,
-          },
-        };
-      }
       const staleFlags = { ...(((proj as any)._staleFlags || {}) as Record<string, unknown>) };
       delete staleFlags.assets;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
@@ -390,7 +428,7 @@ export async function POST(req: NextRequest) {
         props: parsed.props,
         assets,
         consistency: consistencyProject.consistency,
-        pendingWorldFacts: responsePendingWorldFacts || null,
+        pendingWorldFacts: null,
         _staleFlags: staleFlags,
         assetsApproved: false,
         currentStep: 2,
@@ -409,7 +447,6 @@ export async function POST(req: NextRequest) {
       characters: parsed.characters,
       environments: parsed.environments,
       props: parsed.props,
-      pendingWorldFacts: responsePendingWorldFacts,
     });
   });
 }
@@ -455,14 +492,6 @@ function hasGeneratedAssetUrl(item: any): boolean {
 function cloneAssetField(value: any): any {
   if (!value || typeof value !== 'object') return value;
   return JSON.parse(JSON.stringify(value));
-}
-
-function normalizeAssetMatchKey(value: any): string {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[“”"']/g, '')
-    .replace(/\s+/g, '');
 }
 
 function assetMatchKeys(item: any): string[] {

@@ -467,6 +467,26 @@ function _assetContentEl() {
   return $("assetsContent");
 }
 
+function _hideAssetActions() {
+  var btnExtract = $("btnExtractAssets");
+  var btnGen = $("btnGenAssetImages");
+  var btnClean = $("btnCleanObsolete");
+  var topConfirm = $("btnConfirmAssetsTop");
+  var confirmArea = $("assetsConfirmArea");
+  var hint = $("assetImgHint");
+  var stylizeBadge = $("assetStylizeBadge");
+  if (btnExtract) btnExtract.hidden = true;
+  if (btnGen) btnGen.hidden = true;
+  if (btnClean) btnClean.hidden = true;
+  if (topConfirm) topConfirm.hidden = true;
+  if (confirmArea) confirmArea.hidden = true;
+  if (hint) hint.textContent = "";
+  if (stylizeBadge) {
+    stylizeBadge.textContent = "";
+    stylizeBadge.hidden = true;
+  }
+}
+
 function _clearAssetEntranceAnimation() {
   if (_assetEntranceClearTimer) {
     clearTimeout(_assetEntranceClearTimer);
@@ -505,25 +525,29 @@ export function getBackgroundStylizeCount() { return _backgroundStylizeTasks.siz
 export function refreshAssetsPage() {
   _pendingAssetRerender = false;
   var need = $("assetsNeedScript");
+  var needExtract = $("assetsNeedExtract");
   var ready = $("assetsReady");
   var content = $("assetsContent");
   var saveTplBtn = $("btnSaveWorldTemplate");
   var knowledgeBtn = $("btnKnowledgeSnapshot");
-  var pendingWorldBtn = $("btnConfirmPendingWorldFacts");
   var hasScript = !!(project && (project.finalScript || project.script));
+  var hasAssets = !!(project && project.assets);
+  var hasAssetItems = !!(project && _assetItemsForConfirm().length);
   if (!project || !hasScript) {
     // 真实数据不存在（无项目 / 无剧本）时仍显示 need 状态，避免空页面误导用户
-    need.hidden = false;
+    if (need) need.hidden = false;
+    if (needExtract) needExtract.hidden = true;
     if (ready) ready.hidden = true;
     if (content) content.hidden = true;
+    _hideAssetActions();
     if (saveTplBtn) saveTplBtn.hidden = true;
     if (knowledgeBtn) knowledgeBtn.hidden = true;
-    if (pendingWorldBtn) pendingWorldBtn.hidden = true;
     return;
   }
-  need.hidden = true;
-  ready.hidden = false;
-  if (project.assets) {
+  if (need) need.hidden = true;
+  if (hasAssets && hasAssetItems) {
+    if (needExtract) needExtract.hidden = true;
+    if (ready) ready.hidden = false;
     if (content) content.hidden = false;
     var _staleBannerEl = content && content.querySelector(".upstream-stale-banner");
     if (_staleBannerEl) _staleBannerEl.remove();
@@ -538,11 +562,22 @@ export function refreshAssetsPage() {
     checkAssetsConfirm();
     _refreshWorldKnowledgeButtons();
     _updateStylizeBadge();
+  } else if (_assetsExtracting) {
+    if (needExtract) needExtract.hidden = true;
+    if (ready) ready.hidden = false;
+    if (content) content.hidden = true;
+    _hideAssetActions();
+    if (saveTplBtn) saveTplBtn.hidden = true;
+    _refreshWorldKnowledgeButtons();
   } else {
+    if (needExtract) needExtract.hidden = false;
+    if (ready) ready.hidden = true;
     if (content) content.hidden = true;
     var banner = $("assetsExtractBanner");
     if (banner) banner.hidden = true;
+    _hideAssetActions();
     if (saveTplBtn) saveTplBtn.hidden = true;
+    _refreshWorldKnowledgeButtons();
     checkAssetsConfirm();
   }
 }
@@ -552,15 +587,10 @@ function _hasConsistencyAttention() {
   return !!(meta && (meta.needsRoleSync || (Array.isArray(meta.roleSyncReasons) && meta.roleSyncReasons.length)));
 }
 
-function _hasPendingWorldFacts() {
-  return !!(project && project.pendingWorldFacts && project.pendingWorldFacts.worldTemplateSnapshot);
-}
-
 function _refreshWorldKnowledgeButtons() {
   var knowledgeBtn = $("btnKnowledgeSnapshot");
-  var pendingWorldBtn = $("btnConfirmPendingWorldFacts");
   var hasProject = !!(project && project.id);
-  var hasAttention = _hasConsistencyAttention() || _hasPendingWorldFacts();
+  var hasAttention = _hasConsistencyAttention();
   if (knowledgeBtn) {
     knowledgeBtn.hidden = !hasProject;
     var icon = knowledgeBtn.querySelector(".material-symbols-outlined");
@@ -569,7 +599,6 @@ function _refreshWorldKnowledgeButtons() {
     knowledgeBtn.classList.toggle("border-[#F7D48B]", hasAttention);
     knowledgeBtn.classList.toggle("bg-[#FFF8E6]", hasAttention);
   }
-  if (pendingWorldBtn) pendingWorldBtn.hidden = !_hasPendingWorldFacts();
 }
 
 function _setExtractProgress(pct, title, hint) {
@@ -590,7 +619,17 @@ export async function extractAssets() {
   checkAssetsConfirm();
   var originId = project.id;
   var btn = $("btnExtractAssets");
+  var emptyBtn = $("btnExtractAssetsEmpty");
+  var needExtract = $("assetsNeedExtract");
+  var ready = $("assetsReady");
+  var content = $("assetsContent");
+  var hadAssets = !!(project && _assetItemsForConfirm().length);
+  if (needExtract) needExtract.hidden = true;
+  if (ready) ready.hidden = false;
+  if (content) content.hidden = !hadAssets;
+  if (!hadAssets) _hideAssetActions();
   if (btn) btn.disabled = true;
+  if (emptyBtn) emptyBtn.disabled = true;
   _setExtractProgress(10, "正在分析剧本", "识别角色、场景与道具");
 
   var _extractCharCount = 0;
@@ -635,9 +674,6 @@ export async function extractAssets() {
       proj.characters = Array.isArray(resp.characters) ? resp.characters : _deepClonePlain(nextAssets.characters || []);
       proj.environments = Array.isArray(resp.environments) ? resp.environments : _deepClonePlain(nextAssets.scenes || []);
       proj.props = Array.isArray(resp.props) ? resp.props : _deepClonePlain(nextAssets.props || []);
-      if (Object.prototype.hasOwnProperty.call(resp, "pendingWorldFacts")) {
-        proj.pendingWorldFacts = resp.pendingWorldFacts;
-      }
       if (proj._staleFlags) delete proj._staleFlags["assets"];
       if (Object.keys(warningsMap).length) {
         proj._carryWarnings = warningsMap;
@@ -693,6 +729,7 @@ export async function extractAssets() {
   _assetsExtracting = false;
   checkAssetsConfirm();
   if (btn) btn.disabled = false;
+  if (emptyBtn) emptyBtn.disabled = false;
 }
 
 export async function _showAssetActions() {
@@ -4759,19 +4796,6 @@ function _renderKnowledgeConsistencyAlerts(consistency) {
   '</section>';
 }
 
-function _renderKnowledgePendingWorldFacts(pending) {
-  if (!pending) return "";
-  var summary = pending.summary || {};
-  return '<section class="rounded-xl border border-[#D6E4FF] bg-[#F5F8FF] p-4">' +
-    '<div class="flex items-center gap-2">' +
-      '<span class="material-symbols-outlined text-base text-[#3156A3]">priority_high</span>' +
-      '<h4 class="text-sm font-bold text-[#24427A]">待确认的世界观回填</h4>' +
-    '</div>' +
-    '<p class="text-xs text-[#526989] mt-2 leading-relaxed">资产抽取发现可补充到世界观的空字段，确认后才会写入剧级世界观。</p>' +
-    _knowledgeInfoRow("候选", (summary.characterCount || 0) + " 个角色 / " + (summary.locationCount || 0) + " 个场景 / " + (summary.propCount || 0) + " 个道具") +
-  '</section>';
-}
-
 function _renderKnowledgeCharacters(characters) {
   if (!characters || !characters.length) {
     return '<section class="rounded-xl border border-[#ECEFF1] bg-white p-4">' +
@@ -4876,7 +4900,6 @@ export async function openKnowledgeSnapshot() {
         '</section>' +
         _renderKnowledgeTemplate("风格模板", style.template, style.drift) +
         _renderKnowledgeTemplate("世界观模板", world.template, world.drift) +
-        _renderKnowledgePendingWorldFacts(world.pendingFacts) +
         _renderKnowledgeConsistencyAlerts(consistency) +
         _renderKnowledgeCharacters(data.characters || []) +
         _renderKnowledgeStages(data.recentStages || []) +
@@ -4887,27 +4910,6 @@ export async function openKnowledgeSnapshot() {
       errBody.innerHTML = '<div class="rounded-xl border border-[#FFCDD2] bg-[#FFF5F5] p-5 text-sm text-[#B71C1C]">读取失败：' + escapeHtml((e && e.message) || e) + '</div>';
     }
   }
-}
-
-export async function confirmPendingWorldFacts() {
-  if (!project || !project.id) { showToast("请先打开项目", "warn"); return; }
-  var pending = project.pendingWorldFacts;
-  var snapshot = pending && pending.worldTemplateSnapshot;
-  if (!snapshot) { showToast("没有待确认的世界观更新", "info"); return; }
-  var summary = pending.summary || {};
-  var msg = "将把本次资产抽取得到的空字段补充写入当前项目世界观。";
-  if (summary.characterCount || summary.locationCount || summary.propCount) {
-    msg += "\n\n候选包含：" + (summary.characterCount || 0) + " 个角色 / " + (summary.locationCount || 0) + " 个场景 / " + (summary.propCount || 0) + " 个道具。";
-  }
-  msg += "\n\n已存在的非空字段不会被覆盖。";
-  var ok = await showConfirm("确认世界观更新", msg, "确认更新", "取消");
-  if (!ok) return;
-  project.worldTemplateSnapshot = snapshot;
-  project.selectedWorldTemplateId = snapshot.id || project.selectedWorldTemplateId || null;
-  project.pendingWorldFacts = null;
-  _saveAssetsProject();
-  _refreshWorldKnowledgeButtons();
-  showToast("世界观更新已确认", "success");
 }
 
 function _worldTemplateCharacterKey(item) {

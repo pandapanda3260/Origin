@@ -15,14 +15,12 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
 import type { UserRow } from './db';
-import { InsufficientCreditsError } from './credits';
-import { costForBatchType, creditKindForBatchType, finalizeBatchFromTasks } from './batch-task-accounting';
+import { assertCanStartPaidOperation } from './usage-billing';
+import { finalizeBatchFromTasks } from './batch-task-accounting';
 import {
   TASK_STATUS_TRANSITIONS,
   batchHeartbeat as heartbeatDurableTasks,
-  chargeTaskLedger,
   claimNextTask,
-  refundTaskLedger,
   releaseExpiredTaskLeases,
   requestTaskCancel,
   transitionTaskStatus,
@@ -750,6 +748,7 @@ export function createBatch(opts: {
 }): { batchId: string; total: number; reused?: boolean; duplicateGroupIdxs?: number[] } {
   const db = getDb();
   const total = opts.targets.length;
+  assertCanStartPaidOperation(opts.user.id);
   const batchId = randomUUID();
   const optsJson = JSON.stringify(opts.options || {});
   const leaseAt = _nowIso();
@@ -1493,42 +1492,6 @@ export async function runBatch(opts: {
         return;
       }
 
-      // 单任务计费（图片/视频每条扣一份）
-      const cost = costForBatchType(opts.batchType);
-      let chargeId: string | null = null;
-      if (cost > 0) {
-        try {
-          const r = chargeTaskLedger({
-            userId: opts.user.id,
-            taskId: t.id,
-            amount: cost,
-            kind: creditKindForBatchType(opts.batchType),
-            reason: `batch:${opts.batchType}`,
-          });
-          chargeId = r.ledgerId;
-        } catch (e: any) {
-          const msg = e?.message || String(e);
-          db.prepare(`UPDATE batch_tasks SET error_msg=?, updated_at=? WHERE id=?`)
-            .run(msg.slice(0, 1000), _nowIso(), t.id);
-          transitionTaskStatus({
-            taskId: t.id,
-            from: 'running',
-            to: 'failed',
-            reason: msg.slice(0, 500),
-            actor: 'worker',
-            runnerId: BATCH_RUNNER_ID,
-            meta: { errorCode: e instanceof InsufficientCreditsError ? 'INSUFFICIENT_CREDITS' : undefined },
-          });
-          failed++;
-          db.prepare(`UPDATE batches SET failed=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`).run(failed, opts.batchId);
-          _emit(opts.batchId, 'task_failed', {
-            taskId: t.id, targetSeq: t.seq, target, errorMsg: msg, reason: msg,
-            errorCode: e instanceof InsufficientCreditsError ? 'INSUFFICIENT_CREDITS' : undefined,
-          });
-          return;
-        }
-      }
-
       try {
         throwIfTaskCancelRequested(t.id);
         const result = await exec({
@@ -1603,11 +1566,6 @@ export async function runBatch(opts: {
       } catch (e: any) {
         const msg = e?.message || String(e);
         const wasCancelled = e instanceof BatchTaskCancelledError;
-        // 任务失败：把刚预扣的积分退还
-        if (cost > 0) {
-          try { refundTaskLedger({ userId: opts.user.id, taskId: t.id, amount: cost, reason: `refund:${opts.batchType}` }); }
-          catch (refundErr) { console.error('[batch] refund failed:', opts.batchId, t.id, refundErr); }
-        }
         if (wasCancelled) {
           db.prepare(`UPDATE batch_tasks SET error_msg=?, result_json='{}', updated_at=? WHERE id=?`)
             .run(msg.slice(0, 1000), _nowIso(), t.id);

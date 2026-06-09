@@ -12,7 +12,6 @@ import {
   probeDurationSec,
 } from './ffmpeg';
 import { storyboardShotIndices } from './frame-workflow-state';
-import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from './credits';
 import { patchProjectForUser } from './projects-db';
 import { buildKnowledgeContextForStage } from './knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from './knowledge/context-db';
@@ -262,19 +261,6 @@ export function markExportTaskIgnored(args: {
      SET status='cancelled', error_msg=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE id=? AND owner_id=? AND status IN ('queued','running')`,
   ).run((args.reason || 'replaced by retry').slice(0, 1000), taskId, args.userId);
-  if (info.changes > 0) {
-    try {
-      refundCredits({
-        userId: args.userId,
-        amount: CREDIT_PRICES.export,
-        reason: `edit.export.cancelled:${String(args.reason || 'replaced').slice(0, 120)}`,
-        refId: taskId,
-        refundRefId: `export:${taskId}`,
-      });
-    } catch (e) {
-      console.error('[export] cancel refund failed:', taskId, e);
-    }
-  }
   return info.changes > 0;
 }
 
@@ -341,40 +327,8 @@ export async function startEditExport(args: {
     composeMeta,
   });
 
-  try {
-    chargeCredits({
-      userId: args.user.id,
-      amount: CREDIT_PRICES.export,
-      kind: 'export',
-      reason: 'edit.export',
-      refId: exportId,
-    });
-  } catch (e: any) {
-    if (e instanceof InsufficientCreditsError) {
-      throw new EditExportError(e.message, 402, {
-        detail: e.message,
-        errorCode: 'INSUFFICIENT_CREDITS',
-        required: e.required,
-        balance: e.balance,
-      });
-    }
-    throw new EditExportError(e?.message || String(e), 500);
-  }
-
   const db = getDb();
-  const refundOnFailure = (reason: string) => {
-    try {
-      refundCredits({
-        userId: args.user.id,
-        amount: CREDIT_PRICES.export,
-        reason: `edit.export.failed:${reason}`,
-        refId: exportId,
-        refundRefId: `export:${exportId}`,
-      });
-    } catch (refErr) {
-      console.error('[export] refund failed:', exportId, refErr);
-    }
-  };
+  const refundOnFailure = (_reason: string) => {};
 
   const ownerDir = join(EXPORTS_DIR, String(args.user.id));
   let fullPath: string;

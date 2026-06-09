@@ -347,19 +347,21 @@ function bootstrap(db: Database.Database) {
       ON scheduled_jobs(status, next_run_at, lease_expires_at);
 
     -- 阶段四：视频任务（单条片段生成）
-    CREATE TABLE IF NOT EXISTS video_tasks (
-      id            TEXT PRIMARY KEY,
-      owner_id      INTEGER NOT NULL,
-      project_id    TEXT,
-      group_idx     INTEGER,                  -- 关联 storyboards[group_idx]
-      prompt        TEXT NOT NULL DEFAULT '',
-      provider      TEXT NOT NULL DEFAULT 'openai',  -- openai | seedance | keling | fake
-      provider_task TEXT,                      -- 远端任务 id（用于轮询）
-      video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
-      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
-      progress      INTEGER NOT NULL DEFAULT 0,      -- 0-100
-      filename      TEXT,                            -- data/videos/<owner>/<filename>
-      duration_sec  REAL,
+	    CREATE TABLE IF NOT EXISTS video_tasks (
+	      id            TEXT PRIMARY KEY,
+	      owner_id      INTEGER NOT NULL,
+	      project_id    TEXT,
+	      group_idx     INTEGER,                  -- 关联 storyboards[group_idx]
+	      prompt        TEXT NOT NULL DEFAULT '',
+	      provider      TEXT NOT NULL DEFAULT 'openai',  -- openai | seedance | keling | fake
+	      provider_task TEXT,                      -- 远端任务 id（用于轮询）
+	      video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
+	      billing_session_id TEXT,
+	      billing_context_json TEXT NOT NULL DEFAULT '{}',
+	      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
+	      progress      INTEGER NOT NULL DEFAULT 0,      -- 0-100
+	      filename      TEXT,                            -- data/videos/<owner>/<filename>
+	      duration_sec  REAL,
 	      cover_image_id TEXT,                           -- 关联 images.id（视频封面）
 	      error_msg     TEXT,
 	      error_message TEXT,
@@ -822,15 +824,16 @@ function bootstrap(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_script_library_project ON script_library_items(owner_id, project_id, updated_at DESC);
 
     -- 阶段五：用户积分余额（按用户单行）
-    CREATE TABLE IF NOT EXISTS user_credits (
-      user_id              INTEGER PRIMARY KEY,
-      total_credits        INTEGER NOT NULL DEFAULT 0,
-      subscription_credits INTEGER NOT NULL DEFAULT 0,
-      topup_credits        INTEGER NOT NULL DEFAULT 0,
-      bonus_credits        INTEGER NOT NULL DEFAULT 0,
-      plan_code            TEXT NOT NULL DEFAULT 'free',
-      plan_status          TEXT NOT NULL DEFAULT 'active',
-      period_end           TEXT,
+	    CREATE TABLE IF NOT EXISTS user_credits (
+	      user_id              INTEGER PRIMARY KEY,
+	      total_credits        INTEGER NOT NULL DEFAULT 0,
+	      subscription_credits INTEGER NOT NULL DEFAULT 0,
+	      topup_credits        INTEGER NOT NULL DEFAULT 0,
+	      bonus_credits        INTEGER NOT NULL DEFAULT 0,
+	      overdraft_credits    INTEGER NOT NULL DEFAULT 0,
+	      plan_code            TEXT NOT NULL DEFAULT 'free',
+	      plan_status          TEXT NOT NULL DEFAULT 'active',
+	      period_end           TEXT,
       cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
       updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -845,19 +848,55 @@ function bootstrap(db: Database.Database) {
       reason      TEXT NOT NULL DEFAULT '',
       ref_id      TEXT,                        -- 关联的 task_id / order_id / batch_id 等
       provider    TEXT,
-      model       TEXT,
-      model_role  TEXT,
-      cost_micros INTEGER,
-      admin_user_id INTEGER,
-      idempotency_key TEXT,
-      charge_ref_id TEXT,
+	      model       TEXT,
+	      model_role  TEXT,
+	      cost_micros INTEGER,
+	      cost_currency TEXT,
+	      operation_module TEXT,
+	      operation_feature TEXT,
+	      consumption_type TEXT,
+	      quantity REAL,
+	      input_tokens INTEGER,
+	      output_tokens INTEGER,
+	      cached_tokens INTEGER,
+	      reasoning_tokens INTEGER,
+	      duration_sec REAL,
+	      price_catalog_id TEXT,
+	      price_snapshot_json TEXT,
+	      usage_event_ids_json TEXT,
+	      admin_user_id INTEGER,
+	      idempotency_key TEXT,
+	      charge_ref_id TEXT,
       refund_ref_id TEXT,
       balance_after INTEGER NOT NULL,
       created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-      FOREIGN KEY (admin_user_id) REFERENCES admin_users(id) ON DELETE SET NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_ledger_user_time ON credit_ledger(user_id, created_at DESC);
+	      FOREIGN KEY (admin_user_id) REFERENCES admin_users(id) ON DELETE SET NULL
+	    );
+	    CREATE INDEX IF NOT EXISTS idx_ledger_user_time ON credit_ledger(user_id, created_at DESC);
+
+	    CREATE TABLE IF NOT EXISTS api_price_catalog (
+	      id                         TEXT PRIMARY KEY,
+	      provider                   TEXT,
+	      model                      TEXT NOT NULL,
+	      model_role                 TEXT,
+	      consumption_type           TEXT NOT NULL,
+	      unit                       TEXT NOT NULL,
+	      price_cny_micros_per_unit  INTEGER NOT NULL,
+	      price_usd_micros_per_unit  INTEGER,
+	      original_currency          TEXT NOT NULL DEFAULT 'CNY',
+	      original_price             REAL,
+	      exchange_rate              REAL,
+	      source_note                TEXT NOT NULL DEFAULT '',
+	      status                     TEXT NOT NULL DEFAULT 'active',
+	      effective_from             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+	      last_updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+	      last_updated_by            TEXT,
+	      created_at                 TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+	      CHECK (status IN ('active', 'requires_probe', 'disabled'))
+	    );
+	    CREATE INDEX IF NOT EXISTS idx_api_price_catalog_lookup
+	      ON api_price_catalog(model, provider, model_role, consumption_type, status);
 
     -- 阶段五：订单（兑换码 / Stripe / 微信支付都进这一张表）
     CREATE TABLE IF NOT EXISTS billing_orders (
@@ -978,10 +1017,20 @@ function bootstrap(db: Database.Database) {
       reasoning_tokens       INTEGER,
       cached_tokens          INTEGER,
       total_tokens           INTEGER,
-      billable_tokens        INTEGER,
-      usage_source           TEXT NOT NULL DEFAULT 'missing',
-      prompt_hash            TEXT,
-      response_hash          TEXT,
+	      billable_tokens        INTEGER,
+	      usage_source           TEXT NOT NULL DEFAULT 'missing',
+	      billing_session_id     TEXT,
+	      billing_scope          TEXT NOT NULL DEFAULT 'unknown',
+	      operation_key          TEXT,
+	      operation_label        TEXT,
+	      consumption_type       TEXT,
+	      quantity               REAL,
+	      duration_sec           REAL,
+	      billing_status         TEXT NOT NULL DEFAULT 'unbilled',
+	      ledger_id              TEXT,
+	      provider_response_hash TEXT,
+	      prompt_hash            TEXT,
+	      response_hash          TEXT,
       batch_id               TEXT,
       task_id                TEXT,
       run_id                 TEXT,
@@ -995,8 +1044,8 @@ function bootstrap(db: Database.Database) {
       ON token_usage_events(owner_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_token_usage_category_time
       ON token_usage_events(module_key, feature_key, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_token_usage_model_time
-      ON token_usage_events(provider, model, created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_token_usage_model_time
+	      ON token_usage_events(provider, model, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS user_activity (
       user_id       INTEGER PRIMARY KEY,
@@ -1033,8 +1082,9 @@ function bootstrap(db: Database.Database) {
   migrateLedgerBuckets(db);
   migrateBatchLeaseColumns(db);
   migrateDurableTaskColumns(db);
-  migrateLedgerIdempotencyColumns(db);
-  migrateImageAuditColumns(db);
+	  migrateLedgerIdempotencyColumns(db);
+	  migrateUsageBillingColumns(db);
+	  migrateImageAuditColumns(db);
   migrateExportEdlVersionColumn(db);
   migrateExportLocalDownloadColumns(db);
   migrateExportProviderColumns(db);
@@ -1489,6 +1539,123 @@ function migrateLedgerIdempotencyColumns(db: Database.Database) {
   } catch (e) {
     console.warn('[db] migrateLedgerIdempotencyColumns:', e);
   }
+}
+
+function migrateUsageBillingColumns(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'user_credits', 'overdraft_credits', 'overdraft_credits INTEGER NOT NULL DEFAULT 0');
+    db.prepare(
+      `UPDATE user_credits
+          SET total_credits = subscription_credits + topup_credits + bonus_credits - overdraft_credits`,
+    ).run();
+
+    for (const column of [
+      'cost_currency TEXT',
+      'operation_module TEXT',
+      'operation_feature TEXT',
+      'consumption_type TEXT',
+      'quantity REAL',
+      'input_tokens INTEGER',
+      'output_tokens INTEGER',
+      'cached_tokens INTEGER',
+      'reasoning_tokens INTEGER',
+      'duration_sec REAL',
+      'price_catalog_id TEXT',
+      'price_snapshot_json TEXT',
+      'usage_event_ids_json TEXT',
+    ]) {
+      const name = column.split(' ')[0];
+      addColumnIfMissing(db, 'credit_ledger', name, column);
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_ledger_provider_model_time
+        ON credit_ledger(provider, model, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_ledger_operation_time
+        ON credit_ledger(operation_module, operation_feature, created_at DESC);
+    `);
+
+    addColumnIfMissing(db, 'video_tasks', 'billing_session_id', 'billing_session_id TEXT');
+    addColumnIfMissing(db, 'video_tasks', 'billing_context_json', "billing_context_json TEXT NOT NULL DEFAULT '{}'");
+
+    for (const column of [
+      'billing_session_id TEXT',
+      "billing_scope TEXT NOT NULL DEFAULT 'unknown'",
+      'operation_key TEXT',
+      'operation_label TEXT',
+      'consumption_type TEXT',
+      'quantity REAL',
+      'duration_sec REAL',
+      "billing_status TEXT NOT NULL DEFAULT 'unbilled'",
+      'ledger_id TEXT',
+      'provider_response_hash TEXT',
+    ]) {
+      const name = column.split(' ')[0];
+      addColumnIfMissing(db, 'token_usage_events', name, column);
+    }
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_token_usage_billing_status
+        ON token_usage_events(billing_status, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS api_price_catalog (
+        id                         TEXT PRIMARY KEY,
+        provider                   TEXT,
+        model                      TEXT NOT NULL,
+        model_role                 TEXT,
+        consumption_type           TEXT NOT NULL,
+        unit                       TEXT NOT NULL,
+        price_cny_micros_per_unit  INTEGER NOT NULL,
+        price_usd_micros_per_unit  INTEGER,
+        original_currency          TEXT NOT NULL DEFAULT 'CNY',
+        original_price             REAL,
+        exchange_rate              REAL,
+        source_note                TEXT NOT NULL DEFAULT '',
+        status                     TEXT NOT NULL DEFAULT 'active',
+        effective_from             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        last_updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        last_updated_by            TEXT,
+        created_at                 TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        CHECK (status IN ('active', 'requires_probe', 'disabled'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_api_price_catalog_lookup
+        ON api_price_catalog(model, provider, model_role, consumption_type, status);
+    `);
+    seedUsageBillingPriceCatalog(db);
+  } catch (e) {
+    console.warn('[db] migrateUsageBillingColumns:', e);
+  }
+}
+
+function seedUsageBillingPriceCatalog(db: Database.Database) {
+  const updatedAt = '2026-06-09T00:00:00.000Z';
+  const rows = [
+    // price_cny_micros_per_unit is per unit named in `unit`.
+    { id: 'v0:claude-opus-4-8:text_input', provider: '', model: 'claude-opus-4-8', role: null, type: 'text_input', unit: '1m_tokens', cny: 34_100_000, usd: 5_000_000, cur: 'USD', raw: 5, status: 'active', note: 'Anthropic official price, converted with USD/CNY 6.82.' },
+    { id: 'v0:claude-opus-4-8:text_output', provider: '', model: 'claude-opus-4-8', role: null, type: 'text_output', unit: '1m_tokens', cny: 170_500_000, usd: 25_000_000, cur: 'USD', raw: 25, status: 'active', note: 'Anthropic official price, converted with USD/CNY 6.82.' },
+    { id: 'v0:gpt-5.5:text_input', provider: '', model: 'gpt-5.5', role: null, type: 'text_input', unit: '1m_tokens', cny: 34_100_000, usd: 5_000_000, cur: 'USD', raw: 5, status: 'active', note: 'OpenAI official price, converted with USD/CNY 6.82.' },
+    { id: 'v0:gpt-5.5:text_output', provider: '', model: 'gpt-5.5', role: null, type: 'text_output', unit: '1m_tokens', cny: 204_600_000, usd: 30_000_000, cur: 'USD', raw: 30, status: 'active', note: 'OpenAI official price, converted with USD/CNY 6.82.' },
+    { id: 'v0:gpt-5.5:text_cached', provider: '', model: 'gpt-5.5', role: null, type: 'text_cached', unit: '1m_tokens', cny: 3_410_000, usd: 500_000, cur: 'USD', raw: 0.5, status: 'active', note: 'OpenAI cached-input price, converted with USD/CNY 6.82.' },
+    { id: 'v0:gpt-5.4:text_input', provider: '', model: 'gpt-5.4', role: null, type: 'text_input', unit: '1m_tokens', cny: 17_050_000, usd: 2_500_000, cur: 'USD', raw: 2.5, status: 'active', note: 'OpenAI fallback price, converted with USD/CNY 6.82.' },
+    { id: 'v0:gpt-5.4:text_output', provider: '', model: 'gpt-5.4', role: null, type: 'text_output', unit: '1m_tokens', cny: 102_300_000, usd: 15_000_000, cur: 'USD', raw: 15, status: 'active', note: 'OpenAI fallback price, converted with USD/CNY 6.82.' },
+    { id: 'v0:doubao-seed-2-0-pro-260215:text_input', provider: '', model: 'doubao-seed-2-0-pro-260215', role: null, type: 'text_input', unit: '1m_tokens', cny: 3_200_000, usd: 469_000, cur: 'CNY', raw: 3.2, status: 'active', note: 'Volcengine native CNY price.' },
+    { id: 'v0:doubao-seed-2-0-pro-260215:text_output', provider: '', model: 'doubao-seed-2-0-pro-260215', role: null, type: 'text_output', unit: '1m_tokens', cny: 16_000_000, usd: 2_346_000, cur: 'CNY', raw: 16, status: 'active', note: 'Volcengine native CNY price.' },
+    { id: 'v0:doubao-seed-2-0-pro-260215:text_cached', provider: '', model: 'doubao-seed-2-0-pro-260215', role: null, type: 'text_cached', unit: '1m_tokens', cny: 640_000, usd: 94_000, cur: 'CNY', raw: 0.64, status: 'active', note: 'Volcengine native CNY cached-input price.' },
+    { id: 'v0:gpt-image-2:image_text_input', provider: '', model: 'gpt-image-2', role: null, type: 'image_text_input', unit: '1m_tokens', cny: 34_100_000, usd: 5_000_000, cur: 'USD', raw: 5, status: 'requires_probe', note: 'Requires live provider usage probe before automatic charging.' },
+    { id: 'v0:gpt-image-2:image_input', provider: '', model: 'gpt-image-2', role: null, type: 'image_input', unit: '1m_tokens', cny: 54_560_000, usd: 8_000_000, cur: 'USD', raw: 8, status: 'requires_probe', note: 'Requires live provider usage probe before automatic charging.' },
+    { id: 'v0:gpt-image-2:image_output', provider: '', model: 'gpt-image-2', role: null, type: 'image_output', unit: '1m_tokens', cny: 204_600_000, usd: 30_000_000, cur: 'USD', raw: 30, status: 'requires_probe', note: 'Requires live provider usage probe before automatic charging.' },
+    { id: 'v0:doubao-seedream-4-5-251128:image_count', provider: '', model: 'doubao-seedream-4-5-251128', role: null, type: 'image_count', unit: 'image', cny: 250_000, usd: 37_000, cur: 'CNY', raw: 0.25, status: 'active', note: 'Volcengine Seedream native CNY per-image price.' },
+    { id: 'v0:doubao-seedance-2-0-260128:video_second', provider: '', model: 'doubao-seedance-2-0-260128', role: null, type: 'video_second', unit: 'second', cny: 1_000_000, usd: 147_000, cur: 'CNY', raw: 1, status: 'active', note: 'Seedance first version charges by observable duration seconds; update after provider cost probe if raw usage is available.' },
+  ];
+  const stmt = db.prepare(
+    `INSERT OR IGNORE INTO api_price_catalog
+      (id, provider, model, model_role, consumption_type, unit,
+       price_cny_micros_per_unit, price_usd_micros_per_unit,
+       original_currency, original_price, exchange_rate, source_note,
+       status, effective_from, last_updated_at, last_updated_by)
+     VALUES
+      (@id, @provider, @model, @role, @type, @unit,
+       @cny, @usd, @cur, @raw, 6.82, @note, @status, @updatedAt, @updatedAt, 'seed:v0')`,
+  );
+  for (const row of rows) stmt.run({ ...row, updatedAt });
 }
 
 function migrateImageAuditColumns(db: Database.Database) {

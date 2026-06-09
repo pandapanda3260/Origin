@@ -12,8 +12,8 @@ export const MOCK_BILLING_PLANS_LIST = [
     isPopular: false,
   },
   {
-    code: 'pro',
-    title: 'Pro',
+    code: 'plus',
+    title: 'Plus',
     description: '专业创作者',
     price_cents: 9900,
     billing_cycle: 'month',
@@ -24,8 +24,8 @@ export const MOCK_BILLING_PLANS_LIST = [
     isPopular: true,
   },
   {
-    code: 'studio',
-    title: 'Studio',
+    code: 'pro',
+    title: 'Pro',
     description: '工作室与团队',
     price_cents: 29900,
     billing_cycle: 'month',

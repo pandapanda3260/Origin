@@ -211,6 +211,147 @@ body.is-activating [data-write-action] {
   opacity: .55;
 }
 
+/* ============================================================
+   Sidebar account entry and popover
+   ============================================================ */
+.account-entry {
+  min-height: 52px;
+  border-radius: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+.account-entry-icon {
+  color: rgba(44, 62, 80, 0.76);
+  width: 26px;
+  flex: 0 0 26px;
+  font-size: 26px;
+  line-height: 1;
+}
+.account-entry-copy {
+  flex: 1 1 auto;
+}
+.account-entry-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #0B1320;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+.account-entry-plan {
+  margin-top: 0;
+  color: #7A8B96;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.account-entry-chevron {
+  color: rgba(44, 62, 80, 0.42);
+  font-size: 20px;
+  transition: color 0.16s ease;
+}
+.account-entry.is-active .account-entry-icon,
+.account-entry.is-active .account-entry-name,
+.account-entry.is-active .account-entry-plan,
+.account-entry.is-open .account-entry-chevron {
+  color: rgba(255, 255, 255, 0.92);
+}
+.account-menu-popover {
+  position: absolute;
+  left: 1.5rem;
+  right: 0;
+  bottom: calc(100% - 10px);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px;
+  border: 1px solid rgba(144, 164, 174, 0.3);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 46px rgba(11, 19, 32, 0.14);
+  backdrop-filter: blur(26px);
+  -webkit-backdrop-filter: blur(26px);
+}
+.account-menu-popover[hidden] {
+  display: none;
+}
+.account-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: rgba(144, 164, 174, 0.28);
+}
+.account-menu-item {
+  width: 100%;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #0B1320;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-align: left;
+  transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
+}
+.account-menu-item .material-symbols-outlined {
+  width: 22px;
+  flex: 0 0 22px;
+  color: rgba(11, 19, 32, 0.9);
+  font-size: 22px;
+}
+.account-menu-billing-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+.account-menu-billing-title {
+  color: #0B1320;
+}
+.account-menu-billing-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+  color: rgba(44, 62, 80, 0.58);
+  font-size: 10px;
+  font-weight: 750;
+}
+.account-menu-billing-meta .material-symbols-outlined {
+  width: auto;
+  flex: 0 0 auto;
+  color: currentColor;
+  font-size: 12px;
+}
+.account-menu-item[data-account-menu-action="billing"] {
+  min-height: 48px;
+}
+.account-menu-item:hover:not(:disabled) {
+  background: rgba(236, 239, 241, 0.72);
+}
+.account-menu-item:active:not(:disabled) {
+  transform: scale(0.98);
+}
+.account-menu-item:disabled {
+  color: rgba(44, 62, 80, 0.42);
+  cursor: not-allowed;
+}
+.account-menu-item:disabled .material-symbols-outlined {
+  color: rgba(44, 62, 80, 0.42);
+}
+.account-menu-item--logout {
+  margin-top: 2px;
+}
+
 /* Billing chip —— 从 glow-border-wrap（边缘彩光跟随 cursor）换成 PixelCard：
    hover / focus 时 canvas 上从中心向外按距离延迟的像素块闪烁动画。
    视觉实现：
@@ -651,6 +792,15 @@ body.billing-modal-lock {
   text-align: center;
 }
 
+.workflow-empty-state--page-center {
+  min-height: min(54vh, 540px);
+  padding: 8rem 1.5rem;
+}
+
+.workflow-empty-state--page-center .workflow-empty-state__text {
+  max-width: 34rem;
+}
+
 .workflow-empty-state__icon {
   display: flex;
   width: 5rem;
@@ -703,6 +853,7 @@ body.billing-modal-lock {
   font-size: 0.75rem;
   font-weight: 700;
   letter-spacing: 0.04em;
+  white-space: nowrap;
   transition: opacity 0.16s ease, transform 0.16s ease;
 }
 
@@ -729,6 +880,11 @@ body.billing-modal-lock {
   }
 
   .workflow-empty-state {
+    min-height: 52vh;
+    padding: 5.5rem 1rem;
+  }
+
+  .workflow-empty-state--page-center {
     min-height: 52vh;
     padding: 5.5rem 1rem;
   }
@@ -7625,6 +7781,31 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .vtd-phone-preview video::-webkit-media-controls-panel {
   background-color: rgba(11,19,32,0.72);
 }
+.vtd-preview-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  z-index: 3;
+  color: rgba(255,255,255,0.92);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: rgba(11,19,32,0.55);
+  backdrop-filter: blur(2px);
+}
+.vtd-preview-loading[hidden] { display: none; }
+.vtd-preview-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2.5px solid rgba(255,255,255,0.28);
+  border-top-color: #fff;
+  animation: vtd-mini-spin .72s linear infinite;
+}
 .vtd-preview-play {
   position: absolute;
   left: 50%;
@@ -10706,7 +10887,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   padding: 24px 28px 10px;
 }
 
-.edit-guard-surface .workflow-empty-state {
+.edit-guard-surface .workflow-empty-state:not(.workflow-empty-state--page-center) {
   min-height: min(54vh, 540px);
 }
 

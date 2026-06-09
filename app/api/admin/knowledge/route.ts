@@ -4,7 +4,6 @@ import { requireAdmin } from '@/lib/admin-auth';
 import { dryRunPayload, withAdminAudit } from '@/lib/admin-audit';
 import { ensureAdminPreviewUser } from '@/lib/admin-shadow';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { CREDIT_PRICES, chargeCredits, getBalance, grantCredits } from '@/lib/credits';
 import { getDb } from '@/lib/db';
 import { isKnowledgeSelectiveInjectionEnabledForStage } from '@/lib/feature-flags';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
@@ -488,7 +487,6 @@ async function handlePreview(audit: any, req: NextRequest) {
   if (!project) return jsonError('project not found', 404);
 
   const shadowUserId = ensurePreviewUserForAdmin(audit.admin.id);
-  ensurePreviewCredits(shadowUserId);
   const before = { card, project: { id: project.id, title: project.title }, shadowUserId };
   audit.setAuditTarget({ type: 'knowledge_card', ids: [cardId] });
   audit.setAuditDiff({ before, after: { preview: true, chargedUserId: shadowUserId } });
@@ -498,16 +496,6 @@ async function handlePreview(audit: any, req: NextRequest) {
       after: { preview: true, chargedUserId: shadowUserId, runModel: body.runModel !== false },
     }));
   }
-
-  const charge = chargeCredits({
-    userId: shadowUserId,
-    amount: CREDIT_PRICES.text,
-    kind: 'text',
-    reason: 'admin_knowledge_preview',
-    refId: cardId,
-    chargeRefId: `admin-preview:${audit.idempotencyKey}`,
-    idempotencyKey: `admin-preview:${audit.idempotencyKey}`,
-  });
 
   const prompt = buildPreviewPrompt({ card, project, module });
   let output = '';
@@ -538,8 +526,11 @@ async function handlePreview(audit: any, req: NextRequest) {
         callItemType: 'knowledge_card',
         callItemId: cardId,
         callItemLabel: card.title || cardId,
-        runId: audit.idempotencyKey || null,
-        meta: {
+          runId: audit.idempotencyKey || null,
+          billingScope: 'internal_admin',
+          operationKey: `admin-preview:${audit.idempotencyKey || cardId}`,
+          operationLabel: '知识卡预览',
+          meta: {
           adminId: audit.admin?.id || null,
           adminUsername: audit.admin?.username || null,
           previewProjectOwnerId: project.ownerId || null,
@@ -554,8 +545,7 @@ async function handlePreview(audit: any, req: NextRequest) {
     mode,
     cardId,
     projectId,
-    charged: CREDIT_PRICES.text,
-    charge,
+    charged: 0,
     prompt,
     output,
   });
@@ -744,19 +734,6 @@ function ensurePreviewUserForAdmin(adminId: number) {
   ).get({ id: adminId });
   if (!admin) throw new Error('admin not found');
   return ensureAdminPreviewUser(db, admin);
-}
-
-function ensurePreviewCredits(shadowUserId: number) {
-  const balance = getBalance(shadowUserId);
-  if (balance.totalCredits >= 1000) return;
-  grantCredits({
-    userId: shadowUserId,
-    amount: 1000,
-    kind: 'gift',
-    reason: 'admin_preview_topup',
-    bucket: 'bonus',
-    refId: `admin_preview_topup:${Date.now()}`,
-  });
 }
 
 function buildPreviewPrompt(args: { card: any; project: any; module: AdminKnowledgeModule }) {

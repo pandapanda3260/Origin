@@ -4,6 +4,12 @@ import { mountHoloCard } from './holo_card.js';
 let _ctx = {};
 let _summary = null;
 let _ledger = [];
+// 账务流水分页：server 端 offset 分页（后端 /api/billing/ledger 已支持 limit/offset/total）。
+// 每页 10 行；_ledgerPage 从 0 起；翻页只重渲流水区块，不整页重渲（避免顶部卡片闪烁）。
+const LEDGER_PAGE_SIZE = 10;
+let _ledgerTotal = 0;
+let _ledgerPage = 0;
+let _ledgerBusy = false;
 let _pendingOrderNo = '';
 let _paymentMethod = 'wxpay';
 // 防重复提交开关：发起支付 / 兑换 / 取消恢复时置位，避免连点触发多次请求或状态卡死。
@@ -37,13 +43,136 @@ function _fmtDate(raw) {
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-// 账务流水类别中文兜底：仅在后端没下发 reason 文案时使用。
+// 账务流水类别中文兜底（kind 是后端稳定枚举，9 值）。作为 reason 未命中时的兜底层。
 function _kindLabel(kind) {
   var map = {
     text: '文本生成', image: '图片生成', video: '视频生成', export: '导出成片',
-    topup: '积分充值', redeem: '兑换码', refund: '失败退还', gift: '赠送', adjust: '调整',
+    topup: '积分充值', redeem: '兑换码充值', refund: '失败退还', gift: '赠送积分', adjust: '余额调整',
   };
-  return map[String(kind || '')] || '账务记录';
+  return map[String(kind || '')] || '';
+}
+
+// reason 在各扣费点是自由文本（dotted/colon 代码 + 部分已中文），不适合做唯一展示源。
+// 这里把会露英文/代码的"稳定前缀"映射成中文；命中即用，未命中返回空交回上层。
+function _reasonLabel(reason) {
+  var r = String(reason == null ? '' : reason);
+  if (!r) return '';
+  // 顺序：更具体的前缀在前
+  if (r.indexOf('edit.export.failed') === 0) return '导出失败退还';
+  if (r.indexOf('edit.export.cancelled') === 0) return '导出取消退还';
+  if (r.indexOf('edit.export') === 0) return '导出成片';
+  if (r === 'script.full-create') return '剧本生成';
+  if (r === 'script.adapt') return '剧本改编';
+  if (r === 'script.revise') return '剧本修订';
+  if (r.indexOf('script.') === 0) return '剧本生成失败退还'; // script.error / script.persist.error
+  if (r.indexOf('batch:video_segments') === 0 || r.indexOf('batch:videos') === 0) return '视频生成';
+  if (r.indexOf('batch:storyboard_prompts') === 0) return '分镜镜头生成';
+  if (r.indexOf('batch:video_prompts') === 0) return '视频提示词生成';
+  if (r.indexOf('batch:') === 0) return '图片生成';
+  if (r.indexOf('refund:') === 0) return '生成失败退还';
+  if (r === 'orphan export reap') return '导出超时退还';
+  return '';
+}
+
+function _hasCjk(s) { return /[一-鿿]/.test(String(s == null ? '' : s)); }
+
+// 流水标签解析（前端映射，不动后端）：
+//  1) reason 命中稳定前缀 → 中文；
+//  2) reason 已是中文（工具箱*/兑换码*/开户赠送*）→ 原样；
+//  3) reason 是其它非中文文本 → 保留原文（必要英文可保留，不强译）；
+//  4) reason 为空 → 用 kind 中文兜底；都没有则 "账务记录"。
+function _ledgerLabel(item) {
+  var reason = String((item && item.reason) || '');
+  var mapped = _reasonLabel(reason);
+  if (mapped) return mapped;
+  if (reason && _hasCjk(reason)) return reason;
+  if (reason) return reason;
+  return _kindLabel(item && (item.kind || item.entry_type)) || '账务记录';
+}
+
+// ---- 账务流水渲染（区块级，供整页渲染与翻页增量渲染复用）----
+function _ledgerRowsHtml() {
+  return (_ledger || []).map(function (item) {
+    var when = _fmtWhen(item.createdAt || item.created_at || '');
+	    var label = _ledgerLabel(item);
+	    var amount = Number(item.amount || 0);
+	    var amountText = (amount > 0 ? '+' : '') + amount;
+    var balance = Number(item.balanceAfter || item.balance_after || 0);
+	    return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
+	      '<div class="min-w-0">' +
+	        '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
+	        '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + escapeHtml(when) + ' · 余额 ' + escapeHtml(balance) + '</div>' +
+	      '</div>' +
+      '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
+    '</div>';
+  }).join('') || '<p class="text-sm text-on-surface-variant/50">暂无账务流水。</p>';
+}
+
+// 翻页控件：放"最近账务流水"标题右侧（标题行 flex justify-between）。仅 1 页时隐藏。
+// 用内联样式避免依赖未预编译的 Tailwind 工具类（本仓 workspace-tailwind 为静态编译）。
+function _ledgerPagerHtml() {
+  var total = Number(_ledgerTotal || 0);
+  if (total <= LEDGER_PAGE_SIZE) return '';
+  var totalPages = Math.max(1, Math.ceil(total / LEDGER_PAGE_SIZE));
+  var cur = (_ledgerPage || 0) + 1;
+  var atFirst = (_ledgerPage || 0) <= 0;
+  var atLast = (_ledgerPage || 0) >= totalPages - 1;
+  var base = 'padding:3px 9px;border-radius:8px;border:1px solid rgba(0,0,0,0.12);background:#fff;font-weight:700;line-height:1;font-size:13px;';
+  function navBtn(dir, glyph, disabled) {
+    return '<button type="button" data-ledger-nav="' + dir + '"' + (disabled ? ' disabled' : '') +
+      ' style="' + base + (disabled ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;') + '">' + glyph + '</button>';
+  }
+  return '<div class="flex items-center gap-2">' +
+    navBtn('prev', '‹', atFirst) +
+    '<span class="text-[11px] text-on-surface-variant/60">第 ' + cur + ' / ' + totalPages + ' 页</span>' +
+    navBtn('next', '›', atLast) +
+  '</div>';
+}
+
+function _ledgerInnerHtml() {
+  return '<div class="flex items-center justify-between gap-3 mb-4">' +
+      '<div class="text-sm font-bold">最近账务流水</div>' +
+      _ledgerPagerHtml() +
+    '</div>' +
+    '<div>' + _ledgerRowsHtml() + '</div>';
+}
+
+function _bindLedgerPager(scope) {
+  if (!scope) return;
+  var prev = scope.querySelector('[data-ledger-nav="prev"]');
+  var next = scope.querySelector('[data-ledger-nav="next"]');
+  if (prev) prev.addEventListener('click', function () {
+    if ((_ledgerPage || 0) > 0) loadLedgerPage((_ledgerPage || 0) - 1);
+  });
+  if (next) next.addEventListener('click', function () {
+    var totalPages = Math.max(1, Math.ceil(Number(_ledgerTotal || 0) / LEDGER_PAGE_SIZE));
+    if ((_ledgerPage || 0) < totalPages - 1) loadLedgerPage((_ledgerPage || 0) + 1);
+  });
+}
+
+// 只重渲流水区块（不动顶部卡片/套餐网格），避免翻页时整页闪烁。
+function _renderLedgerSection() {
+  var el = document.getElementById('billingLedgerSection');
+  if (!el) return;
+  el.innerHTML = _ledgerInnerHtml();
+  _bindLedgerPager(el);
+}
+
+async function loadLedgerPage(page) {
+  if (_ledgerBusy) return;
+  if (page < 0) page = 0;
+  _ledgerBusy = true;
+  try {
+    var resp = await apiGet('/api/billing/ledger?limit=' + LEDGER_PAGE_SIZE + '&offset=' + (page * LEDGER_PAGE_SIZE));
+    _ledger = (resp && resp.items) || [];
+    _ledgerTotal = Number((resp && resp.total) || 0);
+    _ledgerPage = page;
+  } catch (e) {
+    showToast(e && e.message ? e.message : '加载账务流水失败', 'warn');
+  } finally {
+    _ledgerBusy = false;
+  }
+  _renderLedgerSection();
 }
 
 export function initBilling(ctx) {
@@ -55,44 +184,42 @@ export function getBillingSummary() {
 }
 
 export function refreshBillingBadge() {
-  // 刷新账户余额文案：
-  //   - #accountBillingBadge  账户卡里的小字（如果当前布局提供）
-  // 文案格式："<档位title> · <积分图标> <数字> 积分"，例如 "Pro · [toll] 1234 积分"。
+  // 刷新账户入口里的会员类型文案。
   // 档位 title 直接取后端 /api/billing/me 下发的 currentPlan.title，前端不做 code→title 映射；
   // 这样后端加档位 / 改档位文案（services/billing_service.py PLANS 表），前端一行都不用动。
   var badgeEl = document.getElementById('accountBillingBadge');
-  if (!badgeEl) return;
+  var menuPlanEl = document.getElementById('accountMenuPlan');
+  var menuCreditsEl = document.getElementById('accountMenuCredits');
+  if (!badgeEl && !menuPlanEl && !menuCreditsEl) return;
 
-  var planTitle, credits;
+  var planTitle;
+  var credits = 0;
   if (!_summary) {
     // _summary===null：刚登录 /api/billing/me 还没回 / 或失败。后端会给每个用户 seed
-    // 一条 free 订阅，这里的 Free · 0 仅作首屏兜底，几十毫秒后就会被真数据覆盖。
+    // 一条 free 订阅，这里的 Free 仅作首屏兜底，几十毫秒后就会被真数据覆盖。
     planTitle = 'Free';
-    credits = 0;
   } else {
     planTitle = (_summary.currentPlan && _summary.currentPlan.title) || 'Free';
     var balances = _summary.balances || {};
     credits = balances.totalCredits || 0;
   }
 
-  var safePlan = escapeHtml(String(planTitle));
-  var safeCredits = escapeHtml(String(credits));
-  var html =
-    safePlan +
-    ' · <span class="material-symbols-outlined text-sm align-middle">toll</span> ' +
-    safeCredits + ' 积分';
-
-  if (badgeEl) badgeEl.innerHTML = html;
+  if (badgeEl) badgeEl.textContent = String(planTitle);
+  if (menuPlanEl) menuPlanEl.textContent = String(planTitle);
+  if (menuCreditsEl) menuCreditsEl.textContent = Number(credits || 0).toLocaleString();
 }
 
 export async function loadBillingSummary() {
   try {
     _summary = await apiGet('/api/billing/me');
     try {
-      var ledgerResp = await apiGet('/api/billing/ledger?limit=20');
+      _ledgerPage = 0;
+      var ledgerResp = await apiGet('/api/billing/ledger?limit=' + LEDGER_PAGE_SIZE + '&offset=0');
       _ledger = (ledgerResp && ledgerResp.items) || [];
+      _ledgerTotal = Number((ledgerResp && ledgerResp.total) || 0);
     } catch (_e) {
       _ledger = [];
+      _ledgerTotal = 0;
     }
     renderBillingPage();
     refreshBillingBadge();
@@ -363,10 +490,15 @@ export function renderBillingPage() {
     else regularTopups.push(p);
   });
 
-  var planCards = plans.filter(function (p) { return p.code !== 'free'; }).map(function (p) {
+  // 当前档（含 free）一律渲染成卡片；非当前的 free 仍不展示（不做"降级到 free"卡）。
+  var _curCode = subscription.plan_code || subscription.planCode || '';
+  var planCards = plans.filter(function (p) { return p.code !== 'free' || p.code === _curCode; }).map(function (p) {
     var isCurrent = (subscription.plan_code || subscription.planCode || '') === p.code;
     var priceObj = _formatPlanPrice(p);
     var isCustom = priceObj.price === '联系销售';
+    // 中文价格文案（免费 / 联系销售）在 text-5xl 下 CJK 字身比 "$NNN" 数字视觉大很多，
+    // 降到 text-4xl 让其视觉高度与付费档 "$299" 接近。
+    var priceCls = _hasCjk(priceObj.price) ? 'text-4xl' : 'text-5xl';
     var featureItems = _derivePlanFeatureItems(p);
     var subLabel = (p.billing_cycle === 'year' ? '年付套餐' : '月付套餐') + (p.features && p.features.topupAllowed ? ' · 可加购' : '');
     var creditsChip = Number(p.monthly_credits || 0) > 0
@@ -381,8 +513,26 @@ export function renderBillingPage() {
         '</div>' +
       '</li>';
     }).join('');
-    var ctaLabel = isCurrent ? '当前套餐' : (isCustom ? '联系销售' : '升级此套餐');
-    var ctaAttrs = 'class="billing-card-plan plan-cta" data-plan-code="' + escapeHtml(p.code) + '"' + (isCurrent || isCustom ? ' disabled' : '');
+    // CTA 与"升级此套餐"互斥同位：当前付费档 → 取消/恢复；当前 free → 不可取消；非当前 → 升级/联系销售。
+    var isPaidCurrent = isCurrent && p.code !== 'free';
+    var ctaHtml;
+    if (isPaidCurrent && cancelAtPeriodEnd) {
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-sub-action="resume">恢复自动续订</button>';
+    } else if (isPaidCurrent) {
+      // CTA 复用与其它套餐卡完全一致的 .plan-cta 样式，保证卡片 UI 统一（不再内联改色）。
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-sub-action="cancel">取消套餐订阅</button>';
+    } else if (isCurrent) {
+      // 免费当前档：默认 :disabled 会让文字置灰看不清，这里强制白字 + 中性半透明底（非 cyan），保证可读。
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" disabled style="color:#ECEFF1;opacity:1;background:rgba(255,255,255,0.12);box-shadow:none;">当前套餐</button>';
+    } else if (isCustom) {
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-plan-code="' + escapeHtml(p.code) + '" disabled>联系销售</button>';
+    } else {
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-plan-code="' + escapeHtml(p.code) + '">升级此套餐</button>';
+    }
+    // 已申请到期取消：在 CTA 上方提示"到期后降级为免费版"。
+    var cancelNote = (isPaidCurrent && cancelAtPeriodEnd)
+      ? '<div class="text-[10px] font-bold text-amber-300/90 mt-3">' + (periodEnd ? '到期 ' + escapeHtml(_fmtDate(periodEnd)) + ' 后降级为免费版' : '到期后降级为免费版') + '</div>'
+      : '';
     return '<div class="plan-card' + (isCurrent ? ' is-current' : '') + '">' +
       '<div class="plan-energy-pulse"></div>' +
       '<div class="relative z-10 flex flex-col h-full">' +
@@ -395,13 +545,14 @@ export function renderBillingPage() {
         '</div>' +
         '<div class="mb-6">' +
           '<div class="flex items-baseline gap-1">' +
-            '<span class="text-5xl font-bold plan-price-glow tracking-tighter">' + escapeHtml(priceObj.price) + '</span>' +
+            '<span class="' + priceCls + ' font-bold plan-price-glow tracking-tighter">' + escapeHtml(priceObj.price) + '</span>' +
             (priceObj.cycle ? '<span class="text-[11px] font-bold text-[#ECEFF1]/30 uppercase">' + escapeHtml(priceObj.cycle) + '</span>' : '') +
           '</div>' +
           (creditsChip ? '<div class="mt-2">' + creditsChip + '</div>' : '') +
         '</div>' +
         '<ul class="space-y-4 flex-grow">' + featureHtml + '</ul>' +
-        '<button type="button" ' + ctaAttrs + '>' + escapeHtml(ctaLabel) + '</button>' +
+        cancelNote +
+        ctaHtml +
       '</div>' +
     '</div>';
   }).join('');
@@ -458,45 +609,7 @@ export function renderBillingPage() {
         return '<span class="plan-feature-badge">' + escapeHtml(label) + '</span>';
       }).join('') + '</div>'
     : '';
-  // 订阅操作（取消续订 / 恢复自动续订）—— 处理器与 .plan-action-btn 样式早已存在，
-  // 但此前从未渲染，导致付费用户无法在账务页取消续订、也看不到"到期停止"状态。
-  // 仅对付费档展示；免费档没有可取消的订阅。
-  var curPlanCode = (_summary.currentPlan && _summary.currentPlan.code) || subscription.plan_code || subscription.planCode || 'free';
-  var isPaidPlan = !!curPlanCode && curPlanCode !== 'free';
-  var subActionHtml = '';
-  if (isPaidPlan) {
-    if (cancelAtPeriodEnd) {
-      subActionHtml =
-        '<div class="flex items-center gap-2 flex-wrap">' +
-          '<span class="text-[10px] font-bold text-amber-300/90 uppercase tracking-wider">' +
-            (periodEnd ? '到期 ' + escapeHtml(_fmtDate(periodEnd)) + ' 后停止' : '到期后停止续订') +
-          '</span>' +
-          '<button type="button" id="btnResumeSubscription" class="plan-action-btn">恢复自动续订</button>' +
-        '</div>';
-    } else {
-      subActionHtml =
-        '<div class="flex items-center gap-2 flex-wrap">' +
-          (periodEnd ? '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-wider">自动续订 · ' + escapeHtml(_fmtDate(periodEnd)) + '</span>' : '') +
-          '<button type="button" id="btnCancelSubscription" class="plan-action-btn">取消续订</button>' +
-        '</div>';
-    }
-  }
-  var ledgerRows = (_ledger || []).map(function (item) {
-    // 后端 /api/billing/ledger 与 /api/billing/me 下发字段为 reason / kind / createdAt，
-    // 旧代码读的是 reason_code / entry_type / created_at（均为 undefined），导致每条
-    // 流水都退化成字面量 "ledger"、时间也读不到。这里改读正确字段并格式化时间。
-    var when = _fmtWhen(item.createdAt || item.created_at || '');
-    var label = item.reason || _kindLabel(item.kind || item.entry_type);
-    var amount = Number(item.amount || 0);
-    var amountText = (amount > 0 ? '+' : '') + amount;
-    return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
-      '<div class="min-w-0">' +
-        '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
-        '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + escapeHtml(when) + '</div>' +
-      '</div>' +
-      '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
-    '</div>';
-  }).join('') || '<p class="text-sm text-on-surface-variant/50">暂无账务流水。</p>';
+  // 取消/恢复入口已移到"当前套餐卡片"的 CTA 上（与升级互斥同位）；顶部状态条不再放取消按钮。
   host.innerHTML = '' +
     // ----------------------------------------------------------------
     // 当前套餐状态卡（紧凑版）
@@ -526,8 +639,7 @@ export function renderBillingPage() {
             '<div class="plan-balance-cell"><div class="text-[9px] font-bold tracking-widest text-[#ECEFF1]/45 uppercase">常规购买积分</div><div class="text-lg font-bold text-[#ECEFF1] mt-0.5">' + (balances.topupCredits || 0) + '</div></div>' +
           '</div>' +
         '</div>' +
-        '<div class="flex items-center ' + (subActionHtml ? 'justify-between' : 'justify-end') + ' gap-3 mt-3 flex-wrap">' +
-          subActionHtml +
+        '<div class="flex items-center justify-end gap-3 mt-3 flex-wrap">' +
           '<div class="plan-pill-group">' +
             '<button type="button" class="billing-pay-method plan-pill-btn ' + (_paymentMethod === 'wxpay' ? 'is-active' : '') + '" data-pay-method="wxpay">微信</button>' +
             '<button type="button" class="billing-pay-method plan-pill-btn ' + (_paymentMethod === 'alipay' ? 'is-active' : '') + '" data-pay-method="alipay">支付宝</button>' +
@@ -555,9 +667,8 @@ export function renderBillingPage() {
         '<button type="button" id="billingRedeemBtn" class="px-5 py-2.5 rounded-xl text-sm font-bold bg-[#0B1320] text-[#ECEFF1] hover:bg-[#00E5FF] hover:text-[#0B1320] active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed">兑换</button>' +
       '</div>' +
     '</section>' +
-    '<section class="bg-surface-container-lowest rounded-2xl p-6 border border-outline-variant/10 shadow-sm">' +
-      '<div class="text-sm font-bold mb-4">最近账务流水</div>' +
-      '<div>' + ledgerRows + '</div>' +
+    '<section id="billingLedgerSection" class="bg-surface-container-lowest rounded-2xl p-6 border border-outline-variant/10 shadow-sm">' +
+      _ledgerInnerHtml() +
     '</section>';
   Array.prototype.slice.call(host.querySelectorAll('.billing-pay-method')).forEach(function (btn) {
     btn.addEventListener('click', function () {
@@ -585,8 +696,9 @@ export function renderBillingPage() {
       }
     });
   }
-  _bindSubAction(host.querySelector('#btnResumeSubscription'), resumeSubscription, '恢复失败');
-  _bindSubAction(host.querySelector('#btnCancelSubscription'), cancelSubscription, '取消失败');
+  _bindSubAction(host.querySelector('[data-sub-action="resume"]'), resumeSubscription, '恢复失败');
+  _bindSubAction(host.querySelector('[data-sub-action="cancel"]'), cancelSubscription, '取消失败');
+  _bindLedgerPager(host.querySelector('#billingLedgerSection'));
 
   // 发起支付：全局 _checkoutBusy 守卫，避免同时点多个套餐/积分包重复下单；
   // 点击后按钮禁用 + "处理中…"，startCheckout 内部成功/占位/错误都会重渲。

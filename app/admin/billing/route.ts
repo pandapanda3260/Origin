@@ -10,7 +10,8 @@ export async function GET(req: NextRequest) {
     title: '财务积分',
     headHtml: `<style>
       .billing-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
-      .billing-toolbar input { width:320px; max-width:100%; }
+	      .billing-toolbar input { width:220px; max-width:100%; }
+        .billing-toolbar select { min-width:150px; }
       .billing-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:14px; }
       .metric { border:1px solid var(--line); border-radius:8px; background:#fff; padding:14px; }
       .metric strong { display:block; font-size:var(--admin-font-xl); margin-top:6px; }
@@ -25,11 +26,34 @@ export async function GET(req: NextRequest) {
       @media (max-width: 900px) { .billing-grid { grid-template-columns:1fr; } }
     </style>`,
     bodyHtml: `<section class="panel">
-      <div class="billing-toolbar">
-        <input data-billing-search="true" placeholder="搜索用户ID / 手机号 / 订单 / ledger / refId" />
-        <button data-billing-search-button="true" class="primary">搜索</button>
-        <button data-billing-refresh="true">刷新</button>
-      </div>
+	      <div class="billing-toolbar">
+	        <input data-billing-search="true" placeholder="搜索用户ID / 手机号 / 订单 / ledger / refId" />
+          <input data-billing-from="true" placeholder="开始时间 ISO / YYYY-MM-DD" />
+          <input data-billing-to="true" placeholder="结束时间 ISO / YYYY-MM-DD" />
+          <select data-billing-module="true">
+            <option value="">全部模块</option>
+            <option value="script">script</option>
+            <option value="batch">batch</option>
+            <option value="image">image</option>
+            <option value="video">video</option>
+            <option value="toolbox">toolbox</option>
+            <option value="admin">admin</option>
+          </select>
+          <input data-billing-provider="true" placeholder="provider" />
+          <input data-billing-model="true" placeholder="model" />
+          <select data-billing-consumption="true">
+            <option value="">全部消耗类型</option>
+            <option value="text_token">text_token</option>
+            <option value="image_count">image_count</option>
+            <option value="image_text_input">image_text_input</option>
+            <option value="image_input">image_input</option>
+            <option value="image_output">image_output</option>
+            <option value="video_second">video_second</option>
+          </select>
+	        <button data-billing-search-button="true" class="primary">搜索</button>
+	        <button data-billing-refresh="true">刷新</button>
+          <button data-billing-export="true">导出 CSV</button>
+	      </div>
       <div class="billing-grid" data-billing-metrics="true"></div>
       <div class="adjust-form">
         <input data-adjust-user-id="true" class="adjust-user-input" placeholder="用户 ID" />
@@ -40,9 +64,10 @@ export async function GET(req: NextRequest) {
       <div class="tabs">
         <button data-tab="users" data-active="true">余额</button>
         <button data-tab="orders">订单</button>
-        <button data-tab="ledger">Ledger</button>
-        <button data-tab="cost">成本观察</button>
-        <button data-tab="redeem">兑换码</button>
+	        <button data-tab="ledger">Ledger</button>
+	        <button data-tab="cost">成本观察</button>
+          <button data-tab="prices">价格表</button>
+	        <button data-tab="redeem">兑换码</button>
       </div>
       <div class="admin-table-wrap">
         <table class="admin-table">
@@ -53,27 +78,56 @@ export async function GET(req: NextRequest) {
       <div class="notice" data-billing-notice="true"></div>
     </section>`,
     scriptsHtml: `<script>
-      const state = { tab:'users', data:null };
-      const qInput = document.querySelector('[data-billing-search="true"]');
-      const metrics = document.querySelector('[data-billing-metrics="true"]');
+	      const state = { tab:'users', data:null };
+	      const qInput = document.querySelector('[data-billing-search="true"]');
+        const fromInput = document.querySelector('[data-billing-from="true"]');
+        const toInput = document.querySelector('[data-billing-to="true"]');
+        const moduleInput = document.querySelector('[data-billing-module="true"]');
+        const providerInput = document.querySelector('[data-billing-provider="true"]');
+        const modelInput = document.querySelector('[data-billing-model="true"]');
+        const consumptionInput = document.querySelector('[data-billing-consumption="true"]');
+	      const metrics = document.querySelector('[data-billing-metrics="true"]');
       const head = document.querySelector('[data-billing-head="true"]');
       const table = document.querySelector('[data-billing-table="true"]');
       const notice = document.querySelector('[data-billing-notice="true"]');
       function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch])); }
       function setNotice(message, kind = '') { notice.textContent = message || ''; notice.dataset.kind = kind; }
-      function fmtDate(value) { if (!value) return '-'; try { return new Date(value).toLocaleString('zh-CN', { hour12:false }); } catch { return value; } }
-      function yuan(cents) { return (Number(cents || 0) / 100).toFixed(2); }
-      function userLabel(row) { return row?.phone || row?.displayName || row?.username || row?.userId || '-'; }
-      function renderMetrics() {
-        const cost = state.data?.cost || {};
-        const revenue = (cost.revenue || []).map((r) => r.currency + ' ' + yuan(r.amountCents)).join(' / ') || '0.00';
-        const gifts = (cost.gifts || []).reduce((sum, r) => sum + Number(r.credits || 0), 0);
-        const charged = (cost.creditSpend || []).reduce((sum, r) => sum + Number(r.chargedCredits || 0), 0);
-        metrics.innerHTML =
-          '<div class="metric"><span class="muted">现金收入（真实 paid topup）</span><strong>' + esc(revenue) + '</strong></div>' +
-          '<div class="metric"><span class="muted">赠送/兑换/调账入账</span><strong>' + gifts + ' 积分</strong></div>' +
-          '<div class="metric"><span class="muted">累计消耗积分</span><strong>' + charged + '</strong></div>';
-      }
+	      function fmtDate(value) { if (!value) return '-'; try { return new Date(value).toLocaleString('zh-CN', { hour12:false }); } catch { return value; } }
+	      function yuan(cents) { return (Number(cents || 0) / 100).toFixed(2); }
+        function cny(micros) { return (Number(micros || 0) / 1000000).toFixed(6); }
+	      function userLabel(row) { return row?.phone || row?.displayName || row?.username || row?.userId || '-'; }
+        function usageText(row) {
+          const parts = [];
+          if (row.consumptionType) parts.push(row.consumptionType);
+          if (Number(row.quantity || 0)) parts.push('数量 ' + Number(row.quantity || 0));
+          if (Number(row.inputTokens || 0) || Number(row.outputTokens || 0) || Number(row.cachedTokens || 0)) {
+            parts.push('in/out/cache ' + Number(row.inputTokens || 0) + '/' + Number(row.outputTokens || 0) + '/' + Number(row.cachedTokens || 0));
+          }
+          if (Number(row.durationSec || 0)) parts.push(Number(row.durationSec || 0).toFixed(3) + 's');
+          return parts.join(' · ') || '-';
+        }
+        function params(extra) {
+          const p = new URLSearchParams();
+          if (qInput.value.trim()) p.set('q', qInput.value.trim());
+          if (fromInput.value.trim()) p.set('from', fromInput.value.trim());
+          if (toInput.value.trim()) p.set('to', toInput.value.trim());
+          if (moduleInput.value) p.set('module', moduleInput.value);
+          if (providerInput.value.trim()) p.set('provider', providerInput.value.trim());
+          if (modelInput.value.trim()) p.set('model', modelInput.value.trim());
+          if (consumptionInput.value) p.set('consumptionType', consumptionInput.value);
+          Object.entries(extra || {}).forEach(([k, v]) => p.set(k, v));
+          return p;
+        }
+	      function renderMetrics() {
+	        const cost = state.data?.cost || {};
+	        const revenue = (cost.revenue || []).map((r) => r.currency + ' ' + yuan(r.amountCents)).join(' / ') || '0.00';
+	        const gifts = (cost.gifts || []).reduce((sum, r) => sum + Number(r.credits || 0), 0);
+	        const charged = (cost.creditSpend || []).reduce((sum, r) => sum + Number(r.chargedCredits || 0), 0);
+	        metrics.innerHTML =
+	          '<div class="metric"><span class="muted">现金收入（真实 paid topup）</span><strong>' + esc(revenue) + '</strong></div>' +
+	          '<div class="metric"><span class="muted">赠送/兑换/调账入账</span><strong>' + gifts + ' 积分</strong></div>' +
+	          '<div class="metric"><span class="muted">累计消耗积分</span><strong>' + charged + '</strong><div class="muted">' + esc(cost.pointsRule?.label || '1 元 = 100 积分') + '</div></div>';
+	      }
       function rows(items, emptyCols, mapper) {
         if (!items || !items.length) return '<tr><td colspan="' + emptyCols + '" class="muted">暂无数据</td></tr>';
         return items.map(mapper).join('');
@@ -81,33 +135,43 @@ export async function GET(req: NextRequest) {
       function render() {
         renderMetrics();
         document.querySelectorAll('[data-tab]').forEach((btn) => btn.dataset.active = btn.dataset.tab === state.tab ? 'true' : 'false');
-        const data = state.data || {};
-        if (state.tab === 'users') {
-          head.innerHTML = '<tr><th>ID</th><th>用户</th><th>总积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>计划</th><th>更新时间</th></tr>';
-          table.innerHTML = rows(data.users, 8, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
+	        const data = state.data || {};
+	        if (state.tab === 'users') {
+	          head.innerHTML = '<tr><th>ID</th><th>用户</th><th>总积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>透支</th><th>计划</th><th>更新时间</th></tr>';
+	          table.innerHTML = rows(data.users, 9, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + Number(u.overdraftCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
         } else if (state.tab === 'orders') {
           head.innerHTML = '<tr><th>订单</th><th>用户</th><th>类型</th><th>Provider</th><th>金额</th><th>积分</th><th>状态</th><th>时间</th></tr>';
           table.innerHTML = rows(data.orders, 8, (o) => '<tr><td class="mono">' + esc(o.id) + '</td><td>' + esc(userLabel(o)) + '<div class="muted">' + o.userId + '</div></td><td>' + esc(o.kind + '/' + (o.planCode || '-')) + '</td><td>' + esc(o.provider) + '<div class="muted mono">' + esc(o.providerRef || '') + '</div></td><td>' + esc(o.currency) + ' ' + yuan(o.amountCents) + '</td><td>' + Number(o.creditsAdded || 0) + '</td><td>' + esc(o.status) + '</td><td>' + esc(fmtDate(o.createdAt)) + '</td></tr>');
-        } else if (state.tab === 'ledger') {
-          head.innerHTML = '<tr><th>Ledger</th><th>用户</th><th>金额</th><th>类型</th><th>原因</th><th>Ref</th><th>模型/成本</th><th>时间</th></tr>';
-          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(userLabel(l)) + '<div class="muted">' + l.userId + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.kind) + (l.adminUsername ? '<div class="muted">admin ' + esc(l.adminUsername) + '</div>' : '') + '</td><td>' + esc(l.reason || '-') + '</td><td class="mono">' + esc(l.refId || '-') + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? (Number(l.costMicros)/1000000).toFixed(6) : '-') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
-        } else if (state.tab === 'cost') {
-          head.innerHTML = '<tr><th>Provider</th><th>Model</th><th>Role</th><th>实际成本</th><th>消耗积分</th><th>样本</th></tr>';
-          table.innerHTML = rows(data.cost?.modelCost, 6, (r) => '<tr><td>' + esc(r.provider) + '</td><td>' + esc(r.model) + '</td><td>' + esc(r.modelRole) + '</td><td>' + (Number(r.costMicros || 0)/1000000).toFixed(6) + '</td><td>' + Number(r.chargedCredits || 0) + '</td><td>' + Number(r.count || 0) + '</td></tr>');
-        } else {
+	        } else if (state.tab === 'ledger') {
+	          head.innerHTML = '<tr><th>Ledger</th><th>用户</th><th>金额</th><th>操作</th><th>消耗</th><th>模型/成本</th><th>Ref</th><th>时间</th></tr>';
+	          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(userLabel(l)) + '<div class="muted">' + l.userId + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.reason || '-') + '<div class="muted">' + esc([l.operationModule,l.operationFeature,l.kind].filter(Boolean).join(' / ')) + (l.adminUsername ? ' · admin ' + esc(l.adminUsername) : '') + '</div></td><td>' + esc(usageText(l)) + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? '¥' + cny(l.costMicros) : '-') + '</div></td><td class="mono">' + esc(l.refId || '-') + '<div class="muted mono">' + esc(l.chargeRefId || '') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
+	        } else if (state.tab === 'cost') {
+	          const cost = data.cost || {};
+            const costRows = []
+              .concat((cost.providerCost || []).map((r) => ({ dimension:'provider', name:r.provider, detail:'-', ...r })))
+              .concat((cost.modelCost || []).map((r) => ({ dimension:'model', name:[r.provider,r.model,r.modelRole,r.consumptionType].filter(Boolean).join(' / '), detail:usageText(r), ...r })))
+              .concat((cost.userCost || []).map((r) => ({ dimension:'user', name:userLabel(r), detail:'userId ' + r.userId, ...r })));
+            head.innerHTML = '<tr><th>维度</th><th>对象</th><th>实际成本</th><th>消耗积分</th><th>用量</th><th>样本</th></tr>';
+	          table.innerHTML = rows(costRows, 6, (r) => '<tr><td>' + esc(r.dimension) + '</td><td>' + esc(r.name) + '<div class="muted">' + esc(r.detail || '-') + '</div></td><td>¥' + cny(r.costMicros) + '</td><td>' + Number(r.chargedCredits || 0) + '</td><td>' + esc(usageText(r)) + '</td><td>' + Number(r.count || 0) + '</td></tr>');
+	        } else if (state.tab === 'prices') {
+	          head.innerHTML = '<tr><th>状态</th><th>Provider / Model</th><th>消耗类型</th><th>单位</th><th>人民币单价</th><th>美元单价</th><th>更新时间</th><th>来源</th></tr>';
+            table.innerHTML = rows(data.priceCatalog, 8, (p) => '<tr><td>' + esc(p.status) + '</td><td>' + esc([p.provider,p.model,p.modelRole].filter(Boolean).join(' / ')) + '</td><td>' + esc(p.consumptionType) + '</td><td>' + esc(p.unit) + '</td><td>¥' + cny(p.priceCnyMicrosPerUnit) + '</td><td>' + (p.priceUsdMicrosPerUnit == null ? '-' : '$' + cny(p.priceUsdMicrosPerUnit)) + '</td><td>' + esc(fmtDate(p.lastUpdatedAt)) + '</td><td>' + esc(p.sourceNote || '-') + '</td></tr>');
+	        } else {
           head.innerHTML = '<tr><th>兑换码</th><th>积分</th><th>计划</th><th>使用</th><th>过期</th><th>备注</th><th>创建</th></tr>';
           table.innerHTML = rows(data.redeemCodes, 7, (r) => '<tr><td class="mono">' + esc(r.code) + '</td><td>' + Number(r.credits || 0) + '</td><td>' + esc(r.planCode || '-') + '</td><td>' + Number(r.usedCount || 0) + '/' + Number(r.maxUses || 0) + '</td><td>' + esc(fmtDate(r.expiresAt)) + '</td><td>' + esc(r.memo || '-') + '</td><td>' + esc(fmtDate(r.createdAt)) + '</td></tr>');
         }
       }
-      async function load() {
-        const params = new URLSearchParams();
-        if (qInput.value.trim()) params.set('q', qInput.value.trim());
-        setNotice('加载中...');
-        const res = await fetch('/api/admin/billing?' + params.toString(), { credentials:'same-origin' });
+	      async function load() {
+	        setNotice('加载中...');
+	        const res = await fetch('/api/admin/billing?' + params().toString(), { credentials:'same-origin' });
         const data = await res.json().catch(() => null);
         if (!res.ok) { setNotice((data && data.detail) || '加载失败', 'error'); return; }
-        state.data = data; render(); setNotice('已更新', 'ok');
-      }
+	        state.data = data; render(); setNotice('已更新', 'ok');
+	      }
+        function exportCsv() {
+          const p = params({ format:'csv', limit:'5000' });
+          window.location.href = '/api/admin/billing?' + p.toString();
+        }
       async function adjust() {
         const userId = Number(document.querySelector('[data-adjust-user-id="true"]').value);
         const amount = Number(document.querySelector('[data-adjust-amount="true"]').value);
@@ -127,9 +191,10 @@ export async function GET(req: NextRequest) {
         if (!commit.ok) { setNotice((commitData && commitData.detail) || '提交失败', 'error'); return; }
         setNotice('调账完成', 'ok'); await load();
       }
-      document.querySelector('[data-billing-search-button="true"]')?.addEventListener('click', load);
-      document.querySelector('[data-billing-refresh="true"]')?.addEventListener('click', load);
-      qInput?.addEventListener('keydown', (event) => { if (event.key === 'Enter') load(); });
+	      document.querySelector('[data-billing-search-button="true"]')?.addEventListener('click', load);
+	      document.querySelector('[data-billing-refresh="true"]')?.addEventListener('click', load);
+        document.querySelector('[data-billing-export="true"]')?.addEventListener('click', exportCsv);
+	      qInput?.addEventListener('keydown', (event) => { if (event.key === 'Enter') load(); });
       document.querySelector('[data-adjust-submit="true"]')?.addEventListener('click', adjust);
       document.querySelectorAll('[data-tab]').forEach((btn) => btn.addEventListener('click', () => { state.tab = btn.dataset.tab; render(); }));
       window.adminStartPolling?.(load);

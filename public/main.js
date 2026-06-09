@@ -33,7 +33,7 @@ import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   reattachVideoPromptBatches } from './modules/videoPrompts.js';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=104';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=107';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
@@ -50,7 +50,7 @@ import { initScript, syncScriptProject, refreshScriptPage,
 import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   renderAssets, renderAssetGrid, updateAssetCardImage, generateSingleAssetImage,
   generateAllAssetImages, checkAssetsConfirm, confirmAssets, handleAssetAction,
-  saveAsWorldTemplate, confirmPendingWorldFacts, openKnowledgeSnapshot,
+  saveAsWorldTemplate, openKnowledgeSnapshot,
   refreshLibraryPage, _initLibraryEvents, _openVideoLightbox,
   resetLibraryState, _showAssetActions, _restoreAssetGenStatus, _diagnoseApiError,
   _toastErrorWithActions,
@@ -60,10 +60,10 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=136';
+  _openLightbox } from './modules/assets.js?v=138';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
-import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
+import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=106';
 import { mountPixelCard } from './modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
 import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
@@ -1024,6 +1024,7 @@ var _scriptEditInitialText = "";
       cleanupBlobUrls(project);
       // Phase 5.9：只记 projectId 这一个 key；不再 mirror 整包到 localStorage。
       try { localStorage.setItem(_uPrefix + "sw_last_project_id", project.id); } catch (_) {}
+      _ovSelectCurrentProjectTask();
       _syncProjectModules(project);
       _ensureEpisodes();
 
@@ -1947,49 +1948,103 @@ var _scriptEditInitialText = "";
   /* ================================================================
      帐号栏 + 管理面板
      ================================================================ */
-	  function _initAccountBar() {
-	    async function logoutCurrentUser() {
-	      var token = "";
-	      try { token = localStorage.getItem("sw_auth_token") || ""; } catch (_) { token = ""; }
-	      try {
-	        if (token) {
-	          await fetch("/api/auth/logout", {
-	            method: "POST",
-	            headers: { "Authorization": "Bearer " + token }
-	          });
-	        }
-	      } catch (_) {
-	      } finally {
-	        try {
-	          localStorage.removeItem("sw_auth_token");
-	          localStorage.removeItem("sw_auth_user");
-	        } catch (_) {}
-	        window.location.href = "/";
-	      }
+  function _initAccountBar() {
+    async function logoutCurrentUser() {
+      var token = "";
+      try { token = localStorage.getItem("sw_auth_token") || ""; } catch (_) { token = ""; }
+      try {
+        if (token) {
+          await fetch("/api/auth/logout", {
+            method: "POST",
+            headers: { "Authorization": "Bearer " + token }
+          });
+        }
+      } catch (_) {
+      } finally {
+        try {
+          localStorage.removeItem("sw_auth_token");
+          localStorage.removeItem("sw_auth_user");
+        } catch (_) {}
+        window.location.href = "/";
+      }
     }
-    ["btnLogout", "btnSettingsLogout"].forEach(function (id) {
-	      var logoutBtn = $(id);
-	      if (logoutBtn) logoutBtn.addEventListener("click", logoutCurrentUser);
-	    });
 
-	    var user = getSessionUser() || getCachedAuthUser();
-	    var nameEl = $("accountUsername");
-		    if (nameEl && user && (user.displayName || user.phone)) nameEl.textContent = user.displayName || user.phone;
-	    startUserActivityHeartbeat();
-	    try { loadBillingSummary(); } catch (_) {}
-	    try { refreshBillingBadge(); } catch (_) {}
-	    // 暴露给其它模块（如 shots/storyboard/videoPrompts）判断是否挂诊断面板。
-	    // 只读、刻意全局、刷新即重置，避免本地存储被改假冒管理员。
-	    window.__qdIsAdmin = false;
-	    // 设置入口暂时隐藏（当前无实际功能）。需要放出时，取消下面两行注释即可。
-	    // var navSettings = $("navSettings");
-	    // if (navSettings) navSettings.hidden = false;
-	    var diagIds = ["shotsDiagnostic", "sbDiagnostic", "vpDiagnostic"];
-	    diagIds.forEach(function (id) {
-	      var el = document.getElementById(id);
-	      if (el) { el.hidden = true; el.style.display = "none"; }
-	    });
-	  }
+    function accountDisplayName(user) {
+      var value = "";
+      if (user) value = user.displayName || user.phone || "";
+      value = String(value || "").trim();
+      return value || "用户";
+    }
+
+    function setAccountMenuOpen(open) {
+      var accountBar = $("accountBar");
+      var accountMenu = $("accountMenu");
+      var accountChevron = accountBar ? accountBar.querySelector(".account-entry-chevron") : null;
+      if (!accountBar || !accountMenu) return;
+      accountMenu.hidden = !open;
+      accountBar.classList.toggle("is-open", !!open);
+      accountBar.classList.toggle("is-active", !!open);
+      accountBar.setAttribute("aria-expanded", open ? "true" : "false");
+      if (accountChevron) accountChevron.textContent = open ? "chevron_left" : "chevron_right";
+    }
+
+    ["btnLogout", "btnSettingsLogout"].forEach(function (id) {
+      var logoutBtn = $(id);
+      if (logoutBtn) logoutBtn.addEventListener("click", logoutCurrentUser);
+    });
+
+    var user = getSessionUser() || getCachedAuthUser();
+    var displayName = accountDisplayName(user);
+    var nameEl = $("accountUsername");
+    if (nameEl) nameEl.textContent = displayName;
+
+    var accountBar = $("accountBar");
+    var accountMenu = $("accountMenu");
+    if (accountBar && accountMenu) {
+      accountBar.addEventListener("click", function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        setAccountMenuOpen(accountMenu.hidden);
+      });
+      accountMenu.addEventListener("click", function (ev) {
+        var actionEl = ev.target && ev.target.closest ? ev.target.closest("[data-account-menu-action]") : null;
+        if (!actionEl) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var action = actionEl.getAttribute("data-account-menu-action");
+        setAccountMenuOpen(false);
+        if (action === "billing") {
+          switchPage("billing", { user: true });
+        } else if (action === "logout") {
+          logoutCurrentUser();
+        }
+      });
+      document.addEventListener("click", function (ev) {
+        if (accountMenu.hidden) return;
+        var target = ev.target;
+        if ((accountBar.contains && accountBar.contains(target)) || (accountMenu.contains && accountMenu.contains(target))) return;
+        setAccountMenuOpen(false);
+      });
+      document.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape" && !accountMenu.hidden) setAccountMenuOpen(false);
+      });
+    }
+
+    startUserActivityHeartbeat();
+    try { loadBillingSummary(); } catch (_) {}
+    try { refreshBillingBadge(); } catch (_) {}
+    // 暴露给其它模块（如 shots/storyboard/videoPrompts）判断是否挂诊断面板。
+    // 只读、刻意全局、刷新即重置，避免本地存储被改假冒管理员。
+    window.__qdIsAdmin = false;
+    // 设置入口暂时隐藏（当前无实际功能）。需要放出时，取消下面两行注释即可。
+    // var navSettings = $("navSettings");
+    // if (navSettings) navSettings.hidden = false;
+    var diagIds = ["shotsDiagnostic", "sbDiagnostic", "vpDiagnostic"];
+    diagIds.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) { el.hidden = true; el.style.display = "none"; }
+    });
+  }
 
   function startUserActivityHeartbeat() {
     if (window.__originUserActivityTimer) return;
@@ -2461,6 +2516,100 @@ var _scriptEditInitialText = "";
     return _ovOverviewThumbnailDisplayUrl(url);
   }
 
+  // ── 任务页右侧预览/下载用的视频地址签名 ──
+  // task.videoUrl 是持久化在项目里的"内部受保护地址"（/api/videos/file/{id}，无签名）。
+  // <video src> 和 <a download> 都不会带 Authorization 头，后端那条路要么认 Bearer
+  // 头、要么认 ?exp=&sig= 签名，二者都没有 → 401 → 点了播不出来、下载也失败。
+  // 这里按需把它换成带签名的临时地址（和片段卡 reattach / 剪辑预览同款链路：
+  // GET /api/videos/{id}/url）。外链或已带有效签名的地址原样返回。
+  var _OV_INTERNAL_VIDEO_RE = /\/api\/videos\/file\/([a-zA-Z0-9-]+)/;
+  var _OV_EXPORT_FILE_RE = /\/api\/edit\/export-file\/([a-zA-Z0-9-]+)/;
+  function _ovVideoIdFromUrl(url) {
+    var m = _OV_INTERNAL_VIDEO_RE.exec(String(url || ""));
+    return m ? m[1] : "";
+  }
+  function _ovExportIdFromUrl(url) {
+    var m = _OV_EXPORT_FILE_RE.exec(String(url || ""));
+    return m ? m[1] : "";
+  }
+  // 需要换签名的两类内部地址：片段视频 /api/videos/file/{id}、剪辑成片 /api/edit/export-file/{id}。
+  // 已带有效签名(exp 未过期)的不用再换。外链不管。
+  function _ovVideoUrlNeedsSigning(url) {
+    if (_ovExportIdFromUrl(url)) return !_ovSignedImageUrlStillValid(url);
+    return !!_ovVideoIdFromUrl(url) && !_ovSignedImageUrlStillValid(url);
+  }
+  // 签名地址缓存：同一个原始地址在多次渲染/点击间复用，避免每次 detail 重渲都打一次签名接口。
+  var _ovSignedUrlCache = new Map();
+  async function _ovResolvePlayableVideoUrl(url) {
+    url = String(url || "").trim();
+    if (!url || !_ovVideoUrlNeedsSigning(url)) return url;
+    var cached = _ovSignedUrlCache.get(url);
+    if (cached && _ovSignedImageUrlStillValid(cached)) return cached;
+    var endpoint = "";
+    var exportId = _ovExportIdFromUrl(url);
+    if (exportId) {
+      endpoint = "/api/edit/export-file/" + encodeURIComponent(exportId) + "/url";
+    } else {
+      var id = _ovVideoIdFromUrl(url);
+      if (!id) return url;
+      endpoint = "/api/videos/" + encodeURIComponent(id) + "/url";
+    }
+    try {
+      var resp = await apiGet(endpoint);
+      var signed = (resp && resp.url) || "";
+      if (signed) _ovSignedUrlCache.set(url, signed);
+      return signed;
+    } catch (e) {
+      console.warn("[overview] 播放地址签名获取失败:", e && e.message);
+      return "";
+    }
+  }
+  // 异步把签名地址塞进预览 <video>。解析期间该 video 可能已被下一次渲染替换，
+  // 用 isConnected + dataset 兜一下，避免把地址写到已脱离文档/已切到别的任务的旧元素上。
+  function _ovApplyPreviewVideoSrc(videoEl, rawUrl) {
+    if (!videoEl || !rawUrl) return;
+    if (!_ovVideoUrlNeedsSigning(rawUrl)) { videoEl.src = rawUrl; return; }
+    videoEl.dataset.ovRawSrc = rawUrl;
+    _ovResolvePlayableVideoUrl(rawUrl).then(function (signed) {
+      if (!signed || !videoEl.isConnected) return;
+      if (videoEl.dataset.ovRawSrc !== rawUrl) return;
+      videoEl.src = signed;
+    });
+  }
+  // 预览封面（poster）也是无签名图片地址（/api/images/file/{id}），<video poster> 一样
+  // 带不了 Bearer → 黑底/裂图。走和列表缩略图同一套 fetchAssetSignedUrl 换签名图，
+  // 异步塞 poster。外链/已带有效签名的直接用（inline poster 已设，这里不覆盖）。
+  function _ovApplyPreviewPoster(videoEl, thumbUrl) {
+    thumbUrl = String(thumbUrl || "").trim();
+    if (!videoEl || !thumbUrl) return;
+    var id = _ovImageAssetIdFromUrl(thumbUrl);
+    if (!id || _ovSignedImageUrlStillValid(thumbUrl)) {
+      if (!videoEl.getAttribute("poster")) videoEl.poster = _ovOverviewThumbnailDisplayUrl(thumbUrl);
+      return;
+    }
+    videoEl.dataset.ovPosterRaw = thumbUrl;
+    fetchAssetSignedUrl(id, 3600).then(function (signed) {
+      if (!signed || !videoEl.isConnected) return;
+      if (videoEl.dataset.ovPosterRaw !== thumbUrl) return;
+      videoEl.poster = _ovOverviewThumbnailDisplayUrl(signed);
+    }).catch(function (e) { console.warn("[overview] 预览封面签名失败:", e && e.message); });
+  }
+  // 预览播放器交互态：加载圈跟随 waiting/playing/error，播放钮跟随 play/pause/ended。
+  // 解决"点了播放黑屏一阵不知道在干嘛"——签名+缓冲期间显式转圈"正在加载视频…"。
+  function _ovBindPreviewVideoUx(video, preview) {
+    if (!video || !preview) return;
+    var loadingEl = preview.querySelector("[data-ov-preview-loading]");
+    var playBtn = preview.querySelector("[data-ov-action='preview-play']");
+    function setLoading(on) { if (loadingEl) loadingEl.hidden = !on; }
+    function showPlayBtn(on) { if (playBtn) playBtn.hidden = !on; }
+    video.addEventListener("waiting", function () { setLoading(true); });
+    video.addEventListener("playing", function () { setLoading(false); showPlayBtn(false); });
+    video.addEventListener("canplay", function () { setLoading(false); });
+    video.addEventListener("pause", function () { if (!video.ended) { setLoading(false); showPlayBtn(true); } });
+    video.addEventListener("ended", function () { setLoading(false); showPlayBtn(true); });
+    video.addEventListener("error", function () { setLoading(false); showPlayBtn(true); });
+  }
+
   function _ovThumbnailImgHtml(url) {
     url = String(url || "").trim();
     if (!url) return "";
@@ -2735,6 +2884,12 @@ var _scriptEditInitialText = "";
     var media = hasDetail
       ? _ovProjectMedia(proj)
       : { videoUrl: "", thumbnail: _ovFirst(summary && summary.thumbnail, _ovProjectMedia(proj).thumbnail) };
+    // 剪辑页合成成片：editData.exportUrl（导出完成时由后端写入，指向 /api/edit/export-file/{id}）。
+    // 任务页右侧预览优先播它（完整成片），没有时才退回片段视频。只有加载了详情的项目能拿到。
+    var composedVideoUrl = "";
+    if (hasDetail && proj.editData && proj.editData.exportUrl) {
+      composedVideoUrl = String(proj.editData.exportUrl || "");
+    }
     var promptText = _ovProjectPromptSummary(proj);
     var summaryDurationSec = Number(summary && summary.durationSec);
     var durationSec = hasDetail
@@ -2769,6 +2924,7 @@ var _scriptEditInitialText = "";
       progress: progress,
       thumbnail: media.thumbnail,
       videoUrl: media.videoUrl,
+      composedVideoUrl: composedVideoUrl,
       prompt: promptText || "",
       promptCount: promptText ? String(promptText).length : 0,
     };
@@ -2943,8 +3099,34 @@ var _scriptEditInitialText = "";
     return c;
   }
 
-  function _ovSetSelected(id, tasks) {
+  function _ovCurrentProjectTaskId() {
+    return project && project.id ? "p:" + project.id : "";
+  }
+
+  function _ovHasTaskId(tasks, id) {
+    if (!id) return false;
+    return (tasks || []).some(function (t) { return t && t.id === id; });
+  }
+
+  function _ovSelectCurrentProjectTask() {
+    if (!_ovTaskState) return;
+    var currentId = _ovCurrentProjectTaskId();
+    if (currentId) _ovTaskState.selectedId = currentId;
+  }
+
+  function _ovAlignSelectedToCurrentProject(tasks) {
+    if (!_ovTaskState) return false;
+    if (_ovTaskState.activatingId) return false;
+    var currentId = _ovCurrentProjectTaskId();
+    if (!currentId || !_ovHasTaskId(tasks, currentId)) return false;
+    _ovTaskState.selectedId = currentId;
+    return true;
+  }
+
+  function _ovSetSelected(id, tasks, options) {
+    options = options || {};
     tasks = tasks || _ovBuildTasks();
+    if (options.preferCurrent !== false && _ovAlignSelectedToCurrentProject(tasks)) return;
     if (id && tasks.some(function (t) { return t.id === id; })) { _ovTaskState.selectedId = id; return; }
     if (_ovTaskState.selectedId && tasks.some(function (t) { return t.id === _ovTaskState.selectedId; })) return;
     _ovTaskState.selectedId = tasks.length ? tasks[0].id : "";
@@ -3226,8 +3408,17 @@ var _scriptEditInitialText = "";
       return;
     }
     if (preview) {
-      if (task.videoUrl) {
-        preview.innerHTML = '<video src="' + escapeHtml(task.videoUrl) + '" poster="' + escapeHtml(_ovThumbnailPosterUrl(task.thumbnail)) + '" controls playsinline preload="metadata"></video><button type="button" class="vtd-preview-play" data-ov-action="preview-play" title="播放"><span class="material-symbols-outlined">play_arrow</span></button>';
+      if (task.videoUrl || task.composedVideoUrl) {
+        // 优先播剪辑合成片；没有合成片时退回片段视频（默认就是片段1）。
+        var _ovPlayUrl = task.composedVideoUrl || task.videoUrl;
+        preview.innerHTML =
+          '<video poster="' + escapeHtml(_ovThumbnailPosterUrl(task.thumbnail)) + '" controls playsinline preload="metadata"></video>' +
+          '<button type="button" class="vtd-preview-play" data-ov-action="preview-play" title="播放"><span class="material-symbols-outlined">play_arrow</span></button>' +
+          '<div class="vtd-preview-loading" data-ov-preview-loading hidden><span class="vtd-preview-spinner"></span><span>正在加载视频…</span></div>';
+        var _ovPrevVideo = preview.querySelector("video");
+        _ovApplyPreviewVideoSrc(_ovPrevVideo, _ovPlayUrl);
+        _ovApplyPreviewPoster(_ovPrevVideo, task.thumbnail);
+        _ovBindPreviewVideoUx(_ovPrevVideo, preview);
       } else if (task.thumbnail) {
         preview.innerHTML = _ovThumbnailImgHtml(task.thumbnail) + '<div class="vtd-preview-unavailable"><span class="material-symbols-outlined">videocam_off</span><p>视频未生成</p></div>';
       } else {
@@ -3243,7 +3434,7 @@ var _scriptEditInitialText = "";
         return '<div class="vtd-workflow-item' + (s.done ? ' is-done' : s.ready ? ' is-ready' : '') + '"><span class="vtd-workflow-num">' + (idx + 1) + '</span><div><strong>' + escapeHtml(s.label) + '</strong><p>' + escapeHtml(s.value) + '</p></div>' + (s.done ? '<span class="material-symbols-outlined">check</span>' : s.ready ? '<em>就绪</em>' : '<em>待处理</em>') + '</div>';
       }).join("");
     }
-    if (dl) { dl.disabled = !task.videoUrl; dl.dataset.taskId = task.id; }
+    if (dl) { dl.disabled = !(task.composedVideoUrl || task.videoUrl); dl.dataset.taskId = task.id; }
   }
 
   function _ovRenderStats(counts) {
@@ -3425,15 +3616,21 @@ var _scriptEditInitialText = "";
     }
   }
 
-  function _ovDownloadVideo(task) {
-    if (!task || !task.videoUrl) {
+  async function _ovDownloadVideo(task) {
+    if (!task || !(task.composedVideoUrl || task.videoUrl)) {
       showToast("视频尚未生成", "warn");
+      return;
+    }
+    // 下载也优先给合成片；和预览同理，持久化的无签名地址直接 <a download> 会 401，先换签名地址。
+    var href = await _ovResolvePlayableVideoUrl(task.composedVideoUrl || task.videoUrl);
+    if (!href) {
+      showToast("下载地址获取失败，请刷新后重试", "warn");
       return;
     }
     try {
       var name = String(task.title || task.name || task.id || "video").replace(/[\\/:*?"<>|]+/g, "_").trim();
       var a = document.createElement("a");
-      a.href = task.videoUrl;
+      a.href = href;
       a.download = (name || "video") + ".mp4";
       a.rel = "noopener";
       a.style.display = "none";
@@ -3711,11 +3908,23 @@ var _scriptEditInitialText = "";
         return;
       }
       _ovSelectTask(id);
-      if (action === "play" && task.videoUrl) {
-        setTimeout(function () {
-          var video = $("ovPreviewWrap") && $("ovPreviewWrap").querySelector("video");
-          if (video) video.play().catch(function () {});
-        }, 40);
+      if (action === "play" && (task.videoUrl || task.composedVideoUrl)) {
+        // 预览 <video> 的签名地址是异步塞进去的（要一次签名接口往返），
+        // 等 src 就绪再 play，避免在签名返回前就 play 一个空 src 静默失败。
+        // 等待期间显示加载圈（playing 事件会收掉）。
+        var _ovPlayWaitStart = Date.now();
+        (function waitAndPlay() {
+          var wrap = $("ovPreviewWrap");
+          var video = wrap && wrap.querySelector("video");
+          if (!video) return;
+          var loadingEl = wrap.querySelector("[data-ov-preview-loading]");
+          var playBtn = wrap.querySelector("[data-ov-action='preview-play']");
+          if (playBtn) playBtn.hidden = true;
+          if (loadingEl) loadingEl.hidden = false;
+          if (video.src) { video.play().catch(function () {}); return; }
+          if (Date.now() - _ovPlayWaitStart > 4000) { if (loadingEl) loadingEl.hidden = true; if (playBtn) playBtn.hidden = false; return; }
+          setTimeout(waitAndPlay, 80);
+        })();
       }
     });
     if (list) list.addEventListener("keydown", function (e) {
@@ -3784,10 +3993,19 @@ var _scriptEditInitialText = "";
       var btn = e.target.closest("[data-ov-action='preview-play']");
       if (!btn) return;
       var video = preview.querySelector("video");
-      if (video) {
-        btn.hidden = true;
-        video.play().catch(function () { btn.hidden = false; });
-      }
+      if (!video) return;
+      var loadingEl = preview.querySelector("[data-ov-preview-loading]");
+      btn.hidden = true;
+      if (loadingEl) loadingEl.hidden = false; // 点下立刻转圈，playing 事件会把它收掉
+      function fail() { btn.hidden = false; if (loadingEl) loadingEl.hidden = true; }
+      function tryPlay() { video.play().catch(fail); }
+      // src 已就绪（_ovApplyPreviewVideoSrc 大多数情况下已提前签好）直接播；
+      // 万一用户在签名返回前抢先点了，这里再兜底解析一次再播。
+      if (video.src) { tryPlay(); return; }
+      _ovResolvePlayableVideoUrl(video.dataset.ovRawSrc || "").then(function (signed) {
+        if (signed && video.isConnected) { video.src = signed; tryPlay(); }
+        else { fail(); showToast("预览加载失败，请刷新后重试", "warn"); }
+      });
     });
   }
 
@@ -7141,10 +7359,13 @@ var _scriptEditInitialText = "";
 	          return false;
 	        }
 	      },
-	    });
+    });
     initProject({
       getProject: () => project,
-      setProject: (p) => { project = p; },
+      setProject: (p) => {
+        project = p;
+        _ovSelectCurrentProjectTask();
+      },
       getVideoState: () => videoState,
       ensureEpisodes: () => _ensureEpisodes(),
       restoreAssetGenStatus: () => _restoreAssetGenStatus(),
@@ -7572,8 +7793,10 @@ var _scriptEditInitialText = "";
     });
 
     /* Assets page */
-	    $("btnExtractAssets").addEventListener("click", extractAssets);
-	    $("btnGenAssetImages").addEventListener("click", generateAllAssetImages);
+    $("btnExtractAssets").addEventListener("click", extractAssets);
+    var btnExtractAssetsEmpty = $("btnExtractAssetsEmpty");
+    if (btnExtractAssetsEmpty) btnExtractAssetsEmpty.addEventListener("click", extractAssets);
+    $("btnGenAssetImages").addEventListener("click", generateAllAssetImages);
 	    $("btnConfirmAssets").addEventListener("click", confirmAssets);
 	    var btnConfirmAssetsTop = $("btnConfirmAssetsTop");
 	    if (btnConfirmAssetsTop) btnConfirmAssetsTop.addEventListener("click", confirmAssets);
@@ -7582,8 +7805,6 @@ var _scriptEditInitialText = "";
     if (_btnSaveTpl) _btnSaveTpl.addEventListener("click", saveAsWorldTemplate);
     var _btnKnowledgeSnapshot = $("btnKnowledgeSnapshot");
     if (_btnKnowledgeSnapshot) _btnKnowledgeSnapshot.addEventListener("click", openKnowledgeSnapshot);
-    var _btnConfirmPendingWorldFacts = $("btnConfirmPendingWorldFacts");
-    if (_btnConfirmPendingWorldFacts) _btnConfirmPendingWorldFacts.addEventListener("click", confirmPendingWorldFacts);
     var charGrid = $("assetCharGrid");
     var sceneGrid = $("assetSceneGrid");
     var propGrid = $("assetPropGrid");
@@ -7593,6 +7814,8 @@ var _scriptEditInitialText = "";
 
     /* Shots page */
     $("btnGenShots").addEventListener("click", generateShots);
+    var btnGenShotsEmpty = $("btnGenShotsEmpty");
+    if (btnGenShotsEmpty) btnGenShotsEmpty.addEventListener("click", generateShots);
     $("btnConfirmShots").addEventListener("click", confirmImages);
     var slw = $("shotListWrap");
     if (slw) slw.addEventListener("click", handleShotAction);

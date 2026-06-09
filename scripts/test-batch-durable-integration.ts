@@ -35,8 +35,6 @@ async function main() {
     resolveTaskStartTransitionConflict,
   } = await import('../lib/batches');
   const {
-    costForBatchType,
-    creditKindForBatchType,
     finalizeBatchFromTasks,
     taskChargeRef,
     taskRefundRef,
@@ -63,11 +61,6 @@ async function main() {
     return { status: res.status, json: await res.json() };
   }
 
-  assert.equal(costForBatchType('asset_images'), 30);
-  assert.equal(costForBatchType('asset_stylize'), 30);
-  assert.equal(costForBatchType('video_prompts'), 1);
-  assert.equal(creditKindForBatchType('video_segments'), 'video');
-  assert.equal(creditKindForBatchType('video_prompts'), 'text');
   assert.equal(taskChargeRef('task-ref-smoke'), 'charge:task-ref-smoke');
   assert.equal(taskRefundRef('task-ref-smoke'), 'refund:task-ref-smoke');
 
@@ -117,7 +110,7 @@ async function main() {
   const refundBucketRow = db
     .prepare("SELECT buckets_json FROM credit_ledger WHERE refund_ref_id = 'refund:task-bucket-refund'")
     .get() as any;
-  assert.deepEqual(JSON.parse(refundBucketRow.buckets_json), { bonus: 50, topup: 20, subscription: 0 });
+  assert.deepEqual(JSON.parse(refundBucketRow.buckets_json), { bonus: 50, topup: 20, subscription: 0, overdraft: 0 });
   assert.equal(
     (db.prepare("SELECT COUNT(*) AS c FROM credit_ledger WHERE refund_ref_id = 'refund:task-bucket-refund'").get() as any).c,
     1,
@@ -179,7 +172,7 @@ async function main() {
        )`,
     )
     .get(ok.batchId) as any;
-  assert.equal(okCharges.c, 2);
+  assert.equal(okCharges.c, 0);
 
   registerExecutor('storyboard_images', async () => {
     throw new Error('planned failure');
@@ -198,14 +191,14 @@ async function main() {
   const failLedger = db
     .prepare(
       `SELECT
-         SUM(CASE WHEN charge_ref_id IS NOT NULL THEN 1 ELSE 0 END) AS charges,
-         SUM(CASE WHEN refund_ref_id IS NOT NULL THEN 1 ELSE 0 END) AS refunds
+         COALESCE(SUM(CASE WHEN charge_ref_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS charges,
+         COALESCE(SUM(CASE WHEN refund_ref_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS refunds
        FROM credit_ledger
        WHERE ref_id IN (SELECT id FROM batch_tasks WHERE batch_id = ?)`,
     )
     .get(fail.batchId) as any;
-  assert.equal(failLedger.charges, 1);
-  assert.equal(failLedger.refunds, 1);
+  assert.equal(failLedger.charges, 0);
+  assert.equal(failLedger.refunds, 0);
 
   registerExecutor('video_prompts', async (ctx) => {
     await sleep(80);
@@ -235,14 +228,14 @@ async function main() {
   const cancelLedger = db
     .prepare(
       `SELECT
-         SUM(CASE WHEN charge_ref_id IS NOT NULL THEN 1 ELSE 0 END) AS charges,
-         SUM(CASE WHEN refund_ref_id IS NOT NULL THEN 1 ELSE 0 END) AS refunds
+         COALESCE(SUM(CASE WHEN charge_ref_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS charges,
+         COALESCE(SUM(CASE WHEN refund_ref_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS refunds
        FROM credit_ledger
        WHERE ref_id IN (SELECT id FROM batch_tasks WHERE batch_id = ?)`,
     )
     .get(cancelRun.batchId) as any;
-  assert.equal(cancelLedger.charges, 1);
-  assert.equal(cancelLedger.refunds, 1);
+  assert.equal(cancelLedger.charges, 0);
+  assert.equal(cancelLedger.refunds, 0);
 
   registerExecutor('upstream_test', async (ctx) => {
     transitionTaskStatus({

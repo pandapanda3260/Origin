@@ -1,4 +1,4 @@
-import { chargeCredits, CREDIT_PRICES, refundCredits } from './credits';
+import { CREDIT_PRICES, getBalance } from './credits';
 
 export type ToolboxBillableTool = 'image' | 'video';
 
@@ -20,16 +20,8 @@ export function chargeToolboxCredits(opts: {
   toolType: ToolboxBillableTool;
   amount?: number;
 }) {
-  const amount = opts.amount || toolboxCreditPrice(opts.toolType);
-  return chargeCredits({
-    userId: opts.userId,
-    amount,
-    kind: opts.toolType,
-    reason: opts.toolType === 'video' ? '工具箱视频生成' : '工具箱图片生成',
-    refId: opts.itemId,
-    chargeRefId: toolboxChargeRef(opts.itemId),
-    idempotencyKey: toolboxChargeRef(opts.itemId),
-  });
+  const balance = getBalance(opts.userId);
+  return { ledgerId: null, balanceAfter: balance.totalCredits, legacySkipped: true };
 }
 
 export function refundToolboxCredits(opts: {
@@ -39,13 +31,6 @@ export function refundToolboxCredits(opts: {
   amount?: number;
   reason?: string;
 }) {
-  const amount = opts.amount || toolboxCreditPrice(opts.toolType);
-  return refundCredits({
-    userId: opts.userId,
-    amount,
-    reason: opts.reason || (opts.toolType === 'video' ? '工具箱视频生成失败退款' : '工具箱图片生成失败退款'),
-    refId: opts.itemId,
-    refundRefId: toolboxRefundRef(opts.itemId),
-    idempotencyKey: toolboxRefundRef(opts.itemId),
-  });
+  const balance = getBalance(opts.userId);
+  return { ledgerId: null, balanceAfter: balance.totalCredits, alreadyApplied: true, legacySkipped: true };
 }

@@ -41,6 +41,8 @@ import {
 } from '@/lib/video-segment-runtime';
 import { artifactUsageBlockedPayload, describeArtifactStatus } from '@/lib/sentinel';
 import { applyBlockerFilterWithWarnings } from '@/lib/batch-preflight';
+import { InsufficientCreditsError } from '@/lib/credits';
+import { assertCanStartPaidOperation } from '@/lib/usage-billing';
 import {
   AssetQuotaError,
   assertCanStartAssetGeneration,
@@ -292,13 +294,15 @@ export async function POST(req: NextRequest) {
 	    if (!prompt) return jsonError('缺 prompt', 400);
 	  }
 
-  try {
-    try {
-      assertCanStartAssetGeneration(user.id);
-    } catch (error: any) {
-      if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
-      throw error;
-    }
+	  try {
+	    try {
+	      assertCanStartAssetGeneration(user.id);
+        assertCanStartPaidOperation(user.id);
+	    } catch (error: any) {
+	      if (error instanceof AssetQuotaError) return jsonError(error.message, error.status);
+        if (error instanceof InsufficientCreditsError) return jsonError(error.message, 402);
+	      throw error;
+	    }
     assetBatchId = createGenerationBatch({
       ownerId: user.id,
       projectId: projectId || null,

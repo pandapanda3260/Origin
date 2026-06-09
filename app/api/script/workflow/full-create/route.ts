@@ -10,7 +10,8 @@ import {
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
-import { CREDIT_PRICES, chargeCredits, refundCredits, InsufficientCreditsError } from '@/lib/credits';
+import { InsufficientCreditsError } from '@/lib/credits';
+import { assertCanStartPaidOperation } from '@/lib/usage-billing';
 import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { shortKnowledgeHash } from '@/lib/knowledge/hash';
@@ -63,16 +64,8 @@ export async function POST(req: NextRequest) {
       return;
     }
 
-    // 计费：剧本生成 ≈ 2 次 LLM 调用（剧本 + 情绪标签）
-    let charge: { ledgerId: string; balanceAfter: number } | null = null;
     try {
-      charge = chargeCredits({
-        userId: user.id,
-        amount: CREDIT_PRICES.text * 2,
-        kind: 'text',
-        reason: isRevise ? 'script.revise' : isAdapt ? 'script.adapt' : 'script.full-create',
-        refId: projectId,
-      });
+      assertCanStartPaidOperation(user.id);
     } catch (e: any) {
       if (e instanceof InsufficientCreditsError) {
         writer.event('error', { error: e.message, errorCode: 'INSUFFICIENT_CREDITS', required: e.required, balance: e.balance });
@@ -135,10 +128,6 @@ export async function POST(req: NextRequest) {
         writer.scriptChunk(delta);
       });
     } catch (e: any) {
-      // LLM 调用失败 → 退积分 + 抛友好错误
-      if (charge) {
-        try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 2, reason: 'script.error', refId: projectId }); } catch (_) {}
-      }
       writer.error(formatScriptGenerationError(e, { isAdapt }));
       return;
     }
@@ -197,10 +186,6 @@ export async function POST(req: NextRequest) {
       try {
         updateProjectForUser(projectId, user.id, writePayload);
       } catch (e: any) {
-        // 最终写库失败时，整个流程相当于白跑了——必须退款
-        if (charge) {
-          try { refundCredits({ userId: user.id, amount: CREDIT_PRICES.text * 2, reason: 'script.persist.error', refId: projectId }); } catch (_) {}
-        }
         writer.error('保存失败：' + (e?.message || String(e)));
         return;
       }

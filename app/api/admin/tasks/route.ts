@@ -653,22 +653,28 @@ function refundCandidate(source: TaskSource, before: any) {
       acc.refundable += item.refundable;
       return acc;
     }, { charged: 0, refunded: 0, refundable: 0 });
-  }
-  const id = String(before.id);
-  const chargeRef = source === 'batch_task' ? taskChargeRef(id) : '';
-  const refundRef = source === 'batch_task' ? taskRefundRef(id) : `refund:${id}`;
-  const row = getDb().prepare<any, any>(
-    `SELECT
-       SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS charged,
-       SUM(CASE WHEN kind = 'refund' AND amount > 0 THEN amount ELSE 0 END) AS refunded
-       FROM credit_ledger
-      WHERE user_id = @ownerId
-        AND (
-          ref_id = @id
-          OR (@chargeRef <> '' AND charge_ref_id = @chargeRef)
-          OR (@refundRef <> '' AND refund_ref_id = @refundRef)
-        )`,
-  ).get({ ownerId: Number(before.ownerId), id, chargeRef, refundRef }) || {};
+	  }
+	  const id = String(before.id);
+	  if (source === 'video_task') {
+	    return { charged: 0, refunded: 0, refundable: 0 };
+	  }
+	  const chargeRef = source === 'batch_task' ? taskChargeRef(id) : '';
+	  const refundRef = source === 'batch_task' ? taskRefundRef(id) : `refund:${id}`;
+	  const row = source === 'batch_task'
+	    ? getDb().prepare<any, any>(
+	        `SELECT
+	           SUM(CASE WHEN amount < 0 AND charge_ref_id = @chargeRef THEN -amount ELSE 0 END) AS charged,
+	           SUM(CASE WHEN kind = 'refund' AND amount > 0 AND refund_ref_id = @refundRef THEN amount ELSE 0 END) AS refunded
+	         FROM credit_ledger
+	        WHERE user_id = @ownerId`,
+	      ).get({ ownerId: Number(before.ownerId), chargeRef, refundRef }) || {}
+	    : getDb().prepare<any, any>(
+	        `SELECT
+	           SUM(CASE WHEN amount < 0 AND kind = 'export' AND ref_id = @id THEN -amount ELSE 0 END) AS charged,
+	           SUM(CASE WHEN kind = 'refund' AND amount > 0 AND (refund_ref_id = @refundRef OR ref_id = @id) THEN amount ELSE 0 END) AS refunded
+	         FROM credit_ledger
+	        WHERE user_id = @ownerId`,
+	      ).get({ ownerId: Number(before.ownerId), id, refundRef }) || {};
   const charged = Number(row.charged || 0);
   const refunded = Number(row.refunded || 0);
   return { charged, refunded, refundable: Math.max(0, charged - refunded) };

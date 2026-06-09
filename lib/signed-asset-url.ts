@@ -145,3 +145,48 @@ export function verifySignedVideoUrl(opts: {
     return false;
   }
 }
+
+// 剪辑导出的成片（exports 表）。和视频片段同理：/api/edit/export-file/{id} 是 Bearer-only，
+// <video src> 带不了登录头，给它一条 exp+sig 签名路径，前端拿签名地址就能直接流式播放。
+function signExportPayload(exportId: string, ownerId: number, exp: number): string {
+  return `export-url-v1:${exportId}:${ownerId}:${exp}`;
+}
+
+function exportDigest(exportId: string, ownerId: number, exp: number): string {
+  return createHmac('sha256', getSecret())
+    .update(signExportPayload(exportId, ownerId, exp))
+    .digest('base64url');
+}
+
+export function buildSignedExportUrl(exportId: string, ownerId: number, ttlSeconds = DEFAULT_TTL_SECONDS) {
+  const ttl = normalizeAssetUrlTtl(ttlSeconds);
+  const exp = Math.floor(Date.now() / 1000) + ttl;
+  const sig = exportDigest(exportId, ownerId, exp);
+  return {
+    url: `/api/edit/export-file/${encodeURIComponent(exportId)}?exp=${exp}&sig=${encodeURIComponent(sig)}`,
+    ttl,
+    expiresAt: exp,
+  };
+}
+
+export function verifySignedExportUrl(opts: {
+  exportId: string;
+  ownerId: number;
+  exp: string | null;
+  sig: string | null;
+}) {
+  const exp = Number(opts.exp || 0);
+  if (!Number.isFinite(exp) || exp <= 0) return false;
+  if (exp < Math.floor(Date.now() / 1000)) return false;
+  if (!opts.sig) return false;
+
+  const expected = exportDigest(opts.exportId, opts.ownerId, exp);
+  const a = Buffer.from(opts.sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
