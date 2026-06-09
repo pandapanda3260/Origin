@@ -1,179 +1,189 @@
-# 统一页面刷新等待 UI — 方案 v4（工程化定稿，基于真实代码扫描，待确认后执行）
+# 统一页面刷新等待 UI — 方案 v5（工程化定稿，待确认即进 Phase 0）
 
-> 本版整合你提的 8 条落地修正，整篇重写（非补丁）。所有锚点已逐个扫码核实，决策全部拍死、无选择项。
-> 边界（保留 v3，已确认正确）：只动 `public/`；不做小游戏；不做横幅 / 顶部进度条；静态 loading 节点写进 `workspace.html` 解决预启动闪屏；4 页灰度；不动后端 / 字段 / schema / `readyForEdit` / reattach / 导入逻辑。
+> 整合你第 5 轮 6 条修正，整篇重写（非补丁）。所有锚点已扫码核实，决策全部拍死、无选择项。
+> 边界（v4 已确认正确，保留）：只动 `public/`；不做小游戏 / 横幅 / 顶部进度条；静态 loading 节点写进 `workspace.html`；4 页灰度；独立 `_swLoadToken`；`_showProjectSkeleton(true)` 仅这 4 页 no-op；batch region loader 放 `.batch-workbench-scroll` 而非 `#batchClipList`；不碰后端 / 字段 / schema / `readyForEdit` / reattach / 导入逻辑。
 > **本阶段不改任何代码，等你确认后再执行。** 产出可直接交 Codex / Claude Code。
 
 ---
 
 ## 0. 一句话方案
 
-4 个重灾页（资产 / 镜头 / 片段 / 剪辑）各放一个**默认可见、绝对定位、带局部 stacking context 的页面内像素加载层**，由 `main.js` 一个**独立 `_swLoadToken` 驱动的权威加载态**统一显隐；启动 `done` 在 **boot 最终 `switchPage(forceRefresh)` 之后**触发，切项目 `begin` 在 **`_activateProjectContext` 开始处**触发，失败显式判定进 error+retry。
+4 个重灾页（资产/镜头/片段/剪辑）各放一个**默认可见、绝对定位、带局部 stacking context**的页面内像素加载层，由 `main.js` 一个**独立 `_swLoadToken` 权威态**统一显隐。**所有 begin/done/error 收口都在 `main.js`**：启动在 `_markWorkspaceBootReady()` 之后下一帧 settle，切项目在 `_activateProjectContext` 内 begin/done、catch 里 `swLoadError` 后**续抛**，错误态重试走 `main.js` 包装流程（非裸 `loadProject`）。
 
 ---
 
-## 1. 扫码核实结论（逐条对应你的 8 点，带真实行号）
+## 1. 扫码核实结论（逐条对应你第 5 轮的 6 点，带真实行号）
 
 | # | 你的修正 | 扫码核实（file:line） | 处理 |
 |---|---|---|---|
-| 1 | done 不能放 loadProject 末尾 | `init()`(main.js:6962) 里 `await loadProject()`(7078) **早于** `syncEditProject(project)`(7469) 与各页事件接线；boot 期 `switchPage` 刷新被 `_appBootstrapping`(164) 延后(1778-1779)，真正可见刷新在 `_appBootstrapping=false`(7588) 后的 `switchPage(bootTargetPage,{forceRefresh:true})`(7590) | ✅ 启动 `done` 改到 **7590 之后**由 main.js 触发 |
-| 2 | `_projectActivationToken` 不能复用 | 它只在 `_activateProjectContext` 里 `++`(899)；硬刷新走 `loadProject()` 不经过它 | ✅ 新建独立 `_swLoadToken`，begin/done/error **同时**接 `loadProject` 路径与 `_activateProjectContext` |
-| 3 | 切项目 begin 太晚 | `_activateProjectContext`(896) 在 `fetchProjectByIdShared`(920) **之后**才 `_resetProjectRuntime`(928)；fetch 期间旧内容仍在 | ✅ begin 提到 `_activateProjectContext` 开始处(紧挨 `_setProjectActivating(true)` 907)，成功 refresh(938) 后 done，catch 进 error |
-| 4 | skeleton no-op 不能无条件 | `_showProjectSkeleton(on)`(1113)：`on=true` 建/显，`on=false` 走隐藏+清 watchdog | ✅ 只在 `on===true` 且 active∈4页 时 `return`；`on===false` 必须照常清理 |
-| 5 | loadFailed 要显式 | `loadProject` 列表失败被吞→`serverList=[]`(327/350/352)，`targetId` 随后被清空(356-360)；目标项目 fetch 失败仅 console.warn(401-403) | ✅ 显式记 `listOk` / `targetFetchFailed`：listOk 且 0 项=ready/empty；listOk=false 或 targetFetchFailed=true 才 error |
-| 6 | batch loader 避开 children 计数 | `syncTaskListVisibility()` 用 `clipList.children.length` 判 `hasPlanRows`(videoTasks.js:1314)；`renderBatchClipList` 的 `list.innerHTML=""`(2999) 会删子节点 | ✅ region loader 挂到外层 `.batch-workbench-scroll`(workspace.html:1200，含 `#batchClipList`1201)，绝对定位、**不作 `#batchClipList` 子节点**；`try/finally` + `renderSeq` 防旧 render 误关 |
-| 7 | 遮罩 z 要高于剪辑层 | edit 时间线 `#editTimelineArea` 是 `relative z-[50]`(workspace.html:1370) | ✅ 4 页容器 `isolation:isolate` 建局部 stacking context，loading 层 `z-index:60`（页内最高） |
-| 8 | 版本号按现状 | importmap 已 `project.js?v=104`(workspace.html:1749)、`videoTasks.js?v=118`(1763)；但 `main.js:18` 是相对 `./modules/project.js?v=103`（绕过 importmap），`main.js:27` 是裸 `/modules/videoTasks.js`（走 importmap） | ✅ 见 §6：project.js→105（importmap+main.js:18 两处）；videoTasks.js→119（只 importmap，main.js:27 裸 import 自动解析）；不写 `?v=1` |
+| 1 | 重试不能裸调 `loadProject()` | `loadProject()`(project.js:319) 只管加载/刷新，不含全局 loader begin/done；它在 `init()` 内被 `await`(main.js:7078) | ✅ 重试 = `main.js` 包装 `_retryActiveLoad()`：begin→loadProject→`switchPage(forceRefresh)`→done/error（§3.4） |
+| 2 | `_activateProjectContext` 错误不能吞 | 它(main.js:896) 是 **try/finally 无 catch**，错误向上抛；`switchToProject`(1005) 的 catch 弹「切换项目失败」toast(1015-1018) | ✅ 新增 catch：`swLoadError(swT)` 后 **`throw e` 续抛**，保留 toast/返回行为 |
+| 3 | 版本号过期 | `styles.css?v=185`(workspace.html:73)（不是 182）；`main.js?v=246`(:1769)；importmap `project.js?v=104`/`videoTasks.js?v=118`；`main.js:18` 相对 `project.js?v=103` | ✅ styles.css **185→186**；其余见 §6 |
+| 4 | CSS 背景要真实变量 | `styles.css:8 --bg-main:#ECEFF1`（页面主背景变量真实存在） | ✅ 遮罩 `background: var(--bg-main);`，不留占位 |
+| 5 | 收口放 bootReady 之后 | 最终 `switchPage(...forceRefresh)`(main.js:7590) **紧接** `_markWorkspaceBootReady()`(7591)；该函数(209) 释放 boot CSS | ✅ settle 放 `_markWorkspaceBootReady()` **之后 + `requestAnimationFrame` 下一帧**，避免 loader 已隐藏但 boot CSS 未释放的空窗 |
+| 6 | `renderSeq` 要先声明模块变量 | `videoTasks.js` 模块状态区在 16-39 行（`let _ctx`/`let project`/`var _videoInFlightGroups` 等），**无 `_batchRenderSeq`** | ✅ 模块状态区补 `var _batchRenderSeq = 0;`，否则 `++_batchRenderSeq` ReferenceError |
 
 ---
 
-## 2. 决策清单（全部拍死，无选项；不同意可否单条）
+## 2. 决策清单（全部拍死，无选项）
 
 1. **加载视觉**：页面内绝对定位遮罩 `.sw-page-loading`，默认可见（治预启动闪），内含像素「O」环 + 「加载中…」。
 2. **像素动效**：纯 CSS 像素方块拼 Origin「O」环按序淡入循环；单色随主题文字色；~44px；零依赖、无 canvas。
-3. **权威态归 main.js**：`_swLoad = { projectId, token, status }`，独立计数器 `_swLoadToken`；`_isSwLoadCurrent(t)=t===_swLoadToken`；done/error 过期回调丢弃。各页不加 loaded 标志。
-4. **启动 done 时机**：boot 最终 `switchPage(...forceRefresh)`(7590) 之后由 main.js settle（§3.2）。
-5. **切项目 begin 时机**：`_activateProjectContext` 开始处(907 附近)。
-6. **error/retry**：`loadProject` 顶层 `listOk`/`targetFetchFailed` 显式判定；retry = 重新 `loadProject()`。
-7. **batch region loader**：挂 `.batch-workbench-scroll`，绝对定位，非 `#batchClipList` 子节点，`try/finally`+`renderSeq`。
-8. **z 层级**：4 页容器 `isolation:isolate` + loading 层 `z-index:60`。
-9. **skeleton 处置**：`_showProjectSkeleton` 仅在 `on===true` 且 active∈{assets,shots,batch,edit} 时 no-op；其余照常。
-10. **版本**：§6 唯一版本号统一 bump；新 `loading.js` 走 importmap 绝对路径（与 edit/videoTasks 同款），不用相对 `?v`。
-11. **loading.js 注入**：仅 main.js import 一次，控制器经各页现有 `initXxx(ctx)` 下发；batch 的 region loader 经 `initVideoTasks` ctx 注入。
+3. **权威态**：`main.js` 持 `_swLoadToken`/`_swLoad{projectId,token,status}`/`_swActiveLoadFailed`；`_isSwLoadCurrent(t)=t===_swLoadToken`；过期回调丢弃。各页不加 loaded 标志。
+4. **begin/done/error 全在 main.js 收口**；`loadProject` 只回填结果（`setActiveLoadOutcome`），不直接 done/hide。
+5. **启动 settle**：`_markWorkspaceBootReady()`(7591) 之后 `requestAnimationFrame` 内按结果 done/error。
+6. **切项目**：begin 放在 `_activateProjectContext` 的**同项目早返回(913)之后、fetch(920)之前**（同项目 no-op 不闪 loader）；成功(refreshAllPages 938 后)done；catch `swLoadError` 后 **续抛**。
+7. **错误重试**：`_retryActiveLoad()`（§3.4），绑到遮罩 error 态的「重试」按钮；不裸调 `loadProject`。
+8. **skeleton**：`_showProjectSkeleton(on)` 仅 `on===true` 且 active∈{assets,shots,batch,edit} 时 `return`；`on===false` 照常清理。
+9. **batch region loader**：挂 `.batch-workbench-scroll`，绝对定位、非 `#batchClipList` 子节点；`var _batchRenderSeq=0` 模块变量 + `try/finally`。
+10. **z 层级**：4 页容器 `isolation:isolate` + 遮罩 `z-index:60`（盖住时间线 `z-[50]`）。
+11. **背景**：`.sw-page-loading{background:var(--bg-main)}`。
+12. **版本**：§6；新 `loading.js` 走 importmap 绝对路径。
 
 ---
 
-## 3. 状态机与时序（精确到行）
+## 3. 状态机与时序（精确到行 + 契约伪码）
 
-### 3.1 权威态（main.js）
-```
-_swLoadToken = 0
-_swLoad = { projectId:'', token:0, status:'loading' }      // 初始即 loading，与遮罩默认可见一致
-_swStartupLoadFailed = false                               // loadProject 回填
-
-swLoadBegin(projectId)  : _swLoad={projectId, token:++_swLoadToken, status:'loading'}; 显 4 页遮罩
-swLoadDone(token)       : if(token!==_swLoadToken)return; _swLoad.status='ready'; 隐 4 页遮罩(淡出)
-swLoadError(token)      : if(token!==_swLoadToken)return; _swLoad.status='error'; 4 页遮罩切 error+retry
+### 3.1 main.js 权威态
+```js
+var _swLoadToken = 0;
+var _swLoad = { projectId:'', token:0, status:'loading' };  // 初始 loading，与遮罩默认可见一致
+var _swActiveLoadFailed = false;                             // loadProject 经 ctx 回填
+var _swStartupToken = 0;
+var _swLoadingUI = createSwLoading({ pages:['assets','shots','batch','edit'] }); // loading.js
+function _isSwLoadCurrent(t){ return t === _swLoadToken; }
+function _pageUsesInlineLoader(p){ return p==='assets'||p==='shots'||p==='batch'||p==='edit'; }
+function swLoadBegin(projectId){ _swLoad={projectId:projectId||'',token:++_swLoadToken,status:'loading'}; _swLoadingUI.showAll(); return _swLoad.token; }
+function swLoadDone(t){ if(!_isSwLoadCurrent(t))return; _swLoad.status='ready'; _swLoadingUI.hideAll(); }
+function swLoadError(t){ if(!_isSwLoadCurrent(t))return; _swLoad.status='error'; _swLoadingUI.errorAll(_retryActiveLoad); }
 ```
 
 ### 3.2 启动时序（硬刷新）
 ```
-HTML 解析 → boot CSS 显示记忆页(workspace.html:40-69) → 该页 .sw-page-loading 默认可见  ← 预启动不闪
+HTML 解析 → boot CSS 显示记忆页(workspace.html:40-69) → .sw-page-loading 默认可见   ← 预启动不闪
 init()(6962):
-  switchPage(initialBootTargetPage)(6974) — boot 期刷新被延后(1778)
-  initVideoTasks(7003) / initProject(7050) …
-  swLoadBegin(startup) ← main.js 在 `await loadProject()`(7078) 前调；记 startupToken
-  await loadProject()(project.js:319) → 回填 _swStartupLoadFailed（§4.5），期间不 done
-  initEdit(7445)/syncEditProject(7469)/各页事件接线 …
-  boot finalize: _appBootstrapping=false(7588); switchPage(bootTargetPage,{forceRefresh:true})(7590) ← 真实渲染
-  settleStartup(): _swStartupLoadFailed ? swLoadError(startupToken) : swLoadDone(startupToken)   ← done 在这里
+  initVideoTasks(7003)/initProject(7050)…
+  _swStartupToken = swLoadBegin('')          ← 在 await loadProject()(7078) 之前
+  await loadProject()                        ← 内部经 ctx 回填 _swActiveLoadFailed（§4.5），不 done
+  initEdit(7445)/syncEditProject(7469)/各页接线…
+  _appBootstrapping=false(7588); switchPage(bootTargetPage,{forceRefresh:true})(7590); _markWorkspaceBootReady()(7591)
+  requestAnimationFrame(()=> _swActiveLoadFailed ? swLoadError(_swStartupToken) : swLoadDone(_swStartupToken))  ← settle 在 bootReady 之后下一帧
 ```
 
 ### 3.3 切项目时序
 ```
 _activateProjectContext(projId)(896):
-  _setProjectActivating(true)(907) → swLoadBegin(projId)   ← begin 提前到 fetch 之前
-  [若 project.id===projId 直接 return(913)] → swLoadDone(token) 后返回（无加载）
-  await fetchProjectByIdShared(920) → 失败/抛错 → catch → swLoadError(token)
-  _resetProjectRuntime(928) / _syncProjectModules(935) / refreshAllPages(938) / _restoreVideoTasks(939)
-  成功落地后 → swLoadDone(token)
-  [stale token 的 return(917/924/945) 不 settle —— 新 token 已接管，旧回调天然被丢弃]
+  var swT = 0;
+  ++_projectActivationToken(899); _setProjectActivating(true)(907); [useSkeleton→_showProjectSkeleton(true)(910，4页 no-op)]
+  try {
+    if (project.id === projId) return project;        // 同项目 no-op，不 begin、不闪 loader
+    swT = swLoadBegin(projId);                          // begin：同项目守卫之后、flush/fetch 之前
+    [flush(915) / fetchProjectByIdShared(920) / stale token return null(917/924/945，不 settle)]
+    if(!p||!p.id) throw "项目数据为空"(925);
+    _resetProjectRuntime(928)/_syncProjectModules(935)/refreshAllPages(938)/_restoreVideoTasks(939)…
+    swLoadDone(swT); return project(951);               // 成功
+  } catch (e) { swLoadError(swT); throw e; }            // ← 续抛，保留 switchToProject(1015) 的 toast
+  finally { /* 原 abort/skeleton/_setProjectActivating(false) 不变(952-959) */ }
+```
+
+### 3.4 错误重试（main.js 包装，§点1）
+```js
+async function _retryActiveLoad(){
+  var t = swLoadBegin(_swLoad.projectId || '');     // 重新进入 loading
+  _swActiveLoadFailed = false;
+  try { await loadProject(); } catch(_) {}
+  switchPage(activePage, { forceRefresh:true, skipAnimation:true });  // 重渲当前页
+  _swActiveLoadFailed ? swLoadError(t) : swLoadDone(t);              // 收口
+}
 ```
 
 ---
 
 ## 4. 改动清单（file-by-file，可执行）
 
-> Phase 0 触达 6 文件：`workspace.html`、`styles.css`、新 `modules/loading.js`、`main.js`、`project.js`、`videoTasks.js`。**不动** edit.js / shots.js / storyboard.js / assets.js 的 render。
+> Phase 0 触达 6 文件；**不动** edit.js / shots.js / storyboard.js / assets.js 的 render。
 
 ### 4.1 `public/workspace.html`
-- 4 个页容器各加**默认可见**遮罩（该页第一个子节点）：`#pageAssets` / `#pageShots` / `#pageBatch` / `#pageEdit`：
+- 4 页容器(`#pageAssets`/`#pageShots`/`#pageBatch`/`#pageEdit`)各加默认可见遮罩（首子节点）：
   `<div class="sw-page-loading" data-loading-for="assets" role="status" aria-live="polite"><span class="sw-pixel-o" aria-hidden="true"></span><span class="sw-load-text">加载中…</span></div>`
 - importmap(1739-1766)：`project.js?v=104→105`、`videoTasks.js?v=118→119`、新增 `"/modules/loading.js":"/modules/loading.js?v=1"`。
-- 顶部样式版本：`styles.css?v=182→183`(:73)。
-- 入口脚本：`main.js?v=246→247`(:1769)。
+- `styles.css?v=185→186`(:73)；`main.js?v=246→247`(:1769)。
 
-### 4.2 `public/styles.css`（bump v183）
-- `#pageAssets,#pageShots,#pageBatch,#pageEdit{position:relative;isolation:isolate;}`（建局部 stacking context，配合 §点7）。
-- `.batch-workbench-scroll{position:relative;}`（承载 batch region loader）。
-- `.sw-page-loading{position:absolute;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:<工作区页面背景同款变量，禁止硬编码色>;transition:opacity .18s ease;}`
+### 4.2 `public/styles.css`（bump v186）
+- `#pageAssets,#pageShots,#pageBatch,#pageEdit{position:relative;isolation:isolate;}`
+- `.batch-workbench-scroll{position:relative;}`
+- `.sw-page-loading{position:absolute;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg-main);transition:opacity .18s ease;}`
   `.sw-page-loading.is-hiding{opacity:0;pointer-events:none;}` `.sw-page-loading[hidden]{display:none;}`
-- `.sw-region-loading{position:absolute;inset:0;z-index:30;...同款像素，缩小;}`（batch 列表区用）。
-- 像素「O」环 keyframes（方块按序淡入循环）。
+- `.sw-region-loading{position:absolute;inset:0;z-index:30;background:var(--bg-main);…像素缩小版;}`
+- 像素「O」环 keyframes（方块按序淡入循环）；error 态样式（文案 + `.sw-load-retry` 按钮）。
 
 ### 4.3 `public/modules/loading.js`（新增，importmap v1）
-- 工厂导出：`createSwLoading({ pageLayerSelector })` → `{ showPage(id), hidePage(id), errorPage(id,onRetry), showRegion(el), hideRegion(el), pixelEl() }`。
-- 只操作传入节点；error 态用同一遮罩切文案+「重试」按钮；零依赖。
+- `export function createSwLoading({pages})` → `{ showAll(), hideAll(), errorAll(onRetry), showRegion(el), hideRegion(el) }`。
+- 按 `[data-loading-for]` 找 4 页遮罩；`errorAll` 把遮罩切「加载失败 + 重试」，按钮 click→`onRetry`；零依赖。
 
 ### 4.4 `public/main.js`（bump v247）
-- 顶部 import：`import { createSwLoading } from '/modules/loading.js';`（绝对路径走 importmap）；`./modules/project.js?v=103` → `?v=105`(:18)。
-- 新增 `_swLoadToken`/`_swLoad`/`_swStartupLoadFailed` 与 `swLoadBegin/Done/Error`/`_isSwLoadCurrent`/`settleStartup`（§3.1-3.2）。
-- `_pageUsesInlineLoader(p){return p==='assets'||p==='shots'||p==='batch'||p==='edit';}`。
-- `_showProjectSkeleton(on)`(1113) 开头：`if (on === true && _pageUsesInlineLoader(activePage)) return;`（**仅拦 on=true**）。
-- `await loadProject()`(7078) **前** `swLoadBegin('')`（startup）；boot finalize `switchPage(...forceRefresh)`(7590) **后**加 `settleStartup()`。
-- `_activateProjectContext`(896)：`_setProjectActivating(true)`(907) 后 `swLoadBegin(projId)`；同项目早返回前 `swLoadDone`；成功(938 后) `swLoadDone(token)`；catch `swLoadError(token)`。
-- `initProject` ctx(7050)：加 `setStartupLoadOutcome:(failed)=>{_swStartupLoadFailed=failed;}`（与 `showProjectSkeleton` 并列）。
-- `initVideoTasks` ctx(7003)：注入 `swRegion:{show,hide}`（指向 `.batch-workbench-scroll`）。
+- import：新增 `import { createSwLoading } from '/modules/loading.js';`；`./modules/project.js?v=103`→`?v=105`(:18)。
+- 新增 §3.1 权威态 + `_retryActiveLoad`(§3.4)。
+- `_showProjectSkeleton(on)`(1113) 开头：`if (on === true && _pageUsesInlineLoader(activePage)) return;`（仅拦 on=true）。
+- `init()`：`await loadProject()`(7078) 前 `_swStartupToken = swLoadBegin('')`；`_markWorkspaceBootReady()`(7591) 后 `requestAnimationFrame(settleStartup)`（§3.2）。
+- `_activateProjectContext`(896)：按 §3.3 加 `var swT=0` / 同项目守卫后 `swLoadBegin` / 成功 `swLoadDone(swT)` / **新增 catch `swLoadError(swT); throw e;`**（finally 不变）。
+- ctx 注入：`initProject`(7050) 加 `setActiveLoadOutcome:(failed)=>{_swActiveLoadFailed=failed;}`；`initVideoTasks`(7003) 加 `swRegion:{show:()=>_swLoadingUI.showRegion($(' .batch-workbench-scroll')), hide:()=>_swLoadingUI.hideRegion(...)}`。
 
-### 4.5 `public/modules/project.js`（bump v105：importmap+main.js:18）
-- `loadProject()`(319)：
-  - 列表请求：`var listOk=false;` 仅在 `resp.ok`(335) 置 `listOk=true`；非 ok / catch 不置。
-  - 目标项目：`var targetFetchFailed=false;` 当 `targetId` 存在但 `fetchProjectFromServer` 返回 null(401-403) → `targetFetchFailed=true`。
-  - 末尾（refreshActivePage 之后 417）：`var failed = (!listOk && !_getProject()) || targetFetchFailed;`（listOk 且 0 项 → failed=false=ready）。`_ctx.setStartupLoadOutcome && _ctx.setStartupLoadOutcome(failed);`
-  - **不**在此调 done/hide（启动 done 由 main.js settleStartup 管）。
+### 4.5 `public/modules/project.js`（bump v105：importmap + main.js:18 两处）
+- `loadProject()`(319)：`var listOk=false`（仅 `resp.ok`(335) 置真）；`var targetFetchFailed=false`（targetId 存在但 `fetchProjectFromServer` 返回 null 401-403 → 置真）。
+- 末尾(refreshActivePage 417 之后)：`var failed=(!listOk && !_getProject())||targetFetchFailed;`（listOk 且 0 项→failed=false）；`_ctx.setActiveLoadOutcome && _ctx.setActiveLoadOutcome(failed);`。**不**在此 done/hide。
 
-### 4.6 `public/modules/videoTasks.js`（bump v119：仅 importmap，main.js:27 裸 import 自动解析）
-- `renderBatchClipList()`(2961)：函数体 `var seq = ++_batchRenderSeq;`；**prefetch await 之前**(2975 上) `_ctx.swRegion && _ctx.swRegion.show();`；`try{ …原逻辑… } finally { if(seq===_batchRenderSeq) _ctx.swRegion && _ctx.swRegion.hide(); }`。**仅包裹，不改原逻辑**；loader 不进 `#batchClipList`，不影响 `list.innerHTML=""`(2999) 与 `children.length`(1314)。
-- `refreshBatchPage()`(2845) 不改。
+### 4.6 `public/modules/videoTasks.js`（bump v119：仅 importmap）
+- 模块状态区(16-39)补 `var _batchRenderSeq = 0;`。
+- `renderBatchClipList()`(2961)：`var seq=++_batchRenderSeq; _ctx.swRegion&&_ctx.swRegion.show();` 在 prefetch await(2975) 之前；`try{…原逻辑含 list.innerHTML=""(2999)…}finally{ if(seq===_batchRenderSeq) _ctx.swRegion&&_ctx.swRegion.hide(); }`。仅包裹，不改原逻辑、不进 `#batchClipList`。
 
 ---
 
 ## 5. 不碰清单
-- `readyForEdit`、批次 reattach、导入剪辑下一步、`hasLiveRow`/任务镜像、`syncTaskListVisibility` 的 `children.length` 判据、`project_edit_readiness` 字段口径。
+- `readyForEdit`、批次 reattach、导入剪辑下一步、`hasLiveRow`/任务镜像、`syncTaskListVisibility` 的 `children.length` 判据(videoTasks.js:1314)、`project_edit_readiness` 字段口径。
+- `switchToProject` 失败 toast 行为（靠 catch 续抛保留）。
 - 共享 resolver / 字段 schema；`reference-site/`、后端、`lib/model-routing`、`CLAUDE.md` 治理项。
-- edit.js / shots.js / storyboard.js / assets.js 的 render 逻辑（遮罩在其之上集中托管）。
-- 不做老数据迁移 / 兼容。
+- edit.js / shots.js / storyboard.js / assets.js 的 render 逻辑。
 
 ---
 
 ## 6. 版本 bump 清单（按当前文件现状）
-| 模块 | importmap(workspace.html) | main.js import | 备注 |
+| 模块 | importmap(workspace.html) | main.js | 备注 |
 |---|---|---|---|
 | project.js | 1749：`?v=104→105` | :18 相对 `?v=103→105` | 两处都改（相对 import 绕过 importmap） |
-| videoTasks.js | 1763：`?v=118→119` | :27 裸 `/modules/videoTasks.js`（不动） | 裸 import 走 importmap，自动取 v119 |
-| loading.js（新） | 新增 `?v=1` | :顶部 `import … from '/modules/loading.js'` | 绝对路径走 importmap |
-| styles.css | — | workspace.html:73 `?v=182→183` | |
+| videoTasks.js | 1763：`?v=118→119` | :27 裸 import 不动 | 裸 `/modules/videoTasks.js` 走 importmap，自动取 119 |
+| loading.js（新） | 新增 `?v=1` | 顶部 `import … from '/modules/loading.js'` | 绝对路径走 importmap |
+| styles.css | — | workspace.html:73 `?v=185→186` | |
 | main.js | — | workspace.html:1769 `?v=246→247` | |
-
-沉淀规则：以后改 `loading.js`/`videoTasks.js` 只 bump importmap 版本；改 `project.js` 记得 importmap + main.js:18 两处同步（直到把 :18 也改成裸 import 走 importmap，本期先对齐版本号不重构）。
 
 ---
 
 ## 7. 分期
-- **Phase 0（本次审批范围）**：§4 全部，仅 assets/shots/batch/edit。产出 = 预启动不闪 + 统一页面内像素加载 + 启动/切项目时机正确 + error/retry + 片段 async 不漏 loading + z 层级正确。
-- **Phase 1**：铺到其余流水线页；按需给 shots/images/assets 加 region loader；像素动效与空/错态文案定稿。
+- **Phase 0（本次审批范围）**：§4 全部，仅 assets/shots/batch/edit。
+- **Phase 1**：铺到其余流水线页；按需给 shots/images/assets 加 region loader；像素动效与文案定稿。
 
 ---
 
 ## 8. 验收清单（可实跑）
-1. 硬刷新进 4 页：JS ready 前也只见像素加载层，不闪 guard/空态（Slow 3G / 首帧断点验证）。
-2. 启动 done 时机：遮罩在 boot 最终 `forceRefresh`(7590) 渲染后才淡出，资产/镜头/剪辑无"先露旧 guard 再变"的二次跳。
-3. 切项目：点切换的**那一刻**起遮罩就在（fetch 期间不露旧项目）；成功 ready / 失败 error；过期回调不误关。
-4. 接口失败（断网/500/列表挂）：4 页「加载失败 · 重试」，重试重走 loadProject；listOk 且 0 项仍正常显示空态（不误判 error）。
-5. `_showProjectSkeleton(false)` 仍能正常关闭（其余页 skeleton 不卡死）。
-6. 片段页：prefetch 期间 `.batch-workbench-scroll` 有 region loading；`syncTaskListVisibility` 的 `children.length` 判据不被污染；批次 reattach/导入/任务镜像无回归；旧 render 不误关新 loader。
-7. 剪辑页遮罩盖得住时间线（z-50 之上）。
-8. 镜头页 shots+images 两区都被覆盖，不闪 `imagesNeedShots`。
+1. 硬刷新进 4 页：JS ready 前只见像素加载层，不闪 guard/空态（Slow 3G / 首帧断点）。
+2. 启动 settle：遮罩在 `_markWorkspaceBootReady()` 后下一帧才淡出，无"loader 隐藏但页面还空"的空窗、无二次跳。
+3. **错误重试**：断网时 4 页显示「加载失败 · 重试」，点重试**重新进入 loading**（不是静默），成功 ready / 仍失败回 error。
+4. **切项目失败**：`_activateProjectContext` 失败时遮罩进 error，且 `switchToProject` 的「切换项目失败」toast **仍照常弹**（续抛未被吞）。
+5. 切项目成功：点切换那一刻起遮罩就在（fetch 期间不露旧项目），refreshAllPages 后 ready；同项目点击不闪 loader。
+6. listOk 且 0 项：正常显示空态，不误判 error。
+7. `_showProjectSkeleton(false)` 仍能正常关闭其余页 skeleton。
+8. 片段页：prefetch 期间 `.batch-workbench-scroll` 有 region loading；`children.length` 判据不被污染；旧 render 不误关新 loader（`renderSeq`）；reattach/导入/镜像无回归。
+9. 剪辑页遮罩盖住时间线(`z-[50]`)；镜头页 shots+images 两区都覆盖。
 
 ---
 
 ## 9. 交给 Codex / Claude Code 的执行顺序
-1. `styles.css`：4 页 `position:relative;isolation:isolate`、`.batch-workbench-scroll{position:relative}`、`.sw-page-loading`/`.sw-region-loading`/像素 keyframes（bump 工作区背景变量，勿硬编码色）。
-2. `workspace.html`：注入 4 个 `.sw-page-loading` 静态节点；importmap bump（project 105 / videoTasks 119 / 新增 loading 1）；`styles.css?v=183`、`main.js?v=247`。
+1. `styles.css`(v186)：4 页 `position:relative;isolation:isolate`、`.batch-workbench-scroll{position:relative}`、`.sw-page-loading`(`background:var(--bg-main)`,`z-index:60`)、`.sw-region-loading`、像素 keyframes、error 态样式。
+2. `workspace.html`：注入 4 个 `.sw-page-loading`；importmap bump（project 105 / videoTasks 119 / 新 loading 1）；`styles.css?v=186`、`main.js?v=247`。
 3. 新建 `modules/loading.js`。
-4. `main.js`：`_swLoad*` 状态 + begin/done/error + settleStartup + `_pageUsesInlineLoader`；`_showProjectSkeleton` 仅拦 on=true；`loadProject` 前 begin、7590 后 settleStartup；`_activateProjectContext` begin/done/error；ctx 注入（setStartupLoadOutcome、swRegion、loading 控制器）；import 改 project.js?v=105 + 新增 loading.js。
-5. `project.js`：`listOk`/`targetFetchFailed` + `setStartupLoadOutcome`。
-6. `videoTasks.js`：`renderBatchClipList` 包 `swRegion.show/hide` + `renderSeq` try/finally。
-7. 自测：`npm run typecheck`（如涉及）、手动跑 §8 全清单、Slow 3G 录屏 before/after、切项目与断网两条专项。
+4. `main.js`(v247)：权威态 + `swLoadBegin/Done/Error` + `_retryActiveLoad` + `_pageUsesInlineLoader`；`_showProjectSkeleton` 仅拦 on=true；`init` 内 startup begin + bootReady 后 rAF settle；`_activateProjectContext` begin/done + **catch swLoadError 续抛**；ctx 注入 `setActiveLoadOutcome` / `swRegion` / loading 控制器；import 改 project.js?v=105 + 新增 loading.js。
+5. `project.js`(v105)：`listOk`/`targetFetchFailed` + `setActiveLoadOutcome`。
+6. `videoTasks.js`(v119)：补 `var _batchRenderSeq=0`；`renderBatchClipList` 包 `swRegion.show/hide` + `try/finally` renderSeq。
+7. 自测：`npm run typecheck`、§8 全清单、Slow 3G 录屏 before/after、断网重试与切项目失败两条专项。
 
-> 确认这版即可进入实现；本阶段未改任何代码。
+> 确认即进 Phase 0；本阶段未改任何代码。

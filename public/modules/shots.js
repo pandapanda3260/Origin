@@ -216,7 +216,7 @@ function _refreshShotPlanActionState(override) {
   var state = override || _getShotPlanActionState();
   if (btn) {
     btn.innerHTML =
-      '<span class="shots-step-number">1</span>' +
+      '<span class="shots-step-number">I</span>' +
       '<span>' + escapeHtml(state.label || "") + '</span>';
     btn.disabled = !!state.disabled;
   }

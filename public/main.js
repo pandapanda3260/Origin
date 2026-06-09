@@ -15,7 +15,7 @@ import { initProject, getProject, setProject, loadProject, loadProjectData, save
   _serializeProject, cleanupBlobUrls, _registerServerTask, _updateServerTaskStatus,
   _notifyServerTaskDone,
   _archiveOldImage, _safeWriteBack, _flushServerSave, fetchProjectByIdShared,
-  flushPendingProjectSaveOnUnload } from './modules/project.js?v=103';
+  flushPendingProjectSaveOnUnload } from './modules/project.js?v=105';
 import { EPISODE_FIELDS } from './modules/episode_fields.js?v=100';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
@@ -65,6 +65,7 @@ import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/t
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js';
 import { mountPixelCard } from './modules/pixel_card.js';
+import { createSwLoading } from '/modules/loading.js';
 import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
 
 // Aliases so existing code using underscore-prefixed names keeps working
@@ -164,6 +165,68 @@ var _scriptEditInitialText = "";
   var _appBootstrapping = true;
   var _bootUserNavigated = false;
   var _bootDeferredPageRefresh = "";
+
+  // ── 统一页面内加载层：权威态（独立 _swLoadToken，硬刷新与切项目共用）──
+  var _swLoadToken = 0;
+  var _swLoad = { projectId: "", token: 0, status: "loading" };
+  var _swActiveLoadFailed = false;
+  var _swStartupToken = 0;
+  var _swLoadingUI = createSwLoading({ pages: ["assets", "shots", "prompts", "batch", "edit"] });
+  function _isSwLoadCurrent(t) { return t === _swLoadToken; }
+  function _pageUsesInlineLoader(p) { return p === "assets" || p === "shots" || p === "prompts" || p === "batch" || p === "edit"; }
+  function _swActivationRetryOptions(options) {
+    options = options || {};
+    return {
+      silent: !!options.silent,
+      navigateToOverview: !!options.navigateToOverview,
+      showSkeleton: !!options.showSkeleton,
+      refreshPages: !!options.refreshPages,
+      resetViewState: !!options.resetViewState,
+    };
+  }
+  function swLoadBegin(projectId, meta) {
+    meta = meta || {};
+    _swActiveLoadFailed = false;
+    _swLoad = {
+      projectId: projectId || "",
+      token: ++_swLoadToken,
+      status: "loading",
+      retryMode: meta.retryMode || "loadProject",
+      retryOptions: meta.retryOptions || null,
+    };
+    _swLoadingUI.showAll();
+    return _swLoad.token;
+  }
+  function swLoadDone(t) {
+    if (!_isSwLoadCurrent(t)) return;
+    _swLoad.status = "ready";
+    _swLoadingUI.hideAll();
+  }
+  function swLoadError(t) {
+    if (!_isSwLoadCurrent(t)) return;
+    _swLoad.status = "error";
+    _swLoadingUI.errorAll(_retryActiveLoad);
+  }
+  async function _retryActiveLoad() {
+    var projectId = _swLoad.projectId || "";
+    var retryMode = _swLoad.retryMode || "loadProject";
+    var retryOptions = _swLoad.retryOptions ? Object.assign({}, _swLoad.retryOptions) : null;
+    if (retryMode === "activateProject" && projectId) {
+      var beforeToken = _swLoadToken;
+      try {
+        await _activateProjectContext(projectId, retryOptions || { showSkeleton: true, refreshPages: true, resetViewState: true });
+        if (_swLoadToken === beforeToken) swLoadDone(_swLoad.token);
+      } catch (e) {
+        console.warn("[SwLoad] retry activate project failed:", e);
+      }
+      return;
+    }
+    var t = swLoadBegin(projectId, { retryMode: "loadProject" });
+    try { await loadProject(); } catch (_) {}
+    switchPage(activePage, { forceRefresh: true, skipAnimation: true });
+    if (_swActiveLoadFailed) swLoadError(t); else swLoadDone(t);
+  }
+
   var _coreNavigationBound = false;
   var onlineEditorConfig = null;
   var _onlineEditorConfigPromise = null;
@@ -789,6 +852,30 @@ var _scriptEditInitialText = "";
     } catch (e) { return []; }
   }
 
+  function _cleanProjectName(value) {
+    return String(value || "").trim();
+  }
+
+  function _nextDefaultProjectNameFromList(list) {
+    var used = Object.create(null);
+    (Array.isArray(list) ? list : []).forEach(function (item) {
+      if (!item) return;
+      [_cleanProjectName(item.name), _cleanProjectName(item.title)].forEach(function (name) {
+        if (name) used[name] = true;
+      });
+    });
+    if (!used["新项目"]) return "新项目";
+    for (var i = 2; i < 10000; i++) {
+      var candidate = "新项目" + i;
+      if (!used[candidate]) return candidate;
+    }
+    return "新项目" + Date.now();
+  }
+
+  function _resolveNewProjectName(name, list) {
+    return _cleanProjectName(name) || _nextDefaultProjectNameFromList(list);
+  }
+
   function saveProjectList(list) {
     localStorage.setItem(STORAGE_PROJECT_LIST, JSON.stringify(list));
   }
@@ -897,6 +984,7 @@ var _scriptEditInitialText = "";
     options = options || {};
     if (!projId) return null;
     var token = ++_projectActivationToken;
+    var swT = 0;
     var useSkeleton = !!options.showSkeleton;
     if (_projectActivationAbort) {
       try { _projectActivationAbort.abort(); } catch (_) {}
@@ -911,6 +999,10 @@ var _scriptEditInitialText = "";
     }
     try {
       if (project && project.id === projId) return project;
+      swT = swLoadBegin(projId, {
+        retryMode: "activateProject",
+        retryOptions: _swActivationRetryOptions(options),
+      });
       if (project && project.id && project.id !== projId) {
         try { await _flushServerSave(); }
         catch (e) { console.warn("[activateProject] flush before switch failed:", e); }
@@ -948,7 +1040,11 @@ var _scriptEditInitialText = "";
       _loadProjectProfileOverride();
       if (options.navigateToOverview) switchPage("overview");
       console.log("[Project] Loaded from server:", project.name, "v=", project.version);
+      swLoadDone(swT);
       return project;
+    } catch (e) {
+      swLoadError(swT);
+      throw e;
     } finally {
       if (_projectActivationAbort === activationCtl) _projectActivationAbort = null;
       if (useSkeleton && _projectSkeletonToken === token) {
@@ -1111,6 +1207,7 @@ var _scriptEditInitialText = "";
   // 器扩展拦截 fetch / 维护期网络抖动）。比 fetch 超时长 1 倍留冗余。
   var _PROJECT_SKELETON_MAX_MS = 20000;
   function _showProjectSkeleton(on) {
+    if (on === true && _pageUsesInlineLoader(activePage)) return;
     if (on) {
       if (_projectSkeletonEl) { _projectSkeletonEl.style.display = "flex"; }
       else {
@@ -1231,7 +1328,7 @@ var _scriptEditInitialText = "";
       return false;
     }
     var list = await getProjectListFromServer();
-    var expected = String(name || marker.name || "新项目");
+    var expected = _cleanProjectName(name || marker.name) || "新项目";
     var hit = (list || []).find(function (item) {
       return item && marker.clientRequestId && item.clientRequestId === marker.clientRequestId;
     });
@@ -1269,6 +1366,7 @@ var _scriptEditInitialText = "";
       showToast("最多保存 " + MAX_PROJECTS + " 个项目，请先删除旧项目", "warn");
       return false;
     }
+    var projectName = _resolveNewProjectName(name, list);
 
     // Phase 5.2：切出当前项目前，先把最后的改动刷到后端，再起新项目。
     if (project && project.id) {
@@ -1281,7 +1379,7 @@ var _scriptEditInitialText = "";
     var draft = {
       id: "proj_" + Date.now(),
       clientRequestId: clientRequestId,
-      name: name || "新项目",
+      name: projectName,
       createdAt: Date.now(),
       currentStep: 1,
       idea: "",
@@ -1333,12 +1431,12 @@ var _scriptEditInitialText = "";
       } else {
         console.warn("[createNewProject] POST /api/projects non-2xx:", resp.status);
         if (resp.status >= 500) {
-          _lastMaybeCreatedProject = { name: name || "新项目", clientRequestId: clientRequestId, at: Date.now() };
+          _lastMaybeCreatedProject = { name: projectName, clientRequestId: clientRequestId, at: Date.now() };
         }
       }
     } catch (e) {
       console.warn("[createNewProject] POST /api/projects failed:", e);
-      _lastMaybeCreatedProject = { name: name || "新项目", clientRequestId: clientRequestId, at: Date.now() };
+      _lastMaybeCreatedProject = { name: projectName, clientRequestId: clientRequestId, at: Date.now() };
     }
 
     // Phase 5.9：后端配额拒绝优先级高——前端 UX 检查可能因为 list 不一致漏判。
@@ -3308,19 +3406,12 @@ var _scriptEditInitialText = "";
     }
   }
 
-  function _ovDefaultProjectTaskName() {
-    var d = new Date();
-    var mm = String(d.getMinutes());
-    if (mm.length < 2) mm = "0" + mm;
-    return "项目 " + (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours() + ":" + mm;
-  }
-
   async function _ovCreateProjectTask(btn) {
     if (_ovProjectTaskCreating) return;
     _ovProjectTaskCreating = true;
     if (btn) btn.disabled = true;
     try {
-      var ok = await createNewProject(_ovDefaultProjectTaskName());
+      var ok = await createNewProject();
       if (ok !== false) {
         refreshOverview();
         switchPage("script");
@@ -7005,6 +7096,10 @@ var _scriptEditInitialText = "";
       getSettings: () => settings,
       getVideoState: () => videoState,
       getProjectEpoch: () => _projectEpoch,
+      swRegion: {
+        show: () => _swLoadingUI.showRegion(document.querySelector('.batch-workbench-scroll')),
+        hide: () => _swLoadingUI.hideRegion(document.querySelector('.batch-workbench-scroll')),
+      },
       MAX_CONCURRENT,
       MAX_TASKS_TOTAL,
       STATUS_COPY,
@@ -7071,10 +7166,12 @@ var _scriptEditInitialText = "";
       uPrefix: _uPrefix,
       EPISODE_FIELDS: EPISODE_FIELDS,
       showProjectSkeleton: (on) => _showProjectSkeleton(on),
+      setActiveLoadOutcome: (failed) => { _swActiveLoadFailed = !!failed; },
     });
     // Phase 5.9：server-first boot — await 保证 loadProject 返回前，后续
     // syncXxxProject / initXxx 都拿到的是服务器权威 project。loadProject 内部
     // 显示骨架屏，资料到位后自己关闭；异常也不会阻塞后续初始化。
+    _swStartupToken = swLoadBegin('', { retryMode: "loadProject" });
     try { await loadProject(); }
     catch (e) { console.warn("[Init] loadProject failed:", e); }
     wireSettingsPageOnce();
@@ -7349,11 +7446,7 @@ var _scriptEditInitialText = "";
       if (_btnNew) _btnNew.addEventListener("click", async function () {
         try {
           console.log("[UI] btnNewProject clicked");
-          var d = new Date();
-          var mm = String(d.getMinutes());
-          if (mm.length < 2) mm = "0" + mm;
-          var name = "项目 " + (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours() + ":" + mm;
-          var ok = await createNewProject(name);
+          var ok = await createNewProject();
           if (ok !== false) {
             refreshOverview();
             switchPage("script");
@@ -7365,11 +7458,7 @@ var _scriptEditInitialText = "";
       if (_btnReset) _btnReset.addEventListener("click", async function () {
         try {
           console.log("[UI] btnResetProject clicked");
-          var d = new Date();
-          var mm = String(d.getMinutes());
-          if (mm.length < 2) mm = "0" + mm;
-          var name = "项目 " + (d.getMonth() + 1) + "/" + d.getDate() + " " + d.getHours() + ":" + mm;
-          var ok = await createNewProject(name);
+          var ok = await createNewProject();
           if (ok !== false) refreshOverview();
         } catch (e) { console.error("[ResetProject]", e); }
       });
@@ -7589,6 +7678,9 @@ var _scriptEditInitialText = "";
     _bootDeferredPageRefresh = "";
     switchPage(bootTargetPage, { forceRefresh: true, skipAnimation: true });
     _markWorkspaceBootReady();
+    requestAnimationFrame(function () {
+      if (_swActiveLoadFailed) swLoadError(_swStartupToken); else swLoadDone(_swStartupToken);
+    });
   }
 
   /* 通用：给所有 .upstream-stale-banner / .stale-banner 自动追加 X 关闭按钮 */

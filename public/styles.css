@@ -22,6 +22,95 @@
   --top-announcement-height: 32px;
 }
 
+/* ═══════════════════════════════════════════
+   统一页面内加载层 (Phase 0: assets / shots / prompts / batch / edit)
+   遮罩默认可见，治 JS-ready 前的预启动闪屏；由 main.js 权威态显隐。
+   ═══════════════════════════════════════════ */
+#pageAssets, #pageShots, #pagePrompts, #pageBatch, #pageEdit {
+  position: relative;
+  isolation: isolate;
+  min-height: calc(100vh - var(--top-announcement-height));
+}
+.batch-workbench-scroll { position: relative; }
+
+.sw-page-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--bg-main);
+  transition: opacity .18s ease;
+}
+.sw-page-loading[hidden] { display: none; }
+.sw-page-loading.is-hiding { opacity: 0; pointer-events: none; }
+
+.sw-region-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: var(--bg-main);
+}
+.sw-region-loading[hidden] { display: none; }
+.sw-region-loading .sw-pixel-o { transform: scale(.82); }
+
+.sw-load-body,
+.sw-load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+.sw-load-error { gap: 12px; }
+.sw-load-text { font-size: 12px; letter-spacing: .14em; color: var(--text-dim); }
+.sw-load-retry {
+  height: 32px;
+  padding: 0 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 12px;
+  letter-spacing: .08em;
+  cursor: pointer;
+  transition: opacity .15s ease;
+}
+.sw-load-retry:hover { opacity: .82; }
+
+/* 像素「O」环：3x3 像素方块去中心，绕圈逐格脉冲（纯 CSS，零依赖） */
+.sw-pixel-o {
+  display: grid;
+  grid-template-columns: repeat(3, 9px);
+  grid-template-rows: repeat(3, 9px);
+  gap: 5px;
+}
+.sw-pixel-o i {
+  width: 9px;
+  height: 9px;
+  background: var(--text);
+  border-radius: 1px;
+  opacity: .2;
+  animation: sw-o-pulse 1.2s ease-in-out infinite;
+}
+.sw-pixel-o i:nth-child(5) { visibility: hidden; animation: none; }
+.sw-pixel-o i:nth-child(1) { animation-delay: 0s; }
+.sw-pixel-o i:nth-child(2) { animation-delay: .1s; }
+.sw-pixel-o i:nth-child(3) { animation-delay: .2s; }
+.sw-pixel-o i:nth-child(6) { animation-delay: .3s; }
+.sw-pixel-o i:nth-child(9) { animation-delay: .4s; }
+.sw-pixel-o i:nth-child(8) { animation-delay: .5s; }
+.sw-pixel-o i:nth-child(7) { animation-delay: .6s; }
+.sw-pixel-o i:nth-child(4) { animation-delay: .7s; }
+@keyframes sw-o-pulse { 0%, 100% { opacity: .2; } 50% { opacity: 1; } }
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html { height: 100%; }
@@ -3130,6 +3219,11 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell {
 body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   min-height: 0;
 }
+#vpStoryboardFrames {
+  padding-left: 8px;
+  padding-right: 12px;
+  overflow-x: hidden;
+}
 .vp-refine-command-wrap {
   margin: 0 0 8px;
   flex: 0 0 auto;
@@ -3506,13 +3600,14 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
+  min-width: 22px;
   height: 16px;
   flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 850;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 15px;
+  font-weight: 800;
   line-height: 1;
-  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
 }
 .batch-redesign-hero-actions {
   display: inline-flex;
@@ -4562,6 +4657,7 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   font-size: 11px !important;
   font-weight: 850 !important;
   line-height: 1 !important;
+  white-space: nowrap !important;
 }
 
 #btnScriptHeaderRegen {
@@ -4572,12 +4668,14 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
+  min-width: 22px;
   height: 16px;
   flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 850;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 15px;
+  font-weight: 800;
   line-height: 1;
+  letter-spacing: 0;
 }
 
 /* ============================================================
@@ -8988,9 +9086,13 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
-  font-weight: 780;
+  min-width: 22px;
+  height: 16px;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 15px;
+  font-weight: 800;
   line-height: 1;
+  letter-spacing: 0;
   flex-shrink: 0;
 }
 #shotsTopActions > #shotsHint {
@@ -10601,6 +10703,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 
 .edit-guard-surface {
   min-height: 100%;
+  padding: 24px 28px 10px;
 }
 
 .edit-guard-surface .workflow-empty-state {
@@ -10611,7 +10714,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   max-width: 34rem;
 }
 
-#editWorkspace .edit-workbench-header {
+#pageEdit .edit-workbench-header {
   padding: 0 !important;
   display: flex;
   align-items: center;
@@ -10619,14 +10722,14 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   flex-shrink: 0;
 }
 
-#editWorkspace .edit-title-row {
+#pageEdit .edit-title-row {
   display: flex;
   align-items: baseline;
   gap: 16px;
   min-width: 0;
 }
 
-#editWorkspace .edit-workbench-header h1 {
+#pageEdit .edit-workbench-header h1 {
   margin: 0;
   color: #0B1320;
   font-size: 28px;
@@ -10635,7 +10738,7 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   letter-spacing: 0;
 }
 
-#editWorkspace .edit-title-row span {
+#pageEdit .edit-title-row span {
   color: #748692;
   font-size: 10px;
   line-height: 1;

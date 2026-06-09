@@ -317,6 +317,8 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
   }
 
   async function loadProject() {
+    var listOk = false;
+    var targetFetchFailed = false;
     try { _purgeLegacyProjectShadow(); } catch (_) {}
 
     if (_ctx.showProjectSkeleton) {
@@ -333,6 +335,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
         );
         _checkAuth(resp);
         if (resp.ok) {
+          listOk = true;
           var data = await resp.json();
           serverList = data.projects || [];
           // Phase 5.9：服务器列表 = 项目清单的唯一权威源。直接覆盖
@@ -399,6 +402,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
           try { cleanupBlobUrls(_getProject()); } catch (_) {}
           try { _ctx.addProjectToList && _ctx.addProjectToList(_getProject()); } catch (_) {}
         } else {
+          targetFetchFailed = true;
           console.warn("[loadProject] fetch current project failed, id=", targetId);
         }
       }
@@ -415,6 +419,9 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
       if (_ctx.refreshActivePage) _ctx.refreshActivePage();
       else if (_ctx.refreshAllPages) _ctx.refreshAllPages();
     } catch (_) {}
+
+    var _swFailed = (!listOk && !_getProject()) || targetFetchFailed;
+    try { _ctx.setActiveLoadOutcome && _ctx.setActiveLoadOutcome(_swFailed); } catch (_) {}
 
     if (_getProject()) {
       try { _ctx.restoreAssetGenStatus && _ctx.restoreAssetGenStatus(); } catch (_) {}

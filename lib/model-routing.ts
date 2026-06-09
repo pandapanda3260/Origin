@@ -111,7 +111,7 @@ export function resolveTextModelConfig(
       return real({
         baseUrl: env('CLAUDE_API_BASE') || env('TEXT_API_BASE') || 'https://gateway.zerail.com/v1',
         apiKey: key,
-        model: env('CLAUDE_MODEL') || env('MODEL_PRIMARY_BRAIN') || 'claude-opus-4-7',
+        model: env('CLAUDE_MODEL') || env('MODEL_PRIMARY_BRAIN') || 'claude-opus-4-8',
         provider: inferProvider(env('CLAUDE_PROVIDER') || 'zerail_messages', 'text'),
         endpoint: env('CLAUDE_API_ENDPOINT') || '/messages',
         role,

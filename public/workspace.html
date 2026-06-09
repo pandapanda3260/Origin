@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=185" />
+    <link rel="stylesheet" href="styles.css?v=194" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -712,6 +712,12 @@
 
       <!-- ══════ 2.5 资产库 ══════ -->
       <div class="page-scroll p-12 overflow-y-auto" id="pageAssets" hidden>
+        <div class="sw-page-loading" data-loading-for="assets" role="status" aria-live="polite">
+          <div class="sw-load-body">
+            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="sw-load-text">加载中…</span>
+          </div>
+        </div>
         <div class="max-w-7xl mx-auto">
 
 	          <!-- Header -->
@@ -729,16 +735,16 @@
 	                  <span class="material-symbols-outlined text-[16px]">bookmark_add</span>保存世界观
 	                </button>
 			                <button type="button" id="btnExtractAssets" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden>
-			                  <span class="asset-step-number">1</span>重新分析资产信息
+				                  <span class="asset-step-number">I</span>重新分析资产信息
 			                </button>
 	                <button type="button" id="btnCleanObsolete" class="h-10 px-6 bg-surface-container-lowest border border-[#e65100]/20 rounded-full text-xs font-bold tracking-wide text-[#e65100] hover:bg-[#fff3e0] transition-all flex items-center gap-2" hidden>
                   <span class="material-symbols-outlined text-[16px]">delete_sweep</span>清理过时资产
                 </button>
 			                <button type="button" id="btnGenAssetImages" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden data-write-action>
-	                  <span class="asset-step-number">2</span>生成全部图片
+		                  <span class="asset-step-number">II</span>生成全部图片
 	                </button>
 				                <button type="button" id="btnConfirmAssetsTop" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden data-write-action>
-			                  <span class="asset-step-number">3</span>
+				                  <span class="asset-step-number">III</span>
 			                  <span>确认资产，进入下一步</span>
 			                  <span class="material-symbols-outlined text-[16px]">arrow_forward</span>
 			                </button>
@@ -830,6 +836,12 @@
 
       <!-- ══════ 3. 镜头设计 ══════ -->
       <div class="page-scroll shots-page-scroll" id="pageShots" hidden>
+        <div class="sw-page-loading" data-loading-for="shots" role="status" aria-live="polite">
+          <div class="sw-load-body">
+            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="sw-load-text">加载中…</span>
+          </div>
+        </div>
         <div class="shots-dashboard-shell">
           <header class="shots-dashboard-header">
             <div class="script-title-block">
@@ -841,18 +853,18 @@
             <div id="shotsTopActions" class="flex flex-col items-end gap-2 shrink-0" hidden>
               <div class="flex flex-wrap items-start justify-end gap-3">
                 <button type="button" id="btnGenShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap flex items-center gap-2" data-write-action>
-                  <span class="shots-step-number">1</span>
+                  <span class="shots-step-number">I</span>
                   <span>AI 镜头设计</span>
                 </button>
                 <div class="flex items-center gap-3" id="imagesActionBar" hidden>
                   <button type="button" id="btnGenAllImages" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap flex items-center gap-2" data-write-action>
-                    <span class="shots-step-number">2</span>
+                    <span class="shots-step-number">II</span>
                     <span>生成全部关键帧</span>
                   </button>
                 </div>
                 <section id="shotsConfirmArea" class="flex items-start" hidden>
                   <button type="button" id="btnConfirmShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap inline-flex items-center gap-2" data-write-action>
-                    <span class="shots-step-number">3</span>
+                    <span class="shots-step-number">III</span>
                     <span>确认分镜图，进入下一步</span>
                     <span class="material-symbols-outlined text-base">arrow_forward</span>
                   </button>
@@ -954,12 +966,18 @@
 
       <!-- ══════ 5. 视频提示词设计 ══════ -->
       <div class="page-scroll prompts-page-scroll" id="pagePrompts" hidden>
+        <div class="sw-page-loading" data-loading-for="prompts" role="status" aria-live="polite">
+          <div class="sw-load-body">
+            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="sw-load-text">加载中…</span>
+          </div>
+        </div>
         <div class="prompts-page-shell flex overflow-hidden relative">
           <section id="promptsNeedImages" class="workflow-guard-surface" hidden>
-            <header class="workflow-page-header">
-              <h2 class="workflow-page-title">提示词生成</h2>
-              <p class="workflow-page-subtitle">基于分镜图生成并确认视频提示词</p>
-            </header>
+            <div class="max-w-md shrink-0">
+              <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">提示词生成</h2>
+              <p class="text-on-surface-variant text-base leading-relaxed mb-2">基于分镜图生成并确认视频提示词</p>
+            </div>
             <div class="workflow-empty-state">
               <div class="workflow-empty-state__icon">
                 <span class="material-symbols-outlined">warning</span>
@@ -1030,14 +1048,22 @@
 
       <!-- ══════ 6. 片段生成 ══════ -->
       <div class="page-scroll overflow-y-auto" id="pageBatch" hidden>
+        <div class="sw-page-loading" data-loading-for="batch" role="status" aria-live="polite">
+          <div class="sw-load-body">
+            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="sw-load-text">加载中…</span>
+          </div>
+        </div>
           <div class="batch-page-shell px-12 pt-10 pb-20 max-w-[1600px] mx-auto">
 
           <!-- Guard: need prompts first -->
           <div id="batchNeedPrompts">
-            <header class="workflow-page-header">
-              <h2 class="workflow-page-title">片段生成</h2>
-              <p class="workflow-page-subtitle">BATCH GENERATION</p>
-            </header>
+            <section class="batch-redesign-hero batch-redesign-hero--guard">
+              <div class="batch-redesign-title">
+                <h2>片段生成</h2>
+                <span>BATCH GENERATION</span>
+              </div>
+            </section>
             <div class="workflow-empty-state">
               <div class="workflow-empty-state__icon">
                 <span class="material-symbols-outlined">warning</span>
@@ -1058,15 +1084,15 @@
               </div>
               <div class="batch-redesign-hero-actions">
                 <button type="button" id="btnGenerateAllSegments" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">1</span>
+                  <span class="batch-action-step" aria-hidden="true">I</span>
                   <span>生成全部片段</span>
                 </button>
                 <button type="button" id="btnImportAllSegments" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">2</span>
+                  <span class="batch-action-step" aria-hidden="true">II</span>
                   <span>全部导入剪辑</span>
                 </button>
                 <button type="button" id="btnStartBatch" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">3</span>
+                  <span class="batch-action-step" aria-hidden="true">III</span>
                   <span>确认片段视频，进入下一步</span>
                   <span class="material-symbols-outlined">arrow_forward</span>
                 </button>
@@ -1214,6 +1240,12 @@
 
       <!-- ══════ 7. 自动剪辑工作台 ══════ -->
       <div class="page-scroll edit-page-shell !p-0 !overflow-hidden" id="pageEdit" hidden>
+        <div class="sw-page-loading" data-loading-for="edit" role="status" aria-live="polite">
+          <div class="sw-load-body">
+            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="sw-load-text">加载中…</span>
+          </div>
+        </div>
         <div class="edit-workbench-shell flex flex-col">
 
           <!-- Guard: no imported clips yet. 文案不再暗示"必须全部视频完成"；
@@ -1221,9 +1253,11 @@
                决策（canEnterEdit = importedCount >= 1）。前端只读这个字段。 -->
           <div id="editGuard" class="flex-1 edit-neural-grid">
             <div class="workflow-guard-surface edit-guard-surface">
-              <header class="workflow-page-header">
-                <h2 class="workflow-page-title">智能剪辑工作台</h2>
-                <p class="workflow-page-subtitle">Edit Studio · 逐条把已生成的视频加入时间线即可开始剪辑</p>
+              <header class="edit-workbench-header edit-guard-header flex-shrink-0">
+                <div class="edit-title-row">
+                  <h1>剪辑工作台</h1>
+                  <span>EDIT STUDIO</span>
+                </div>
               </header>
               <div class="workflow-empty-state">
                 <div class="workflow-empty-state__icon">
@@ -1743,13 +1777,14 @@
         "/modules/episode_fields.js": "/modules/episode_fields.js?v=100",
         "/modules/episodes.js":       "/modules/episodes.js?v=101",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
-        "/modules/project.js":        "/modules/project.js?v=104",
+        "/modules/loading.js":        "/modules/loading.js?v=1",
+        "/modules/project.js":        "/modules/project.js?v=105",
         "/modules/render_hooks.js":   "/modules/render_hooks.js?v=102",
         "/modules/script.js":         "/modules/script.js?v=108",
         "/modules/settings.js":       "/modules/settings.js?v=101",
-        "/modules/shots.js":          "/modules/shots.js?v=105",
+        "/modules/shots.js":          "/modules/shots.js?v=106",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=134",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=135",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
@@ -1757,13 +1792,13 @@
         "/modules/toolbox.js":        "/modules/toolbox.js?v=201",
         "/modules/utils.js":          "/modules/utils.js?v=203",
         "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=108",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=118"
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=120"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=203"></script>
-    <script type="module" src="main.js?v=246"></script>
+    <script type="module" src="main.js?v=249"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

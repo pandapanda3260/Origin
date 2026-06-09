@@ -31,6 +31,7 @@ let STATUS_COPY = {};
 let VIDEO_ADAPTERS = {};
 let _projectEpoch = 0;
 var _videoInFlightGroups = new Set();
+var _batchRenderSeq = 0;
 var _videoGenerationEstimate = {
   averageSec: null,
   sampleSize: 0,
@@ -2962,6 +2963,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     _syncVideoRefs();
     var list = $("batchClipList");
     if (!list || !project || !project.storyboards) return;
+    var seq = ++_batchRenderSeq;
+    if (_ctx.swRegion) _ctx.swRegion.show();
+    try {
     var groups = getStoryboardGroups();
 
     var prefetchTargets = [];
@@ -2972,8 +2976,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       prefetchTargets.push({ gIdx: gIdx, group: group, sb: sb });
     });
 
-    await Promise.all(prefetchTargets.map(async function (t) {
-      var jobs = [_vpFetchAndCache(t.sb)];
+	    await Promise.all(prefetchTargets.map(async function (t) {
+	      var jobs = [_vpFetchAndCache(t.sb)];
       var sbRefUrl = firstFrameImageUrl(t.sb);
       var matchKey = [t.gIdx, sbRefUrl, Array.isArray(t.group && t.group.shotIndices) ? t.group.shotIndices.join(",") : ""].join("|");
       if (!t.sb._matchedRefs || t.sb._matchedRefs._forKey !== matchKey) {
@@ -2992,13 +2996,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             t.sb._matchedRefs = t.sb._matchedRefs || [];
           }
         })());
-      }
-      await Promise.all(jobs);
-    }));
+	      }
+	      await Promise.all(jobs);
+	    }));
 
-	    list.innerHTML = "";
-	    var liveWrap = $("batchTaskListWrap");
-	    var stats = _renderBatchVisualStats(_collectBatchVisualStats(groups));
+	    if (seq !== _batchRenderSeq) return;
+		    list.innerHTML = "";
+		    var liveWrap = $("batchTaskListWrap");
+		    var stats = _renderBatchVisualStats(_collectBatchVisualStats(groups));
 
 		    groups.forEach(function (group, gIdx) {
 		      var sb = project.storyboards[gIdx] || {};
@@ -3085,9 +3090,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	              '</button>') +
 	        '</div>';
 	      list.appendChild(card);
-	    });
-	    _renderBatchVisualStats(stats);
-	    hydrateProtectedImageElements(list);
+		    });
+		    _renderBatchVisualStats(stats);
+		    syncTaskListVisibility();
+		    hydrateProtectedImageElements(list);
+    } finally {
+      if (seq === _batchRenderSeq && _ctx.swRegion) _ctx.swRegion.hide();
+    }
 	  }
 
   function _selectBatchVideoModel(alias) {

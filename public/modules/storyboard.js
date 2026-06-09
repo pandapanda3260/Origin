@@ -6368,7 +6368,7 @@ function _setTopFirstFrameActionLocked(locked) {
   var btn = $("btnGenAllImages");
   if (actionBar) actionBar.hidden = false;
   if (!btn) return;
-  btn.innerHTML = '<span class="shots-step-number">2</span><span>生成全部关键帧</span>';
+  btn.innerHTML = '<span class="shots-step-number">II</span><span>生成全部关键帧</span>';
   btn.disabled = !!locked;
   btn.dataset.actionState = locked ? 'locked' : '';
   btn.title = locked ? '镜头计划可用后可生成全部关键帧' : '';
@@ -6983,7 +6983,7 @@ function _syncMergedStoryboardConfirmState(groups) {
   // 禁用态由 disabled + opacity 区分；编号/箭头结构与 workspace.html 保持一致，
   // 避免每次刷新时把按钮子节点冲回旧结构。
   var SHOTS_CONFIRM_HTML =
-    '<span class="shots-step-number">3</span>' +
+    '<span class="shots-step-number">III</span>' +
     '<span>确认分镜图，进入下一步</span>' +
     '<span class="material-symbols-outlined text-base">arrow_forward</span>';
   if (!allFirstFramesReady) {
@@ -7014,7 +7014,7 @@ function _updateImagesActionButton(groups) {
   var preflightBlocked = preflight.status !== "allowed";
   var preflightMessage = preflight.message || "";
   var hint = $("imagesHint");
-  btn.innerHTML = '<span class="shots-step-number">2</span><span>' + escapeHtml(label) + '</span>';
+  btn.innerHTML = '<span class="shots-step-number">II</span><span>' + escapeHtml(label) + '</span>';
   btn.disabled = state.action === 'generating' || !!materialBlockMessage || preflightBlocked;
   btn.dataset.actionState = materialBlockMessage ? 'material_limit' : (preflightBlocked ? preflight.status : state.action);
   btn.title = materialBlockMessage || preflightMessage || '';
