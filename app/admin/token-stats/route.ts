@@ -70,7 +70,7 @@ export async function GET(req: NextRequest) {
       .token-table td { color:var(--admin-text-strong); font-size:var(--admin-font-md); }
       .token-table-user { min-width:760px; }
       .token-table-category { min-width:760px; }
-      .token-table-calls { min-width:1180px; }
+      .token-table-calls { min-width:1360px; }
       .token-cell-title { display:block; color:var(--admin-text-strong); font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .token-cell-sub { display:block; margin-top:4px; color:var(--admin-text-muted); font-size:var(--admin-font-sm); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .token-value-strong { color:var(--admin-text-strong); font-size:var(--admin-font-lg); font-weight:900; }
@@ -176,8 +176,8 @@ export async function GET(req: NextRequest) {
       </div>
       <div class="admin-table-wrap token-table-wrap">
         <table class="admin-table token-table token-table-calls">
-          <thead><tr><th>时间</th><th>用户 / 项目</th><th>分类</th><th>模型</th><th>Token</th><th>状态</th><th>路径</th></tr></thead>
-          <tbody data-token-calls="true"><tr><td colspan="7"><div class="token-empty">${tokenIcons.file}<span>加载中...</span></div></td></tr></tbody>
+          <thead><tr><th>时间</th><th>用户 / 项目</th><th>分类</th><th>模型</th><th>Token</th><th>积分消耗</th><th>状态</th><th>路径</th></tr></thead>
+          <tbody data-token-calls="true"><tr><td colspan="8"><div class="token-empty">${tokenIcons.file}<span>加载中...</span></div></td></tr></tbody>
         </table>
       </div>
       <div class="token-details-foot">
@@ -248,9 +248,10 @@ export async function GET(req: NextRequest) {
           '<td><span class="token-cell-title">' + esc(row.moduleLabel) + '</span><span class="token-cell-sub">' + esc(row.featureLabel) + '</span></td>' +
           '<td><span class="token-cell-title">' + esc(row.provider || '-') + '</span><span class="token-cell-sub admin-mono">' + esc(row.model || '-') + '</span></td>' +
           '<td><strong class="token-value-strong">' + fmt(row.totalTokens) + '</strong><span class="token-cell-sub">in ' + fmt(row.inputTokens) + ' / out ' + fmt(row.outputTokens) + '</span></td>' +
+          '<td><strong class="token-value-strong">' + (Number(row.chargedCredits || 0) > 0 ? fmt(row.chargedCredits) : '-') + '</strong><span class="token-cell-sub">' + esc(row.billingStatus || row.billingScope || '-') + '</span></td>' +
           '<td><span class="token-status ' + (row.status === 'ok' ? 'token-status-ok' : 'token-status-warn') + '">' + esc(row.status) + '</span><span class="token-cell-sub">' + esc(row.usageSource) + '</span></td>' +
           '<td class="admin-mono"><span class="token-cell-title">' + esc(row.requestPath || row.routeName || '-') + '</span></td></tr>'
-        ).join('') : empty(7);
+        ).join('') : empty(8);
         const totalPages = Math.max(1, Math.ceil(state.total / state.limit));
         const page = Math.min(totalPages, Math.floor(state.offset / state.limit) + 1);
         pageText.textContent = page + ' / ' + totalPages;

@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const { hashSync } = require('bcryptjs');
 
 const baseUrl = process.env.ADMIN_SMOKE_BASE_URL || 'http://localhost:3000';
 const origin = process.env.ADMIN_SMOKE_ORIGIN || 'http://localhost:3000';
@@ -43,26 +44,45 @@ function createFixture() {
   return withDb((db) => {
     const suffix = `${Date.now()}_${Math.floor(Math.random() * 100000)}`;
     const id = `token_stats_smoke_${suffix}`;
+    const ledgerId = `ledger_token_stats_smoke_${suffix}`;
+    const user = db.prepare(
+      `INSERT INTO users (username, email, display_name, password_hash, email_verified)
+       VALUES (?, ?, ?, ?, 1)
+       RETURNING id, username`,
+    ).get(`token_stats_smoke_user_${suffix}`, `token_stats_smoke_${suffix}@example.test`, 'Token Stats Smoke User', hashSync(crypto.randomUUID(), 10));
+    db.prepare(
+      `INSERT INTO user_credits (user_id, total_credits, bonus_credits)
+       VALUES (?, 93, 93)`,
+    ).run(user.id);
+    db.prepare(
+      `INSERT INTO credit_ledger
+        (id, user_id, amount, kind, reason, ref_id, charge_ref_id, usage_event_ids_json, balance_after)
+       VALUES
+        (?, ?, -7, 'text', 'token stats smoke charge', ?, ?, ?, 93)`,
+    ).run(ledgerId, user.id, id, `usage:text:${id}`, JSON.stringify([id]));
     db.prepare(
       `INSERT INTO token_usage_events
         (id, owner_id, username_snapshot, project_id, project_title_snapshot, request_path,
          route_name, trace_name, module_key, module_label, feature_key, feature_label,
          call_item_type, call_item_id, call_item_label, provider, model, model_role, slot,
          status, latency_ms, input_tokens, output_tokens, reasoning_tokens, total_tokens,
-         billable_tokens, usage_source, meta_json)
+         billable_tokens, usage_source, billing_status, ledger_id, meta_json)
        VALUES
-        (?, NULL, 'smoke-user', ?, 'Smoke Project', '/smoke/token', 'smoke.token',
+        (?, ?, ?, ?, 'Smoke Project', '/smoke/token', 'smoke.token',
          'smoke-token-stats', 'smoke', 'Smoke', 'smoke_call', 'Smoke Call',
          'test', ?, 'Smoke Call Item', 'openai_chat', 'smoke-model', 'brain', 'brain',
-         'ok', 12, 11, 22, 3, 36, 36, 'provider', '{}')`,
-    ).run(id, id, id);
-    return { id };
+         'ok', 12, 11, 22, 3, 36, 36, 'provider', 'billed', ?, '{}')`,
+    ).run(id, user.id, user.username, id, id, ledgerId);
+    return { id, ledgerId, user };
   });
 }
 
 function cleanupFixture(fx) {
   withDb((db) => {
     db.prepare('DELETE FROM token_usage_events WHERE id = ? OR project_id = ?').run(fx.id, fx.id);
+    db.prepare('DELETE FROM credit_ledger WHERE id = ? OR user_id = ?').run(fx.ledgerId, fx.user.id);
+    db.prepare('DELETE FROM user_credits WHERE user_id = ?').run(fx.user.id);
+    db.prepare('DELETE FROM users WHERE id = ?').run(fx.user.id);
     db.prepare("DELETE FROM admin_actions WHERE action = 'token_stats.export' AND result_json LIKE '%200%'").run();
   });
 }
@@ -84,7 +104,9 @@ async function main() {
       assert(result.json && result.json.ok === true, `${view} did not return ok json`);
     }
     const calls = await request(`${base}&view=calls`, { headers: { cookie } });
-    assert(calls.json.rows.some((row) => row.id === fx.id), 'calls view did not include fixture event');
+    const callRow = calls.json.rows.find((row) => row.id === fx.id);
+    assert(callRow, 'calls view did not include fixture event');
+    assert(callRow.chargedCredits === 7, `calls view did not include charged credits: ${JSON.stringify(callRow)}`);
 
     const csv = await request('/api/admin/token-stats', {
       method: 'POST',
@@ -99,6 +121,7 @@ async function main() {
     assert(csv.res.status === 200, `csv export failed: ${csv.res.status} ${csv.text}`);
     assert((csv.res.headers.get('content-type') || '').includes('text/csv'), 'csv export should return text/csv');
     assert(csv.text.includes('created_at,owner_id,username'), 'csv export missing header');
+    assert(csv.text.includes('charged_credits'), 'csv export missing charged credits header');
     assert(csv.text.includes(fx.id), 'csv export missing fixture row');
     assert(!csv.text.includes('prompt content') && !csv.text.includes('response content'), 'csv export should not contain raw prompt/response');
 

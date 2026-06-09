@@ -101,10 +101,11 @@ export type TokenUsageEventRow = {
 	  consumptionType: string | null;
 	  quantity: number | null;
 	  durationSec: number | null;
-	  billingStatus: string | null;
-	  ledgerId: string | null;
-	  providerResponseHash: string | null;
-	  batchId: string | null;
+  billingStatus: string | null;
+  ledgerId: string | null;
+  chargedCredits: number;
+  providerResponseHash: string | null;
+  batchId: string | null;
   taskId: string | null;
   runId: string | null;
   correlationId: string | null;
@@ -259,26 +260,30 @@ function initialBillingStatus(status: string, billingScope: BillingScope, usage:
 
 export function listTokenUsageEvents(filters: TokenUsageFilters = {}): { rows: TokenUsageEventRow[]; total: number } {
   maybeCleanupTokenUsageEvents();
-  const { where, params } = buildWhere(filters);
+  const rowsFilter = buildWhere(filters, { tableAlias: 'e' });
+  const totalFilter = buildWhere(filters);
   const limit = clampInt(filters.limit, 100, 1, 500);
   const offset = clampInt(filters.offset, 0, 0, 100_000);
   const rows = getDb()
     .prepare<Record<string, unknown>, any>(
       `SELECT ${TOKEN_USAGE_SELECT}
-         FROM token_usage_events
-        WHERE ${where.join(' AND ')}
-        ORDER BY created_at DESC, id DESC
+         FROM token_usage_events e
+         LEFT JOIN credit_ledger l
+           ON l.id = e.ledger_id
+           OR l.charge_ref_id = ('usage:text:' || e.id)
+        WHERE ${rowsFilter.where.join(' AND ')}
+        ORDER BY e.created_at DESC, e.id DESC
         LIMIT @limit OFFSET @offset`,
     )
-    .all({ ...params, limit, offset })
+    .all({ ...rowsFilter.params, limit, offset })
     .map(decodeTokenUsageRow);
   const total = getDb()
     .prepare<Record<string, unknown>, any>(
       `SELECT COUNT(*) AS count
          FROM token_usage_events
-        WHERE ${where.join(' AND ')}`,
+        WHERE ${totalFilter.where.join(' AND ')}`,
     )
-    .get(params)?.count || 0;
+    .get(totalFilter.params)?.count || 0;
   return { rows, total: Number(total) || 0 };
 }
 
@@ -386,6 +391,7 @@ export function buildTokenUsageCsv(rows: TokenUsageEventRow[]): string {
     'cached_tokens',
     'total_tokens',
     'billable_tokens',
+    'charged_credits',
     'usage_source',
     'trace_name',
     'request_path',
@@ -423,6 +429,7 @@ export function buildTokenUsageCsv(rows: TokenUsageEventRow[]): string {
       row.cachedTokens ?? '',
       row.totalTokens ?? '',
       row.billableTokens ?? '',
+      row.chargedCredits ?? 0,
       row.usageSource,
       row.traceName || '',
       row.requestPath || '',
@@ -457,54 +464,55 @@ function maybeCleanupTokenUsageEvents() {
 }
 
 const TOKEN_USAGE_SELECT = `
-  id,
-  created_at AS createdAt,
-  owner_id AS ownerId,
-  username_snapshot AS usernameSnapshot,
-  project_id AS projectId,
-  project_title_snapshot AS projectTitleSnapshot,
-  request_path AS requestPath,
-  route_name AS routeName,
-  trace_name AS traceName,
-  module_key AS moduleKey,
-  module_label AS moduleLabel,
-  feature_key AS featureKey,
-  feature_label AS featureLabel,
-  call_item_type AS callItemType,
-  call_item_id AS callItemId,
-  call_item_label AS callItemLabel,
-  provider,
-  model,
-  model_role AS modelRole,
-  slot,
-  status,
-  status_code AS statusCode,
-  error_code AS errorCode,
-  latency_ms AS latencyMs,
-  input_tokens AS inputTokens,
-  output_tokens AS outputTokens,
-  reasoning_tokens AS reasoningTokens,
-  cached_tokens AS cachedTokens,
-  total_tokens AS totalTokens,
-	  billable_tokens AS billableTokens,
-	  usage_source AS usageSource,
-	  billing_session_id AS billingSessionId,
-	  billing_scope AS billingScope,
-	  operation_key AS operationKey,
-	  operation_label AS operationLabel,
-	  consumption_type AS consumptionType,
-	  quantity,
-	  duration_sec AS durationSec,
-	  billing_status AS billingStatus,
-	  ledger_id AS ledgerId,
-	  provider_response_hash AS providerResponseHash,
-	  prompt_hash AS promptHash,
-  response_hash AS responseHash,
-  batch_id AS batchId,
-  task_id AS taskId,
-  run_id AS runId,
-  correlation_id AS correlationId,
-  meta_json AS metaJson
+  e.id,
+  e.created_at AS createdAt,
+  e.owner_id AS ownerId,
+  e.username_snapshot AS usernameSnapshot,
+  e.project_id AS projectId,
+  e.project_title_snapshot AS projectTitleSnapshot,
+  e.request_path AS requestPath,
+  e.route_name AS routeName,
+  e.trace_name AS traceName,
+  e.module_key AS moduleKey,
+  e.module_label AS moduleLabel,
+  e.feature_key AS featureKey,
+  e.feature_label AS featureLabel,
+  e.call_item_type AS callItemType,
+  e.call_item_id AS callItemId,
+  e.call_item_label AS callItemLabel,
+  e.provider,
+  e.model,
+  e.model_role AS modelRole,
+  e.slot,
+  e.status,
+  e.status_code AS statusCode,
+  e.error_code AS errorCode,
+  e.latency_ms AS latencyMs,
+  e.input_tokens AS inputTokens,
+  e.output_tokens AS outputTokens,
+  e.reasoning_tokens AS reasoningTokens,
+  e.cached_tokens AS cachedTokens,
+  e.total_tokens AS totalTokens,
+	  e.billable_tokens AS billableTokens,
+	  e.usage_source AS usageSource,
+	  e.billing_session_id AS billingSessionId,
+	  e.billing_scope AS billingScope,
+	  e.operation_key AS operationKey,
+	  e.operation_label AS operationLabel,
+	  e.consumption_type AS consumptionType,
+	  e.quantity,
+	  e.duration_sec AS durationSec,
+	  e.billing_status AS billingStatus,
+	  e.ledger_id AS ledgerId,
+    COALESCE(CASE WHEN l.amount < 0 THEN -l.amount ELSE 0 END, 0) AS chargedCredits,
+	  e.provider_response_hash AS providerResponseHash,
+	  e.prompt_hash AS promptHash,
+  e.response_hash AS responseHash,
+  e.batch_id AS batchId,
+  e.task_id AS taskId,
+  e.run_id AS runId,
+  e.correlation_id AS correlationId,
+  e.meta_json AS metaJson
 `;
 
 function normalizeUsage(value: Record<string, unknown> | null | undefined) {
@@ -572,54 +580,55 @@ function category(moduleKey: string, moduleLabel: string, featureKey: string, fe
   };
 }
 
-function buildWhere(filters: TokenUsageFilters = {}, opts: { onlyCountedUsage?: boolean; onlyMissingUsage?: boolean } = {}) {
+function buildWhere(filters: TokenUsageFilters = {}, opts: { onlyCountedUsage?: boolean; onlyMissingUsage?: boolean; tableAlias?: string } = {}) {
   const where = ['1=1'];
   const params: Record<string, unknown> = {};
+  const col = (name: string) => opts.tableAlias ? `${opts.tableAlias}.${name}` : name;
   if (filters.since) {
-    where.push('created_at >= @since');
+    where.push(`${col('created_at')} >= @since`);
     params.since = filters.since;
   }
   if (filters.until) {
-    where.push('created_at < @until');
+    where.push(`${col('created_at')} < @until`);
     params.until = filters.until;
   }
   if (filters.ownerId != null) {
-    where.push('owner_id = @ownerId');
+    where.push(`${col('owner_id')} = @ownerId`);
     params.ownerId = filters.ownerId;
   }
   if (filters.projectId) {
-    where.push('project_id = @projectId');
+    where.push(`${col('project_id')} = @projectId`);
     params.projectId = filters.projectId;
   }
   if (filters.moduleKey) {
-    where.push('module_key = @moduleKey');
+    where.push(`${col('module_key')} = @moduleKey`);
     params.moduleKey = filters.moduleKey;
   }
   if (filters.featureKey) {
-    where.push('feature_key = @featureKey');
+    where.push(`${col('feature_key')} = @featureKey`);
     params.featureKey = filters.featureKey;
   }
   if (filters.provider) {
-    where.push('provider = @provider');
+    where.push(`${col('provider')} = @provider`);
     params.provider = filters.provider;
   }
   if (filters.model) {
-    where.push('model = @model');
+    where.push(`${col('model')} = @model`);
     params.model = filters.model;
   }
   if (filters.status) {
-    where.push('status = @status');
+    where.push(`${col('status')} = @status`);
     params.status = filters.status;
   }
   if (filters.query) {
     where.push(`(
-      username_snapshot LIKE @query OR project_title_snapshot LIKE @query OR project_id LIKE @query OR
-      trace_name LIKE @query OR call_item_label LIKE @query OR call_item_id LIKE @query OR model LIKE @query
+      ${col('username_snapshot')} LIKE @query OR ${col('project_title_snapshot')} LIKE @query OR ${col('project_id')} LIKE @query OR
+      ${col('trace_name')} LIKE @query OR ${col('call_item_label')} LIKE @query OR ${col('call_item_id')} LIKE @query OR ${col('model')} LIKE @query
     )`);
     params.query = `%${filters.query}%`;
   }
-  if (opts.onlyCountedUsage) where.push("usage_source != 'missing' AND total_tokens IS NOT NULL");
-  if (opts.onlyMissingUsage) where.push("(usage_source = 'missing' OR total_tokens IS NULL)");
+  if (opts.onlyCountedUsage) where.push(`${col('usage_source')} != 'missing' AND ${col('total_tokens')} IS NOT NULL`);
+  if (opts.onlyMissingUsage) where.push(`(${col('usage_source')} = 'missing' OR ${col('total_tokens')} IS NULL)`);
   return { where, params };
 }
 
@@ -670,6 +679,7 @@ function decodeTokenUsageRow(row: any): TokenUsageEventRow {
 	    durationSec: row.durationSec == null ? null : Number(row.durationSec),
 	    billingStatus: row.billingStatus || null,
 	    ledgerId: row.ledgerId || null,
+	    chargedCredits: Number(row.chargedCredits || 0),
 	    providerResponseHash: row.providerResponseHash || null,
 	    promptHash: row.promptHash || null,
     responseHash: row.responseHash || null,

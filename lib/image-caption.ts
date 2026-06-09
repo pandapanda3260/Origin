@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { UserRow } from './db';
-import { resolveLLMConfig } from './llm';
+import { applyTokenBudget, observeTextModelCall } from './llm';
+import { resolveTextModelConfig } from './model-routing';
 import { postJsonWithProxySupport } from './proxy-fetch';
 import { getExternalEnvValue } from './env';
+import type { TokenUsageContext } from './token-usage';
 
 export type TailFrameCaption = {
   status: 'ready';
@@ -53,9 +55,13 @@ function cleanCaption(text: string): string {
     .slice(0, 800);
 }
 
-export async function captionTailFrameForVideo(user: UserRow | null, imagePath: string): Promise<TailFrameCaption> {
+export async function captionTailFrameForVideo(
+  user: UserRow | null,
+  imagePath: string,
+  tokenContext?: TokenUsageContext | null,
+): Promise<TailFrameCaption> {
   const imageContentHash = hashImageFileContent(imagePath);
-  const cfg = resolveLLMConfig(user, 'text');
+  const cfg = resolveTextModelConfig(user, 'frameConsistencyCheck');
   if (cfg.mode === 'fake') {
     return {
       status: 'ready',
@@ -78,6 +84,29 @@ export async function captionTailFrameForVideo(user: UserRow | null, imagePath: 
       process.env.ORIGIN_IMAGE_CAPTION_TIMEOUT_MS ||
       120_000,
   );
+  const usageOpts = {
+    maxTokens: 500,
+    traceName: 'tail-frame-caption',
+    modelRole: 'frameConsistencyCheck' as const,
+    tokenContext: {
+      ownerId: user?.id || null,
+      usernameSnapshot: user?.phone || user?.display_name || user?.username || null,
+      moduleKey: 'video',
+      moduleLabel: '视频生成',
+      featureKey: 'tail_frame_caption',
+      featureLabel: '尾帧 Caption',
+      operationKey: tokenContext?.operationKey || tokenContext?.callItemId || undefined,
+      operationLabel: tokenContext?.operationLabel || '尾帧 Caption',
+      ...(tokenContext || {}),
+    },
+  };
+  const budgeted = applyTokenBudget(
+    cfg,
+    [{ role: 'user' as const, content: prompt }],
+    usageOpts,
+    'complete',
+  );
+  const maxOutputTokens = budgeted.maxTokens ?? 500;
   let text = '';
 
   if (cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses' || cfg.provider === 'zerail_responses') {
@@ -92,37 +121,45 @@ export async function captionTailFrameForVideo(user: UserRow | null, imagePath: 
           ],
         },
       ],
-      max_output_tokens: 500,
+      max_output_tokens: maxOutputTokens,
     };
     if (cfg.reasoningEffort) body.reasoning = { effort: cfg.reasoningEffort };
-    const json = await postJsonWithProxySupport(
-      `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
-      cfg.apiKey,
-      body,
-      timeoutMs,
-      `尾帧 caption 生成超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+    const json = await observeTextModelCall(
+      cfg,
+      budgeted,
+      () => postJsonWithProxySupport(
+        `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
+        cfg.apiKey,
+        body,
+        timeoutMs,
+        `尾帧 caption 生成超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+      ),
     );
     text = extractResponsesText(json);
   } else if (cfg.provider === 'openai_chat') {
-    const json = await postJsonWithProxySupport(
-      `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
-      cfg.apiKey,
-      {
-        model: cfg.model,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: dataUrl } },
-            ],
-          },
-        ],
-        max_tokens: 500,
-        temperature: 0.2,
-      },
-      timeoutMs,
-      `尾帧 caption 生成超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+    const json = await observeTextModelCall(
+      cfg,
+      budgeted,
+      () => postJsonWithProxySupport(
+        `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
+        cfg.apiKey,
+        {
+          model: cfg.model,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: prompt },
+                { type: 'image_url', image_url: { url: dataUrl } },
+              ],
+            },
+          ],
+          max_tokens: maxOutputTokens,
+          temperature: 0.2,
+        },
+        timeoutMs,
+        `尾帧 caption 生成超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+      ),
     );
     text = extractChatText(json);
   } else {

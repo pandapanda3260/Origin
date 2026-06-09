@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=204" />
+    <link rel="stylesheet" href="styles.css?v=215" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -892,6 +892,7 @@
                 <h1>分镜生成</h1>
                 <span>镜头表、素材参考、首尾帧统一工作区</span>
               </div>
+              <p id="shotsKeyframeProgress" class="shots-keyframe-progress" hidden aria-live="polite"></p>
             </div>
             <div id="shotsTopActions" class="flex flex-col items-end gap-2 shrink-0" hidden>
               <div class="flex flex-wrap items-start justify-end gap-3">
@@ -1543,7 +1544,7 @@
                 <p class="text-[10px] font-bold tracking-[0.2em] text-[#90A4AE] uppercase mt-1">Studio Library · 汇总所有项目生成的图片与视频</p>
               </div>
               <button type="button" id="btnLibWorldTemplates" class="h-10 px-5 bg-surface-container-lowest border border-outline-variant/15 rounded-full text-xs font-bold tracking-wide text-on-surface-variant hover:bg-surface-container-high transition-all flex items-center gap-2 shrink-0">
-                <span class="material-symbols-outlined text-sm">auto_stories</span>世界观模板 (<span class="lib-count-template">0</span>)
+                <span class="material-symbols-outlined text-sm">auto_stories</span>查看世界观列表（<span class="lib-count-template">0</span>）
               </button>
             </div>
           </header>
@@ -1827,12 +1828,12 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=138",
+        "/modules/assets.js":         "/modules/assets.js?v=141",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
         "/modules/edit.js":           "/modules/edit.js?v=138",
         "/modules/episode_fields.js": "/modules/episode_fields.js?v=100",
-        "/modules/episodes.js":       "/modules/episodes.js?v=101",
+        "/modules/episodes.js":       "/modules/episodes.js?v=102",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/loading.js":        "/modules/loading.js?v=1",
         "/modules/project.js":        "/modules/project.js?v=105",
@@ -1841,7 +1842,7 @@
         "/modules/settings.js":       "/modules/settings.js?v=101",
         "/modules/shots.js":          "/modules/shots.js?v=107",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=135",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=138",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
@@ -1855,7 +1856,7 @@
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=203"></script>
-    <script type="module" src="main.js?v=263"></script>
+    <script type="module" src="main.js?v=270"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

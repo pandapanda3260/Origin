@@ -4,7 +4,7 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { getProjectByIdForUser } from '@/lib/projects-db';
 import { getStyleTemplateForUser } from '@/lib/style-templates-db';
-import { getWorldTemplate } from '@/lib/world-templates-db';
+import { getWorldTemplate, mergeWorldCharacterPools } from '@/lib/world-templates-db';
 import { shortKnowledgeHash, stableKnowledgeValue } from '@/lib/knowledge/hash';
 
 export const runtime = 'nodejs';
@@ -179,6 +179,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   const worldId = templateId(worldSnapshot);
   const styleSource = styleId ? getStyleTemplateForUser(user.id, styleId) : null;
   const worldSource = worldId ? getWorldTemplate(user.id, worldId) : null;
+  const worldCharacters = worldSnapshot
+    ? mergeWorldCharacterPools(worldSnapshot.characters, worldSnapshot.characterCandidates)
+    : [];
 
   const locks = Array.isArray(project?.consistency?.characters) ? project.consistency.characters : [];
 
@@ -203,7 +206,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
         id: worldId,
         name: cleanText(worldSnapshot.name || worldSnapshot.title, 160),
         summary: cleanText(worldSnapshot.summary || worldSnapshot.description, 500),
-        characterCount: Array.isArray(worldSnapshot.characters) ? worldSnapshot.characters.length : 0,
+        characterCount: worldCharacters.length,
         locationCount: Array.isArray(worldSnapshot.locations) ? worldSnapshot.locations.length : 0,
         propCount: Array.isArray(worldSnapshot.props) ? worldSnapshot.props.length : 0,
       } : null,

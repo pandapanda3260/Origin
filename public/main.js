@@ -40,7 +40,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=132';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=138';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -60,7 +60,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=138';
+  _openLightbox } from './modules/assets.js?v=141';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=106';
@@ -3422,7 +3422,7 @@ var _scriptEditInitialText = "";
       } else if (task.thumbnail) {
         preview.innerHTML = _ovThumbnailImgHtml(task.thumbnail) + '<div class="vtd-preview-unavailable"><span class="material-symbols-outlined">videocam_off</span><p>视频未生成</p></div>';
       } else {
-        preview.innerHTML = '<div class="vtd-preview-empty"><span class="material-symbols-outlined">movie_filter</span><p>暂无缩略图</p></div>';
+        preview.innerHTML = '<div class="vtd-preview-empty"><span class="material-symbols-outlined">movie_filter</span><p>暂无视频</p></div>';
       }
     }
     if (param) {
@@ -4023,12 +4023,13 @@ var _scriptEditInitialText = "";
      ================================================================ */
 		  var _stylePageBound = false;
 				  var _styleOptionsSaveTimer = null;
-				  var _styleTemplateModalOpen = false;
-				  var _styleTemplateModalTempId = "";
-				  var _styleWorldTemplateModalOpen = false;
-				  var _styleWorldTemplateModalTempId = "";
-				  var _styleWorldTemplateModalLoading = false;
-				  var _styleAutoRecommendPromise = null;
+					  var _styleTemplateModalOpen = false;
+					  var _styleTemplateModalTempId = "";
+					  var _styleWorldTemplateModalOpen = false;
+					  var _styleWorldTemplateModalTempId = "";
+					  var _styleWorldTemplateModalLoading = false;
+					  var _styleWorldPersistSeq = 0;
+					  var _styleAutoRecommendPromise = null;
 			  var _styleAutoRecommendKey = "";
 			  var _STYLE_AUTO_RECOMMENDATION_VERSION = "2026-06-06-world-preferred-style-v1";
 			  var _STYLE_ASPECT_RATIOS = { "16:9": true, "9:16": true, "1:1": true };
@@ -5475,6 +5476,79 @@ var _scriptEditInitialText = "";
 				    _renderStyleWorldTemplateModal();
 				  }
 
+				  function _normalizeStyleWorldIntent(intent) {
+				    intent = intent || {};
+				    var worldId = intent.selectedWorldTemplateId == null ? null : String(intent.selectedWorldTemplateId || "").trim();
+				    var snapshot = intent.worldTemplateSnapshot && typeof intent.worldTemplateSnapshot === "object"
+				      ? intent.worldTemplateSnapshot
+				      : null;
+				    if (!worldId && snapshot) {
+				      worldId = String(snapshot.id || snapshot.templateId || snapshot.template_id || "").trim() || null;
+				    }
+				    return {
+				      selectedWorldTemplateId: worldId || null,
+				      worldTemplateSnapshot: snapshot,
+				    };
+				  }
+
+				  function _renderStyleWorldIntentUi(intent) {
+				    intent = _normalizeStyleWorldIntent(intent);
+				    _renderStylePageWorldTemplates();
+				    var templates = (typeof _getWorldTemplates === "function") ? _getWorldTemplates() : [];
+				    var tpl = intent.selectedWorldTemplateId
+				      ? _findWorldTemplateById(templates, intent.selectedWorldTemplateId)
+				      : null;
+				    _renderStyleTemplateRecommendHint(intent.selectedWorldTemplateId ? "world" : "none", tpl);
+				    _renderStyleInferenceHint();
+				    _renderStylePageBiblePanel();
+				  }
+
+				  function _applyStyleWorldIntentLocal(intent) {
+				    if (!project || !intent || (intent.projectId && project.id !== intent.projectId)) return false;
+				    var normalized = _normalizeStyleWorldIntent(intent);
+				    project.selectedWorldTemplateId = normalized.selectedWorldTemplateId;
+				    project.worldTemplateSnapshot = normalized.worldTemplateSnapshot;
+				    _syncProjectModules(project);
+				    _renderStyleWorldIntentUi(normalized);
+				    return true;
+				  }
+
+				  function _flushStyleWorldIntent(job, attempt) {
+				    return Promise.resolve(_flushServerSave()).then(function (result) {
+				      if (!job || job.seq !== _styleWorldPersistSeq) return result;
+				      if (result && result.ok) return result;
+				      if (result && result.stale && attempt < 1) {
+				        if (!_applyStyleWorldIntentLocal(job)) return result;
+				        return _flushStyleWorldIntent(job, attempt + 1);
+				      }
+				      if (_applyStyleWorldIntentLocal(job)) {
+				        try { saveProject(); } catch (e) { console.warn("[StyleWorld] deferred save failed:", e); }
+				        showToast("世界观关联保存失败，已保留页面状态，系统会稍后重试。", "warn");
+				      }
+				      return result;
+				    }).catch(function (err) {
+				      if (job && job.seq === _styleWorldPersistSeq && _applyStyleWorldIntentLocal(job)) {
+				        try { saveProject(); } catch (e) { console.warn("[StyleWorld] deferred save failed:", e); }
+				        showToast("世界观关联保存失败，已保留页面状态，系统会稍后重试。", "warn");
+				      }
+				      console.warn("[StyleWorld] background save failed:", err);
+				      return { ok: false, error: err };
+				    });
+				  }
+
+				  function _persistStyleWorldIntent(intent) {
+				    if (!project || !project.id) return Promise.resolve({ ok: false, reason: "no-project" });
+				    var normalized = _normalizeStyleWorldIntent(intent);
+				    var job = {
+				      projectId: project.id,
+				      seq: ++_styleWorldPersistSeq,
+				      selectedWorldTemplateId: normalized.selectedWorldTemplateId,
+				      worldTemplateSnapshot: normalized.worldTemplateSnapshot,
+				    };
+				    _applyStyleWorldIntentLocal(job);
+				    return _flushStyleWorldIntent(job, 0);
+				  }
+
 				  function _confirmStyleWorldTemplateModal() {
 				    if (!_styleWorldTemplateModalOpen) return;
 				    var templates = (typeof _getWorldTemplates === "function") ? _getWorldTemplates() : [];
@@ -5483,9 +5557,9 @@ var _scriptEditInitialText = "";
 				      showToast("请先选择一个世界观", "warn");
 				      return;
 				    }
+				    _closeStyleWorldTemplateModal();
 				    Promise.resolve(_applyWorldTemplateReferenceFromStylePage(tpl))
 				      .then(function () {
-				        _closeStyleWorldTemplateModal();
 				        return _applyRecommendedStyleTemplateForWorld();
 				      })
 				      .catch(function (err) {
@@ -5794,19 +5868,13 @@ var _scriptEditInitialText = "";
 			      }
 		    });
 		    var clearWorldBtn = $("btnStyleWorldClear");
-	    if (clearWorldBtn) {
-	      clearWorldBtn.addEventListener("click", function () {
-	        if (!project) return;
-	        project.selectedWorldTemplateId = null;
-	        project.worldTemplateSnapshot = null;
-	        saveProject();
-	        _renderStylePageWorldTemplates();
-	        _renderStyleTemplateRecommendHint("none", null);
-	        _renderStyleInferenceHint();
-	        _renderStylePageBiblePanel();
-	        showToast("已清除关联世界观", "info");
-	      });
-	    }
+		    if (clearWorldBtn) {
+		      clearWorldBtn.addEventListener("click", function () {
+		        if (!project) return;
+		        _persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null });
+		        showToast("已清除关联世界观", "info");
+		      });
+		    }
 	    var clearTplBtn = $("btnStyleTemplateClear");
 	    if (clearTplBtn) {
 	      clearTplBtn.addEventListener("click", function () {
@@ -7582,9 +7650,10 @@ var _scriptEditInitialText = "";
       checkAndSuggest: (stage) => _checkAndSuggest(stage),
       archiveOldImage: (item, kind) => _archiveOldImage(item, kind),
       registerServerTask: (id, kind, type, idx) => _registerServerTask(id, kind, type, idx),
-      updateServerTaskStatus: (id, status, url) => _updateServerTaskStatus(id, status, url),
-      refreshStylePage: () => refreshStylePage(),
-      updateStoryboardCard: (idx, status, url, text) => updateStoryboardCard(idx, status, url, text),
+	      updateServerTaskStatus: (id, status, url) => _updateServerTaskStatus(id, status, url),
+	      refreshStylePage: () => refreshStylePage(),
+	      persistWorldTemplateSelection: (intent) => _persistStyleWorldIntent(intent),
+	      updateStoryboardCard: (idx, status, url, text) => updateStoryboardCard(idx, status, url, text),
       historyBtnHtml: (item, variant) => _historyBtnHtml(item, variant),
       openHistoryPopover: (btn, item, onApply) => _openHistoryPopover(btn, item, onApply),
       openAssetHistoryModal: (item, type, onApply) => _openAssetHistoryModal(item, type, onApply),

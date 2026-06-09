@@ -479,6 +479,7 @@ export function refreshShotsPage() {
     if (actionBar) actionBar.hidden = true;
     var wrap = $("shotListWrap");
     if (wrap) wrap.innerHTML = "";
+    _hideScriptRefPanel();
     var ca = $("shotsConfirmArea");
     if (ca) ca.hidden = true;
     _refreshShotPlanActionState();
@@ -493,6 +494,7 @@ export function refreshShotsPage() {
     if (emptyActionBar) emptyActionBar.hidden = true;
     var emptyWrap = $("shotListWrap");
     if (emptyWrap) emptyWrap.innerHTML = "";
+    _hideScriptRefPanel();
     var emptyConfirm = $("shotsConfirmArea");
     if (emptyConfirm) emptyConfirm.hidden = true;
     _refreshShotPlanActionState();
@@ -639,6 +641,18 @@ function _updateShotSummaryMeta() {
   summaryMeta.textContent = "共 " + project.shots.length + " 个镜头 · " + totalSec + " 秒";
 }
 
+function _hideScriptRefPanel() {
+  var colWrap = $("scriptRefColWrap");
+  var panel = $("scriptRefPanel");
+  if (panel) {
+    panel.innerHTML = "";
+    panel.textContent = "";
+  }
+  if (colWrap) colWrap.hidden = true;
+  _scriptParas = [];
+  _shotParaMap = {};
+}
+
 export function renderShotList() {
   _syncRefs();
   _syncShotsProgressBanner();
@@ -648,6 +662,7 @@ export function renderShotList() {
   if (!project || !project.shots || !project.shots.length) {
     var emptySummaryMeta = $("shotSummaryMeta");
     if (emptySummaryMeta) emptySummaryMeta.textContent = "";
+    _hideScriptRefPanel();
     var ca = $("shotsConfirmArea"); if (ca) ca.hidden = true;
     var emptyActionBar = $("imagesActionBar"); if (emptyActionBar) emptyActionBar.hidden = true;
     var emptyTopActions = $("shotsTopActions"); if (emptyTopActions && !(project && project.shotPlanStatus === "generating")) emptyTopActions.hidden = true;
@@ -849,7 +864,8 @@ function _renderScriptRefPanel() {
   var panel = $("scriptRefPanel");
   if (!colWrap || !panel) return;
   if (!project || !project.script || !project.shots || !project.shots.length) {
-    colWrap.hidden = true; return;
+    _hideScriptRefPanel();
+    return;
   }
   var raw = stripStepTags(project.script).replace(/\r\n/g, "\n");
   _scriptParas = raw.split(/\n{2,}/).map(function (p) { return p.trim(); }).filter(Boolean);

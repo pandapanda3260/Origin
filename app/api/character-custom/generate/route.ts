@@ -143,6 +143,28 @@ export async function POST(req: NextRequest) {
       imagePath: referenceImagePath,
       params,
       sourceType,
+      tokenContext: {
+        ownerId: user.id,
+        usernameSnapshot: user.phone || user.display_name || user.username || null,
+        projectId,
+        projectTitleSnapshot: (project as any)?.title || null,
+        requestPath: req.nextUrl.pathname,
+        routeName: 'character-custom.generate',
+        moduleKey: 'assets',
+        moduleLabel: '资产生成',
+        featureKey: 'custom_character_vision',
+        featureLabel: '自定义角色参考图识别',
+        callItemType: 'custom_character_version',
+        callItemId: versionId,
+        callItemLabel: placeholderName,
+        operationKey: `custom-character:${versionId}:vision`,
+        operationLabel: '自定义角色参考图识别',
+        meta: {
+          characterId,
+          sourceType,
+          hasReferenceImage: !!referenceImagePath,
+        },
+      },
     });
     const isCrowd = isAnonymousCrowdAsset(structuredFields);
     const rawStyleBible = (project as any)?.styleBible || {};

@@ -48,9 +48,17 @@ var _tailFramesGenerating = false;
 var _promptsConverting = false;
 var IMG_PARALLEL = 3;
 var MAX_SHOTS_PER_GROUP = 5;
+var KEYFRAME_PROGRESS_INITIAL_SEC = 70;
 var _sbCurrentIdx = 0;
 var _sbProgrammaticScrolling = false;
 var _sbScrollSettleTimer = null;
+var SB_INDEX_RAIL_ANCHOR_EPSILON = 2;
+var _sbIndexRailActiveShotIdx = null;
+var _sbIndexRailProgrammaticScrolling = false;
+var _sbIndexRailScrollSettleTimer = null;
+var _sbIndexRailSyncRaf = 0;
+var _sbIndexRailViewportSyncBound = false;
+var _sbIndexRailResizeObserver = null;
 var _firstFramePreflightState = { key: "", status: "idle", payload: null, message: "", promise: null };
 var FIRST_FRAME_DEFAULT_HINT = "基于片段镜头与资产生成关键帧，并管理可选尾帧";
 var FIRST_FRAME_REWRITE_CHAT_ENABLED = false;
@@ -62,6 +70,51 @@ var FFE_AUTOSAVE_SAVING_VISIBLE_MS = 500;
 // 用于 textarea maxlength、计数器，以及 _ffeDraftForCompare 保存前比较规范化。
 var FFE_PROMPT_OVERRIDE_MAX_CHARS = 5000;
 var FFE_NEGATIVE_PROMPT_MAX_CHARS = 500;
+
+function _keyframeProgressConcurrency() {
+  return Math.max(1, Number(IMG_PARALLEL) || 3);
+}
+
+function _keyframeRemainingSeconds(done, fail, total, startTs) {
+  total = Math.max(0, Number(total) || 0);
+  done = Math.max(0, Number(done) || 0);
+  fail = Math.max(0, Number(fail) || 0);
+  var pending = Math.max(0, total - done - fail);
+  if (!pending) return 0;
+  var completed = done + fail;
+  var avg = completed >= 1 && startTs
+    ? Math.max(8, (Date.now() - startTs) / 1000 / completed)
+    : KEYFRAME_PROGRESS_INITIAL_SEC;
+  return Math.max(1, Math.ceil(pending * avg / _keyframeProgressConcurrency()));
+}
+
+function _formatKeyframeProgress(done, total, fail, startTs) {
+  total = Math.max(0, Number(total) || 0);
+  done = Math.max(0, Number(done) || 0);
+  fail = Math.max(0, Number(fail) || 0);
+  var visibleDone = Math.min(total || done + fail, done + fail);
+  var lines = ["生成中…… " + visibleDone + "/" + (total || "?")];
+  if (fail > 0) lines.push(fail + " 张失败");
+  var remain = _keyframeRemainingSeconds(done, fail, total, startTs);
+  if (remain > 0) lines.push("约剩 " + remain + " 秒");
+  return lines.join("，");
+}
+
+function _showKeyframeHeaderProgress(done, total, fail, startTs) {
+  var el = $("shotsKeyframeProgress");
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = _formatKeyframeProgress(done, total, fail, startTs);
+  el.classList.toggle("is-warning", Number(fail) > 0);
+}
+
+function _hideKeyframeHeaderProgress() {
+  var el = $("shotsKeyframeProgress");
+  if (!el) return;
+  el.hidden = true;
+  el.textContent = "";
+  el.classList.remove("is-warning");
+}
 
 function _ffeInitialAutoSaveState() {
   return {
@@ -295,6 +348,7 @@ async function _maybeAutoStartTailFramesFromCurrentProject(projectId, sourceBatc
     await generateAllTailFrames({
       targets: targets,
       buttonId: opts.buttonId || 'btnGenAllImages',
+      progressState: opts.progressState || null,
     });
     return true;
   } catch (e) {
@@ -417,6 +471,7 @@ function _reattachImagesBatch(b) {
   if (isComplete) {
     _clearStoryboardReattachRunning(originId, batchId);
     _imagesGenerating = false;
+    _hideKeyframeHeaderProgress();
     checkImagesConfirm();
     var terminalReloadKey = _storyboardBatchKey(originId, batchId);
     _scheduleStoryboardTerminalProjectReload(originId, batchId, {
@@ -437,35 +492,24 @@ function _reattachImagesBatch(b) {
   var btn = $("btnGenAllImages");
   var hint = $("imagesHint");
   if (btn) btn.disabled = true;
-  if (hint) hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + (snap.total || "?");
-
-  // 刷新后重连场景：把 #sbDiagnostic 改成倒计时（同 generateAllImages 路径）
-  var rDiagBox = $("sbDiagnostic");
   var rDoneCount = snap.succeeded || 0;
   var rFailCount = snap.failed || 0;
   var rTotal = snap.total || 0;
   // 刷新后没有"本次生成开始时刻"，从 batch 创建时间近似（不准但够用）
   var rStartTs = b.createdAt ? new Date(b.createdAt).getTime() : Date.now();
+  if (hint) hint.textContent = "生成中… " + rDoneCount + "/" + (rTotal || "?");
   function _renderEtaR() {
-    if (!rDiagBox || !rTotal) return;
-    var pending = Math.max(0, rTotal - rDoneCount - rFailCount);
-    var lines = ["生成中… " + rDoneCount + "/" + rTotal];
-    if (rFailCount > 0) lines.push(rFailCount + " 张失败");
-    if (pending > 0) {
-      var avg = (rDoneCount + rFailCount >= 1)
-        ? Math.max(8, (Date.now() - rStartTs) / 1000 / (rDoneCount + rFailCount))
-        : 70;
-      var remain = Math.ceil(pending * avg / 4);
-      lines.push("约剩 " + remain + " 秒");
-    }
-    rDiagBox.innerHTML = '<div class="diag-empty" style="text-align:center;padding:8px 0;font-weight:500;color:#475569;">' +
-      escapeHtml(lines.join("，")) +
-      '</div>';
+    if (!rTotal) return;
+    _showKeyframeHeaderProgress(rDoneCount, rTotal, rFailCount, rStartTs);
   }
   _renderEtaR();
   var rTick = setInterval(_renderEtaR, 1000);
   function _stopTickR() { if (rTick) { clearInterval(rTick); rTick = null; } }
-  function _clearEtaR() { if (rDiagBox) rDiagBox.innerHTML = ''; }
+  function _clearEtaR() {
+    _hideKeyframeHeaderProgress();
+    var rDiagBox = $("sbDiagnostic");
+    if (rDiagBox) rDiagBox.innerHTML = '';
+  }
 
   subscribeBatch(batchId, {
     onSnapshot: function (s) {
@@ -587,6 +631,7 @@ function _reattachTailFrameBatch(b) {
   if (isComplete) {
     _clearStoryboardReattachRunning(originId, batchId);
     _setTailFramesGenerating(false);
+    _hideKeyframeHeaderProgress();
     _scheduleStoryboardTerminalProjectReload(originId, batchId, {
       reason: "tail_frame_images_terminal_snapshot",
       confirmImages: false,
@@ -596,7 +641,29 @@ function _reattachTailFrameBatch(b) {
 
   // 订阅剩余进度。尾帧不复用首帧 _imagesGenerating 锁, 但需要独立标记全局按钮为生成中。
   _setTailFramesGenerating(true);
+  var tailDoneCount = snap.succeeded || 0;
+  var tailFailCount = snap.failed || 0;
+  var tailTotal = snap.total || tasks.length || 0;
+  var tailStartTs = b.createdAt ? new Date(b.createdAt).getTime() : Date.now();
+  function _renderTailEtaR() {
+    if (!tailTotal) return;
+    _showKeyframeHeaderProgress(tailDoneCount, tailTotal, tailFailCount, tailStartTs);
+  }
+  _renderTailEtaR();
+  var tailEtaTick = setInterval(_renderTailEtaR, 1000);
+  function _stopTailEtaR() { if (tailEtaTick) { clearInterval(tailEtaTick); tailEtaTick = null; } }
+  function _clearTailEtaR() {
+    _stopTailEtaR();
+    _hideKeyframeHeaderProgress();
+  }
   subscribeBatch(batchId, {
+    onSnapshot: function (s) {
+      if (!s || typeof s.total !== 'number') return;
+      tailTotal = s.total;
+      if (typeof s.succeeded === 'number') tailDoneCount = s.succeeded;
+      if (typeof s.failed === 'number') tailFailCount = s.failed;
+      _renderTailEtaR();
+    },
     onTaskCompleted: function (data) {
       var extra = (data && data.extra) || {};
       var target = (data && data.target) || {};
@@ -611,6 +678,8 @@ function _reattachTailFrameBatch(b) {
         proj.storyboards[gIdx2] = existing;
       });
       renderStoryboardFrameCard(gIdx2, 'tail', 'done', { imgUrl: rawUrl });
+      tailDoneCount++;
+      _renderTailEtaR();
     },
     onTaskFailed: function (data) {
       var extra = (data && data.extra) || {};
@@ -623,10 +692,13 @@ function _reattachTailFrameBatch(b) {
       _clearFailedTailFrameLocally(gIdx2, errMsg2, extra, originId);
       if (_isImageSafetyBlocked(errRecord2.imageSafetyAudit, errRecord2.message || displayMsg2)) renderImageGrid();
       else renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
+      tailFailCount++;
+      _renderTailEtaR();
     },
     onBatchCompleted: function () {
       _clearStoryboardReattachRunning(originId, batchId);
       _setTailFramesGenerating(false);
+      _clearTailEtaR();
       _scheduleStoryboardTerminalProjectReload(originId, batchId, {
         reason: "tail_frame_images_sse_completed",
         confirmImages: false,
@@ -635,6 +707,7 @@ function _reattachTailFrameBatch(b) {
     onClose: function () {
       _clearStoryboardReattachRunning(originId, batchId);
       _setTailFramesGenerating(false);
+      _clearTailEtaR();
       /* SSE 断开由 polling 兜底, 或由后端最终 snapshot 修正 */
     },
   });
@@ -6383,8 +6456,11 @@ function _storyboardIndexRailHasFailure(sb) {
 function _setStoryboardIndexRailActive(shotIdx) {
   var rail = $("sbIndexRail");
   if (!rail) return;
+  shotIdx = Number(shotIdx);
+  if (!Number.isFinite(shotIdx)) return;
+  _sbIndexRailActiveShotIdx = shotIdx;
   rail.querySelectorAll(".sb-index-rail-btn").forEach(function (btn) {
-    btn.classList.toggle("is-active", Number(btn.dataset.shotIdx) === Number(shotIdx));
+    btn.classList.toggle("is-active", Number(btn.dataset.shotIdx) === shotIdx);
   });
 }
 
@@ -6417,14 +6493,117 @@ function _positionStoryboardIndexRail() {
   }
 }
 
+function _storyboardIndexRailAnchorY() {
+  var rail = $("sbIndexRail");
+  if (!rail || rail.hidden) return 112;
+  var firstButton = rail.querySelector(".sb-index-rail-btn");
+  if (firstButton) return firstButton.getBoundingClientRect().top;
+  return rail.getBoundingClientRect().top || 112;
+}
+
+function _shotCardsForIndexRail() {
+  var root = $("shotListWrap");
+  return root ? Array.prototype.slice.call(root.querySelectorAll(".shot-workbench-card[data-shot-idx]")) : [];
+}
+
+function _currentShotIdxForIndexRailViewport() {
+  var cards = _shotCardsForIndexRail().filter(function (card) {
+    var idx = Number(card.dataset.shotIdx);
+    return Number.isFinite(idx);
+  });
+  if (!cards.length) return null;
+  var anchorY = _storyboardIndexRailAnchorY();
+  var testY = anchorY + SB_INDEX_RAIL_ANCHOR_EPSILON;
+  var previousIdx = null;
+  for (var i = 0; i < cards.length; i++) {
+    var rect = cards[i].getBoundingClientRect();
+    var shotIdx = Number(cards[i].dataset.shotIdx);
+    if (rect.top <= testY && rect.bottom > testY) return shotIdx;
+    if (rect.top <= testY) previousIdx = shotIdx;
+  }
+  if (previousIdx !== null) return previousIdx;
+  return Number(cards[0].dataset.shotIdx);
+}
+
+function _syncStoryboardIndexRailFromViewport() {
+  var rail = $("sbIndexRail");
+  if (!rail || rail.hidden) return;
+  if (_sbIndexRailProgrammaticScrolling) return;
+  if (!rail.querySelector(".sb-index-rail-btn")) return;
+  if (!_shotCardsForIndexRail().length) return;
+  var shotIdx = _currentShotIdxForIndexRailViewport();
+  if (shotIdx === null) return;
+  _setStoryboardIndexRailActive(shotIdx);
+}
+
+function _scheduleStoryboardIndexRailViewportSync(opts) {
+  opts = opts || {};
+  var reposition = !!opts.reposition;
+  if (_sbIndexRailSyncRaf) return;
+  _sbIndexRailSyncRaf = requestAnimationFrame(function () {
+    _sbIndexRailSyncRaf = 0;
+    if (reposition) _positionStoryboardIndexRail();
+    _syncStoryboardIndexRailFromViewport();
+  });
+}
+
+function _bindStoryboardIndexRailViewportSync() {
+  if (!_sbIndexRailViewportSyncBound) {
+    _sbIndexRailViewportSyncBound = true;
+    window.addEventListener("scroll", function () {
+      _scheduleStoryboardIndexRailViewportSync();
+    }, { passive: true });
+    window.addEventListener("resize", function () {
+      _scheduleStoryboardIndexRailViewportSync({ reposition: true });
+    });
+  }
+  if (_sbIndexRailResizeObserver && _sbIndexRailResizeObserver.disconnect) {
+    _sbIndexRailResizeObserver.disconnect();
+    _sbIndexRailResizeObserver = null;
+  }
+  var root = $("shotListWrap");
+  if (root && typeof ResizeObserver !== "undefined") {
+    _sbIndexRailResizeObserver = new ResizeObserver(function () {
+      _scheduleStoryboardIndexRailViewportSync();
+    });
+    _sbIndexRailResizeObserver.observe(root);
+  }
+}
+
+function _waitForIndexRailScrollSettle(targetScrollY, shotIdx) {
+  var lastY = window.scrollY || window.pageYOffset || 0;
+  var stableFrames = 0;
+  function tick() {
+    var currentY = window.scrollY || window.pageYOffset || 0;
+    var nearTarget = Math.abs(currentY - targetScrollY) < 2;
+    var stable = Math.abs(currentY - lastY) < 0.5;
+    stableFrames = (nearTarget || stable) ? stableFrames + 1 : 0;
+    lastY = currentY;
+    if (stableFrames >= 2) {
+      _sbIndexRailProgrammaticScrolling = false;
+      _sbIndexRailScrollSettleTimer = null;
+      _setStoryboardIndexRailActive(shotIdx);
+      _scheduleStoryboardIndexRailViewportSync();
+      return;
+    }
+    _sbIndexRailScrollSettleTimer = setTimeout(tick, 80);
+  }
+  _sbIndexRailScrollSettleTimer = setTimeout(tick, 80);
+}
+
 function _scrollToShotCardFromRail(shotIdx) {
   var selector = '.shot-workbench-card[data-shot-idx="' + String(shotIdx) + '"]';
   var root = $("shotListWrap");
   var card = root && root.querySelector(selector);
   if (!card) card = document.querySelector(selector);
   if (!card) return;
-  var firstRailBtn = $("sbIndexRail") && $("sbIndexRail").querySelector(".sb-index-rail-btn");
-  var targetTop = firstRailBtn ? firstRailBtn.getBoundingClientRect().top : 112;
+  if (_sbIndexRailScrollSettleTimer) {
+    clearTimeout(_sbIndexRailScrollSettleTimer);
+    _sbIndexRailScrollSettleTimer = null;
+  }
+  _sbIndexRailProgrammaticScrolling = true;
+  _setStoryboardIndexRailActive(shotIdx);
+  var targetTop = _storyboardIndexRailAnchorY();
   var cardTop = card.getBoundingClientRect().top;
   var nextScrollY = window.scrollY + cardTop - targetTop;
   try {
@@ -6432,7 +6611,7 @@ function _scrollToShotCardFromRail(shotIdx) {
   } catch (_e) {
     window.scrollTo(0, Math.max(0, nextScrollY));
   }
-  _setStoryboardIndexRailActive(shotIdx);
+  _waitForIndexRailScrollSettle(Math.max(0, nextScrollY), shotIdx);
 }
 
 function _renderStoryboardIndexRail(groups, isShotLayout) {
@@ -6442,6 +6621,7 @@ function _renderStoryboardIndexRail(groups, isShotLayout) {
   if (!isShotLayout || !shots.length || shots.length < 2) {
     rail.hidden = true;
     rail.innerHTML = "";
+    _sbIndexRailActiveShotIdx = null;
     return;
   }
   var html = '<div class="sb-index-rail-inner">';
@@ -6465,6 +6645,8 @@ function _renderStoryboardIndexRail(groups, isShotLayout) {
       _scrollToShotCardFromRail(shotIdx);
     });
   });
+  _bindStoryboardIndexRailViewportSync();
+  _scheduleStoryboardIndexRailViewportSync();
 }
 
 export function renderImageGrid() {
@@ -6878,6 +7060,21 @@ function _tailKeyframeTargets(groups, opts) {
     targets.push({ groupIdx: i, idx: i, shotIndices: (group && group.shotIndices) || [] });
   }
   return targets;
+}
+
+function _plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode) {
+  groups = groups || getStoryboardGroups();
+  buttonState = buttonState || {};
+  if (tailKeyframeMode === 'all') {
+    var allCount = 0;
+    for (var i = 0; i < groups.length; i++) {
+      var sb = (project.storyboards && project.storyboards[i]) || {};
+      if (_isTailKeyframeWanted(groups[i], sb)) allCount++;
+    }
+    return allCount;
+  }
+  if (tailKeyframeMode === 'failed') return (buttonState.failedTail || []).length;
+  return (buttonState.pendingTailKeyframes || []).length;
 }
 
 function _isFirstFrameStale(gIdx) {
@@ -7712,6 +7909,16 @@ export async function generateAllTailFrames(opts) {
     _setTailFramesGenerating(false);
     return;
   }
+  var externalProgressState = opts.progressState && typeof opts.progressState === 'object'
+    ? opts.progressState
+    : null;
+  if (externalProgressState) {
+    var minimumTotal = Number(externalProgressState.done || 0) +
+      Number(externalProgressState.fail || 0) +
+      targets.length;
+    externalProgressState.total = Math.max(Number(externalProgressState.total || 0), minimumTotal);
+    if (!externalProgressState.startTs) externalProgressState.startTs = Date.now();
+  }
 
   return new Promise(function (resolve) {
     var settled = false;
@@ -7721,12 +7928,27 @@ export async function generateAllTailFrames(opts) {
     var doneCount = 0;
     var failCount = 0;
     var finishingFromServer = null;
+    var tailProgress = externalProgressState || {
+      done: 0,
+      fail: 0,
+      total: totalCount,
+      startTs: Date.now(),
+    };
+    var tailEtaTick = setInterval(_renderTailEta, 1000);
 
     function _stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+    function _stopTailEta() { if (tailEtaTick) { clearInterval(tailEtaTick); tailEtaTick = null; } }
+    function _renderTailEta() {
+      _showKeyframeHeaderProgress(tailProgress.done, tailProgress.total, tailProgress.fail, tailProgress.startTs);
+    }
+    _renderTailEta();
+
     function finish() {
       if (settled) return;
       settled = true;
       _stopPoll();
+      _stopTailEta();
+      _hideKeyframeHeaderProgress();
       if (btn) btn.disabled = false;
       _setTailFramesGenerating(false);
       if (failCount === 0) {
@@ -7767,6 +7989,8 @@ export async function generateAllTailFrames(opts) {
       renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: rawUrl });
       completedIdx[gIdx] = 'done';
       doneCount++;
+      tailProgress.done = Number(tailProgress.done || 0) + 1;
+      _renderTailEta();
     }
     function _failOne(extra, errMsg) {
       var gIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
@@ -7778,6 +8002,8 @@ export async function generateAllTailFrames(opts) {
       else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
       completedIdx[gIdx] = 'failed';
       failCount++;
+      tailProgress.fail = Number(tailProgress.fail || 0) + 1;
+      _renderTailEta();
     }
 
     async function _pollOnce() {
@@ -7812,6 +8038,11 @@ export async function generateAllTailFrames(opts) {
     pollTimer = setInterval(_pollOnce, 5000);
 
     subscribeBatch(startResp.batchId, {
+      onSnapshot: function (snap) {
+        if (!snap || typeof snap.total !== 'number') return;
+        totalCount = snap.total;
+        _renderTailEta();
+      },
       onTaskCompleted: function (data) {
         var extra = (data && data.extra) || {};
         var patch = (data && data.patch) || {};
@@ -7950,6 +8181,9 @@ export async function generateAllImages() {
   var runTailKeyframesAfterFirst = buttonState.pendingTailKeyframes.length > 0 ||
     buttonState.failedTail.length > 0 ||
     buttonState.action === 'regenerate_all';
+  var plannedTailKeyframeCount = runTailKeyframesAfterFirst
+    ? _plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode)
+    : 0;
   if (!targets.length) {
     var tailOnlyTargets = _tailKeyframeTargets(groups, {
       failedOnly: tailKeyframeMode === 'failed',
@@ -7971,36 +8205,29 @@ export async function generateAllImages() {
   if (hint) hint.textContent = "正在生成 " + totalCount + " 张关键帧…";
   targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "loading", null, "生成关键帧中…"); });
 
-  // —— 倒计时区域 ——
-  // 用户反馈："这个位置改成倒计时吧 还有多久能生成完"。
-  // 借用之前给"门控诊断"留的 #sbDiagnostic 容器，生成期间把它改成
-  // 动态倒计时（done/total + 估算剩余秒数）；批次结束后清空。
-  // 估算逻辑：等真实跑完 1 张以后用实测速度，否则给 70 秒/张的初始猜测
-  //（gpt-image medium 实测）；后端并发 4 → 墙钟剩余时间 ≈ pending × avgSec ÷ 4。
+  var doneCount = 0;
+  var failCount = 0;
+  var finished = false;
+  var keyframeProgressState = {
+    done: 0,
+    fail: 0,
+    total: totalCount + plannedTailKeyframeCount,
+    startTs: Date.now(),
+  };
+  // 标题下方进度行：等真实跑完 1 张以后用实测速度，否则用保守初始猜测；
+  // 并发估算来自当前前端图片并发常量，避免标题 ETA 和调度上限明显偏离。
   var diagBox = $("sbDiagnostic");
-  var etaStartTs = Date.now();
   function _renderEta() {
-    if (!diagBox) return;
-    var done = doneCount;
-    var fail = failCount;
-    var pending = Math.max(0, totalCount - done - fail);
-    var lines = ["生成中… " + done + "/" + totalCount];
-    if (fail > 0) lines.push(fail + " 张失败");
-    if (pending > 0) {
-      var avg = (done + fail >= 1)
-        ? (Date.now() - etaStartTs) / 1000 / (done + fail)
-        : 70;
-      var remain = Math.ceil(pending * avg / 4);
-      lines.push("约剩 " + remain + " 秒");
-    }
-    diagBox.innerHTML = '<div class="diag-empty" style="text-align:center;padding:8px 0;font-weight:500;color:#475569;">' +
-      escapeHtml(lines.join("，")) +
-      '</div>';
+    _showKeyframeHeaderProgress(
+      keyframeProgressState.done,
+      keyframeProgressState.total,
+      keyframeProgressState.fail,
+      keyframeProgressState.startTs,
+    );
   }
   function _clearEta() {
-    if (!diagBox) return;
-    // 批次结束后清空——后续门控诊断面板自己回填（如果有数据的话）
-    diagBox.innerHTML = '';
+    _hideKeyframeHeaderProgress();
+    if (diagBox) diagBox.innerHTML = '';
   }
   _renderEta();
   // 兜底：定期 tick 让"约剩 N 秒"自然减少（即便 SSE / poll 没新事件）
@@ -8027,6 +8254,8 @@ export async function generateAllImages() {
     _sbMarkFirstFrameCardPromptDraftCommitPendingForTargets(targets);
   } catch (e) {
     console.error('[generateAllImages] /api/batch/start failed:', e);
+    _stopEtaTick();
+    _clearEta();
     if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
       if (hint) hint.textContent = '积分不足';
       showBillingPaywall(e.billing || null);
@@ -8048,15 +8277,15 @@ export async function generateAllImages() {
     return;
   }
 
-  var doneCount = 0;
-  var failCount = 0;
-  var finished = false;
-
   function finish() {
     if (finished) return;
     finished = true;
     _stopEtaTick();
-    _clearEta();
+    if (!runTailKeyframesAfterFirst) {
+      _clearEta();
+    } else if (diagBox) {
+      diagBox.innerHTML = '';
+    }
     var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
     if (hint) hint.textContent = done + "/" + groups.length + " 张关键帧已生成";
     var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
@@ -8067,8 +8296,10 @@ export async function generateAllImages() {
         includeReady: tailKeyframeMode === 'all',
         buttonId: 'btnGenAllImages',
         hintId: 'imagesHint',
+        progressState: keyframeProgressState,
       })
         .finally(function () {
+          _hideKeyframeHeaderProgress();
           _imagesGenerating = false;
           if (btn) btn.disabled = false;
           var finalGroups = getStoryboardGroups();
@@ -8100,6 +8331,7 @@ export async function generateAllImages() {
     if (_seenDone[groupIdx]) return;  // 已处理过
     _seenDone[groupIdx] = true;
     doneCount++;
+    keyframeProgressState.done++;
 
     var imageAssetId = (extra && extra.assetId) || '';
     var shotIndices = (extra && Array.isArray(extra.shotIndices)) ? extra.shotIndices : null;
@@ -8132,6 +8364,7 @@ export async function generateAllImages() {
     if (_seenFailed[groupIdx] || _seenDone[groupIdx]) return;
     _seenFailed[groupIdx] = true;
     failCount++;
+    keyframeProgressState.fail++;
     var displayMsg = _firstFrameFailureDisplay(errMsg || '生成失败', extra);
     _clearFailedStoryboardLocally(groupIdx, displayMsg, extra, originId);
     var audit = _imageSafetyAuditFromExtra(extra);
@@ -8204,6 +8437,7 @@ export async function generateAllImages() {
     onSnapshot: function (snap) {
       if (hint && snap && typeof snap.total === 'number') {
         hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
+        _renderEta();
       }
     },
     onTaskStarted: function (data) {

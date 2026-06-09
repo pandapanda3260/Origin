@@ -128,12 +128,12 @@ function previewUrlsFromEntities(items: any[], max = 4) {
     .slice(0, max);
 }
 
-function worldCharacterKey(character: any) {
+export function worldCharacterKey(character: any) {
   if (!character || typeof character !== 'object') return firstText(character).toLowerCase();
   return firstText(character.characterId, character.id, character.sourceAssetId, character.name, character.title, character.role).toLowerCase();
 }
 
-function mergeWorldCharacterPools(...pools: any[]) {
+export function mergeWorldCharacterPools(...pools: any[]) {
   const byKey = new Map<string, any>();
   const out: any[] = [];
   for (const pool of pools) {

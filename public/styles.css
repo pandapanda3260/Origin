@@ -220,6 +220,7 @@ body.is-activating [data-write-action] {
   background: transparent;
   border: 0;
   box-shadow: none;
+  gap: 5px !important; /* 覆盖 gap-3(12px)：图标→文字间距 5px；chevron 仍贴右不受影响 */
 }
 .account-entry-icon {
   color: rgba(44, 62, 80, 0.76);
@@ -1224,8 +1225,17 @@ body.is-online-editor-page .agent-panel {
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes shotsPageEnterOpacity {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 .page-scroll.page-enter-anim {
   animation: pageEnterAnim 0.28s ease-out both;
+}
+
+#pageShots.page-enter-anim {
+  animation-name: shotsPageEnterOpacity;
 }
 
 /* Scrollbar styling for page areas */
@@ -9236,6 +9246,17 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 850;
   letter-spacing: 0.16em;
 }
+.shots-keyframe-progress {
+  margin: 8px 0 0;
+  color: #0B7F55;
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+.shots-keyframe-progress.is-warning {
+  color: #A16207;
+}
 .script-header-actions {
   display: flex;
   align-items: center;
@@ -12286,6 +12307,54 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 900;
   letter-spacing: 0.08em;
   user-select: none;
+}
+.lib-world-preview-stack {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding-left: 10px;
+}
+.lib-world-preview-slot {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: -10px;
+  overflow: hidden;
+  border: 2px solid #fff;
+  border-radius: 9999px;
+  background: #EEF5F8;
+  color: #2C3E50;
+  box-shadow: 0 8px 18px rgba(44, 62, 80, 0.12);
+}
+.lib-world-preview-slot:first-child {
+  margin-left: 0;
+}
+.lib-world-preview-slot img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+.lib-world-preview-slot--scene {
+  background: #EAF4F0;
+  color: #2E6F5C;
+}
+.lib-world-preview-slot--prop {
+  background: #F4F0E8;
+  color: #78613A;
+}
+.lib-world-preview-slot--more {
+  background: #2C3E50;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 900;
+}
+.lib-world-preview-empty-icon {
+  font-size: 17px;
 }
 #libProjectTabs .lib-proj-btn {
   max-width: min(260px, 100%);
@@ -18377,3 +18446,87 @@ body.first-frame-editor-lock {
   padding-left: 1.5rem;
   width: calc(100% + 1.5rem);
 }
+
+/* ════════════════════════════════════════════════════════════════
+   侧栏整体缩小（目标：≈800px 屏高下，从 Logo 到底部用户入口一屏放下，无需滚动）
+   ----------------------------------------------------------------
+   需求口径：只缩尺寸，不动 DOM 结构 / 配色 / 圆角 / 点阵 / 竖线光点 /
+            hover / 点击动效 / 跳转功能。
+   做法：等比例收小 Logo、图标、字号、上下间距，并把宽度小幅变窄。
+        纵向间距收得多（内容溢出的主因），字号/图标收得少（中文可读下限）。
+   宽度：288px → 256px，必须三处同步——#sidebar 宽、主内容 margin-left、
+        在线剪辑页 #pageOnlineEditor 的 left（否则正文/剪辑页会和侧栏错位）。
+   横向 px-6(1.5rem) 故意保持不变：#sidebarNavTrackHost 的光点裁剪补偿依赖它。
+   选择器全部用 #sidebar / 双 class 提高 specificity 盖过 Tailwind 单 class，无需 !important。
+   回退：git reset --hard d4aa04a，或直接删除本块即恢复原始尺寸。
+   ════════════════════════════════════════════════════════════════ */
+
+/* 宽度三处同步：288px → 256px */
+#sidebar { width: 256px; }
+main.main-area { margin-left: 256px; }
+#pageOnlineEditor:not([hidden]) { left: 256px; }
+
+/* 侧栏自身上下留白：py-8(32px) → 顶 36 / 底 18（左右 px-6 不动）。
+   顶部留 36 给 Logo 上方呼吸空间。 */
+#sidebar {
+  padding-top: 36px;
+  padding-bottom: 18px;
+}
+
+/* 顶部 Logo 区：图 144→92，整块底距 mb-4(16)→14（拉开 Logo 区与「任务列表」） */
+#sidebar > div:first-child { margin-bottom: 14px; }
+#sidebar img[alt="ORIGIN"] { width: 92px; height: 92px; }
+
+/* 「任务列表」入口：按钮上下 12→8，外层块底距 pb-5(20)→12 */
+#navTaskListShortcut {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+#sidebar > div:nth-child(2) { padding-bottom: 12px; }
+
+/* 所有导航项（剧本…剪辑 / 素材库…角色定制 / 底部用户入口同用 .sw-nav-item）：
+   上下 py-3(12)→7、字号 14→13、图标-文字间距 gap-3(12)→9.6、图标 24→20 */
+#sidebar .sw-nav-item {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  font-size: 13px;
+  gap: 0.6rem;
+}
+#sidebar .sw-nav-item .material-symbols-outlined {
+  font-size: 20px;
+}
+
+/* 导航项之间的间距：space-y-1(4px) → 6px（剧本…剪辑、素材库…角色定制都更透气；
+   不含底部用户入口） */
+#sidebar .sw-nav-item + .sw-nav-item:not(.account-entry) {
+  margin-top: 6px;
+}
+
+/* 「剪辑」入口与下方「分集」分界线的间距：分集区上内边距 pt-2(8) → 14 */
+#sidebarPipelineWrap + div {
+  padding-top: 14px;
+}
+
+/* 底部用户入口：去掉 52px 高度下限，用户名/套餐/箭头收小 */
+#sidebar .account-entry { min-height: 0; }
+/* 用户入口图标放大到 30px。账户高亮框左边界与「任务列表」框左边界对齐（距侧栏左 28px =
+   侧栏 px-6 24 + 任务列表外层 px-1 4）：#accountBar 负 margin 左移 20px + 同量加宽保持
+   右边界不变。图标再留 10px 左内边距，与高亮框左边界拉开 10px（图标落在 38px）。
+   外层 pl-6 不动，保留账户弹出菜单 .account-menu-popover 的定位。 */
+.account-entry-icon { width: 30px; flex: 0 0 30px; font-size: 30px; }
+#accountBar {
+  margin-left: -20px;
+  width: calc(100% + 20px);
+  padding-left: 10px;
+}
+.account-entry-name { font-size: 13px; }
+.account-entry-plan { font-size: 10px; }
+.account-entry-chevron { font-size: 18px; }
+
+/* 分集列表：集数变多时只在分集区内部滚动，不挤掉下方固定入口（~2 行封顶，滚动条隐藏） */
+#episodeTabsWrap {
+  max-height: 96px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+#episodeTabsWrap::-webkit-scrollbar { width: 0; height: 0; }

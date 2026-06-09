@@ -37,6 +37,6 @@ assert(refreshBlock.includes('_syncShotsProgressBanner();'), 'shots page refresh
 const renderBlock = section(shots, 'export function renderShotList()', 'function _renderScriptRefPanel');
 assert(renderBlock.includes('_syncShotsProgressBanner();'), 'shot list render should clear stale banner');
 
-assert(main.includes("./modules/shots.js?v=104"), 'main import should bump shots.js cache version');
+assert(/\.\/modules\/shots\.js\?v=\d+/.test(main), 'main import should carry a shots.js cache-bust version');
 
 console.log('shots progress banner reset contract ok');

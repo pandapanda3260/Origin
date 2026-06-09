@@ -253,7 +253,7 @@ function isTextFallbackEligible(error: any): boolean {
   ].some((needle) => message.includes(needle));
 }
 
-async function observeTextModelCall<T>(
+export async function observeTextModelCall<T>(
   cfg: ResolvedModelConfig,
   opts: LLMOptions,
   fn: () => Promise<T>,

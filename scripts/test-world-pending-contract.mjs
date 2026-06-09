@@ -15,6 +15,9 @@ assert.ok(!extractSource.includes('worldSnapshotMerge'));
 
 const assetsSource = readFileSync(new URL('../public/modules/assets.js', import.meta.url), 'utf8');
 assert.ok(assetsSource.includes('export async function openKnowledgeSnapshot'));
+assert.ok(assetsSource.includes('function _flushAssetsProjectNow()'));
+assert.ok(assetsSource.includes('if (_ctx.persistWorldTemplateSelection)'));
+assert.ok(assetsSource.includes('_ctx.persistWorldTemplateSelection(intent);'));
 assert.ok(!assetsSource.includes('export async function confirmPendingWorldFacts'));
 assert.ok(!assetsSource.includes('_renderKnowledgePendingWorldFacts'));
 assert.ok(!assetsSource.includes('function _pendingWorldFactsSummary'));
@@ -24,6 +27,11 @@ assert.ok(!assetsSource.includes('project.worldTemplateSnapshot = snapshot'));
 const mainSource = readFileSync(new URL('../public/main.js', import.meta.url), 'utf8');
 assert.ok(mainSource.includes('openKnowledgeSnapshot'));
 assert.ok(mainSource.includes('btnKnowledgeSnapshot'));
+assert.ok(mainSource.includes('function _persistStyleWorldIntent(intent)'));
+assert.ok(mainSource.includes('return _flushStyleWorldIntent(job, 0);'));
+assert.ok(mainSource.includes('if (result && result.stale && attempt < 1)'));
+assert.ok(mainSource.includes('_persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null });'));
+assert.ok(mainSource.includes('persistWorldTemplateSelection: (intent) => _persistStyleWorldIntent(intent)'));
 assert.ok(!mainSource.includes('confirmPendingWorldFacts'));
 assert.ok(!mainSource.includes('btnConfirmPendingWorldFacts'));
 

@@ -3,11 +3,12 @@ import { readFileSync } from 'node:fs';
 import type { UserRow } from './db';
 import { buildAssetStyleLock } from './asset-style-lock';
 import { appendCharacterCastingPrompt } from './casting-profile';
-import { applyTokenBudget, chatComplete } from './llm';
+import { applyTokenBudget, chatComplete, observeTextModelCall } from './llm';
 import { resolveTextModelConfig } from './model-routing';
 import { postJsonWithProxySupport } from './proxy-fetch';
 import { getExternalEnvValue } from './env';
 import { normalizeCrowdFlag, normalizeCrowdSize } from './crowd-character';
+import type { TokenUsageContext } from './token-usage';
 
 export type CustomCharacterEntityType = 'auto' | 'human' | 'non-human';
 type ResolvedCustomCharacterEntityType = 'human' | 'non-human';
@@ -231,12 +232,13 @@ export async function buildCustomCharacterFields(input: {
   imagePath?: string | null;
   params: CustomCharacterParams;
   sourceType?: CustomCharacterSourceType;
+  tokenContext?: TokenUsageContext | null;
 }) {
   const prompt = cleanText(input.prompt, 4000);
   if (!input.imagePath) {
     return structureTextCharacter(input.user, prompt, input.params);
   }
-  return structureVisionCharacter(input.user, input.imagePath, prompt, input.params, input.sourceType || 'image');
+  return structureVisionCharacter(input.user, input.imagePath, prompt, input.params, input.sourceType || 'image', input.tokenContext || null);
 }
 
 async function structureTextCharacter(user: UserRow, prompt: string, params: CustomCharacterParams) {
@@ -265,7 +267,14 @@ async function structureTextCharacter(user: UserRow, prompt: string, params: Cus
   return normalizeCustomCharacterFields(parseJsonObject(text), params);
 }
 
-async function structureVisionCharacter(user: UserRow, imagePath: string, prompt: string, params: CustomCharacterParams, sourceType: CustomCharacterSourceType) {
+async function structureVisionCharacter(
+  user: UserRow,
+  imagePath: string,
+  prompt: string,
+  params: CustomCharacterParams,
+  sourceType: CustomCharacterSourceType,
+  tokenContext: TokenUsageContext | null,
+) {
   const cfg = resolveTextModelConfig(user, 'structured');
   if (cfg.mode === 'fake') throw new Error('当前结构化文本模型未配置，无法识别参考图角色');
   if (cfg.provider !== 'openai_responses' && cfg.provider !== 'packy_responses' && cfg.provider !== 'zerail_responses' && cfg.provider !== 'openai_chat') {
@@ -292,10 +301,26 @@ async function structureVisionCharacter(user: UserRow, imagePath: string, prompt
   );
   // 走统一预算层决定输出 token 上限：推理模型会按 reasoning reserve 预留思考额度，
   // 避免“思考占满固定额度 → 正文为空 → JSON 解析失败”这类偶发失败（原来这里硬编码 1400）。
+  const usageOpts = {
+    maxTokens: 8192,
+    traceName: 'custom-character-vision',
+    modelRole: 'structured' as const,
+    tokenContext: {
+      ownerId: user.id,
+      usernameSnapshot: user.phone || user.display_name || user.username || null,
+      moduleKey: 'assets',
+      moduleLabel: '资产生成',
+      featureKey: 'custom_character_vision',
+      featureLabel: '自定义角色参考图识别',
+      operationKey: tokenContext?.operationKey || tokenContext?.callItemId || undefined,
+      operationLabel: tokenContext?.operationLabel || '自定义角色参考图识别',
+      ...(tokenContext || {}),
+    },
+  };
   const budgeted = applyTokenBudget(
     cfg,
     [{ role: 'user' as const, content: textPrompt }],
-    { maxTokens: 8192, traceName: 'custom-character-vision', modelRole: 'structured' },
+    usageOpts,
     'complete',
   );
   const maxOutputTokens = budgeted.maxTokens ?? 8192;
@@ -314,33 +339,41 @@ async function structureVisionCharacter(user: UserRow, imagePath: string, prompt
       text: { format: { type: 'json_object' } },
     };
     if (cfg.reasoningEffort) body.reasoning = { effort: cfg.reasoningEffort };
-    const json = await postJsonWithProxySupport(
-      `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
-      cfg.apiKey,
-      body,
-      timeoutMs,
-      `角色图片识别超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+    const json = await observeTextModelCall(
+      cfg,
+      budgeted,
+      () => postJsonWithProxySupport(
+        `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
+        cfg.apiKey,
+        body,
+        timeoutMs,
+        `角色图片识别超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+      ),
     );
     text = extractResponsesText(json);
   } else {
-    const json = await postJsonWithProxySupport(
-      `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
-      cfg.apiKey,
-      {
-        model: cfg.model,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: textPrompt },
-            { type: 'image_url', image_url: { url: dataUrl } },
-          ],
-        }],
-        max_tokens: maxOutputTokens,
-        temperature: 0.2,
-        response_format: { type: 'json_object' },
-      },
-      timeoutMs,
-      `角色图片识别超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+    const json = await observeTextModelCall(
+      cfg,
+      budgeted,
+      () => postJsonWithProxySupport(
+        `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
+        cfg.apiKey,
+        {
+          model: cfg.model,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: textPrompt },
+              { type: 'image_url', image_url: { url: dataUrl } },
+            ],
+          }],
+          max_tokens: maxOutputTokens,
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+        },
+        timeoutMs,
+        `角色图片识别超时（>${Math.round(timeoutMs / 1000)}s 未返回）`,
+      ),
     );
     text = extractChatText(json);
   }

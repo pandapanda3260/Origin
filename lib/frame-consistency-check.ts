@@ -1,14 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import type { UserRow } from './db';
-import { applyTokenBudget, parseJsonLoose, type ChatMessage } from './llm';
+import { applyTokenBudget, observeTextModelCall, parseJsonLoose, type ChatMessage } from './llm';
 import {
-  recordModelCallEvent,
   resolveTextModelConfig,
   type ResolvedModelConfig,
 } from './model-routing';
 import { postJsonWithProxySupport } from './proxy-fetch';
 import { getExternalEnvValue } from './env';
 import type { FrameImageGenerationPlan, FrameReference, FrameType } from './frame-image-plan';
+import type { TokenUsageContext } from './token-usage';
 
 export type FrameConsistencyGrade = 'pass' | 'warn' | 'fail';
 export type FrameConsistencyStatus = 'checked' | 'skipped' | 'error';
@@ -264,6 +264,7 @@ export async function checkFrameVisualConsistency(args: {
   user: UserRow;
   plan: FrameImageGenerationPlan;
   generatedImagePath?: string | null;
+  tokenContext?: TokenUsageContext | null;
 }): Promise<FrameConsistencyCheckResult> {
   const cfg = resolveTextModelConfig(args.user, 'frameConsistencyCheck');
   const responsesProvider = cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses' || cfg.provider === 'zerail_responses';
@@ -287,15 +288,36 @@ export async function checkFrameVisualConsistency(args: {
 
   const prompt = buildCheckPrompt(args.plan, selectedReferences);
   const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+  const usageOpts = {
+    maxTokens: 1600,
+    traceName: 'frame-consistency-check',
+    modelRole: 'frameConsistencyCheck' as const,
+    responseFormat: 'json_object' as const,
+    tokenContext: {
+      ownerId: args.user.id,
+      usernameSnapshot: args.user.phone || args.user.display_name || args.user.username || null,
+      moduleKey: 'image',
+      moduleLabel: '图片生成',
+      featureKey: 'frame_consistency_check',
+      featureLabel: '首尾帧一致性校验',
+      operationKey: args.tokenContext?.operationKey || args.tokenContext?.callItemId || undefined,
+      operationLabel: args.tokenContext?.operationLabel || '首尾帧一致性校验',
+      ...(args.tokenContext || {}),
+      meta: {
+        ...(args.tokenContext?.meta || {}),
+        frameType: args.plan.frameType,
+        referenceCount: selectedReferences.length,
+      },
+    },
+  };
   const budgeted = applyTokenBudget(
     cfg,
     messages,
-    { maxTokens: 1600, traceName: 'frame-consistency-check', modelRole: 'frameConsistencyCheck', responseFormat: 'json_object' },
+    usageOpts,
     'complete',
   );
   const maxOutputTokens = budgeted.maxTokens ?? 1600;
   const requestTimeoutMs = timeoutMs();
-  const started = Date.now();
 
   try {
     const imageUrls = [generatedPath, ...referencePaths].map(imagePathToDataUrl);
@@ -314,33 +336,41 @@ export async function checkFrameVisualConsistency(args: {
         text: { format: { type: 'json_object' } },
       };
       if (cfg.reasoningEffort) body.reasoning = { effort: cfg.reasoningEffort };
-      const json = await postJsonWithProxySupport(
-        `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
-        cfg.apiKey,
-        body,
-        requestTimeoutMs,
-        `首尾帧视觉一致性校验超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）`,
+      const json = await observeTextModelCall(
+        cfg,
+        budgeted,
+        () => postJsonWithProxySupport(
+          `${cfg.baseUrl}${cfg.endpoint || '/responses'}`,
+          cfg.apiKey,
+          body,
+          requestTimeoutMs,
+          `首尾帧视觉一致性校验超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）`,
+        ),
       );
       text = extractResponsesText(json);
     } else {
-      const json = await postJsonWithProxySupport(
-        `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
-        cfg.apiKey,
-        {
-          model: cfg.model,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
-            ],
-          }],
-          max_tokens: maxOutputTokens,
-          temperature: 0,
-          response_format: { type: 'json_object' },
-        },
-        requestTimeoutMs,
-        `首尾帧视觉一致性校验超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）`,
+      const json = await observeTextModelCall(
+        cfg,
+        budgeted,
+        () => postJsonWithProxySupport(
+          `${cfg.baseUrl}${cfg.endpoint || '/chat/completions'}`,
+          cfg.apiKey,
+          {
+            model: cfg.model,
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: prompt },
+                ...imageUrls.map((url) => ({ type: 'image_url', image_url: { url } })),
+              ],
+            }],
+            max_tokens: maxOutputTokens,
+            temperature: 0,
+            response_format: { type: 'json_object' },
+          },
+          requestTimeoutMs,
+          `首尾帧视觉一致性校验超时（>${Math.round(requestTimeoutMs / 1000)}s 未返回）`,
+        ),
       );
       text = extractChatText(json);
     }
@@ -352,24 +382,8 @@ export async function checkFrameVisualConsistency(args: {
       model: cfg.model,
       provider: cfg.provider,
     });
-    recordModelCallEvent({
-      cfg,
-      slot: 'frameConsistencyCheck',
-      status: 'ok',
-      latencyMs: Date.now() - started,
-      traceName: 'frame-consistency-check',
-      meta: { grade: normalized.grade, frameType: args.plan.frameType },
-    });
     return normalized;
   } catch (err: any) {
-    recordModelCallEvent({
-      cfg,
-      slot: 'frameConsistencyCheck',
-      status: 'error',
-      latencyMs: Date.now() - started,
-      traceName: 'frame-consistency-check',
-      message: err?.message || String(err),
-    });
     return errorResult(args.plan.frameType, err, cfg);
   }
 }

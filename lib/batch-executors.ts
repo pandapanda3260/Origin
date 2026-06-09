@@ -246,6 +246,28 @@ async function generateFrameImageWithConsistencyCheck(args: {
       user: args.ctx.user,
       plan: { ...args.plan, finalPrompt: promptForAttempt },
       generatedImagePath,
+      tokenContext: {
+        ownerId: args.ctx.user.id,
+        usernameSnapshot: args.ctx.user.phone || args.ctx.user.display_name || args.ctx.user.username || null,
+        projectId: args.ctx.projectId,
+        routeName: `batch.${args.progressMode}`,
+        moduleKey: 'image',
+        moduleLabel: '图片生成',
+        featureKey: 'frame_consistency_check',
+        featureLabel: '首尾帧一致性校验',
+        callItemType: 'batch_task',
+        callItemId: args.ctx.taskId,
+        callItemLabel: `${args.progressMode} #${args.groupIdx + 1}`,
+        batchId: args.ctx.batchId,
+        taskId: args.ctx.taskId,
+        operationKey: `batch:${args.ctx.batchId}:task:${args.ctx.taskId}:frame-consistency:${attempt}`,
+        operationLabel: '首尾帧一致性校验',
+        meta: {
+          groupIdx: args.groupIdx,
+          attempt,
+          progressMode: args.progressMode,
+        },
+      },
     });
     const decision = buildFrameConsistencyRetryDecision({
       basePrompt: args.prompt,
@@ -2605,7 +2627,29 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       const currentTailHash = hashImageFileContent(tailFrameLocalPath);
       const cachedHash = String(tailCaption?.imageContentHash || '');
       if (!targetEndCaption || cachedHash !== currentTailHash) {
-        refreshedTailCaption = await captionTailFrameForVideo(ctx.user, tailFrameLocalPath);
+        refreshedTailCaption = await captionTailFrameForVideo(ctx.user, tailFrameLocalPath, {
+          ownerId: ctx.user.id,
+          usernameSnapshot: ctx.user.phone || ctx.user.display_name || ctx.user.username || null,
+          projectId: ctx.projectId,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          routeName: 'batch.video_segments',
+          moduleKey: 'video',
+          moduleLabel: '视频生成',
+          featureKey: 'tail_frame_caption',
+          featureLabel: '尾帧 Caption',
+          callItemType: 'batch_task',
+          callItemId: ctx.taskId,
+          callItemLabel: `片段 ${groupIdx + 1} 尾帧 Caption`,
+          batchId: ctx.batchId,
+          taskId: ctx.taskId,
+          operationKey: `batch:${ctx.batchId}:task:${ctx.taskId}:tail-caption`,
+          operationLabel: '尾帧 Caption',
+          meta: {
+            groupIdx,
+            targetEndStrategy,
+            tailFrameHash: currentTailHash,
+          },
+        });
         targetEndCaption = refreshedTailCaption.text;
       }
     } catch (captionErr: any) {

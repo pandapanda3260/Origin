@@ -114,17 +114,14 @@ export function _renderEpisodeTabs() {
     btn.className = idx === curIdx
       ? "flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-bold bg-primary text-on-primary shadow-sm transition-all"
       : "flex items-center gap-2 px-3 py-1.5 rounded-full text-[11px] font-bold text-on-surface-variant hover:bg-surface-container transition-all";
-    var stepDone = ep.videoPromptsApproved;
-    btn.innerHTML =
-      (stepDone ? '<span class="material-symbols-outlined text-xs">check_circle</span>' : '') +
-      '<span>' + escapeHtml(ep.title) + '</span>';
+    btn.innerHTML = '<span>' + escapeHtml(ep.title) + '</span>';
     btn.addEventListener("click", function () { _switchEpisode(idx); });
     wrap.appendChild(btn);
   });
 
   var addBtn = document.createElement("button");
   addBtn.className = "flex items-center gap-1 px-3 py-1.5 rounded-full text-[11px] font-bold text-primary/60 hover:text-primary hover:bg-primary/5 transition-all border border-dashed border-primary/20";
-  addBtn.innerHTML = '<span class="material-symbols-outlined text-sm">add</span><span>续写新一集</span>';
+  addBtn.innerHTML = '<span class="material-symbols-outlined text-sm">add</span><span>续写</span>';
   addBtn.addEventListener("click", function () { _openNewEpisodeDialog(); });
   wrap.appendChild(addBtn);
 }

@@ -29,6 +29,11 @@ function _saveAssetsProject() {
   return _ctx.saveProject ? _ctx.saveProject() : undefined;
 }
 
+function _flushAssetsProjectNow() {
+  if (_ctx.flushServerSave) return _ctx.flushServerSave();
+  return _saveAssetsProject();
+}
+
 var _assetsExtracting = false;
 var _assetImagesGenerating = false;
 var _assetGenStatus = {};
@@ -945,8 +950,9 @@ function _renderCharCards(container, items) {
       var degradedHint = cardState.statusMessage
         ? '<p class="mt-2 text-[11px] leading-relaxed text-amber-500/80">' + escapeHtml(cardState.statusMessage) + '</p>'
         : '';
+      var referenceLabel = item.isCrowd ? "参考图" : "三视图";
       statusHtml =
-        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">角色设定图</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
+        '<div class="flex justify-between items-center mb-2"><span class="text-[10px] font-bold tracking-widest text-[#90A4AE] uppercase">' + escapeHtml(referenceLabel) + '</span><span class="text-[10px] font-bold ' + statusTone + '">' + escapeHtml(cardState.statusLabel) + '</span></div>' +
         '<div class="w-full aspect-square rounded-lg overflow-hidden bg-[#ECEFF1] cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalSrc) + '>' +
           '<img src="' + escapeHtml(thumbSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover object-[right_center]" />' +
         '</div>' +
@@ -4950,6 +4956,197 @@ function _worldTemplateCharacterPreviewUrls(tpl, limit) {
   }).filter(Boolean).slice(0, limit);
 }
 
+function _worldTemplateEntityPreviewUrl(item) {
+  if (!item || typeof item !== "object") return "";
+  return String(
+    item.coverImageUrl ||
+    item.thumbnailUrl ||
+    item.thumbUrl ||
+    item.realPhotoUrl ||
+    item.rawUrl ||
+    item.imageUrl ||
+    item.pencilUrl ||
+    item.referenceImageUrl ||
+    (item.referencePanels && (
+      item.referencePanels.headshotUrl ||
+      item.referencePanels.frontUrl ||
+      item.referencePanels.sheetUrl
+    )) ||
+    ""
+  ).trim();
+}
+
+function _worldTemplateEntityLabel(item, fallback) {
+  if (!item || typeof item !== "object") return String(item || fallback || "").trim();
+  return String(
+    item.name ||
+    item.title ||
+    item.sceneName ||
+    item.location ||
+    item.role ||
+    item.propType ||
+    item.id ||
+    fallback ||
+    ""
+  ).trim();
+}
+
+function _worldTemplateFirstArray(tpl, keys) {
+  if (!tpl || !Array.isArray(keys)) return [];
+  for (var i = 0; i < keys.length; i++) {
+    var list = tpl[keys[i]];
+    if (Array.isArray(list) && list.length) return list;
+  }
+  return [];
+}
+
+function _worldTemplateEntityCount(tpl, countKey, aliases) {
+  var num = Number(tpl && tpl[countKey]);
+  if (Number.isFinite(num) && num >= 0) return Math.floor(num);
+  return _worldTemplateFirstArray(tpl, aliases).length;
+}
+
+function _worldTemplatePreviewUrlsFromKeys(tpl, keys) {
+  var urls = [];
+  if (!tpl || !Array.isArray(keys)) return urls;
+  keys.forEach(function (key) {
+    var list = tpl[key];
+    if (!Array.isArray(list)) return;
+    list.forEach(function (item) {
+      var url = typeof item === "string" ? item : _worldTemplateEntityPreviewUrl(item);
+      url = String(url || "").trim();
+      if (url) urls.push(url);
+    });
+  });
+  return urls;
+}
+
+function _worldTemplatePreviewItemsForType(tpl, opts, limit) {
+  var entities = opts.characters ? _worldTemplateCharacters(tpl) : _worldTemplateFirstArray(tpl, opts.aliases);
+  var urls = _worldTemplatePreviewUrlsFromKeys(tpl, opts.previewKeys);
+  var count = opts.count || 0;
+  var max = Math.max(entities.length, urls.length, count > 0 ? 1 : 0);
+  var items = [];
+  for (var i = 0; i < max && items.length < limit; i++) {
+    var entity = entities[i];
+    var src = urls[i] || _worldTemplateEntityPreviewUrl(entity);
+    var label = _worldTemplateEntityLabel(entity, opts.label + (i + 1));
+    if (!src && !label && i >= count) continue;
+    items.push({
+      type: opts.type,
+      kindLabel: opts.label,
+      icon: opts.icon,
+      src: src,
+      label: label
+    });
+  }
+  if (!items.length && count > 0) {
+    items.push({
+      type: opts.type,
+      kindLabel: opts.label,
+      icon: opts.icon,
+      src: "",
+      label: count + opts.label
+    });
+  }
+  return items;
+}
+
+function _worldTemplatePreviewItems(tpl, limit) {
+  limit = Math.max(1, limit || 7);
+  var groups = [
+    {
+      type: "character",
+      label: "角色",
+      icon: "person",
+      count: _worldTemplateCharacterCount(tpl),
+      characters: true,
+      previewKeys: ["characterPreviewUrls"]
+    },
+    {
+      type: "scene",
+      label: "场景",
+      icon: "location_on",
+      count: _worldTemplateEntityCount(tpl, "locationCount", ["locations", "scenes", "environments", "places"]),
+      aliases: ["locations", "scenes", "environments", "places"],
+      previewKeys: ["locationPreviewUrls", "scenePreviewUrls", "environmentPreviewUrls"]
+    },
+    {
+      type: "prop",
+      label: "道具",
+      icon: "category",
+      count: _worldTemplateEntityCount(tpl, "propCount", ["props", "items", "keyItems", "artifacts"]),
+      aliases: ["props", "items", "keyItems", "artifacts"],
+      previewKeys: ["propPreviewUrls"]
+    }
+  ].map(function (group) {
+    return Object.assign({}, group, {
+      items: _worldTemplatePreviewItemsForType(tpl, group, limit),
+      cursor: 0
+    });
+  });
+
+  var visible = [];
+  function takeOne(group) {
+    if (visible.length >= limit) return;
+    if (group.cursor >= group.items.length) return;
+    visible.push(group.items[group.cursor]);
+    group.cursor += 1;
+  }
+  groups.forEach(takeOne);
+  while (visible.length < limit && groups.some(function (group) { return group.cursor < group.items.length; })) {
+    groups.forEach(takeOne);
+  }
+  var total = groups.reduce(function (sum, group) { return sum + group.count; }, 0);
+  return {
+    items: visible,
+    overflow: Math.max(0, total - visible.length)
+  };
+}
+
+function _worldTemplatePreviewStackHtml(tpl, limit) {
+  var preview = _worldTemplatePreviewItems(tpl, limit || 7);
+  if (!preview.items.length && !preview.overflow) return "";
+  var html = preview.items.map(function (item) {
+    var title = item.kindLabel + (item.label ? " · " + item.label : "");
+    if (item.src) {
+      return '<span class="lib-world-preview-slot lib-world-preview-slot--' + escapeHtml(item.type) + '" title="' + escapeHtml(title) + '">' +
+        '<img src="' + escapeHtml(item.src) + '" alt="" loading="lazy" decoding="async" />' +
+      '</span>';
+    }
+    return '<span class="lib-world-preview-slot lib-world-preview-slot--' + escapeHtml(item.type) + ' lib-world-preview-slot--empty" title="' + escapeHtml(title) + '">' +
+      '<span class="material-symbols-outlined lib-world-preview-empty-icon">' + escapeHtml(item.icon) + '</span>' +
+    '</span>';
+  }).join("");
+  if (preview.overflow) {
+    html += '<span class="lib-world-preview-slot lib-world-preview-slot--more" title="' + escapeHtml("还有 " + preview.overflow + " 项世界观信息") + '">+' + escapeHtml(String(preview.overflow)) + '</span>';
+  }
+  return '<div class="lib-world-preview-stack" aria-label="世界观预览">' + html + '</div>';
+}
+
+function _worldTemplateMetaPillHtml(icon, text, tone) {
+  return '<span class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-bold ' + tone + '">' +
+    '<span class="material-symbols-outlined text-xs">' + escapeHtml(icon) + '</span>' +
+    escapeHtml(text) +
+  '</span>';
+}
+
+function _worldTemplateSummaryPillsHtml(tpl) {
+  var charCount = _worldTemplateCharacterCount(tpl);
+  var locationCount = _worldTemplateEntityCount(tpl, "locationCount", ["locations", "scenes", "environments", "places"]);
+  var propCount = _worldTemplateEntityCount(tpl, "propCount", ["props", "items", "keyItems", "artifacts"]);
+  var styleName = String((tpl && (tpl.preferredStyleTemplateName || tpl.styleTemplateName || tpl.styleName)) || "").trim();
+  var pills = [
+    _worldTemplateMetaPillHtml("person", charCount + " 角色", "border-[#CFD8DC] bg-white/60 text-[#90A4AE]"),
+    _worldTemplateMetaPillHtml("location_on", locationCount + " 场景", "border-[#CFD8DC] bg-white/60 text-[#90A4AE]"),
+    _worldTemplateMetaPillHtml("category", propCount + " 道具", "border-[#CFD8DC] bg-white/60 text-[#90A4AE]")
+  ];
+  if (styleName) {
+    pills.push(_worldTemplateMetaPillHtml("palette", styleName, "border-[#2C3E50]/10 bg-[#2C3E50]/5 text-[#2C3E50]"));
+  }
+  return pills.join("");
+}
+
 function _worldTemplateSaveCharacterStats() {
   var locks = project && project.consistency && Array.isArray(project.consistency.characters) ? project.consistency.characters : [];
   var assetCount = project && project.assets && Array.isArray(project.assets.characters) ? project.assets.characters.length : 0;
@@ -5144,7 +5341,7 @@ export function _applyWorldTemplate(tpl) {
     project.videoPromptsApproved = false;
   }
 
-  _saveAssetsProject();
+  _flushAssetsProjectNow();
 
   var charCount = _worldTemplateCharacterCount(tpl);
   showToast("已应用世界观模板：世界观来源已记录，" + charCount + " 个角色将进入一致性对账", "success");
@@ -5158,10 +5355,18 @@ export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
 
   var full = await _loadWorldTemplateDetail(tpl);
   var worldSnapshot = _attachProjectStylePreferenceToWorldSnapshot(snapshotWorldTemplate(full || tpl));
-  project.selectedWorldTemplateId = worldSnapshot.id || full.id || tpl.id || null;
-  project.worldTemplateSnapshot = worldSnapshot;
-  _saveAssetsProject();
-  if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+  var intent = {
+    selectedWorldTemplateId: worldSnapshot.id || full.id || tpl.id || null,
+    worldTemplateSnapshot: worldSnapshot,
+  };
+  if (_ctx.persistWorldTemplateSelection) {
+    _ctx.persistWorldTemplateSelection(intent);
+  } else {
+    project.selectedWorldTemplateId = intent.selectedWorldTemplateId;
+    project.worldTemplateSnapshot = intent.worldTemplateSnapshot;
+    if (_ctx.refreshStylePage) _ctx.refreshStylePage();
+    _flushAssetsProjectNow();
+  }
   showToast("已关联世界观「" + ((full && full.name) || "未命名") + "」。它会作为资产候选池和内容规则参考。", "success");
 }
 
@@ -5237,11 +5442,7 @@ export function _openTemplateImportModal() {
   var gridHtml = "";
   templates.forEach(function (tpl, i) {
     var charCount = _worldTemplateCharacterCount(tpl);
-    var charImgs = "";
-    var previewUrls = _worldTemplateCharacterPreviewUrls(tpl, 3);
-    previewUrls.slice(0, 3).forEach(function (src) {
-      charImgs += '<img src="' + escapeHtml(src) + '" class="w-8 h-8 rounded-full object-cover border-2 border-white -ml-2 first:ml-0" />';
-    });
+    var previewStackHtml = _worldTemplatePreviewStackHtml(tpl, 5);
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
 
     gridHtml +=
@@ -5255,7 +5456,7 @@ export function _openTemplateImportModal() {
         '<p class="text-[11px] text-on-surface-variant/60 leading-relaxed mb-3">世界观参考 · ' + charCount + ' 个角色</p>' +
         '<div class="flex items-center justify-between">' +
           '<div class="flex items-center">' +
-            (charImgs ? '<div class="flex items-center">' + charImgs + '</div>' : '') +
+            previewStackHtml +
             '<span class="text-[10px] text-on-surface-variant/50 ml-2">' + charCount + ' 个角色</span>' +
           '</div>' +
           '<span class="text-[10px] text-on-surface-variant/40">' + escapeHtml(date) + '</span>' +
@@ -5285,6 +5486,7 @@ export function _openTemplateImportModal() {
   });
 
   document.body.appendChild(overlay);
+  hydrateProtectedImageElements(overlay);
 
   overlay.querySelector("#btnCloseTplModal").addEventListener("click", function () { overlay.remove(); });
 
@@ -5621,6 +5823,16 @@ function _goProjectTabPage(pageIdx) {
   _applyProjectTabPage();
 }
 
+function _renderWorldTemplateLibraryButton(btn, count) {
+  if (!btn) return;
+  var icon = '<span class="material-symbols-outlined text-sm">auto_stories</span>';
+  if (_libActiveTab === "template") {
+    btn.innerHTML = icon + "返回素材库列表";
+  } else {
+    btn.innerHTML = icon + "查看世界观列表（<span class=\"lib-count-template\">" + String(count || 0) + "</span>）";
+  }
+}
+
 export async function refreshLibraryPage() {
   var projList = (_ctx && typeof _ctx.getProjectList === "function" ? _ctx.getProjectList() : []) || [];
   if (project && !projList.some(function (p) { return p.id === project.id; })) {
@@ -5634,8 +5846,6 @@ export async function refreshLibraryPage() {
   _renderProjectTabs(projList);
 
   var templates = _getWorldTemplates();
-  var countTpl = document.querySelector(".lib-count-template");
-  if (countTpl) countTpl.textContent = String(templates.length);
 
   var tabs = document.querySelectorAll(".lib-tab");
   tabs.forEach(function (t) {
@@ -5647,6 +5857,7 @@ export async function refreshLibraryPage() {
 
   var btnTplLib = $("btnLibWorldTemplates");
   if (btnTplLib) {
+    _renderWorldTemplateLibraryButton(btnTplLib, templates.length);
     if (_libActiveTab === "template") {
       btnTplLib.classList.remove("bg-surface-container-lowest", "text-on-surface-variant");
       btnTplLib.classList.add("bg-[#2C3E50]", "text-white", "border-[#2C3E50]");
@@ -5798,12 +6009,8 @@ function _renderLibraryTemplates(container, templates) {
 
   var html = "";
   templates.forEach(function (tpl, i) {
-    var charCount = _worldTemplateCharacterCount(tpl);
-    var charImgs = "";
-    var previewUrls = _worldTemplateCharacterPreviewUrls(tpl, 4);
-    previewUrls.slice(0, 4).forEach(function (src) {
-      charImgs += '<img src="' + escapeHtml(src) + '" class="w-9 h-9 rounded-full object-cover border-2 border-white -ml-2 first:ml-0 shadow-sm" />';
-    });
+    var summaryPills = _worldTemplateSummaryPillsHtml(tpl);
+    var previewStackHtml = _worldTemplatePreviewStackHtml(tpl, 7);
     var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
 
     html +=
@@ -5822,18 +6029,15 @@ function _renderLibraryTemplates(container, templates) {
             '<span class="material-symbols-outlined text-[#e53935] text-base">delete_outline</span>' +
           '</button>' +
         '</div>' +
-        '<div class="flex items-center justify-between mb-4">' +
-          '<div class="flex items-center gap-3">' +
-            '<div class="flex items-center gap-1.5 text-[10px] text-[#90A4AE]">' +
-              '<span class="material-symbols-outlined text-xs">person</span>' + charCount + ' 角色' +
-            '</div>' +
-          '</div>' +
-          (charImgs ? '<div class="flex items-center ml-2">' + charImgs + '</div>' : '') +
+        '<div class="flex flex-wrap items-center justify-between gap-3 mb-4">' +
+          '<div class="flex flex-wrap items-center gap-2 min-w-0">' + summaryPills + '</div>' +
+          (previewStackHtml ? '<div class="shrink-0 ml-auto">' + previewStackHtml + '</div>' : '') +
         '</div>' +
         '<button class="w-full py-2.5 bg-[#2C3E50] text-white rounded-xl text-xs font-bold tracking-wide hover:bg-[#34495E] transition-colors" data-tpl-lib-apply="' + i + '">导入到当前项目</button>' +
       '</div>';
   });
   container.innerHTML = html;
+  hydrateProtectedImageElements(container);
 
   container.querySelectorAll("[data-tpl-lib-del]").forEach(function (btn) {
     btn.addEventListener("click", async function (ev) {
