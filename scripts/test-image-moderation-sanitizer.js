@@ -90,6 +90,12 @@ const cases = [
     input: '猪八戒灰蓝粗布僧袍半敞，圆胖身子贴近镜头。',
     expected: '衣袍松垮但完整覆盖身体',
   },
+  {
+    name: 'lock section content is rewritable (full coverage)',
+    category: 'sexual',
+    input: 'CHARACTER LOCK:\n猪八戒: 灰蓝粗布僧袍半敞，圆胖身形。\nPROP LOCK:\n九齿钉耙金属表面有烟尘。',
+    expected: '衣袍松垮但完整覆盖身体',
+  },
 ];
 
 const negativeCases = [
@@ -124,7 +130,7 @@ for (const item of cases) {
 for (const item of negativeCases) {
   const preflight = preflightImageModerationPrompt(item.input);
   const rewrite = rewriteImagePromptForModeration(item.input, ['sexual']);
-  assert(preflight.hits.length === 0, `${item.name}: expected no preflight hit in protected/body-feature text`);
+  assert(preflight.hits.length === 0, `${item.name}: expected no false-positive preflight hit on species/body-feature text`);
   assert(rewrite.rewrittenPrompt === item.input, `${item.name}: expected no rewrite`);
   assert(rewrite.rewriteDiff.length === 0, `${item.name}: expected no rewrite diff`);
 }

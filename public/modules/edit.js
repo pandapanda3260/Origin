@@ -2,10 +2,10 @@
  * Edit workbench module — extracted from main.js (stage 2 refactor).
  * Call initEdit(ctx) once at startup, then syncEditProject(p) whenever project changes.
  */
-import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl, fetchUploadSignedUrl, hydrateProtectedImageElements } from './utils.js';
-import { subscribeTask, subscribeBatch } from './backend_stream.js';
-import { showBillingPaywall } from './billing.js';
-import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js';
+import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl, fetchUploadSignedUrl, hydrateProtectedImageElements } from './utils.js?v=300';
+import { subscribeTask, subscribeBatch } from './backend_stream.js?v=300';
+import { showBillingPaywall } from './billing.js?v=114';
+import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js?v=300';
 
 // 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 117" 才能确认新代码加载到。
 console.log('%c[EDIT_JS_VERSION] 117 —— 下载按钮状态按导出完成态收口', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');

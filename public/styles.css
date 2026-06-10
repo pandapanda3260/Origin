@@ -262,7 +262,7 @@ body.is-activating [data-write-action] {
 }
 .account-menu-popover {
   position: absolute;
-  left: 1.5rem;
+  left: 0;
   right: 0;
   bottom: calc(100% - 10px);
   z-index: 70;
@@ -17558,6 +17558,9 @@ body.first-frame-editor-lock {
 
 	  #firstFrameEditorRoot .ffe-context-top {
 	    min-height: 0;
+	    /* 单列 track 锁成 minmax(0,1fr)：默认 auto track 的最小尺寸会跟着子项
+	     * (素材面板)的内容最小宽度走，Safari 下曾被 13 槽 strip 撑爆。 */
+	    grid-template-columns: minmax(0, 1fr);
 	    position: relative;
 	    z-index: 30;
 	    overflow: visible;
@@ -17582,6 +17585,14 @@ body.first-frame-editor-lock {
 	    gap: 6px;
 	    height: clamp(126px, 16.8vh, 150px);
 	    min-height: 0;
+	    /* 关键修复(2026-06-10)：面板自身必须 min-width:0 + max-width:100%。
+	     * 此前只在 .ffe-material-strip 上做 overflow-x:auto + min-width:0，
+	     * Chrome 系正常，但 Safari 在算 grid track 最小尺寸时仍按 strip 的
+	     * 内容宽(13 槽 ≈ 1070px)给面板撑宽 —— 面板半透明白底连同
+	     * 预算/下载按钮整体溢出到中列、盖住"图片展示区域"标题。
+	     * 面板宽度锁死后，右边界与下方提示词面板对齐，strip 在面板内滚动。 */
+	    min-width: 0;
+	    max-width: 100%;
 	    padding: 12px 14px;
 	    overflow: visible;
 	  }
@@ -17599,13 +17610,16 @@ body.first-frame-editor-lock {
 
   #firstFrameEditorRoot .ffe-material-strip {
     display: grid;
-    /* 保持原有"按槽位(slot-count=cap+1)固定 tile 宽排列"的设计不变；
-     * 此前没有溢出控制，槽位排不下时整条 strip 会撑宽素材面板、溢出到中列盖住
-     * 图片标题，右对齐的预算/下载也被一起顶过去。加 overflow-x:auto + min-width:0：
-     * 排不下时改为横向滚动，strip 盒宽收敛到面板宽，右边界与提示词面板对齐。
-     * （空槽来自 slot-count=cap+1，如需让滚动只显示真实图块，需另调
-     *  material_image_panel.js 的 slotCount，属共享改动单列。） */
-    grid-template-columns: repeat(var(--ffe-material-slot-count), var(--ffe-material-tile-size));
+    /* (2026-06-10 改) 弃用 repeat(slot-count, tile-size)：slot-count=cap+1
+     * 会生成大量空列(如 cap=12 → 13 列只占 4 列)，既把 strip 的内容宽顶到
+     * ~1070px(Safari 下进而撑爆面板，见上方 .ffe-material-panel 注释)，
+     * 滚动时还要划过一长段空白。改成按真实子元素生成列：
+     * grid-auto-flow:column + grid-auto-columns 固定 tile 宽 ——
+     * 图块少时不滚动，超出面板宽时 overflow-x:auto 横向滑动翻阅。
+     * 共享渲染器 material_image_panel.js 的 slotCount 不动(其他页面还在用)。 */
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: var(--ffe-material-tile-size);
     gap: 7px;
     align-items: start;
     justify-content: start;

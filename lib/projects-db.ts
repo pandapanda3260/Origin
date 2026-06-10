@@ -280,11 +280,44 @@ export type ProjectStageInfo = {
   running: number;
 };
 
+// 资产阶段的产物倒推：已提取出资产且每个资产都有图 → 视为资产阶段已完成（用户常跳过"确认资产"按钮）。
+// "有图"的字段口径对齐 public/modules/assets.js 的 _hasAssetImage（含真人参考/铅笔稿/参考锁/三视图面板）；
+// 角色 reference.status=failed 视为未完成（casting 失败需回资产页处理）。
+// 与前端 public/main.js 的 _ovAssetsArtifactComplete 保持同构，改一处必须同步另一处。
+function projectSummaryAssetsArtifactComplete(data: any): boolean {
+  const assets = data?.assets;
+  if (!assets) return false;
+  const groups: Array<{ list: any[]; isChar: boolean }> = [
+    { list: arr(assets.characters), isChar: true },
+    { list: arr(assets.scenes), isChar: false },
+    { list: arr(assets.props), isChar: false },
+  ];
+  let count = 0;
+  for (const group of groups) {
+    for (const raw of group.list) {
+      const it = raw || {};
+      count += 1;
+      const ref = it.reference && typeof it.reference === 'object' ? it.reference : {};
+      const panels = it.panels && typeof it.panels === 'object' ? it.panels : {};
+      if (group.isChar && String(ref.status || '').toLowerCase() === 'failed') return false;
+      const url = firstValue(
+        it.imageUrl, it.rawUrl, it.realPhotoUrl, it.pencilUrl,
+        ref.currentUrl, ref.lastKnownGoodUrl,
+        it.referenceLock?.sheetUrl,
+        panels.sheetUrl, panels.frontUrl, panels.sideUrl, panels.backUrl,
+      );
+      if (!url) return false;
+    }
+  }
+  return count > 0;
+}
+
 // 任务列表状态胶囊的"阶段"判定（与前端 public/main.js 的 _ovProjectStageInfo 保持同构，改一处必须同步另一处）。
 // 思路：从最远的下游产物倒推阶段（成片 > 可剪辑 > 片段 > 提示词 > 镜头图 > 镜头设计），
 // 不依赖 *Approved 确认 flag——实际数据里用户经常跳过确认按钮，flag 与真实进度脱节
 // （例：已导出成片的项目 imagesApproved 仍是 false）。只有尚无任何生成产物的
-// 早期创作阶段（剧本/风格/资产/镜头设计）才用 approve flag 区分。
+// 早期创作阶段（剧本/风格/资产/镜头设计）才用 approve flag 区分，
+// 其中资产阶段额外认产物：资产已提取且全部有图 → 视为完成推进到镜头设计（projectSummaryAssetsArtifactComplete）。
 // 注意：有成片导出（editData.exportUrl）就算已完成，之后剪辑页再改动也不回退状态。
 export function projectSummaryStageInfo(
   data: any,
@@ -337,7 +370,7 @@ export function projectSummaryStageInfo(
   if (arr(data?.shots).length > 0) return info('images', imgDone, panelTotal || arr(data?.shots).length);
   if (!data?.script || !data?.scriptApproved) return info('script');
   if (!projectSummaryStyleBibleUsable(data)) return info('style');
-  if (!data?.assetsApproved) return info('assets');
+  if (!data?.assetsApproved && !projectSummaryAssetsArtifactComplete(data)) return info('assets');
   return info('shots');
 }
 

@@ -1,5 +1,5 @@
-import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from './utils.js';
-import { subscribeBatch } from './backend_stream.js';
+import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from './utils.js?v=300';
+import { subscribeBatch } from './backend_stream.js?v=300';
 import { segmentInfoForShot } from './frameRecommendations.js?v=1';
 import {
   ANGLES,
@@ -18,7 +18,7 @@ import {
   normalizeLens,
   normalizeLight,
   normalizeShotType,
-} from './shotSchema.js';
+} from './shotSchema.js?v=300';
 
 let _ctx = {};
 let project = null;
@@ -669,6 +669,11 @@ function _hideScriptRefPanel() {
   _shotParaMap = {};
 }
 
+/* 注：重渲染滚动跳变（整重建 → 高度塌缩 → scrollY 被钳 → "跳回镜头 2"）
+ * 的防护已收口到全局守卫 modules/scroll_anchor_guard.js（main.js 初始化），
+ * 覆盖 renderShotList / renderImageGrid / SSE 回调等所有重建路径，
+ * 本模块不再做局部锚定。 */
+
 export function renderShotList() {
   _syncRefs();
   _syncShotsProgressBanner();
@@ -991,6 +996,88 @@ function _bindShotHoverHighlight() {
   });
 }
 
+/* ----------------------------------------------------------------
+   镜头表生成倒计时（"，剩x分x秒"）
+   ----------------------------------------------------------------
+   - 总时长估算：取最近 5 次成功生成的真实耗时中位数（localStorage），
+     没有历史就用 240s 兜底（推理类模型 3~5 分钟常态，取偏中值）。
+   - 锚点：本地点击时刻起算；snapshot/轮询带回 batch.createdAt 后矫正，
+     这样刷新 / reattach 续接进度时倒计时不会从头再走。
+   - 超出预估后不再装"剩 0 秒"，改显示"已用x分x秒（超出预估）"。
+   - 只在成功完成时把真实耗时写回历史，失败/取消不污染估算。
+   ---------------------------------------------------------------- */
+var SHOTPLAN_DUR_KEY = "origin_shotplan_durations_v1";
+var SHOTPLAN_DEFAULT_ESTIMATE_SEC = 240;
+
+function _fmtMinSec(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m > 0 ? m + "分" + (s < 10 ? "0" + s : s) + "秒" : s + "秒";
+}
+
+function _shotPlanEstimateSec() {
+  try {
+    var arr = JSON.parse(localStorage.getItem(SHOTPLAN_DUR_KEY) || "[]");
+    var ds = (Array.isArray(arr) ? arr : []).filter(function (n) {
+      return Number.isFinite(n) && n >= 10 && n <= 1800;
+    });
+    if (!ds.length) return SHOTPLAN_DEFAULT_ESTIMATE_SEC;
+    ds.sort(function (a, b) { return a - b; });
+    return Math.round(ds[Math.floor(ds.length / 2)]); // 中位数抗离群
+  } catch (_e) {
+    return SHOTPLAN_DEFAULT_ESTIMATE_SEC;
+  }
+}
+
+function _recordShotPlanDuration(sec) {
+  if (!(sec >= 10 && sec <= 1800)) return; // 秒级完成多半是缓存/复用，不计入
+  try {
+    var arr = JSON.parse(localStorage.getItem(SHOTPLAN_DUR_KEY) || "[]");
+    if (!Array.isArray(arr)) arr = [];
+    arr.push(Math.round(sec));
+    while (arr.length > 5) arr.shift();
+    localStorage.setItem(SHOTPLAN_DUR_KEY, JSON.stringify(arr));
+  } catch (_e) {}
+}
+
+var _shotsEta = null; // { anchorMs, totalSec, timer }
+var _shotsHintBase = "";
+
+function _shotsEtaSuffix() {
+  if (!_shotsEta) return "";
+  var elapsed = (Date.now() - _shotsEta.anchorMs) / 1000;
+  var remain = Math.ceil(_shotsEta.totalSec - elapsed);
+  if (remain > 0) return "，剩" + _fmtMinSec(remain);
+  return "，已用" + _fmtMinSec(elapsed) + "（超出预估）";
+}
+
+function _shotsEtaStart() {
+  _shotsEtaStop(false);
+  _shotsEta = { anchorMs: Date.now(), totalSec: _shotPlanEstimateSec(), timer: null };
+  _shotsEta.timer = setInterval(function () {
+    if (!_shotsEta) return;
+    var hintEl = $("shotsGenHint");
+    if (hintEl && _shotsHintBase) hintEl.textContent = _shotsHintBase + _shotsEtaSuffix();
+  }, 1000);
+}
+
+/* snapshot / 轮询帧带 createdAt（服务端 getBatchSnapshot 附带）时矫正锚点 */
+function _shotsEtaSyncAnchor(snap) {
+  if (!_shotsEta || !snap || !snap.createdAt) return;
+  var t = Date.parse(snap.createdAt);
+  if (Number.isFinite(t) && t > 0 && t <= Date.now() && Math.abs(t - _shotsEta.anchorMs) > 3000) {
+    _shotsEta.anchorMs = t;
+  }
+}
+
+function _shotsEtaStop(recordSuccess) {
+  if (!_shotsEta) return;
+  if (recordSuccess) _recordShotPlanDuration((Date.now() - _shotsEta.anchorMs) / 1000);
+  if (_shotsEta.timer) clearInterval(_shotsEta.timer);
+  _shotsEta = null;
+}
+
 function _setShotsProgress(pct, title, hint) {
   var bar = $("shotsGenProgress");
   var banner = $("shotsGenBanner");
@@ -999,22 +1086,68 @@ function _setShotsProgress(pct, title, hint) {
   if (bar) bar.style.width = pct + "%";
   if (banner) banner.hidden = false;
   if (titleEl && title) titleEl.textContent = title;
-  if (hintEl && hint) hintEl.textContent = hint;
+  if (hintEl && hint) {
+    _shotsHintBase = hint;
+    hintEl.textContent = hint + _shotsEtaSuffix();
+  }
 }
 
-function _hideShotsProgressBanner() {
-  var bar = $("shotsGenProgress");
+/* 失败终态展示：停 ETA 倒计时、停转圈、换 error 图标、亮出"重新生成"按钮。
+   背景(2026-06-10 Vasily)：失败后 needPlan 入口是隐藏的、镜头列表又是空的，
+   页面上没有任何重试入口，只能切页/刷新绕回去。 */
+function _setShotsGenBannerFailed(hint) {
+  _shotsEtaStop(false);
+  _setShotsProgress(0, "镜头设计失败", hint);
   var banner = $("shotsGenBanner");
-  var titleEl = $("shotsGenTitle");
-  var hintEl = $("shotsGenHint");
   if (banner) {
-    banner.hidden = true;
+    var icon = banner.querySelector(".material-symbols-outlined");
+    if (icon) {
+      icon.classList.remove("animate-spin");
+      icon.textContent = "error";
+    }
+  }
+  var retry = $("btnShotsGenRetry");
+  if (retry) {
+    retry.hidden = false;
+    retry.disabled = false;
+    // onclick 赋值幂等，重复进失败态不会叠监听
+    retry.onclick = _retryGenerateShotsFromBanner;
+  }
+}
+
+/* 回到"生成中"视觉：转圈图标 + 藏重试按钮（开始/重连/成功收尾时调） */
+function _resetShotsGenBannerVisuals() {
+  var banner = $("shotsGenBanner");
+  if (banner) {
     var icon = banner.querySelector(".material-symbols-outlined");
     if (icon) {
       icon.classList.add("animate-spin");
       icon.textContent = "progress_activity";
     }
   }
+  var retry = $("btnShotsGenRetry");
+  if (retry) retry.hidden = true;
+}
+
+function _retryGenerateShotsFromBanner() {
+  _syncRefs();
+  // 失败终态各路径都会 finish() 清挂账；这里兜底再清一次，防住
+  // "失败已展示但 finish 还没跑到"的窗口期点击被 generateShots 早退吞掉。
+  if (project && project.id) {
+    _trackingShotsBatchByProject.delete(String(project.id));
+  }
+  generateShots();
+}
+
+function _hideShotsProgressBanner() {
+  _shotsEtaStop(false);
+  _shotsHintBase = "";
+  var bar = $("shotsGenProgress");
+  var banner = $("shotsGenBanner");
+  var titleEl = $("shotsGenTitle");
+  var hintEl = $("shotsGenHint");
+  if (banner) banner.hidden = true;
+  _resetShotsGenBannerVisuals();
   if (bar) {
     bar.style.width = "0%";
     bar.classList.remove("extract-bar-pulse");
@@ -1065,7 +1198,12 @@ export async function generateShots(opts) {
   var _trackKey = String(originId);
   var _tracked = _trackingShotsBatchByProject.get(_trackKey);
   if (existingBatchId) {
-    if (_tracked === existingBatchId) return; // 这路批次已在跟踪，避免双订阅
+    if (_tracked === existingBatchId) {
+      // 这路批次已在跟踪，避免双订阅。但"切走项目又切回"会经 _hideShotsProgressBanner
+      // 停掉倒计时——这里只复活 ticker（锚点由下一帧 snapshot.createdAt 矫正）。
+      if (!_shotsEta && project && project.shotPlanStatus === "generating") _shotsEtaStart();
+      return;
+    }
   } else if (_tracked) {
     return; // 本会话已有一路镜头计划在跟踪（自动触发/重复点击直接忽略）
   }
@@ -1081,6 +1219,8 @@ export async function generateShots(opts) {
     disabled: true,
     hint: existingBatchId ? "正在重新连接镜头计划生成任务。" : "后台正在生成镜头计划，请稍候。",
   });
+  _resetShotsGenBannerVisuals(); // 从失败态重试/重连时复原转圈+收起重试按钮
+  _shotsEtaStart();
   _setShotsProgress(5, "AI 正在分析剧本与资产…", "准备生成完整镜头表，请稍候");
   var _progressBar = $("shotsGenProgress");
   if (_progressBar) _progressBar.classList.add("extract-bar-pulse");
@@ -1111,7 +1251,7 @@ export async function generateShots(opts) {
     } catch (e) {
       if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
       var errTextStart = ((e && e.message) || e).toString().slice(0, 150);
-      _setShotsProgress(0, "镜头设计失败", errTextStart);
+      _setShotsGenBannerFailed(errTextStart);
       showToast("镜头设计启动失败：" + _diagnoseApiError(errTextStart), "error");
       _refreshShotPlanActionState();
       return;
@@ -1129,6 +1269,7 @@ export async function generateShots(opts) {
     if (finished) return;
     finished = true;
     _stopPoll();
+    _shotsEtaStop(false);
     if (_trackingShotsBatchByProject.get(_trackKey) === batchId) {
       _trackingShotsBatchByProject.delete(_trackKey);
     }
@@ -1183,6 +1324,8 @@ export async function generateShots(opts) {
       }
 
       if (serverShots && serverShots.length) {
+        _shotsEtaStop(true);
+        _resetShotsGenBannerVisuals(); // 可能从失败展示翻转回成功（如空patch但服务端已落盘）
         _setShotsProgress(100, "镜头设计完成", "共生成 " + serverShots.length + " 个镜头");
         setTimeout(function () { var b = $("shotsGenBanner"); if (b) b.hidden = true; }, 1200);
         refreshShotsPage();
@@ -1203,6 +1346,7 @@ export async function generateShots(opts) {
     try {
       var snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
       if (!snap || finished) return;
+      _shotsEtaSyncAnchor(snap);
       if (snap.status === "completed") {
         console.log("[Shots] poll detected batch completed → reload project");
         await _finishAfterServerSync(snap);
@@ -1214,7 +1358,7 @@ export async function generateShots(opts) {
         }
         var failMsg = taskErr || "请稍后重试";
         console.warn("[Shots] poll detected batch failed: " + failMsg);
-        _setShotsProgress(0, "镜头设计失败", failMsg.slice(0, 120));
+        _setShotsGenBannerFailed(failMsg.slice(0, 120));
         showToast("镜头设计失败：" + _diagnoseApiError(failMsg), "error");
         finish();
       }
@@ -1226,16 +1370,27 @@ export async function generateShots(opts) {
 
   subscribeBatch(batchId, {
     onSnapshot: function (snap) {
+      if (finished) return; // 终态后迟到的 snapshot 不再覆盖失败/完成展示
+      _shotsEtaSyncAnchor(snap);
       if (snap && snap.succeeded >= 1) {
         _setShotsProgress(95, "生成完成，正在落盘…", "");
       } else if (snap && snap.failed >= 1) {
-        _setShotsProgress(0, "镜头设计失败", "请稍后重试");
+        // 单任务批次，任务失败即终态。优先取 snapshot 里的真实 errorMsg，
+        // 别再只给"请稍后重试"（实际错误如"LLM background submit 超时"应直给）。
+        var snapErr = "";
+        if (Array.isArray(snap.tasks)) {
+          var ft = snap.tasks.find(function (t) { return t.status === "failed"; });
+          if (ft && ft.errorMsg) snapErr = String(ft.errorMsg);
+        }
+        _setShotsGenBannerFailed((snapErr || "请稍后重试").slice(0, 120));
+        showToast("镜头设计失败：" + _diagnoseApiError(snapErr || "请稍后重试"), "error");
+        finish(); // 立即收尾：清挂账让"重新生成"点击即生效，也避免兜底轮询再弹一次 toast
       } else {
         _setShotsProgress(20, "AI 正在生成镜头表", "已连接后台任务");
       }
     },
     onTaskStarted: function () {
-      _setShotsProgress(20, "AI 正在生成镜头表", "请耐心等待，推理类模型可能需要 1~3 分钟");
+      _setShotsProgress(20, "AI 正在生成镜头表", "模型已开始生成，请耐心等待");
     },
     onTaskProgress: function (data) {
       if (!data || !data.stage) return;
@@ -1274,10 +1429,13 @@ export async function generateShots(opts) {
       var patch = (data && data.patch) || {};
       var arr = Array.isArray(patch.value) ? patch.value : null;
       if (!arr || !arr.length) {
-        _setShotsProgress(0, "镜头设计失败", "AI 未返回有效镜头表");
+        // 注意：这里故意不 finish() —— onBatchCompleted 的 _finishAfterServerSync
+        // 还有机会从服务端整包恢复；恢复成功路径会复原横幅视觉。
+        _setShotsGenBannerFailed("AI 未返回有效镜头表");
         showToast("镜头设计失败：未能解析出分镜列表", "error");
         return;
       }
+      _shotsEtaStop(true);
 
       var isCurrent = false;
       try {
@@ -1303,6 +1461,7 @@ export async function generateShots(opts) {
         }, data && data.serverVersion);
       }
 
+      _resetShotsGenBannerVisuals();
       _setShotsProgress(100, "镜头设计完成", "共生成 " + arr.length + " 个镜头");
       if (isCurrent) {
         var _types = {};
@@ -1321,14 +1480,13 @@ export async function generateShots(opts) {
       }
     },
     onTaskFailed: function (data) {
+      if (finished) return; // snapshot/轮询已先判终态时不再重复弹 toast
       var errText = ((data && data.errorMsg) || "生成失败").toString().slice(0, 150);
-      _setShotsProgress(0, "镜头设计失败", errText);
-      var banner = $("shotsGenBanner");
-      if (banner) {
-        var icon = banner.querySelector(".animate-spin");
-        if (icon) { icon.classList.remove("animate-spin"); icon.textContent = "error"; }
-      }
+      _setShotsGenBannerFailed(errText);
       showToast("镜头设计失败: " + _diagnoseApiError(errText), "error");
+      // 单任务批次，任务失败即批次终态：立即收尾（清挂账+停轮询），
+      // "重新生成"点下去不会被旧挂账早退，兜底轮询也不会 5 秒后再弹一次错误。
+      finish();
     },
     onBatchCompleted: async function (data) {
       var snap = null;

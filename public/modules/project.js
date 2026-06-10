@@ -12,7 +12,7 @@ import {
   escapeHtml,
   fetchAssetSignedUrl,
   fetchVideoSignedUrl,
-} from './utils.js?v=201';
+} from './utils.js?v=300';
 
 let _ctx = {};
 

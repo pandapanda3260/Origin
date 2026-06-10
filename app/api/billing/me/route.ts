@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { getBalance, listLedger, settleExpiredSubscription } from '@/lib/credits';
+import { getBalance, listLedger, renewDueSubscription, settleExpiredSubscription } from '@/lib/credits';
 import { PLANS, TOPUP_PACKS, getPlan } from '@/lib/billing-config';
 import { getDb } from '@/lib/db';
 
@@ -14,6 +14,8 @@ export async function GET(req: NextRequest) {
 
   // 惰性结算：已申请到期取消且已过期的付费订阅，在这里降级为 free（再读余额即为降级后的真值）。
   try { settleExpiredSubscription(user.id); } catch (_) {}
+  // 惰性续费（模拟支付开关下）：未取消且已过期 → 订阅桶按月覆盖重置（与上面按 cancel 标记互斥）。
+  try { renewDueSubscription(user.id); } catch (_) {}
 
   const bal = getBalance(user.id);
   // 未知 planCode 不要 fallback 成 PLANS[0]（那是 free），会把付费用户错误显示为免费。

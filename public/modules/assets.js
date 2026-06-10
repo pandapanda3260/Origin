@@ -1,13 +1,21 @@
-import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from './utils.js?v=203';
-import { loadProjectData } from './project.js';
-import { subscribeBatch, subscribeTask } from './backend_stream.js';
-import { renderAssetCard } from './render_hooks.js';
-import { attachShotsBatch } from './shots.js';
-import { reattachStoryboardBatches } from './storyboard.js';
-import { showBillingPaywall } from './billing.js';
-import { invalidateAllMaterialPanels } from './material_image_panel.js?v=103';
+import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from './utils.js?v=300';
+import { loadProjectData } from './project.js?v=106';
+import { subscribeBatch, subscribeTask } from './backend_stream.js?v=300';
+import { renderAssetCard } from './render_hooks.js?v=300';
+import { attachShotsBatch } from './shots.js?v=114';
+import { reattachStoryboardBatches } from './storyboard.js?v=152';
+import { showBillingPaywall } from './billing.js?v=114';
+import { invalidateAllMaterialPanels } from './material_image_panel.js?v=104';
 
 const _getAuthHeaders = getAuthHeaders;
+
+// 进度提示统一时间格式："x分x秒"（<60s 只显 "x秒"）。各模块各持一份，避免动 utils.js 引发全量 cache-bust。
+function _fmtMinSec(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m > 0 ? m + "分" + (s < 10 ? "0" + s : s) + "秒" : s + "秒";
+}
 
 var _ctx = {};
 var project = null;
@@ -2735,7 +2743,7 @@ function _attachAssetImageBatch(opts) {
       }
       // 并发 3 → 实际墙钟时间约为 pending × avgSec ÷ 3
       var remain = _clampAssetEta(Math.ceil(pending * avgSec / 3));
-      parts.push("约剩 " + remain + " 秒");
+      parts.push("约剩 " + _fmtMinSec(remain));
     }
     // 积分不足场景：所有 pending 都不会再跑（积分预扣环节失败），换一行更醒目的文案
     if (creditPaywallShown) {
@@ -4597,14 +4605,44 @@ function _projectStyleTemplatePreferenceForWorldSnapshot() {
   };
 }
 
+// 世界观可记录的画幅集合：与风格页画面比例选项一致
+var _WORLD_PREFERRED_ASPECT_RATIOS = { "16:9": true, "9:16": true, "1:1": true };
+
+export function _normalizeWorldPreferredAspectRatio(value) {
+  var ratio = String(value || "").trim();
+  return _WORLD_PREFERRED_ASPECT_RATIOS[ratio] ? ratio : "";
+}
+
+export function _worldSnapshotPreferredAspectRatio(worldSnapshot) {
+  if (!worldSnapshot || typeof worldSnapshot !== "object") return "";
+  return _normalizeWorldPreferredAspectRatio(
+    worldSnapshot.preferredAspectRatio || worldSnapshot.preferred_aspect_ratio
+  );
+}
+
+// 与 _projectStyleTemplatePreferenceForWorldSnapshot 同构：项目当前画面比例
+function _projectAspectRatioPreferenceForWorldSnapshot() {
+  if (!project || typeof project !== "object") return "";
+  var opts = project.styleOptions && typeof project.styleOptions === "object" ? project.styleOptions : {};
+  var sb = project.styleBible && typeof project.styleBible === "object" ? project.styleBible : {};
+  return _normalizeWorldPreferredAspectRatio(opts.aspectRatio || sb.aspectRatio || project.videoAspectRatio);
+}
+
 function _attachProjectStylePreferenceToWorldSnapshot(worldSnapshot) {
   if (!worldSnapshot || typeof worldSnapshot !== "object") return worldSnapshot;
-  if (worldSnapshot.preferredStyleTemplateId || worldSnapshot.preferred_style_template_id) return worldSnapshot;
-  var preference = _projectStyleTemplatePreferenceForWorldSnapshot();
-  if (!preference) return worldSnapshot;
-  worldSnapshot.preferredStyleTemplateId = preference.preferredStyleTemplateId;
-  if (preference.preferredStyleTemplateName) worldSnapshot.preferredStyleTemplateName = preference.preferredStyleTemplateName;
-  worldSnapshot.preferredStyleTemplateSource = preference.preferredStyleTemplateSource;
+  if (!worldSnapshot.preferredStyleTemplateId && !worldSnapshot.preferred_style_template_id) {
+    var preference = _projectStyleTemplatePreferenceForWorldSnapshot();
+    if (preference) {
+      worldSnapshot.preferredStyleTemplateId = preference.preferredStyleTemplateId;
+      if (preference.preferredStyleTemplateName) worldSnapshot.preferredStyleTemplateName = preference.preferredStyleTemplateName;
+      worldSnapshot.preferredStyleTemplateSource = preference.preferredStyleTemplateSource;
+    }
+  }
+  // 画面比例同款补缺：模板没记录时，把项目当前画幅写进快照
+  if (!_worldSnapshotPreferredAspectRatio(worldSnapshot)) {
+    var aspect = _projectAspectRatioPreferenceForWorldSnapshot();
+    if (aspect) worldSnapshot.preferredAspectRatio = aspect;
+  }
   return worldSnapshot;
 }
 
@@ -5305,7 +5343,8 @@ function _worldTemplateSaveEraText() {
 function _worldTemplateSaveMetaHtml() {
   var styleText = _worldTemplateSaveStylePreferenceText();
   var eraText = _worldTemplateSaveEraText();
-  if (!styleText && !eraText) return "";
+  var aspectText = _projectAspectRatioPreferenceForWorldSnapshot();
+  if (!styleText && !eraText && !aspectText) return "";
   return (
     '<section class="save-tpl-meta-card" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:12px;background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:14px 18px;box-shadow:0 8px 24px rgba(15,30,55,0.035);margin-bottom:16px">' +
       (styleText
@@ -5313,6 +5352,13 @@ function _worldTemplateSaveMetaHtml() {
             '<span class="material-symbols-outlined" style="font-size:20px;color:#3867D6;flex:0 0 auto">palette</span>' +
             '<span style="font-size:13px;font-weight:800;color:#60748A;white-space:nowrap">风格偏好</span>' +
             '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:850" title="' + escapeHtml(styleText) + '">' + escapeHtml(styleText) + '</span>' +
+          '</div>'
+        : '') +
+      (aspectText
+        ? '<div style="display:flex;align-items:center;gap:10px;min-width:0;color:#172C43">' +
+            '<span class="material-symbols-outlined" style="font-size:20px;color:#3867D6;flex:0 0 auto">crop_portrait</span>' +
+            '<span style="font-size:13px;font-weight:800;color:#60748A;white-space:nowrap">画面比例</span>' +
+            '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:850" title="' + escapeHtml(aspectText) + '">' + escapeHtml(aspectText) + '</span>' +
           '</div>'
         : '') +
       (eraText
@@ -5941,6 +5987,19 @@ export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
 
   var full = await _loadWorldTemplateDetail(tpl);
   var worldSnapshot = _attachProjectStylePreferenceToWorldSnapshot(snapshotWorldTemplate(full || tpl));
+  // 应用世界观时同步其记录的画面比例（与风格模板同款行为）。
+  // 模板没记录时 _attach 已把项目当前画幅补进快照，此处为 no-op。
+  var preferredAspect = _worldSnapshotPreferredAspectRatio(worldSnapshot);
+  if (preferredAspect) {
+    if (!project.styleOptions || typeof project.styleOptions !== "object") project.styleOptions = {};
+    if (project.styleOptions.aspectRatio !== preferredAspect) {
+      project.styleOptions.aspectRatio = preferredAspect;
+    }
+    // 防一次性默认迁移把 16:9 翻回 9:16（同 lib/projects-db.ts STYLE_ASPECT_DEFAULT_VERSION）
+    if (!project.styleOptions.aspectRatioDefaultVersion) {
+      project.styleOptions.aspectRatioDefaultVersion = "2026-05-14-9x16";
+    }
+  }
   var intent = {
     selectedWorldTemplateId: worldSnapshot.id || full.id || tpl.id || null,
     worldTemplateSnapshot: worldSnapshot,

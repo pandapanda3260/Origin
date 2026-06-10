@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=235" />
+    <link rel="stylesheet" href="styles.css?v=237" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -958,6 +958,7 @@
                   <p class="text-sm font-bold text-on-background" id="shotsGenTitle">AI 正在设计镜头…</p>
                   <p class="text-xs text-on-surface-variant mt-0.5" id="shotsGenHint">分析剧本、资产、情绪曲线，生成完整镜头表</p>
                 </div>
+                <button type="button" id="btnShotsGenRetry" class="px-5 py-2.5 bg-primary text-on-primary rounded-full font-bold text-xs tracking-wide hover:opacity-90 transition-all whitespace-nowrap shrink-0" data-write-action hidden>重新生成</button>
               </div>
               <div class="mt-4 h-1 bg-surface-container rounded-full overflow-hidden">
                 <div id="shotsGenProgress" class="h-full bg-primary rounded-full transition-all duration-1000 ease-out" style="width:0%"></div>
@@ -1834,35 +1835,36 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=163",
-        "/modules/backend_stream.js": "/modules/backend_stream.js?v=101",
-        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
-        "/modules/edit.js":           "/modules/edit.js?v=140",
-        "/modules/episode_fields.js": "/modules/episode_fields.js?v=101",
-        "/modules/episodes.js":       "/modules/episodes.js?v=103",
-        "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
-        "/modules/loading.js":        "/modules/loading.js?v=1",
-        "/modules/project.js":        "/modules/project.js?v=105",
-        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=102",
-        "/modules/script.js":         "/modules/script.js?v=116",
-        "/modules/settings.js":       "/modules/settings.js?v=101",
-        "/modules/shots.js":          "/modules/shots.js?v=110",
-        "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=147",
-        "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
+        "/modules/assets.js":         "/modules/assets.js?v=169",
+        "/modules/backend_stream.js": "/modules/backend_stream.js?v=300",
+        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=300",
+        "/modules/edit.js":           "/modules/edit.js?v=302",
+        "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
+        "/modules/episodes.js":       "/modules/episodes.js?v=107",
+        "/modules/error_hub.js":      "/modules/error_hub.js?v=300",
+        "/modules/loading.js":        "/modules/loading.js?v=300",
+        "/modules/project.js":        "/modules/project.js?v=106",
+        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=300",
+        "/modules/script.js":         "/modules/script.js?v=117",
+        "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
+        "/modules/settings.js":       "/modules/settings.js?v=300",
+        "/modules/shots.js":          "/modules/shots.js?v=114",
+        "/modules/store.js":          "/modules/store.js?v=300",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=152",
+        "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
-        "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
-        "/modules/tasks.js":          "/modules/tasks.js?v=100",
-        "/modules/toolbox.js":        "/modules/toolbox.js?v=201",
-        "/modules/utils.js":          "/modules/utils.js?v=203",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=111",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=123"
+        "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=104",
+        "/modules/tasks.js":          "/modules/tasks.js?v=300",
+        "/modules/toolbox.js":        "/modules/toolbox.js?v=202",
+        "/modules/utils.js":          "/modules/utils.js?v=300",
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=113",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=302"
       }
     }
     </script>
-    <script type="module" src="modules/store.js?v=100"></script>
-    <script type="module" src="modules/utils.js?v=203"></script>
-    <script type="module" src="main.js?v=319"></script>
+    <script type="module" src="modules/store.js?v=300"></script>
+    <script type="module" src="modules/utils.js?v=300"></script>
+    <script type="module" src="main.js?v=329"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

@@ -1,5 +1,5 @@
 import { $, escapeHtml, showToast, apiPost, apiPostStream, apiGet, getAuthHeaders, getActiveBatchesShared,
-  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=201';
+  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=300';
 import {
   materialPanelCandidateTilesForRole,
   materialPanelOrderedTiles,
@@ -22,11 +22,11 @@ import {
   setMaterialPanelUploading,
   shouldRefreshMaterialPanel,
   setMaterialPanel,
-} from './material_image_panel.js?v=103';
-import { attachDiagnostic } from './diagnostic.js';
-import { renderStoryboardCard, renderStoryboardFrameCard } from './render_hooks.js';
-import { subscribeBatch } from './backend_stream.js';
-import { showBillingPaywall } from './billing.js';
+} from './material_image_panel.js?v=104';
+import { attachDiagnostic } from './diagnostic.js?v=300';
+import { renderStoryboardCard, renderStoryboardFrameCard } from './render_hooks.js?v=300';
+import { subscribeBatch } from './backend_stream.js?v=300';
+import { showBillingPaywall } from './billing.js?v=114';
 import {
   canGenerateTailFrame as _canGenerateTailFrame,
   firstFrameImageUrl as _firstFrameImageUrl,
@@ -88,6 +88,14 @@ function _keyframeRemainingSeconds(done, fail, total, startTs) {
   return Math.max(1, Math.ceil(pending * avg / _keyframeProgressConcurrency()));
 }
 
+// 进度提示统一时间格式："x分x秒"（<60s 只显 "x秒"）。各模块各持一份，避免动 utils.js 引发全量 cache-bust。
+function _fmtMinSec(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m > 0 ? m + "分" + (s < 10 ? "0" + s : s) + "秒" : s + "秒";
+}
+
 // ETA 单调钳制：估算值 = 已耗时/已完成 的动态均值，两次完成之间没有新事件时
 // 均值被持续拉大，"约剩 8 秒"会回升到 13、18——倒计时上涨非常怪。
 // 这里记住上次显示值并按墙钟自然倒数（-1/秒），新估算只有更小（来了新完成）
@@ -117,7 +125,7 @@ function _formatKeyframeProgress(done, total, fail, startTs) {
   var lines = ["生成中… " + visibleDone + "/" + (total || "?")];
   if (fail > 0) lines.push(fail + " 张失败");
   var remain = _clampKeyframeEta(_keyframeRemainingSeconds(done, fail, total, startTs), total, startTs);
-  if (remain > 0) lines.push("约剩 " + remain + " 秒");
+  if (remain > 0) lines.push("约剩 " + _fmtMinSec(remain));
   return lines.join("，");
 }
 
@@ -2612,6 +2620,7 @@ async function _sbHydrateTailFramePromptEditor(gIdx, el) {
     if (currentEl && currentEl === el && !state.dirtyAt && String(currentEl.value || '') === beforeValue) {
       currentEl.value = _sbTailFrameCardPromptText(gIdx);
     }
+    _sbSyncFramePromptSafetyHighlight(currentEl || el);
     _sbRefreshTailFrameCardPendingDraft(gIdx);
     _sbSetTailFrameCardPromptStatus(gIdx, _sbTailFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
   } catch (_) {
@@ -2634,6 +2643,7 @@ function _sbHydrateTailFramePromptEditors(root) {
       if (!state.dirtyAt && String(currentEl.value || '') === beforeValue) {
         currentEl.value = nextText;
       }
+      _sbSyncFramePromptSafetyHighlight(currentEl);
       _sbRefreshTailFrameCardPendingDraft(gIdx);
       _sbSetTailFrameCardPromptStatus(gIdx, _sbTailFrameCardPromptStatus(gIdx, project.storyboards && project.storyboards[gIdx]));
     }).catch(function (err) {
@@ -2800,6 +2810,7 @@ async function _sbRestoreTailFrameCardPrompt(gIdx) {
     if (resp.tailFrameBackup) project.storyboards[gIdx].tailFrameBackup = resp.tailFrameBackup;
     var el = _sbTailFrameCardPromptTextarea(gIdx);
     if (el) el.value = _sbTailFrameCardPromptText(gIdx);
+    if (el) _sbSyncFramePromptSafetyHighlight(el);
     _sbSetTailFrameCardPromptStatus(gIdx, 'restored');
     showToast('已恢复尾帧初始 prompt', 'success');
   } catch (err) {
@@ -5735,6 +5746,7 @@ document.addEventListener('input', function (ev) {
     if (target.readOnly) return;
     var tailGIdx = parseInt(target.dataset.gidx, 10);
     if (isNaN(tailGIdx)) return;
+    _sbSyncFramePromptSafetyHighlight(target);
     _sbRefreshTailFrameCardPendingDraft(tailGIdx);
     _sbScheduleTailFrameCardPromptSave(tailGIdx, { source: 'tail-card-autosave-input' });
   }
@@ -5821,6 +5833,7 @@ document.addEventListener('compositionend', function (ev) {
       var tailCardAuto = _sbTailFrameCardPromptState(tailCardGIdx);
       tailCardAuto.composing = false;
       tailCardAuto.dirtyAt = null;
+      _sbSyncFramePromptSafetyHighlight(ev.target);
       _sbScheduleTailFrameCardPromptSave(tailCardGIdx, { source: 'tail-card-autosave-compositionend' });
     }
     return;
@@ -5858,7 +5871,7 @@ document.addEventListener('blur', function (ev) {
   _ffeScheduleAutoSave({ source: 'autosave-blur', immediate: true });
 }, true);
 document.addEventListener('scroll', function (ev) {
-  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"]')) {
+  if (ev.target && ev.target.matches && ev.target.matches('textarea[data-sb-first-prompt-field="content"], textarea[data-sb-tail-prompt-field="content"]')) {
     _sbSyncFramePromptSafetyHighlight(ev.target);
   }
 }, true);
@@ -7456,7 +7469,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
     var eta = _startSingleFrameEta({
       initialSec: 70,
       onTick: function (remain) {
-        var loadingText = "生成首帧中…约剩 " + remain + " 秒";
+        var loadingText = "生成首帧中…约剩 " + _fmtMinSec(remain);
         try { updateStoryboardCard(gIdx, "loading", null, loadingText); } catch (_e) {}
         if (typeof opts.onLoadingText === 'function') {
           try { opts.onLoadingText(loadingText); } catch (_loadingTextErr) {}
@@ -7836,7 +7849,7 @@ export async function generateStoryboardTailFrame(gIdx) {
       initialSec: 60,
       onTick: function (remain) {
         try {
-          renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: '生成尾帧中…约剩 ' + remain + ' 秒' });
+          renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: '生成尾帧中…约剩 ' + _fmtMinSec(remain) });
         } catch (_e) {}
       },
     });

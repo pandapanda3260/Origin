@@ -212,13 +212,14 @@ export function settleUsageCharge(input: UsageChargeInput): UsageChargeResult {
 
   const txn = db.transaction(() => {
     const cur = getBalance(input.userId);
+    // 扣减优先级：subscription > bonus > topup（2026-06-10 反转，与 credits.ts chargeCredits 同步改）。
     let remaining = points;
+    const subUse = Math.min(remaining, cur.subscriptionCredits);
+    remaining -= subUse;
     const bonusUse = Math.min(remaining, cur.bonusCredits);
     remaining -= bonusUse;
     const topupUse = Math.min(remaining, cur.topupCredits);
     remaining -= topupUse;
-    const subUse = Math.min(remaining, cur.subscriptionCredits);
-    remaining -= subUse;
     const overdraftUse = remaining;
 
     const newBonus = cur.bonusCredits - bonusUse;

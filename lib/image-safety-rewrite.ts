@@ -10,8 +10,9 @@ import type { RewriteDiff } from './content-sanitize';
  * 提示词软化后重试,是 safe-image-gen 自动救回的"真正能动"的一层。
  *
  * 约束:
- *   - 只软化描述性文字(尤其【主镜头】的"- 画面：")的敏感意象;
- *   - 保留所有【...】小节结构与【角色/场景/道具/项目风格锁定】【硬性禁止】原文,避免破坏一致性;
+ *   - 全部小节内容均可改写(含【角色/场景/道具/项目风格锁定】【参考图】),敏感意象藏在锁定区时也能救回;
+ *     仅要求保留【...】小节结构,并尽量少动锁定区的一致性锚点(身份/外观/配色/参考图映射);
+ *   - 不得新增原文没有的小节(上下文镜头/用户原文约束/世界观硬事实等是上游有意裁剪的);
  *   - 模型走 modelRole='structured'(治理:不硬编码 model/provider/effort)。
  */
 
@@ -21,13 +22,15 @@ const IMAGE_SAFETY_REWRITE_SYSTEM = [
   '',
   '严格要求:',
   '1. 保留所有以【】包裹的小节标题和整体结构顺序。',
-  '2.【参考图】【角色锁定】【场景锁定】【道具锁定】【项目风格锁定】这些小节的内容必须原样保留,一字不改。',
-  '3. 只能改写【任务】【画面目标】【构图规则】【主镜头】【尾帧目标】【硬性禁止】等可变生成说明。',
-  '4. 严禁新增或恢复【上下文镜头】【用户原文约束】【世界观硬事实】或 OBSERVED DRIFT GUARDRAILS。',
-  '5. 只软化可能触发内容安全审核的描述性文字(尤其【主镜头】里"- 画面："那一行的自由描写):',
+  '2. 所有小节的内容都可以改写,包括【参考图】【角色锁定】【场景锁定】【道具锁定】【项目风格锁定】:',
+  '   敏感措辞无论出现在哪个小节,都要软化;没有敏感措辞的句子尽量原样保留。',
+  '3. 严禁新增或恢复原文中不存在的小节,如【上下文镜头】【用户原文约束】【世界观硬事实】或 OBSERVED DRIFT GUARDRAILS。',
+  '4. 只软化可能触发内容安全审核的描述性文字(尤其【主镜头】里"- 画面："那一行的自由描写):',
   '   弱化血腥、暴力、武器、尸体、群体跪拜/宗教膜拜、裸露、性、自残等敏感意象,',
   '   改写成中性、克制、具体、可拍的电影化镜头描述。',
-  '6. 不改变人物身份、外观、所在场景与核心动作要义;不要新增旁白或文字内容。',
+  '5. 改写锁定类小节时,尽量保住一致性锚点:人物身份与外观要点、配色、场景标识、',
+  '   参考图编号与角色/场景的对应关系(如 Image 1 = 某角色)不要无故改动,只替换其中的敏感措辞。',
+  '6. 不改变人物身份、所在场景与核心动作要义;不要新增旁白或文字内容。',
   '7. 直接输出改写后的【完整提示词文本】,不要加任何解释、前后缀、引号或代码块。',
 ].join('\n');
 
@@ -36,7 +39,6 @@ export type ImageSafetyRewriteInvalidReason =
   | 'too_short'
   | 'no_change'
   | 'llm_error'
-  | 'protected_section_changed'
   | 'forbidden_section_added';
 
 export type ImageSafetyLLMRewrite = {
@@ -54,44 +56,7 @@ export type ImageSafetyLLMRewrite = {
   };
 };
 
-const PROTECTED_SECTION_TITLES = new Set([
-  '参考图',
-  '角色锁定',
-  '场景锁定',
-  '道具锁定',
-  '项目风格锁定',
-]);
-
 const FORBIDDEN_SECTION_RE = /【(?:上下文镜头|用户原文约束|世界观硬事实)】|OBSERVED DRIFT GUARDRAILS/g;
-
-function collectProtectedSections(text: string): Map<string, string[]> {
-  const out = new Map<string, string[]>();
-  const re = /【([^】]+)】[\s\S]*?(?=\n【[^】]+】|$)/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(String(text || ''))) !== null) {
-    const title = match[1];
-    if (!PROTECTED_SECTION_TITLES.has(title)) continue;
-    const list = out.get(title) || [];
-    list.push(match[0]);
-    out.set(title, list);
-  }
-  return out;
-}
-
-function sameProtectedSections(original: string, rewritten: string): boolean {
-  const before = collectProtectedSections(original);
-  const after = collectProtectedSections(rewritten);
-  const titles = new Set([...before.keys(), ...after.keys()]);
-  for (const title of titles) {
-    const a = before.get(title) || [];
-    const b = after.get(title) || [];
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i += 1) {
-      if (a[i] !== b[i]) return false;
-    }
-  }
-  return true;
-}
 
 function hasForbiddenSection(text: string): boolean {
   FORBIDDEN_SECTION_RE.lastIndex = 0;
@@ -157,7 +122,6 @@ export async function rewriteImagePromptForModerationLLM(
   if (rewritten.length < 20) return noChange('too_short');
   if (rewritten === original) return noChange('no_change');
   if (hasForbiddenSection(rewritten)) return noChange('forbidden_section_added');
-  if (!sameProtectedSections(original, rewritten)) return noChange('protected_section_changed');
 
   const rewriteDiff: RewriteDiff[] = [
     {

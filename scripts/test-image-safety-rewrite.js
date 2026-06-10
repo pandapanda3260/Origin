@@ -96,7 +96,7 @@ async function run() {
     assertEqual(out.invalidDetail, 'max_output_tokens', 'throw detail');
   });
 
-  await test('LLM 改写: 保护区保持原文且硬性禁止可改 → changed=true', async () => {
+  await test('LLM 改写: 锁定区未动且硬性禁止可改 → changed=true', async () => {
     const original = [
       '【任务】生成首帧。',
       '【主镜头】',
@@ -120,18 +120,18 @@ async function run() {
       '- 禁止字幕、说明文字。',
     ].join('\n');
     const out = await rw.rewriteImagePromptForModerationLLM(null, original, { chatImpl: async () => rewritten });
-    assert(out.changed === true, 'changed true when protected sections are exact');
+    assert(out.changed === true, 'changed true when lock sections are untouched');
     assert(out.rewrittenPrompt.includes('禁止字幕、说明文字'), 'hard prohibition can be rewritten');
   });
 
-  await test('LLM 改写: 修改保护区 → changed=false', async () => {
+  await test('LLM 改写: 锁定区也可改写(降敏全量覆盖) → changed=true', async () => {
     const original = [
       '【主镜头】',
       '- 画面：满地跪伏的人群。',
       '【参考图】',
       '- Image 1 = 角色（Alice）- 锁定同一人脸部、服装。',
       '【角色锁定】',
-      'Alice: blue coat, calm face',
+      'Alice: blue coat, 袒胸示伤, calm face',
     ].join('\n');
     const rewritten = [
       '【主镜头】',
@@ -139,11 +139,11 @@ async function run() {
       '【参考图】',
       '- Image 1 = 角色（Alice）- 锁定同一人脸部、服装。',
       '【角色锁定】',
-      'Alice: red coat, calm face',
+      'Alice: blue coat, 衣袍完整覆盖身体, calm face',
     ].join('\n');
     const out = await rw.rewriteImagePromptForModerationLLM(null, original, { chatImpl: async () => rewritten });
-    assert(out.changed === false, 'changed false when protected section changed');
-    assertEqual(out.invalidReason, 'protected_section_changed', 'protected section reason');
+    assert(out.changed === true, 'changed true when lock section content is rewritten');
+    assert(out.rewrittenPrompt.includes('衣袍完整覆盖身体'), 'lock section rewrite is adopted');
   });
 
   await test('LLM 改写: 加回删除区 → changed=false', async () => {

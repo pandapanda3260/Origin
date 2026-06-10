@@ -5,10 +5,10 @@
  * composition root and injects project/settings/videoState plus cross-domain
  * callbacks through initVideoTasks(ctx).
  */
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=201';
-import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
-import { subscribeTask, subscribeBatch } from './backend_stream.js';
-import { showBillingPaywall } from './billing.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=300';
+import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js?v=302';
+import { subscribeTask, subscribeBatch } from './backend_stream.js?v=300';
+import { showBillingPaywall } from './billing.js?v=114';
 import { describeVideoModelStatusFailure } from './video_model_status.js?v=1';
 import { firstFrameImageUrl } from './frameRecommendations.js?v=1';
 
@@ -1184,6 +1184,15 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
 	  }
 
+	  // 进度提示统一时间格式："x分x秒"（<60s 只显 "x秒"）。
+	  // 注意与 _formatBatchDuration 分工：MM:SS 留给"片段时长"列，剩余时间类提示用本函数。
+	  function _fmtMinSec(sec) {
+	    sec = Math.max(0, Math.round(Number(sec) || 0));
+	    var m = Math.floor(sec / 60);
+	    var s = sec % 60;
+	    return m > 0 ? m + "分" + (s < 10 ? "0" + s : s) + "秒" : s + "秒";
+	  }
+
   // 预计时长展示在原算法基础上再 /3（用户口径调整：和实际后端调度并发后的体感更贴近）
   var _BATCH_ESTIMATE_DIVISOR = 3;
 
@@ -1243,7 +1252,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    if (!elapsedSec || pct <= 1) return "计算中";
 	    var estimatedTotal = elapsedSec / (pct / 100);
 	    var remaining = Math.max(0, Math.round(estimatedTotal - elapsedSec));
-	    return remaining ? "剩余约 " + _formatBatchDuration(remaining) : "即将完成";
+	    return remaining ? "剩余约 " + _fmtMinSec(remaining) : "即将完成";
 	  }
 
 	  function _batchThumbHtml(src) {
@@ -1338,7 +1347,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         if (cnt > 0) {
           var avgSec = sumMs / cnt / 1000;
           var estSec = Math.round(avgSec * active);
-          if (estSec > 8) etaText = "预估剩余约 " + estSec + " 秒（按已完成片段平均耗时）";
+          if (estSec > 8) etaText = "预估剩余约 " + _fmtMinSec(estSec) + "（按已完成片段平均耗时）";
         }
       }
       etaEl.textContent = etaText;

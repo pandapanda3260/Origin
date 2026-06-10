@@ -1798,6 +1798,9 @@ export function getBatchSnapshot(batchId: string, ownerId?: number): any | null 
     batchId,
     batchType: batch.batch_type,
     status: batch.status,
+    // 批次创建时刻（ISO UTC）。前端倒计时用它做"已耗时"锚点：
+    // 刷新页面 / reattach 后不至于把倒计时从头再走一遍。纯附加字段，老前端无感。
+    createdAt: batch.created_at || null,
     total: batch.total,
     succeeded: batch.succeeded,
     failed: batch.failed,

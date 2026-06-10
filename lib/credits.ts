@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { getDb } from './db';
+import { getPlan, isDevAutopayEnabled } from './billing-config';
 
 export type CreditKind = 'text' | 'image' | 'video' | 'export' | 'topup' | 'redeem' | 'refund' | 'gift' | 'adjust';
 
@@ -148,6 +149,124 @@ export function settleExpiredSubscription(userId: number): boolean {
   return downgraded;
 }
 
+// 订阅周期：自然月粗粒度（setUTCMonth +1）。月末日期会向后滚（1/31 → 3/2 一类），
+// 模拟支付阶段可接受；真支付网关接入时以网关账期为准，这里只是兜底口径。
+function addMonthsIso(fromMs: number, months: number): string {
+  const d = new Date(fromMs);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d.toISOString();
+}
+
+/**
+ * 订阅生效（购买/换档统一入口，由 lib/billing-fulfill.ts 在支付成功后调用）。
+ *
+ * 语义（2026-06-10 拍板，"每月重置"）：订阅桶**覆盖重置**为该档 monthly_credits（不叠加，
+ * 换档同理：plus→pro 重置为 400000，反向换档同样覆盖）；period_end = 现在 +1 月；
+ * 清取消标记。topup / bonus / overdraft 桶不动。流水 kind='adjust' 记录桶差额留痕。
+ */
+export function activatePlanSubscription(
+  userId: number,
+  planCode: string,
+  opts?: { reasonPrefix?: string; refId?: string },
+): { periodEnd: string; creditsSet: number } {
+  const plan = getPlan(planCode);
+  if (!plan) throw new Error('未知订阅档位：' + planCode);
+  if (!Number(plan.price_cents) || planCode === 'free') throw new Error('免费档无需订阅');
+  const monthly = Number(plan.monthly_credits || 0);
+  const db = getDb();
+  getBalance(userId); // 确保开户
+  const periodEnd = addMonthsIso(Date.now(), 1);
+  let out: { periodEnd: string; creditsSet: number } | null = null;
+  const txn = db.transaction(() => {
+    const cur = getBalance(userId);
+    const newTotal = monthly + cur.topupCredits + cur.bonusCredits - cur.overdraftCredits;
+    const info = db.prepare(
+      `UPDATE user_credits SET
+         plan_code = ?, plan_status = 'active', subscription_credits = ?, total_credits = ?,
+         cancel_at_period_end = 0, period_end = ?,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE user_id = ?
+         AND subscription_credits = ? AND topup_credits = ? AND bonus_credits = ? AND overdraft_credits = ?`,
+    ).run(
+      plan.code, monthly, newTotal, periodEnd, userId,
+      cur.subscriptionCredits, cur.topupCredits, cur.bonusCredits, cur.overdraftCredits,
+    );
+    if (info.changes !== 1) throw new Error('积分余额更新冲突，请重试');
+    db.prepare(
+      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after)
+       VALUES (?, ?, ?, 'adjust', ?, ?, ?)`,
+    ).run(
+      randomUUID(), userId, monthly - cur.subscriptionCredits,
+      `${opts?.reasonPrefix || ''}订阅 ${plan.title} 生效：订阅积分重置为 ${monthly}`.slice(0, 200),
+      opts?.refId || null, newTotal,
+    );
+    out = { periodEnd, creditsSet: monthly };
+  });
+  txn.immediate();
+  return out!;
+}
+
+/**
+ * 到期续费（惰性，模拟支付专用）。
+ *
+ * 仅在模拟支付开关开启时生效（isDevAutopayEnabled，方向B 2026-06-10 拍板）：付费档、
+ * 未申请取消、period_end 已过 → 视为"自动扣款成功"，订阅桶覆盖重置为 monthly_credits，
+ * period_end 按月顺延到未来（跨多月只重置一次，不叠发）。与 settleExpiredSubscription
+ * 互斥（cancel 标记分流），同样只挂在读取入口（me / config/client / projects POST），
+ * 不进扣费路径。真支付网关接入后，这段由"续费扣款回调"替代，开关关掉即停。
+ */
+export function renewDueSubscription(userId: number): boolean {
+  if (!isDevAutopayEnabled()) return false;
+  const db = getDb();
+  const row = db
+    .prepare<{ uid: number }, any>(
+      `SELECT plan_code, plan_status, period_end, cancel_at_period_end,
+              subscription_credits, topup_credits, bonus_credits, overdraft_credits
+       FROM user_credits WHERE user_id = @uid`,
+    )
+    .get({ uid: userId });
+  if (!row) return false;
+  if (row.cancel_at_period_end) return false;
+  if (!row.plan_code || row.plan_code === 'free') return false;
+  if (!row.period_end) return false;
+  const oldEnd = Date.parse(String(row.period_end));
+  if (!Number.isFinite(oldEnd) || oldEnd > Date.now()) return false;
+  const plan = getPlan(String(row.plan_code));
+  if (!plan || !Number(plan.price_cents)) return false;
+
+  const monthly = Number(plan.monthly_credits || 0);
+  // period_end 按月顺延直到未来（封顶 240 次防御异常数据死循环）
+  let endMs = oldEnd;
+  for (let i = 0; i < 240 && endMs <= Date.now(); i++) {
+    endMs = Date.parse(addMonthsIso(endMs, 1));
+  }
+  const newEnd = new Date(endMs).toISOString();
+  const oldSub = Number(row.subscription_credits || 0);
+  const newTotal =
+    monthly + Number(row.topup_credits || 0) + Number(row.bonus_credits || 0) - Number(row.overdraft_credits || 0);
+  let renewed = false;
+  const txn = db.transaction(() => {
+    const info = db.prepare(
+      `UPDATE user_credits SET
+         subscription_credits = ?, total_credits = ?, period_end = ?,
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE user_id = ? AND plan_code = ? AND period_end = ? AND cancel_at_period_end = 0`,
+    ).run(monthly, newTotal, newEnd, userId, row.plan_code, row.period_end);
+    if (info.changes !== 1) return;
+    db.prepare(
+      `INSERT INTO credit_ledger (id, user_id, amount, kind, reason, ref_id, balance_after)
+       VALUES (?, ?, ?, 'adjust', ?, ?, ?)`,
+    ).run(
+      randomUUID(), userId, monthly - oldSub,
+      `[模拟支付] 订阅 ${plan.title} 续费：订阅积分重置为 ${monthly}`.slice(0, 200),
+      null, newTotal,
+    );
+    renewed = true;
+  });
+  txn.immediate();
+  return renewed;
+}
+
 /**
  * 迁移期 legacy 扣减。只在余额 <= 0 时拦截，允许本次扣减后变成负余额。
  * 新 API 用量扣费优先使用 usage-billing.ts。
@@ -184,14 +303,15 @@ export function chargeCredits(opts: {
       throw new InsufficientCreditsError(1, cur.totalCredits);
     }
 
-    // 扣减优先级：bonus > topup > subscription
+    // 扣减优先级：subscription > bonus > topup（2026-06-10 反转，与 usage-billing.ts 同步改）。
+    // 理由：订阅桶随月度重置会"过期"，必须先烧；topup 是花钱买的永久积分，最后才动；bonus 赠送居中。
     let remaining = opts.amount;
+    const subUse = Math.min(remaining, cur.subscriptionCredits);
+    remaining -= subUse;
     const bonusUse = Math.min(remaining, cur.bonusCredits);
     remaining -= bonusUse;
     const topupUse = Math.min(remaining, cur.topupCredits);
     remaining -= topupUse;
-    const subUse = Math.min(remaining, cur.subscriptionCredits);
-    remaining -= subUse;
     const overdraftUse = remaining;
 
     const newBonus = cur.bonusCredits - bonusUse;

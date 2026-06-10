@@ -15,9 +15,9 @@ export const MOCK_BILLING_PLANS_LIST = [
     code: 'plus',
     title: 'Plus',
     description: '专业创作者',
-    price_cents: 9900,
+    price_cents: 159900,
     billing_cycle: 'month',
-    monthly_credits: 2000,
+    monthly_credits: 80000,
     limits: { concurrency: 4, projects: 1000, storageGB: 50 },
     features: { models: ['全部模型'], priority: 'fast', support: '邮件' },
     isCurrent: false,
@@ -27,9 +27,9 @@ export const MOCK_BILLING_PLANS_LIST = [
     code: 'pro',
     title: 'Pro',
     description: '工作室与团队',
-    price_cents: 29900,
+    price_cents: 799900,
     billing_cycle: 'month',
-    monthly_credits: 8000,
+    monthly_credits: 400000,
     limits: { concurrency: 10, projects: 5000, storageGB: 500 },
     features: { models: ['全部模型 + 4K'], priority: 'priority', support: '专属客服' },
     isCurrent: false,
@@ -38,9 +38,9 @@ export const MOCK_BILLING_PLANS_LIST = [
 ];
 
 export const MOCK_TOPUP_PACKS = [
-  { code: 'topup_500', title: '500 积分包', credits: 500, price_cents: 1900 },
-  { code: 'topup_2000', title: '2000 积分包', credits: 2000, price_cents: 6900 },
-  { code: 'topup_10000', title: '10000 积分包', credits: 10000, price_cents: 29900 },
+  { code: 'topup_basic', title: '基础积分包', credits: 40000, price_cents: 100000 },
+  { code: 'topup_advanced', title: '进阶积分包', credits: 120000, price_cents: 300000 },
+  { code: 'topup_enterprise', title: '企业积分包', credits: 2000000, price_cents: 4000000 },
 ];
 
 export const MOCK_BILLING_ME = {

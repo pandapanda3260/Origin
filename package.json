@@ -33,6 +33,8 @@
     "diagnose:characters": "node scripts/diagnose-character-consistency.js",
     "evaluate:resolver": "node scripts/evaluate-character-mention-resolver.js",
     "test:continuity-chunking": "node scripts/test-continuity-parallel-chunking.mjs",
+    "test:cache-busting": "node scripts/test-frontend-cache-busting.mjs",
+    "test:online-editor-keepalive": "node scripts/test-online-editor-keepalive.mjs",
     "test:sanitize": "node scripts/test-image-moderation-sanitizer.js",
     "test:moderation-recovery": "node scripts/test-image-moderation-recovery.js",
     "test:image-provider-routing": "tsx scripts/test-image-provider-routing.ts",
@@ -72,7 +74,9 @@
     "test:edit-export-concat": "tsx scripts/test-edit-export-concat.ts",
     "test:subtitle-format": "node scripts/test-subtitle-format.mjs",
     "test:episode-continue-contract": "tsx scripts/test-episode-create-contract.ts",
+    "test:world-aspect-preference": "node scripts/test-world-aspect-preference-contract.mjs",
     "test:project-quota": "tsx scripts/test-project-quota.ts",
+    "test:billing-autopay": "DB_PATH=${DB_PATH:-/tmp/qd-test-billing-autopay.sqlite} tsx scripts/test-billing-autopay.ts",
     "prompt-eval:collect": "node scripts/prompt-sample-collect.mjs",
     "prompt-eval:report": "node scripts/prompt-eval.mjs",
     "start": "next start -p 3000",
@@ -81,7 +85,8 @@
     "backup:sqlite": "tsx scripts/backup-sqlite.ts",
     "migrate:shot-plan-legacy": "tsx scripts/migrate-shot-plan-legacy.ts",
     "stress:sqlite": "tsx scripts/stress-sqlite-durable.ts",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:scroll-anchor-guard": "node scripts/test-scroll-anchor-guard.mjs"
   },
   "dependencies": {
     "@langchain/core": "^1.1.44",

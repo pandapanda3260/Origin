@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { countProjectsForUser, createProjectForUser, listProjectsByUser } from '@/lib/projects-db';
-import { getBalance, settleExpiredSubscription } from '@/lib/credits';
+import { getBalance, renewDueSubscription, settleExpiredSubscription } from '@/lib/credits';
 import { getPlan } from '@/lib/billing-config';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 
@@ -24,6 +24,7 @@ export async function POST(req: NextRequest) {
   // 先惰性结算过期订阅（照抄 billing/me 的打法），防止过期 Plus 还按 1000 算；
   // 降级后存量超限不删不锁，只拦新建。
   try { settleExpiredSubscription(user.id); } catch (_) {}
+  try { renewDueSubscription(user.id); } catch (_) {}
   let planCode = 'free';
   try { planCode = getBalance(user.id).planCode || 'free'; } catch (_) {}
   const plan = getPlan(planCode) || getPlan('free');

@@ -189,6 +189,19 @@ function preferredStyleTemplateNameFrom(value: any) {
   );
 }
 
+// 世界观可记录的画幅偏好：与风格页画面比例选项保持同一集合
+const WORLD_PREFERRED_ASPECT_RATIOS = new Set(['16:9', '9:16', '1:1']);
+
+function preferredAspectRatioFrom(value: any) {
+  const ratio = cleanString(
+    value?.preferredAspectRatio
+      || value?.preferred_aspect_ratio
+      || '',
+    10,
+  );
+  return WORLD_PREFERRED_ASPECT_RATIOS.has(ratio) ? ratio : '';
+}
+
 function normalizedPreferredStyleFields(value: any) {
   const preferredStyleTemplateId = preferredStyleTemplateIdFrom(value);
   const preferredStyleTemplateName = preferredStyleTemplateNameFrom(value);
@@ -199,10 +212,12 @@ function normalizedPreferredStyleFields(value: any) {
       || '',
     80,
   );
+  const preferredAspectRatio = preferredAspectRatioFrom(value);
   const out: Record<string, string> = {};
   if (preferredStyleTemplateId) out.preferredStyleTemplateId = preferredStyleTemplateId;
   if (preferredStyleTemplateName) out.preferredStyleTemplateName = preferredStyleTemplateName;
   if (preferredStyleTemplateSource) out.preferredStyleTemplateSource = preferredStyleTemplateSource;
+  if (preferredAspectRatio) out.preferredAspectRatio = preferredAspectRatio;
   return out;
 }
 
@@ -1004,11 +1019,26 @@ function preferredStyleTemplateFromProject(project: any) {
   };
 }
 
+// 与 preferredStyleTemplateFromProject 同构：把项目当前画面比例记录进世界观模板。
+// 只在项目显式有值且合法时记录，不补默认值。
+function preferredAspectRatioFromProject(project: any) {
+  const preferredAspectRatio = preferredAspectRatioFrom({
+    preferredAspectRatio: project?.styleOptions?.aspectRatio
+      || project?.styleBible?.aspectRatio
+      || project?.videoAspectRatio
+      || '',
+  });
+  return preferredAspectRatio ? { preferredAspectRatio } : {};
+}
+
 export function buildWorldTemplateFromProject(project: any, opts: { templateId?: string; name?: string; include?: BuildWorldTemplateInclude } = {}) {
   const styleBible = project?.styleBible && typeof project.styleBible === 'object' ? project.styleBible : {};
   const worldRulesRaw = styleBible.worldRules || styleBible.world_rules || {};
   const include = opts.include || {};
-  const preferredStyleFields = preferredStyleTemplateFromProject(project);
+  const preferredStyleFields = {
+    ...preferredStyleTemplateFromProject(project),
+    ...preferredAspectRatioFromProject(project),
+  };
   const characterSplit = includeEnabled(include, 'characters')
     ? splitWorldCharactersFromProject(project)
     : { characters: [], characterCandidates: [] };
@@ -1054,7 +1084,10 @@ export function buildWorldTemplateFromProjectSnapshot(
   const templateId = opts.templateId
     || (opts.mode === 'create' ? `world_${cleanId(project?.id || randomUUID())}` : firstText(snapshot.id))
     || `world_${cleanId(project?.id || randomUUID())}`;
-  const preferredStyleFields = preferredStyleTemplateFromProject(project);
+  const preferredStyleFields = {
+    ...preferredStyleTemplateFromProject(project),
+    ...preferredAspectRatioFromProject(project),
+  };
   const projectCharacterSplit = splitWorldCharactersFromProject(project);
   const snapshotCharacters = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characters);
   const snapshotCandidates = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characterCandidates);

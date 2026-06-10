@@ -1,7 +1,7 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js';
-import { attachDiagnostic } from './diagnostic.js';
-import { renderVpCard } from './render_hooks.js';
-import { subscribeBatch } from './backend_stream.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=300';
+import { attachDiagnostic } from './diagnostic.js?v=300';
+import { renderVpCard } from './render_hooks.js?v=300';
+import { subscribeBatch } from './backend_stream.js?v=300';
 import { firstFrameImageUrl } from './frameRecommendations.js?v=1';
 
 let _ctx = {};
@@ -1632,6 +1632,14 @@ export async function generateGroupVideoPrompt(gIdx) {
 	  }
 	}
 
+// 进度提示统一时间格式："x分x秒"（<60s 只显 "x秒"）。各模块各持一份，避免动 utils.js 引发全量 cache-bust。
+function _fmtMinSec(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m > 0 ? m + "分" + (s < 10 ? "0" + s : s) + "秒" : s + "秒";
+}
+
 function _isVideoPromptBatchTerminalStatus(status) {
   status = String(status || '').toLowerCase();
   return status === 'completed' || status === 'failed' || status === 'cancelled' ||
@@ -1675,6 +1683,40 @@ function _attachVideoPromptBatch(opts) {
   var pollTimer = null;
   var streamHandle = null;
 
+  // —— "约剩x分x秒"估算 ——
+  // 吞吐口径：已耗时 ÷ 已处理条数 × 待处理条数（并发已隐含在吞吐里）。
+  // 单调钳制（同资产页 _clampAssetEta）：两次完成之间均值上漂时按墙钟自然倒数，
+  // 新估算只有更小才允许跳变。reattach（silent）不显示——耗时锚点不在本端，
+  // 历史事件回放会把速度算飘。
+  var _etaStartTs = Date.now();
+  var _etaClamp = { remain: 0, wallTs: 0 };
+  var _etaTimer = null;
+
+  function _stopEtaTimer() {
+    if (_etaTimer) {
+      clearInterval(_etaTimer);
+      _etaTimer = null;
+    }
+  }
+
+  function _promptEtaSuffix() {
+    if (silent || terminalAtAttach || finished) return "";
+    var total = totalCount || groups.length || 0;
+    var processed = doneCount + failCount;
+    var pending = total - processed;
+    if (processed < 1 || pending <= 0) return "";
+    var fresh = Math.ceil((Date.now() - _etaStartTs) / 1000 / processed * pending);
+    if (!(fresh > 0)) return "";
+    var now = Date.now();
+    if (!_etaClamp.wallTs) {
+      _etaClamp = { remain: fresh, wallTs: now };
+    } else {
+      var decayed = Math.max(1, Math.round(_etaClamp.remain - (now - _etaClamp.wallTs) / 1000));
+      _etaClamp = { remain: Math.min(decayed, fresh), wallTs: now };
+    }
+    return "，约剩" + _fmtMinSec(_etaClamp.remain);
+  }
+
   function _stopPoll() {
     if (pollTimer) {
       clearInterval(pollTimer);
@@ -1689,7 +1731,7 @@ function _attachVideoPromptBatch(opts) {
     // 不允许迟到的回放再把它改回"生成中"。
     if (!hint || finished || terminalAtAttach) return;
     var total = totalCount || groups.length || 0;
-    hint.textContent = "生成中… " + (doneCount + failCount) + "/" + total;
+    hint.textContent = "生成中… " + (doneCount + failCount) + "/" + total + _promptEtaSuffix();
   }
 
   function _videoPromptFailureToast() {
@@ -1718,6 +1760,7 @@ function _attachVideoPromptBatch(opts) {
     if (finished) return;
     finished = true;
     _stopPoll();
+    _stopEtaTimer();
     var reloadOk = true;
     try {
       if (_ctx.reloadProjectFromServer) {
@@ -1923,6 +1966,8 @@ function _attachVideoPromptBatch(opts) {
   }
 
   pollTimer = setInterval(_pollOnce, 5000);
+  // 每秒重算"约剩x分x秒"，让它在两次完成事件之间也自然倒数
+  if (!silent) _etaTimer = setInterval(_refreshRunningHint, 1000);
 
   streamHandle = subscribeBatch(batchId, {
     onSnapshot: function (snap) {
@@ -1930,7 +1975,7 @@ function _attachVideoPromptBatch(opts) {
       // "N/N 条已生成"覆盖回"生成中… N/N"。
       if (finished) return;
       if (hint && snap && typeof snap.total === 'number') {
-        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
+        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total + _promptEtaSuffix();
       }
       if (snap && Array.isArray(snap.tasks)) snap.tasks.forEach(_applySnapshotTask);
     },
@@ -1977,6 +2022,7 @@ function _attachVideoPromptBatch(opts) {
   return {
     close: function () {
       _stopPoll();
+      _stopEtaTimer();
       if (attachKey) delete _vpAttachedBatchesByKey[attachKey];
       if (streamHandle && streamHandle.close) streamHandle.close();
     },

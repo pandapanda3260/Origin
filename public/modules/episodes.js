@@ -8,8 +8,8 @@
  * 旧的项目内 AI 自动续写接口已连路由一起摘除（拍板：写剧本是独立工作流，
  * 另行立项）。episodes[] 镜像机制保留，用于老多集项目兼容读。
  */
-import { showToast, escapeHtml, getAuthHeaders } from './utils.js';
-import { snapshotWorldTemplate } from './assets.js';
+import { showToast, escapeHtml, getAuthHeaders } from './utils.js?v=300';
+import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from './assets.js?v=169';
 
 let _ctx = {};
 
@@ -347,8 +347,19 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
       prevProjectId: sourceId,
       episodes: [{ title: "第 " + state.nextNumber + " 集" }],
     };
-    var aspect = project.styleOptions && project.styleOptions.aspectRatio;
-    if (aspect) payload.styleOptions = { aspectRatio: aspect };
+    // 带上 aspectRatioDefaultVersion：服务端 normalizeProjectStyleDefaults 对没有
+    // 该标记的项目会把 16:9 当旧默认翻回 9:16（一次性迁移），不带标记会把继承/
+    // 模板记录的 16:9 冲掉。常量与 lib/projects-db.ts STYLE_ASPECT_DEFAULT_VERSION
+    // 及 main.js _STYLE_ASPECT_DEFAULT_VERSION 同源。
+    var _EP_ASPECT_DEFAULT_VERSION = "2026-05-14-9x16";
+    var prevStyleOpts = (project.styleOptions && typeof project.styleOptions === "object") ? project.styleOptions : {};
+    var aspect = prevStyleOpts.aspectRatio;
+    if (aspect) {
+      payload.styleOptions = {
+        aspectRatio: aspect,
+        aspectRatioDefaultVersion: prevStyleOpts.aspectRatioDefaultVersion || _EP_ASPECT_DEFAULT_VERSION,
+      };
+    }
 
     // 2) 世界观：拉全量模板 → 与风格页同款快照语义（snapshotWorldTemplate 剥离 styleBible）
     if (useTemplate) {
@@ -357,6 +368,16 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
       var snap = snapshotWorldTemplate(fullTpl);
       payload.selectedWorldTemplateId = snap.id || tplId;
       payload.worldTemplateSnapshot = snap;
+      // 世界观记录的画面比例优先于上一集继承（与应用世界观自动同步风格同款语义）
+      var tplAspect = _normalizeWorldPreferredAspectRatio(
+        snap.preferredAspectRatio || snap.preferred_aspect_ratio
+      );
+      if (tplAspect) {
+        payload.styleOptions = {
+          aspectRatio: tplAspect,
+          aspectRatioDefaultVersion: prevStyleOpts.aspectRatioDefaultVersion || _EP_ASPECT_DEFAULT_VERSION,
+        };
+      }
       if (statusEl) statusEl.textContent = "正在创建第 " + state.nextNumber + " 集任务…";
     }
 

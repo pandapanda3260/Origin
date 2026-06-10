@@ -3,7 +3,7 @@ import { MOCK_CLIENT_CONFIG } from '@/mocks/config';
 import { jsonOk } from '@/lib/api-helpers';
 import { readSystemConfig } from '@/lib/system-config';
 import { getCurrentUser } from '@/lib/auth';
-import { getBalance, settleExpiredSubscription } from '@/lib/credits';
+import { getBalance, renewDueSubscription, settleExpiredSubscription } from '@/lib/credits';
 import { getPlan } from '@/lib/billing-config';
 
 export const runtime = 'nodejs';
@@ -18,6 +18,7 @@ export async function GET(req: NextRequest) {
     const user = await getCurrentUser(req);
     if (user) {
       try { settleExpiredSubscription(user.id); } catch (_) {}
+      try { renewDueSubscription(user.id); } catch (_) {}
       const plan = getPlan(getBalance(user.id).planCode);
       if (Number(plan?.limits?.projects) > 0) maxProjects = Number(plan!.limits!.projects);
     }

@@ -1,7 +1,7 @@
 /**
  * Maintenance Banner — extracted from main.js (stage 3 refactor).
  */
-import { showToast } from './utils.js';
+import { showToast } from './utils.js?v=300';
 
 export function initTasks(_ctx) {}
 export function syncTasksProject(_project) {}

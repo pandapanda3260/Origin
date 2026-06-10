@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FFE layout probe (临时探针页,验证完即删)</title>
+<link rel="stylesheet" href="styles.css?v=237" />
+<style>
+  /* 探针报告浮层,不影响被测布局 */
+  #probeReport {
+    position: fixed; left: 8px; bottom: 8px; z-index: 99999;
+    max-width: 760px; max-height: 42vh; overflow: auto;
+    background: rgba(10,18,30,0.92); color: #9fe8b2;
+    font: 11px/1.5 Menlo, monospace; padding: 10px 12px; border-radius: 8px;
+    white-space: pre;
+  }
+</style>
+</head>
+<body>
+<div id="firstFrameEditorRoot">
+  <div class="ffe-modal" role="dialog" aria-modal="true" aria-label="首帧编辑控制台">
+    <button type="button" class="ffe-close" title="关闭"><span class="material-symbols-outlined">close</span></button>
+    <div class="ffe-shell">
+      <aside class="ffe-column ffe-context-column">
+        <div class="ffe-context-stack ffe-context-layout">
+          <div class="ffe-context-top">
+            <section class="sb-material-panel ffe-material-panel" data-ffe-material-version="ordered-strip-v2" data-material-scope="editor" data-group-idx="0">
+              <div class="sb-material-panel-title">
+                <span class="sb-material-panel-title-copy"><span>素材图展示区</span><em>REFERENCE ASSETS</em></span>
+                <span class="ffe-material-budget">3/12</span>
+                <button type="button" class="sb-material-download-btn" title="下载全部素材图" aria-label="下载全部素材图"><span class="material-symbols-outlined">download</span></button>
+              </div>
+              <div class="ffe-material-strip" style="--ffe-material-slot-count: 13" id="probeStrip">
+                <div class="sb-material-thumb ffe-material-thumb" data-role="scene" data-tile-id="t1">
+                  <div class="sb-material-thumb-image">
+                    <div class="ffe-image-frame ffe-image-frame--thumb">
+                      <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Crect width='80' height='80' fill='%238aa'/%3E%3C/svg%3E" alt="" />
+                      <div class="ffe-image-fallback" role="img" aria-label="场景图"><span class="material-symbols-outlined">broken_image</span><strong>图片暂不可用</strong><span>原图链接失效或文件不可访问</span></div>
+                    </div>
+                    <button type="button" class="sb-material-thumb-delete" title="从本次首帧参考中移除"><span class="material-symbols-outlined">delete_outline</span></button>
+                  </div>
+                </div>
+                <div class="sb-material-thumb ffe-material-thumb" data-role="prop" data-tile-id="t2">
+                  <div class="sb-material-thumb-image">
+                    <div class="ffe-image-frame ffe-image-frame--thumb">
+                      <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Crect width='80' height='80' fill='%23a86'/%3E%3C/svg%3E" alt="" />
+                      <div class="ffe-image-fallback" role="img" aria-label="道具图"><span class="material-symbols-outlined">broken_image</span><strong>图片暂不可用</strong><span>原图链接失效或文件不可访问</span></div>
+                    </div>
+                    <button type="button" class="sb-material-thumb-delete" title="从本次首帧参考中移除"><span class="material-symbols-outlined">delete_outline</span></button>
+                  </div>
+                </div>
+                <div class="sb-material-thumb ffe-material-thumb" data-role="char" data-tile-id="t3">
+                  <div class="sb-material-thumb-image">
+                    <div class="ffe-image-frame ffe-image-frame--thumb">
+                      <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Crect width='80' height='80' fill='%23687'/%3E%3C/svg%3E" alt="" />
+                      <div class="ffe-image-fallback" role="img" aria-label="角色图"><span class="material-symbols-outlined">broken_image</span><strong>图片暂不可用</strong><span>原图链接失效或文件不可访问</span></div>
+                    </div>
+                    <button type="button" class="sb-material-thumb-delete" title="从本次首帧参考中移除"><span class="material-symbols-outlined">delete_outline</span></button>
+                  </div>
+                </div>
+                <div class="ffe-material-add-wrap">
+                  <button type="button" class="sb-material-add-box ffe-material-add-box" data-disabled-computed="false" title="添加图片" aria-disabled="false" aria-haspopup="menu" aria-expanded="false">
+                    <span>+</span>
+                    <em>添加素材</em>
+                  </button>
+                </div>
+              </div>
+              <div class="ffe-material-omitted"><span>7 个素材未进入本次参考</span></div>
+            </section>
+          </div>
+          <section class="ffe-panel ffe-prompt-panel">
+            <div class="ffe-panel-head">
+              <div>
+                <h3>提示词展示区域</h3>
+                <span>画面提示词</span>
+              </div>
+              <div class="ffe-field-meta"><span class="ffe-field-counter" data-state="ok">1849/5000</span></div>
+            </div>
+            <div class="ffe-panel-body"><textarea class="ffe-textarea ffe-prompt-textarea" maxlength="5000" placeholder="填写或调整最终首帧 Prompt">【任务】生成一张用于图生视频流程的全彩电影感首帧。占位提示词文本。</textarea></div>
+          </section>
+        </div>
+      </aside>
+      <main class="ffe-center">
+        <section class="ffe-panel ffe-image-panel">
+          <div class="ffe-panel-head">
+            <div>
+              <h3>图片展示区域</h3>
+              <span>IMAGE PREVIEW · 16:9 · 1536×1024</span>
+            </div>
+          </div>
+          <div class="ffe-panel-body">
+            <div class="ffe-preview-slot">
+              <div class="ffe-preview-stage">
+                <div class="ffe-image-empty"><span class="material-symbols-outlined">image</span><strong>暂无当前首帧</strong><span>占位</span></div>
+              </div>
+            </div>
+            <div class="ffe-image-actions">
+              <button type="button" class="ffe-action-secondary"><span class="material-symbols-outlined">download</span><span>下载图片</span></button>
+            </div>
+          </div>
+        </section>
+      </main>
+      <aside class="ffe-right">
+        <div class="ffe-history-head"><div><h3>历史图片 list</h3><span>HISTORY</span></div></div>
+        <div class="ffe-history-list"><div class="ffe-history-empty">暂无历史图片</div></div>
+        <div class="ffe-history-footer"><button type="button" disabled>已显示 1 张</button></div>
+      </aside>
+    </div>
+  </div>
+</div>
+<pre id="probeReport">probing…</pre>
+<script>
+function probe() {
+  var q = function (s) { return document.querySelector(s); };
+  var els = {
+    shell: q('.ffe-shell'),
+    leftCol: q('.ffe-context-column'),
+    ctxTop: q('.ffe-context-top'),
+    panel: q('.ffe-material-panel'),
+    title: q('.sb-material-panel-title'),
+    budget: q('.ffe-material-budget'),
+    strip: q('#probeStrip'),
+    prompt: q('.ffe-prompt-panel'),
+    center: q('.ffe-image-panel'),
+  };
+  var lines = ['viewport ' + window.innerWidth + 'x' + window.innerHeight + ' dpr=' + devicePixelRatio +
+    ' | 图块数=' + document.querySelectorAll('#probeStrip .sb-material-thumb').length];
+  Object.keys(els).forEach(function (k) {
+    var el = els[k];
+    if (!el) { lines.push(k + ': MISSING'); return; }
+    var r = el.getBoundingClientRect();
+    var cs = getComputedStyle(el);
+    lines.push(
+      k.padEnd(8) + ' L=' + r.left.toFixed(1).padStart(7) + ' R=' + r.right.toFixed(1).padStart(7) +
+      ' W=' + r.width.toFixed(1).padStart(7) +
+      ' scrollW=' + String(el.scrollWidth).padStart(5) + ' clientW=' + String(el.clientWidth).padStart(5) +
+      ' ofx=' + cs.overflowX + ' minW=' + cs.minWidth + ' disp=' + cs.display
+    );
+  });
+  var verdicts = [];
+  if (els.panel && els.prompt) {
+    var pr = els.panel.getBoundingClientRect();
+    var pp = els.prompt.getBoundingClientRect();
+    var diff = pr.right - pp.right;
+    verdicts.push((Math.abs(diff) <= 1 ? '✅ PASS' : '❌ FAIL') + ' 素材面板右边界与提示词面板对齐 (差 ' + diff.toFixed(1) + 'px)');
+  }
+  if (els.panel && els.center) {
+    var pr2 = els.panel.getBoundingClientRect();
+    var pc = els.center.getBoundingClientRect();
+    verdicts.push((pr2.right <= pc.left + 1 ? '✅ PASS' : '❌ FAIL') + ' 素材面板不压中列 (面板R=' + pr2.right.toFixed(1) + ' 中列L=' + pc.left.toFixed(1) + ')');
+  }
+  if (els.strip) {
+    var scrollable = els.strip.scrollWidth > els.strip.clientWidth + 1;
+    var tiles = document.querySelectorAll('#probeStrip .sb-material-thumb').length;
+    verdicts.push('ℹ️ strip ' + (scrollable ? '可横向滚动 (' + els.strip.scrollWidth + '>' + els.strip.clientWidth + ')' : '未触发滚动(内容未超宽)') + ' — ' + tiles + ' 个图块时' + (tiles >= 10 ? '应为可滚动' : '应为不滚动'));
+  }
+  document.getElementById('probeReport').textContent = lines.concat(['']).concat(verdicts).join('\n');
+}
+function fillTiles() {
+  var strip = document.getElementById('probeStrip');
+  var thumbs = strip.querySelectorAll('.sb-material-thumb');
+  var addWrap = strip.querySelector('.ffe-material-add-wrap');
+  while (strip.querySelectorAll('.sb-material-thumb').length < 13) {
+    var clone = thumbs[strip.querySelectorAll('.sb-material-thumb').length % thumbs.length].cloneNode(true);
+    strip.insertBefore(clone, addWrap);
+  }
+  document.querySelector('.ffe-material-budget').textContent = '13/13';
+  requestAnimationFrame(probe);
+}
+window.addEventListener('load', function () { requestAnimationFrame(probe); });
+window.addEventListener('resize', function () { requestAnimationFrame(probe); });
+</script>
+<button id="probeFillBtn" style="position:fixed;right:8px;bottom:8px;z-index:99999;padding:8px 14px;border-radius:8px;border:1px solid #888;background:#fff;font-weight:700;cursor:pointer" onclick="fillTiles()">压力测试: 填满 13 个图块</button>
+</body>
+</html>

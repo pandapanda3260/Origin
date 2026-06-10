@@ -70,6 +70,7 @@ function withVevDemoBinding<T extends MaterialItem>(
   const vevSpace = binding.vevSpace || 'origin';
   return {
     ...item,
+    title,
     cloudReachable: true,
     vevSource: binding.vevSource,
     vevProjectId: binding.vevProjectId,
@@ -101,7 +102,7 @@ function videoMaterialBase(req: NextRequest, v: any, userId: number): MaterialIt
     id: v.id,
     url: toAbsoluteUrl(req, signed.url) || signed.url,
     type: 'video',
-    title: names.displayName,
+    title: names.downloadFilename,
     durationSec: v.duration_sec,
     // 封面给签名 URL：VevDemo 跨域 iframe 的 <img> 海报带不了 Bearer，未签名会 401。
     coverUrl: v.cover_image_id

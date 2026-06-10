@@ -1,10 +1,10 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from './utils.js?v=203';
-import { emptyScriptConsultState, isEmptyScriptConsultState } from './script_consult_state.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from './utils.js?v=300';
+import { emptyScriptConsultState, isEmptyScriptConsultState } from './script_consult_state.js?v=300';
 import {
   appendScriptTimeline, buildDraftEvent, buildSystemEvent,
   latestScriptTimelineDraft, nextScriptTimelineVersion, newScriptTimelineId,
   scriptTimelineSummary, scriptTimelineTimeAgo, SCRIPT_TIMELINE_SOURCE_LABELS,
-} from './script_timeline.js?v=1';
+} from './script_timeline.js?v=2';
 
 var _ctx = {};
 var project = null;

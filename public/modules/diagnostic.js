@@ -14,7 +14,7 @@
  * getLast 返回最近一次收到的 diagnostic 对象（没有则 null）.
  */
 
-import { escapeHtml } from './utils.js';
+import { escapeHtml } from './utils.js?v=300';
 
 const STAGE_LABEL = {
   shot_design: '分镜设计',

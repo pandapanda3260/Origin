@@ -145,30 +145,6 @@ function compileImageRule(rule: Rule): RegExp | null {
   }
 }
 
-type TextSpan = { start: number; end: number };
-
-function collectProtectedImageRewriteSpans(text: string): TextSpan[] {
-  const spans: TextSpan[] = [];
-  const source = String(text || '');
-  const sectionRe = /CHARACTER LOCK:[\s\S]*?(?=\n(?:SCENE LOCK|PROP LOCK|PROJECT STYLE LOCK|COMPOSITION RULES|OBSERVED DRIFT GUARDRAILS):|$)/gi;
-  let section: RegExpExecArray | null;
-  while ((section = sectionRe.exec(source)) !== null) {
-    spans.push({ start: section.index, end: section.index + section[0].length });
-  }
-
-  const bodyFeatureRe =
-    /(黑毛猪|黑毛狗|棕金短毛猕猴|全身覆毛|脸颊黑毛|耳后短毛|猪八戒[^。；\n]{0,40}(?:短毛|毛发|黑毛)|孙悟空[^。；\n]{0,40}(?:短毛|毛发|黑毛)|(?:猕猴|猪|狗|动物|非人角色|拟人角色|anthropomorphic|non-human)[^。；\n]{0,50}(?:黑毛|短毛|毛发|覆毛|fur|hair))/giu;
-  let match: RegExpExecArray | null;
-  while ((match = bodyFeatureRe.exec(source)) !== null) {
-    spans.push({ start: match.index, end: match.index + match[0].length });
-  }
-  return spans.sort((a, b) => a.start - b.start);
-}
-
-function overlapsProtectedSpan(start: number, end: number, spans: TextSpan[]): boolean {
-  return spans.some((span) => start < span.end && end > span.start);
-}
-
 function expandReplacement(template: string, args: any[]): string {
   const hasGroups = args.length > 0 && typeof args[args.length - 1] === 'object';
   const captures = hasGroups ? args.slice(1, -3) : args.slice(1, -2);
@@ -178,14 +154,8 @@ function expandReplacement(template: string, args: any[]): string {
   });
 }
 
-function replacementOffset(args: any[]): number {
-  const hasGroups = args.length > 0 && typeof args[args.length - 1] === 'object';
-  return Number(args[hasGroups ? args.length - 3 : args.length - 2]);
-}
-
 export function preflightImageModerationPrompt(prompt: string): ImageModerationPreflight {
   const text = String(prompt || '');
-  const protectedSpans = collectProtectedImageRewriteSpans(text);
   const hits: ImageModerationPreflightHit[] = [];
   for (const [categoryKey, rules] of Object.entries(IMAGE_RULES)) {
     const category = uniqueCategories([categoryKey])[0];
@@ -194,7 +164,6 @@ export function preflightImageModerationPrompt(prompt: string): ImageModerationP
       if (!re) continue;
       let match: RegExpExecArray | null;
       while ((match = re.exec(text)) !== null) {
-        if (overlapsProtectedSpan(match.index, match.index + match[0].length, protectedSpans)) continue;
         hits.push({
           category,
           pattern: rule.pattern,
@@ -259,12 +228,10 @@ export function inferImagePromptSafetyHints(prompt: string, maxHints = 8): Image
     });
   }
 
-  const protectedSpans = collectProtectedImageRewriteSpans(text);
   for (const rule of IMAGE_SAFETY_HINT_RULES) {
     let match: RegExpExecArray | null;
     rule.pattern.lastIndex = 0;
     while ((match = rule.pattern.exec(text)) !== null) {
-      if (overlapsProtectedSpan(match.index, match.index + match[0].length, protectedSpans)) continue;
       push({
         text: match[0],
         reason: rule.reason,
@@ -287,7 +254,6 @@ export function rewriteImagePromptForModeration(
   const selectedCategories = uniqueCategories(categories);
   let rewrittenPrompt = originalPrompt;
   const rewriteDiff: RewriteDiff[] = [];
-  let protectedSpans = collectProtectedImageRewriteSpans(rewrittenPrompt);
 
   const applyCategoryRules = (categoriesToApply: ViolationCategory[]) => {
     for (const category of categoriesToApply) {
@@ -297,8 +263,6 @@ export function rewriteImagePromptForModeration(
         if (!re) continue;
         rewrittenPrompt = rewrittenPrompt.replace(re, (...args) => {
           const matched = String(args[0] || '');
-          const offset = replacementOffset(args);
-          if (overlapsProtectedSpan(offset, offset + matched.length, protectedSpans)) return matched;
           const replacement = expandReplacement(rule.replacement, args);
           if (matched === replacement) return matched;
           rewriteDiff.push({
@@ -311,7 +275,6 @@ export function rewriteImagePromptForModeration(
           });
           return replacement;
         });
-        protectedSpans = collectProtectedImageRewriteSpans(rewrittenPrompt);
       }
     }
   };

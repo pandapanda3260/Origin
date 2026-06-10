@@ -24,7 +24,7 @@
  * —— batch_tasks.result_json 存的就是发帧用的同一份 resultForStore。
  */
 
-import { getAuthToken, apiGet } from './utils.js';
+import { getAuthToken, apiGet } from './utils.js?v=300';
 
 const MAX_RETRIES = 3;
 const FALLBACK_POLL_INTERVAL_MS = 5000;

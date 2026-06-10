@@ -1,5 +1,5 @@
-import { ApiError, apiGet, apiPost, escapeHtml, showToast } from './utils.js';
-import { mountHoloCard } from './holo_card.js';
+import { ApiError, apiGet, apiPost, escapeHtml, showToast } from './utils.js?v=300';
+import { mountHoloCard } from './holo_card.js?v=300';
 
 let _ctx = {};
 let _summary = null;
@@ -376,6 +376,14 @@ export async function startCheckout(orderType, code, paymentMethod) {
     renderBillingPage();
     return { ok: false, detail: detail };
   }
+  // 模拟支付（BILLING_DEV_AUTOPAY，方向B）：后端 checkout 已同步到账并返回 status='applied'，
+  // 不跳转支付页，直接刷新余额/套餐/流水（loadBillingSummary 内部会重渲整页+刷新角标）。
+  if (order && order.status === 'applied') {
+    _pendingOrderNo = '';
+    await loadBillingSummary();
+    showToast((order.message ? String(order.message) : '支付成功，已到账。'), 'ok');
+    return order;
+  }
   var navigated = submitCheckoutForm(order);
   if (!navigated) {
     // 支付通道尚未对接（占位）或未返回可用支付地址：把后端的引导文案如实展示，
@@ -550,92 +558,45 @@ export function renderBillingPage() {
   //   - data-plan-code 只放在 CTA <button> 上，避免整卡 + 按钮双重触发 checkout
   //     （click 委托在下面 host.querySelectorAll('[data-plan-code]') 里）。
   // ----------------------------------------------------------------
-  function _formatMoney(cents) {
+  // 千分位数字（1,599 / 40,000）：新定价进入四五位数后必须有分隔，否则难读。
+  function _formatMoneyNumber(cents) {
     var amount = Number(cents || 0) / 100;
-    var body = amount % 1 === 0 ? amount.toFixed(0) : amount.toFixed(2);
-    return '¥' + body;
+    return amount % 1 === 0
+      ? amount.toLocaleString('zh-CN')
+      : amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
-  function _priorityLabel(value) {
-    var v = String(value || '');
-    if (v === 'priority') return '优先调度';
-    if (v === 'fast') return '快速调度';
-    if (v === 'normal') return '标准调度';
-    return v;
+  function _formatMoney(cents) {
+    return '¥' + _formatMoneyNumber(cents);
   }
+  // 套餐卡大字价格：¥ 与数字拆开返回，渲染时符号缩小+留间距
+  //（2026-06-10 Vasily：整串塞进 tracking-tighter 大字里 ¥ 和数字贴太近不美观）。
   function _formatPlanPrice(p) {
     var cents = Number(p.price_cents || 0);
     var cycle = (p.billing_cycle || 'month');
     // 免费档 / 企业自定义合约：不显示具体价格
-    if (cents <= 0 && cycle !== 'month') return { price: '联系销售', cycle: '' };
-    if (cents <= 0) return { price: '免费', cycle: '' };
+    if (cents <= 0 && cycle !== 'month') return { symbol: '', number: '联系销售', cycle: '' };
+    if (cents <= 0) return { symbol: '', number: '免费', cycle: '' };
     var cycleLabel = cycle === 'year' ? '/年' : '/月';
-    return { price: _formatMoney(cents), cycle: cycleLabel };
+    return { symbol: '¥', number: _formatMoneyNumber(cents), cycle: cycleLabel };
   }
+  // 卡片恒两条（2026-06-10 拍板）：①积分/每月重置 ②任务上限/项目与素材空间。
+  // 并发（任务调度上限）与模型/支持两条已删——concurrency 本就未接任何后端逻辑，
+  // models/support 字段仍在配置下发，只是不再上卡片。
   function _derivePlanFeatureItems(p) {
     var limits = p.limits || {};
-    var features = p.features || {};
-    var items = [];
-    // 1) 月度积分
-    items.push({
+    var items = [{
       icon: 'bolt',
       label: (Number(p.monthly_credits || 0)).toLocaleString() + ' 积分',
       sub: Number(p.monthly_credits || 0) > 0 ? '每月重置' : '按合约交付',
-    });
-    // 2) 并发
-    if (limits.concurrency != null) {
-      items.push({
-        icon: 'speed',
-        label: Number(limits.concurrency) + ' 个并发任务',
-        sub: '任务调度上限',
-      });
-    }
-    // 3) 项目与存储
-    if (limits.projects != null || limits.storageGB != null) {
-      var quotaBits = [];
-      if (limits.projects != null) quotaBits.push(Number(limits.projects).toLocaleString() + ' 个项目');
-      if (limits.storageGB != null) quotaBits.push(Number(limits.storageGB).toLocaleString() + 'GB 存储');
+    }];
+    if (limits.projects != null) {
       items.push({
         icon: 'inventory_2',
-        label: quotaBits.join(' / '),
+        label: Number(limits.projects).toLocaleString() + ' 个任务上限',
         sub: '项目与素材空间',
       });
-    } else if (limits.maxVideoSeconds != null) {
-      items.push({
-        icon: 'timer',
-        label: '单段 ' + Number(limits.maxVideoSeconds) + 's',
-        sub: limits.maxCompositeSeconds ? '合成上限 ' + Number(limits.maxCompositeSeconds) + 's' : '',
-      });
     }
-    // 4) 模型与支持
-    var models = Array.isArray(features.models) ? features.models.filter(Boolean).join(' / ') : String(features.models || '');
-    var serviceBits = [];
-    if (features.priority) serviceBits.push(_priorityLabel(features.priority));
-    if (features.support) serviceBits.push(String(features.support) + '支持');
-    if (models) {
-      items.push({
-        icon: 'auto_awesome',
-        label: models,
-        sub: serviceBits.join(' · '),
-      });
-    } else if (serviceBits.length) {
-      items.push({
-        icon: 'support_agent',
-        label: serviceBits.join(' · '),
-        sub: '服务权益',
-      });
-    }
-    // 兼容未来扩展字段：没有 models/support 时，用差异化特性兜底。
-    var hi = null;
-    if (features.premiumUnlimited)      hi = { icon: 'all_inclusive',       label: 'Premium 无限配额',   sub: '高级模型不限次数' };
-    else if (features.premiumCredits)   hi = { icon: 'stars',               label: Number(features.premiumCredits).toLocaleString() + ' Premium 积分', sub: '额外高级模型配额' };
-    else if (features.customBranding)   hi = { icon: 'workspace_premium',   label: '自定义品牌水印',     sub: '品牌化交付' };
-    else if (features.api)              hi = { icon: 'api',                 label: '全功能 API 访问',    sub: '集成工作流' };
-    else if (features.customDeal)       hi = { icon: 'support_agent',       label: '定制企业合约',       sub: '联系销售定制' };
-    else if (features.commercial)       hi = { icon: 'verified_user',       label: '商用授权',           sub: '可用于商业交付' };
-    else if (features.watermark)        hi = { icon: 'branding_watermark',  label: '含官方水印',         sub: '免费档默认' };
-    if (hi && items.length < 4) items.push(hi);
-    // 最多只渲染 4 条，避免卡片高度参差
-    return items.slice(0, 4);
+    return items;
   }
   var trialPack = null;
   var regularTopups = [];
@@ -649,10 +610,10 @@ export function renderBillingPage() {
   var planCards = plans.filter(function (p) { return p.code !== 'free' || p.code === _curCode; }).map(function (p) {
     var isCurrent = (subscription.plan_code || subscription.planCode || '') === p.code;
     var priceObj = _formatPlanPrice(p);
-    var isCustom = priceObj.price === '联系销售';
-    // 中文价格文案（免费 / 联系销售）在 text-5xl 下 CJK 字身比 "$NNN" 数字视觉大很多，
-    // 降到 text-4xl 让其视觉高度与付费档 "$299" 接近。
-    var priceCls = _hasCjk(priceObj.price) ? 'text-4xl' : 'text-5xl';
+    var isCustom = priceObj.number === '联系销售';
+    // 中文价格文案（免费 / 联系销售）在 text-5xl 下 CJK 字身比 "¥NNN" 数字视觉大很多，
+    // 降到 text-4xl 让其视觉高度与付费档接近。
+    var priceCls = _hasCjk(priceObj.number) ? 'text-4xl' : 'text-5xl';
     var featureItems = _derivePlanFeatureItems(p);
     var subLabelBits = [p.billing_cycle === 'year' ? '年付套餐' : '月付套餐'];
     if (p.description) subLabelBits.push(p.description);
@@ -702,7 +663,11 @@ export function renderBillingPage() {
         '</div>' +
         '<div class="mb-6">' +
           '<div class="flex items-baseline gap-1">' +
-            '<span class="' + priceCls + ' font-bold plan-price-glow tracking-tighter">' + escapeHtml(priceObj.price) + '</span>' +
+            // ¥ 符号缩小到 0.55 倍并与数字留间距（margin 相对小字号，约 4px），光效/字重继承外层。
+            '<span class="' + priceCls + ' font-bold plan-price-glow tracking-tighter">' +
+              (priceObj.symbol ? '<span style="font-size:0.55em;margin-right:0.16em;">' + escapeHtml(priceObj.symbol) + '</span>' : '') +
+              escapeHtml(priceObj.number) +
+            '</span>' +
             (priceObj.cycle ? '<span class="text-[11px] font-bold text-[#ECEFF1]/30 uppercase">' + escapeHtml(priceObj.cycle) + '</span>' : '') +
           '</div>' +
           (creditsChip ? '<div class="mt-2">' + creditsChip + '</div>' : '') +
@@ -721,7 +686,7 @@ export function renderBillingPage() {
     var credits = Number(p.credits || 0).toLocaleString();
     return '<button type="button" class="billing-card-topup plan-topup-card" data-topup-code="' + escapeHtml(p.code) + '">' +
       '<div class="plan-topup-title">' + escapeHtml(p.title || p.code) + '</div>' +
-      '<div class="plan-topup-meta">' + escapeHtml(priceStr) + ' · <span class="plan-topup-credits">' + escapeHtml(credits) + ' 积分</span></div>' +
+      '<div class="plan-topup-meta">' + escapeHtml(priceStr) + ' · <span class="plan-topup-credits">' + escapeHtml(credits) + ' 积分</span> · 永久积分</div>' +
     '</button>';
   }).join('');
   var trialCard = '';

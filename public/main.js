@@ -4,50 +4,51 @@
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,
   getAuthToken, getAuthHeaders, checkAuth, ensureSession, getCachedAuthUser, getSessionUser, fetchAssetSignedUrl,
-  hydrateProtectedImageElements } from './modules/utils.js?v=201';
-import { appStore } from './modules/store.js';
-import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js';
-import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js';
+  hydrateProtectedImageElements } from './modules/utils.js?v=300';
+import { appStore } from './modules/store.js?v=300';
+import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js?v=300';
+import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js?v=302';
 import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
-  refreshSettingsFormFromState, wireSettingsPageOnce } from './modules/settings.js';
-import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modules/tasks.js';
+  refreshSettingsFormFromState, wireSettingsPageOnce } from './modules/settings.js?v=300';
+import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modules/tasks.js?v=300';
 import { initProject, getProject, setProject, loadProject, loadProjectData, saveProject,
   _serializeProject, cleanupBlobUrls, _registerServerTask, _updateServerTaskStatus,
   _notifyServerTaskDone,
   _archiveOldImage, _safeWriteBack, _flushServerSave, fetchProjectByIdShared,
-  flushPendingProjectSaveOnUnload } from './modules/project.js?v=105';
-import { EPISODE_FIELDS } from './modules/episode_fields.js?v=101';
+  flushPendingProjectSaveOnUnload } from './modules/project.js?v=106';
+import { EPISODE_FIELDS } from './modules/episode_fields.js?v=102';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
-  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=103';
+  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=107';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
+  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js?v=302';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
   refineVideoPrompt, handleVideoPromptAction,
   getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave,
-  reattachVideoPromptBatches } from './modules/videoPrompts.js?v=111';
+  reattachVideoPromptBatches } from './modules/videoPrompts.js?v=113';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=110';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=114';
+import { initScrollAnchorGuard } from './modules/scroll_anchor_guard.js?v=1';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=147';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=152';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
   extractStyleBible,
   initScriptImportEvents, confirmScript, tagEmotions, renderEmotionSegments, renderScriptAnalysis,
   refreshScriptImportDraft, emotionBadgeHtml, showScriptEdit, showScriptDisplay, isScriptGenerating,
-  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=116';
+  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=117';
 import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   renderAssets, renderAssetGrid, updateAssetCardImage, generateSingleAssetImage,
   generateAllAssetImages, checkAssetsConfirm, confirmAssets, handleAssetAction,
@@ -61,13 +62,13 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=163';
-import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=207';
-import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=111';
-import { mountPixelCard } from './modules/pixel_card.js';
-import { createSwLoading } from '/modules/loading.js';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
+  _openLightbox } from './modules/assets.js?v=169';
+import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=202';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=211';
+import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=114';
+import { mountPixelCard } from './modules/pixel_card.js?v=300';
+import { createSwLoading } from '/modules/loading.js?v=300';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=10';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
@@ -992,6 +993,7 @@ var _scriptEditInitialText = "";
     syncScriptProject(nextProject);
     syncAssetsProject(nextProject);
     syncEpisodesProject(nextProject);
+    syncOnlineEditorProject(nextProject);
   }
 
   async function _activateProjectContext(projId, options) {
@@ -1177,6 +1179,7 @@ var _scriptEditInitialText = "";
           syncStoryboardProject(null);
           syncScriptProject(null);
           syncAssetsProject(null);
+          syncOnlineEditorProject(null);
           localStorage.removeItem(STORAGE_PROJECT);
           refreshOverview();
         }
@@ -1722,7 +1725,8 @@ var _scriptEditInitialText = "";
 
   function _refreshPageForActiveRoute(page) {
     try {
-      if (page !== "onlineEditor") destroyOnlineEditor();
+      // iframe 保活：切页不再销毁在线精修 iframe（方案：在线精修iframe保活-方案.md）。
+      // 跨项目销毁走 _syncProjectModules 里的 syncOnlineEditorProject；假活走进页 ping 对账。
       if (page === "overview") refreshOverview();
       if (page === "script") refreshScriptPage();
       if (page === "style") refreshStylePage();
@@ -2789,10 +2793,44 @@ var _scriptEditInitialText = "";
     done: "已完成",
   };
 
+  // 资产阶段的产物倒推：已提取出资产且每个资产都有图 → 视为资产阶段已完成（用户常跳过"确认资产"按钮）。
+  // "有图"的字段口径对齐 modules/assets.js 的 _hasAssetImage（含真人参考/铅笔稿/参考锁/三视图面板）；
+  // 角色 reference.status=failed 视为未完成（casting 失败需回资产页处理）。
+  // 与服务端 lib/projects-db.ts 的 projectSummaryAssetsArtifactComplete 保持同构，改一处必须同步另一处。
+  function _ovAssetsArtifactComplete(proj) {
+    var assets = proj && proj.assets;
+    if (!assets) return false;
+    var groups = [
+      { list: assets.characters || [], isChar: true },
+      { list: assets.scenes || [], isChar: false },
+      { list: assets.props || [], isChar: false },
+    ];
+    var count = 0;
+    for (var g = 0; g < groups.length; g++) {
+      var list = Array.isArray(groups[g].list) ? groups[g].list : [];
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i] || {};
+        count++;
+        var ref = it.reference && typeof it.reference === "object" ? it.reference : {};
+        var panels = it.panels && typeof it.panels === "object" ? it.panels : {};
+        if (groups[g].isChar && String(ref.status || "").toLowerCase() === "failed") return false;
+        var url = _ovFirst(
+          it.imageUrl, it.rawUrl, it.realPhotoUrl, it.pencilUrl,
+          ref.currentUrl, ref.lastKnownGoodUrl,
+          it.referenceLock && it.referenceLock.sheetUrl,
+          panels.sheetUrl, panels.frontUrl, panels.sideUrl, panels.backUrl
+        );
+        if (!url) return false;
+      }
+    }
+    return count > 0;
+  }
+
   // 项目阶段判定（与服务端 lib/projects-db.ts 的 projectSummaryStageInfo 保持同构，改一处必须同步另一处）。
   // 从最远的下游产物倒推阶段（成片 > 可剪辑 > 片段 > 提示词 > 镜头图 > 镜头设计），
   // 不依赖 *Approved 确认 flag——实际数据里用户经常跳过确认按钮，flag 与真实进度脱节；
-  // 只有尚无任何生成产物的早期创作阶段（剧本/风格/资产/镜头设计）才用 flag 区分。
+  // 只有尚无任何生成产物的早期创作阶段（剧本/风格/资产/镜头设计）才用 flag 区分，
+  // 其中资产阶段额外认产物：资产已提取且全部有图 → 视为完成推进到镜头设计（_ovAssetsArtifactComplete）。
   // 有成片导出（editData.exportUrl）就算已完成，之后剪辑页再改动也不回退状态。
   function _ovProjectStageInfo(proj, counts, segmentCount) {
     proj = proj || {};
@@ -2835,7 +2873,7 @@ var _scriptEditInitialText = "";
     if (Array.isArray(proj.shots) && proj.shots.length > 0) return info("images", imgDone, panelTotal || proj.shots.length);
     if (!proj.script || !proj.scriptApproved) return info("script");
     if (!_ovHasUsableStyleBible(proj)) return info("style");
-    if (!proj.assetsApproved) return info("assets");
+    if (!proj.assetsApproved && !_ovAssetsArtifactComplete(proj)) return info("assets");
     return info("shots");
   }
 
@@ -3902,6 +3940,7 @@ var _scriptEditInitialText = "";
           syncStoryboardProject(null);
           syncScriptProject(null);
           syncAssetsProject(null);
+          syncOnlineEditorProject(null);
           localStorage.removeItem(STORAGE_PROJECT);
           refreshOverview();
         }
@@ -5048,6 +5087,13 @@ var _scriptEditInitialText = "";
 	    ).trim();
 	  }
 
+	  function _styleWorldTemplatePreferredAspect(tpl) {
+	    var ratio = String(
+	      (tpl && (tpl.preferredAspectRatio || tpl.preferred_aspect_ratio)) || ""
+	    ).trim();
+	    return _STYLE_ASPECT_RATIOS[ratio] ? ratio : "";
+	  }
+
 	  function _styleWorldTemplatePreferredStyleName(tpl) {
 	    var preference = tpl && tpl.styleTemplatePreference;
 	    return String(
@@ -5089,12 +5135,15 @@ var _scriptEditInitialText = "";
 	  }
 
 	  function _styleWorldTemplateSubtitle(tpl) {
-	    return [
+	    var parts = [
 	      _styleWorldTemplateCharacterCount(tpl) + "个角色",
 	      _styleWorldTemplateCount(tpl, "locationCount", ["locations", "scenes", "environments", "places"]) + "个场景",
 	      _styleWorldTemplateCount(tpl, "propCount", ["props", "items", "keyItems", "artifacts"]) + "个道具",
 	      _styleWorldTemplateStyleLabel(tpl)
-	    ].join("、");
+	    ];
+	    var aspect = _styleWorldTemplatePreferredAspect(tpl);
+	    if (aspect) parts.push(aspect);
+	    return parts.join("、");
 	  }
 
 	  function _styleWorldTemplateThumbHtml(tpl) {
@@ -5698,6 +5747,8 @@ var _scriptEditInitialText = "";
 				  function _renderStyleWorldIntentUi(intent) {
 				    intent = _normalizeStyleWorldIntent(intent);
 				    _renderStylePageWorldTemplates();
+				    // 应用世界观可能同步了记录的画面比例，刷新画幅选中态
+				    _renderStyleAspectRatio();
 				    var templates = (typeof _getWorldTemplates === "function") ? _getWorldTemplates() : [];
 				    var tpl = intent.selectedWorldTemplateId
 				      ? _findWorldTemplateById(templates, intent.selectedWorldTemplateId)
@@ -7796,6 +7847,11 @@ var _scriptEditInitialText = "";
 	      },
 	    });
     syncVideoPromptsProject(project);
+    // 全局滚动锚定守卫：根治长列表整重建（renderShotList/renderImageGrid/SSE 回调等）
+    // 导致的 window 滚动跳变。context = 页 + 项目，切页/切项目锚点自动作废。
+    initScrollAnchorGuard({
+      getContext: () => activePage + "|" + (project && project.id ? project.id : ""),
+    });
     initShots({
       getProject: () => project,
       saveProject: () => saveProject(),

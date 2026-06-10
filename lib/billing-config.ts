@@ -22,9 +22,9 @@ export const PLANS = [
     code: 'plus',
     title: 'Plus',
     description: '专业创作者',
-    price_cents: 9900,
+    price_cents: 159900,
     billing_cycle: 'month',
-    monthly_credits: 2000,
+    monthly_credits: 80000,
     limits: { concurrency: 4, projects: 1000, storageGB: 50 },
     features: { models: ['全部模型'], priority: 'fast', support: '邮件' },
   },
@@ -32,19 +32,34 @@ export const PLANS = [
     code: 'pro',
     title: 'Pro',
     description: '工作室与团队',
-    price_cents: 29900,
+    price_cents: 799900,
     billing_cycle: 'month',
-    monthly_credits: 8000,
+    monthly_credits: 400000,
     limits: { concurrency: 10, projects: 5000, storageGB: 500 },
     features: { models: ['全部模型 + 4K'], priority: 'priority', support: '专属客服' },
   },
 ];
 
+// 积分包（永久积分，进 topup 桶不过期）。2026-06-10 新定价拍板，旧 topup_500/2000/10000 直接删不留兼容。
 export const TOPUP_PACKS = [
-  { code: 'topup_500', title: '500 积分包', credits: 500, price_cents: 1900 },
-  { code: 'topup_2000', title: '2000 积分包', credits: 2000, price_cents: 6900 },
-  { code: 'topup_10000', title: '10000 积分包', credits: 10000, price_cents: 29900 },
+  { code: 'topup_basic', title: '基础积分包', credits: 40000, price_cents: 100000 },
+  { code: 'topup_advanced', title: '进阶积分包', credits: 120000, price_cents: 300000 },
+  { code: 'topup_enterprise', title: '企业积分包', credits: 2000000, price_cents: 4000000 },
 ];
+
+/**
+ * 模拟支付开关（2026-06-10 Vasily 拍板方向 B）：
+ * 开启时 /api/billing/checkout 视为支付成功，立即统一到账（lib/billing-fulfill.ts），
+ * 订阅续费也按"自动扣款成功"惰性重置（lib/credits.ts renewDueSubscription）。
+ * 规则：BILLING_DEV_AUTOPAY=1 强开 / =0 强关 / 未设置时非生产环境默认开。
+ * 红线：生产环境严禁置 1，等于免费送积分；真支付网关接入后此开关只做触发器替换，到账逻辑复用。
+ */
+export function isDevAutopayEnabled(): boolean {
+  const flag = String(process.env.BILLING_DEV_AUTOPAY || '').trim();
+  if (flag === '1') return true;
+  if (flag === '0') return false;
+  return process.env.NODE_ENV !== 'production';
+}
 
 export const ADMIN_MANUAL_ADJUST_LIMITS = {
   secondConfirmAbove: 10_000,

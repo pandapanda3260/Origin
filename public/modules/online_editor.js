@@ -38,7 +38,12 @@ var _vevDemoProjectBindingInFlightProjectId = '';
 var _vevDemoInitialAutoSyncKey = '';
 var _lastVevTimelineApplyToastKey = '';
 var _lastVevTimelineApplyToastAt = 0;
+var _syncMaterialsBusyFlag = false;
+var _hostKeydownBound = false;
+var _keepAlivePingTimer = null;
+var _keepAlivePingCallback = null;
 
+const OEV_KEEPALIVE_PING_TIMEOUT_MS = 3000;
 const OEV_IFRAME_LOAD_TIMEOUT_MS = 25000;
 const OEV_IFRAME_READY_TIMEOUT_MS = 10000;
 const OEV_IFRAME_AUTO_RETRY_DELAY_MS = 3000;
@@ -87,6 +92,62 @@ function onOnlineEditorPageEnter() {
   if (!_oeCtx) return;
   _restoreExportStateFromStorage();
   syncOnlineEditorProjectTitle();
+  _verifyKeptAliveFrame();
+}
+
+// ============================================================================
+// iframe 保活（方案：在线精修iframe保活-方案.md）
+// 切页不销毁 iframe；跨项目在 _syncProjectModules 收口必杀；进页 ping 对账防假活。
+// ============================================================================
+
+/**
+ * 项目同步钩子：挂在 main.js 的 _syncProjectModules 收口。
+ * 同项目(含 409 回拉)不动；项目变了立刻销毁保活的 iframe，焊死串台口子。
+ */
+function syncOnlineEditorProject(nextProject) {
+  const nextId = String(nextProject?.id || '').trim();
+  const boundId = String(_vevDemoBoundOriginProjectId || '').trim();
+  if (!_vevFrame) return;
+  if (boundId && nextId === boundId) return;
+  // 项目变了 / 项目被清空 / 尚未完成绑定就换了项目：一律销毁，等下次进页重建。
+  console.log('[OnlineEditor] 项目已切换，销毁保活的 VevDemo iframe:', boundId || '(未绑定)', '->', nextId || '(空)');
+  _destroyVevDemoFrame();
+}
+
+function _clearKeepAlivePing() {
+  if (_keepAlivePingTimer) {
+    clearTimeout(_keepAlivePingTimer);
+    _keepAlivePingTimer = null;
+  }
+  _keepAlivePingCallback = null;
+}
+
+/**
+ * 进页对账：保活的 iframe 可能已假死(vevdemo dev server 重启过等)。
+ * 发 origin:ping，3 秒内收到 pong 即复用；超时/发送失败则销毁重建，走正常重连。
+ */
+function _verifyKeptAliveFrame() {
+  if (!_vevFrame || !_isVevDemoReady) return;
+  if (_keepAlivePingTimer) return; // 已有进行中的对账
+  _keepAlivePingCallback = () => {
+    _clearKeepAlivePing();
+    console.log('[OnlineEditor] 保活 iframe 对账通过，直接复用');
+  };
+  _keepAlivePingTimer = setTimeout(() => {
+    console.warn('[OnlineEditor] 保活 iframe ping 超时，销毁重建');
+    _rebuildKeptAliveFrame();
+  }, OEV_KEEPALIVE_PING_TIMEOUT_MS);
+  const sent = _sendToVevDemo('origin:ping', { timestamp: Date.now(), source: 'keepalive-verify' });
+  if (!sent) {
+    console.warn('[OnlineEditor] 保活 iframe ping 发送失败，销毁重建');
+    _rebuildKeptAliveFrame();
+  }
+}
+
+function _rebuildKeptAliveFrame() {
+  _clearKeepAlivePing();
+  _destroyVevDemoFrame();
+  mountOnlineEditor();
 }
 
 function _cleanOnlineEditorText(value) {
@@ -945,6 +1006,7 @@ function _createVevDemoFrame(url) {
 
   container.appendChild(frame);
   container.appendChild(backFallback);
+  _bindHostEditorKeydown();
 }
 
 function _clearVevDemoAutoRetryTimer() {
@@ -1035,7 +1097,52 @@ async function _retryVevDemoConnection(options) {
   }
 }
 
+// ============================================================================
+// 外壳按键转发：焦点在 Origin 外壳(顶栏/空白处)时，剪辑快捷键转发进 VevDemo iframe。
+// 焦点在 iframe 内部时按键不会冒到父窗口，天然不会双触发。
+// ============================================================================
+
+const OEV_FORWARD_SHORTCUT_CODES = new Set(['Space', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'KeyC']);
+
+function _isEditableHostTarget(target) {
+  const element = target instanceof Element ? target : null;
+  if (!element) return false;
+  const tagName = String(element.tagName || '').toLowerCase();
+  if (['input', 'textarea', 'select'].includes(tagName)) return true;
+  return Boolean(element.isContentEditable || element.closest?.('input, textarea, select, [contenteditable="true"], [contenteditable=""], [role="textbox"]'));
+}
+
+function _handleHostEditorKeydown(event) {
+  if (event.defaultPrevented) return;
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (!OEV_FORWARD_SHORTCUT_CODES.has(event.code)) return;
+  if (event.repeat && (event.code === 'Space' || event.code === 'KeyC')) return;
+  if (!_isOnlineEditorPageActive() || !_isVevDemoReady || !_vevFrame) return;
+  if (document.getElementById('oeExportPlaybackModal')) return; // 导出回放弹窗打开时按键留给弹窗内 video
+  if (_isEditableHostTarget(event.target)) return;
+  event.preventDefault();
+  _sendToVevDemo('origin:editorShortcut', {
+    code: event.code,
+    key: event.key,
+    shiftKey: event.shiftKey,
+  });
+}
+
+function _bindHostEditorKeydown() {
+  if (_hostKeydownBound) return;
+  _hostKeydownBound = true;
+  window.addEventListener('keydown', _handleHostEditorKeydown);
+}
+
+function _unbindHostEditorKeydown() {
+  if (!_hostKeydownBound) return;
+  _hostKeydownBound = false;
+  window.removeEventListener('keydown', _handleHostEditorKeydown);
+}
+
 function _destroyVevDemoFrame() {
+  _unbindHostEditorKeydown();
+  _clearKeepAlivePing();
   _clearVevDemoAutoRetryTimer();
   if (_vevFrame) {
     _vevFrame.remove();
@@ -1405,14 +1512,16 @@ function _onMaterialsImported(data) {
   const { count, mediaIds, results, mode, registeredCount, probedCount, registrationResults } = data || {};
   console.log('[OnlineEditor] 素材同步完成:', { count, mediaIds, results, registrationResults });
   if (mode === 'create-edit-material' && Number(registeredCount || 0) > 0) {
-    _oeCtx?.showToast?.(`已同步 ${registeredCount} 个素材到 VevDemo 素材库`, 'success');
+    _oeCtx?.showToast?.(`已同步 ${registeredCount} 个素材到剪辑器，若列表里没看到，切换一下素材面板的分类即可刷新`, 'success');
     return;
   }
   const skipped = Array.isArray(registrationResults)
     ? registrationResults.filter((item) => item && item.ok === false).length
     : 0;
-  const suffix = skipped > 0 ? `，${skipped} 个素材尚未完成 VOD/TOS 注册` : '，尚未完成 VOD/TOS 注册';
-  _oeCtx?.showToast?.(`已检测 ${probedCount || count || 0} 个浏览器侧可访问素材${suffix}`, 'warning');
+  const suffix = skipped > 0
+    ? `，其中 ${skipped} 个云端转码还没完成，稍后再点一次"同步素材"即可`
+    : '，云端转码还没完成，稍后再点一次"同步素材"即可';
+  _oeCtx?.showToast?.(`已检测 ${probedCount || count || 0} 个素材可在浏览器播放${suffix}`, 'warning');
 }
 
 function _onVevDemoError(data) {
@@ -1424,6 +1533,14 @@ function _onVevDemoError(data) {
 function _onVevDemoStatus(data) {
   const payload = _normalizeVevExportPayload(data);
   if (!_isVevExportStatusPayload(payload)) {
+    if (data?.status === 'import-progress') {
+      _setSyncMaterialsProgress(data.done, data.total);
+      return;
+    }
+    if (data?.status === 'pong') {
+      if (_keepAlivePingCallback) _keepAlivePingCallback();
+      return;
+    }
     if (_isVevDemoAwaitingProjectBindingState(data)) {
       console.log('[OnlineEditor] VevDemo 桥已就绪，等待 Origin 工程绑定:', data);
       _ensureVevDemoProjectBinding(data?.status || 'state');
@@ -2774,19 +2891,30 @@ function _setOnlineEditorControlsReady(ready) {
 }
 
 function _setSyncMaterialsBusy(busy) {
+  _syncMaterialsBusyFlag = !!busy;
   const syncBtn = document.getElementById('oeBtnSyncMaterials');
   if (!syncBtn) return;
   syncBtn.disabled = !!busy;
   _renderSyncMaterialsButtonLabel(busy);
 }
 
-function _renderSyncMaterialsButtonLabel(busy) {
+function _renderSyncMaterialsButtonLabel(busy, progressText) {
   const syncBtn = document.getElementById('oeBtnSyncMaterials');
   if (!syncBtn) return;
+  const label = busy ? (progressText ? `同步中 ${progressText}` : '同步中') : '同步素材';
   syncBtn.innerHTML = `
     <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">sync</span>
-    <span>${busy ? '同步中' : '同步素材'}</span>
+    <span>${label}</span>
   `;
+}
+
+function _setSyncMaterialsProgress(done, total) {
+  // 迟到的进度消息不允许把已复位的按钮改回"同步中"。
+  if (!_syncMaterialsBusyFlag) return;
+  const totalCount = Number(total) || 0;
+  if (totalCount <= 0) return;
+  const doneCount = Math.min(Math.max(Number(done) || 0, 0), totalCount);
+  _renderSyncMaterialsButtonLabel(true, `${doneCount}/${totalCount}`);
 }
 
 // ============================================================================
@@ -2806,6 +2934,7 @@ export {
   mountOnlineEditor,
   onOnlineEditorPageEnter,
   destroyOnlineEditor,
+  syncOnlineEditorProject,
   refreshMediaList,
   initTimeline,
   getOnlineEditorState,
