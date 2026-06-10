@@ -3147,6 +3147,11 @@ function _clearVevDemoTracks() {
         resolve(data);
         return;
       }
+      // 清空成功 = 用户明确要空轨道。编辑器重建会再触发一次 ready，若本会话
+      // 首次自动同步之前失败过，会借机重试并把轨道铺回去（2026-06-11 实锤）。
+      // 这里把"首次自动同步"标记为已消费，铺设只听用户手动点「同步素材」。
+      // 跨会话（刷新页面）由 EditParam.OriginTracksClearedAt 标记兜底。
+      _vevDemoInitialAutoSyncKey = `${_vevDemoBoundOriginProjectId}:${_vevDemoBoundVevProjectId}`;
       const cleared = Number(data?.clearedItemCount) || 0;
       _oeCtx?.showToast?.(
         cleared > 0

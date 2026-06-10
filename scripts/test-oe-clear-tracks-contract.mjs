@@ -101,4 +101,57 @@ assert.match(
   '消息分发必须把 options 透传给 handleOriginApplyTimeline',
 );
 
+// ── 2026-06-11 回归修复：清空后被自动铺设回填 + "本来就是空的"误报 ──
+// 回归现场：清空轨道→编辑器重建触发 ready→会话内首次自动同步重试→把刚清空的
+// 轨道铺了回去（且因降级/跳段铺得不全没字幕）；同时清空计数只看 EditParam.Track，
+// 而 SDK 活草稿在 LatestEditParam，导致明明有片段却报"轨道本来就是空的"。
+
+// fe：自动铺设必须尊重"用户清空过"标记；手动铺设成功后作废标记
+assert.match(
+  feSrc,
+  /const respectClearedMarker = options\?\.respectClearedMarker === true;/,
+  'handleOriginApplyTimeline 必须支持 respectClearedMarker 选项',
+);
+assert.match(
+  feSrc,
+  /if \(respectClearedMarker\) \{[\s\S]*?clearedAt > appliedAt[\s\S]*?skipped: 'tracks_cleared_by_user'/,
+  '清空时间晚于上次铺设时间时，自动铺设必须跳过',
+);
+assert.match(
+  feSrc,
+  /delete nextEditParam\.OriginTracksClearedAt;/,
+  '铺设成功必须作废 OriginTracksClearedAt 标记',
+);
+
+// fe：判空/计数必须看三个来源（编辑器内存活草稿/LatestEditParam/EditParam）
+assert.match(
+  feSrc,
+  /function resolveCurrentTrackForInspection\(projectInfo, editParam\)[\s\S]*?getVevEditorProjectData\(\)\?\.LatestEditParam\?\.Track/,
+  '轨道判空必须包含编辑器内存活草稿与 LatestEditParam',
+);
+assert.match(
+  feSrc,
+  /const existingTrackItemCount = resolveCurrentTrackForInspection\(projectInfo, editParam\)\.itemCount;/,
+  'onlyIfTracksEmpty 判空必须用三来源取最大',
+);
+assert.match(
+  feSrc,
+  /const liveTrackSnapshot = getVevEditorProjectData\(\)\?\.LatestEditParam\?\.Track \|\| null;\s*destroyVevEditorInstance\('clear-tracks'\);/,
+  '清空计数必须在销毁编辑器前先取活草稿快照',
+);
+
+// 壳层：两条自动铺设路径都必须带 respectClearedMarker；清空成功必须压制会话内重试
+const autoApplyWithMarker = oeSrc.match(/_applyCurrentEdlTimelineToVevDemo\((?:scopedMaterials|result\.reachableMaterials), \{ respectClearedMarker: true \}\)/g) || [];
+assert.equal(autoApplyWithMarker.length, 2, '自动同步的两条铺设路径（复用binding+完整同步）都必须带 respectClearedMarker');
+assert.match(
+  oeSrc,
+  /_vevDemoInitialAutoSyncKey = `\$\{_vevDemoBoundOriginProjectId\}:\$\{_vevDemoBoundVevProjectId\}`;/,
+  '清空成功必须把会话内首次自动同步标记为已消费',
+);
+assert.match(
+  oeSrc,
+  /skipped === 'tracks_cleared_by_user'/,
+  '壳层必须识别"用户已清空轨道"的跳过分支',
+);
+
 console.log('oe clear-tracks / sync-auto-layout contract tests passed');

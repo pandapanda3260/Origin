@@ -68,7 +68,7 @@ import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEv
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=114';
 import { mountPixelCard } from './modules/pixel_card.js?v=300';
 import { createSwLoading } from '/modules/loading.js?v=300';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=16';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=17';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
