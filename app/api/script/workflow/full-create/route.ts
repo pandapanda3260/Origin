@@ -23,6 +23,7 @@ import { buildKnowledgeContextForStage } from '@/lib/knowledge/compile-context';
 import { recordKnowledgeContextBestEffort } from '@/lib/knowledge/context-db';
 import { shortKnowledgeHash } from '@/lib/knowledge/hash';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
+import { beginStageRun, progressStageRun, endStageRun, SCRIPT_GENERATE_STAGE } from '@/lib/stage-inflight';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -82,6 +83,33 @@ export async function POST(req: NextRequest) {
       return;
     }
 
+    // 刷新续接 + 防重：登记 in-flight 状态（详见 lib/stage-inflight.ts）。
+    // 客户端刷新断开 SSE 后本 handler 会继续跑完落库，登记让前端能查到并续接，
+    // 同时拦住同项目并发的第二路剧本生成（双扣积分 + 时间线重复 append）。
+    const initialStepLabel = isRevise ? '正在按你的指令修改剧本…' : isAdapt ? '正在把原文改编成剧本…' : '正在生成剧本…';
+    const trackInflight = !!(projectId && proj);
+    if (trackInflight) {
+      const begin = beginStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, {
+        step: initialStepLabel,
+        pct: 15,
+        meta: { mode: isRevise ? 'revise' : isAdapt ? 'adapt' : 'create' },
+      });
+      if (!begin.ok) {
+        writer.error('该项目的剧本生成已在后台进行中，请稍候，完成后会自动写入项目');
+        return;
+      }
+    }
+    let inflightEnded = false;
+    const endInflight = (outcome: 'done' | 'error', errMsg?: string) => {
+      if (!trackInflight || inflightEnded) return;
+      inflightEnded = true;
+      endStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, outcome, errMsg);
+    };
+    const stepInflight = (label: string, pct: number) => {
+      if (!trackInflight || inflightEnded) return;
+      progressStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, label, pct);
+    };
+
 	    let scriptText = '';
     const worldContext = proj
       ? projectWorldContextForStage('script_create', (proj as any).worldTemplateSnapshot, {
@@ -135,7 +163,9 @@ export async function POST(req: NextRequest) {
         writer.scriptChunk(delta);
       });
     } catch (e: any) {
-      writer.error(formatScriptGenerationError(e, { isAdapt }));
+      const failMsg = formatScriptGenerationError(e, { isAdapt });
+      endInflight('error', failMsg);
+      writer.error(failMsg);
       return;
     }
 
@@ -149,16 +179,17 @@ export async function POST(req: NextRequest) {
     // → 输出"已删除当前剧本。请提供新的创作需求…"）。不像剧本 → 不重标、
     // 不落库，直接报错，当前剧本保持不变。
     if (!looksLikeFiveActScript(scriptText)) {
-      writer.error(
-        isRevise
-          ? 'AI 没有按剧本格式返回（可能把这条指令当成了聊天），本次修改未生效，当前剧本保持不变。请换成剧本修改类指令，如"把开头改得更紧凑"。'
-          : 'AI 没有按剧本格式输出，本次结果未保存，请调整描述后重试。',
-      );
+      const guardMsg = isRevise
+        ? 'AI 没有按剧本格式返回（可能把这条指令当成了聊天），本次修改未生效，当前剧本保持不变。请换成剧本修改类指令，如"把开头改得更紧凑"。'
+        : 'AI 没有按剧本格式输出，本次结果未保存，请调整描述后重试。';
+      endInflight('error', guardMsg);
+      writer.error(guardMsg);
       return;
     }
 
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
+    stepInflight('正在打情绪标签…', 80);
     let emotions: any[] = [];
     try {
       const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
@@ -229,7 +260,9 @@ export async function POST(req: NextRequest) {
         // 后续 PUT 才不会必撞 409（"已同步到服务器最新版本"churn）。
         savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
       } catch (e: any) {
-        writer.error('保存失败：' + (e?.message || String(e)));
+        const saveMsg = '保存失败：' + (e?.message || String(e));
+        endInflight('error', saveMsg);
+        writer.error(saveMsg);
         return;
       }
       try {
@@ -259,6 +292,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    endInflight('done');
     writer.done({
       script: scriptText,
       // 前端 script.js 读 emotionSegments + durationSec

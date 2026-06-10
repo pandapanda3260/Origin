@@ -357,7 +357,7 @@ function _getEditExportState() {
   }
   if (editData.exportUrl) {
     if (_exportMatchesCurrentEdl()) {
-      return { state: "download", label: "下载成片", sub: "Download", disabled: false, hint: "" };
+      return { state: "download", label: "下载导出", sub: "Download", disabled: false, hint: "" };
     }
     return {
       state: "stale",
@@ -403,9 +403,12 @@ function _pulseAutoComposeButton() {
 // 不整包 reload 项目（避免跳页）。_sendTimelineOp / 媒体删除失败时调用。
 async function _resyncEditDataFromServer() {
   if (!project || !project.id) return;
+  var pid = String(project.id);
   try {
-    var latest = await apiGet("/api/projects/" + encodeURIComponent(project.id));
+    var latest = await apiGet("/api/projects/" + encodeURIComponent(pid));
     if (!latest || !latest.id) return;
+    // await 期间可能切了项目：拉回来的是旧项目数据，绝不能灌进新项目内存
+    if (!project || String(project.id) !== pid) return;
     if (typeof latest.version === "number" && _ctx.bumpProjectVersion) {
       _ctx.bumpProjectVersion(latest.version);
     }
@@ -424,6 +427,7 @@ async function _resyncEditDataFromServer() {
     if (!project.editData) project.editData = {};
     if (ed.edl) {
       await _hydrateEdlVideoUrls(ed.edl);
+      if (!project || String(project.id) !== pid) return; // 同上：hydrate 是第二个悬挂点
       project.editData.edl = ed.edl; // arch-guard:allow-editdata 强同步回灌
       _editState.edl = ed.edl;
     }
@@ -462,8 +466,43 @@ export function initEdit(ctx) {
   _ctx = ctx;
 }
 
+// 项目级 UI 纪元：切到另一个项目时 +1。剪辑页的动作按钮/遮罩/导出 SSE 订阅
+// 都是模块级+共享静态 DOM，不跟项目走；上一个项目遗留的流回调、await 尾巴
+// 若不按纪元作废，会把 A 项目的"导出中 N%"画进 B 项目页面、甚至把 A 的
+// exportTaskId/exportUrl 写进 B 的内存 editData（2026-06-10 串台实锤）。
+var _editUiEpoch = 0;
+
 export function syncEditProject(p) {
+  var prevId = project && project.id ? String(project.id) : "";
+  var nextId = p && p.id ? String(p.id) : "";
+  var switched = prevId && prevId !== nextId;
+  if (switched) _teardownProjectScopedEditUi();
   project = p;
+  // 切完再按新项目的 editData 把导出按钮校正一遍（teardown 时 project 还是旧的）
+  if (switched) {
+    try { _syncEditExportButtonState(); } catch (_e) {}
+  }
+}
+
+// 切项目收口：作废旧纪元回调 + 关导出流订阅 + 清动作锁和遮罩。
+// 后端任务本身不受影响；切回原项目时由 _tryResumeExportStream / composeRuns
+// 心跳恢复"导出中/成片中"的展示，所以这里只清 UI 态，不碰任何数据。
+function _teardownProjectScopedEditUi() {
+  _editUiEpoch++;
+  if (_exportStreamHandle) {
+    try { _exportStreamHandle.close(); } catch (_e) {}
+    _exportStreamHandle = null;
+  }
+  [
+    ["btnEditAnalyze", "editCardAnalyze", "片段分析"],
+    ["btnEditGenEdl", "editCardGenEdl", "剪辑方案"],
+    ["btnEditAutoCompose", "editCardAutoCompose", "一键成片"],
+    ["btnEditExport", "editCardExport", "下载导出"],
+  ].forEach(function (spec) {
+    try {
+      if (_editActionBusy[spec[0]]) _editActionEnd(spec[0], spec[1], spec[2]);
+    } catch (_e) {}
+  });
 }
 
   /* ================================================================
@@ -4103,7 +4142,7 @@ export function syncEditProject(p) {
       showToast("导出正在进行中，请稍候", "warn");
       return;
     }
-    showToast("请先一键成片，再下载成片", "warn");
+    showToast("请先一键成片，再下载导出", "warn");
   }
 
   function _attachExportStream(taskId) {
@@ -4113,12 +4152,16 @@ export function syncEditProject(p) {
       try { _exportStreamHandle.close(); } catch (_e) {}
       _exportStreamHandle = null;
     }
+    // 纪元守卫：切项目后这些回调全部作废（close() 挡不住已在飞的微任务/轮询回调）
+    var epoch = _editUiEpoch;
     var handle = subscribeTask(taskId, {
       onProgress: function (data) {
+        if (epoch !== _editUiEpoch) return;
         var pct = (data && data.progress != null) ? data.progress : 0;
         _editActionProgress("editCardExport", "导出中 " + pct + "%");
       },
       onCompleted: function (data) {
+        if (epoch !== _editUiEpoch) return;
         var url = (data && (data.downloadUrl || data.resultUrl)) || "";
         var edlVersion = data && data.edlVersion;
         var edlSignature = data && (data.edlSignature || data.exportedEdlSignature);
@@ -4134,13 +4177,14 @@ export function syncEditProject(p) {
           if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
         }
         if (url) {
-          showToast("成片导出完成，点击「下载成片」保存文件", "ok");
+          showToast("成片导出完成，点击「下载导出」保存文件", "ok");
         }
         _editActionEnd("btnEditExport", "editCardExport", "下载导出");
         _exportStreamHandle = null;
         _syncEditExportButtonState();
       },
       onFailed: function (data) {
+        if (epoch !== _editUiEpoch) return;
         var msg = (data && (data.reason || data.errorMsg)) || "导出失败";
         if (project && project.editData && project.editData.exportTaskId === taskId && !project.editData.exportUrl) {
           project.editData.exportTaskId = "";
@@ -4151,9 +4195,11 @@ export function syncEditProject(p) {
         _syncEditExportButtonState();
       },
       onClose: function () {
+        if (epoch !== _editUiEpoch) return;
         // SSE 异常断开：兜底拉一次 HTTP 状态确认结果，避免按钮卡死。
         apiGet("/api/edit/export-status/" + taskId).then(function (status) {
           if (!status) return;
+          if (epoch !== _editUiEpoch) return; // await 期间可能已切项目
           var isCompleted = status.done || status.status === "completed";
           var isFailed = status.status === "failed" || status.status === "cancelled" || status.status === "timeout";
           var downloadUrl = status.downloadUrl || status.url || "";
@@ -4172,7 +4218,7 @@ export function syncEditProject(p) {
                 if (edlSignature) project.editData.exportedEdlSignature = edlSignature; // arch-guard:allow-editdata
                 if (edlSignatureMeta) project.editData.exportedEdlSignatureMeta = edlSignatureMeta; // arch-guard:allow-editdata
               }
-              showToast("成片导出完成，点击「下载成片」保存文件", "ok");
+              showToast("成片导出完成，点击「下载导出」保存文件", "ok");
             } else if (restarted) {
               showToast("服务刚刚重启了，这次导出中断了，点「下载导出」重试一次就好", "warn");
             } else if (isFailed || errorMsg) {
@@ -4200,6 +4246,7 @@ export function syncEditProject(p) {
     }
     if (!_editActionStart("btnEditExport", "editCardExport", "#34d399", "正在下载导出…", "Exporting")) return;
 
+    var epoch = _editUiEpoch; // 纪元守卫：await 期间切项目则整段作废（防串台）
     var exportEdl = _editState.edl ? _edlForPersistence(_editState.edl) : {
       timeline: segs.map(function (s) {
         return {
@@ -4226,6 +4273,7 @@ export function syncEditProject(p) {
       if (!taskId) {
         throw new Error(resp && resp.error ? resp.error : "任务创建失败");
       }
+      if (epoch !== _editUiEpoch) return; // 提交期间已切项目：任务照跑，UI 交还 teardown
       // E-2.2：taskId 通过 task_store 持久化（register 已在后端做过），前端只需要
       // 在内存里缓存就够——不再 saveProject 写盘（Bug F 同款）。刷新后由
       // _tryResumeExportStream() 从 editData 里读回重订。
@@ -4238,6 +4286,7 @@ export function syncEditProject(p) {
       showToast("导出任务已提交，正在处理…", "ok");
       _attachExportStream(taskId);
     } catch (e) {
+      if (epoch !== _editUiEpoch) return;
       if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
         showBillingPaywall(e.billing || null);
       } else {
@@ -4292,6 +4341,7 @@ export function syncEditProject(p) {
   // 用户不必再手动点一次「一键成片」。失败则提示并停下。
   async function _acceptTimelineAndCompose() {
     if (!project || !project.id) return;
+    var epoch = _editUiEpoch;
     try {
       await apiPost("/api/edit/auto-compose/recovery", {
         projectId: project.id,
@@ -4299,9 +4349,11 @@ export function syncEditProject(p) {
       });
       await _resyncEditDataFromServer();
     } catch (e) {
+      if (epoch !== _editUiEpoch) return;
       showToast("处理失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
       return;
     }
+    if (epoch !== _editUiEpoch) return; // 确认弹窗/请求期间切了项目：不在新项目上续跑成片
     await _autoComposeEditVideo();
   }
 
@@ -4332,12 +4384,16 @@ export function syncEditProject(p) {
     var needOverwriteConfirm = false;
     var observedExportTaskId = "";
     var shouldResumeExportStream = false;
+    // 纪元守卫：流式回调和 await 尾巴都可能在用户切到其它项目后才到达，
+    // 届时 project 已指向新项目，绝不能再写 editData / 画进度（防串台）。
+    var epoch = _editUiEpoch;
     try {
       var resp = await apiPostStream("/api/edit/auto-compose", {
         projectId: project.id,
         mode: "start",
       }, null, function (evt) {
         if (!evt) return;
+        if (epoch !== _editUiEpoch) return;
         if (evt.type === "phase") {
           _editActionProgress("editCardAutoCompose", _composePhaseLabel(evt.phase));
         } else if (evt.type === "preflight_result") {
@@ -4366,7 +4422,9 @@ export function syncEditProject(p) {
         }
       });
 
+      if (epoch !== _editUiEpoch) return; // 成片流结束前已切项目：UI/editData 均不再归这条流管
       await _resyncEditDataFromServer();
+      if (epoch !== _editUiEpoch) return;
       if (resp && resp.exportTaskId && project) {
         if (!project.editData) project.editData = {};
         project.editData.exportTaskId = resp.exportTaskId;
@@ -4390,6 +4448,7 @@ export function syncEditProject(p) {
         showToast("一键成片完成", "ok");
       }
     } catch (e) {
+      if (epoch !== _editUiEpoch) return;
       if (capturedError && capturedError.code === "MANUAL_TIMELINE_EDIT_DETECTED") {
         // 推迟到本次成片动作完全结束（_editActionEnd 之后）再弹确认，
         // 否则在 busy 态里递归触发 _autoComposeEditVideo 会被忙碌守卫挡掉。
@@ -4412,6 +4471,7 @@ export function syncEditProject(p) {
         shouldResumeExportStream = true;
       }
     }
+    if (epoch !== _editUiEpoch) return; // catch 里 await 期间切了项目：收尾已由 teardown 做掉
     _editActionEnd("btnEditAutoCompose", "editCardAutoCompose", "一键成片");
     _syncEditExportButtonState();
     if (shouldResumeExportStream) setTimeout(_tryResumeExportStream, 0);

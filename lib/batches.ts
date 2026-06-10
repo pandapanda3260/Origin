@@ -1827,6 +1827,28 @@ function safeParse(s: string) {
  *
  * 前端刷新后调 /api/batch/active 用来 reattach SSE 订阅 + 恢复失败卡片。
  */
+/**
+ * 轻量查询：该用户该项目是否已有指定类型的批次在跑（queued/running）。
+ * 用于 /api/batch/start 的同类型防重（如 shots：镜头表生成中用户又点
+ * "确认资产"自动触发 generateShots → 直接复用进行中的批次，不再起第二路）。
+ */
+export function findActiveBatchForType(opts: {
+  ownerId: number;
+  projectId: string;
+  batchType: string;
+}): { batchId: string; total: number } | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT id, total FROM batches
+       WHERE owner_id = ? AND project_id = ? AND batch_type = ? AND status IN ('queued','running')
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    )
+    .get(opts.ownerId, opts.projectId, opts.batchType) as any;
+  return row ? { batchId: String(row.id), total: Number(row.total) || 1 } : null;
+}
+
 export function getActiveBatchesForUser(opts: {
   ownerId: number;
   projectId?: string;

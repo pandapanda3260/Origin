@@ -268,9 +268,16 @@ function ok(name) { passed++; console.log('  ✓ ' + name); }
   assert.match(as, /_reattachedBatchKeys/, 'assets: reattach 防重注册表');
 
   const html = read('../public/workspace.html');
-  assert.match(html, /backend_stream\.js\?v=101/, 'importmap: backend_stream 已 bump');
-  assert.match(html, /videoTasks\.js\?v=122/, 'importmap: videoTasks 已 bump');
-  assert.match(html, /assets\.js\?v=163/, 'importmap: assets 已 bump');
+  // 契约语义是"至少 bump 到修复版本"，不是钉死精确值——后续无关修复继续 bump
+  // 不应打破本契约（2026-06-10 videoTasks 122→123 即误伤实例）。
+  const importmapVersionAtLeast = (mod, min) => {
+    const m = html.match(new RegExp(mod.replace(/\./g, '\\.') + '\\?v=(\\d+)'));
+    assert.ok(m, `importmap: ${mod} 带版本号`);
+    assert.ok(Number(m[1]) >= min, `importmap: ${mod} 版本 ${m[1]} >= ${min}（已 bump）`);
+  };
+  importmapVersionAtLeast('backend_stream.js', 101);
+  importmapVersionAtLeast('videoTasks.js', 122);
+  importmapVersionAtLeast('assets.js', 163);
   ok('静态契约：模块接线 + importmap 版本号');
 }
 

@@ -1044,6 +1044,12 @@ function _syncShotsProgressBanner() {
    - 成功后 `services.project_patch` 直接权威落盘 `project.shots`，前端
      `_safeWriteBack` 只是 UI 乐观更新
    ---------------------------------------------------------------- */
+// 本会话正在跟踪的 shots 批次（projectKey → batchId）。
+// 防止重复调用 generateShots 造成同一批次双订阅（双倍回调/弹双 toast），
+// 以及"确认资产自动触发 + 手点生成"这类同会话重入。
+// 服务端 /api/batch/start 对 shots 还有同项目复用兜底（跨刷新/跨标签页场景）。
+var _trackingShotsBatchByProject = new Map();
+
 export async function generateShots(opts) {
   _syncRefs();
   var existingBatchId = (opts && opts.resumeBatchId) || null;
@@ -1056,6 +1062,13 @@ export async function generateShots(opts) {
   }
 
   var originId = project.id;
+  var _trackKey = String(originId);
+  var _tracked = _trackingShotsBatchByProject.get(_trackKey);
+  if (existingBatchId) {
+    if (_tracked === existingBatchId) return; // 这路批次已在跟踪，避免双订阅
+  } else if (_tracked) {
+    return; // 本会话已有一路镜头计划在跟踪（自动触发/重复点击直接忽略）
+  }
   var btn = $("btnGenShots");
   var needPlan = $("shotsNeedPlan");
   var ready = $("shotsReady");
@@ -1091,6 +1104,10 @@ export async function generateShots(opts) {
       });
       batchId = startResp && startResp.batchId;
       if (!batchId) throw new Error("启动失败：未返回 batchId");
+      if (startResp && startResp.reused) {
+        // 服务端防重命中：同项目已有镜头计划批次在跑，复用并续显进度
+        _setShotsProgress(15, "重新连接生成任务…", "检测到后台已在生成镜头计划，继续跟踪进度");
+      }
     } catch (e) {
       if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
       var errTextStart = ((e && e.message) || e).toString().slice(0, 150);
@@ -1102,6 +1119,7 @@ export async function generateShots(opts) {
   } else {
     _setShotsProgress(15, "重新连接生成任务…", "已检测到后台正在生成，继续跟踪进度");
   }
+  _trackingShotsBatchByProject.set(_trackKey, batchId);
 
   var finished = false;
   var finishingFromServer = null;
@@ -1111,6 +1129,9 @@ export async function generateShots(opts) {
     if (finished) return;
     finished = true;
     _stopPoll();
+    if (_trackingShotsBatchByProject.get(_trackKey) === batchId) {
+      _trackingShotsBatchByProject.delete(_trackKey);
+    }
     if (_progressBar) _progressBar.classList.remove("extract-bar-pulse");
     _refreshShotPlanActionState();
   }

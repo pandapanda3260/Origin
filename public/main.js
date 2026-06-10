@@ -33,7 +33,7 @@ import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   reattachVideoPromptBatches } from './modules/videoPrompts.js?v=111';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=109';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=110';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
@@ -47,7 +47,7 @@ import { initScript, syncScriptProject, refreshScriptPage,
   extractStyleBible,
   initScriptImportEvents, confirmScript, tagEmotions, renderEmotionSegments, renderScriptAnalysis,
   refreshScriptImportDraft, emotionBadgeHtml, showScriptEdit, showScriptDisplay, isScriptGenerating,
-  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=113';
+  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=116';
 import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   renderAssets, renderAssetGrid, updateAssetCardImage, generateSingleAssetImage,
   generateAllAssetImages, checkAssetsConfirm, confirmAssets, handleAssetAction,
@@ -64,7 +64,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _openLightbox } from './modules/assets.js?v=163';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=207';
-import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=108';
+import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=111';
 import { mountPixelCard } from './modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
 import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
@@ -3322,14 +3322,28 @@ var _scriptEditInitialText = "";
   }
 
   function _ovContinuePageForProject(proj) {
-    if (!proj || !proj.script || !proj.scriptApproved) return "script";
-    if (!_ovHasUsableStyleBible(proj)) return "style";
-    if (!proj.assetsApproved) return "assets";
-    if (!proj.shotsApproved) return "shots";
-    if (!proj.imagesApproved) return "images";
-    if (!proj.videoPromptsApproved) return "prompts";
-    if (_ovProjectCanEnterEdit(proj)) return "edit";
-    return "batch";
+    // 与状态胶囊同口径（_ovProjectStageInfo）：从最远下游产物倒推阶段，不信 *Approved flag。
+    // 旧实现按 flag 链判定，但用户常跳过各步"确认"按钮（如已导出成片的项目 imagesApproved 仍 false），
+    // 导致已完成的项目"继续制作"跳回分镜/镜头页。counts 算法与 _ovProjectTaskFromSummary 的 hasDetail 分支一致。
+    if (!proj) return "script";
+    var localTasks = _ovLocalTasksForProject(proj.id);
+    var segmentCount = _ovProjectSegmentCount(proj, localTasks);
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    var vts = Array.isArray(proj.videoTasks) ? proj.videoTasks : [];
+    var counts = { running: 0, done: 0, failed: 0, pending: 0 };
+    for (var i = 0; i < segmentCount; i++) {
+      var localTask = _ovLocalTaskForProjectGroup(localTasks, i);
+      var serverStatus = _ovStatusFrom(null, vts[i] || {}, sbs[i] || {});
+      var status = (serverStatus === "done" || serverStatus === "failed")
+        ? serverStatus
+        : _ovStatusFrom(localTask, vts[i] || {}, sbs[i] || {});
+      if (counts[status] === undefined) status = "pending";
+      counts[status]++;
+    }
+    var stage = _ovProjectStageInfo(proj, counts, segmentCount).stage;
+    // 已完成 → 剪辑页（看成片/微调/重导出）。其余 stage 与页面名一一对应（images 由 switchPage 归一到 shots）。
+    if (stage === "done") return "edit";
+    return stage;
   }
 
   function _ovContinuePageLabel(page) {
@@ -7652,6 +7666,13 @@ var _scriptEditInitialText = "";
       getProject: () => project,
       setProject: (p) => {
         project = p;
+        // 整包替换 project 对象时必须同步所有模块的本地引用，否则 script/assets
+        // 等模块继续读旧对象：写入走 safeWriteBack 落到新对象（数据没丢），但
+        // 渲染读的是旧对象 → 按钮"点了没反应"。实例：409 整包回拉后，剧本页
+        // "保留此原稿"点击后导入卡片不消失（proj_1781092769217, 2026-06-10）。
+        // 旧实现只在 _loadProjectFromServer 里手动补 syncEdit/syncTasks 两家，
+        // 模块拆分后清单漂移；现在收口到 setProject 一处，所有替换路径自动覆盖。
+        _syncProjectModules(project);
         _ovSelectCurrentProjectTask();
       },
       getVideoState: () => videoState,

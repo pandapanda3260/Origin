@@ -290,30 +290,59 @@ export async function POST(req: NextRequest) {
 
   const modelResults: any[] = [];
   if (missing.length) {
-    const llmInput = {
-      assets,
-      pairs: missing.map(x => x.pair),
-    };
-    try {
-      const maxTokens = Math.min(12000, Math.max(3500, 1400 + missing.length * 650));
-      const json = await chatCompleteJsonWithRetry<any>(
-        user,
-        [
-          { role: 'system', content: SP_CONTINUITY },
-          { role: 'user', content: JSON.stringify(llmInput) },
-        ],
-        { temperature: 0.1, maxTokens, modelRole: 'continuity' },
-        parseJsonLoose,
-        'continuity.check-adjacent',
-      );
-      const rawPairs = Array.isArray(json?.pairs) ? json.pairs : [];
-      for (const item of missing) {
-        const raw = rawPairs.find((p: any) => String(p?.pairKey) === item.pair.pairKey) || { warnings: [] };
-        const result = { warnings: normalizePairResult(item.pair, raw) };
-        setCached(user.id, projectId, item.pair.pairKey, item.inputHash, result);
-        modelResults.push({ pair: item.pair, inputHash: item.inputHash, result, cached: false });
+    // 并行分片：原先把所有未命中缓存的相邻对塞进一次大模型调用，延迟随对数线性增长
+    // （≈1400+650*n maxTokens 的长输出）。现在按固定片大小拆成多路并发小调用，
+    // 整体等待≈最慢一片。modelRole/temperature 不变；maxTokens 是任务输出预算，
+    // 最终仍由统一预算层 clamp（见 docs/model-config-governance.md）。
+    // 失败语义：单片失败只丢该片检查结果（fail-open，与原行为一致）；
+    // 全部片失败才返回 checkFailed=true，前端照旧放行生成。
+    const CONTINUITY_PAIRS_PER_CALL = 4;
+    const CONTINUITY_MAX_CONCURRENT_CALLS = 4;
+    const chunks: Array<typeof missing> = [];
+    for (let i = 0; i < missing.length; i += CONTINUITY_PAIRS_PER_CALL) {
+      chunks.push(missing.slice(i, i + CONTINUITY_PAIRS_PER_CALL));
+    }
+    let failedChunks = 0;
+    let lastError: any = null;
+    const runChunk = async (chunk: typeof missing) => {
+      const llmInput = {
+        assets,
+        pairs: chunk.map(x => x.pair),
+      };
+      const maxTokens = Math.min(12000, Math.max(3500, 1400 + chunk.length * 650));
+      try {
+        const json = await chatCompleteJsonWithRetry<any>(
+          user,
+          [
+            { role: 'system', content: SP_CONTINUITY },
+            { role: 'user', content: JSON.stringify(llmInput) },
+          ],
+          { temperature: 0.1, maxTokens, modelRole: 'continuity' },
+          parseJsonLoose,
+          'continuity.check-adjacent',
+        );
+        const rawPairs = Array.isArray(json?.pairs) ? json.pairs : [];
+        for (const item of chunk) {
+          const raw = rawPairs.find((p: any) => String(p?.pairKey) === item.pair.pairKey) || { warnings: [] };
+          const result = { warnings: normalizePairResult(item.pair, raw) };
+          setCached(user.id, projectId, item.pair.pairKey, item.inputHash, result);
+          modelResults.push({ pair: item.pair, inputHash: item.inputHash, result, cached: false });
+        }
+      } catch (e: any) {
+        failedChunks += 1;
+        lastError = e;
+        console.warn('[continuity] chunk check failed:', e?.message || e);
       }
-    } catch (e: any) {
+    };
+    const queue = chunks.slice();
+    const workers = Array.from(
+      { length: Math.min(CONTINUITY_MAX_CONCURRENT_CALLS, queue.length) },
+      async () => {
+        for (let next = queue.shift(); next; next = queue.shift()) await runChunk(next);
+      },
+    );
+    await Promise.all(workers);
+    if (failedChunks === chunks.length) {
       return jsonOk({
         ok: true,
         projectId,
@@ -321,7 +350,7 @@ export async function POST(req: NextRequest) {
         cachedPairs: cachedResults.length,
         modelPairs: 0,
         checkFailed: true,
-        error: e?.message || String(e),
+        error: lastError?.message || String(lastError || 'continuity model check failed'),
         warnings: [],
         pairs: pairs.map(p => ({ pairKey: p.pairKey, fromGroupIdx: p.fromGroupIdx, toGroupIdx: p.toGroupIdx, warningCount: 0 })),
       });
@@ -339,6 +368,8 @@ export async function POST(req: NextRequest) {
     checkedPairs: pairs.length,
     cachedPairs: cachedResults.length,
     modelPairs: modelResults.length,
+    // 部分分片失败时这里 >0：这些对本次未检查（fail-open 放行），仅作观测用
+    uncheckedPairs: Math.max(0, missing.length - modelResults.length),
     warnings,
     pairs: results.map(r => ({
       pairKey: r.pair.pairKey,

@@ -538,6 +538,10 @@ function _syncScriptDraftMeta() {
 export function refreshScriptPage() {
   if (!project) return;
   if (_scriptGenerating) return;
+  // 刷新续接：剧本生成（生成/改编/改写/扩写）可能仍在后台跑（SSE 断开不中止
+  // handler，见 lib/sse.ts）。查一把 generate-status，还在跑就接上进度，
+  // 别让"回到选择状态"误导用户重点一次造成双扣费。
+  try { _maybeResumeScriptGenerate(); } catch (e) { console.warn("[Script] resume check failed:", e); }
   // 委托绑定一次即可（_ensureConfirmDraftDelegation 内部有幂等保护）
   _ensureConfirmDraftDelegation();
   _ensureScriptHistoryDelegation();
@@ -574,6 +578,129 @@ export function refreshScriptPage() {
   if (ideaInput && project && !project.script) ideaInput.value = project.idea || "";
   _updateScriptInputPlaceholder();
   chatAutoResize(ideaInput);
+}
+
+// ── 刷新后续接后台剧本生成 ──────────────────────────────────────────
+// full-create / expand / consult-confirm 都是一次性 SSE：刷新断开后 handler
+// 仍在后端跑完并落库（lib/sse.ts cancel 只停外发）。这组函数在进入剧本页时
+// 查 in-flight 状态，还在跑就复用现有流式视觉（结果卡 + 波浪 + step 行）接上，
+// 跑完拉权威项目重渲染，全程不新增 UI 元素。
+var _scriptGenResume = { key: "", polling: false, timer: null, lastCheckAt: 0, handledEndAt: {} };
+
+function _scriptGenStatusUrl(projectId) {
+  return "/api/script/workflow/generate-status?projectId=" + encodeURIComponent(projectId);
+}
+
+function _maybeResumeScriptGenerate() {
+  if (!project || !project.id) return;
+  if (_scriptGenerating || _scriptGenResume.polling) return;
+  var key = String(project.id);
+  var now = Date.now();
+  if (_scriptGenResume.key === key && now - _scriptGenResume.lastCheckAt < 5000) return;
+  _scriptGenResume.key = key;
+  _scriptGenResume.lastCheckAt = now;
+  apiGet(_scriptGenStatusUrl(key)).then(function (st) {
+    if (!st || _scriptGenerating || _scriptGenResume.polling) return;
+    if (!project || String(project.id) !== key) return;
+    if (st.status === "running") { _beginScriptGenResume(key, st); return; }
+    if (!st.endedAt || _scriptGenResume.handledEndAt[key] === st.endedAt) return;
+    _scriptGenResume.handledEndAt[key] = st.endedAt;
+    if (st.status === "done") {
+      // 完成瞬间刷新：内存可能还是旧剧本，拉一次权威数据补齐（静默）
+      _finishScriptGenResume(key, { announce: false });
+    } else if (st.status === "error") {
+      showToast("上次剧本生成未完成：" + String(st.error || "已中断").slice(0, 120), "error");
+    }
+  }).catch(function (e) {
+    console.warn("[Script] generate status check failed:", e);
+  });
+}
+
+function _beginScriptGenResume(key, st) {
+  if (_scriptGenerating || _scriptGenResume.polling) return;
+  _scriptGenerating = true;
+  _scriptGenResume.polling = true;
+  var genBtn = $("btnGenScript");
+  if (genBtn) genBtn.disabled = true;
+  // 复用流式生成的视觉：结果卡 + 空文本波浪 + step 行（与 generateScript 同款）
+  var resultCard = $("scriptResultCard");
+  if (resultCard) { resultCard.hidden = false; _moveScriptResultToEnd(); }
+  var displayText = $("scriptDisplayText");
+  if (displayText) {
+    displayText.textContent = "";
+    displayText.style.pointerEvents = "none";
+    displayText.classList.add("streaming-wave");
+  }
+  _hideScriptConfirmArea();
+  showScriptDisplay();
+  _scrollChatToBottom();
+  var stepEl = $("scriptStreamStep");
+  function _showStep(s) {
+    if (!stepEl) return;
+    stepEl.hidden = false;
+    stepEl.textContent = "AI · " + ((s && s.step) || "剧本正在生成") + "（后台进行中，刷新页面不会中断）";
+  }
+  _showStep(st);
+
+  _scriptGenResume.timer = setInterval(function () {
+    if (!project || String(project.id) !== key) { _stopScriptGenResume(); return; }
+    apiGet(_scriptGenStatusUrl(key)).then(function (cur) {
+      if (!_scriptGenResume.polling) return;
+      if (!project || String(project.id) !== key) { _stopScriptGenResume(); return; }
+      if (cur && cur.status === "running") { _showStep(cur); return; }
+      if (cur && cur.endedAt) _scriptGenResume.handledEndAt[key] = cur.endedAt;
+      _stopScriptGenResume();
+      if (cur && cur.status === "done") { _finishScriptGenResume(key, { announce: true }); return; }
+      var msg = String((cur && cur.error) || "剧本生成中断，请重试").slice(0, 150);
+      chatAddMsg("status", '<span class="chat-status-err">生成失败: ' + escapeHtml(msg) + '</span>');
+      _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(msg);
+      refreshScriptPage();
+    }).catch(function (e) {
+      console.warn("[Script] generate status poll failed:", e);
+    });
+  }, 2500);
+}
+
+function _stopScriptGenResume() {
+  if (_scriptGenResume.timer) { clearInterval(_scriptGenResume.timer); _scriptGenResume.timer = null; }
+  _scriptGenResume.polling = false;
+  _scriptGenerating = false;
+  var genBtn = $("btnGenScript");
+  if (genBtn) genBtn.disabled = false;
+  var displayText = $("scriptDisplayText");
+  if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
+  var stepEl = $("scriptStreamStep");
+  if (stepEl) { stepEl.hidden = true; stepEl.textContent = ""; }
+}
+
+async function _finishScriptGenResume(key, opts) {
+  var announce = !opts || opts.announce !== false;
+  var ok = false;
+  try { ok = _ctx.reloadProjectFromServer ? await _ctx.reloadProjectFromServer() : false; }
+  catch (e) { console.warn("[Script] reload after generate resume failed:", e); }
+  if (!project || String(project.id) !== key) return;
+  if (!ok) {
+    if (announce) showToast("剧本已生成，但同步结果失败，请刷新页面查看", "warn");
+    return;
+  }
+  refreshScriptPage();
+  if (announce) {
+    chatAddMsg("status", '<span class="chat-status-ok">剧本草稿已生成（后台任务完成）。请确认剧本后继续下一步。</span>');
+    showToast("剧本生成完成", "success");
+    _scrollChatToBottom();
+  }
+}
+
+// 服务端防重命中（"已在后台进行中"）→ 不进失败态，转入续接模式
+function _isBackgroundScriptGenError(e) {
+  return (((e && e.message) || e) + "").indexOf("已在后台进行中") !== -1;
+}
+
+function _attachToBackgroundScriptGen() {
+  _scriptGenResume.lastCheckAt = 0;
+  // setTimeout 让调用方 finally（清 _scriptGenerating / 按钮态）先跑完再续接
+  setTimeout(function () { try { _maybeResumeScriptGenerate(); } catch (_) {} }, 0);
+  chatAddMsg("status", '<span class="chat-status-ok">该项目的剧本生成已在后台进行中，已自动接上进度。</span>');
 }
 
 function _pendingImportedDraft() {
@@ -683,6 +810,10 @@ async function _applyImportedDraft() {
     ]);
   });
   if (!isCurrent) return;
+  // "采用导入稿"是用户显式决策，丢了很贵：跳过 1.5s debounce 立即落服务器，
+  // 缩小"导入保存 PUT 还在途 → 本次 PUT 带旧 If-Match 撞 409 → 整包回拉
+  // 把刚采用的内容滚回去"的竞态窗口（同 _deleteCurrentScript 的口径）。
+  _ctx.flushServerSave && _ctx.flushServerSave();
   // 被导入内容替换掉的旧版本沉为折叠卡 + 系统行
   if (prevScriptForTl.trim() && prevScriptForTl.trim() !== text) {
     var supEvtForTl = _supersededDraftEventFor(prevScriptForTl, prevDraftEvtForTl);
@@ -799,6 +930,9 @@ function _discardImportedDraft() {
     proj.scriptDraft = proj.script || "";
   });
   _ctx.saveProject && _ctx.saveProject();
+  // 同"保留此原稿"：显式决策立即落盘，避免 debounce 窗口内被 409 整包回拉
+  // 后草稿卡片"复活"，看起来像点击没生效。
+  _ctx.flushServerSave && _ctx.flushServerSave();
   refreshScriptImportDraft();
   renderScriptAnalysis();
   showToast("已放弃导入草稿", "info");
@@ -1860,6 +1994,11 @@ async function _consultConfirm() {
   } catch (e) {
     if (!_isScriptRequestCurrent(guard) || (e && e.name === "AbortError")) return;
     if (stepEl) stepEl.hidden = true;
+    if (_isBackgroundScriptGenError(e)) {
+      chatRemoveDots();
+      _attachToBackgroundScriptGen();
+      return;
+    }
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
@@ -2146,6 +2285,12 @@ export async function generateScript(idea, options) {
       if (sourceAbortToConsult) {
         await _consultTurn(idea, { skipUserBubble: true });
       }
+      return;
+    }
+    if (_isBackgroundScriptGenError(e)) {
+      if (stepEl) stepEl.hidden = true;
+      _removeSourceAdaptHint(sourceHintEl);
+      _attachToBackgroundScriptGen();
       return;
     }
     if (stepEl) stepEl.hidden = true;
@@ -2639,6 +2784,13 @@ export async function reviseScript(instruction) {
 		    }
   } catch (e) {
     if (stepEl2) stepEl2.hidden = true;
+    if (_isBackgroundScriptGenError(e)) {
+      var _restoreTextBg = stripStepTags((project && project.script) || "");
+      if (displayText) { displayText.textContent = _restoreTextBg; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
+      if (editArea) editArea.value = _restoreTextBg;
+      _attachToBackgroundScriptGen();
+      return;
+    }
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;

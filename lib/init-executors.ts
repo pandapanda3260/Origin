@@ -9,7 +9,7 @@
 import './batch-executors';
 import { installConsoleHook } from './sys-logs';
 import { reapOrphanBatches, startBatchOrphanReaper, startBatchRecoveryLoop } from './batches';
-import { reapOrphanExports } from './exports-reap';
+import { reapOrphanExports, startExportsStaleReaper } from './exports-reap';
 import { recoverOrphanedOnlineEditorDownloads, requeuePendingOnlineEditorDownloads, startOnlineEditorDownloadWorker } from './online-editor-downloads';
 import { recoverRunningVideoTasks, startVideoRecoveryLoop } from './video-gen';
 import { startProviderPollingLoop } from './provider-polling-worker';
@@ -53,9 +53,21 @@ const reapOnStart = envFlag('REAP_ORPHANS_ON_START', !recoveryEnabled && !extern
 if (!isNextProductionBuild() && reapOnStart && !(globalThis as any)[reapKey]) {
   (globalThis as any)[reapKey] = true;
   try { reapOrphanBatches(); } catch (e) { console.error('[init] reapOrphanBatches:', e); }
-  try { reapOrphanExports(); } catch (e) { console.error('[init] reapOrphanExports:', e); }
   try { recoverOrphanedOnlineEditorDownloads(); } catch (e) { console.error('[init] recoverOrphanedOnlineEditorDownloads:', e); }
   try { requeuePendingOnlineEditorDownloads(); } catch (e) { console.error('[init] requeuePendingOnlineEditorDownloads:', e); }
+}
+
+// exports 的孤儿/停滞回收独立于 reapOnStart：
+// doExport 只跑在 web 进程 setImmediate 里，batch 恢复循环不会续跑 exports 表，
+// 进程死掉后 running 行没人收尸 → /api/tasks/[id]/stream 永远轮到 running →
+// 前端永远"导出中 N%"（dev 默认 recoveryEnabled=true → reapOnStart=false，
+// 正好踩中；2026-06-10 实锤）。单进程形态一律启动即回收 + 周期 stale 兜底；
+// 外部 worker / worker 进程形态跳过，避免误杀其它进程正在跑的导出。
+const exportsReapKey = '__qd_exports_reaped__';
+if (!isNextProductionBuild() && !workerProcess && !externalWorkerExpected && !(globalThis as any)[exportsReapKey]) {
+  (globalThis as any)[exportsReapKey] = true;
+  try { reapOrphanExports(); } catch (e) { console.error('[init] reapOrphanExports:', e); }
+  try { startExportsStaleReaper(); } catch (e) { console.error('[init] startExportsStaleReaper:', e); }
 }
 
 if (!isNextProductionBuild() && recoveryEnabled) {

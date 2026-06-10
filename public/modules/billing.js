@@ -7,9 +7,11 @@ let _ledger = [];
 // 账务流水分页：server 端 offset 分页（后端 /api/billing/ledger 已支持 limit/offset/total）。
 // 每页 10 行；_ledgerPage 从 0 起；翻页只重渲流水区块，不整页重渲（避免顶部卡片闪烁）。
 const LEDGER_PAGE_SIZE = 10;
+const LEDGER_EXPORT_PAGE_SIZE = 200;
 let _ledgerTotal = 0;
 let _ledgerPage = 0;
 let _ledgerBusy = false;
+let _ledgerExportBusy = false;
 let _pendingOrderNo = '';
 let _paymentMethod = 'wxpay';
 // 防重复提交开关：发起支付 / 兑换 / 取消恢复时置位，避免连点触发多次请求或状态卡死。
@@ -94,7 +96,7 @@ function _ledgerAccountParts() {
   var user = (_summary && _summary.user) || {};
   var accountName = String(user.displayName || user.display_name || user.username || '').trim() || '未命名账号';
   var phone = String(user.phone || '').trim() || '未绑定';
-  return ['账号名称 ' + accountName, '注册手机号 ' + phone];
+  return [accountName, phone];
 }
 
 function _billingAccountName() {
@@ -123,6 +125,69 @@ function _ledgerRowsHtml() {
   }).join('') || '<p class="text-sm text-on-surface-variant/50">暂无账务流水。</p>';
 }
 
+function _csvCell(value) {
+  var s = String(value == null ? '' : value);
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function _ledgerExportFilename() {
+  var d = new Date();
+  var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  return 'origin-billing-ledger-' +
+    d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' +
+    pad(d.getHours()) + pad(d.getMinutes()) + '.csv';
+}
+
+function _ledgerExportCsv(items) {
+  var accountParts = _ledgerAccountParts();
+  var rows = [[
+    '时间', '明细', '金额', '余额', '账号名称', '注册手机号', '类型', '原因', '引用ID', '流水ID',
+  ]];
+  (items || []).forEach(function (item) {
+    rows.push([
+      _fmtWhen(item.createdAt || item.created_at || ''),
+      _ledgerLabel(item),
+      Number(item.amount || 0),
+      Number(item.balanceAfter || item.balance_after || 0),
+      accountParts[0] || '',
+      accountParts[1] || '',
+      item.kind || item.entry_type || '',
+      item.reason || '',
+      item.refId || item.ref_id || '',
+      item.id || '',
+    ]);
+  });
+  return '\ufeff' + rows.map(function (row) {
+    return row.map(_csvCell).join(',');
+  }).join('\r\n');
+}
+
+function _downloadTextFile(filename, content, mimeType) {
+  var blob = new Blob([content], { type: mimeType || 'text/plain;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () {
+    try { document.body.removeChild(a); } catch (_e) {}
+    try { URL.revokeObjectURL(url); } catch (_e) {}
+  }, 0);
+}
+
+function _ledgerExportButtonHtml() {
+  var disabled = _ledgerExportBusy || Number(_ledgerTotal || 0) <= 0;
+  return '<button type="button" data-ledger-export="1" title="下载全部明细" aria-label="下载全部明细"' +
+    (disabled ? ' disabled' : '') +
+    ' style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:9999px;border:1px solid rgba(15,23,42,0.12);background:#fff;color:#0f172a;box-shadow:0 1px 4px rgba(15,23,42,0.06);' +
+    (disabled ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;') + '">' +
+      '<span class="material-symbols-outlined" style="font-size:16px;line-height:1">' + (_ledgerExportBusy ? 'sync' : 'download') + '</span>' +
+    '</button>';
+}
+
 // 翻页控件：放"最近账务流水"标题右侧（标题行 flex justify-between）。仅 1 页时隐藏。
 // 用内联样式避免依赖未预编译的 Tailwind 工具类（本仓 workspace-tailwind 为静态编译）。
 function _ledgerPagerHtml() {
@@ -146,16 +211,50 @@ function _ledgerPagerHtml() {
 
 function _ledgerInnerHtml() {
   return '<div class="flex items-center justify-between gap-3 mb-4">' +
-      '<div class="text-sm font-bold">最近账务流水</div>' +
+      '<div class="flex items-center gap-2">' +
+        '<div class="text-sm font-bold">最近账务流水</div>' +
+        _ledgerExportButtonHtml() +
+      '</div>' +
       _ledgerPagerHtml() +
     '</div>' +
     '<div>' + _ledgerRowsHtml() + '</div>';
 }
 
-function _bindLedgerPager(scope) {
+async function downloadAllLedger() {
+  if (_ledgerExportBusy) return;
+  _ledgerExportBusy = true;
+  _renderLedgerSection();
+  try {
+    var all = [];
+    var total = Number(_ledgerTotal || 0);
+    var offset = 0;
+    while (true) {
+      var resp = await apiGet('/api/billing/ledger?limit=' + LEDGER_EXPORT_PAGE_SIZE + '&offset=' + offset);
+      var items = (resp && resp.items) || [];
+      total = Number((resp && resp.total) || total || 0);
+      if (items.length) all = all.concat(items);
+      offset += items.length;
+      if (!items.length || offset >= total) break;
+    }
+    if (!all.length) {
+      showToast('暂无账务流水可下载', 'info');
+      return;
+    }
+    _downloadTextFile(_ledgerExportFilename(), _ledgerExportCsv(all), 'text/csv;charset=utf-8');
+    showToast('已下载 ' + all.length + ' 条账务流水', 'ok');
+  } catch (e) {
+    showToast(e && e.message ? e.message : '下载账务流水失败', 'error');
+  } finally {
+    _ledgerExportBusy = false;
+    _renderLedgerSection();
+  }
+}
+
+function _bindLedgerControls(scope) {
   if (!scope) return;
   var prev = scope.querySelector('[data-ledger-nav="prev"]');
   var next = scope.querySelector('[data-ledger-nav="next"]');
+  var exportBtn = scope.querySelector('[data-ledger-export="1"]');
   if (prev) prev.addEventListener('click', function () {
     if ((_ledgerPage || 0) > 0) loadLedgerPage((_ledgerPage || 0) - 1);
   });
@@ -163,6 +262,7 @@ function _bindLedgerPager(scope) {
     var totalPages = Math.max(1, Math.ceil(Number(_ledgerTotal || 0) / LEDGER_PAGE_SIZE));
     if ((_ledgerPage || 0) < totalPages - 1) loadLedgerPage((_ledgerPage || 0) + 1);
   });
+  if (exportBtn) exportBtn.addEventListener('click', downloadAllLedger);
 }
 
 // 只重渲流水区块（不动顶部卡片/套餐网格），避免翻页时整页闪烁。
@@ -170,7 +270,7 @@ function _renderLedgerSection() {
   var el = document.getElementById('billingLedgerSection');
   if (!el) return;
   el.innerHTML = _ledgerInnerHtml();
-  _bindLedgerPager(el);
+  _bindLedgerControls(el);
 }
 
 async function loadLedgerPage(page) {
@@ -430,7 +530,7 @@ export function renderBillingPage() {
   var subscription = _summary.subscription || {};
   var plan = (_summary.currentPlan && _summary.currentPlan.title) || 'Free';
   var accountName = _billingAccountName();
-  var currentPlanLabel = (accountName ? accountName + ' · ' : '') + plan;
+  var currentPlanLabelHtml = (accountName ? '<span style="text-transform:none;">' + escapeHtml(accountName) + '</span> · ' : '') + escapeHtml(plan);
   var balances = _summary.balances || {};
   var plans = _summary.plans || [];
   var topups = _summary.topupPacks || [];
@@ -684,7 +784,7 @@ export function renderBillingPage() {
           '<div class="min-w-0 flex-1">' +
             '<div class="text-[9px] font-bold tracking-[0.3em] text-[#ECEFF1]/50 uppercase">当前套餐 / Current Plan</div>' +
             '<div class="flex items-baseline gap-3 flex-wrap mt-1">' +
-              '<span class="text-3xl font-bold plan-price-glow tracking-tighter font-headline uppercase">' + escapeHtml(currentPlanLabel) + '</span>' +
+              '<span class="text-3xl font-bold plan-price-glow tracking-tighter font-headline uppercase">' + currentPlanLabelHtml + '</span>' +
               '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-widest">' + escapeHtml(statusText) + (periodEnd ? ' · 到期 ' + escapeHtml(_fmtDate(periodEnd)) : '') + '</span>' +
             '</div>' +
             featureHtml +
@@ -755,7 +855,7 @@ export function renderBillingPage() {
   }
   _bindSubAction(host.querySelector('[data-sub-action="resume"]'), resumeSubscription, '恢复失败');
   _bindSubAction(host.querySelector('[data-sub-action="cancel"]'), cancelSubscription, '取消失败');
-  _bindLedgerPager(host.querySelector('#billingLedgerSection'));
+  _bindLedgerControls(host.querySelector('#billingLedgerSection'));
 
   // 发起支付：全局 _checkoutBusy 守卫，避免同时点多个套餐/积分包重复下单；
   // 点击后按钮禁用 + "处理中…"，startCheckout 内部成功/占位/错误都会重渲。

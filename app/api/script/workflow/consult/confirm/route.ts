@@ -11,6 +11,7 @@ import { getJson } from '@/lib/kv-db';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { looksLikeFiveActScript } from '@/lib/script-output-guard';
 import { appendScriptTimeline, buildDraftEvent, nextScriptTimelineVersion } from '@/lib/script-timeline';
+import { beginStageRun, progressStageRun, endStageRun, SCRIPT_GENERATE_STAGE } from '@/lib/stage-inflight';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -48,6 +49,31 @@ export async function POST(req: NextRequest) {
       return;
     }
 
+    // 刷新续接 + 防重：与 full-create / expand 共用 script_generate stage
+    //（同项目同时只允许一路剧本生成，防双扣积分；详见 lib/stage-inflight.ts）
+    const trackInflight = !!(projectId && proj);
+    if (trackInflight) {
+      const begin = beginStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, {
+        step: '正在生成剧本…',
+        pct: 15,
+        meta: { mode: 'consult_confirm' },
+      });
+      if (!begin.ok) {
+        writer.error('该项目的剧本生成已在后台进行中，请稍候，完成后会自动写入项目');
+        return;
+      }
+    }
+    let inflightEnded = false;
+    const endInflight = (outcome: 'done' | 'error', errMsg?: string) => {
+      if (!trackInflight || inflightEnded) return;
+      inflightEnded = true;
+      endStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, outcome, errMsg);
+    };
+    const stepInflight = (label: string, pct: number) => {
+      if (!trackInflight || inflightEnded) return;
+      progressStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, label, pct);
+    };
+
 	    let scriptText = '';
     const worldContext = proj
       ? projectWorldContextForStage('script_create', (proj as any).worldTemplateSnapshot, {
@@ -63,10 +89,17 @@ export async function POST(req: NextRequest) {
       creatorPersona: persona,
       worldContext,
     });
-    await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
-      scriptText += delta;
-      writer.scriptChunk(delta);
-    });
+    try {
+      await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
+        scriptText += delta;
+        writer.scriptChunk(delta);
+      });
+    } catch (e: any) {
+      const failMsg = '剧本生成失败：' + (e?.message || String(e));
+      endInflight('error', failMsg);
+      writer.error(failMsg);
+      return;
+    }
 
     // 兜底：如果 LLM 还是输出了 <step> 标签，剥掉
     scriptText = scriptText.replace(/<step>[^<]*<\/step>\s*/gi, '').trim();
@@ -83,13 +116,16 @@ export async function POST(req: NextRequest) {
 
     // 守门：输出不像五段式剧本（模型把指令当聊天回应）→ 不落库不重标
     if (!looksLikeFiveActScript(scriptText)) {
-      writer.error('AI 没有按剧本格式输出，本次结果未保存，请再点一次"确认生成剧本"或补充描述后重试。');
+      const guardMsg = 'AI 没有按剧本格式输出，本次结果未保存，请再点一次"确认生成剧本"或补充描述后重试。';
+      endInflight('error', guardMsg);
+      writer.error(guardMsg);
       return;
     }
 
     // === 2. 情绪标记（非流式 JSON，带 3 次重试）===
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
+    stepInflight('正在打情绪标签…', 80);
     let emotions: any[] = [];
     try {
       const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
@@ -117,19 +153,27 @@ export async function POST(req: NextRequest) {
           emotionSegments: emotions.length ? emotions : undefined,
         }),
       ]);
-      const updated = updateProjectForUser(projectId, user.id, {
-        scriptDraft: scriptText,
-        script: scriptText,
-        emotions,
-        scriptApproved: false,
-        scriptReviewState: 'draft',
-        scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
-        currentStep: 1,
-        scriptTimeline: savedTimeline,
-      });
-      savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
+      try {
+        const updated = updateProjectForUser(projectId, user.id, {
+          scriptDraft: scriptText,
+          script: scriptText,
+          emotions,
+          scriptApproved: false,
+          scriptReviewState: 'draft',
+          scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
+          currentStep: 1,
+          scriptTimeline: savedTimeline,
+        });
+        savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
+      } catch (e: any) {
+        const saveMsg = '保存失败：' + (e?.message || String(e));
+        endInflight('error', saveMsg);
+        writer.error(saveMsg);
+        return;
+      }
     }
 
+    endInflight('done');
     writer.done({
       script: scriptText,
       // 前端 script.js 读 emotionSegments；同时保留 emotions 便于其它老调用方

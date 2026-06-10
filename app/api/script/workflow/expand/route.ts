@@ -10,6 +10,7 @@ import {
   buildInstructionEvent,
   nextScriptTimelineVersion,
 } from '@/lib/script-timeline';
+import { beginStageRun, endStageRun, SCRIPT_GENERATE_STAGE } from '@/lib/stage-inflight';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -35,19 +36,46 @@ export async function POST(req: NextRequest) {
 
   return sseResponse(async (writer) => {
     writer.step('正在扩充剧本…');
+    // 刷新续接 + 防重：与 full-create / consult/confirm 共用 script_generate stage
+    //（同项目同时只允许一路剧本生成，防双扣积分；详见 lib/stage-inflight.ts）
+    const trackInflight = !!(projectId && proj);
+    if (trackInflight) {
+      const begin = beginStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, {
+        step: '正在扩充剧本…',
+        pct: 20,
+        meta: { mode: 'expand' },
+      });
+      if (!begin.ok) {
+        writer.error('该项目的剧本生成已在后台进行中，请稍候，完成后会自动写入项目');
+        return;
+      }
+    }
+    let inflightEnded = false;
+    const endInflight = (outcome: 'done' | 'error', errMsg?: string) => {
+      if (!trackInflight || inflightEnded) return;
+      inflightEnded = true;
+      endStageRun(user.id, projectId!, SCRIPT_GENERATE_STAGE, outcome, errMsg);
+    };
     let buf = '';
-    await chatStream(
-      user,
-      [
-        { role: 'system', content: SP_EXPAND },
-        { role: 'user', content: `当前剧本：\n${baseScript}` },
-      ],
-      { temperature: 0.7, maxTokens: 3500, modelRole: 'brain' },
-      (delta) => {
-        buf += delta;
-        writer.scriptChunk(delta);
-      },
-    );
+    try {
+      await chatStream(
+        user,
+        [
+          { role: 'system', content: SP_EXPAND },
+          { role: 'user', content: `当前剧本：\n${baseScript}` },
+        ],
+        { temperature: 0.7, maxTokens: 3500, modelRole: 'brain' },
+        (delta) => {
+          buf += delta;
+          writer.scriptChunk(delta);
+        },
+      );
+    } catch (e: any) {
+      const failMsg = '剧本扩充失败：' + (e?.message || String(e));
+      endInflight('error', failMsg);
+      writer.error(failMsg);
+      return;
+    }
 
     // 兜底：剥 LLM 可能残留的 <step> / <phase> 标签，再把字面量 "\n" 还原为真换行
     const cleanScript = buf
@@ -59,7 +87,9 @@ export async function POST(req: NextRequest) {
 
     // 守门：输出不像五段式剧本（模型把指令当聊天回应）→ 不落库，原剧本不动
     if (!looksLikeFiveActScript(cleanScript)) {
-      writer.error('AI 没有按剧本格式输出，本次扩充未生效，当前剧本保持不变，请重试。');
+      const guardMsg = 'AI 没有按剧本格式输出，本次扩充未生效，当前剧本保持不变，请重试。';
+      endInflight('error', guardMsg);
+      writer.error(guardMsg);
       return;
     }
 
@@ -77,18 +107,26 @@ export async function POST(req: NextRequest) {
           instructionId: instrEvt.id,
         }),
       ]);
-      const updated = updateProjectForUser(projectId, user.id, {
-        scriptDraft: cleanScript,
-        script: cleanScript,
-        scriptApproved: false,
-        scriptReviewState: 'draft',
-        scriptTimeline: savedTimeline,
-      });
-      savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
+      try {
+        const updated = updateProjectForUser(projectId, user.id, {
+          scriptDraft: cleanScript,
+          script: cleanScript,
+          scriptApproved: false,
+          scriptReviewState: 'draft',
+          scriptTimeline: savedTimeline,
+        });
+        savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
+      } catch (e: any) {
+        const saveMsg = '保存失败：' + (e?.message || String(e));
+        endInflight('error', saveMsg);
+        writer.error(saveMsg);
+        return;
+      }
     }
 
     // serverVersion：服务端已 version+1，带回前端对齐 If-Match，避免后续 PUT 必撞 409
     // scriptTimeline：前端必须写回内存，否则随后的整项目 PUT 会用旧数组盖掉这次 append
+    endInflight('done');
     writer.done({
       script: cleanScript,
       deltaTokens: Math.ceil(cleanScript.length / 2),

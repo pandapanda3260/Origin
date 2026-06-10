@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { ActiveVideoBatchConflictError, createBatch } from '@/lib/batches';
+import { ActiveVideoBatchConflictError, createBatch, findActiveBatchForType } from '@/lib/batches';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { assertVideoPromptReadyForGroups, markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { resolveLLMConfig } from '@/lib/llm';
@@ -365,6 +365,19 @@ export async function POST(req: NextRequest) {
   if (batchType === 'shots') {
     const proj = getProjectByIdForUser(projectId, user.id);
     if (!proj) return jsonError('项目不存在', 404);
+    // 防重：同项目已有镜头计划批次在跑 → 直接复用，前端订阅同一批次续显进度，
+    // 不再起第二路（双扣积分 + 双写 project.shots）。典型触发场景：镜头表
+    // 生成中用户回资产页再点"确认资产，进入下一步"，自动 generateShots 重入。
+    const activeShots = findActiveBatchForType({ ownerId: user.id, projectId, batchType: 'shots' });
+    if (activeShots) {
+      return jsonOk({
+        batchId: activeShots.batchId,
+        total: activeShots.total,
+        status: 'running',
+        reused: true,
+        duplicateGroupIdxs: [],
+      });
+    }
     const sourceSnapshot = computeShotPlanSourceSnapshot(proj as any);
     const sourceHash = computeShotPlanSourceHash(proj as any);
     shotPlanStartContext = { sourceHash, sourceSnapshot };
