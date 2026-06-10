@@ -93,7 +93,7 @@ function _formatKeyframeProgress(done, total, fail, startTs) {
   done = Math.max(0, Number(done) || 0);
   fail = Math.max(0, Number(fail) || 0);
   var visibleDone = Math.min(total || done + fail, done + fail);
-  var lines = ["生成中…… " + visibleDone + "/" + (total || "?")];
+  var lines = ["生成中… " + visibleDone + "/" + (total || "?")];
   if (fail > 0) lines.push(fail + " 张失败");
   var remain = _keyframeRemainingSeconds(done, fail, total, startTs);
   if (remain > 0) lines.push("约剩 " + remain + " 秒");
@@ -105,7 +105,6 @@ function _showKeyframeHeaderProgress(done, total, fail, startTs) {
   if (!el) return;
   el.hidden = false;
   el.textContent = _formatKeyframeProgress(done, total, fail, startTs);
-  el.classList.toggle("is-warning", Number(fail) > 0);
 }
 
 function _hideKeyframeHeaderProgress() {
@@ -113,7 +112,39 @@ function _hideKeyframeHeaderProgress() {
   if (!el) return;
   el.hidden = true;
   el.textContent = "";
-  el.classList.remove("is-warning");
+}
+
+/**
+ * 镜头页标题静态三态摘要（首帧口径）：
+ *   生成完成 N/N > 部分缺失 "x/N 张已生成，缺少镜头 …" > 待生成… 0/N。
+ * 批次活跃时（含 reattach）进度文案归批流程管，这里不抢占。
+ * 挂在 checkImagesConfirm 末尾：页面渲染与各批次终态都会经过它。
+ */
+function _syncShotsKeyframeHeaderHint() {
+  var el = $("shotsKeyframeProgress");
+  if (!el) return;
+  if (_imagesGenerating || _imagesStarting || _tailFramesGenerating) return;
+  var groups = (project && project.shots && project.shots.length) ? getStoryboardGroups() : [];
+  if (!groups.length) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  var done = 0;
+  var missing = [];
+  for (var i = 0; i < groups.length; i++) {
+    var sb = project.storyboards && project.storyboards[i];
+    if (_firstFrameUrl(sb)) done++;
+    else missing.push(String(i + 1));
+  }
+  el.hidden = false;
+  if (!missing.length) {
+    el.textContent = "生成完成 " + done + "/" + groups.length;
+  } else if (done === 0) {
+    el.textContent = "待生成… 0/" + groups.length;
+  } else {
+    el.textContent = done + "/" + groups.length + " 张已生成，缺少镜头 " + missing.join("、");
+  }
 }
 
 function _ffeInitialAutoSaveState() {
@@ -436,7 +467,27 @@ function _reattachImagesBatch(b) {
 
   if (!project.storyboards) project.storyboards = [];
 
-  tasks.forEach(function (t) {
+  var rSeenDone = Object.create(null);
+  var rSeenFailed = Object.create(null);
+  function _markRDone(groupIdx) {
+    if (typeof groupIdx !== 'number') return false;
+    if (rSeenDone[groupIdx] || rSeenFailed[groupIdx]) return false;
+    rSeenDone[groupIdx] = true;
+    return true;
+  }
+  function _markRFailed(groupIdx) {
+    if (typeof groupIdx !== 'number') return false;
+    if (rSeenFailed[groupIdx] || rSeenDone[groupIdx]) return false;
+    rSeenFailed[groupIdx] = true;
+    return true;
+  }
+  function _bumpRDone() {
+    if (!rTotal || rDoneCount + rFailCount < rTotal) rDoneCount++;
+  }
+  function _bumpRFailed() {
+    if (!rTotal || rDoneCount + rFailCount < rTotal) rFailCount++;
+  }
+  function _applyReattachedImageTask(t) {
     var extra = _snapshotTaskExtra(t);
     var target = _snapshotTaskTarget(t);
     var gIdx = _firstTaskNumber([target.groupIdx, extra.groupIdx, t.target_idx, t.seq]);
@@ -446,6 +497,7 @@ function _reattachImagesBatch(b) {
     var url = _snapshotTaskImageUrl(t);
 
     if (isDone && url) {
+      if (!_markRDone(gIdx)) return;
       if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
       if (_isTailPatchExtra(extra)) {
         // 尾帧任务: 独立 apply, 只更新尾帧图位, 不触碰卡片主分镜/首帧 img。
@@ -461,11 +513,13 @@ function _reattachImagesBatch(b) {
         updateStoryboardCard(gIdx, "done", displayUrl);
       }
     } else if (isFailed) {
+      if (!_markRFailed(gIdx)) return;
       updateStoryboardCard(gIdx, "error", null, _snapshotTaskError(t, 120));
     } else {
       updateStoryboardCard(gIdx, "loading", null, "生成中…");
     }
-  });
+  }
+  tasks.forEach(_applyReattachedImageTask);
 
   var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
   if (isComplete) {
@@ -514,6 +568,7 @@ function _reattachImagesBatch(b) {
   subscribeBatch(batchId, {
     onSnapshot: function (s) {
       if (s && typeof s.total === 'number') {
+        if (Array.isArray(s.tasks)) s.tasks.forEach(_applyReattachedImageTask);
         rTotal = s.total;
         if (typeof s.succeeded === 'number') rDoneCount = s.succeeded;
         if (typeof s.failed === 'number') rFailCount = s.failed;
@@ -532,6 +587,7 @@ function _reattachImagesBatch(b) {
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
       var rawUrl = extra.rawUrl || patch.value || data.resultUrl || '';
       if (typeof groupIdx !== 'number' || !rawUrl) return;
+      if (!_markRDone(groupIdx)) return;
 
       _safeWriteBack(originId, function (proj) {
         if (!proj.storyboards) proj.storyboards = [];
@@ -546,15 +602,16 @@ function _reattachImagesBatch(b) {
       } else {
         renderStoryboardFrameCard(groupIdx, 'tail', 'done', { imgUrl: rawUrl });
       }
-      rDoneCount++;
+      _bumpRDone();
       _renderEtaR();
     },
     onTaskFailed: function (data) {
       var extra = data.extra || {};
       var groupIdx = (typeof extra.groupIdx === 'number') ? extra.groupIdx : null;
       var errMsg = (data.errorMsg || '生成失败').toString().slice(0, 120);
+      if (!_markRFailed(groupIdx)) return;
       if (typeof groupIdx === 'number') updateStoryboardCard(groupIdx, "error", null, errMsg);
-      rFailCount++;
+      _bumpRFailed();
       _renderEtaR();
     },
     onBatchCompleted: function () {
@@ -602,7 +659,27 @@ function _reattachTailFrameBatch(b) {
 
   if (!project.storyboards) project.storyboards = [];
 
-  tasks.forEach(function (t) {
+  var tailSeenDone = Object.create(null);
+  var tailSeenFailed = Object.create(null);
+  function _markTailRDone(groupIdx) {
+    if (typeof groupIdx !== 'number') return false;
+    if (tailSeenDone[groupIdx] || tailSeenFailed[groupIdx]) return false;
+    tailSeenDone[groupIdx] = true;
+    return true;
+  }
+  function _markTailRFailed(groupIdx) {
+    if (typeof groupIdx !== 'number') return false;
+    if (tailSeenFailed[groupIdx] || tailSeenDone[groupIdx]) return false;
+    tailSeenFailed[groupIdx] = true;
+    return true;
+  }
+  function _bumpTailRDone() {
+    if (!tailTotal || tailDoneCount + tailFailCount < tailTotal) tailDoneCount++;
+  }
+  function _bumpTailRFailed() {
+    if (!tailTotal || tailDoneCount + tailFailCount < tailTotal) tailFailCount++;
+  }
+  function _applyReattachedTailTask(t) {
     var extra = _snapshotTaskExtra(t);
     var target = _snapshotTaskTarget(t);
     var gIdx = _firstTaskNumber([target.groupIdx, extra.groupIdx, t.target_idx, t.seq]);
@@ -612,10 +689,12 @@ function _reattachTailFrameBatch(b) {
     var url = _snapshotTaskImageUrl(t);
 
     if (isDone && url) {
+      if (!_markTailRDone(gIdx)) return;
       if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
       _applyTailFrameFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
       renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: url });
     } else if (isFailed) {
+      if (!_markTailRFailed(gIdx)) return;
       var errMsg = _snapshotTaskError(t, 120);
       var extraRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
       _clearFailedTailFrameLocally(gIdx, errMsg, extra, originId);
@@ -625,7 +704,8 @@ function _reattachTailFrameBatch(b) {
     } else {
       renderStoryboardFrameCard(gIdx, 'tail', 'loading', { loadingText: "生成尾帧中…" });
     }
-  });
+  }
+  tasks.forEach(_applyReattachedTailTask);
 
   var isComplete = _isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b));
   if (isComplete) {
@@ -659,6 +739,7 @@ function _reattachTailFrameBatch(b) {
   subscribeBatch(batchId, {
     onSnapshot: function (s) {
       if (!s || typeof s.total !== 'number') return;
+      if (Array.isArray(s.tasks)) s.tasks.forEach(_applyReattachedTailTask);
       tailTotal = s.total;
       if (typeof s.succeeded === 'number') tailDoneCount = s.succeeded;
       if (typeof s.failed === 'number') tailFailCount = s.failed;
@@ -671,6 +752,7 @@ function _reattachTailFrameBatch(b) {
       var patch = (data && data.patch) || {};
       var rawUrl = extra.rawUrl || extra.url || patch.url || patch.rawUrl || (data && data.resultUrl) || '';
       if (typeof gIdx2 !== 'number' || !rawUrl) return;
+      if (!_markTailRDone(gIdx2)) return;
       _safeWriteBack(originId, function (proj) {
         if (!proj.storyboards) proj.storyboards = [];
         var existing = proj.storyboards[gIdx2] || {};
@@ -678,7 +760,7 @@ function _reattachTailFrameBatch(b) {
         proj.storyboards[gIdx2] = existing;
       });
       renderStoryboardFrameCard(gIdx2, 'tail', 'done', { imgUrl: rawUrl });
-      tailDoneCount++;
+      _bumpTailRDone();
       _renderTailEtaR();
     },
     onTaskFailed: function (data) {
@@ -687,12 +769,13 @@ function _reattachTailFrameBatch(b) {
       var gIdx2 = _firstTaskNumber([target.groupIdx, extra.groupIdx, data.targetSeq]);
       var errMsg2 = ((data && data.errorMsg) || '生成失败').toString().slice(0, 120);
       if (typeof gIdx2 !== 'number') return;
+      if (!_markTailRFailed(gIdx2)) return;
       var errRecord2 = _tailFrameErrorRecordFromExtra(extra, errMsg2);
       var displayMsg2 = _tailFrameErrorDisplay(errRecord2, errMsg2);
       _clearFailedTailFrameLocally(gIdx2, errMsg2, extra, originId);
       if (_isImageSafetyBlocked(errRecord2.imageSafetyAudit, errRecord2.message || displayMsg2)) renderImageGrid();
       else renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
-      tailFailCount++;
+      _bumpTailRFailed();
       _renderTailEtaR();
     },
     onBatchCompleted: function () {
@@ -861,6 +944,7 @@ function switchPage(p) { if (_ctx.switchPage) _ctx.switchPage(p); }
 function formatCreatorProfileForApi() { return _ctx.formatCreatorProfileForApi ? _ctx.formatCreatorProfileForApi() : null; }
 function _diagnoseApiError(msg) { return _ctx.diagnoseApiError ? _ctx.diagnoseApiError(msg) : msg; }
 function _isStale(key) { return _ctx.isStale ? _ctx.isStale(key) : false; }
+function _applyServerStaleFlags(prefixes, serverFlags) { return _ctx.applyServerStaleFlags ? _ctx.applyServerStaleFlags(prefixes, serverFlags) : false; }
 function _markDownstreamStale(scope, detail) { if (_ctx.markDownstreamStale) _ctx.markDownstreamStale(scope, detail); }
 function _checkAndSuggest(stage) { if (_ctx.checkAndSuggest) _ctx.checkAndSuggest(stage); }
 function _archiveOldImage(item, source) { if (_ctx.archiveOldImage) _ctx.archiveOldImage(item, source); }
@@ -3131,7 +3215,7 @@ function _storyboardFramePanelHtml(kind, sb, gIdx, group, opts) {
              '</div>' +
              '<div class="sb-frame-preview-col">' +
                '<div class="sb-frame-field-label">图片展示</div>' +
-               '<div class="sb-frame-preview-stage">' +
+               '<div class="sb-frame-preview-stage" style="--sb-stage-ar: ' + _sbStageAspectCss(sb) + '">' +
                  imgHtml +
                  '<div class="sb-frame-loading" hidden>' +
                    '<div class="sb-frame-loading-card">' +
@@ -3348,6 +3432,21 @@ function _ffeFormatDateTime(value) {
   } catch (_) {
     return raw;
   }
+}
+
+// 图片展示 stage 的画幅 → CSS aspect-ratio 值 (styles.css 的 --sb-stage-ar)。
+// 取值链对齐生成侧: plan.aspectRatio → planSummary.aspectRatio →
+// project.styleOptions.aspectRatio, 缺省 9:16 (对齐 main.js 项目默认)。
+// 白名单映射, 不直接拼接外部字符串进 style。
+function _sbStageAspectCss(sb) {
+  sb = sb || {};
+  var plan = sb.plan || {};
+  var summary = plan.planSummary || {};
+  var styleOpts = (typeof project !== 'undefined' && project && project.styleOptions) || {};
+  var ratio = String(plan.aspectRatio || summary.aspectRatio || styleOpts.aspectRatio || '').trim();
+  if (ratio === '1:1') return '1 / 1';
+  if (ratio === '16:9') return '16 / 9';
+  return '9 / 16';
 }
 
 function _ffeImageSizeForRatio(ratio) {
@@ -7227,6 +7326,7 @@ export function checkImagesConfirm() {
   _syncMergedStoryboardConfirmState(groups);
   _updateImagesActionButton(groups);
   _syncFirstFramePrimaryButtons(groups);
+  _syncShotsKeyframeHeaderHint();
 }
 
 /**
@@ -8005,6 +8105,22 @@ export async function generateAllTailFrames(opts) {
       tailProgress.fail = Number(tailProgress.fail || 0) + 1;
       _renderTailEta();
     }
+    function _applyTailBatchSnapshotTask(t) {
+      var status = String((t && t.status) || '').toLowerCase();
+      if (status === 'completed' || status === 'succeeded' || status === 'done') {
+        var result = t.result || {};
+        var extra = result.extra || {};
+        var patch = result.patch || {};
+        var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+        if (url) _applyOne(extra, url);
+      } else if (status === 'failed' || status === 'timeout') {
+        var target = t.target || {};
+        var extraF = _snapshotTaskExtra(t);
+        if (typeof extraF.groupIdx !== 'number') extraF.groupIdx = target.groupIdx;
+        var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
+        _failOne(extraF, errMsgPoll);
+      }
+    }
 
     async function _pollOnce() {
       if (settled) return;
@@ -8012,21 +8128,7 @@ export async function generateAllTailFrames(opts) {
         var snap = await apiGet('/api/batch/' + encodeURIComponent(startResp.batchId));
         if (!snap || settled) return;
         var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
-        tasks.forEach(function (t) {
-          if (t.status === 'completed') {
-            var result = t.result || {};
-            var extra = result.extra || {};
-            var patch = result.patch || {};
-            var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
-            if (url) _applyOne(extra, url);
-          } else if (t.status === 'failed') {
-            var target = t.target || {};
-            var extraF = _snapshotTaskExtra(t);
-            if (typeof extraF.groupIdx !== 'number') extraF.groupIdx = target.groupIdx;
-            var errMsgPoll = (t.errorMsg || '生成失败').toString().slice(0, 120);
-            _failOne(extraF, errMsgPoll);
-          }
-        });
+        tasks.forEach(_applyTailBatchSnapshotTask);
         if (snap.status === 'completed' || snap.status === 'failed' ||
             snap.status === 'cancelled' || snap.status === 'partial') {
           await _finishAfterServerSync();
@@ -8041,6 +8143,8 @@ export async function generateAllTailFrames(opts) {
       onSnapshot: function (snap) {
         if (!snap || typeof snap.total !== 'number') return;
         totalCount = snap.total;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        tasks.forEach(_applyTailBatchSnapshotTask);
         _renderTailEta();
       },
       onTaskCompleted: function (data) {
@@ -8373,6 +8477,22 @@ export async function generateAllImages() {
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
     _renderEta();
   }
+  function _applyStoryboardBatchSnapshotTask(t) {
+    var status = String((t && t.status) || '').toLowerCase();
+    if (status === 'completed' || status === 'succeeded' || status === 'done') {
+      var result = t.result || {};
+      var extra = result.extra || {};
+      var patch = result.patch || {};
+      var gIdx = (typeof extra.groupIdx === 'number')
+        ? extra.groupIdx
+        : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
+      var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
+      _applyTaskCompleted(gIdx, url, extra, result.serverVersion);
+    } else if (status === 'failed' || status === 'timeout') {
+      var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
+      _applyTaskFailed(gIdx2, t.errorMsg, _snapshotTaskExtra(t));
+    }
+  }
 
   // ============================================================
   // 兜底轮询：每 5 秒主动 GET /api/batch/<id>，拿后端权威 snapshot。
@@ -8407,21 +8527,7 @@ export async function generateAllImages() {
       var snap = await apiGet("/api/batch/" + encodeURIComponent(startResp.batchId));
       if (!snap || pollSettled) return;
       var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
-      tasks.forEach(function (t) {
-        if (t.status === 'completed') {
-          var result = t.result || {};
-          var extra = result.extra || {};
-          var patch = result.patch || {};
-          var gIdx = (typeof extra.groupIdx === 'number')
-            ? extra.groupIdx
-            : ((t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq]);
-          var url = extra.rawUrl || extra.url || patch.url || patch.rawUrl || result.resultUrl || '';
-          _applyTaskCompleted(gIdx, url, extra, result.serverVersion);
-        } else if (t.status === 'failed') {
-          var gIdx2 = (t.target && typeof t.target.groupIdx === 'number') ? t.target.groupIdx : seqToGroupIdx[t.seq];
-          _applyTaskFailed(gIdx2, t.errorMsg, _snapshotTaskExtra(t));
-        }
-      });
+      tasks.forEach(_applyStoryboardBatchSnapshotTask);
       if (snap.status === 'completed' || snap.status === 'failed' ||
           snap.status === 'cancelled' || snap.status === 'partial') {
         console.log('[StoryboardImg] poll detected batch finished status=' + snap.status);
@@ -8436,7 +8542,9 @@ export async function generateAllImages() {
   subscribeBatch(startResp.batchId, {
     onSnapshot: function (snap) {
       if (hint && snap && typeof snap.total === 'number') {
-        hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
+        var tasks = Array.isArray(snap.tasks) ? snap.tasks : [];
+        tasks.forEach(_applyStoryboardBatchSnapshotTask);
+        hint.textContent = "生成中… " + Math.min(snap.total, doneCount + failCount) + "/" + snap.total;
         _renderEta();
       }
     },
@@ -8484,9 +8592,34 @@ export async function confirmImages() {
     checkImagesConfirm();
     return;
   }
-  var stale = groups.filter(function (_, i) { return _isStale("storyboard_" + i); });
-  if (stale.length) {
-    showToast("还有 " + stale.length + " 张分镜图已过期，请先重新生成", "warn");
+  var staleIdx = [];
+  groups.forEach(function (_, i) { if (_isStale("storyboard_" + i)) staleIdx.push(i); });
+  if (staleIdx.length) {
+    // 本地 stale 标记可能是孤儿残留：历史上标记清除只发生在前端"亲历 task_completed"
+    // 的回调里，页面刷新/重连窗口内完成的重生成清不到标记（图和 sourceHash 其实已是新的）。
+    // 拦截前先调服务端权威重算，按 mirror 语义对齐 storyboard_* 前缀：
+    // 权威认定不 stale 的残留标记被删除并放行；权威仍认定 stale 才拦截。
+    try {
+      var staleResp = await apiPost("/api/orchestration/compute-stale", { projectId: project.id });
+      if (staleResp && staleResp.staleFlags && typeof staleResp.staleFlags === "object") {
+        var flagsChanged = _applyServerStaleFlags(["storyboard_"], staleResp.staleFlags);
+        if (flagsChanged) saveProject();
+        staleIdx = [];
+        groups.forEach(function (_, i) { if (_isStale("storyboard_" + i)) staleIdx.push(i); });
+      }
+    } catch (e) {
+      // 权威重算失败时保守处理：维持原有"按本地标记拦截"的行为。
+      console.warn("[ImagesConfirm] compute-stale 复核失败，按本地标记拦截:", (e && e.message) || e);
+    }
+  }
+  if (staleIdx.length) {
+    var staleLabels = staleIdx.map(function (i) {
+      var g = groups[i] || {};
+      var sis = (Array.isArray(g.shotIndices) && g.shotIndices.length) ? g.shotIndices : [i];
+      return "镜头" + sis.map(function (s) { return s + 1; }).join("-");
+    });
+    var staleLabelText = staleLabels.slice(0, 3).join("、") + (staleLabels.length > 3 ? " 等" : "");
+    showToast("还有 " + staleIdx.length + " 张分镜图已过期（" + staleLabelText + "），请重新生成后再确认", "warn");
     checkImagesConfirm();
     return;
   }

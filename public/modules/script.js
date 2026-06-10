@@ -1,5 +1,10 @@
-import { $, escapeHtml, showToast, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from './utils.js?v=203';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from './utils.js?v=203';
 import { emptyScriptConsultState, isEmptyScriptConsultState } from './script_consult_state.js';
+import {
+  appendScriptTimeline, buildDraftEvent, buildSystemEvent,
+  latestScriptTimelineDraft, nextScriptTimelineVersion, newScriptTimelineId,
+  scriptTimelineSummary, scriptTimelineTimeAgo, SCRIPT_TIMELINE_SOURCE_LABELS,
+} from './script_timeline.js?v=1';
 
 var _ctx = {};
 var project = null;
@@ -207,6 +212,263 @@ function _moveScriptResultToEnd() {
   if (resultCard && wrap && resultCard.parentNode === wrap) wrap.appendChild(resultCard);
 }
 
+// ═══════════ 剧本时间线信息流（方案：剧本工作台-时间线信息流-方案.md）═══════════
+//
+// 渲染策略：
+//   - 冷重建（_renderScriptTimelineHistory）只在"项目切换/首次进入/强制"时跑，
+//     把 scriptTimeline + 只读咨询历史画成流；会话内的新事件靠增量插入
+//     （live 气泡本来就在，叠加被替换版本的折叠卡），避免和 live DOM 重复。
+//   - 历史节点统一挂 .script-history-node，重建时整体清除。
+//   - 最新一版草稿不进流——它就是底部那张工作卡。
+
+var _scriptHistoryEvtMap = {}; // evtId -> draft 事件（含全文），恢复按钮用
+
+function _scriptHistorySourceLabel(src) {
+  return (src && SCRIPT_TIMELINE_SOURCE_LABELS[src]) || "历史版本";
+}
+
+// 把历史节点插到指定节点（默认剧本工作卡）前面
+function _insertHistoryNodeBeforeResult(node, beforeNode) {
+  var box = $("chatMessages");
+  if (!box || !node) return null;
+  var anchor = (beforeNode && beforeNode.parentNode === box) ? beforeNode : $("scriptResultCard");
+  if (anchor && anchor.parentNode === box) box.insertBefore(node, anchor);
+  else box.appendChild(node);
+  return node;
+}
+
+function _historyChatBubbleNode(type, content) {
+  var msg = document.createElement("div");
+  msg.className = "chat-msg chat-msg--" + (type === "user" ? "user" : "ai") + " script-history-node";
+  if (type === "user") {
+    msg.innerHTML = '<div class="chat-bubble chat-bubble--user"></div>';
+  } else {
+    msg.innerHTML = '<div class="chat-avatar w-8 h-8 rounded-full bg-secondary-container/30 flex items-center justify-center shrink-0"><span class="material-symbols-outlined text-primary text-sm" style="font-variation-settings:\'FILL\' 1">auto_awesome</span></div><div class="chat-bubble chat-bubble--ai"></div>';
+  }
+  var bubble = msg.querySelector(".chat-bubble");
+  if (bubble) bubble.textContent = content;
+  return msg;
+}
+
+function _historySystemNode(text) {
+  var msg = document.createElement("div");
+  msg.className = "chat-msg chat-msg--status script-history-node";
+  msg.innerHTML = '<div class="chat-avatar w-8 h-8 rounded-full bg-secondary-container/30 flex items-center justify-center shrink-0"><span class="material-symbols-outlined text-primary text-sm" style="font-variation-settings:\'FILL\' 1">auto_awesome</span></div><div class="chat-bubble chat-bubble--status"></div>';
+  var bubble = msg.querySelector(".chat-bubble--status");
+  if (bubble) bubble.textContent = text;
+  return msg;
+}
+
+// 历史草稿折叠卡。evt 可以是 timeline 里的真实事件，也可以是会话内构造的快照
+function _historyDraftCardNode(evt) {
+  if (!evt || !evt.id) return null;
+  _scriptHistoryEvtMap[evt.id] = evt;
+  var hasFull = typeof evt.script === "string" && evt.script.trim();
+  var verLabel = evt.version ? "v" + evt.version : "历史版本";
+  var srcLabel = evt.source ? _scriptHistorySourceLabel(evt.source) : "";
+  var timeLabel = evt.ts ? scriptTimelineTimeAgo(evt.ts) : "";
+  var node = document.createElement("div");
+  node.className = "chat-msg chat-msg--ai script-history-node";
+  node.innerHTML =
+    '<div class="chat-avatar w-8 h-8 rounded-full bg-secondary-container/30 flex items-center justify-center shrink-0"><span class="material-symbols-outlined text-primary text-sm">history</span></div>' +
+    '<div class="script-history-card" data-evt-id="' + escapeHtml(String(evt.id)) + '">' +
+      '<div class="script-history-head">' +
+        '<span class="script-history-ver">' + escapeHtml(verLabel) + '</span>' +
+        (srcLabel ? '<span class="script-history-src">' + escapeHtml(srcLabel) + '</span>' : '') +
+        (timeLabel ? '<span class="script-history-time">' + escapeHtml(timeLabel) + '</span>' : '') +
+      '</div>' +
+      '<div class="script-history-preview"></div>' +
+      '<pre class="script-history-body" hidden></pre>' +
+      '<div class="script-history-actions">' +
+        (hasFull
+          ? '<button type="button" class="script-mini-btn script-history-toggle">展开全文</button>' +
+            '<button type="button" class="script-mini-btn script-history-restore"><span class="material-symbols-outlined">history</span><span>恢复此版本</span></button>'
+          : '<span class="script-history-gone">全文已超出保留窗口，仅留摘要</span>') +
+      '</div>' +
+    '</div>';
+  var preview = node.querySelector(".script-history-preview");
+  if (preview) preview.textContent = (evt.summary || scriptTimelineSummary(evt.script || "")) + (hasFull ? "…" : "");
+  if (hasFull) {
+    var body = node.querySelector(".script-history-body");
+    if (body) body.textContent = stripStepTags(evt.script);
+  }
+  return node;
+}
+
+// 会话内"当前版本被替换"时插入它的折叠卡：优先用 timeline 里的真实事件
+// （全文匹配才算），否则用快照构造一张本地卡（version 未知 → 显示"历史版本"）
+function _supersededDraftEventFor(prevScript, prevDraftEvt) {
+  var prevTrim = String(prevScript || "").trim();
+  if (!prevTrim) return null;
+  if (prevDraftEvt && String(prevDraftEvt.script || "").trim() === prevTrim) return prevDraftEvt;
+  return {
+    id: newScriptTimelineId(),
+    ts: Date.now(),
+    type: "draft",
+    script: prevScript,
+    summary: scriptTimelineSummary(prevScript),
+  };
+}
+
+export function noteScriptDraftSuperseded(prevScript, beforeNode) {
+  // 调用方（如 expand）可能已把时间线换成含新版本的数组，这里回扫找
+  // "全文与被替换版本一致"的那条 draft 事件，找不到就用快照构造本地卡
+  var prevTrim = String(prevScript || "").trim();
+  if (!prevTrim) return;
+  var matched = null;
+  var tl = (project && Array.isArray(project.scriptTimeline)) ? project.scriptTimeline : [];
+  for (var i = tl.length - 1; i >= 0; i--) {
+    var e = tl[i];
+    if (e && e.type === "draft" && String(e.script || "").trim() === prevTrim) { matched = e; break; }
+  }
+  var evt = matched || _supersededDraftEventFor(prevScript, null);
+  if (evt) _insertHistoryNodeBeforeResult(_historyDraftCardNode(evt), beforeNode || null);
+}
+
+// 手动编辑保存：记 draft(edit) 事件 + 把改前版本沉为折叠卡（main.js 调用）
+export function recordManualScriptEditToTimeline(prevScript, nextScript) {
+  if (!project || !project.id) return;
+  var originId = project.id;
+  var prevDraftEvt = latestScriptTimelineDraft(project.scriptTimeline);
+  _ctx.safeWriteBack(originId, function (proj) {
+    proj.scriptTimeline = appendScriptTimeline(proj.scriptTimeline, [
+      buildDraftEvent({
+        version: nextScriptTimelineVersion(proj.scriptTimeline),
+        script: nextScript,
+        source: "edit",
+      }),
+    ]);
+  });
+  var evt = _supersededDraftEventFor(prevScript, prevDraftEvt);
+  if (evt) _insertHistoryNodeBeforeResult(_historyDraftCardNode(evt));
+  _syncScriptDraftMeta();
+}
+
+async function _restoreScriptVersion(evt) {
+  if (!project || !project.id || !evt) return;
+  if (_scriptGenerating) { showToast("正在生成中，请稍后再操作", "warn"); return; }
+  var text = String(evt.script || "");
+  if (!text.trim()) { showToast("该版本全文已超出保留窗口，无法恢复", "warn"); return; }
+  var verLabel = evt.version ? "v" + evt.version : "该历史版本";
+  var ok = await showConfirm(
+    "恢复" + verLabel,
+    "将把 " + verLabel + " 设为当前剧本，下游内容（资产/镜头/分镜等）会标记为需重新生成。继续？",
+    "恢复", "取消"
+  );
+  if (!ok) return;
+  var originId = project.id;
+  var prevScript = stripStepTags(String(project.script || ""));
+  var prevDraftEvt = latestScriptTimelineDraft(project.scriptTimeline);
+  var hasEmotion = Array.isArray(evt.emotionSegments) && evt.emotionSegments.length > 0;
+  var newVersion = null;
+  var sysText = "";
+  var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+    newVersion = nextScriptTimelineVersion(proj.scriptTimeline);
+    sysText = "已恢复 " + verLabel + " 为当前剧本（v" + newVersion + "）";
+    proj.script = text;
+    proj.scriptDraft = text;
+    proj.scriptApproved = false;
+    proj.scriptReviewState = "draft";
+    proj.emotionSegments = hasEmotion ? evt.emotionSegments : [];
+    proj.scriptTimeline = appendScriptTimeline(proj.scriptTimeline, [
+      buildDraftEvent({
+        version: newVersion,
+        script: text,
+        source: "restore",
+        emotionSegments: hasEmotion ? evt.emotionSegments : undefined,
+      }),
+      buildSystemEvent(sysText),
+    ]);
+  });
+  if (!isCurrent) return;
+  _ctx.markDownstreamStale && _ctx.markDownstreamStale("script", {});
+  _ctx.saveProject && _ctx.saveProject();
+  // 被替换的版本沉为折叠卡 + 系统行
+  if (prevScript.trim() && prevScript.trim() !== text.trim()) {
+    var supEvt = _supersededDraftEventFor(prevScript, prevDraftEvt);
+    if (supEvt) _insertHistoryNodeBeforeResult(_historyDraftCardNode(supEvt));
+  }
+  _insertHistoryNodeBeforeResult(_historySystemNode(sysText));
+  refreshScriptPage();
+  if (hasEmotion) showToast("已恢复 " + verLabel, "success");
+  else showToast("已恢复 " + verLabel + "。该版本没有情绪段快照，请重新分析情绪", "info");
+  _scrollChatToBottom();
+}
+
+var _scriptHistoryDelegated = false;
+function _ensureScriptHistoryDelegation() {
+  if (_scriptHistoryDelegated) return;
+  var box = $("chatMessages");
+  if (!box) return;
+  box.addEventListener("click", function (e) {
+    var toggle = e.target.closest && e.target.closest(".script-history-toggle");
+    if (toggle) {
+      var card = toggle.closest(".script-history-card");
+      var body = card && card.querySelector(".script-history-body");
+      if (body) {
+        body.hidden = !body.hidden;
+        toggle.textContent = body.hidden ? "展开全文" : "收起全文";
+      }
+      return;
+    }
+    var restoreBtn = e.target.closest && e.target.closest(".script-history-restore");
+    if (restoreBtn) {
+      var card2 = restoreBtn.closest(".script-history-card");
+      var id = card2 && card2.getAttribute("data-evt-id");
+      var evt = id ? _scriptHistoryEvtMap[id] : null;
+      if (evt) _restoreScriptVersion(evt);
+    }
+  });
+  _scriptHistoryDelegated = true;
+}
+
+// 冷重建：项目切换/首次进入/强制时，把咨询历史(只读) + scriptTimeline 画成流
+function _renderScriptTimelineHistory(force) {
+  if (!project) return;
+  var box = $("chatMessages");
+  if (!box) return;
+  var tag = String(project.id || "");
+  if (!force && box.dataset.timelineProject === tag) return;
+  box.querySelectorAll(".script-history-node").forEach(function (n) {
+    if (n.parentNode) n.parentNode.removeChild(n);
+  });
+  var timeline = (project && Array.isArray(project.scriptTimeline)) ? project.scriptTimeline : [];
+  var hasScript = !!String(project.script || "").trim();
+  // 有剧本时 _replayScriptConsultHistory 不会跑，由这里补只读咨询气泡；
+  // consultVersion 已存在说明会话内咨询 DOM 还在，跳过避免重复
+  if (hasScript && !box.dataset.consultVersion) {
+    var sc = project.scriptConsult || {};
+    var msgs = Array.isArray(sc.messages) ? sc.messages : [];
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i] || {};
+      var content = typeof m.content === "string" ? m.content : "";
+      if (!content) continue;
+      _insertHistoryNodeBeforeResult(_historyChatBubbleNode(m.role === "user" ? "user" : "ai", content));
+    }
+  }
+  var lastDraftIdx = -1;
+  for (var j = timeline.length - 1; j >= 0; j--) {
+    if (timeline[j] && timeline[j].type === "draft") { lastDraftIdx = j; break; }
+  }
+  for (var k = 0; k < timeline.length; k++) {
+    var evt = timeline[k];
+    if (!evt || typeof evt !== "object") continue;
+    if (evt.type === "instruction") {
+      if (evt.text) _insertHistoryNodeBeforeResult(_historyChatBubbleNode("user", String(evt.text)));
+    } else if (evt.type === "system") {
+      if (evt.text) _insertHistoryNodeBeforeResult(_historySystemNode(String(evt.text)));
+    } else if (evt.type === "draft") {
+      // 最新一版且与当前剧本一致 → 它就是底部工作卡，不重复渲染
+      if (k === lastDraftIdx && hasScript &&
+          String(evt.script || "").trim() === String(project.script || "").trim()) continue;
+      var node = _historyDraftCardNode(evt);
+      if (node) _insertHistoryNodeBeforeResult(node);
+    }
+  }
+  box.dataset.timelineProject = tag;
+  _syncScriptWelcomeVisibility();
+}
+
 function _showScriptConfirmArea() {
   var confirmArea = $("scriptConfirmArea");
   if (!confirmArea) return;
@@ -252,11 +514,22 @@ function _syncScriptWelcomeVisibility() {
 }
 
 function _syncScriptDraftMeta() {
+  // 删除 icon 跟着角标走：有剧本才显示（生成中点击在 _deleteCurrentScript 里拦）
+  var delBtn = $("btnDeleteScript");
+  if (delBtn) delBtn.hidden = !(project && String(project.script || "").trim());
+  // 版本行：用时间线里最新草稿的真实版本号；老项目无时间线则保留静态文案
+  var verLine = $("scriptCardVersionLine");
+  if (verLine) {
+    var latestDraftEvt = latestScriptTimelineDraft(project && project.scriptTimeline);
+    if (latestDraftEvt && latestDraftEvt.version) {
+      verLine.textContent = "v" + latestDraftEvt.version + " · " + (scriptTimelineTimeAgo(latestDraftEvt.ts) || "刚刚");
+    }
+  }
   var badge = $("scriptDraftStatusBadge");
   if (!badge) return;
   var approved = !!(project && project.scriptApproved);
   var modified = !!(project && project.scriptReviewState === "modified");
-  badge.textContent = approved ? "剧本 · 已确认" : (modified ? "剧本 · 已修改" : "草稿 · 待确认");
+  badge.textContent = approved ? "剧本 · 已确认" : (modified ? "剧本 · 已修改" : "剧本已生成");
   badge.classList.toggle("is-approved", approved);
   badge.classList.toggle("is-modified", !approved && modified);
   badge.classList.toggle("is-pending", !approved && !modified);
@@ -267,8 +540,11 @@ export function refreshScriptPage() {
   if (_scriptGenerating) return;
   // 委托绑定一次即可（_ensureConfirmDraftDelegation 内部有幂等保护）
   _ensureConfirmDraftDelegation();
+  _ensureScriptHistoryDelegation();
   // 回放多轮咨询历史（只在"还没走到正式剧本"阶段做，避免和已有 bible / script 卡重叠）
   _replayScriptConsultHistory();
+  // 回放剧本时间线（历史指令/草稿折叠卡/系统事件；项目内只冷重建一次）
+  _renderScriptTimelineHistory();
   var resultCard = $("scriptResultCard");
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
@@ -321,6 +597,10 @@ export function refreshScriptImportDraft() {
   }
   card.hidden = false;
   if (textarea.value !== draft) textarea.value = draft;
+  // 导入草稿是"最新事件"：挪到对话流末尾，避免被埋在历史消息上方看不见
+  // （卡片在 HTML 里静态写在容器顶部，而消息/剧本卡都在底部追加）。
+  var wrap = _scriptMessageContainer();
+  if (wrap && card.parentNode === wrap && card !== wrap.lastElementChild) wrap.appendChild(card);
   _syncScriptWelcomeVisibility();
 }
 
@@ -334,6 +614,8 @@ async function _setImportedDraft(text) {
   _ctx.saveProject && _ctx.saveProject();
   refreshScriptImportDraft();
   renderScriptAnalysis();
+  // 把视口带到新出现的导入卡片上，否则用户停在旧剧本卡处看不到任何变化
+  if (_pendingImportedDraft()) _scrollChatToBottom();
   return true;
 }
 
@@ -356,7 +638,14 @@ export async function uploadScriptFile(file) {
     var text = String(data.text || "").trim();
     if (!text) { showToast("文件内容为空", "error"); return; }
     var ok = await _setImportedDraft(text);
-    if (ok) showToast("剧本已导入为待确认草稿", "success");
+    if (ok) {
+      if (_pendingImportedDraft()) {
+        showToast("剧本已导入为待确认草稿", "success");
+      } else {
+        // 导入内容和当前剧本一字不差 → 不会出现待确认卡片，提示要说实话
+        showToast("导入内容与当前剧本完全一致，无需处理", "info");
+      }
+    }
   } catch (e) {
     showToast("导入失败: " + ((e && e.message) || e), "error");
   }
@@ -368,6 +657,9 @@ async function _applyImportedDraft() {
   if (!text) { showToast("导入草稿为空", "warn"); return; }
   if (!project || !project.id) return;
   var originId = project.id;
+  var prevScriptForTl = stripStepTags(String(project.script || ""));
+  var prevDraftEvtForTl = latestScriptTimelineDraft(project.scriptTimeline);
+  var sysTextForTl = "导入内容已应用为当前剧本草稿";
   var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
     proj.script = text;
     proj.scriptDraft = text;
@@ -381,8 +673,22 @@ async function _applyImportedDraft() {
     proj.assetsApproved = false;
     proj.shots = [];
     proj.shotsApproved = false;
+    proj.scriptTimeline = appendScriptTimeline(proj.scriptTimeline, [
+      buildDraftEvent({
+        version: nextScriptTimelineVersion(proj.scriptTimeline),
+        script: text,
+        source: "import",
+      }),
+      buildSystemEvent(sysTextForTl),
+    ]);
   });
   if (!isCurrent) return;
+  // 被导入内容替换掉的旧版本沉为折叠卡 + 系统行
+  if (prevScriptForTl.trim() && prevScriptForTl.trim() !== text) {
+    var supEvtForTl = _supersededDraftEventFor(prevScriptForTl, prevDraftEvtForTl);
+    if (supEvtForTl) _insertHistoryNodeBeforeResult(_historyDraftCardNode(supEvtForTl));
+  }
+  _insertHistoryNodeBeforeResult(_historySystemNode(sysTextForTl));
   var scriptOutput = $("scriptOutput");
   if (scriptOutput) scriptOutput.value = text;
   var resultCard = $("scriptResultCard");
@@ -428,6 +734,62 @@ async function _convertImportedDraft() {
     [applyBtn, convertBtn, discardBtn].forEach(function (btn) { if (btn) btn.disabled = false; });
     refreshScriptImportDraft();
   }
+}
+
+// ── 删除当前剧本（剧本卡角标右侧的删除 icon）──────────────────────────
+// 清空剧本与全部派生数据（情绪段/分析/资产/镜头/分镜/视频提示词/旁白），
+// 回到"未生成剧本"的初始创作态。字段口径对齐 episode_fields.createEmptyEpisode；
+// idea / 目标时长保留，方便用户改完创意直接重新生成。
+async function _deleteCurrentScript() {
+  if (!project || !project.id) return;
+  if (_scriptGenerating) { showToast("正在生成中，请等本次结束后再删", "warn"); return; }
+  if (!String(project.script || "").trim()) return;
+  var ok = await showConfirm(
+    "删除当前剧本",
+    "将清空当前剧本，以及由它生成的情绪分段、剧本分析、资产、镜头、分镜和视频提示词。此操作不可恢复，确定删除？",
+    "删除",
+    "取消"
+  );
+  if (!ok) return;
+  var originId = project.id;
+  var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+    proj.script = "";
+    proj.scriptDraft = "";
+    proj.scriptApproved = false;
+    proj.scriptReviewState = "";
+    proj.emotionSegments = [];
+    proj.emotions = [];
+    proj.scriptAnalysis = null;
+    proj.narrations = [];
+    proj.assets = null;
+    proj.assetsApproved = false;
+    proj.shots = [];
+    proj.shotsApproved = false;
+    proj.storyboards = [];
+    proj.imagesApproved = false;
+    proj.videoPrompts = [];
+    proj.videoPromptsApproved = false;
+    proj.currentStep = 1;
+    proj.scriptConsult = emptyScriptConsultState();
+    // 派生数据全清了，残留的 stale 标记没有指向对象，一并清掉
+    proj._staleFlags = {};
+    proj._staleFlagReasons = {};
+    // 时间线不清：删除本身记为历史事件，删错了还能从折叠卡恢复
+    proj.scriptTimeline = appendScriptTimeline(proj.scriptTimeline, [
+      buildSystemEvent("已删除当前剧本"),
+    ]);
+  });
+  if (!isCurrent) return;
+  _ctx.saveProject && _ctx.saveProject();
+  // 删除属于"丢了很贵"的关键落点，跳过 debounce 立即刷服务器
+  _ctx.flushServerSave && _ctx.flushServerSave();
+  _clearConsultDomForEmptyProject();
+  refreshScriptPage();
+  // 强制重建时间线流：此刻没有当前剧本，所有历史版本（含刚删的）都渲染为可恢复折叠卡
+  _renderScriptTimelineHistory(true);
+  renderScriptAnalysis();
+  renderEmotionSegments();
+  showToast("已删除当前剧本，历史版本仍可在记录里恢复", "success");
 }
 
 function _discardImportedDraft() {
@@ -476,6 +838,8 @@ export function initScriptImportEvents() {
   if (convertBtn) convertBtn.addEventListener("click", function () { _convertImportedDraft(); });
   var discardBtn = $("btnDiscardImportedDraft");
   if (discardBtn) discardBtn.addEventListener("click", _discardImportedDraft);
+  var deleteScriptBtn = $("btnDeleteScript");
+  if (deleteScriptBtn) deleteScriptBtn.addEventListener("click", function () { _deleteCurrentScript(); });
   var analysisBtn = $("btnScriptAnalysisRegen");
   if (analysisBtn) analysisBtn.addEventListener("click", function () { runScriptAnalysis(); });
 }
@@ -1473,7 +1837,9 @@ async function _consultConfirm() {
       proj.assetsApproved = false;
       proj.shots = [];
       proj.shotsApproved = false;
-    });
+      // 后端已 append 时间线并落库；必须同步回内存，否则后续整项目 PUT 会用旧数组盖掉
+      if (Array.isArray(resp.scriptTimeline)) proj.scriptTimeline = resp.scriptTimeline;
+    }, typeof resp.serverVersion === "number" ? resp.serverVersion : undefined);
 
     if (isCurrent) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
@@ -1644,6 +2010,9 @@ export async function generateScript(idea, options) {
   $("btnGenScript").disabled = true;
   $("ideaInput").value = "";
   chatAutoResize($("ideaInput"));
+  // 时间线：转换/重生路径会替换已有剧本，成功后旧版本沉为折叠卡
+  var _genPrevScript = stripStepTags(String((project && project.script) || ""));
+  var _genPrevDraftEvt = latestScriptTimelineDraft(project && project.scriptTimeline);
   var userMessage = Object.prototype.hasOwnProperty.call(options, "userMessage") ? options.userMessage : idea;
   var userMsgEl = options.skipUserBubble ? null : chatAddMsg("user", escapeHtml(userMessage));
 
@@ -1720,11 +2089,18 @@ export async function generateScript(idea, options) {
       proj.assetsApproved = false;
       proj.shots = [];
       proj.shotsApproved = false;
-    });
+      // 后端已 append 时间线并落库；必须同步回内存，否则后续整项目 PUT 会用旧数组盖掉
+      if (Array.isArray(resp.scriptTimeline)) proj.scriptTimeline = resp.scriptTimeline;
+    }, typeof resp.serverVersion === "number" ? resp.serverVersion : undefined);
 
     if (isCurrent) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
 	      if (editArea) editArea.value = resp.script;
+	      // 转换/重生路径替换了已有剧本：旧版本沉为折叠卡（插在本轮用户气泡前）
+	      if (_genPrevScript.trim() && _genPrevScript.trim() !== String(resp.script || "").trim()) {
+	        var _genSupEvt = _supersededDraftEventFor(_genPrevScript, _genPrevDraftEvt);
+	        if (_genSupEvt) _insertHistoryNodeBeforeResult(_historyDraftCardNode(_genSupEvt), userMsgEl);
+	      }
 	      refreshScriptImportDraft();
 	      _syncScriptDraftMeta();
 	      if (editBtn) editBtn.hidden = false;
@@ -1824,17 +2200,19 @@ export async function extractStyleBible(options) {
         throw new Error(_styleBibleErrorText(resp, "未知错误"));
       }
     }
-			    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
-		      _applyStyleBibleResponse(proj, resp);
-		      if (proj.assets) {
-	        if (!proj._staleFlags) proj._staleFlags = {};
-	        proj._staleFlags["assets"] = true;
-	      }
-			    });
-			    if (isCurrent) {
-			      if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
-			    }
-			  } catch (e) {
+    var isCurrent = _ctx.safeWriteBack(originId, function (proj) {
+      _applyStyleBibleResponse(proj, resp);
+      if (proj.assets) {
+        if (!proj._staleFlags) proj._staleFlags = {};
+        proj._staleFlags["assets"] = true;
+        if (!proj._staleFlagReasons || typeof proj._staleFlagReasons !== "object") proj._staleFlagReasons = {};
+        proj._staleFlagReasons["assets"] = "style_bible_changed";
+      }
+    });
+    if (isCurrent) {
+      if (_ctx.markDownstreamStale) _ctx.markDownstreamStale("style_bible", {});
+    }
+  } catch (e) {
     if (e && e.status === 409) throw e;
     var errText = _scriptErrorText(e);
     _ctx.safeWriteBack(originId, function (proj) {
@@ -1842,7 +2220,7 @@ export async function extractStyleBible(options) {
       proj.styleBibleError = errText;
     });
     throw e;
-			  }
+  }
 }
 
 export async function confirmScript() {
@@ -1879,6 +2257,14 @@ export async function confirmScript() {
     if (_ctx.reloadProjectFromServer) {
       await _ctx.reloadProjectFromServer();
     }
+    // 时间线记一条系统事件。放在 reload 之后：此时内存已对齐服务器最新
+    // version，append 后的 PUT 不会撞乐观锁
+    var _confirmSysText = "已确认剧本，进入风格制定";
+    _ctx.safeWriteBack(originId, function (proj) {
+      proj.scriptTimeline = appendScriptTimeline(proj.scriptTimeline, [buildSystemEvent(_confirmSysText)]);
+    });
+    _ctx.saveProject && _ctx.saveProject();
+    _insertHistoryNodeBeforeResult(_historySystemNode(_confirmSysText));
   } catch (e) {
     // 后端拒绝（脚本空 / 项目不存在等）——回滚本地 scriptApproved
     _ctx.safeWriteBack(originId, function (proj) {
@@ -2154,7 +2540,10 @@ export async function reviseScript(instruction) {
   $("btnGenScript").disabled = true;
   $("ideaInput").value = "";
   chatAutoResize($("ideaInput"));
-  chatAddMsg("user", escapeHtml(instruction));
+  // 时间线：改写成功后，被替换的当前版本要沉为折叠卡（插在指令气泡前面）
+  var _revPrevScript = stripStepTags(String((project && project.script) || ""));
+  var _revPrevDraftEvt = latestScriptTimelineDraft(project && project.scriptTimeline);
+  var _revUserMsgNode = chatAddMsg("user", escapeHtml(instruction));
 
   var displayText = $("scriptDisplayText");
   var editArea = $("scriptOutput");
@@ -2206,11 +2595,18 @@ export async function reviseScript(instruction) {
 		      proj.scriptReviewState = "draft";
 	      proj.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
 	      proj.scriptTargetDurationSec = resp.durationSec || proj.scriptTargetDurationSec || null;
-	    });
+	      // 后端已 append 时间线并落库；必须同步回内存，否则后续整项目 PUT 会用旧数组盖掉
+	      if (Array.isArray(resp.scriptTimeline)) proj.scriptTimeline = resp.scriptTimeline;
+	    }, typeof resp.serverVersion === "number" ? resp.serverVersion : undefined);
 
     if (isCurrent) {
 	      if (displayText) { displayText.textContent = resp.script; displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
 	      if (editArea) editArea.value = resp.script;
+	      // 改写成功：旧版本沉为折叠卡，插在本轮指令气泡前
+	      if (_revPrevScript.trim() && _revPrevScript.trim() !== String(resp.script || "").trim()) {
+	        var _revSupEvt = _supersededDraftEventFor(_revPrevScript, _revPrevDraftEvt);
+	        if (_revSupEvt) _insertHistoryNodeBeforeResult(_historyDraftCardNode(_revSupEvt), _revUserMsgNode);
+	      }
 	      refreshScriptImportDraft();
 	      _syncScriptDraftMeta();
 	      if (editBtn) editBtn.hidden = false;
@@ -2229,6 +2625,11 @@ export async function reviseScript(instruction) {
     if (displayText) { displayText.style.pointerEvents = ""; displayText.classList.remove("streaming-wave"); }
     if (editBtn) editBtn.hidden = false;
     if (expandBtn) expandBtn.hidden = false;
+    // 失败时把流式过程中写进卡片的半成品/聊天体文本清掉，恢复显示当前真实剧本，
+    // 否则"修改未生效"但屏幕上留着一段假剧本（实例："已删除当前剧本。…"）。
+    var _restoreText = stripStepTags((project && project.script) || "");
+    if (displayText) displayText.textContent = _restoreText;
+    if (editArea) editArea.value = _restoreText;
     var errText = _scriptErrorText(e);
     chatAddMsg("status", '<span class="chat-status-err">修改失败: ' + escapeHtml(errText) + '</span>');
     _ctx.toastErrorWithActions && _ctx.toastErrorWithActions(errText);

@@ -13,7 +13,10 @@ var _ctx = {};
 var project = null;
 
 export function initAssets(ctx) { _ctx = ctx; }
-export function syncAssetsProject(p) { project = p; }
+export function syncAssetsProject(p) {
+  project = p;
+  _refreshSaveWorldTemplateButton();
+}
 export function resetLibraryState() { _libActiveProject = null; _libActiveTab = "all"; _libProjPage = 0; _libProjPages = []; _libProjList = []; }
 
 function _invalidateMaterialPanelsAfterAssetChange() {
@@ -37,6 +40,7 @@ function _flushAssetsProjectNow() {
 var _assetsExtracting = false;
 var _assetImagesGenerating = false;
 var _assetGenStatus = {};
+var _assetImageBatchCountsByProject = new Map();
 var _assetReviewSnapshot = null;
 var _pendingAssetRerender = false;
 var _libActiveProject = null;
@@ -51,6 +55,99 @@ var _assetEntranceClearTimer = null;
 var ASSET_CARD_DISPLAY_W = 1024;
 var ASSET_CARD_THUMB_W = 512;
 var ASSET_LIGHTBOX_W = 1600;
+
+function _assetProjectKey(originId) {
+  return originId ? String(originId) : "";
+}
+
+function _currentAssetProjectKey() {
+  return _assetProjectKey(project && project.id);
+}
+
+function _assetImageBatchCount(originId) {
+  var key = _assetProjectKey(originId);
+  return key ? (_assetImageBatchCountsByProject.get(key) || 0) : 0;
+}
+
+function _hasActiveAssetImageBatchForCurrentProject() {
+  var key = _currentAssetProjectKey();
+  return !!(key && _assetImageBatchCount(key) > 0);
+}
+
+function _beginAssetImageBatch(originId) {
+  var key = _assetProjectKey(originId);
+  if (!key) return;
+  _assetImageBatchCountsByProject.set(key, _assetImageBatchCount(key) + 1);
+  _syncAssetHeaderHint({ preserveExisting: true });
+}
+
+function _endAssetImageBatch(originId) {
+  var key = _assetProjectKey(originId);
+  if (!key) return;
+  var next = Math.max(0, _assetImageBatchCount(key) - 1);
+  if (next > 0) _assetImageBatchCountsByProject.set(key, next);
+  else _assetImageBatchCountsByProject.delete(key);
+  _syncAssetHeaderHint({ preserveExisting: true });
+}
+
+function _setAssetHeaderHint(text, tone) {
+  var hint = $("assetImgHint");
+  if (!hint) return;
+  hint.textContent = text || "";
+  hint.classList.remove("is-progress", "is-warning", "is-error", "is-success");
+  if (tone) hint.classList.add("is-" + tone);
+}
+
+function _clearAssetHeaderHint() {
+  _setAssetHeaderHint("", "");
+}
+
+// ── 参考图静态三态扫描 ──
+// done = 已有 imageUrl 的资产数；missingLabels = 该生成而没生成的资产名。
+// 与 _summarizeAssetImageGeneration 的 done/still_missing 同口径，但随时可
+// 从 project.assets 重算——刷新/切项目后摘要不丢。
+function _assetHeaderImageState() {
+  var done = 0;
+  var missingLabels = [];
+  if (!project || !project.assets) return { total: 0, done: 0, missingLabels: missingLabels };
+  ["characters", "scenes", "props"].forEach(function (cat) {
+    var type = cat === "characters" ? "char" : cat === "scenes" ? "scene" : "prop";
+    (project.assets[cat] || []).forEach(function (item, idx) {
+      if (!item) return;
+      if (item.imageUrl) { done++; return; }
+      if (item.imagePrompt) {
+        var label = (item.name || "").toString().trim() || (_assetTypeLabel(type) + (idx + 1));
+        missingLabels.push(label);
+      }
+    });
+  });
+  return { total: done + missingLabels.length, done: done, missingLabels: missingLabels };
+}
+
+function _formatAssetMissingLabels(labels) {
+  if (labels.length <= 3) return labels.join("、");
+  return labels.slice(0, 3).join("、") + " 等 " + labels.length + " 项";
+}
+
+function _syncAssetHeaderHint(options) {
+  options = options || {};
+  if (_hasActiveAssetImageBatchForCurrentProject()) return;
+  var img = _assetHeaderImageState();
+  // 部分缺失（=失败摘要位）优先于完成摘要
+  if (img.done > 0 && img.missingLabels.length > 0) {
+    _setAssetHeaderHint(img.done + "/" + img.total + " 张已生成，缺少 " + _formatAssetMissingLabels(img.missingLabels), "warning");
+    return;
+  }
+  if (img.total > 0 && img.done >= img.total) {
+    _setAssetHeaderHint("生成完成 " + img.done + "/" + img.total, "success");
+    return;
+  }
+  if (img.total > 0 && img.done === 0) {
+    _setAssetHeaderHint("待生成… 0/" + img.total, "");
+    return;
+  }
+  if (!options.preserveExisting) _clearAssetHeaderHint();
+}
 
 function _assetVariant(url, width) {
   return imageVariantUrl(url || "", { w: width });
@@ -479,17 +576,12 @@ function _hideAssetActions() {
   var topConfirm = $("btnConfirmAssetsTop");
   var confirmArea = $("assetsConfirmArea");
   var hint = $("assetImgHint");
-  var stylizeBadge = $("assetStylizeBadge");
   if (btnExtract) btnExtract.hidden = true;
   if (btnGen) btnGen.hidden = true;
   if (btnClean) btnClean.hidden = true;
   if (topConfirm) topConfirm.hidden = true;
   if (confirmArea) confirmArea.hidden = true;
-  if (hint) hint.textContent = "";
-  if (stylizeBadge) {
-    stylizeBadge.textContent = "";
-    stylizeBadge.hidden = true;
-  }
+  if (hint) _clearAssetHeaderHint();
 }
 
 function _clearAssetEntranceAnimation() {
@@ -510,25 +602,57 @@ function _scheduleAssetEntranceAnimationClear() {
   }, ASSET_ENTRANCE_ANIM_MS);
 }
 
-// 后台转绘任务托管：一键生成"资产阶段"完成后，Step2 彩铅转绘继续
-// 在后台跑，用户可以立刻进入编辑/剧本/分镜，不用盯着进度条 4 分钟。
-// 只有视频生成入口会硬等 pencilUrl 就绪。
-//
-// Map<charIdx, { charIdx, charName, taskId, status, startedAt }>
-//   status: "submitting" | "running" | "done" | "failed"
-//
-// 注意：此 Map 仅代表当前 project 正在后台跑的转绘任务。切项目时
-// 不清空——一个项目的后台任务可以在另一个项目打开时继续跑完写回。
-var _backgroundStylizeTasks = new Map();
-// 暴露给视频入口做"能不能开始生成"的前置检查
-export function getBackgroundStylizeCount() { return _backgroundStylizeTasks.size; }
-
 /* ================================================================
    资产库（角色/场景/道具 提取 + 参考图生成）
    ================================================================ */
 
+function _staleFlagReasonsForProject(targetProject, create) {
+  if (!targetProject) return null;
+  if (!targetProject._staleFlagReasons || typeof targetProject._staleFlagReasons !== "object") {
+    if (!create) return null;
+    targetProject._staleFlagReasons = {};
+  }
+  return targetProject._staleFlagReasons;
+}
+
+function _setStaleFlagReasonForProject(targetProject, key, reason) {
+  var reasons = _staleFlagReasonsForProject(targetProject, true);
+  if (reasons && key && reason) reasons[key] = reason;
+}
+
+function _clearStaleFlagReasonForProject(targetProject, key) {
+  var reasons = _staleFlagReasonsForProject(targetProject, false);
+  if (reasons && key) delete reasons[key];
+}
+
+function _assetStaleReasonForProject(targetProject) {
+  var reasons = _staleFlagReasonsForProject(targetProject, false);
+  var reason = reasons && String(reasons.assets || "").trim();
+  if (reason) return reason;
+
+  var flag = targetProject && targetProject._staleFlags && targetProject._staleFlags.assets;
+  if (typeof flag === "string") return flag;
+  if (targetProject && targetProject.scriptReviewState === "modified") return "script_changed";
+  if (targetProject && targetProject.styleBibleStaleReason === "script_changed") return "script_changed";
+  if (targetProject && (targetProject.styleBibleGeneratedAt || targetProject.styleBibleManuallyEditedAt || targetProject.styleBibleSource === "manual")) {
+    return "style_bible_changed";
+  }
+  if (targetProject && (targetProject.selectedWorldTemplateId || targetProject.worldTemplateSnapshot)) return "world_changed";
+  return "";
+}
+
+export function _assetStaleBannerTextForProject(targetProject) {
+  var reason = _assetStaleReasonForProject(targetProject);
+  if (reason === "script_changed") return "剧本已修改，资产可能需要重新分析以保持一致性";
+  if (reason === "style_bible_changed" || reason === "style_changed" || reason === "world_changed" || reason === "style_world_changed") {
+    return "风格/世界观设定已更新，资产可能需要重新分析以保持一致性";
+  }
+  return "上游内容已更新，资产可能需要重新分析以保持一致性";
+}
+
 export function refreshAssetsPage() {
   _pendingAssetRerender = false;
+  _refreshSaveWorldTemplateButton();
   var need = $("assetsNeedScript");
   var needExtract = $("assetsNeedExtract");
   var ready = $("assetsReady");
@@ -559,14 +683,14 @@ export function refreshAssetsPage() {
     if (_ctx.isStale("assets") && content) {
       var _sb = document.createElement("div");
       _sb.className = "upstream-stale-banner";
-      _sb.innerHTML = '<span class="material-symbols-outlined">warning</span>剧本已修改，资产可能需要重新分析以保持一致性';
+      _sb.innerHTML = '<span class="material-symbols-outlined">warning</span>' + escapeHtml(_assetStaleBannerTextForProject(project));
       content.insertBefore(_sb, content.firstChild);
     }
     renderAssets();
     _showAssetActions();
     checkAssetsConfirm();
     _refreshWorldKnowledgeButtons();
-    _updateStylizeBadge();
+    _syncAssetHeaderHint();
   } else if (_assetsExtracting) {
     if (needExtract) needExtract.hidden = true;
     if (ready) ready.hidden = false;
@@ -680,6 +804,7 @@ export async function extractAssets() {
       proj.environments = Array.isArray(resp.environments) ? resp.environments : _deepClonePlain(nextAssets.scenes || []);
       proj.props = Array.isArray(resp.props) ? resp.props : _deepClonePlain(nextAssets.props || []);
       if (proj._staleFlags) delete proj._staleFlags["assets"];
+      _clearStaleFlagReasonForProject(proj, "assets");
       if (Object.keys(warningsMap).length) {
         proj._carryWarnings = warningsMap;
       } else if (proj._carryWarnings) {
@@ -1447,10 +1572,6 @@ function _renderPropCards(container, items) {
  *   - `TaskRecover` 的 asset/storyboard 分支（3-B-8 起后端 `/api/tasks/active`
  *     只返回 video，前端这条路径也删空）
  *
- * 角色 orphan-pencil 兜底（有 realPhotoUrl 但缺 pencilUrl）由
- * `_autoRecoverOrphanPencils` 处理——它会通过 `_retryPencilConversion`
- * 走新的 `_runStylizeBatch` 路径，落盘依旧权威。
- *
  * 函数整体 fire-and-forget：不 await 不影响首屏渲染，SSE 回来时刷 UI。
  */
 export function _restoreAssetGenStatus() {
@@ -1458,43 +1579,6 @@ export function _restoreAssetGenStatus() {
   reattachActiveBatches(project.id).catch(function (e) {
     console.warn("[RestoreGenStatus] reattach failed:", (e && e.message) || e);
   });
-  _autoRecoverOrphanPencils();
-}
-
-/**
- * 角色缺 pencilUrl 的兜底：刷新后若发现历史数据里有 realPhotoUrl 但无
- * pencilUrl，且当前没有 asset_stylize batch 在跑（`_backgroundStylizeTasks`
- * 会在 reattach 时回填），就挨个补一次转绘。新路径走后端 batch。
- */
-function _autoRecoverOrphanPencils() {
-  if (!project || !project.assets || !project.assets.characters) return;
-  var orphans = [];
-  project.assets.characters.forEach(function (item, idx) {
-    if (!item) return;
-    if (item.isCrowd) return;
-    var et = (item.entityType || "human").toString().toLowerCase();
-    if (et === "non-human") return;
-    if (item.realPhotoUrl && !item.pencilUrl && !_backgroundStylizeTasks.has(idx)) {
-      orphans.push(idx);
-    }
-  });
-  if (!orphans.length) return;
-  console.log("[OrphanPencil] Found " + orphans.length + " chars needing pencil retry");
-  _runOrphanPencilRecovery(orphans);
-}
-
-async function _runOrphanPencilRecovery(idxList) {
-  for (var i = 0; i < idxList.length; i++) {
-    var idx = idxList[i];
-    var item = project && project.assets && project.assets.characters && project.assets.characters[idx];
-    if (!item || !item.realPhotoUrl || item.pencilUrl) continue;
-    try {
-      await _retryPencilConversion(idx);
-    } catch (e) {
-      console.warn("[OrphanPencil] Recovery failed idx=" + idx, e && e.message);
-    }
-    if (i < idxList.length - 1) await sleep(3000);
-  }
 }
 
 function _cleanupStaleGenStatus() {
@@ -1514,6 +1598,27 @@ function _cleanupStaleGenStatus() {
   // Phase 3-B-7：`project._generatingAssets` 不再是权威源，也不再由此函数
   // 维护。如果历史项目 JSON 还带着这个字段，交给 `updateAssetCardImage` 的
   // "done/error" 分支或后端 `apply_patch_and_save` 按 key 清掉。
+}
+
+function _isTerminalBatchStatus(status) {
+  status = String(status || "").toLowerCase();
+  return status === "completed" || status === "failed" || status === "cancelled" || status === "partial";
+}
+
+function _batchTaskSeq(task, fallback) {
+  if (task && typeof task.seq === "number") return task.seq;
+  if (task && typeof task.batch_seq === "number") return task.batch_seq;
+  return fallback || 0;
+}
+
+function _batchTaskTarget(task) {
+  task = task || {};
+  var target = (task.target && typeof task.target === "object") ? Object.assign({}, task.target) : {};
+  if (!target.type && task.extra && task.extra.target && task.extra.target.type) target.type = task.extra.target.type;
+  if (typeof target.idx !== "number" && task.extra && task.extra.target && typeof task.extra.target.idx === "number") target.idx = task.extra.target.idx;
+  if (!target.type && task.target_type) target.type = task.target_type;
+  if (typeof target.idx !== "number" && typeof task.target_idx === "number") target.idx = task.target_idx;
+  return target;
 }
 
 export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
@@ -1944,43 +2049,6 @@ function _markAssetImageFailedLocally(originId, type, idx, err, extra, serverVer
   }, serverVersion);
 }
 
-/**
- * 更新资产面板顶部的「风格图补全中 N/M」徽标。
- * N = 当前项目已就绪的 pencilUrl 数；M = 需要转绘的人形角色总数
- * （non-human 直接复用真人图所以不计入）。
- */
-function _updateStylizeBadge() {
-  var el = $("assetStylizeBadge");
-  if (!el) return;
-  var chars = (project && project.assets && project.assets.characters) || [];
-  var total = 0;
-  var done = 0;
-  chars.forEach(function (c) {
-    if (c && c.isCrowd) return;
-    var et = (c.entityType || "human").toString().toLowerCase();
-    if (et === "non-human") return;  // 不需要转绘
-    if (!c.realPhotoUrl) return;      // 第一步都没完成
-    total++;
-    if (c.pencilUrl) done++;
-  });
-  var running = _backgroundStylizeTasks.size;
-  if (running === 0 && total > 0 && done >= total) {
-    el.hidden = true;
-    return;
-  }
-  if (total === 0) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  if (running > 0) {
-    el.textContent = "风格图补全中 " + done + "/" + total + "（后台运行，可继续下一步）";
-    } else {
-    // 有缺口但没有 running —— 之前失败留下的
-    el.textContent = "风格图待补全 " + done + "/" + total + "（点击卡片重试）";
-  }
-}
-
 function _collectDefaultAssetImageTargets() {
   var targets = [];
   if (!project || !project.assets) return targets;
@@ -2002,10 +2070,10 @@ function _setAssetImagesGeneratingLocked(locked) {
   checkAssetsConfirm();
 }
 
-function _summarizeAssetImageGeneration(hint) {
+function _summarizeAssetImageGeneration(hint, options) {
+  var silent = !!(options && options.silent);
   var done = 0;
   var still_missing = 0;
-  var pencil_pending = 0;
   if (!project || !project.assets) return;
   ["characters", "scenes", "props"].forEach(function (cat) {
     (project.assets[cat] || []).forEach(function (item) {
@@ -2013,30 +2081,19 @@ function _summarizeAssetImageGeneration(hint) {
       else if (item.imagePrompt) still_missing++;
     });
   });
-  (project.assets.characters || []).forEach(function (item) {
-    if (item && item.isCrowd) return;
-    var et = (item.entityType || "human").toString().toLowerCase();
-    if (et === "non-human") return;
-    if (item.realPhotoUrl && !item.pencilUrl) pencil_pending++;
-  });
-  if (hint) {
-    var hintParts = [];
-    if (still_missing > 0) hintParts.push(still_missing + " 张图仍失败");
-    if (pencil_pending > 0) hintParts.push(pencil_pending + " 个角色风格图后台补全中");
-    if (hintParts.length > 0) {
-      hint.textContent = done + " 张已生成，" + hintParts.join("、") + "（可进入下一步）";
-    } else {
-      hint.textContent = done + " 张参考图全部生成完成 ✓";
-    }
+  // 完成/缺失/待生成摘要统一由 sync 从 project.assets 静态计算
+  // （onFinish 前已 reload，扫描结果即本批结果），刷新后口径一致。
+  if (hint) _syncAssetHeaderHint();
+  if (silent) {
+    checkAssetsConfirm();
+    return;
   }
   if (still_missing > 0) {
     showToast(still_missing + " 张参考图待优化（不影响后续步骤，可手动重试）", "info");
-  } else if (pencil_pending > 0) {
-    showToast("资产生成完成 ✓ 风格图在后台补全中，可直接进入下一步", "ok");
   } else if (done > 0) {
     showToast("资产参考图生成完成 ✓", "ok");
   }
-  _updateStylizeBadge();
+  _syncAssetHeaderHint({ preserveExisting: true });
   checkAssetsConfirm();
 }
 
@@ -2045,12 +2102,12 @@ async function _runAssetImageTargets(targets, hint) {
   targets = Array.isArray(targets) ? targets : [];
   if (_assetImagesGenerating) return;
   if (!targets.length) {
-    if (hint) hint.textContent = "没有需要生成的资产";
+    if (hint) _setAssetHeaderHint("没有需要生成的资产", "");
     return;
   }
   _setAssetImagesGeneratingLocked(true);
   try {
-    if (hint) hint.textContent = "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
+    if (hint) _setAssetHeaderHint("正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）", "progress");
     targets.forEach(function (t) {
       updateAssetCardImage(t.type, t.idx, "loading");
     });
@@ -2196,7 +2253,7 @@ async function _executeAssetRegenerationReview(targets, reuseRows) {
   var reused = 0;
   _setAssetImagesGeneratingLocked(true);
   try {
-    if (hint) hint.textContent = reuseRows.length && targets.length ? "正在沿用历史图并生成选中资产…" : reuseRows.length ? "正在沿用历史参考图…" : "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）";
+    if (hint) _setAssetHeaderHint(reuseRows.length && targets.length ? "正在沿用历史图并生成选中资产…" : reuseRows.length ? "正在沿用历史参考图…" : "正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）", "progress");
     reuseRows.forEach(function (row) {
       if (_reuseLatestInfoChangedImage(row.type, row.idx)) reused++;
     });
@@ -2216,9 +2273,10 @@ async function _executeAssetRegenerationReview(targets, reuseRows) {
       await _runAssetImageBatch(project.id, targets, hint, targets.length);
       _summarizeAssetImageGeneration(hint);
     } else {
-      if (hint) hint.textContent = reused > 0 ? "已沿用历史参考图" : "没有需要生成的资产";
+      if (hint) _setAssetHeaderHint(reused > 0 ? "已沿用历史参考图" : "没有需要生成的资产", reused > 0 ? "success" : "");
       if (reused > 0) showToast("已沿用历史参考图", "ok");
-      _updateStylizeBadge();
+      // preserveExisting：保留上面刚写的提示，不被立即清空
+      _syncAssetHeaderHint({ preserveExisting: true });
       checkAssetsConfirm();
     }
   } finally {
@@ -2304,7 +2362,7 @@ export async function generateAllAssetImages() {
   }
   var allTargets = _collectDefaultAssetImageTargets();
   if (!allTargets.length) {
-    if (hint) hint.textContent = "没有需要生成的资产";
+    if (hint) _setAssetHeaderHint("没有需要生成的资产", "");
     return;
   }
   await _runAssetImageTargets(allTargets, hint);
@@ -2337,7 +2395,7 @@ function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
     }).then(function (startResp) {
       if (!startResp || !startResp.batchId) {
         var errMsg = (startResp && startResp.error) || "未能创建批量任务";
-        if (hint) hint.textContent = "批量启动失败：" + errMsg;
+        if (hint) _setAssetHeaderHint("批量启动失败：" + errMsg, "error");
         showToast("批量启动失败：" + _diagnoseApiError(errMsg), "error");
         mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error"); });
         resolve({ done: 0, failed: mainTargets.length });
@@ -2354,11 +2412,11 @@ function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
     }).catch(function (e) {
       console.error("[AssetImg] /api/batch/start failed:", e);
       if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
-        if (hint) hint.textContent = '积分不足';
+        if (hint) _setAssetHeaderHint('积分不足', "error");
         showBillingPaywall(e.billing || null);
       } else {
         var errMsg = ((e && e.message) || e).toString();
-        if (hint) hint.textContent = "批量启动失败：" + errMsg;
+        if (hint) _setAssetHeaderHint("批量启动失败：" + errMsg, "error");
         showToast("批量启动失败：" + _diagnoseApiError(errMsg), "error");
       }
       mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error"); });
@@ -2390,10 +2448,19 @@ function _attachAssetImageBatch(opts) {
   var hint = opts.hint || null;
   var totalTasks = opts.totalTasks || 0;
   var onFinish = opts.onFinish || function () {};
-  var doneCount = opts.initialDone || 0;
-  var failCount = opts.initialFailed || 0;
+  var initialDoneCount = Math.max(0, Number(opts.initialDone || 0) || 0);
+  var initialFailedCount = Math.max(0, Number(opts.initialFailed || 0) || 0);
+  var snapshotDoneCount = initialDoneCount;
+  var snapshotFailedCount = initialFailedCount;
+  var seenDoneSeqs = Object.create(null);
+  var seenFailedSeqs = Object.create(null);
+  var rejectedSeqs = Object.create(null);
+  var seenDoneCount = 0;
+  var seenFailedCount = 0;
+  var rejectedCount = 0;
   var settled = false;
   var pollTimer = null;
+  _beginAssetImageBatch(originId);
   // 同一批里多张图同时撞积分上限时，只弹一次付费墙。否则用户每张失败都被弹
   // 一次会很烦。批次结束时自动 reset。
   var creditPaywallShown = false;
@@ -2402,24 +2469,76 @@ function _attachAssetImageBatch(opts) {
     if (settled) return;
     settled = true;
     _stopPoll();
+    _endAssetImageBatch(originId);
     checkAssetsConfirm();
     onFinish(res);
   }
 
   // 启动时刻 + 每张完成时间，用来动态算"平均 X 秒/张" → 估剩余时间
   var startTs = Date.now();
+  function _assetBatchEventKey(data, target) {
+    if (data && data.taskId) return "task:" + data.taskId;
+    if (data && data.id) return "task:" + data.id;
+    if (data && typeof data.targetSeq !== "undefined" && data.targetSeq !== null) return "seq:" + data.targetSeq;
+    if (target && target.type && typeof target.idx === "number") return "target:" + target.type + "_" + target.idx;
+    return "";
+  }
+  function _markAssetBatchDone(key) {
+    if (!key) {
+      seenDoneCount++;
+      return true;
+    }
+    if (seenDoneSeqs[key] || seenFailedSeqs[key]) return false;
+    seenDoneSeqs[key] = true;
+    seenDoneCount++;
+    return true;
+  }
+  function _markAssetBatchFailed(key) {
+    if (!key) {
+      seenFailedCount++;
+      return true;
+    }
+    if (seenFailedSeqs[key] || seenDoneSeqs[key]) return false;
+    seenFailedSeqs[key] = true;
+    seenFailedCount++;
+    return true;
+  }
+  function _markAssetBatchRejected(key) {
+    if (!key) {
+      rejectedCount++;
+      return true;
+    }
+    if (rejectedSeqs[key]) return false;
+    rejectedSeqs[key] = true;
+    rejectedCount++;
+    return true;
+  }
+  function _assetBatchProgressCounts() {
+    var done = Math.max(initialDoneCount + seenDoneCount, snapshotDoneCount);
+    var failed = Math.max(initialFailedCount + seenFailedCount, snapshotFailedCount);
+    var processed = done + failed;
+    if (totalTasks > 0) processed = Math.min(totalTasks, processed);
+    return {
+      done: done,
+      failed: failed,
+      processed: processed,
+      failureLabel: failed + rejectedCount,
+      pending: Math.max(0, totalTasks - processed),
+    };
+  }
   function _refreshHint() {
     if (!hint) return;
-    var done = doneCount;
-    var fail = failCount;
-    var pending = Math.max(0, totalTasks - done - fail);
+    var counts = _assetBatchProgressCounts();
+    var done = counts.processed;
+    var fail = counts.failureLabel;
+    var pending = counts.pending;
     var parts = ["生成中… " + done + "/" + totalTasks];
     if (fail > 0) parts.push(fail + " 张失败");
     if (pending > 0) {
       // 已完成至少 1 张：用真实速度估剩余；否则给 35 秒/张的初始猜测
       var avgSec;
-      if (done + fail >= 1) {
-        avgSec = (Date.now() - startTs) / 1000 / (done + fail);
+      if (done >= 1) {
+        avgSec = (Date.now() - startTs) / 1000 / done;
       } else {
         avgSec = 35;
       }
@@ -2429,11 +2548,9 @@ function _attachAssetImageBatch(opts) {
     }
     // 积分不足场景：所有 pending 都不会再跑（积分预扣环节失败），换一行更醒目的文案
     if (creditPaywallShown) {
-      hint.textContent = "积分不足，剩余 " + (totalTasks - done) + " 张已停 — 请充值后重试（已成功 " + done + "/" + totalTasks + "）";
-      hint.style.color = "#dc2626";
+      _setAssetHeaderHint("积分不足，剩余 " + pending + " 张已停 — 请充值后重试（已处理 " + done + "/" + totalTasks + "）", "error");
     } else {
-      hint.textContent = parts.join("，");
-      hint.style.color = "";
+      _setAssetHeaderHint(parts.join("，"), fail > 0 ? "warning" : "progress");
     }
   }
   // 给一个初始 hint，避免空白
@@ -2458,8 +2575,8 @@ function _attachAssetImageBatch(opts) {
       var snap = await apiGet("/api/batch/" + encodeURIComponent(batchId));
       if (!snap || settled) return;
       // 用后端权威值修正本地计数（即便 SSE 帧全丢，hint 也会刷新）
-      if (typeof snap.succeeded === "number" && snap.succeeded > doneCount) doneCount = snap.succeeded;
-      if (typeof snap.failed === "number" && snap.failed > failCount) failCount = snap.failed;
+      if (typeof snap.succeeded === "number" && snap.succeeded > snapshotDoneCount) snapshotDoneCount = snap.succeeded;
+      if (typeof snap.failed === "number" && snap.failed > snapshotFailedCount) snapshotFailedCount = snap.failed;
       _refreshHint();
 
       var succeededNow = (typeof snap.succeeded === "number") ? snap.succeeded : 0;
@@ -2494,7 +2611,8 @@ function _attachAssetImageBatch(opts) {
           if (_ctx.reloadProjectFromServer) await _ctx.reloadProjectFromServer();
         } catch (e) { console.warn("[AssetImg] reload after poll failed:", e); }
         try { renderAssets(); } catch (_) {}
-        finish({ done: doneCount, failed: failCount });
+        var terminalCounts = _assetBatchProgressCounts();
+        finish({ done: terminalCounts.processed, failed: terminalCounts.failureLabel });
       }
     } catch (e) {
       // 轮询失败不致命，下一轮重试
@@ -2510,13 +2628,14 @@ function _attachAssetImageBatch(opts) {
     onSnapshot: function (snap) {
       if (snap && typeof snap.total === "number") {
         // snapshot 里 succeeded/failed 是后端权威值，refresh 用它修正本地计数
-        if (typeof snap.succeeded === "number") doneCount = Math.max(doneCount, snap.succeeded);
-        if (typeof snap.failed === "number") failCount = Math.max(failCount, snap.failed);
+        if (typeof snap.succeeded === "number") snapshotDoneCount = Math.max(snapshotDoneCount, snap.succeeded);
+        if (typeof snap.failed === "number") snapshotFailedCount = Math.max(snapshotFailedCount, snap.failed);
       }
       _refreshHint();
     },
     onTaskStarted: function (data) {
-      var tgt = (data && data.target) || seqToTarget[data.targetSeq] || {};
+      var seq = data && data.targetSeq;
+      var tgt = (data && data.target) || (typeof seq !== "undefined" ? seqToTarget[seq] : null) || {};
       if (tgt.type && typeof tgt.idx === "number") {
         updateAssetCardImage(tgt.type, tgt.idx, "loading", null, "生成中…");
       }
@@ -2524,7 +2643,8 @@ function _attachAssetImageBatch(opts) {
     onTaskCompleted: function (data) {
       var extra = (data && data.extra) || {};
       var patch = (data && data.patch) || {};
-      var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
+      var seq = data && data.targetSeq;
+      var tgt = (typeof seq !== "undefined" ? seqToTarget[seq] : null) || { type: extra.type, idx: extra.idx };
       // patch.cat ('characters'/'scenes'/'props') → type ('char'/'scene'/'prop') 兜底
       if (!tgt.type && patch.cat) {
         var cat2type = { characters: "char", scenes: "scene", props: "prop" };
@@ -2537,10 +2657,12 @@ function _attachAssetImageBatch(opts) {
       if (typeof tgt.idx !== "number" && typeof patch.idx === "number") tgt.idx = patch.idx;
       var type = tgt.type;
       var idx = tgt.idx;
+      var eventKey = _assetBatchEventKey(data, tgt);
       var url = extra.rawUrl || patch.value || patch.imageUrl || "";
-      console.log("[AssetImg] task_completed seq=" + data.targetSeq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
+      console.log("[AssetImg] task_completed seq=" + seq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
       if (type === "char" && typeof idx === "number" && extra.referenceStatus === "failed") {
-        failCount++;
+        _markAssetBatchDone(eventKey);
+        _markAssetBatchRejected(eventKey);
         var failedAttemptUrl = extra.lastAttemptUrl || "";
         var isFailedCurrent = _ctx.safeWriteBack(originId, function (proj) {
           if (!proj.assets) proj.assets = {};
@@ -2573,7 +2695,7 @@ function _attachAssetImageBatch(opts) {
         // SSE 帧缺信息：图已落盘但 UI 收不到必要字段。改成主动从 server 拉一次
         // project，让当前还在 loading 的卡片按权威数据补图——而不是默默吞掉等用户 F5。
         console.warn("[AssetImg] task_completed missing target/url — pulling project from server to recover", data);
-        doneCount++;
+        _markAssetBatchDone(eventKey);
         if (_ctx.reloadProjectFromServer) {
           _ctx.reloadProjectFromServer().then(function (ok) {
             if (ok) {
@@ -2586,7 +2708,7 @@ function _attachAssetImageBatch(opts) {
         _refreshHint();
         return;
       }
-      doneCount++;
+      _markAssetBatchDone(eventKey);
 
       // 展示 URL 优先用 pencilUrl（角色最终态）
       var pencilUrl = (type === "char" ? (extra.pencilUrl || "") : "");
@@ -2644,9 +2766,10 @@ function _attachAssetImageBatch(opts) {
       _refreshHint();
     },
     onTaskFailed: function (data) {
-      failCount++;
       var extra = (data && data.extra) || {};
-      var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
+      var seq = data && data.targetSeq;
+      var tgt = (typeof seq !== "undefined" ? seqToTarget[seq] : null) || { type: extra.type, idx: extra.idx };
+      _markAssetBatchFailed(_assetBatchEventKey(data, tgt));
       var type = tgt.type;
       var idx = tgt.idx;
       var err = (data && data.errorMsg) || "生成失败";
@@ -2663,7 +2786,8 @@ function _attachAssetImageBatch(opts) {
       if (isCreditError && !creditPaywallShown) {
         creditPaywallShown = true;
         try { showBillingPaywall((data && data.billing) || null); } catch (_) {}
-        try { showToast("积分不足，剩余 " + Math.max(0, totalTasks - doneCount - failCount) + " 张未生成 — 充值后可继续", "error"); } catch (_) {}
+        var creditCounts = _assetBatchProgressCounts();
+        try { showToast("积分不足，剩余 " + creditCounts.pending + " 张未生成 — 充值后可继续", "error"); } catch (_) {}
       }
       _refreshHint();
     },
@@ -2683,7 +2807,8 @@ function _attachAssetImageBatch(opts) {
       // 安全网渲染：不管之前 task_completed 有没有走完，到这里把三个 grid
       // 全部按服务端权威数据重渲一次
       try { renderAssets(); } catch (e) { console.warn("[AssetImg] renderAssets after reload failed:", e); }
-      finish({ done: doneCount, failed: failCount });
+      var terminalCounts = _assetBatchProgressCounts();
+      finish({ done: terminalCounts.processed, failed: terminalCounts.failureLabel });
     },
     onClose: function () {
       if (pollTimer) {
@@ -2701,7 +2826,7 @@ function _attachAssetImageBatch(opts) {
  * 这个用户 + 这个项目下所有"未完成"的 batch 列表，以及每个 batch 的
  * `tasks[]` 数组（含 status / target_type / target_idx / extra）。
  *
- * 对资产图 batch（batchType 为 `asset_images` / `asset_stylize`）：
+ * 对资产图 batch（batchType 为 `asset_images`）：
  *   1. 把 tasks 里 status=pending/running 的 target 拿出来置 `_assetGenStatus=loading`
  *      （**权威源**——不再信 project._generatingAssets 这种本地副本）
  *   2. 用 `_attachAssetImageBatch` 续挂 SSE 回调，继续看进度和完成事件
@@ -2742,300 +2867,55 @@ export async function reattachActiveBatches(originId) {
       return;
     }
 
-    if (bt !== "asset_images" && bt !== "asset_stylize") {
+    if (bt !== "asset_images") {
       return;
     }
     var tasks = b.tasks || [];
+    var batchStatus = String(b.status || (b.snapshot && b.snapshot.status) || "").toLowerCase();
     var seqToTarget = {};
     var initialDone = 0;
     var initialFailed = 0;
-    tasks.forEach(function (t) {
-      var seq = (typeof t.batch_seq === "number") ? t.batch_seq : 0;
-      var target = (t.extra && t.extra.target) || {
-        type: t.target_type, idx: t.target_idx,
-      };
+    tasks.forEach(function (t, taskIndex) {
+      var seq = _batchTaskSeq(t, taskIndex);
+      var target = _batchTaskTarget(t);
       seqToTarget[seq] = target;
 
       var status = String(t.status || "").toLowerCase();
-      if (status === "succeeded" || status === "done") {
+      if (status === "succeeded" || status === "done" || status === "completed") {
         initialDone++;
-      } else if (status === "failed" || status === "error") {
+      } else if (status === "failed" || status === "error" || status === "cancelled" || status === "needs_review") {
         initialFailed++;
         if (target.type && typeof target.idx === "number") {
           updateAssetCardImage(target.type, target.idx, "error");
         }
-      } else if (status === "running" || status === "pending" || status === "polling") {
+      } else if (status === "running" || status === "queued" || status === "pending" || status === "polling" || status === "retry_pending" || status === "upstream_pending") {
         if (target.type && typeof target.idx === "number") {
           _assetGenStatus[target.type + "_" + target.idx] = "loading";
-          updateAssetCardImage(target.type, target.idx, "loading", null,
-            bt === "asset_stylize" ? "风格化中…" : "生成中…");
+          updateAssetCardImage(target.type, target.idx, "loading", null, "生成中…");
         }
       }
     });
 
-    if (bt === "asset_images") {
-      _attachAssetImageBatch({
-        batchId: b.batchId,
-        originId: originId,
-        seqToTarget: seqToTarget,
-        hint: $("assetImgHint"),
-        totalTasks: tasks.length,
-        initialDone: initialDone,
-        initialFailed: initialFailed,
-        onFinish: function () { _updateStylizeBadge(); },
-      });
-      reattachedCount++;
-    } else if (bt === "asset_stylize") {
-      // 转绘 batch 的回调复用 `_runStylizeBatch` 的写回逻辑。这里走一个
-      // 最小兼容：直接 subscribeBatch，等 task_completed 时触发
-      // `_safeWriteBack` 把 pencilUrl 写回。完整复用抽函数留到后续 phase。
-      _attachStylizeBatchForReattach({
-        batchId: b.batchId,
-        originId: originId,
-        seqToTarget: seqToTarget,
-        tasks: tasks,
-      });
-      reattachedCount++;
+    if (_isTerminalBatchStatus(batchStatus)) {
+      _summarizeAssetImageGeneration($("assetImgHint"), { silent: true });
+      return;
     }
+
+    _attachAssetImageBatch({
+      batchId: b.batchId,
+      originId: originId,
+      seqToTarget: seqToTarget,
+      hint: $("assetImgHint"),
+      totalTasks: tasks.length,
+      initialDone: initialDone,
+      initialFailed: initialFailed,
+      onFinish: function () { _summarizeAssetImageGeneration($("assetImgHint"), { silent: true }); },
+    });
+    reattachedCount++;
   });
 
   console.log("[Reattach] reattached " + reattachedCount + " asset batches for " + originId);
   return { reattached: reattachedCount };
-}
-
-/**
- * 最小化的转绘 batch 重连回调——只负责把 task_completed/failed 的结果写回
- * project.json（UI 乐观更新）和清 badge。完整抽取留到 Phase 3-B-8 或 5。
- */
-function _attachStylizeBatchForReattach(opts) {
-  var batchId = opts.batchId;
-  var originId = opts.originId;
-  var seqToTarget = opts.seqToTarget || {};
-  var tasks = opts.tasks || [];
-
-  // 重建 badge：运行中的 char 进 _backgroundStylizeTasks
-  tasks.forEach(function (t) {
-    var seq = (typeof t.batch_seq === "number") ? t.batch_seq : 0;
-    var target = (t.extra && t.extra.target) || {
-      type: t.target_type, idx: t.target_idx,
-    };
-    if (target.type !== "char") return;
-    var status = String(t.status || "").toLowerCase();
-    if (status === "running" || status === "pending" || status === "polling") {
-      if (!_backgroundStylizeTasks.has(target.idx)) {
-        _backgroundStylizeTasks.set(target.idx, {
-          charIdx: target.idx,
-          charName: "角色#" + target.idx,
-          taskId: t.task_id,
-          status: status === "running" ? "running" : "submitting",
-          startedAt: Date.now(),
-        });
-      }
-    }
-  });
-  _updateStylizeBadge();
-
-  subscribeBatch(batchId, {
-    onTaskCompleted: function (data) {
-      var extra = (data && data.extra) || {};
-      var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
-      if (tgt.type !== "char" || typeof tgt.idx !== "number") return;
-      var idx = tgt.idx;
-      if (extra.skippedReason === 'anonymous_crowd_no_stylize') {
-        _backgroundStylizeTasks.delete(idx);
-        _updateStylizeBadge();
-        return;
-      }
-      var url = extra.pencilUrl || extra.rawUrl || "";
-      if (!url) return;
-      _ctx.safeWriteBack(originId, function (proj) {
-        var item = proj.assets && proj.assets.characters && proj.assets.characters[idx];
-        if (!item) return;
-        _ctx.archiveOldImage(item, "stylize");
-        item.pencilUrl = url;
-        item.imageUrl = url;
-        if (extra.skippedStylize) item.skippedStylize = true;
-        if (item._pencilFailed) delete item._pencilFailed;
-      }, data && data.serverVersion);
-      _backgroundStylizeTasks.delete(idx);
-      _updateStylizeBadge();
-    },
-    onTaskFailed: function (data) {
-      var extra = (data && data.extra) || {};
-      var tgt = seqToTarget[data.targetSeq] || { type: extra.type, idx: extra.idx };
-      if (tgt.type !== "char" || typeof tgt.idx !== "number") return;
-      _ctx.safeWriteBack(originId, function (proj) {
-        var item = proj.assets && proj.assets.characters && proj.assets.characters[tgt.idx];
-        if (item) item._pencilFailed = true;
-      });
-      _backgroundStylizeTasks.delete(tgt.idx);
-      _updateStylizeBadge();
-    },
-    onBatchCompleted: function () {
-      _updateStylizeBadge();
-    },
-    onClose: function () {
-      _updateStylizeBadge();
-    },
-  });
-}
-
-/**
- * Phase 3-B-5 · 角色彩铅化（Step 2）走后端 batch_runner。
- *
- * 输入：targets = [{ idx, charName }]（**只接 human 角色**，non-human 由 caller
- * 自己走本地 fast-path，避免一次无意义的 batch 往返）。
- *
- * 流程：
- *   1. 把 idx 全部注册进 `_backgroundStylizeTasks` → badge "风格图补全中 N/M"
- *   2. /api/batch/start batchType=asset_stylize targets=[{type:"char", idx}]
- *   3. subscribeBatch：
- *      - onTaskStarted：meta.status → running
- *      - onTaskCompleted：safeWriteBack 写 pencilUrl（或 non-human 的
- *        imageUrl=realPhotoUrl），清 _pencilFailed，从 Map 移除
- *      - onTaskFailed：safeWriteBack 标 _pencilFailed=true，从 Map 移除
- *      - onBatchCompleted / onClose：resolve 并刷 badge
- *
- * 返回 Promise<{ done, failed }>。
- */
-function _runStylizeBatch(originId, targets) {
-  if (!targets || !targets.length) return Promise.resolve({ done: 0, failed: 0 });
-
-  var seqToTarget = {};
-  targets.forEach(function (t, seq) { seqToTarget[seq] = t; });
-
-  targets.forEach(function (t) {
-    _backgroundStylizeTasks.set(t.idx, {
-      charIdx: t.idx,
-      charName: t.charName || ("角色#" + t.idx),
-      taskId: null,
-      status: "submitting",
-      startedAt: Date.now(),
-        });
-      });
-  _updateStylizeBadge();
-
-  return new Promise(function (resolve) {
-    var doneCount = 0;
-    var failCount = 0;
-    var settled = false;
-    function finish(res) {
-      if (settled) return;
-      settled = true;
-      // 兜底：尚未收到终态的 idx 从 Map 里清掉，避免 badge 僵住
-      targets.forEach(function (t) {
-        if (_backgroundStylizeTasks.has(t.idx)) _backgroundStylizeTasks.delete(t.idx);
-      });
-      _updateStylizeBadge();
-      resolve(res);
-    }
-
-    var batchTargets = targets.map(function (t) { return { type: "char", idx: t.idx }; });
-
-    apiPost("/api/batch/start", {
-      batchType: "asset_stylize",
-      projectId: originId,
-      targets: batchTargets,
-      options: {},
-    }).then(function (startResp) {
-      if (!startResp || !startResp.batchId) {
-        var errMsg = (startResp && startResp.error) || "未能创建彩铅转绘批量任务";
-        console.warn("[BgStylize] batch start failed:", errMsg);
-        targets.forEach(function (t) {
-          var idx = t.idx;
-          _ctx.safeWriteBack(originId, function (proj) {
-            if (proj.assets && proj.assets.characters && proj.assets.characters[idx]) {
-              proj.assets.characters[idx]._pencilFailed = true;
-            }
-          });
-        });
-        finish({ done: 0, failed: targets.length });
-        return;
-      }
-
-      subscribeBatch(startResp.batchId, {
-        onTaskStarted: function (data) {
-          var seq = (data && data.targetSeq) || 0;
-          var t = seqToTarget[seq];
-          if (!t) return;
-          var meta = _backgroundStylizeTasks.get(t.idx);
-          if (meta) {
-            meta.status = "running";
-            meta.taskId = (data && data.taskId) || meta.taskId;
-            _backgroundStylizeTasks.set(t.idx, meta);
-          }
-          _updateStylizeBadge();
-        },
-        onTaskCompleted: function (data) {
-          var extra = (data && data.extra) || {};
-          var patch = (data && data.patch) || {};
-          var seq = (data && data.targetSeq) || 0;
-          var t = seqToTarget[seq] || { idx: extra.idx };
-          var idx = (typeof t.idx === "number") ? t.idx : extra.idx;
-          var pencilUrl = extra.imageUrl || patch.value || "";
-          if (typeof idx !== "number" || !pencilUrl) {
-            console.warn("[BgStylize] task_completed missing idx/url:", data);
-            failCount++;
-            if (typeof idx === "number") _backgroundStylizeTasks.delete(idx);
-            _updateStylizeBadge();
-            return;
-          }
-          doneCount++;
-          _ctx.safeWriteBack(originId, function (proj) {
-            if (proj.assets && proj.assets.characters && proj.assets.characters[idx]) {
-              _ctx.archiveOldImage(proj.assets.characters[idx], "stylize");
-              proj.assets.characters[idx].pencilUrl = pencilUrl;
-              delete proj.assets.characters[idx]._pencilFailed;
-            }
-          }, data && data.serverVersion);
-          // 同步当前 in-memory project（不经 safeWriteBack 的路径）
-          if (project && project.id === originId
-            && project.assets && project.assets.characters && project.assets.characters[idx]) {
-            project.assets.characters[idx].pencilUrl = pencilUrl;
-            delete project.assets.characters[idx]._pencilFailed;
-          }
-          _backgroundStylizeTasks.delete(idx);
-          _updateStylizeBadge();
-          console.log("[BgStylize] char#" + idx + " done, pencilUrl=" + String(pencilUrl).slice(0, 80));
-        },
-        onTaskFailed: function (data) {
-          failCount++;
-          var extra = (data && data.extra) || {};
-          var seq = (data && data.targetSeq) || 0;
-          var t = seqToTarget[seq] || { idx: extra.idx };
-          var idx = (typeof t.idx === "number") ? t.idx : extra.idx;
-          var err = (data && data.errorMsg) || "彩铅转绘失败";
-          console.warn("[BgStylize] char#" + idx + " failed:", err);
-          if (typeof idx === "number") {
-            _ctx.safeWriteBack(originId, function (proj) {
-              if (proj.assets && proj.assets.characters && proj.assets.characters[idx]) {
-                proj.assets.characters[idx]._pencilFailed = true;
-              }
-            });
-            if (project && project.id === originId
-              && project.assets && project.assets.characters && project.assets.characters[idx]) {
-              project.assets.characters[idx]._pencilFailed = true;
-            }
-            _backgroundStylizeTasks.delete(idx);
-          }
-          _updateStylizeBadge();
-        },
-        onBatchCompleted: function () { finish({ done: doneCount, failed: failCount }); },
-        onClose: function () { finish({ done: doneCount, failed: failCount }); },
-      });
-    }).catch(function (e) {
-      console.error("[BgStylize] /api/batch/start failed:", e);
-      targets.forEach(function (t) {
-        var idx = t.idx;
-        _ctx.safeWriteBack(originId, function (proj) {
-          if (proj.assets && proj.assets.characters && proj.assets.characters[idx]) {
-            proj.assets.characters[idx]._pencilFailed = true;
-          }
-    });
-  });
-      finish({ done: 0, failed: targets.length });
-    });
-  });
 }
 
 function _assetItemsForConfirm() {
@@ -3104,6 +2984,7 @@ export function checkAssetsConfirm() {
   var topBtn = $("btnConfirmAssetsTop");
   var saveTplBtn = $("btnSaveWorldTemplate");
   _refreshWorldKnowledgeButtons();
+  _refreshSaveWorldTemplateButton();
   if (!area || !project || !project.assets) {
     if (area) area.hidden = true;
     if (topBtn) topBtn.hidden = true;
@@ -3593,10 +3474,8 @@ function _showCharMenu(anchor, type, idx) {
   menu.className = "fixed z-50 min-w-[200px] bg-white rounded-2xl overflow-hidden border border-black/[0.06]";
   menu.style.cssText = "box-shadow: 0 8px 32px rgba(0,0,0,.12), 0 2px 8px rgba(0,0,0,.06);";
   var _charItem = project.assets.characters[idx];
-  var _hasPencilIssue = _charItem && !_charItem.isCrowd && _charItem.realPhotoUrl && !_charItem.pencilUrl;
   var _menuEntityType = (((_charItem || {}).entityType) || 'human').toString().toLowerCase();
   var _isNonHumanMenu = _menuEntityType === 'non-human';
-  var _retryLabel = _isNonHumanMenu ? '重试实体概念图' : '重试风格转换';
   menu.innerHTML =
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors rounded-t-2xl" data-menu="upload-char-img">' +
       '<span class="material-symbols-outlined text-lg text-[#2E7D32]">upload</span>上传角色图' +
@@ -3613,10 +3492,6 @@ function _showCharMenu(anchor, type, idx) {
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-menu="char-history">' +
       '<span class="material-symbols-outlined text-lg">history</span>历史记录' +
     '</button>' +
-    (_hasPencilIssue ? '<div class="mx-4 border-t border-black/[0.06]"></div>' +
-    '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e65100] hover:bg-orange-50 transition-colors" data-menu="retry-pencil">' +
-      '<span class="material-symbols-outlined text-lg">brush</span>' + _retryLabel +
-    '</button>' : '') +
     '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-2xl" data-menu="delete-char">' +
       '<span class="material-symbols-outlined text-lg">delete_outline</span>删除' + (_isNonHumanMenu ? '实体' : '角色') +
@@ -3638,8 +3513,6 @@ function _showCharMenu(anchor, type, idx) {
       });
     } else if (act === "char-history") {
       _openAssetHistoryFor("char", idx);
-    } else if (act === "retry-pencil") {
-      _retryPencilConversion(idx);
     } else if (act === "delete-char") {
       var _delCharName = (project.assets.characters[idx] || {}).name || "";
       showConfirm("删除角色", "确定删除角色「" + _delCharName + "」？", function () {
@@ -3921,68 +3794,6 @@ function _replaceAssetCharacterWithCustom(idx, item) {
   showToast("已替换角色特征，角色名称和 ID 已保留", "ok");
 }
 
-/**
- * 手动重试单个角色的彩铅转绘。
- *
- * Phase 3-B-8：走 `_runStylizeBatch` 单任务批次，后端 executor 负责上游调用
- * + 权威落盘；non-human 直接在前端本地同步写回（省一次无意义的 batch 往返）。
- */
-export async function _retryPencilConversion(idx) {
-  if (!project || !project.assets || !project.assets.characters) return;
-  var item = project.assets.characters[idx];
-  if (!item || !item.realPhotoUrl) {
-    showToast("该实体没有原始参考图，请先重新生成", "warn");
-    return;
-  }
-  if (item.isCrowd) {
-    showToast("群像使用整体参考图，不需要风格转换", "info");
-    delete item._pencilFailed;
-    _updateStylizeBadge();
-    return;
-  }
-  var originId = project.id;
-  var _entityType = (item.entityType || "human").toString().toLowerCase();
-  var _isNonHuman = _entityType === "non-human";
-  var charName = item.name || ("角色#" + idx);
-
-  if (_isNonHuman) {
-    item.pencilUrl = item.realPhotoUrl;
-    delete item._pencilFailed;
-    _ctx.archiveOldImage(item, "stylize");
-    _ctx.safeWriteBack(originId, function (proj) {
-      if (proj.assets && proj.assets.characters && proj.assets.characters[idx]) {
-        _ctx.archiveOldImage(proj.assets.characters[idx], "stylize");
-        proj.assets.characters[idx].pencilUrl = item.realPhotoUrl;
-        delete proj.assets.characters[idx]._pencilFailed;
-      }
-    });
-    showToast("实体概念图已就绪！", "ok");
-    updateAssetCardImage("char", idx, "done", item.realPhotoUrl);
-    _updateStylizeBadge();
-    return;
-  }
-
-  showToast("正在重试风格转换…", "ok");
-  updateAssetCardImage("char", idx, "loading", null, "风格转换中…");
-
-  var res = { done: 0, failed: 0 };
-  try {
-    res = await _runStylizeBatch(originId, [{ idx: idx, charName: charName }]);
-  } catch (e) {
-    console.warn("[Stylize] manual retry failed:", _diagnoseApiError((e && e.message || "").slice(0, 200)));
-  }
-
-  if (res.done > 0) {
-    showToast("风格转换成功！", "ok");
-  } else {
-    showToast("风格图暂未生成，可稍后再试", "info");
-  }
-  if (project && project.id === originId) {
-    updateAssetCardImage("char", idx, "done", item.realPhotoUrl);
-  }
-  _updateStylizeBadge();
-}
-
 var _charUploadStreams = {};
 var _assetUploadStreams = {};
 
@@ -4186,12 +3997,6 @@ async function _uploadCharImage(charIdx, file) {
       updateAssetCardImage("char", charIdx, "done", displayUrl);
       renderAssets();
       showToast("角色图上传成功，已保存为当前参考图", "success");
-      var entityType = ((ch.entityType || "human") + "").toLowerCase();
-      if (entityType !== "non-human") {
-        _retryPencilConversion(charIdx).catch(function (e) {
-          console.warn("[CharUpload] stylize after upload failed:", e && e.message);
-        });
-      }
       return;
     }
     if (!data.taskId) {
@@ -4455,6 +4260,67 @@ export function _getStyleTemplates() {
   return Array.isArray(_styleTemplatesMem) ? _styleTemplatesMem : [];
 }
 
+function _worldTemplateIdOf(tpl) {
+  return String(tpl && (tpl.id || tpl.templateId || tpl.template_id) || "").trim();
+}
+
+function _findWorldTemplateByIdInList(templates, id) {
+  id = String(id || "").trim();
+  if (!id) return null;
+  templates = Array.isArray(templates) ? templates : _getWorldTemplates();
+  for (var i = 0; i < templates.length; i++) {
+    if (_worldTemplateIdOf(templates[i]) === id) return templates[i];
+  }
+  return null;
+}
+
+function _findDerivedWorldTemplateForProject(templates) {
+  var projectId = String(project && project.id || "").trim();
+  if (!projectId) return null;
+  templates = Array.isArray(templates) ? templates : _getWorldTemplates();
+  for (var i = 0; i < templates.length; i++) {
+    var tpl = templates[i] || {};
+    if (String(tpl.sourceProjectId || tpl.source_project_id || "").trim() === projectId) return tpl;
+  }
+  return null;
+}
+
+function _resolveWorldTemplateUpdateTarget(templates) {
+  templates = Array.isArray(templates) ? templates : _getWorldTemplates();
+  var snapshot = project && project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"
+    ? project.worldTemplateSnapshot
+    : null;
+  var selectedId = String(project && project.selectedWorldTemplateId || "").trim();
+  var snapshotId = _worldTemplateIdOf(snapshot);
+  var target = _findWorldTemplateByIdInList(templates, selectedId)
+    || _findWorldTemplateByIdInList(templates, snapshotId)
+    || _findDerivedWorldTemplateForProject(templates);
+  if (!target) return { template: null, templateId: "", reason: selectedId || snapshotId ? "missing" : "none" };
+  return { template: target, templateId: _worldTemplateIdOf(target), reason: "matched" };
+}
+
+function _setSaveWorldTemplateButtonText(text) {
+  var btn = $("btnSaveWorldTemplate");
+  if (!btn) return;
+  var textNodes = [];
+  for (var i = 0; i < btn.childNodes.length; i++) {
+    if (btn.childNodes[i].nodeType === 3) {
+      textNodes.push(btn.childNodes[i]);
+    }
+  }
+  for (var j = 0; j < textNodes.length; j++) {
+    btn.removeChild(textNodes[j]);
+  }
+  btn.appendChild(document.createTextNode(text));
+}
+
+function _refreshSaveWorldTemplateButton() {
+  var btn = $("btnSaveWorldTemplate");
+  if (!btn) return;
+  var target = _resolveWorldTemplateUpdateTarget();
+  _setSaveWorldTemplateButtonText(target.template ? "更新世界观" : "保存世界观");
+}
+
 // 是否已完成首次拉取（不论结果是否为空）。用于区分「加载中」与「真的没有模板」，
 // 避免风格页刷新/重载时先闪一下「暂无可用风格模板」空态。
 export function _styleTemplatesLoaded() {
@@ -4644,6 +4510,7 @@ export async function _primeWorldTemplates() {
       _worldTemplatesPrimed = true;
     } finally {
       _worldTemplatesPrimePromise = null;
+      _refreshSaveWorldTemplateButton();
     }
   })();
   return _worldTemplatesPrimePromise;
@@ -5147,29 +5014,354 @@ function _worldTemplateSummaryPillsHtml(tpl) {
   return pills.join("");
 }
 
-function _worldTemplateSaveCharacterStats() {
-  var locks = project && project.consistency && Array.isArray(project.consistency.characters) ? project.consistency.characters : [];
-  var assetCount = project && project.assets && Array.isArray(project.assets.characters) ? project.assets.characters.length : 0;
-  var lockedCount = 0;
-  var candidateCount = 0;
-  if (locks.length) {
-    locks.forEach(function (lock) {
-      if (lock && lock.status === "locked") lockedCount += 1;
-      else if (lock) candidateCount += 1;
-    });
-  } else {
-    lockedCount = assetCount;
+function _worldTemplateSaveEntityKey(entity) {
+  if (!entity || typeof entity !== "object") return "";
+  return String(
+    entity.characterId ||
+    entity.id ||
+    entity.sourceAssetId ||
+    entity.name ||
+    entity.title ||
+    entity.role ||
+    ""
+  ).trim().toLowerCase();
+}
+
+function _worldTemplateProjectEntityList(kind) {
+  if (!project) return [];
+  if (project.assets) {
+    var assetKey = kind === "locations" ? "scenes" : kind;
+    if (Array.isArray(project.assets[assetKey]) && project.assets[assetKey].length) return project.assets[assetKey];
   }
+  var topKey = kind === "locations" ? "environments" : kind;
+  return Array.isArray(project[topKey]) ? project[topKey] : [];
+}
+
+function _worldTemplateMergeSaveEntities(lists) {
+  var byKey = {};
+  var keys = [];
+  var loose = [];
+  (lists || []).forEach(function (list) {
+    if (!Array.isArray(list)) return;
+    list.forEach(function (item) {
+      if (!item) return;
+      if (typeof item !== "object") item = { name: String(item) };
+      var key = _worldTemplateSaveEntityKey(item);
+      if (!key) {
+        loose.push(item);
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(byKey, key)) keys.push(key);
+      byKey[key] = Object.assign({}, byKey[key] || {}, item);
+    });
+  });
+  return keys.map(function (key) { return byKey[key]; }).concat(loose);
+}
+
+function _worldTemplateCurrentSaveEntities() {
+  var snapshot = project && project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"
+    ? project.worldTemplateSnapshot
+    : null;
   return {
-    lockedCount: lockedCount,
-    candidateCount: candidateCount,
-    totalCount: lockedCount + candidateCount
+    characters: _worldTemplateMergeSaveEntities([
+      snapshot ? _worldTemplateCharacters(snapshot) : [],
+      _worldTemplateProjectEntityList("characters"),
+    ]),
+    locations: _worldTemplateMergeSaveEntities([
+      snapshot && Array.isArray(snapshot.locations) ? snapshot.locations : [],
+      _worldTemplateProjectEntityList("locations"),
+    ]),
+    props: _worldTemplateMergeSaveEntities([
+      snapshot && Array.isArray(snapshot.props) ? snapshot.props : [],
+      _worldTemplateProjectEntityList("props"),
+    ]),
   };
+}
+
+function _worldTemplateSaveEntityThumbHtml(item, category) {
+  var url = _worldTemplateEntityPreviewUrl(item);
+  var shapeClass = category === "characters" ? "rounded-full" : "rounded-md";
+  if (url) {
+    return '<img src="' + escapeHtml(url) + '" class="save-tpl-entity-thumb ' + shapeClass + '" style="width:40px;height:40px;object-fit:cover;border:1px solid #E1E8F0;box-shadow:0 1px 3px rgba(15,30,55,0.06);background:#EEF3F8;flex:0 0 auto" alt="" />';
+  }
+  var icon = category === "characters" ? "person" : category === "locations" ? "landscape" : "category";
+  return '<span class="save-tpl-entity-thumb ' + shapeClass + '" style="width:40px;height:40px;background:#EEF3F8;color:#7D8EA5;display:flex;align-items:center;justify-content:center;flex:0 0 auto;border:1px solid #E1E8F0"><span class="material-symbols-outlined" style="font-size:20px">' + icon + '</span></span>';
+}
+
+function _worldTemplateSaveEntitySectionHtml(category, title, items) {
+  items = Array.isArray(items) ? items : [];
+  var emptyCopy = category === "characters" ? "暂无角色" : category === "locations" ? "暂无场景" : "暂无道具";
+  var icon = category === "characters" ? "group" : category === "locations" ? "landscape" : "deployed_code";
+  var rows = items.map(function (item, idx) {
+    var name = _worldTemplateEntityLabel(item, "未命名" + title);
+    var key = _worldTemplateSaveEntityKey(item) || (category + "_" + idx);
+    return (
+      '<label class="save-tpl-entity-row" style="display:flex;align-items:center;gap:10px;min-width:0;padding:8px 10px;background:#FFFFFF;border:1px solid #E2E9F1;border-radius:12px;color:#172C43;box-shadow:0 1px 2px rgba(15,30,55,0.025);cursor:pointer;transition:border-color .16s ease, box-shadow .16s ease">' +
+        '<input type="checkbox" class="saveTplEntityCheckbox" style="width:18px;height:18px;accent-color:#2F6FDB;flex:0 0 auto" data-category="' + escapeHtml(category) + '" data-key="' + escapeHtml(key) + '" checked />' +
+        _worldTemplateSaveEntityThumbHtml(item, category) +
+        '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:700;line-height:1.35" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>' +
+      '</label>'
+    );
+  }).join("");
+  return (
+    '<section class="save-tpl-entity-card" style="min-width:0;background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:16px;box-shadow:0 10px 28px rgba(15,30,55,0.045)">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px">' +
+        '<div style="display:flex;align-items:center;gap:10px;min-width:0;color:#172C43;font-size:17px;font-weight:800;line-height:1.2">' +
+          '<span class="material-symbols-outlined" style="font-size:22px;color:#647A92">' + icon + '</span>' +
+          '<span>' + title + '</span>' +
+        '</div>' +
+        '<span style="display:inline-flex;align-items:center;justify-content:center;min-width:42px;height:24px;padding:0 10px;border-radius:999px;background:#EAF0FF;color:#3268D8;font-size:13px;font-weight:800">' + items.length + ' 个</span>' +
+      '</div>' +
+      (rows ? '<div style="display:grid;grid-template-columns:1fr;gap:8px;max-height:310px;overflow:auto;padding-right:2px">' + rows + '</div>' : '<div style="padding:18px 14px;border-radius:12px;background:#F7FAFD;color:#8A9BAD;font-size:13px">' + emptyCopy + '</div>') +
+    '</section>'
+  );
+}
+
+function _worldTemplateNormalizeTerminology(value) {
+  var out = {};
+  function addTerm(key, desc) {
+    key = String(key || "").trim();
+    if (!key) return;
+    if (desc && typeof desc === "object" && !Array.isArray(desc)) {
+      desc = desc.meaning || desc.description || desc.value || desc.desc || desc.summary || "";
+    }
+    desc = String(desc || "").trim();
+    out[key] = desc || key;
+  }
+  if (Array.isArray(value)) {
+    value.forEach(function (item) {
+      if (!item) return;
+      if (typeof item === "object") {
+        addTerm(item.term || item.name || item.title || item.key, item.meaning || item.description || item.value || item.desc);
+      } else {
+        addTerm(item, item);
+      }
+    });
+  } else if (value && typeof value === "object") {
+    Object.keys(value).forEach(function (key) { addTerm(key, value[key]); });
+  }
+  return out;
+}
+
+function _worldTemplateCurrentTerminology() {
+  var snapshot = project && project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"
+    ? project.worldTemplateSnapshot
+    : null;
+  var styleBible = project && project.styleBible && typeof project.styleBible === "object"
+    ? project.styleBible
+    : {};
+  if (snapshot && (
+    Object.prototype.hasOwnProperty.call(snapshot, "terminology") ||
+    Object.prototype.hasOwnProperty.call(snapshot, "terms") ||
+    Object.prototype.hasOwnProperty.call(snapshot, "titles")
+  )) {
+    return _worldTemplateNormalizeTerminology(snapshot.terminology || snapshot.terms || snapshot.titles);
+  }
+  return _worldTemplateNormalizeTerminology(styleBible.terminology || styleBible.terms || styleBible.titles);
+}
+
+function _worldTemplateTerminologyToText(terminology) {
+  terminology = _worldTemplateNormalizeTerminology(terminology);
+  return Object.keys(terminology).map(function (key) {
+    var desc = String(terminology[key] || "").replace(/\s+/g, " ").trim();
+    return desc && desc !== key ? (key + "：" + desc) : key;
+  }).join("\n");
+}
+
+function _worldTemplateTerminologyFromText(text) {
+  var out = {};
+  String(text || "").split(/\r?\n/).forEach(function (line) {
+    var raw = line.trim();
+    if (!raw) return;
+    var match = raw.match(/^([^:=：]+?)\s*[:：=]\s*(.+)$/);
+    if (!match) match = raw.match(/^(.+?)\s+[—-]\s+(.+)$/);
+    var key = match ? match[1].trim() : raw;
+    var desc = match ? match[2].trim() : raw;
+    if (key) out[key] = desc || key;
+  });
+  return out;
+}
+
+function _removeSaveTemplateDialog(overlay) {
+  if (!overlay) return;
+  if (typeof overlay._restoreSaveTplScroll === "function") {
+    overlay._restoreSaveTplScroll();
+    overlay._restoreSaveTplScroll = null;
+  }
+  overlay.remove();
+}
+
+function _bindSaveTemplateScrollIsolation(overlay) {
+  var scrollBody = overlay ? overlay.querySelector('[data-save-tpl-scroll="true"]') : null;
+  var body = document.body;
+  var html = document.documentElement;
+  var prevBodyOverflow = body.style.overflow;
+  var prevHtmlOverflow = html.style.overflow;
+  var prevBodyOverscroll = body.style.overscrollBehavior;
+  var prevHtmlOverscroll = html.style.overscrollBehavior;
+
+  body.style.overflow = "hidden";
+  html.style.overflow = "hidden";
+  body.style.overscrollBehavior = "none";
+  html.style.overscrollBehavior = "none";
+
+  function isScrollable(node) {
+    if (!node || node.nodeType !== 1) return false;
+    if (node.scrollHeight <= node.clientHeight + 1) return false;
+    var overflowY = "";
+    try { overflowY = window.getComputedStyle(node).overflowY; } catch (_) {}
+    return overflowY !== "hidden" && overflowY !== "visible";
+  }
+
+  function canScrollInDirection(node, deltaY) {
+    if (!isScrollable(node) || !deltaY) return false;
+    var maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+    if (deltaY < 0) return node.scrollTop > 0;
+    return node.scrollTop < maxScrollTop - 1;
+  }
+
+  function scrollCandidates(target) {
+    var candidates = [];
+    if (!scrollBody) return candidates;
+    var node = target && target.nodeType === 1 ? target : target && target.parentElement;
+    if (!node || !scrollBody.contains(node)) {
+      if (isScrollable(scrollBody)) candidates.push(scrollBody);
+      return candidates;
+    }
+    while (node && node !== overlay) {
+      if ((node === scrollBody || scrollBody.contains(node)) && isScrollable(node)) {
+        candidates.push(node);
+      }
+      if (node === scrollBody) break;
+      node = node.parentElement;
+    }
+    if (isScrollable(scrollBody) && candidates.indexOf(scrollBody) === -1) {
+      candidates.push(scrollBody);
+    }
+    return candidates;
+  }
+
+  function isolateWheel(ev) {
+    var deltaY = ev.deltaY || 0;
+    var candidates = scrollCandidates(ev.target);
+    var target = null;
+    for (var i = 0; i < candidates.length; i++) {
+      if (canScrollInDirection(candidates[i], deltaY)) {
+        target = candidates[i];
+        break;
+      }
+    }
+    if (target) {
+      target.scrollTop += deltaY;
+    }
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+
+  overlay.addEventListener("wheel", isolateWheel, { passive: false });
+  overlay._restoreSaveTplScroll = function () {
+    overlay.removeEventListener("wheel", isolateWheel);
+    body.style.overflow = prevBodyOverflow;
+    html.style.overflow = prevHtmlOverflow;
+    body.style.overscrollBehavior = prevBodyOverscroll;
+    html.style.overscrollBehavior = prevHtmlOverscroll;
+  };
+}
+
+function _worldTemplateSaveChangeIcon(category) {
+  if (category === "characters" || category === "characterCandidates") return "person";
+  if (category === "locations") return "landscape";
+  if (category === "props") return "deployed_code";
+  if (category === "terminology") return "format_quote";
+  return "add_circle";
+}
+
+function _worldTemplateSaveChangeTitle(category) {
+  if (category === "characters") return "新增角色";
+  if (category === "characterCandidates") return "新增候选角色";
+  if (category === "locations") return "新增场景";
+  if (category === "props") return "新增道具";
+  if (category === "terminology") return "新增术语";
+  return "新增资产";
+}
+
+function _worldTemplateSaveChangeThumbHtml(item, category) {
+  if (category === "terminology") {
+    return '<span class="save-tpl-entity-thumb rounded-md" style="width:40px;height:40px;background:#F5F8FC;color:#647A92;display:flex;align-items:center;justify-content:center;flex:0 0 auto;border:1px solid #E1E8F0"><span class="material-symbols-outlined" style="font-size:20px">format_quote</span></span>';
+  }
+  return _worldTemplateSaveEntityThumbHtml({
+    imageUrl: item && item.previewUrl,
+    name: item && item.label
+  }, category === "characterCandidates" ? "characters" : category);
+}
+
+function _worldTemplateSaveChangeSectionHtml(title, category, items, emptyCopy) {
+  items = Array.isArray(items) ? items : [];
+  var icon = _worldTemplateSaveChangeIcon(category);
+  var rows = items.map(function (item, idx) {
+    var key = String(item && item.key || "").trim();
+    var label = String(item && item.label || key || "未命名").trim();
+    var dataKey = key || (category + "_" + idx);
+    return (
+      '<label class="save-tpl-entity-row save-tpl-change-row" style="display:flex;align-items:center;gap:10px;min-width:0;padding:8px 10px;background:#FFFFFF;border:1px solid #E2E9F1;border-radius:12px;color:#172C43;box-shadow:0 1px 2px rgba(15,30,55,0.025);cursor:pointer;transition:border-color .16s ease, box-shadow .16s ease">' +
+        '<input type="checkbox" class="saveTplAdditionCheckbox" style="width:18px;height:18px;accent-color:#2F6FDB;flex:0 0 auto" data-category="' + escapeHtml(category) + '" data-key="' + escapeHtml(dataKey) + '" checked />' +
+        _worldTemplateSaveChangeThumbHtml(item, category) +
+        '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:700;line-height:1.35" title="' + escapeHtml(label) + '">' + escapeHtml(label) + '</span>' +
+      '</label>'
+    );
+  }).join("");
+  return (
+    '<section class="save-tpl-entity-card" style="min-width:0;background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:16px;box-shadow:0 10px 28px rgba(15,30,55,0.045)">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px">' +
+        '<div style="display:flex;align-items:center;gap:10px;min-width:0;color:#172C43;font-size:17px;font-weight:800;line-height:1.2">' +
+          '<span class="material-symbols-outlined" style="font-size:22px;color:#647A92">' + icon + '</span>' +
+          '<span>' + escapeHtml(title) + '</span>' +
+        '</div>' +
+        '<span style="display:inline-flex;align-items:center;justify-content:center;min-width:42px;height:24px;padding:0 10px;border-radius:999px;background:#EAF0FF;color:#3268D8;font-size:13px;font-weight:800">' + items.length + ' 个</span>' +
+      '</div>' +
+      (rows ? '<div style="display:grid;grid-template-columns:1fr;gap:8px;max-height:260px;overflow:auto;padding-right:2px">' + rows + '</div>' : '<div style="padding:18px 14px;border-radius:12px;background:#F7FAFD;color:#8A9BAD;font-size:13px">' + escapeHtml(emptyCopy || "暂无新增") + '</div>') +
+    '</section>'
+  );
+}
+
+function _worldTemplateSaveUpdatePreviewHtml(data) {
+  data = data || {};
+  var additions = data.additions || {};
+  var promotions = data.promotions || {};
+  var additionTotal = Number(data.additionTotal || 0);
+  var promotionTotal = Number(data.promotionTotal || 0);
+  var changeTotal = Number(data.changeTotal || (additionTotal + promotionTotal));
+  var sections = [];
+  ["characters", "characterCandidates", "locations", "props"].forEach(function (category) {
+    var items = Array.isArray(additions[category]) ? additions[category] : [];
+    if (!items.length) return;
+    sections.push(_worldTemplateSaveChangeSectionHtml(_worldTemplateSaveChangeTitle(category), category, items, "暂无新增"));
+  });
+  var promoted = Array.isArray(promotions.characterCandidatesToCharacters) ? promotions.characterCandidatesToCharacters : [];
+  if (promoted.length) {
+    sections.push(_worldTemplateSaveChangeSectionHtml("候选转正", "characters", promoted, "暂无转正角色"));
+  }
+  var summary = "新增 " + additionTotal + " 个";
+  if (promotionTotal) summary += " · 转正 " + promotionTotal + " 个";
+  return (
+    '<section style="background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:16px 18px;box-shadow:0 8px 24px rgba(15,30,55,0.035);margin-bottom:14px">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:' + (sections.length ? '14px' : '0') + '">' +
+        '<div style="min-width:0">' +
+          '<div style="color:#172C43;font-size:17px;font-weight:900;line-height:1.25">新增资产</div>' +
+          '<div style="margin-top:4px;color:#7D8EA5;font-size:13px;font-weight:650;line-height:1.35">只会追加勾选的新资产；未勾选项本次不进入模板，模板已有资产不会被删除</div>' +
+        '</div>' +
+        '<span style="display:inline-flex;align-items:center;justify-content:center;min-width:88px;height:28px;padding:0 12px;border-radius:999px;background:#EAF0FF;color:#3268D8;font-size:13px;font-weight:850;white-space:nowrap">' + escapeHtml(summary) + '</span>' +
+      '</div>' +
+      (sections.length
+        ? '<div class="save-tpl-update-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:16px">' + sections.join("") + '</div>'
+        : '<div style="padding:22px 16px;border-radius:12px;background:#F7FAFD;color:#60748A;font-size:14px;font-weight:750;line-height:1.45">' + (changeTotal ? "本次没有可勾选的新资产" : "无新增资产，本次仅同步模板字段") + '</div>') +
+    '</section>'
+  );
 }
 
 function _openSaveTemplateDialog() {
   var existing = document.getElementById("saveTplDialog");
-  if (existing) existing.remove();
+  if (existing) _removeSaveTemplateDialog(existing);
 
   if (!_worldTemplatesPrimed) {
     showToast("正在加载世界观模板…", "info");
@@ -5179,18 +5371,16 @@ function _openSaveTemplateDialog() {
 
   var defaultName = (project.name || "未命名") + " · 世界观";
   var templates = _getWorldTemplates();
-  var currentWorldId = (project.worldTemplateSnapshot && project.worldTemplateSnapshot.id) || project.selectedWorldTemplateId || "";
-  var characterStats = _worldTemplateSaveCharacterStats();
-
-  var charPreviewHtml = "";
-  if (project.assets && project.assets.characters) {
-    project.assets.characters.slice(0, 5).forEach(function (ch) {
-      var src = ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "";
-      if (src) {
-        charPreviewHtml += '<img src="' + escapeHtml(src) + '" class="w-10 h-10 rounded-full object-cover border-2 border-white shadow-sm -ml-2 first:ml-0" title="' + escapeHtml(ch.name) + '" />';
-      }
-    });
-  }
+  var updateTarget = _resolveWorldTemplateUpdateTarget(templates);
+  var defaultMode = updateTarget.template ? "update" : "create";
+  var currentWorldId = updateTarget.templateId || ((project.worldTemplateSnapshot && project.worldTemplateSnapshot.id) || project.selectedWorldTemplateId || "");
+  var initialUpdateName = updateTarget.template ? String(updateTarget.template.name || updateTarget.template.id || "").trim() : "";
+  var initialName = defaultMode === "update" ? (initialUpdateName || defaultName) : defaultName;
+  var saveEntities = _worldTemplateCurrentSaveEntities();
+  var entitySelectionHtml =
+    _worldTemplateSaveEntitySectionHtml("characters", "角色", saveEntities.characters) +
+    _worldTemplateSaveEntitySectionHtml("locations", "场景", saveEntities.locations) +
+    _worldTemplateSaveEntitySectionHtml("props", "道具", saveEntities.props);
   var updateOptions = templates.map(function (tpl) {
     return '<option value="' + escapeHtml(tpl.id) + '"' + (tpl.id === currentWorldId ? ' selected' : '') + '>' + escapeHtml(tpl.name || tpl.id) + '</option>';
   }).join("");
@@ -5201,60 +5391,212 @@ function _openSaveTemplateDialog() {
   overlay.style.animation = "fadeIn .2s ease";
 
   overlay.innerHTML =
-    '<div class="bg-white rounded-2xl shadow-2xl w-[440px] max-w-[90vw] overflow-hidden" onclick="event.stopPropagation()">' +
-      '<div class="px-7 pt-7 pb-5">' +
-        '<div class="flex items-center gap-3 mb-5">' +
-          '<div class="w-11 h-11 rounded-xl bg-gradient-to-br from-[#5B6ABF]/15 to-[#5B6ABF]/5 flex items-center justify-center shrink-0">' +
-            '<span class="material-symbols-outlined text-[#5B6ABF] text-xl">bookmark_add</span>' +
+    '<div class="save-tpl-card" style="width:min(1320px,94vw);height:min(760px,90vh);max-height:90vh;background:#F6F9FC;border:1px solid #DCE5EF;border-radius:16px;box-shadow:0 22px 60px rgba(13,31,52,0.18);overflow:hidden;display:flex;flex-direction:column" onclick="event.stopPropagation()">' +
+      '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:24px 34px 16px 34px;flex:0 0 auto">' +
+        '<div style="display:flex;align-items:center;gap:18px;min-width:0">' +
+          '<div style="width:60px;height:60px;border-radius:999px;background:#EEF3FF;border:1px solid #D7E1FF;display:flex;align-items:center;justify-content:center;box-shadow:inset 0 1px 0 rgba(255,255,255,0.75);flex:0 0 auto">' +
+            '<span class="material-symbols-outlined" style="font-size:29px;color:#3867D6">bookmark_add</span>' +
           '</div>' +
-          '<div>' +
-          '<h3 class="text-base font-bold text-[#1a1a1a]">保存为世界观模板</h3>' +
-          '<p class="text-[11px] text-[#90A4AE] mt-0.5">保存角色与世界观参考，并记录当前风格模板偏好</p>' +
+          '<div style="min-width:0">' +
+            '<h3 id="saveTplDialogTitle" style="margin:0;color:#102033;font-size:26px;font-weight:900;letter-spacing:0;line-height:1.2">' + (defaultMode === "update" ? "更新世界观模板" : "保存为世界观模板") + '</h3>' +
+            '<p style="margin:7px 0 0;color:#7D8EA5;font-size:14px;font-weight:600;line-height:1.35">保存角色与世界观参考，并记录当前风格模板偏好</p>' +
           '</div>' +
         '</div>' +
-        '<div class="mb-5">' +
-          '<label class="block text-[11px] font-bold text-[#607D8B] tracking-wide uppercase mb-2">模板名称</label>' +
-          '<input type="text" id="saveTplNameInput" class="w-full px-4 py-3 bg-[#F8F9FA] border border-[#E0E0E0] rounded-xl text-sm text-[#1a1a1a] focus:outline-none focus:ring-2 focus:ring-[#5B6ABF]/30 focus:border-[#5B6ABF]/50 transition-all" value="' + escapeHtml(defaultName) + '" />' +
-        '</div>' +
-        '<div class="mb-5 bg-[#F8F9FA] rounded-xl p-4 space-y-3">' +
-          '<label class="flex items-center gap-2 text-xs font-bold text-[#2C3E50]"><input type="radio" name="saveTplMode" value="create" checked />新建模板</label>' +
-          '<label class="flex items-center gap-2 text-xs font-bold text-[#2C3E50] ' + (templates.length ? '' : 'opacity-40') + '"><input type="radio" name="saveTplMode" value="update" ' + (templates.length ? '' : 'disabled') + ' />更新已有模板</label>' +
-          '<select id="saveTplUpdateSelect" class="w-full px-3 py-2 bg-white border border-[#E0E0E0] rounded-lg text-xs text-[#2C3E50]" ' + (templates.length ? '' : 'disabled') + '>' + updateOptions + '</select>' +
-        '</div>' +
-        '<div class="bg-[#F8F9FA] rounded-xl p-4 space-y-2.5">' +
-          '<div class="flex items-center justify-between text-[11px]">' +
-            '<span class="text-[#90A4AE] font-medium">锁定角色</span>' +
-            '<div class="flex items-center gap-2">' +
-              (charPreviewHtml ? '<div class="flex items-center">' + charPreviewHtml + '</div>' : '') +
-              '<span class="text-[#2C3E50] font-bold">' + characterStats.lockedCount + ' 个</span>' +
+        '<button type="button" id="saveTplClose" title="关闭" style="width:38px;height:38px;border:0;background:transparent;color:#66788D;border-radius:999px;display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto">' +
+          '<span class="material-symbols-outlined" style="font-size:27px">close</span>' +
+        '</button>' +
+      '</div>' +
+      '<div style="padding:0 34px 20px 34px;overflow-y:auto;flex:1 1 auto;min-height:0" data-save-tpl-scroll="true">' +
+        (updateTarget.reason === "missing"
+          ? '<section style="display:flex;align-items:flex-start;gap:10px;background:#FFF8E8;border:1px solid #F3D9A6;border-radius:14px;padding:12px 16px;margin-bottom:14px;color:#76510A;font-size:13px;font-weight:750;line-height:1.45"><span class="material-symbols-outlined" style="font-size:19px;color:#B7791F;flex:0 0 auto">info</span><span>原绑定世界观模板不可用，已回退为新建模板。</span></section>'
+          : '') +
+        '<section class="save-tpl-basic-card" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr));gap:26px;align-items:end;background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:18px 22px;box-shadow:0 8px 24px rgba(15,30,55,0.035);margin-bottom:16px">' +
+          '<div style="min-width:0">' +
+            '<label style="display:block;margin-bottom:12px;color:#405D76;font-size:14px;font-weight:800">模板名称</label>' +
+            '<input type="text" id="saveTplNameInput" style="width:100%;height:44px;padding:0 16px;background:#FFFFFF;border:1px solid #CFDAE6;border-radius:11px;color:#172C43;font-size:15px;font-weight:700;outline:none;box-shadow:inset 0 1px 0 rgba(15,30,55,0.03)" value="' + escapeHtml(initialName) + '" />' +
+          '</div>' +
+          '<div style="min-width:0;border-left:1px solid #E0E7EF;padding-left:26px">' +
+            '<div style="display:flex;align-items:center;gap:34px;flex-wrap:wrap;margin-bottom:12px">' +
+              '<label style="display:inline-flex;align-items:center;gap:10px;color:#172C43;font-size:15px;font-weight:800;white-space:nowrap"><input type="radio" name="saveTplMode" value="create" style="width:18px;height:18px;accent-color:#2F6FDB" ' + (defaultMode === "create" ? 'checked' : '') + ' />新建模板</label>' +
+              '<label style="display:inline-flex;align-items:center;gap:10px;color:#172C43;font-size:15px;font-weight:800;white-space:nowrap;' + (templates.length ? '' : 'opacity:.45;') + '"><input type="radio" name="saveTplMode" value="update" style="width:18px;height:18px;accent-color:#2F6FDB" ' + (templates.length ? '' : 'disabled') + ' ' + (defaultMode === "update" ? 'checked' : '') + ' />更新已有模板</label>' +
             '</div>' +
+            '<select id="saveTplUpdateSelect" style="width:100%;height:44px;padding:0 14px;background:#FFFFFF;border:1px solid #CFDAE6;border-radius:11px;color:#172C43;font-size:15px;font-weight:700;outline:none" ' + (templates.length ? '' : 'disabled') + '>' + updateOptions + '</select>' +
           '</div>' +
-          (characterStats.candidateCount ? '<div class="flex items-center justify-between text-[11px]"><span class="text-[#90A4AE] font-medium">候选角色</span><span class="text-[#2C3E50] font-bold">' + characterStats.candidateCount + ' 个</span></div>' : '') +
-          '<div class="flex items-center justify-between text-[11px] pt-2 border-t border-[#E0E0E0]"><span class="text-[#607D8B] font-bold">保存总计</span><span class="text-[#2C3E50] font-bold">' + characterStats.totalCount + ' 个</span></div>' +
-          (characterStats.candidateCount ? '<p class="text-[10px] text-[#8A6D3B]">draft / needs_review 角色将作为候选参考保存，不进入锁定角色池。</p>' : '') +
-          '<div class="grid grid-cols-2 gap-2 pt-2 border-t border-[#E0E0E0]">' +
-            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeCharacters" checked /> 包含角色</label>' +
-            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeLocations" checked /> 包含场景</label>' +
-            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeProps" checked /> 包含道具</label>' +
-            '<label class="text-[11px] text-[#607D8B]"><input type="checkbox" id="saveTplIncludeTerminology" checked /> 包含术语</label>' +
+        '</section>' +
+        '<div id="saveTplCreateBody" style="' + (defaultMode === "update" ? 'display:none' : '') + '">' +
+          '<div class="save-tpl-entity-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:16px;margin-bottom:14px">' +
+            entitySelectionHtml +
           '</div>' +
         '</div>' +
+        '<div id="saveTplUpdateBody" style="' + (defaultMode === "update" ? '' : 'display:none') + '">' +
+          '<section style="background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:22px;color:#60748A;font-size:14px;font-weight:750;box-shadow:0 8px 24px rgba(15,30,55,0.035)">正在计算新增资产…</section>' +
+        '</div>' +
       '</div>' +
-      '<div class="flex border-t border-[#F0F0F0]">' +
-        '<button class="flex-1 py-4 text-sm font-bold text-[#90A4AE] hover:bg-[#F8F9FA] transition-colors" id="saveTplCancel">取消</button>' +
-        '<button class="flex-1 py-4 text-sm font-bold text-white bg-[#2C3E50] hover:bg-[#34495E] transition-colors" id="saveTplConfirm">保存模板</button>' +
+      '<div style="display:flex;justify-content:flex-end;gap:12px;padding:16px 34px 18px;border-top:1px solid #DDE6F0;background:rgba(255,255,255,0.82);flex:0 0 auto">' +
+        '<button type="button" style="min-width:140px;height:42px;border:1px solid #CFDAE6;border-radius:10px;background:#FFFFFF;color:#8A9BAD;font-size:14px;font-weight:850;cursor:pointer" id="saveTplCancel">取消</button>' +
+        '<button type="button" style="min-width:170px;height:42px;border:0;border-radius:10px;background:#183B84;color:#FFFFFF;font-size:14px;font-weight:850;box-shadow:0 8px 18px rgba(24,59,132,0.24);cursor:pointer" id="saveTplConfirm">保存模板</button>' +
       '</div>' +
-    '</div>';
+    '</div>' +
+    '<style>' +
+      '@media (max-width: 720px) {' +
+        '#saveTplDialog .save-tpl-card{width:calc(100vw - 28px)!important;height:min(820px,92vh)!important;border-radius:14px!important}' +
+        '#saveTplDialog .save-tpl-card > div:first-child{padding:22px 20px 14px!important}' +
+        '#saveTplDialog [data-save-tpl-scroll="true"]{padding:0 20px 16px!important}' +
+        '#saveTplDialog .save-tpl-basic-card{grid-template-columns:1fr!important;padding:18px!important;gap:16px!important}' +
+        '#saveTplDialog .save-tpl-basic-card > div:nth-child(2){border-left:0!important;padding-left:0!important;border-top:1px solid #E0E7EF!important;padding-top:16px!important}' +
+        '#saveTplDialog .save-tpl-entity-grid{grid-template-columns:1fr!important}' +
+        '#saveTplDialog .save-tpl-card h3{font-size:22px!important}' +
+        '#saveTplDialog .save-tpl-card > div:last-child{padding:14px 20px!important;justify-content:stretch!important}' +
+        '#saveTplDialog .save-tpl-card > div:last-child button{flex:1 1 0!important;min-width:0!important}' +
+      '}' +
+      '#saveTplDialog{overscroll-behavior:contain}' +
+      '#saveTplDialog [data-save-tpl-scroll="true"]{overscroll-behavior:contain}' +
+      '#saveTplDialog .save-tpl-entity-row:hover{border-color:#BFD0EA;box-shadow:0 8px 18px rgba(15,30,55,0.055)}' +
+      '#saveTplDialog input:focus,#saveTplDialog select:focus{border-color:#7EA2F2!important;box-shadow:0 0 0 3px rgba(47,111,219,0.12)!important}' +
+      '#saveTplDialog #saveTplClose:hover{background:#EEF3F8!important;color:#172C43!important}' +
+      '#saveTplDialog #saveTplCancel:hover{background:#F7FAFD!important;color:#60748A!important}' +
+      '#saveTplDialog #saveTplConfirm:hover{background:#123273!important}' +
+    '</style>';
 
   overlay.addEventListener("click", function (ev) {
-    if (ev.target === overlay) overlay.remove();
+    if (ev.target === overlay) _removeSaveTemplateDialog(overlay);
   });
 
   document.body.appendChild(overlay);
+  _bindSaveTemplateScrollIsolation(overlay);
+  hydrateProtectedImageElements(overlay);
 
   var input = overlay.querySelector("#saveTplNameInput");
   input.focus();
   input.select();
+  var scrollBody = overlay.querySelector('[data-save-tpl-scroll="true"]');
+  if (scrollBody) {
+    setTimeout(function () { scrollBody.scrollTop = 0; }, 0);
+  }
+
+  var createBody = overlay.querySelector("#saveTplCreateBody");
+  var updateBody = overlay.querySelector("#saveTplUpdateBody");
+  var dialogTitle = overlay.querySelector("#saveTplDialogTitle");
+  var confirmBtn = overlay.querySelector("#saveTplConfirm");
+  var updatePreviewSeq = 0;
+  var nameDirty = false;
+  var nameSyncing = false;
+  var lastSuggestedName = input ? input.value : "";
+
+  function selectedUpdateTemplate() {
+    var select = overlay.querySelector("#saveTplUpdateSelect");
+    var templateId = select ? String(select.value || "").trim() : "";
+    return _findWorldTemplateByIdInList(templates, templateId);
+  }
+
+  function suggestedNameForMode(mode) {
+    if (mode === "update") {
+      var tpl = selectedUpdateTemplate();
+      var tplName = tpl ? String(tpl.name || tpl.id || "").trim() : "";
+      return tplName || defaultName;
+    }
+    return defaultName;
+  }
+
+  function syncNameForMode(mode) {
+    if (!input) return;
+    var suggested = suggestedNameForMode(mode);
+    var current = input.value.trim();
+    if (!nameDirty || !current || current === lastSuggestedName) {
+      nameSyncing = true;
+      input.value = suggested;
+      nameSyncing = false;
+      nameDirty = false;
+      lastSuggestedName = suggested;
+    }
+  }
+
+  if (input) {
+    input.addEventListener("input", function () {
+      if (nameSyncing) return;
+      nameDirty = true;
+    });
+  }
+
+  function setConfirmDisabled(disabled) {
+    if (!confirmBtn) return;
+    confirmBtn.disabled = !!disabled;
+    confirmBtn.style.opacity = disabled ? "0.55" : "";
+    confirmBtn.style.cursor = disabled ? "not-allowed" : "pointer";
+  }
+
+  async function loadUpdatePreview() {
+    var select = overlay.querySelector("#saveTplUpdateSelect");
+    var templateId = select ? String(select.value || "").trim() : "";
+    if (!updateBody) return;
+    if (!templateId) {
+      updateBody.innerHTML = '<section style="background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:22px;color:#8A5A00;font-size:14px;font-weight:750;box-shadow:0 8px 24px rgba(15,30,55,0.035)">请选择要更新的世界观模板</section>';
+      setConfirmDisabled(true);
+      return;
+    }
+    var seq = ++updatePreviewSeq;
+    updateBody.innerHTML = '<section style="background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:22px;color:#60748A;font-size:14px;font-weight:750;box-shadow:0 8px 24px rgba(15,30,55,0.035)">正在计算新增资产…</section>';
+    setConfirmDisabled(true);
+    try {
+      var resp = await fetch("/api/world-templates/from-project", {
+        method: "POST",
+        headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          projectId: project && project.id,
+          mode: "update",
+          templateId: templateId,
+          dryRun: true,
+          include: {
+            characters: true,
+            locations: true,
+            props: true,
+            terminology: false
+          }
+        })
+      });
+      var data = await _parseWorldTemplateResponse(resp);
+      if (seq !== updatePreviewSeq) return;
+      updateBody.innerHTML = _worldTemplateSaveUpdatePreviewHtml(data);
+      hydrateProtectedImageElements(updateBody);
+      setConfirmDisabled(false);
+    } catch (e) {
+      if (seq !== updatePreviewSeq) return;
+      updateBody.innerHTML = '<section style="background:#FFF7F7;border:1px solid #F1C8C8;border-radius:14px;padding:22px;color:#9A2B2B;font-size:14px;font-weight:750;line-height:1.45;box-shadow:0 8px 24px rgba(15,30,55,0.035)">新增资产预览失败：' + escapeHtml((e && e.message) || e || "未知错误") + '</section>';
+      setConfirmDisabled(true);
+    }
+  }
+
+  function setSaveTemplateMode(mode) {
+    mode = mode === "update" && templates.length ? "update" : "create";
+    if (createBody) createBody.style.display = mode === "update" ? "none" : "";
+    if (updateBody) updateBody.style.display = mode === "update" ? "" : "none";
+    if (dialogTitle) dialogTitle.textContent = mode === "update" ? "更新世界观模板" : "保存为世界观模板";
+    if (confirmBtn) confirmBtn.textContent = mode === "update" ? "更新模板" : "保存模板";
+    syncNameForMode(mode);
+    if (mode === "update") {
+      loadUpdatePreview();
+    } else {
+      updatePreviewSeq++;
+      setConfirmDisabled(false);
+    }
+  }
+
+  overlay.querySelectorAll('input[name="saveTplMode"]').forEach(function (node) {
+    node.addEventListener("change", function () {
+      if (node.checked) setSaveTemplateMode(node.value);
+    });
+  });
+  var updateSelect = overlay.querySelector("#saveTplUpdateSelect");
+  if (updateSelect) {
+    updateSelect.addEventListener("change", function () {
+      var modeNode = overlay.querySelector('input[name="saveTplMode"]:checked');
+      if (modeNode && modeNode.value === "update") {
+        syncNameForMode("update");
+        loadUpdatePreview();
+      }
+    });
+  }
+  setSaveTemplateMode(defaultMode);
 
   async function submitSaveTemplate() {
     var name = input.value.trim();
@@ -5268,22 +5610,36 @@ function _openSaveTemplateDialog() {
       return;
     }
     try {
-      await _doSaveWorldTemplate(name, {
+      var excludeEntityKeys = { characters: [], characterCandidates: [], locations: [], props: [], terminology: [] };
+      var selector = mode === "update" ? ".saveTplAdditionCheckbox" : ".saveTplEntityCheckbox";
+      overlay.querySelectorAll(selector).forEach(function (box) {
+        var category = box.dataset && box.dataset.category;
+        var key = box.dataset && box.dataset.key;
+        if (!box.checked && key && excludeEntityKeys[category]) excludeEntityKeys[category].push(key);
+      });
+      var selectedTemplate = mode === "update" ? selectedUpdateTemplate() : null;
+      var selectedTemplateName = selectedTemplate ? String(selectedTemplate.name || selectedTemplate.id || "").trim() : "";
+      var shouldSendName = mode !== "update" || (nameDirty && name && name !== selectedTemplateName);
+      var saveOptions = {
         mode: mode,
         templateId: templateId,
+        sendName: shouldSendName,
         include: {
-          characters: !!overlay.querySelector("#saveTplIncludeCharacters").checked,
-          locations: !!overlay.querySelector("#saveTplIncludeLocations").checked,
-          props: !!overlay.querySelector("#saveTplIncludeProps").checked,
-          terminology: !!overlay.querySelector("#saveTplIncludeTerminology").checked
-        }
-      });
-      overlay.remove();
+          characters: true,
+          locations: true,
+          props: true,
+          terminology: false
+        },
+        excludeEntityKeys: excludeEntityKeys
+      };
+      await _doSaveWorldTemplate(name, saveOptions);
+      _removeSaveTemplateDialog(overlay);
     } catch (_) {}
   }
 
-  overlay.querySelector("#saveTplCancel").addEventListener("click", function () { overlay.remove(); });
-  overlay.querySelector("#saveTplConfirm").addEventListener("click", submitSaveTemplate);
+  overlay.querySelector("#saveTplCancel").addEventListener("click", function () { _removeSaveTemplateDialog(overlay); });
+  overlay.querySelector("#saveTplClose").addEventListener("click", function () { _removeSaveTemplateDialog(overlay); });
+  confirmBtn.addEventListener("click", submitSaveTemplate);
 
   input.addEventListener("keydown", async function (ev) {
     if (ev.key === "Enter") {
@@ -5299,16 +5655,21 @@ async function _doSaveWorldTemplate(name, options) {
     throw new Error("missing project id");
   }
   try {
+    var payload = {
+      projectId: project.id,
+      mode: options.mode || "create",
+      templateId: options.templateId || undefined,
+      include: options.include || {}
+    };
+    if (options.sendName !== false && name) payload.name = name;
+    if (options.excludeEntityKeys) payload.excludeEntityKeys = options.excludeEntityKeys;
+    if (Object.prototype.hasOwnProperty.call(options, "terminologyOverride")) {
+      payload.terminologyOverride = options.terminologyOverride || {};
+    }
     var resp = await fetch("/api/world-templates/from-project", {
       method: "POST",
       headers: Object.assign({}, _getAuthHeaders(), { "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        projectId: project.id,
-        name: name,
-        mode: options.mode || "create",
-        templateId: options.templateId || undefined,
-        include: options.include || {}
-      })
+      body: JSON.stringify(payload)
     });
     var data = await _parseWorldTemplateResponse(resp);
     var saved = data.template;
@@ -5316,38 +5677,13 @@ async function _doSaveWorldTemplate(name, options) {
       if (!_worldTemplatesMem) _worldTemplatesMem = [];
       _worldTemplatesMem = _worldTemplatesMem.filter(function (tpl) { return tpl.id !== saved.id; });
       _worldTemplatesMem.unshift(saved);
+      _refreshSaveWorldTemplateButton();
     }
     showToast((options.mode === "update" ? "世界观模板已更新：" : "世界观模板已保存：") + "「" + name + "」", "success");
   } catch (e) {
     showToast("保存世界观模板失败：" + ((e && e.message) || e), "error");
     throw e;
   }
-}
-
-export function _applyWorldTemplate(tpl) {
-  if (!project) return;
-
-  var worldSnapshot = _attachProjectStylePreferenceToWorldSnapshot(snapshotWorldTemplate(tpl));
-  project.selectedWorldTemplateId = worldSnapshot.id || tpl.id || project.selectedWorldTemplateId || null;
-  project.worldTemplateSnapshot = worldSnapshot;
-
-  if (project.shots && project.shots.length) {
-    project.shots = [];
-    project.shotsApproved = false;
-  }
-  if (project.storyboards && project.storyboards.length) {
-    project.storyboards = [];
-    project.imagesApproved = false;
-    project.videoPromptsApproved = false;
-  }
-
-  _flushAssetsProjectNow();
-
-  var charCount = _worldTemplateCharacterCount(tpl);
-  showToast("已应用世界观模板：世界观来源已记录，" + charCount + " 个角色将进入一致性对账", "success");
-
-  _ctx.refreshOverview();
-  _ctx.switchPage("assets");
 }
 
 export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
@@ -5367,7 +5703,7 @@ export async function _applyWorldTemplateReferenceFromStylePage(tpl) {
     if (_ctx.refreshStylePage) _ctx.refreshStylePage();
     _flushAssetsProjectNow();
   }
-  showToast("已关联世界观「" + ((full && full.name) || "未命名") + "」。它会作为资产候选池和内容规则参考。", "success");
+  showToast("已关联世界观「" + ((full && full.name) || "未命名") + "」", "success");
 }
 
 export async function _applyWorldTemplateFromStylePage(tpl) {
@@ -5416,112 +5752,6 @@ async function _deleteWorldTemplate(tplId) {
     showToast("删除世界观模板失败：" + ((e && e.message) || e), "error");
     throw e;
   }
-}
-
-export function _openTemplateImportModal() {
-  var existing = document.getElementById("tplImportModal");
-  if (existing) existing.remove();
-
-  if (!_worldTemplatesPrimed) {
-    showToast("正在加载世界观模板…", "info");
-    _primeWorldTemplates().then(function () { _openTemplateImportModal(); });
-    return;
-  }
-
-  var templates = _getWorldTemplates();
-  if (!templates.length) {
-    showToast("还没有保存过世界观模板", "warn");
-    return;
-  }
-
-  var overlay = document.createElement("div");
-  overlay.id = "tplImportModal";
-  overlay.className = "fixed inset-0 z-[9998] flex items-center justify-center bg-black/60 backdrop-blur-sm";
-  overlay.style.animation = "fadeIn .2s ease";
-
-  var gridHtml = "";
-  templates.forEach(function (tpl, i) {
-    var charCount = _worldTemplateCharacterCount(tpl);
-    var previewStackHtml = _worldTemplatePreviewStackHtml(tpl, 5);
-    var date = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString() : "";
-
-    gridHtml +=
-      '<div class="group bg-surface-container-low rounded-xl p-5 border-2 border-transparent hover:border-primary/40 transition-all duration-200">' +
-        '<div class="flex items-start justify-between mb-3">' +
-          '<h4 class="text-sm font-bold text-on-background truncate flex-1">' + escapeHtml(tpl.name) + '</h4>' +
-          '<button class="opacity-0 group-hover:opacity-100 transition-opacity w-7 h-7 rounded-full hover:bg-error-container/30 flex items-center justify-center shrink-0 ml-2" data-tpl-delete="' + escapeHtml(tpl.id) + '" title="删除模板">' +
-            '<span class="material-symbols-outlined text-error text-sm">delete_outline</span>' +
-          '</button>' +
-        '</div>' +
-        '<p class="text-[11px] text-on-surface-variant/60 leading-relaxed mb-3">世界观参考 · ' + charCount + ' 个角色</p>' +
-        '<div class="flex items-center justify-between">' +
-          '<div class="flex items-center">' +
-            previewStackHtml +
-            '<span class="text-[10px] text-on-surface-variant/50 ml-2">' + charCount + ' 个角色</span>' +
-          '</div>' +
-          '<span class="text-[10px] text-on-surface-variant/40">' + escapeHtml(date) + '</span>' +
-        '</div>' +
-        '<button class="w-full mt-4 py-2.5 bg-primary text-on-primary rounded-xl text-xs font-bold tracking-wide hover:opacity-90 transition-all" data-tpl-apply="' + i + '">导入到当前项目</button>' +
-      '</div>';
-  });
-
-  overlay.innerHTML =
-    '<div class="bg-surface rounded-2xl shadow-2xl w-[90vw] max-w-3xl max-h-[80vh] flex flex-col overflow-hidden border border-outline-variant/10" onclick="event.stopPropagation()">' +
-      '<div class="flex items-center justify-between px-6 py-4 border-b border-outline-variant/10">' +
-        '<div>' +
-          '<h3 class="text-lg font-bold text-on-background">从世界观模板创建</h3>' +
-          '<p class="text-xs text-on-surface-variant/60 mt-0.5">选择一个模板，将关联世界观作为剧级内容参考</p>' +
-        '</div>' +
-        '<button class="w-9 h-9 rounded-full hover:bg-surface-container flex items-center justify-center transition-colors" id="btnCloseTplModal">' +
-          '<span class="material-symbols-outlined text-on-surface-variant">close</span>' +
-        '</button>' +
-      '</div>' +
-      '<div class="flex-1 overflow-y-auto p-6">' +
-        '<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">' + gridHtml + '</div>' +
-      '</div>' +
-    '</div>';
-
-  overlay.addEventListener("click", function (ev) {
-    if (ev.target === overlay) overlay.remove();
-  });
-
-  document.body.appendChild(overlay);
-  hydrateProtectedImageElements(overlay);
-
-  overlay.querySelector("#btnCloseTplModal").addEventListener("click", function () { overlay.remove(); });
-
-  overlay.querySelectorAll("[data-tpl-apply]").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      var idx = parseInt(btn.dataset.tplApply, 10);
-      var tpl = templates[idx];
-      if (!tpl) return;
-      showConfirm(
-        "导入模板",
-        "将关联世界观模板，已有镜头表和分镜将被清空，确定继续？",
-        async function () {
-          try {
-            var full = await _loadWorldTemplateDetail(tpl);
-            _applyWorldTemplate(full);
-            overlay.remove();
-          } catch (e) {
-            showToast("加载世界观模板失败：" + ((e && e.message) || e), "error");
-          }
-        }
-      );
-    });
-  });
-
-  overlay.querySelectorAll("[data-tpl-delete]").forEach(function (btn) {
-    btn.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      var tplId = btn.dataset.tplDelete;
-      showConfirm("删除模板", "确定删除这个模板？", function () {
-        _deleteWorldTemplate(tplId);
-        overlay.remove();
-        _openTemplateImportModal();
-      });
-    });
-  });
 }
 
 /* ================================================================
@@ -6033,7 +6263,7 @@ function _renderLibraryTemplates(container, templates) {
           '<div class="flex flex-wrap items-center gap-2 min-w-0">' + summaryPills + '</div>' +
           (previewStackHtml ? '<div class="shrink-0 ml-auto">' + previewStackHtml + '</div>' : '') +
         '</div>' +
-        '<button class="w-full py-2.5 bg-[#2C3E50] text-white rounded-xl text-xs font-bold tracking-wide hover:bg-[#34495E] transition-colors" data-tpl-lib-apply="' + i + '">导入到当前项目</button>' +
+        '<button class="w-full py-2.5 bg-[#2C3E50] text-white rounded-xl text-xs font-bold tracking-wide hover:bg-[#34495E] transition-colors" data-tpl-lib-apply="' + i + '">关联到当前项目</button>' +
       '</div>';
   });
   container.innerHTML = html;
@@ -6052,17 +6282,23 @@ function _renderLibraryTemplates(container, templates) {
 
   container.querySelectorAll("[data-tpl-lib-apply]").forEach(function (btn) {
     btn.addEventListener("click", async function () {
-      var idx = parseInt(btn.dataset.tplLibApply, 10);
-      var tpl = templates[idx];
-      if (!tpl) return;
-      if (!confirm("导入模板将关联世界观，已有的镜头表和分镜将被清空，确定继续？")) return;
-      try {
-        var full = await _loadWorldTemplateDetail(tpl);
-        _applyWorldTemplate(full);
-      } catch (e) {
-        showToast("加载世界观模板失败：" + ((e && e.message) || e), "error");
-      }
-    });
+	      var idx = parseInt(btn.dataset.tplLibApply, 10);
+	      var tpl = templates[idx];
+	      if (!tpl) return;
+	      var tplName = tpl.name || "未命名";
+	      var projectName = (project && (project.name || project.title)) || "当前项目";
+	      if (!confirm("将把世界观模板「" + tplName + "」关联到当前项目「" + projectName + "」。现有镜头表、分镜、视频任务、剪辑数据不会清空。确定继续？")) return;
+	      try {
+	        if (_ctx && typeof _ctx.applyWorldTemplateSelection === "function") {
+	          await _ctx.applyWorldTemplateSelection(tpl);
+	        } else {
+	          await _applyWorldTemplateReferenceFromStylePage(tpl);
+	        }
+	        refreshLibraryPage();
+	      } catch (e) {
+	        showToast("世界观关联失败: " + ((e && e.message) || e), "error");
+	      }
+	    });
   });
 }
 
@@ -6459,6 +6695,10 @@ export async function _showCleanObsoleteDialog() {
 export function _markDownstreamStale(scope, detail) {
   if (!project) return;
   if (!project._staleFlags) project._staleFlags = {};
+  if (scope === "script") {
+    project._staleFlags["assets"] = true;
+    _setStaleFlagReasonForProject(project, "assets", "script_changed");
+  }
   apiPost("/api/orchestration/compute-stale", {
     scope: scope,
     detail: detail,
@@ -6488,6 +6728,7 @@ export function _markDownstreamStaleFallback(scope, detail) {
   } else if (scope === "script") {
     project._staleFlags["style_bible"] = true;
     project._staleFlags["assets"] = true;
+    _setStaleFlagReasonForProject(project, "assets", "script_changed");
   } else if (scope === "style_bible") {
     var shots1 = (project.shots || []);
     for (var si1 = 0; si1 < shots1.length; si1++) {
@@ -6529,6 +6770,7 @@ export function _isStale(key) {
 export function _clearStale(key) {
   if (project && project._staleFlags) {
     delete project._staleFlags[key];
+    _clearStaleFlagReasonForProject(project, key);
     _saveAssetsProject();
   }
 }

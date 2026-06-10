@@ -421,6 +421,8 @@ export async function POST(req: NextRequest) {
       assets.characters = parsed.characters;
       const staleFlags = { ...(((proj as any)._staleFlags || {}) as Record<string, unknown>) };
       delete staleFlags.assets;
+      const staleFlagReasons = { ...(((proj as any)._staleFlagReasons || {}) as Record<string, unknown>) };
+      delete staleFlagReasons.assets;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
       updateProjectForUser(projectId, user.id, {
         characters: parsed.characters,
@@ -430,6 +432,7 @@ export async function POST(req: NextRequest) {
         consistency: consistencyProject.consistency,
         pendingWorldFacts: null,
         _staleFlags: staleFlags,
+        _staleFlagReasons: staleFlagReasons,
         assetsApproved: false,
         currentStep: 2,
       });

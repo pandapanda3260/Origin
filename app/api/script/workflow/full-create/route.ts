@@ -9,6 +9,13 @@ import {
   buildReviseMessages,
 } from '@/lib/prompts';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { looksLikeFiveActScript } from '@/lib/script-output-guard';
+import {
+  appendScriptTimeline,
+  buildDraftEvent,
+  buildInstructionEvent,
+  nextScriptTimelineVersion,
+} from '@/lib/script-timeline';
 import { getJson } from '@/lib/kv-db';
 import { InsufficientCreditsError } from '@/lib/credits';
 import { assertCanStartPaidOperation } from '@/lib/usage-billing';
@@ -138,6 +145,18 @@ export async function POST(req: NextRequest) {
     // 还有 \r\n 序列、行尾多余空格、多空行也一并整理
     scriptText = normalizeScriptWhitespace(scriptText);
 
+    // 守门：模型偶尔无视提示词，把指令当聊天回应（实例：指令"删除当前剧本"
+    // → 输出"已删除当前剧本。请提供新的创作需求…"）。不像剧本 → 不重标、
+    // 不落库，直接报错，当前剧本保持不变。
+    if (!looksLikeFiveActScript(scriptText)) {
+      writer.error(
+        isRevise
+          ? 'AI 没有按剧本格式返回（可能把这条指令当成了聊天），本次修改未生效，当前剧本保持不变。请换成剧本修改类指令，如"把开头改得更紧凑"。'
+          : 'AI 没有按剧本格式输出，本次结果未保存，请调整描述后重试。',
+      );
+      return;
+    }
+
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
     let emotions: any[] = [];
@@ -171,8 +190,29 @@ export async function POST(req: NextRequest) {
       console.warn('[full-create] emotions failed after retries:', e?.message);
     }
 
+    let savedServerVersion: number | null = null;
+    let savedTimeline: any[] | null = null;
     if (projectId && proj) {
+      // 时间线：revise 记"指令+新草稿"两条，create/adapt 只记新草稿
+      const baseTimeline = (proj as any).scriptTimeline;
+      const tlEvents = [] as any[];
+      let instrEvt: any = null;
+      if (isRevise && instruction) {
+        instrEvt = buildInstructionEvent(instruction, 'revise');
+        tlEvents.push(instrEvt);
+      }
+      tlEvents.push(
+        buildDraftEvent({
+          version: nextScriptTimelineVersion(baseTimeline),
+          script: scriptText,
+          source: isRevise ? 'revise' : 'generate',
+          instructionId: instrEvt ? instrEvt.id : undefined,
+          emotionSegments: emotions.length ? emotions : undefined,
+        }),
+      );
+      savedTimeline = appendScriptTimeline(baseTimeline, tlEvents);
       const writePayload: Record<string, any> = {
+        scriptTimeline: savedTimeline,
         scriptDraft: scriptText,
         script: scriptText,
         emotions,
@@ -184,7 +224,10 @@ export async function POST(req: NextRequest) {
       // 修改模式不要覆盖 oneSentence —— 原创意要保留
       if (!isRevise) writePayload.oneSentence = oneSentenceBrief;
       try {
-        updateProjectForUser(projectId, user.id, writePayload);
+        const updated = updateProjectForUser(projectId, user.id, writePayload);
+        // 服务端落库 version+1；把新 version 带回 done，前端写回内存后
+        // 后续 PUT 才不会必撞 409（"已同步到服务器最新版本"churn）。
+        savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
       } catch (e: any) {
         writer.error('保存失败：' + (e?.message || String(e)));
         return;
@@ -225,6 +268,9 @@ export async function POST(req: NextRequest) {
       title: extractTitle(scriptText, isAdapt ? oneSentenceBrief : finalSentence),
       generationMode: isRevise ? 'revise' : isAdapt ? 'adapt' : 'create',
       oneSentenceBrief: isAdapt ? oneSentenceBrief : undefined,
+      serverVersion: savedServerVersion ?? undefined,
+      // 前端必须把最新时间线写回内存，否则随后的整项目 PUT 会用旧数组盖掉这次 append
+      scriptTimeline: savedTimeline ?? undefined,
     });
   });
 }

@@ -246,6 +246,96 @@ function projectSummaryStatusCounts(data: any) {
   return counts;
 }
 
+function projectSummaryStyleBibleUsable(data: any): boolean {
+  const sb = data?.styleBible;
+  if (!sb || typeof sb !== 'object') return false;
+  const hasContent = Object.keys(sb).some((key) => {
+    const value = (sb as any)[key];
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return Object.keys(value).length > 0;
+    return String(value || '').trim().length > 0;
+  });
+  if (!hasContent) return false;
+  const status = data?.styleBibleStatus;
+  return status === 'ready' || !status;
+}
+
+function projectSummaryCanEnterEdit(data: any): boolean {
+  const editData = data?.editData || {};
+  if (editData?.readiness?.canEnterEdit === true) return true;
+  if (arr(editData?.edl?.timeline).length > 0) return true;
+  return arr(data?.storyboards).some((sb: any) => sb && sb.importedToEdit === true);
+}
+
+export type ProjectStageInfo = {
+  stage: 'script' | 'style' | 'assets' | 'shots' | 'images' | 'prompts' | 'batch' | 'edit' | 'done';
+  done: number;
+  total: number;
+  failed: number;
+  running: number;
+};
+
+// 任务列表状态胶囊的"阶段"判定（与前端 public/main.js 的 _ovProjectStageInfo 保持同构，改一处必须同步另一处）。
+// 思路：从最远的下游产物倒推阶段（成片 > 可剪辑 > 片段 > 提示词 > 镜头图 > 镜头设计），
+// 不依赖 *Approved 确认 flag——实际数据里用户经常跳过确认按钮，flag 与真实进度脱节
+// （例：已导出成片的项目 imagesApproved 仍是 false）。只有尚无任何生成产物的
+// 早期创作阶段（剧本/风格/资产/镜头设计）才用 approve flag 区分。
+// 注意：有成片导出（editData.exportUrl）就算已完成，之后剪辑页再改动也不回退状态。
+export function projectSummaryStageInfo(
+  data: any,
+  statusCounts: { running: number; done: number; failed: number; pending: number },
+  segmentCount: number,
+): ProjectStageInfo {
+  const sbs = arr(data?.storyboards);
+  const panelTotal = sbs.length;
+  let imgDone = 0;
+  let imgFailed = 0;
+  let prReady = 0;
+  let prGen = 0;
+  let prFailed = 0;
+  for (const raw of sbs) {
+    const sb = raw || {};
+    if (firstValue(sb.rawUrl, sb.imageUrl, sb.firstFrameUrl)) imgDone += 1;
+    else if (sb.firstFrameLastError) imgFailed += 1;
+    if (sb.videoPromptStatus === 'generating') prGen += 1;
+    else if (sb.videoPromptStatus === 'failed') prFailed += 1;
+    else if (sb.videoPrompt && (!sb.videoPromptStatus || sb.videoPromptStatus === 'ready')) prReady += 1;
+  }
+  const info = (
+    stage: ProjectStageInfo['stage'],
+    done = 0,
+    total = 0,
+    failed = 0,
+    running = 0,
+  ): ProjectStageInfo => ({ stage, done, total, failed, running });
+
+  if (data?.editData?.exportUrl) return info('done', segmentCount, segmentCount);
+  // 有片段正在生成：优先于"成片剪辑中"展示（重生成片段时回到片段生成态）。
+  if (statusCounts.running > 0) {
+    return info('batch', statusCounts.done, segmentCount, statusCounts.failed, statusCounts.running);
+  }
+  if (projectSummaryCanEnterEdit(data)) return info('edit', statusCounts.done, segmentCount);
+  if (statusCounts.done + statusCounts.failed > 0) {
+    // 片段全部完成 → 视为进入剪辑阶段（生成已结束，下一步就是剪）。
+    if (segmentCount > 0 && statusCounts.done >= segmentCount) return info('edit', statusCounts.done, segmentCount);
+    return info('batch', statusCounts.done, segmentCount, statusCounts.failed, statusCounts.running);
+  }
+  if (prReady + prGen + prFailed > 0) {
+    // 提示词全就绪 → 下一步是片段生成，从 0% 开始展示。
+    if (panelTotal > 0 && prReady >= panelTotal) return info('batch', 0, segmentCount);
+    return info('prompts', prReady, panelTotal, prFailed, prGen);
+  }
+  if (imgDone + imgFailed > 0) {
+    if (panelTotal > 0 && imgDone >= panelTotal) return info('prompts', prReady, panelTotal);
+    return info('images', imgDone, panelTotal, imgFailed);
+  }
+  if (arr(data?.shots).length > 0) return info('images', imgDone, panelTotal || arr(data?.shots).length);
+  if (!data?.script || !data?.scriptApproved) return info('script');
+  if (!projectSummaryStyleBibleUsable(data)) return info('style');
+  if (!data?.assetsApproved) return info('assets');
+  return info('shots');
+}
+
 function projectSummaryDurationSec(data: any): number {
   const sbs = arr(data?.storyboards);
   const vts = arr(data?.videoTasks);
@@ -272,6 +362,8 @@ function projectSummaryThumbnail(data: any): string {
 function rowToSummary(r: ProjectRow) {
   let data: any = {};
   try { data = JSON.parse(r.data_json || '{}'); } catch { data = {}; }
+  const statusCounts = projectSummaryStatusCounts(data);
+  const segmentCount = projectSummarySegmentCount(data);
   return {
     id: r.id,
     name: r.title,
@@ -284,8 +376,9 @@ function rowToSummary(r: ProjectRow) {
     version: Number(r.version) || 1,
     clientRequestId: data?.clientRequestId,
     assetCount: projectSummaryAssetCount(data),
-    segmentCount: projectSummarySegmentCount(data),
-    statusCounts: projectSummaryStatusCounts(data),
+    segmentCount,
+    statusCounts,
+    stageInfo: projectSummaryStageInfo(data, statusCounts, segmentCount),
     durationSec: projectSummaryDurationSec(data),
     thumbnail: projectSummaryThumbnail(data),
   };

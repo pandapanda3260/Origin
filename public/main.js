@@ -16,7 +16,7 @@ import { initProject, getProject, setProject, loadProject, loadProjectData, save
   _notifyServerTaskDone,
   _archiveOldImage, _safeWriteBack, _flushServerSave, fetchProjectByIdShared,
   flushPendingProjectSaveOnUnload } from './modules/project.js?v=105';
-import { EPISODE_FIELDS } from './modules/episode_fields.js?v=100';
+import { EPISODE_FIELDS } from './modules/episode_fields.js?v=101';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
@@ -30,23 +30,24 @@ import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
   refineVideoPrompt, handleVideoPromptAction,
   getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave,
-  reattachVideoPromptBatches } from './modules/videoPrompts.js';
+  reattachVideoPromptBatches } from './modules/videoPrompts.js?v=111';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=107';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=109';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=138';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=144';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
   extractStyleBible,
   initScriptImportEvents, confirmScript, tagEmotions, renderEmotionSegments, renderScriptAnalysis,
-  refreshScriptImportDraft, emotionBadgeHtml, showScriptEdit, showScriptDisplay, isScriptGenerating } from './modules/script.js?v=106';
+  refreshScriptImportDraft, emotionBadgeHtml, showScriptEdit, showScriptDisplay, isScriptGenerating,
+  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=113';
 import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   renderAssets, renderAssetGrid, updateAssetCardImage, generateSingleAssetImage,
   generateAllAssetImages, checkAssetsConfirm, confirmAssets, handleAssetAction,
@@ -57,12 +58,12 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _syncAssetToStyleBible, _getAssetDescText, _getAssetName, _autoSyncUpstream,
   _checkEquipmentChange, _detectObsoleteAssets, _removeObsoleteAssets, _showCleanObsoleteDialog,
   _markDownstreamStale, _markDownstreamStaleFallback, _getShotGroupIndices,
-  _isStale, _clearStale,
+  _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=141';
+  _openLightbox } from './modules/assets.js?v=158';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=202';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=207';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=106';
 import { mountPixelCard } from './modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
@@ -366,6 +367,8 @@ var _scriptEditInitialText = "";
       project.scriptReviewState = "modified";
       _markDownstreamStale("script", {});
       saveProject();
+      // 时间线：记 draft(edit) 事件 + 改前版本沉为折叠卡
+      recordManualScriptEditToTimeline(current, next);
       showToast("剧本修改已保存，下游内容已标记为需重新生成", "success");
     } else {
       showToast("剧本没有变化", "info");
@@ -804,8 +807,15 @@ var _scriptEditInitialText = "";
       // 后端 workflow 已完成：追加剧本内容 + 清下游（shots / storyboards /
       // imagesApproved）+ 重标情绪段并落盘 project.json。前端只负责把 done
       // 事件里的字段同步回内存，避免再起网络往返。
+	      var _expandPrevScript = String(project.script || "");
 	      project.script = resp.script || "";
 	      project.scriptDraft = resp.script || "";
+	      // 后端 expand 已落库 version+1，对齐内存 version 避免随后的 PUT 撞 409
+	      if (typeof resp.serverVersion === "number" && resp.serverVersion > (Number(project.version) || 0)) {
+	        project.version = resp.serverVersion;
+	      }
+	      // 后端已 append 时间线；同步回内存，避免随后的整项目 PUT 用旧数组盖掉
+	      if (Array.isArray(resp.scriptTimeline)) project.scriptTimeline = resp.scriptTimeline;
 	      project.emotionSegments = Array.isArray(resp.emotionSegments) ? resp.emotionSegments : [];
       if (resp.clearedDownstream) {
         project.shots = [];
@@ -826,6 +836,10 @@ var _scriptEditInitialText = "";
       }
       overlay.remove();
       refreshScriptPage();
+      // 时间线：扩充前的版本沉为折叠卡
+      if (_expandPrevScript.trim() && _expandPrevScript.trim() !== String(resp.script || "").trim()) {
+        noteScriptDraftSuperseded(_expandPrevScript);
+      }
     } catch (e) {
       var errMsg = ((e && e.message) || e).toString().slice(0, 120);
       if (statusEl) statusEl.textContent = "扩充失败: " + errMsg;
@@ -2284,6 +2298,7 @@ var _scriptEditInitialText = "";
   var _ovProjectTaskNavigating = false;
   var _ovProjectTaskDeleting = false;
   var _ovProjectTaskCreating = false;
+  var _ovLastCardClick = { id: "", time: 0 };
   var _ovSearchLastUserInputAt = 0;
   var _ovSearchLastFocusAt = 0;
   var _ovSearchComposing = false;
@@ -2707,10 +2722,84 @@ var _scriptEditInitialText = "";
     return "pending";
   }
 
+  // 状态胶囊的阶段文案。images/prompts/batch 三个阶段带百分比，失败时显示"xx生成失败"。
+  var _ovStageLabels = {
+    script: "剧本创作中",
+    style: "风格编辑中",
+    assets: "资产整理中",
+    shots: "镜头设计中",
+    images: "镜头生成",
+    prompts: "提示词生成",
+    batch: "片段生成",
+    edit: "成片剪辑中",
+    done: "已完成",
+  };
+
+  // 项目阶段判定（与服务端 lib/projects-db.ts 的 projectSummaryStageInfo 保持同构，改一处必须同步另一处）。
+  // 从最远的下游产物倒推阶段（成片 > 可剪辑 > 片段 > 提示词 > 镜头图 > 镜头设计），
+  // 不依赖 *Approved 确认 flag——实际数据里用户经常跳过确认按钮，flag 与真实进度脱节；
+  // 只有尚无任何生成产物的早期创作阶段（剧本/风格/资产/镜头设计）才用 flag 区分。
+  // 有成片导出（editData.exportUrl）就算已完成，之后剪辑页再改动也不回退状态。
+  function _ovProjectStageInfo(proj, counts, segmentCount) {
+    proj = proj || {};
+    counts = counts || { running: 0, done: 0, failed: 0 };
+    segmentCount = Number(segmentCount) || 0;
+    var sbs = Array.isArray(proj.storyboards) ? proj.storyboards : [];
+    var panelTotal = sbs.length;
+    var imgDone = 0, imgFailed = 0, prReady = 0, prGen = 0, prFailed = 0;
+    sbs.forEach(function (raw) {
+      var sb = raw || {};
+      if (_ovFirst(sb.rawUrl, sb.imageUrl, sb.firstFrameUrl)) imgDone++;
+      else if (sb.firstFrameLastError) imgFailed++;
+      if (sb.videoPromptStatus === "generating") prGen++;
+      else if (sb.videoPromptStatus === "failed") prFailed++;
+      else if (sb.videoPrompt && (!sb.videoPromptStatus || sb.videoPromptStatus === "ready")) prReady++;
+    });
+    function info(stage, done, total, failed, running) {
+      return { stage: stage, done: done || 0, total: total || 0, failed: failed || 0, running: running || 0 };
+    }
+    if (proj.editData && proj.editData.exportUrl) return info("done", segmentCount, segmentCount);
+    // 有片段正在生成：优先于"成片剪辑中"展示（重生成片段时回到片段生成态）。
+    if (counts.running > 0) {
+      return info("batch", counts.done, segmentCount, counts.failed, counts.running);
+    }
+    if (_ovProjectCanEnterEdit(proj)) return info("edit", counts.done, segmentCount);
+    if (counts.done + counts.failed > 0) {
+      // 片段全部完成 → 视为进入剪辑阶段（生成已结束，下一步就是剪）。
+      if (segmentCount > 0 && counts.done >= segmentCount) return info("edit", counts.done, segmentCount);
+      return info("batch", counts.done, segmentCount, counts.failed, counts.running);
+    }
+    if (prReady + prGen + prFailed > 0) {
+      // 提示词全就绪 → 下一步是片段生成，从 0% 开始展示。
+      if (panelTotal > 0 && prReady >= panelTotal) return info("batch", 0, segmentCount);
+      return info("prompts", prReady, panelTotal, prFailed, prGen);
+    }
+    if (imgDone + imgFailed > 0) {
+      if (panelTotal > 0 && imgDone >= panelTotal) return info("prompts", prReady, panelTotal);
+      return info("images", imgDone, panelTotal, imgFailed);
+    }
+    if (Array.isArray(proj.shots) && proj.shots.length > 0) return info("images", imgDone, panelTotal || proj.shots.length);
+    if (!proj.script || !proj.scriptApproved) return info("script");
+    if (!_ovHasUsableStyleBible(proj)) return info("style");
+    if (!proj.assetsApproved) return info("assets");
+    return info("shots");
+  }
+
   function _ovStatusLabel(task) {
     if (!task) return "待处理";
     if (task.status === "loading") return "同步中";
     if (task.status === "unknown") return "待同步";
+    var stage = task.stage;
+    if (stage === "images" || stage === "prompts" || stage === "batch") {
+      var base = _ovStageLabels[stage];
+      if (task.status === "failed") return base + "失败";
+      var pct = (stage === "batch" && task.status === "running")
+        ? Number(task.progress) || 0
+        : Number(task.stagePct) || 0;
+      return base + " " + pct + "%";
+    }
+    if (stage && _ovStageLabels[stage]) return _ovStageLabels[stage];
+    // 兜底（理论上不会走到）：维持旧文案
     if (task.status === "running") return "生成中 " + task.progress + "%";
     if (task.status === "done") return "已完成";
     if (task.status === "failed") return "失败";
@@ -2867,18 +2956,37 @@ var _scriptEditInitialText = "";
     }
 
     var rawProjectStatus = String(proj.status || summary && summary.status || "").toLowerCase();
+    // 阶段信息：当前项目/已加载详情的项目本地实时算；其它项目用服务端 summary 里算好的。
+    var summaryStageInfo = summary && summary.stageInfo && typeof summary.stageInfo === "object" && summary.stageInfo.stage
+      ? summary.stageInfo
+      : null;
+    var stageInfo = (hasDetail || !summaryStageInfo)
+      ? _ovProjectStageInfo(proj, counts, segmentCount)
+      : summaryStageInfo;
+    var stage = stageInfo.stage;
+    var stagePct = stageInfo.total > 0
+      ? Math.max(0, Math.min(100, Math.round(stageInfo.done / stageInfo.total * 100)))
+      : 0;
+
+    // 机器状态（驱动筛选 tab 与配色）：从阶段推导。
+    // running/failed 只对"有东西在生成/生成失败"的阶段成立；创作类阶段一律 pending。
     var taskStatus = "pending";
     if (options.loading) taskStatus = "loading";
-    else if (counts.running > 0) taskStatus = "running";
-    else if (counts.failed > 0) taskStatus = "failed";
-    else if (segmentCount > 0 && counts.done === segmentCount) taskStatus = "done";
+    else if (stage === "done") taskStatus = "done";
     else if (rawProjectStatus === "completed" || rawProjectStatus === "done" || rawProjectStatus === "succeeded") taskStatus = "done";
+    else if (stage === "batch" && (counts.running > 0 || stageInfo.running > 0)) taskStatus = "running";
+    else if (stage === "prompts" && stageInfo.running > 0) taskStatus = "running";
+    else if ((stage === "batch" || stage === "prompts" || stage === "images") && stageInfo.failed > 0) taskStatus = "failed";
     else if (rawProjectStatus === "failed" || rawProjectStatus === "error") taskStatus = "failed";
     else if (options.detailFailed) taskStatus = "unknown";
 
-    var progress = taskStatus === "done" ? 100 : 0;
-    if (taskStatus === "running") {
-      progress = segmentCount ? Math.max(8, Math.min(99, Math.round(progressTotal / segmentCount))) : 8;
+    var progress = 0;
+    if (taskStatus === "done") progress = 100;
+    else if (taskStatus === "running" && stage === "batch") {
+      var smooth = segmentCount ? Math.round(progressTotal / segmentCount) : 0;
+      progress = Math.max(8, Math.min(99, Math.max(smooth, stagePct)));
+    } else {
+      progress = Math.min(99, stagePct);
     }
 
     var media = hasDetail
@@ -2922,6 +3030,12 @@ var _scriptEditInitialText = "";
       audio: "开启",
       status: taskStatus,
       progress: progress,
+      stage: stage,
+      stagePct: stagePct,
+      stageDone: stageInfo.done,
+      stageTotal: stageInfo.total,
+      stageFailed: stageInfo.failed,
+      stageRunning: stageInfo.running,
       thumbnail: media.thumbnail,
       videoUrl: media.videoUrl,
       composedVideoUrl: composedVideoUrl,
@@ -2930,11 +3044,13 @@ var _scriptEditInitialText = "";
     };
   }
 
-  function _ovPrimeProjectTasksFromSummaries(summaries) {
+  function _ovPrimeProjectTasksFromSummaries(summaries, options) {
+    options = options || {};
+    var loadingNonCurrent = options.loadingNonCurrent !== false;
     summaries = Array.isArray(summaries) ? summaries : [];
     _ovProjectTasks = summaries.map(function (sp) {
       var detail = project && project.id === sp.id ? project : null;
-      return _ovProjectTaskFromSummary(sp, detail, { loading: !detail });
+      return _ovProjectTaskFromSummary(sp, detail, { loading: loadingNonCurrent && !detail });
     });
   }
 
@@ -2969,7 +3085,7 @@ var _scriptEditInitialText = "";
         });
       }).filter(function (sp) { return !!sp.id; });
       try { saveProjectList(summaries.map(function (sp) { return { id: sp.id, name: sp.name, createdAt: sp.createdAt }; })); } catch (_) {}
-      _ovPrimeProjectTasksFromSummaries(summaries);
+      _ovPrimeProjectTasksFromSummaries(summaries, { loadingNonCurrent: false });
       _ovProjectTasksLoaded = true;
       if (seq === _ovProjectTasksSeq) _ovRenderDashboard();
     } finally {
@@ -3187,11 +3303,12 @@ var _scriptEditInitialText = "";
     var thumb = t.thumbnail
       ? _ovThumbnailImgHtml(t.thumbnail)
       : '<div class="vtd-thumb-empty"><span class="material-symbols-outlined">movie_filter</span></div>';
-    var retryDisabled = t.projectId ? "" : " disabled";
     var deleteDisabled = t.projectId ? "" : " disabled";
     var renameDisabled = t.projectId ? "" : " disabled";
     var titleText = t.title || "未命名任务";
     var isEditingTitle = _ovTaskState.editingTitleId === t.id;
+    // 失败也展示胶囊：新文案带阶段信息（如"片段生成失败"），不再隐藏。
+    var statusHtml = '<span class="vtd-status ' + statusClass + '">' + escapeHtml(_ovStatusLabel(t)) + '</span>';
     var titleHtml = isEditingTitle
       ? '<div class="vtd-title-edit-row is-editing">' +
           '<input type="text" class="vtd-title-input" data-ov-title-input value="' + escapeHtml(titleText) + '" maxlength="200" autocomplete="off" spellcheck="false" aria-label="任务标题">' +
@@ -3215,9 +3332,7 @@ var _scriptEditInitialText = "";
           '</div>' +
           '<div class="vtd-task-meta">' +
             '<span><i class="material-symbols-outlined">schedule</i>' + escapeHtml(t.durationText) + '</span>' +
-            '<span><i class="material-symbols-outlined">folder</i>素材 ' + escapeHtml(String(t.assetCount || 0)) + '</span>' +
-            '<span><i class="material-symbols-outlined">crop_portrait</i>' + escapeHtml(t.resolution) + '</span>' +
-            '<span><i class="material-symbols-outlined">memory</i>' + escapeHtml(t.model) + '</span>' +
+            '<span><i class="material-symbols-outlined">folder</i>片段 ' + escapeHtml(String(t.segmentCount || 0)) + ' 个</span>' +
             '<span><i class="material-symbols-outlined">aspect_ratio</i>比例 ' + escapeHtml(t.ratio) + '</span>' +
           '</div>' +
         '</div>' +
@@ -3225,12 +3340,8 @@ var _scriptEditInitialText = "";
           '<button type="button" class="vtd-continue-btn" data-ov-action="continue" title="继续制作到当前流程进度"' + continueDisabled + '>' +
             '<span class="material-symbols-outlined">play_arrow</span><span>继续制作</span>' +
           '</button>' +
-          '<span class="vtd-type-pill">' + escapeHtml(t.type || "视频生成任务") + '</span>' +
-          '<span class="vtd-status ' + statusClass + '">' + escapeHtml(_ovStatusLabel(t)) + '</span>' +
+          statusHtml +
           '<div class="vtd-icon-actions">' +
-            (t.status === "failed"
-              ? '<button type="button" data-ov-action="retry" title="进入片段页处理失败任务"' + retryDisabled + '><span class="material-symbols-outlined">rule</span></button>'
-              : '') +
             '<button type="button" data-ov-action="delete" title="删除项目任务"' + deleteDisabled + '><span class="material-symbols-outlined">delete</span></button>' +
           '</div>' +
         '</div>' +
@@ -3642,25 +3753,6 @@ var _scriptEditInitialText = "";
     }
   }
 
-  async function _ovRetryTask(task) {
-    if (!task || !task.projectId || _ovProjectTaskNavigating) return;
-    _ovProjectTaskNavigating = true;
-    try {
-      if (!project || project.id !== task.projectId) {
-        await switchToProject(task.projectId);
-      }
-      if (!project || project.id !== task.projectId) {
-        showToast("无法打开该项目，请刷新后重试", "error");
-        return;
-      }
-      switchPage("batch");
-    } catch (e) {
-      showToast((e && e.message) || "打开失败任务处理页失败", "error");
-    } finally {
-      _ovProjectTaskNavigating = false;
-    }
-  }
-
   async function _ovContinueTask(task) {
     if (!task || !task.projectId || _ovProjectTaskNavigating) return;
     _ovProjectTaskNavigating = true;
@@ -3885,11 +3977,6 @@ var _scriptEditInitialText = "";
         _ovDownloadVideo(task);
         return;
       }
-      if (action === "retry") {
-        e.preventDefault();
-        _ovRetryTask(task);
-        return;
-      }
       if (action === "continue") {
         e.preventDefault();
         _ovContinueTask(task);
@@ -3906,6 +3993,16 @@ var _scriptEditInitialText = "";
         var panel = document.querySelector(".vtd-detail-panel");
         if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: "nearest", inline: "nearest" });
         return;
+      }
+      if (!actionBtn && !e.target.closest("button, input, select, textarea, a, [contenteditable='true']")) {
+        var clickNow = Date.now();
+        var isDoubleCardClick = _ovLastCardClick.id === id && clickNow - _ovLastCardClick.time <= 500;
+        _ovLastCardClick = { id: id, time: clickNow };
+        if (isDoubleCardClick && task.projectId) {
+          e.preventDefault();
+          _ovContinueTask(task);
+          return;
+        }
       }
       _ovSelectTask(id);
       if (action === "play" && (task.videoUrl || task.composedVideoUrl)) {
@@ -4317,7 +4414,10 @@ var _scriptEditInitialText = "";
 		    var selectedName = _styleCurrentSelectedTemplateName();
 		    var text = "";
 		    var title = "";
-		    if (project.styleBibleSource === "world_import") {
+		    if (project.styleBibleStatus === "generating" && selectedName) {
+		      text = "将用：" + selectedName;
+		      title = "正在生成的风格圣经将使用当前选择的风格模板。生成完成后会显示实际使用的模板。";
+		    } else if (project.styleBibleSource === "world_import") {
 		      text = "世界观强导入";
 		      title = "当前风格圣经来自世界观模板强导入，未关联独立风格模板。";
 		    } else if (hasBible && generatedStyleId) {
@@ -4409,6 +4509,37 @@ var _scriptEditInitialText = "";
 		    if (changed.world) reasons.push("世界观");
 		    if (changed.aspectRatio) reasons.push("画幅");
 		    return reasons;
+		  }
+
+		  // —— freshness 横幅的关闭持久化：按「差异状态签名」记忆 ——
+		  // 签名包含差异原因 + 生成时/当前上下文 + 剧本指纹：用户点 X 后，同一状态下
+		  // （含刷新）不再展示；一旦又有新的修改（签名变化），横幅重新出现。
+		  function _styleFreshnessDismissSignature(reasons) {
+		    var seed = JSON.stringify([
+		      reasons,
+		      (project && project.styleBibleGenerationContext) || null,
+		      _styleCurrentGenerationContext(),
+		      (project && project.styleBibleStaleReason) || "",
+		      _styleAutoScriptKey()
+		    ]);
+		    var hash = 0;
+		    for (var i = 0; i < seed.length; i++) {
+		      hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
+		    }
+		    return seed.length + ":" + Math.abs(hash).toString(36);
+		  }
+
+		  function _styleFreshnessDismissStorageKey() {
+		    return "originStyleFreshnessDismiss:" + ((project && project.id) || "");
+		  }
+
+		  function _isStyleFreshnessBannerDismissed(signature) {
+		    if (!signature) return false;
+		    try {
+		      return localStorage.getItem(_styleFreshnessDismissStorageKey()) === signature;
+		    } catch (e) {
+		      return false;
+		    }
 		  }
 
 	  function _isStyleBibleGeneratingForStylePage() {
@@ -4677,10 +4808,15 @@ var _scriptEditInitialText = "";
 		    }
 		    var freshnessReasons = _styleBibleFreshnessReasons();
 		    if (!_isStyleBibleGeneratingForStylePage() && freshnessReasons.length) {
-		      html += '<div class="upstream-stale-banner style-bible-section--wide">' +
-		        '<span class="material-symbols-outlined">warning</span>' +
-		        '<div><p>' + escapeHtml(freshnessReasons.join("、")) + '已修改，请点击「重新生成风格圣经」</p></div>' +
-	      '</div>';
+		      var freshnessSig = _styleFreshnessDismissSignature(freshnessReasons);
+		      if (!_isStyleFreshnessBannerDismissed(freshnessSig)) {
+		        html += '<div class="upstream-stale-banner style-bible-section--wide"' +
+		          ' data-dismiss-store="' + escapeHtml(_styleFreshnessDismissStorageKey()) + '"' +
+		          ' data-dismiss-key="' + escapeHtml(freshnessSig) + '">' +
+		          '<span class="material-symbols-outlined">warning</span>' +
+		          '<div><p>' + escapeHtml(freshnessReasons.join("、")) + '已修改，请点击「重新生成风格圣经」</p></div>' +
+		        '</div>';
+		      }
 	    }
 	    html += _styleBibleSectionHtml("视觉", [
 	      _styleBibleFieldHtml("visualStyle", "视觉风格", sb.visualStyle, true),
@@ -5549,23 +5685,27 @@ var _scriptEditInitialText = "";
 				    return _flushStyleWorldIntent(job, 0);
 				  }
 
-				  function _confirmStyleWorldTemplateModal() {
-				    if (!_styleWorldTemplateModalOpen) return;
-				    var templates = (typeof _getWorldTemplates === "function") ? _getWorldTemplates() : [];
-				    var tpl = _findWorldTemplateById(templates, _styleWorldTemplateModalTempId);
-				    if (!tpl) {
-				      showToast("请先选择一个世界观", "warn");
-				      return;
-				    }
-				    _closeStyleWorldTemplateModal();
-				    Promise.resolve(_applyWorldTemplateReferenceFromStylePage(tpl))
-				      .then(function () {
-				        return _applyRecommendedStyleTemplateForWorld();
-				      })
-				      .catch(function (err) {
-				        showToast("世界观关联失败: " + ((err && err.message) || err), "error");
-				      });
-				  }
+					  function _applyWorldTemplateSelection(tpl) {
+					    return Promise.resolve(_applyWorldTemplateReferenceFromStylePage(tpl))
+					      .then(function () {
+					        return _applyRecommendedStyleTemplateForWorld();
+					      });
+					  }
+
+					  function _confirmStyleWorldTemplateModal() {
+					    if (!_styleWorldTemplateModalOpen) return;
+					    var templates = (typeof _getWorldTemplates === "function") ? _getWorldTemplates() : [];
+					    var tpl = _findWorldTemplateById(templates, _styleWorldTemplateModalTempId);
+					    if (!tpl) {
+					      showToast("请先选择一个世界观", "warn");
+					      return;
+					    }
+					    _closeStyleWorldTemplateModal();
+					    _applyWorldTemplateSelection(tpl)
+					      .catch(function (err) {
+					        showToast("世界观关联失败: " + ((err && err.message) || err), "error");
+					      });
+					  }
 
 			  function _styleBibleHasContent(sb) {
 	    if (!sb || typeof sb !== "object") return false;
@@ -5749,6 +5889,7 @@ var _scriptEditInitialText = "";
 	    project.styleBibleError = "";
 	    project.styleBibleStartedAt = new Date().toISOString();
 	    refreshStylePage();
+	    var finalStylePageRendered = false;
 	    try {
 	      await extractStyleBible({
 	        styleOptions: _styleEffectiveOptionsForRequest(),
@@ -5756,11 +5897,14 @@ var _scriptEditInitialText = "";
 	        worldTemplateSnapshot: project.worldTemplateSnapshot || null,
 	        creatorProfile: formatCreatorProfileForApi ? formatCreatorProfileForApi() : null,
 	      });
-	      refreshStylePage();
+	      var reloadedAfterExtract = await _reloadCurrentProjectForStylePage();
+	      if (!reloadedAfterExtract) refreshStylePage();
+	      finalStylePageRendered = true;
 	      showToast("风格圣经已生成，下游内容已标记为需重新生成", "success");
 	    } catch (e) {
 	      if (e && e.status === 409) {
 	        await _waitForStyleBibleGeneration();
+	        finalStylePageRendered = true;
 	        return;
 	      }
 	      if (project) {
@@ -5768,11 +5912,12 @@ var _scriptEditInitialText = "";
 	        project.styleBibleError = ((e && e.message) || e || "未知错误").toString().slice(0, 180);
 	      }
 	      refreshStylePage();
+	      finalStylePageRendered = true;
 	      showToast("重新提取失败: " + ((e && e.message) || e), "error");
 	    } finally {
-      refreshStylePage();
-    }
-  }
+	      if (!finalStylePageRendered) refreshStylePage();
+	    }
+	  }
 
 	  async function _applyRecommendedStyleTemplateForWorld() {
 	    if (!project || !project.selectedWorldTemplateId) {
@@ -5871,7 +6016,17 @@ var _scriptEditInitialText = "";
 		    if (clearWorldBtn) {
 		      clearWorldBtn.addEventListener("click", function () {
 		        if (!project) return;
-		        _persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null });
+		        // 关联世界观时会自动改选推荐风格模板（_applyWorldTemplateSelection），
+		        // 清除时必须对称地重跑一次无世界观推荐，否则模板选择残留会让
+		        // 「风格模板已修改」横幅一直误报。等服务端保存完成后再推荐，
+		        // 避免 recommend 接口读到未清除的旧世界观快照。
+		        _persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null })
+		          .then(function () {
+		            return _ensureAutoStyleTemplateForStylePage({ force: true });
+		          })
+		          .catch(function (err) {
+		            console.warn("[StyleWorld] re-recommend after clear failed:", err);
+		          });
 		        showToast("已清除关联世界观", "info");
 		      });
 		    }
@@ -7507,7 +7662,7 @@ var _scriptEditInitialText = "";
       getSettings: () => settings,
       saveProject: () => saveProject(),
       flushServerSave: () => _flushServerSave(),
-      safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
+      safeWriteBack: (id, fn, serverVersion) => _safeWriteBack(id, fn, serverVersion),
       getStoryboardGroups: () => getStoryboardGroups(),
       agentInsertRef: (type, label, data) => agentInsertRef(type, label, data),
       isStale: (key) => _isStale(key),
@@ -7559,7 +7714,7 @@ var _scriptEditInitialText = "";
       getProject: () => project,
       saveProject: () => saveProject(),
       flushServerSave: () => _flushServerSave(),
-      safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
+      safeWriteBack: (id, fn, serverVersion) => _safeWriteBack(id, fn, serverVersion),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
       diagnoseApiError: (msg) => _diagnoseApiError(msg),
@@ -7573,12 +7728,13 @@ var _scriptEditInitialText = "";
       getProject: () => project,
       saveProject: () => saveProject(),
       flushServerSave: () => _flushServerSave(),
-      safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
+      safeWriteBack: (id, fn, serverVersion) => _safeWriteBack(id, fn, serverVersion),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
       diagnoseApiError: (msg) => _diagnoseApiError(msg),
       markDownstreamStale: (scope, detail) => _markDownstreamStale(scope, detail),
       isStale: (key) => _isStale(key),
+      applyServerStaleFlags: (prefixes, serverFlags) => _applyServerStaleFlagsToProject(project, prefixes, serverFlags),
       checkAndSuggest: (stage) => _checkAndSuggest(stage),
       archiveOldImage: (item, source) => _archiveOldImage(item, source),
       agentInsertRef: (type, label, data) => agentInsertRef(type, label, data),
@@ -7596,7 +7752,10 @@ var _scriptEditInitialText = "";
     initScript({
       getProject: () => project,
       saveProject: () => saveProject(),
-      safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
+      flushServerSave: () => _flushServerSave(),
+      // 注意第三参 serverVersion 必须透传：剧本生成/改写后端已落库 version+1，
+      // done 事件带回 serverVersion，前端写回内存才能避免下一次 PUT 必撞 409。
+      safeWriteBack: (id, fn, serverVersion) => _safeWriteBack(id, fn, serverVersion),
       switchPage: (p) => switchPage(p),
       formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
       markDownstreamStale: (scope, detail) => _markDownstreamStale(scope, detail),
@@ -7638,7 +7797,7 @@ var _scriptEditInitialText = "";
 	      getVideoState: () => videoState,
 	      saveProject: () => saveProject(),
       flushServerSave: () => _flushServerSave(),
-      safeWriteBack: (id, fn) => _safeWriteBack(id, fn),
+      safeWriteBack: (id, fn, serverVersion) => _safeWriteBack(id, fn, serverVersion),
       switchPage: (p) => switchPage(p),
       // 资产确认 → 跳到分镜页后自动启动镜头计划生成（仅在 project.shots 为空时）。
       // 体验对齐 _confirmStyleAndContinue 的"确认风格 → 自动 extractAssets"。
@@ -7651,9 +7810,10 @@ var _scriptEditInitialText = "";
       archiveOldImage: (item, kind) => _archiveOldImage(item, kind),
       registerServerTask: (id, kind, type, idx) => _registerServerTask(id, kind, type, idx),
 	      updateServerTaskStatus: (id, status, url) => _updateServerTaskStatus(id, status, url),
-	      refreshStylePage: () => refreshStylePage(),
-	      persistWorldTemplateSelection: (intent) => _persistStyleWorldIntent(intent),
-	      updateStoryboardCard: (idx, status, url, text) => updateStoryboardCard(idx, status, url, text),
+		      refreshStylePage: () => refreshStylePage(),
+		      persistWorldTemplateSelection: (intent) => _persistStyleWorldIntent(intent),
+		      applyWorldTemplateSelection: (tpl) => _applyWorldTemplateSelection(tpl),
+		      updateStoryboardCard: (idx, status, url, text) => updateStoryboardCard(idx, status, url, text),
       historyBtnHtml: (item, variant) => _historyBtnHtml(item, variant),
       openHistoryPopover: (btn, item, onApply) => _openHistoryPopover(btn, item, onApply),
       openAssetHistoryModal: (item, type, onApply) => _openAssetHistoryModal(item, type, onApply),
@@ -7699,7 +7859,7 @@ var _scriptEditInitialText = "";
     // 修法：在 `syncAssetsProject(project)` 之后**显式再调一次** —— 此时
     // `assets.js::project` 已就位，`reattachActiveBatches` 才能真正发 GET
     // `/api/batch/active?projectId=...`，从后端 `_BATCHES` + task_store 把
-    // running/pending 的 asset_images / asset_stylize batch 拉回来重建 spinner。
+    // running/pending 的 asset_images batch 拉回来重建 spinner。
     // 首次 (line 2633) 的 no-op 保留不删 —— 幂等调用，代价只有一次 `null` 检查。
     if (project && project.id) {
       try { _restoreAssetGenStatus(); }
@@ -7751,15 +7911,6 @@ var _scriptEditInitialText = "";
           var ok = await createNewProject();
           if (ok !== false) refreshOverview();
         } catch (e) { console.error("[ResetProject]", e); }
-      });
-
-      var _btnTpl = $("btnFromTemplate");
-      if (_btnTpl) _btnTpl.addEventListener("click", function () {
-        try { _openTemplateImportModal(); } catch (e) { console.error("[FromTemplate]", e); }
-      });
-      var _btnTpl2 = $("btnFromTemplate2");
-      if (_btnTpl2) _btnTpl2.addEventListener("click", function () {
-        try { _openTemplateImportModal(); } catch (e) { console.error("[FromTemplate2]", e); }
       });
 
       _wireOverviewDashboardOnce();
@@ -8009,7 +8160,14 @@ var _scriptEditInitialText = "";
       if (!btn) return;
       ev.stopPropagation();
       var banner = btn.closest(".upstream-stale-banner, .stale-banner");
-      if (banner) banner.remove();
+      if (!banner) return;
+      // 带 data-dismiss-store/key 的横幅：记住当前状态签名，重渲染/刷新后同一状态不再出现
+      var dismissStore = banner.getAttribute("data-dismiss-store");
+      var dismissKey = banner.getAttribute("data-dismiss-key");
+      if (dismissStore && dismissKey) {
+        try { localStorage.setItem(dismissStore, dismissKey); } catch (e) {}
+      }
+      banner.remove();
     });
     try {
       var mo = new MutationObserver(schedule);

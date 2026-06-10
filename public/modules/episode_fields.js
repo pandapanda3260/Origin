@@ -15,6 +15,7 @@ export const EPISODE_FIELDS = Object.freeze([
   "videoPromptsApproved",
   "narrations",
   "emotionSegments",
+  "scriptTimeline",
   "currentStep",
 ]);
 
@@ -51,6 +52,7 @@ export function createEmptyEpisode(input) {
     videoPrompts: [],
     videoPromptsApproved: false,
     narrations: [],
+    scriptTimeline: [],
     currentStep: 1,
   };
 }

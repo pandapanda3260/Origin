@@ -310,7 +310,7 @@ function _markFailedAssetImageState(opts: {
   referenceStatus: 'degraded' | 'failed';
   imageSafetyAudit?: any;
 } {
-  if (opts.batchType !== 'asset_images' && opts.batchType !== 'asset_stylize') return null;
+  if (opts.batchType !== 'asset_images') return null;
   const type = String(opts.target?.type || '');
   const idx = Number(opts.target?.idx);
   if (!Number.isFinite(idx) || idx < 0) return null;
@@ -326,28 +326,6 @@ function _markFailedAssetImageState(opts: {
       const assets = (fresh as any).assets || { characters: [], scenes: [], props: [] };
       if (!Array.isArray(assets[cat])) assets[cat] = [];
       const currentAsset = assets[cat][idx] || {};
-      if (opts.batchType === 'asset_stylize') {
-        const message = (opts.message || '风格图生成失败').slice(0, 1000);
-        const nextAsset = {
-          ...currentAsset,
-          _pencilFailed: true,
-          pencilLastError: message,
-          pencilFailedAt: failedAt,
-          imageSafetyAudit: opts.imageSafetyAudit || currentAsset.imageSafetyAudit,
-        };
-        assets[cat][idx] = nextAsset;
-        const top = Array.isArray((fresh as any)[topKey]) ? [...(fresh as any)[topKey]] : [];
-        if (top[idx]) {
-          top[idx] = {
-            ...top[idx],
-            _pencilFailed: true,
-            pencilLastError: message,
-            pencilFailedAt: failedAt,
-            imageSafetyAudit: opts.imageSafetyAudit || top[idx].imageSafetyAudit,
-          };
-        }
-        return { assets, [topKey]: top };
-      }
       const existingUrl =
         currentAsset?.reference?.currentUrl ||
         currentAsset?.reference?.lastKnownGoodUrl ||
@@ -639,7 +617,7 @@ function _concurrencyFor(batchType: string): number {
   if (batchType === 'storyboard_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   if (batchType === 'tail_frame_images') return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   // 资产图也先跟随全局图片上限；后续如需按任务类型细分，再单独加调度策略。
-  if (batchType === 'asset_images' || batchType === 'asset_stylize') {
+  if (batchType === 'asset_images') {
     return getGlobalImageConcurrencyLimit(DEFAULT_GLOBAL_IMAGE_CONCURRENCY_LIMIT);
   }
   return 3;

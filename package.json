@@ -61,7 +61,6 @@
     "test:durable-tasks": "tsx scripts/test-durable-tasks.ts",
     "test:batch-durable": "tsx scripts/test-batch-durable-integration.ts",
     "test:usage-billing": "tsx scripts/test-usage-billing.ts",
-    "test:asset-stylize-executor": "tsx scripts/test-asset-stylize-executor.ts",
     "test:online-editor-expiry": "tsx scripts/test-online-editor-expiry.ts",
     "test:provider-recovery": "tsx scripts/test-provider-recovery.ts",
     "test:frontend-api-timeouts": "node scripts/test-frontend-api-timeouts.mjs",

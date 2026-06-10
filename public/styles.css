@@ -1318,82 +1318,6 @@ body:has(#pageToolbox.toolbox-no-scroll:not([hidden])) {
   max-height: none;
 }
 
-html:has(#pageCharacterCustom:not([hidden]) [data-character-editor]),
-body:has(#pageCharacterCustom:not([hidden]) [data-character-editor]) {
-  height: 100%;
-  overflow: hidden;
-  overscroll-behavior: none;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) {
-  display: flex;
-  flex-direction: column;
-  height: calc(100vh - var(--top-announcement-height, 32px));
-  max-height: calc(100vh - var(--top-announcement-height, 32px));
-  min-height: 0;
-  overflow: hidden !important;
-  overscroll-behavior: none;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-shell {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-tool-head {
-  flex: 0 0 auto;
-  margin-bottom: 18px;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-workbench {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-panel {
-  min-height: 0;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-config {
-  overflow-y: auto;
-}
-
-/* 角色生成左栏：生成按钮常驻底部，左栏内容超出时也不会遮挡它（提示词框保持原高度、内容可滚动）。
-   仅作用于草稿生成按钮(data-character-generate)，不影响确认编辑器的保存/重新生成按钮。 */
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-config [data-character-generate] {
-  position: sticky;
-  bottom: 0;
-  z-index: 2;
-  box-shadow: 0 -10px 14px -8px rgba(15, 23, 42, 0.14);
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-preview {
-  display: flex;
-  flex-direction: column;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-preview-area,
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-preview-empty,
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-media-frame {
-  height: 100%;
-  min-height: 0;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-history {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-#pageCharacterCustom:not([hidden]):has([data-character-editor]) .toolbox-history-list {
-  flex: 1 1 auto;
-  min-height: 0;
-  max-height: none;
-}
-
 .toolbox-hero,
 .toolbox-tool-head {
   display: flex;
@@ -2277,6 +2201,441 @@ body:has(#pageCharacterCustom:not([hidden]) [data-character-editor]) {
 
 .character-new-btn .material-symbols-outlined {
   font-size: 18px;
+}
+
+/* Character generation editor: viewport-locked, width-aware columns, fitted scale. */
+html:has(#pageCharacterCustom:not([hidden]) [data-character-generation-editor]),
+body:has(#pageCharacterCustom:not([hidden]) [data-character-generation-editor]) {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) {
+  position: relative;
+  display: block;
+  height: calc(100vh - var(--top-announcement-height, 32px));
+  max-height: calc(100vh - var(--top-announcement-height, 32px));
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: hidden !important;
+  overscroll-behavior: none;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+  --character-gen-gap: clamp(14px, 1vw, 18px);
+  --character-gen-form-col: clamp(440px, 28vw, 540px);
+  --character-gen-draft-col: clamp(232px, 15vw, 300px);
+  --character-gen-preview-min: 420px;
+  --character-gen-panel-min: clamp(560px, calc(100vh - 210px), 820px);
+  --character-generation-css-zoom: 1;
+  width: 100%;
+  max-width: 1720px;
+  min-height: 0;
+  margin: 0 auto;
+  position: relative;
+  zoom: var(--character-generation-scale, var(--character-generation-css-zoom));
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head {
+  min-width: 0;
+  margin-bottom: 18px;
+  gap: 16px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head > div {
+  min-width: 0;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head h1 {
+  font-size: clamp(36px, 3vw, 48px);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head .character-new-btn {
+  flex: 0 0 auto;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-grid {
+  display: grid;
+  grid-template-columns:
+    minmax(440px, var(--character-gen-form-col))
+    minmax(var(--character-gen-preview-min), 1fr)
+    minmax(232px, var(--character-gen-draft-col));
+  gap: var(--character-gen-gap);
+  align-items: stretch;
+  min-width: 0;
+  min-height: var(--character-gen-panel-min);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-grid > * {
+  min-width: 0;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-form-card {
+  min-height: var(--character-gen-panel-min);
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(255,255,255,0.72);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow: visible;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-form {
+  flex: 0 0 auto;
+  gap: 14px;
+  min-width: 0;
+  padding-right: 0;
+  overflow: visible;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field {
+  gap: 8px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field > span,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attributes-title {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  color: #526168;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field input,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field textarea {
+  border-color: rgba(144,164,174,0.22);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.88);
+  color: #26353b;
+  font-size: 13px;
+  font-weight: 750;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.68);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field input::placeholder,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field textarea::placeholder {
+  color: rgba(120,144,156,0.72);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field input {
+  height: 42px;
+  padding: 0 13px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field textarea {
+  min-height: 126px;
+  padding: 12px 13px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field-with-counter {
+  position: relative;
+  padding-bottom: 15px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field-counter {
+  position: absolute;
+  right: 2px;
+  bottom: 0;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 800;
+  color: rgba(120,144,156,0.72);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-upload {
+  min-height: 52px;
+  border-radius: 12px;
+  justify-content: flex-start;
+  border-color: rgba(91,106,191,0.28);
+  background: rgba(91,106,191,0.055);
+  color: #5B6ABF;
+  padding: 0 14px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-chip {
+  min-height: 58px;
+  border-radius: 12px;
+  border-color: rgba(144,164,174,0.2);
+  background: rgba(255,255,255,0.82);
+  padding: 8px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-chip-main img,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-chip-main > .material-symbols-outlined {
+  width: 44px;
+  height: 44px;
+  border-radius: 9px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-chip-name {
+  color: #526168;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-chip-remove {
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  color: #78909C;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attributes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attributes-card {
+  overflow: hidden;
+  border: 1px solid rgba(144,164,174,0.18);
+  border-radius: 14px;
+  background: rgba(255,255,255,0.58);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 9px;
+  min-height: 56px;
+  padding: 11px 12px 11px 14px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-row:not(:last-child) {
+  border-bottom: 1px solid rgba(144,164,174,0.16);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-label {
+  color: #526168;
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-options button {
+  flex: 0 1 auto;
+  min-width: 50px;
+  height: 32px;
+  padding: 0 11px;
+  border-radius: 9px;
+  border-color: rgba(144,164,174,0.18);
+  background: rgba(255,255,255,0.82);
+  color: #607D8B;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-options button.is-active {
+  border-color: rgba(101,80,255,0.78);
+  background: rgba(101,80,255,0.08);
+  color: #6550ff;
+  box-shadow: 0 0 0 1px rgba(101,80,255,0.18);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-actions {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding-top: 14px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-submit {
+  position: static;
+  width: 100%;
+  height: 54px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #4f24ff 0%, #806bff 100%);
+  box-shadow: 0 14px 28px rgba(80,58,220,0.24);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-submit .material-symbols-outlined {
+  font-size: 19px;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: var(--character-gen-panel-min);
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview .toolbox-preview-area,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview .toolbox-preview-empty,
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview .toolbox-media-frame {
+  height: 100%;
+  min-height: 0;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts {
+  display: flex;
+  flex-direction: column;
+  min-height: var(--character-gen-panel-min);
+  overflow: hidden;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts .toolbox-history-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts .toolbox-empty-history p {
+  font-size: 12px;
+  font-weight: 800;
+}
+
+#pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts .toolbox-empty-history small {
+  font-size: 10px;
+  line-height: 1.7;
+  padding: 0 12px;
+}
+
+@media (max-width: 1500px) and (min-width: 1281px) {
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+    --character-generation-css-zoom: 0.7;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-grid {
+    grid-template-columns: minmax(400px, 0.92fr) minmax(440px, 1fr);
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts {
+    grid-column: 1 / -1;
+    min-height: auto;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts .toolbox-history-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+    overflow: visible;
+  }
+}
+
+@media (max-height: 980px) and (min-width: 1501px) {
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+    --character-generation-css-zoom: 0.92;
+  }
+}
+
+@media (max-width: 1280px) {
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) {
+    padding: 24px !important;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+    --character-gen-panel-min: 480px;
+    --character-generation-css-zoom: 0.51;
+    max-width: 820px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-grid {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-form-card,
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview,
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts {
+    min-height: 0;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-preview {
+    min-height: 460px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-drafts {
+    overflow: visible;
+  }
+}
+
+@media (max-width: 900px) {
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) {
+    padding: 18px !important;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+    --character-generation-css-zoom: 0.51;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head h1 {
+    font-size: 34px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head .character-new-btn {
+    width: 100%;
+    max-width: 220px;
+    margin-left: 0;
+  }
+
+}
+
+@media (max-height: 820px) and (min-width: 1281px) {
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) {
+    padding-top: 18px !important;
+    padding-bottom: 18px !important;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .toolbox-shell {
+    --character-gen-panel-min: 520px;
+    --character-generation-css-zoom: 0.66;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head {
+    margin-bottom: 10px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-head h1 {
+    font-size: 34px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-form-card {
+    padding: 14px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-form {
+    gap: 10px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field input {
+    height: 36px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-field textarea {
+    min-height: 88px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-ref-field .toolbox-ref-upload {
+    min-height: 44px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-row {
+    min-height: 44px;
+    padding: 8px 10px 8px 12px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-attribute-options button {
+    height: 28px;
+  }
+
+  #pageCharacterCustom:not([hidden]):has([data-character-generation-editor]) .character-generation-submit {
+    height: 50px;
+  }
 }
 
 .character-card-grid {
@@ -3781,16 +4140,6 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   gap: 10px;
   flex-wrap: nowrap;
 }
-.batch-hint {
-  min-height: 0;
-  margin: 0 0 12px;
-  color: #64748b;
-  font-size: 12px;
-  font-weight: 700;
-}
-.batch-hint:empty {
-  display: none;
-}
 .batch-stat-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(150px, 1fr));
@@ -4790,13 +5139,9 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
 .vtd-toolbar-btn.is-active,
 .vtd-toolbar-btn:hover,
 .vtd-ghost-btn:hover { background: #edf3f7; }
-.vtd-template-btn { display: none; }
-
 #btnNewProject,
-#btnFromTemplate,
 #ovBillingRechargeBtn,
 #ovNewTaskBtn,
-#btnFromTemplate2,
 #btnScriptHistory,
 #btnUploadScript,
 #btnScriptHeaderRegen,
@@ -7559,19 +7904,6 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   border-color: rgba(37,99,235,0.42);
   box-shadow: 0 0 0 2px rgba(37,99,235,0.11);
 }
-.vtd-type-pill {
-  flex-shrink: 0;
-  max-width: 128px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: rgba(237,243,247,0.72);
-  color: #71808b;
-  font-size: 10px;
-  font-weight: 750;
-}
 .vtd-task-meta {
   display: flex;
   align-items: center;
@@ -9246,16 +9578,31 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 850;
   letter-spacing: 0.16em;
 }
-.shots-keyframe-progress {
+.workflow-title-hint {
   margin: 8px 0 0;
-  color: #0B7F55;
+  color: rgba(82, 97, 104, 0.72);
   font-size: 12px;
   line-height: 1.35;
-  font-weight: 800;
+  font-weight: 600;
   letter-spacing: 0;
 }
-.shots-keyframe-progress.is-warning {
-  color: #A16207;
+.workflow-title-hint:empty {
+  display: none;
+}
+/* 标题提示统一灰色（Vasily 拍板：不要完成绿/缺失黄，镜头页绿色同样删除）。
+   tone class（is-progress/is-warning/is-success）仍由 JS 维护——它们驱动
+   摘要优先级语义（失败摘要 > 风格图状态 > 完成摘要），只是不再上色。
+   仅保留 is-error：积分不足/批量启动失败的红色异常提醒。 */
+.workflow-title-hint.is-error {
+  color: #dc2626;
+  font-weight: 700;
+}
+/* 镜头页标题进度行：与资产/提示词页同为 workflow-title-hint 灰色基类
+   （绿色加粗的页面级配色已按拍板删除）。该行移到 header 之外，避免把
+   "分镜生成"标题在 align-items:center 布局里顶离其他页的标题基线；
+   负 margin 把它拉回标题下方 8px 处（header 自带 28px margin-bottom）。 */
+#shotsKeyframeProgress {
+  margin: -20px 0 20px;
 }
 .script-header-actions {
   display: flex;
@@ -10159,6 +10506,71 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .script-result-card .chat-avatar {
   display: none;
 }
+/* ── 剧本时间线：历史草稿折叠卡 ───────────────────────────── */
+.script-history-card {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #e8e0db;
+  border-radius: 14px;
+  background: #fbf9f7;
+  padding: 12px 14px;
+}
+.script-history-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.script-history-ver {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: #ede5df;
+  color: #7d614f;
+  font-size: 10px;
+  font-weight: 800;
+}
+.script-history-src,
+.script-history-time {
+  color: #9aa7ae;
+  font-size: 10px;
+  font-weight: 650;
+}
+.script-history-preview {
+  color: #6b7a83;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.script-history-body {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid #eee6e1;
+  color: #3d4a52;
+  font-size: 12px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.script-history-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.script-history-gone {
+  color: #b3a8a1;
+  font-size: 11px;
+}
 .script-import-draft-card {
   margin: 0 0 16px;
   padding: 18px;
@@ -10242,6 +10654,41 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   align-items: flex-end;
   gap: 6px;
   white-space: nowrap;
+}
+/* 状态角标 + 删除按钮同一行（删除按钮见下方 .script-card-delete-btn） */
+.script-draft-meta .script-draft-meta-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.script-draft-meta .script-card-delete-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid #ecdcd4;
+  background: #fff;
+  color: #a98e80;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.script-draft-meta .script-card-delete-btn:hover {
+  background: #fbece5;
+  border-color: #e3bfae;
+  color: #c25e3a;
+}
+/* 盖掉 .script-draft-meta span 的胶囊角标样式，否则按钮里的 icon span 会被画成胶囊 */
+.script-draft-meta .script-card-delete-btn .material-symbols-outlined {
+  height: auto;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  font-weight: 500;
 }
 .script-draft-meta span {
   display: inline-flex;
@@ -12949,13 +13396,12 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   position: sticky;
   top: 16px;
   align-self: flex-start;
-  max-height: calc(100vh - 80px);
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(144,164,174,0.15) transparent;
+  /* 滚动已从列移入 .script-ref-body(见剧本对照面板块):
+     之前是整块面板(带 backdrop-filter)在本列的 overflow 滚动里被推着走,
+     Chromium 对"滚动容器内移动的 backdrop-filter 元素"有背景层不随滚的
+     已知毛病 → 面板白底停在旧位置、文字裸画在页面点阵背景上。
+     改成面板框架定死、只滚内部正文后, 背景/边框相对裁剪区静止, 伪影从构造上消失。 */
 }
-.shots-right-col::-webkit-scrollbar { width: 4px; }
-.shots-right-col::-webkit-scrollbar-thumb { background: rgba(144,164,174,0.18); border-radius: 2px; }
 
 @media (min-width: 1800px) {
   .shots-two-col {
@@ -13561,6 +14007,13 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
     position: static;
     max-height: none;
   }
+  /* 单列堆叠时面板不再限高内滚, 让剧本全文自然展开(维持旧行为)。 */
+  .script-ref-panel {
+    max-height: none;
+  }
+  .script-ref-body {
+    overflow-y: visible;
+  }
 }
 
 @media (max-width: 1000px) {
@@ -13830,6 +14283,10 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   border: 1px solid rgba(144, 164, 174, 0.16);
   background: rgba(255, 255, 255, 0.66);
   overflow: hidden;
+  /* 容器查询锚点: .sb-frame-layout 按面板自身宽度(而非 viewport)切 3列/2列/1列,
+     见下方 @container sb-frame 档位块。panel 是 .sb-frame-stack(纵向 flex) 的
+     拉伸子项, 宽度由父级决定、与内容无关, 不触发 inline-size 容器的塌缩坑。 */
+  container: sb-frame / inline-size;
 }
 .sb-frame-panel-head {
   min-height: 48px;
@@ -13919,7 +14376,12 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 }
 .sb-frame-layout {
   display: grid;
-  grid-template-columns: minmax(168px, 0.66fr) minmax(214px, 0.84fr) minmax(300px, 1.2fr);
+  /* 宽档默认(容器 ≥720px): 维持原三列视觉比例, 但去掉 168/214/300 像素下限。
+     旧写法的像素下限是不可压缩的, 容器 <746px 时整个网格撑破面板被 overflow:hidden
+     裁切(按钮截字/图片压线)。档位切换交给文件下方的 @container sb-frame 规则,
+     minmax(0,…) 是防御性兜底: 任何瞬间都不可能再撑破容器。 */
+  grid-template-columns: minmax(0, 0.66fr) minmax(0, 0.84fr) minmax(0, 1.2fr);
+  grid-template-areas: "copy context preview";
   gap: 16px;
   padding: 16px;
 }
@@ -13928,6 +14390,9 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 .sb-frame-preview-col {
   min-width: 0;
 }
+.sb-frame-copy-col { grid-area: copy; }
+.sb-frame-context-col { grid-area: context; }
+.sb-frame-preview-col { grid-area: preview; }
 /* 让画面描述 textarea 跟着 card 高度向下延伸。grid 默认 stretch, copy-col 高度 =
    最高那列 (通常是中间列 chips + 素材 + 对白); col 用 flex column, label 行固定,
    下方 textarea flex:1 吃掉剩余空间, 不再在 textarea 下方留隐形空白。
@@ -14168,11 +14633,18 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 800;
 }
 .sb-frame-context-col .ffe-material-strip {
+  /* 固定一行 3 个 (Vasily: MacBook Air 13寸上参考素材一行正好 3 张)。
+     旧 auto-fill + minmax(min(52px,100%), 84px) 的列数随列宽在 2/3 列之间跳变,
+     13寸屏的列宽档位恰好落在 2 列。改 repeat(3) 后列数恒为 3,
+     tile 宽 = (列宽 − 2×9px gap) / 3, 只随列宽等比缩放不再增减列数:
+     三列宽档列宽 ≥~190px → tile ≥~57px, 删除角标(18px)仍可点。
+     仅作用于镜头卡上下文, FFE 弹窗的固定 tile 版不受影响。 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
 }
 .sb-frame-context-col .sb-material-thumb-image,
 .sb-frame-context-col .sb-material-add-box {
-  min-height: 58px;
+  /* min-height:58px 已删 — 与 84px tile 上限冲突, 尺寸交给轨道宽 × aspect-ratio。 */
   border-radius: 10px;
 }
 .sb-frame-context-col .sb-material-add-box em {
@@ -14182,7 +14654,13 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   position: relative;
   width: 100%;
   max-width: 100%;
-  height: clamp(210px, 16vw, 276px);
+  /* 高度不再看 viewport (旧: clamp(210px,16vw,276px), 列被挤窄时高度不跟缩,
+     画幅也对不上)。改由"列宽 × 项目画幅"推导: --sb-stage-ar 由 storyboard.js
+     渲染面板时写入(取值链 plan.aspectRatio → planSummary.aspectRatio →
+     project.styleOptions.aspectRatio, 缺省 9:16 对齐项目默认)。
+     max-height 防止竖幅画幅在宽列下无限长高, 超限时 img object-contain 自行留边。 */
+  aspect-ratio: var(--sb-stage-ar, 9 / 16);
+  max-height: 460px;
   border-radius: 14px;
   background: #05070A;
   overflow: hidden;
@@ -14253,6 +14731,51 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   font-weight: 700;
   line-height: 1.65;
 }
+
+/* ============ sb-frame 容器查询档位 ============
+   面板按自身宽度(container: sb-frame, 见 .sb-frame-panel)切换布局,
+   取代旧的 @media 1500/900 断点 — 那两档看的是 viewport, 但分镜板真实宽度
+   = viewport − 导航288 − 壳padding − 剧本栏236~300 − 卡/槽padding,
+   在 1320~1410px 窗口宽存在必溢出死区。容器查询天然覆盖右栏收放/浏览器缩放/
+   sb-sheet 合并卡等所有挂载场景。
+   这两个块必须排在所有 sb-frame 基础规则之后(同特异性靠后者生效)。 */
+
+/* 中档 (面板 <720px): 两列, 图片展示占右列通高 ~52%, 描述/素材在左列上下叠。 */
+@container sb-frame (width < 720px) {
+  .sb-frame-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    grid-template-rows: auto 1fr;
+    grid-template-areas:
+      "copy preview"
+      "context preview";
+  }
+  .sb-frame-prompt-editor,
+  .sb-frame-prompt-highlight-wrap {
+    /* 窄环境下 18 行起步的描述框太霸道, 降到 10 行。 */
+    min-height: calc(10 * 1.75em + 14px);
+  }
+}
+
+/* 窄档 (面板 <480px): 单列, 图片+操作按钮在最上(窄屏高频动作是看结果+点生成),
+   想换"描述在上"只需调整 grid-template-areas 行序。 */
+@container sb-frame (width < 480px) {
+  .sb-frame-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-template-areas:
+      "preview"
+      "copy"
+      "context";
+  }
+  .sb-frame-actions {
+    /* 放开单行限制: 按钮 2×2 换行, 不再靠裁切文字硬塞。 */
+    flex-wrap: wrap;
+  }
+  .sb-frame-actions button {
+    flex: 1 1 calc(50% - 4px);
+  }
+}
+
 @media (max-width: 1500px) {
   .shot-card-head {
     /* 窄屏单列堆叠: 标题块在上, 景别/运镜/按钮在下, 都左对齐。 */
@@ -14268,31 +14791,18 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
     position: static;
     opacity: 1;
   }
-  .sb-frame-layout {
-    grid-template-columns: minmax(154px, 0.62fr) minmax(206px, 0.82fr) minmax(280px, 1.22fr);
-    gap: 14px;
-    padding: 14px;
-  }
+  /* 此处原有 .sb-frame-layout 154/206/280 列宽变体 — 已被上方容器查询档位取代。 */
 }
 
-@media (max-width: 900px) {
-  .sb-frame-layout {
-    grid-template-columns: 1fr;
-  }
-  .sb-frame-text-box {
-    height: 140px;
-  }
-  .sb-frame-text-box.sb-frame-prompt-editor {
-    height: auto;
-    min-height: calc(18 * 1.75em + 14px);
-  }
-  .sb-frame-preview-stage {
-    height: min(62vw, 360px);
-  }
-}
+/* 原 @media (max-width: 900px) 的 sb-frame 单列/stage 高度规则已整块删除 —
+   该断点在双栏 1320 先收的结构里永远轮不到生效, 由容器查询档位取代。 */
 
-/* 剧本对照面板：和右侧资产卡一致的毛玻璃风格，文字改深色保证可读。 */
+/* 剧本对照面板：和右侧资产卡一致的毛玻璃风格，文字改深色保证可读。
+   面板自身限高、正文内滚(原来由 .shots-right-col 整列滚, 见该规则处注释)。 */
 .script-ref-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 80px);
   background: rgba(255, 255, 255, 0.85);
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
@@ -14302,10 +14812,17 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   padding: 20px;
 }
 .script-ref-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(144,164,174,0.15) transparent;
   font-size: 13px;
   line-height: 1.9;
   color: #2C3E50;
 }
+.script-ref-body::-webkit-scrollbar { width: 4px; }
+.script-ref-body::-webkit-scrollbar-thumb { background: rgba(144,164,174,0.18); border-radius: 2px; }
 .script-ref-body .sr-para {
   padding: 5px 10px;
   border-radius: 6px;

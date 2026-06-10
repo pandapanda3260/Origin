@@ -4,7 +4,6 @@ import { getDb } from './db';
 export function costForBatchType(batchType: string): number {
   if (
     batchType === 'asset_images' ||
-    batchType === 'asset_stylize' ||
     batchType === 'storyboard_images' ||
     batchType === 'tail_frame_images'
   ) {

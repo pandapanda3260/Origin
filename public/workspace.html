@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=215" />
+    <link rel="stylesheet" href="styles.css?v=234" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -91,7 +91,7 @@
 
     <!-- ===== Scrolling Announcement Banner ===== -->
     <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:var(--top-announcement-height);display:flex;align-items:center;">
-      <div id="announceTrack" style="display:inline-block;white-space:nowrap;animation:bannerScroll 72s linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;"></div>
+      <div id="announceTrack" style="display:inline-block;white-space:nowrap;animation:bannerScroll var(--announcement-scroll-duration,72s) linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;"></div>
     </div>
     <style>
       #announceTrack .announce-item{margin-right:80px}
@@ -100,13 +100,19 @@
     <script>
       (function(){
         var messages = [
-          '吸烟有害健康',
-          '您大点声不费电！',
-          '劳驾，大爷，美国怎么走啊？',
-          '大难不死，必有下回',
-          '高雅不是装的，孙子才是装的'
+          '先确定视频用途，再决定画幅、时长、风格和节奏',
+          '用更具体的画面描述，少写抽象概念和空泛情绪',
+          '尽量使用正向表达，把“不要云”改成“晴朗蓝天”',
+          '图生视频时，重点写动作、镜头和环境变化，不必重复描述图片',
+          '动作要用具体动词和速度词，比如缓慢转身、快速奔跑、轻轻挥手',
+          '多人物场景要用位置区分，比如“左边人物走近，右边人物保持静止”',
+          '想要真实动态，就描述物理细节：水流、烟雾、布料重量、头发飘动',
+          '风格词要统一复用，别一会儿写电影感，一会儿写卡通广告',
+          '失败时一次只改一个变量，比如动作、镜头、光线或画幅',
+          '成片后继续剪辑、加音乐、调节转场，不要只依赖一次生成'
         ];
         var repetitionsPerHalf = 4;
+        var scrollPixelsPerSecond = 60;
         var track = document.getElementById('announceTrack');
         if (!track) return;
 
@@ -124,6 +130,17 @@
 
         appendMessages(false);
         appendMessages(true);
+
+        function updateScrollDuration() {
+          var scrollDistance = track.scrollWidth / 2;
+          if (!scrollDistance) return;
+          track.style.setProperty('--announcement-scroll-duration', (scrollDistance / scrollPixelsPerSecond).toFixed(2) + 's');
+        }
+
+        updateScrollDuration();
+        if (document.fonts && document.fonts.ready) {
+          document.fonts.ready.then(updateScrollDuration).catch(function(){});
+        }
       })();
     </script>
 
@@ -138,7 +155,7 @@
     <canvas id="dotMatrixCanvas"></canvas>
 
     <!-- ===== Sidebar ===== -->
-    <aside id="sidebar" class="fixed left-0 top-0 h-full w-72 flex flex-col py-8 px-6 bg-[#ffffff]/20 backdrop-blur-xl rounded-r-[3rem] border-r border-[#90A4AE]/10 z-40 shadow-[0px_0px_40px_rgba(11,19,32,0.04)]">
+    <aside id="sidebar" class="fixed left-0 top-0 h-full w-72 flex flex-col py-8 px-6 bg-[#ffffff]/20 backdrop-blur-xl border-r border-[#90A4AE]/10 z-40 shadow-[0px_0px_40px_rgba(11,19,32,0.04)]">
       <div class="flex flex-col items-center gap-1 mb-4 px-1">
         <img src="originrise-logo.png" alt="ORIGIN" class="w-36 h-36 object-contain" />
         <div class="flex flex-col items-center select-none -mt-1">
@@ -332,10 +349,6 @@
               <span class="material-symbols-outlined">add</span>
               开始新项目
             </button>
-            <button type="button" id="btnFromTemplate" class="vtd-ghost-btn">
-              <span class="material-symbols-outlined">auto_awesome</span>
-              从模板创建
-            </button>
           </div>
         </div>
 
@@ -359,10 +372,6 @@
               <button type="button" id="ovNewTaskBtn" class="vtd-primary-btn">
                 <span class="material-symbols-outlined">add</span>
                 新建任务
-              </button>
-              <button type="button" id="btnFromTemplate2" class="vtd-ghost-btn vtd-template-btn">
-                <span class="material-symbols-outlined">auto_awesome</span>
-                从模板创建
               </button>
             </div>
           </section>
@@ -576,11 +585,6 @@
               </div>
             </div>
             <div class="script-header-actions">
-              <!-- TODO: 历史版本入口保留给后续版本管理功能接入。 -->
-              <button type="button" id="btnScriptHistory" class="script-toolbar-btn" disabled title="历史版本功能待接入">
-                <span class="material-symbols-outlined">history</span>
-                <span>历史版本</span>
-              </button>
               <button type="button" id="btnUploadScript" class="script-toolbar-btn">
                 <span class="material-symbols-outlined">upload_file</span>
                 <span>导入剧本</span>
@@ -603,7 +607,6 @@
                 </div>
                 <div class="script-panel-heading-actions">
                   <button type="button" id="btnRetagEmotions" class="script-retag-btn" hidden>重新分析情绪</button>
-                  <span class="script-workbench-status">草稿编辑</span>
                 </div>
               </div>
 
@@ -638,11 +641,11 @@
                   <div class="script-import-draft-actions">
                     <button type="button" id="btnApplyImportedDraft" class="script-mini-btn script-mini-btn--primary">
                       <span class="material-symbols-outlined">check</span>
-                      <span>使用此剧本草稿</span>
+                      <span>保留此原稿</span>
                     </button>
                     <button type="button" id="btnConvertImportedDraft" class="script-mini-btn">
                       <span class="material-symbols-outlined">auto_awesome</span>
-                      <span>转换为新的剧本草稿</span>
+                      <span>AI 优化成稿</span>
                     </button>
                     <button type="button" id="btnDiscardImportedDraft" class="script-mini-btn">
                       <span class="material-symbols-outlined">close</span>
@@ -666,8 +669,13 @@
                           <h3 id="scriptCardTitle">剧本草稿</h3>
                         </div>
                         <div class="script-draft-meta">
-                          <span id="scriptDraftStatusBadge" class="is-pending">草稿 · 待确认</span>
-                          <small>版本 1.0 · 刚刚</small>
+                          <div class="script-draft-meta-row">
+                            <span id="scriptDraftStatusBadge" class="is-pending">剧本已生成</span>
+                            <button type="button" id="btnDeleteScript" class="script-card-delete-btn" title="删除当前剧本" hidden>
+                              <span class="material-symbols-outlined">delete</span>
+                            </button>
+                          </div>
+                          <small id="scriptCardVersionLine">版本 1.0 · 刚刚</small>
                         </div>
                       </div>
                       <div class="script-draft-body">
@@ -780,8 +788,7 @@
 			                </button>
 	              </div>
             </div>
-            <p class="text-xs text-on-surface-variant/60 mt-2" id="assetImgHint"></p>
-            <p class="text-xs text-primary mt-1 font-medium" id="assetStylizeBadge" hidden></p>
+            <p class="workflow-title-hint asset-title-hint" id="assetImgHint"></p>
           </header>
 
           <!-- Need Script State -->
@@ -892,7 +899,6 @@
                 <h1>分镜生成</h1>
                 <span>镜头表、素材参考、首尾帧统一工作区</span>
               </div>
-              <p id="shotsKeyframeProgress" class="shots-keyframe-progress" hidden aria-live="polite"></p>
             </div>
             <div id="shotsTopActions" class="flex flex-col items-end gap-2 shrink-0" hidden>
               <div class="flex flex-wrap items-start justify-end gap-3">
@@ -917,6 +923,7 @@
               <p class="text-xs text-on-surface-variant text-right" id="shotsHint"></p>
             </div>
           </header>
+          <p id="shotsKeyframeProgress" class="workflow-title-hint" hidden aria-live="polite"></p>
 
           <div id="shotsNeedScript" class="workflow-empty-state workflow-empty-state--page-center">
             <div class="workflow-empty-state__icon">
@@ -1156,8 +1163,6 @@
                 </button>
               </div>
             </section>
-
-            <p class="batch-hint" id="batchHint"></p>
 
             <section class="batch-stat-grid" aria-label="片段生成统计">
               <div class="batch-stat-card">
@@ -1828,35 +1833,35 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=141",
+        "/modules/assets.js":         "/modules/assets.js?v=158",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
         "/modules/edit.js":           "/modules/edit.js?v=138",
-        "/modules/episode_fields.js": "/modules/episode_fields.js?v=100",
+        "/modules/episode_fields.js": "/modules/episode_fields.js?v=101",
         "/modules/episodes.js":       "/modules/episodes.js?v=102",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/loading.js":        "/modules/loading.js?v=1",
         "/modules/project.js":        "/modules/project.js?v=105",
         "/modules/render_hooks.js":   "/modules/render_hooks.js?v=102",
-        "/modules/script.js":         "/modules/script.js?v=108",
+        "/modules/script.js":         "/modules/script.js?v=113",
         "/modules/settings.js":       "/modules/settings.js?v=101",
-        "/modules/shots.js":          "/modules/shots.js?v=107",
+        "/modules/shots.js":          "/modules/shots.js?v=109",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=138",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=144",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
         "/modules/tasks.js":          "/modules/tasks.js?v=100",
         "/modules/toolbox.js":        "/modules/toolbox.js?v=201",
         "/modules/utils.js":          "/modules/utils.js?v=203",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=108",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=120"
+        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=111",
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=121"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=203"></script>
-    <script type="module" src="main.js?v=270"></script>
+    <script type="module" src="main.js?v=303"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

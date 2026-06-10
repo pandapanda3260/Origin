@@ -11,9 +11,12 @@ globalThis.window = {
 globalThis.document = {
   addEventListener() {},
   removeEventListener() {},
+  // syncAssetsProject → _refreshSaveWorldTemplateButton 会查 DOM 按钮（查不到即早退），
+  // node 环境下补一个返回 null 的 stub 即可。
+  getElementById() { return null; },
 };
 
-const { _applyServerStaleFlagsToProject, deriveAssetCardState, syncAssetsProject } = await import('../public/modules/assets.js');
+const { _applyServerStaleFlagsToProject, _assetStaleBannerTextForProject, deriveAssetCardState, syncAssetsProject } = await import('../public/modules/assets.js');
 
 // The asset page no longer auto-syncs style-driven asset stale badges.
 // This helper still backs managed-prefix mirroring for downstream stale families.
@@ -96,6 +99,41 @@ const { _applyServerStaleFlagsToProject, deriveAssetCardState, syncAssetsProject
   assert.equal(state.failedAttemptUrl, '/failed.png');
   assert.equal(state.statusLabel, '生成失败');
   assert.equal(state.statusMessage, '本次生成结果不可用，请重新生成');
+}
+
+{
+  assert.equal(
+    _assetStaleBannerTextForProject({
+      scriptReviewState: 'approved',
+      _staleFlags: { assets: true },
+      styleBibleGeneratedAt: '2026-06-09T17:02:18.320Z',
+    }),
+    '风格/世界观设定已更新，资产可能需要重新分析以保持一致性',
+    'legacy asset stale flags should infer style/world cause when the script is approved and style bible exists',
+  );
+  assert.equal(
+    _assetStaleBannerTextForProject({
+      scriptReviewState: 'approved',
+      _staleFlags: { assets: true },
+    }),
+    '上游内容已更新，资产可能需要重新分析以保持一致性',
+    'unknown legacy asset stale flags should stay neutral rather than claim a script edit',
+  );
+  assert.equal(
+    _assetStaleBannerTextForProject({
+      scriptReviewState: 'approved',
+      _staleFlags: { assets: true },
+      _staleFlagReasons: { assets: 'style_bible_changed' },
+    }),
+    '风格/世界观设定已更新，资产可能需要重新分析以保持一致性',
+  );
+  assert.equal(
+    _assetStaleBannerTextForProject({
+      scriptReviewState: 'modified',
+      _staleFlags: { assets: true },
+    }),
+    '剧本已修改，资产可能需要重新分析以保持一致性',
+  );
 }
 
 {

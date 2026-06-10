@@ -18,6 +18,7 @@ var _characterMenuScrollHandler = null;
 var _refUploading = false;
 var _ref = null;
 var _listCache = { key: '', items: null, loadedAt: 0 };
+var _generationFitRaf = 0;
 var _LIST_CACHE_TTL_MS = 2 * 60 * 1000;
 var _form = {
   name: '',
@@ -30,6 +31,8 @@ var _form = {
     crowdSize: '',
   },
 };
+var CHARACTER_NAME_MAX = 20;
+var CHARACTER_PROMPT_MAX = 300;
 
 export function initCharacterCustom(ctx) {
   _ctx = ctx || {};
@@ -201,6 +204,19 @@ function _paramButton(value, current, attr, label) {
   return '<button type="button" class="' + (value === current ? 'is-active' : '') + '" ' + attr + '="' + escapeHtml(value) + '">' + escapeHtml(label) + '</button>';
 }
 
+function _fieldCounterHtml(key, value, max) {
+  return '<small class="character-field-counter" data-character-counter="' + escapeHtml(key) + '">' +
+    String(value || '').length + '/' + max +
+  '</small>';
+}
+
+function _paramRowHtml(label, buttonsHtml) {
+  return '<div class="character-attribute-row">' +
+    '<span class="character-attribute-label">' + escapeHtml(label) + '</span>' +
+    '<div class="toolbox-choice-row character-choice-row character-attribute-options">' + buttonsHtml + '</div>' +
+  '</div>';
+}
+
 function _optionHtml(value, current, label) {
   return '<option value="' + escapeHtml(value) + '" ' + (String(value) === String(current) ? 'selected' : '') + '>' + escapeHtml(label) + '</option>';
 }
@@ -213,30 +229,31 @@ function _tagsValue(tags) {
 function _paramRowsHtml() {
   var p = _form.params || {};
   return '' +
-    '<div class="toolbox-field"><span>实体类型</span><div class="toolbox-choice-row character-choice-row">' +
+    '<section class="character-attributes">' +
+      '<h2 class="character-attributes-title">角色属性</h2>' +
+      '<div class="character-attributes-card">' +
+        _paramRowHtml('类型',
       _paramButton('auto', p.entityType, 'data-character-param-entity', '自动') +
       _paramButton('human', p.entityType, 'data-character-param-entity', '真人') +
-      _paramButton('non-human', p.entityType, 'data-character-param-entity', '非人') +
-    '</div></div>' +
-    '<div class="toolbox-field"><span>性别呈现</span><div class="toolbox-choice-row character-choice-row">' +
+      _paramButton('non-human', p.entityType, 'data-character-param-entity', '非人')) +
+        _paramRowHtml('性别',
       _paramButton('auto', p.gender, 'data-character-param-gender', '自动') +
       _paramButton('male', p.gender, 'data-character-param-gender', '男') +
       _paramButton('female', p.gender, 'data-character-param-gender', '女') +
-      _paramButton('unspecified', p.gender, 'data-character-param-gender', '不限定') +
-    '</div></div>' +
-    '<div class="toolbox-field"><span>年龄段</span><div class="toolbox-choice-row character-choice-row">' +
+      _paramButton('unspecified', p.gender, 'data-character-param-gender', '不限')) +
+        _paramRowHtml('年龄',
       _paramButton('auto', p.ageRange, 'data-character-param-age', '自动') +
       _paramButton('teen', p.ageRange, 'data-character-param-age', '少年') +
       _paramButton('young', p.ageRange, 'data-character-param-age', '青年') +
       _paramButton('middle', p.ageRange, 'data-character-param-age', '中年') +
       _paramButton('elder', p.ageRange, 'data-character-param-age', '老年') +
-      _paramButton('unspecified', p.ageRange, 'data-character-param-age', '不限定') +
-    '</div></div>' +
-    '<div class="toolbox-field"><span>群体角色</span><div class="toolbox-choice-row character-choice-row">' +
+      _paramButton('unspecified', p.ageRange, 'data-character-param-age', '不限')) +
+        _paramRowHtml('群体',
       _paramButton('0', p.isCrowd ? '1' : '0', 'data-character-param-crowd', '单体') +
-      _paramButton('1', p.isCrowd ? '1' : '0', 'data-character-param-crowd', '群体') +
-    '</div></div>' +
-    (p.isCrowd ? '<label class="toolbox-field"><span>群体规模</span><input id="characterCrowdSizeInput" value="' + escapeHtml(p.crowdSize || '') + '" placeholder="如：三人 / 一群 / 十余人" /></label>' : '');
+      _paramButton('1', p.isCrowd ? '1' : '0', 'data-character-param-crowd', '群体')) +
+      '</div>' +
+    '</section>' +
+    (p.isCrowd ? '<label class="toolbox-field character-field"><span>群体规模</span><input id="characterCrowdSizeInput" value="' + escapeHtml(p.crowdSize || '') + '" placeholder="如：三人 / 一群 / 十余人" /></label>' : '');
 }
 
 function _refHtml() {
@@ -707,28 +724,30 @@ function _addCharacterTag(id) {
 function _draftEditorHtml() {
   var canConfirm = _isConfirmableVersion(_selectedVersion);
   return '' +
-    '<header class="toolbox-tool-head">' +
+    '<header class="toolbox-tool-head character-generation-head">' +
       '<button type="button" class="toolbox-back" data-character-back title="返回角色定制"><span class="material-symbols-outlined">arrow_back</span></button>' +
       '<div><p class="toolbox-kicker">CHARACTER CUSTOM</p><h1>角色生成</h1></div>' +
       '<button type="button" class="character-new-btn" data-character-confirm ' + (canConfirm && !_busy ? '' : 'disabled') + '><span class="material-symbols-outlined">check</span>确认添加</button>' +
     '</header>' +
-    '<div class="toolbox-workbench" data-character-editor>' +
-      '<section class="toolbox-panel toolbox-config">' +
-        '<div class="toolbox-form">' +
-          '<div class="toolbox-field"><span>参考图</span>' + _refHtml() + '</div>' +
-          '<label class="toolbox-field"><span>角色名称</span><input id="characterNameInput" type="text" maxlength="80" placeholder="为角色命名（留空则使用 AI 生成的名称）" value="' + escapeHtml(_form.name || '') + '" /></label>' +
-          '<label class="toolbox-field"><span>提示词</span><textarea id="characterPromptInput" rows="6" placeholder="描述角色外貌、服装、气质或需要复制的图片特征">' + escapeHtml(_form.prompt || '') + '</textarea></label>' +
+    '<div class="toolbox-workbench character-generation-grid" data-character-editor data-character-generation-editor>' +
+      '<section class="toolbox-panel toolbox-config character-generation-form-card">' +
+        '<div class="toolbox-form character-generate-form character-generation-form">' +
+          '<div class="toolbox-field character-field character-ref-field"><span>参考图</span>' + _refHtml() + '</div>' +
+          '<label class="toolbox-field character-field character-field-with-counter"><span>角色名称</span><input id="characterNameInput" type="text" maxlength="' + CHARACTER_NAME_MAX + '" data-character-counter-source="name" data-character-counter-max="' + CHARACTER_NAME_MAX + '" placeholder="为角色命名（留空则使用 AI 生成的名称）" value="' + escapeHtml(_form.name || '') + '" />' + _fieldCounterHtml('name', _form.name, CHARACTER_NAME_MAX) + '</label>' +
+          '<label class="toolbox-field character-field character-field-with-counter"><span>提示词</span><textarea id="characterPromptInput" rows="6" maxlength="' + CHARACTER_PROMPT_MAX + '" data-character-counter-source="prompt" data-character-counter-max="' + CHARACTER_PROMPT_MAX + '" placeholder="描述角色外貌、服装、气质或需要复制的图片特征">' + escapeHtml(_form.prompt || '') + '</textarea>' + _fieldCounterHtml('prompt', _form.prompt, CHARACTER_PROMPT_MAX) + '</label>' +
           _paramRowsHtml() +
-          '<button type="button" class="toolbox-generate" data-character-generate ' + (_busy || _refUploading ? 'disabled' : '') + '>' +
+        '</div>' +
+        '<div class="character-generation-actions">' +
+          '<button type="button" class="toolbox-generate character-generation-submit" data-character-generate ' + (_busy || _refUploading ? 'disabled' : '') + '>' +
             '<span class="material-symbols-outlined ' + (_busy || _refUploading ? 'toolbox-spin' : '') + '">' + (_busy || _refUploading ? 'progress_activity' : 'auto_awesome') + '</span>' +
             (_busy ? '生成中' : _refUploading ? '等待上传' : '生成角色') +
           '</button>' +
         '</div>' +
       '</section>' +
-      '<section class="toolbox-panel toolbox-preview">' +
+      '<section class="toolbox-panel toolbox-preview character-generation-preview">' +
         '<div id="characterPreviewArea" class="toolbox-preview-area">' + _previewHtml() + '</div>' +
       '</section>' +
-      '<aside class="toolbox-panel toolbox-history">' +
+      '<aside class="toolbox-panel toolbox-history character-generation-drafts">' +
         '<div class="toolbox-history-head"><div><strong>草稿箱</strong><small>未确认角色</small></div></div>' +
         '<div class="toolbox-history-list">' + _draftBoxHtml() + '</div>' +
       '</aside>' +
@@ -878,11 +897,77 @@ function _draftBoxHtml() {
   }).join('');
 }
 
+function _clearGenerationFit() {
+  var root = $('characterCustomRoot');
+  var page = $('pageCharacterCustom');
+  if (root) {
+    root.style.removeProperty('--character-generation-scale');
+    root.style.removeProperty('--character-generation-fit-left');
+    root.style.removeProperty('--character-generation-fit-top');
+    root.style.removeProperty('--character-gen-panel-min');
+    root.removeAttribute('data-character-generation-fit-scale');
+  }
+  if (page) page.removeAttribute('data-character-generation-scale');
+}
+
+function _fitGenerationEditor() {
+  _generationFitRaf = 0;
+  var page = $('pageCharacterCustom');
+  var root = $('characterCustomRoot');
+  if (!page || !root || page.hidden || _view !== 'draftEditor' || !root.querySelector('[data-character-generation-editor]')) {
+    _clearGenerationFit();
+    return;
+  }
+  var pageStyle = window.getComputedStyle(page);
+  var padLeft = parseFloat(pageStyle.paddingLeft) || 0;
+  var padRight = parseFloat(pageStyle.paddingRight) || 0;
+  var padTop = parseFloat(pageStyle.paddingTop) || 0;
+  var padBottom = parseFloat(pageStyle.paddingBottom) || 0;
+  var availableWidth = Math.max(1, page.clientWidth - padLeft - padRight);
+  var availableHeight = Math.max(1, page.clientHeight - padTop - padBottom);
+  // 量自然尺寸前先清掉上一轮的面板高度覆写，避免在旧值基础上累计。
+  root.style.removeProperty('--character-gen-panel-min');
+  var naturalWidth = Math.max(1, Math.ceil(root.scrollWidth));
+  var naturalHeight = Math.max(1, Math.ceil(root.scrollHeight));
+  var scale = Math.min(1, availableWidth / naturalWidth, availableHeight / naturalHeight);
+  scale = Math.max(0.42, Math.min(1, scale));
+  // 左中右三栏同行时，把面板高度补成「可用高度 ÷ 缩放 − 头部占高」，让三栏下边界贴齐页面下边界。
+  var fillHead = root.querySelector('.character-generation-head');
+  var fillForm = root.querySelector('.character-generation-form-card');
+  var fillDrafts = root.querySelector('.character-generation-drafts');
+  var fillSingleRow = !!(fillForm && fillDrafts && Math.abs(fillForm.offsetTop - fillDrafts.offsetTop) < 2);
+  if (fillHead && fillSingleRow) {
+    var fillHeadStyle = window.getComputedStyle(fillHead);
+    var fillHeadBlock = Math.ceil(fillHead.offsetHeight + (parseFloat(fillHeadStyle.marginTop) || 0) + (parseFloat(fillHeadStyle.marginBottom) || 0));
+    var fillPanelTarget = Math.floor(availableHeight / scale) - fillHeadBlock;
+    if (fillPanelTarget >= 480) {
+      root.style.setProperty('--character-gen-panel-min', fillPanelTarget + 'px');
+      naturalHeight = Math.max(1, Math.ceil(root.scrollHeight));
+    }
+  }
+  var visualWidth = naturalWidth * scale;
+  var visualHeight = naturalHeight * scale;
+  var left = padLeft + Math.max(0, (availableWidth - visualWidth) / 2);
+  var top = padTop + Math.max(0, (availableHeight - visualHeight) / 2);
+  root.style.setProperty('--character-generation-scale', scale.toFixed(4));
+  root.style.setProperty('--character-generation-fit-left', left.toFixed(2) + 'px');
+  root.style.setProperty('--character-generation-fit-top', top.toFixed(2) + 'px');
+  root.setAttribute('data-character-generation-fit-scale', scale < 0.999 ? 'scaled' : 'none');
+  page.setAttribute('data-character-generation-scale', scale.toFixed(4));
+}
+
+function _scheduleGenerationFit() {
+  if (_generationFitRaf) window.cancelAnimationFrame(_generationFitRaf);
+  _generationFitRaf = window.requestAnimationFrame(_fitGenerationEditor);
+}
+
 function _render() {
   var root = $('characterCustomRoot');
   if (!root) return;
   root.innerHTML = _view === 'draftEditor' ? _draftEditorHtml() : _view === 'confirmedEditor' ? _confirmedEditorHtml() : _listHtml();
   hydrateProtectedImageElements(root);
+  if (_view === 'draftEditor') _scheduleGenerationFit();
+  else _clearGenerationFit();
 }
 
 function _hasRenderedView() {
@@ -986,6 +1071,15 @@ function _syncFormFromDom() {
   if (name) _form.name = name.value;
   var crowdSize = $('characterCrowdSizeInput');
   if (crowdSize) _form.params.crowdSize = crowdSize.value;
+}
+
+function _updateCharacterFieldCounter(input) {
+  if (!input) return;
+  var key = input.getAttribute('data-character-counter-source') || '';
+  var max = Number(input.getAttribute('data-character-counter-max') || 0);
+  var counter = key && document.querySelector('[data-character-counter="' + key + '"]');
+  if (!counter || !max) return;
+  counter.textContent = String(input.value || '').length + '/' + max;
 }
 
 async function _uploadReference(file) {
@@ -1205,6 +1299,7 @@ async function _regenerateCard(id) {
 export function _initCharacterCustomEvents() {
   if (_wired) return;
   _wired = true;
+  window.addEventListener('resize', _scheduleGenerationFit);
   document.addEventListener('click', function (ev) {
     var activeNameInput = document.querySelector('[data-character-name-input]:not(.hidden)');
     if (activeNameInput) {
@@ -1409,6 +1504,10 @@ export function _initCharacterCustomEvents() {
         _render();
       });
     }
+  });
+  document.addEventListener('input', function (ev) {
+    var counterField = ev.target && ev.target.closest && ev.target.closest('[data-character-counter-source]');
+    if (counterField) _updateCharacterFieldCounter(counterField);
   });
   document.addEventListener('focusout', function (ev) {
     var nameInput = ev.target && ev.target.closest && ev.target.closest('[data-character-name-input]');

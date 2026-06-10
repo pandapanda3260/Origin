@@ -455,6 +455,73 @@ function entityKey(entity: any) {
   return firstText(entity?.characterId, entity?.id, entity?.sourceAssetId, entity?.name, entity?.title, entity?.role).toLowerCase();
 }
 
+function entityKeySet(values: any) {
+  const set = new Set<string>();
+  if (!Array.isArray(values)) return set;
+  for (const value of values) {
+    const key = String(value || '').trim().toLowerCase();
+    if (key) set.add(key);
+  }
+  return set;
+}
+
+export type WorldTemplateEntityExclude = {
+  all?: string[];
+  characters?: string[];
+  characterCandidates?: string[];
+  locations?: string[];
+  props?: string[];
+  terminology?: string[];
+};
+
+export function filterWorldTemplateEntityKeys(input: any, exclude: WorldTemplateEntityExclude | undefined) {
+  if (!input || typeof input !== 'object' || !exclude || typeof exclude !== 'object') return input;
+  const all = entityKeySet(exclude.all);
+  const characterKeys = entityKeySet(exclude.characters);
+  const candidateKeys = entityKeySet(exclude.characterCandidates);
+  const locationKeys = entityKeySet(exclude.locations);
+  const propKeys = entityKeySet(exclude.props);
+  const terminologyKeys = new Set<string>();
+  if (Array.isArray(exclude.terminology)) {
+    for (const value of exclude.terminology) {
+      const key = String(value ?? '');
+      if (key) terminologyKeys.add(key);
+    }
+  }
+  if (
+    !all.size
+    && !characterKeys.size
+    && !candidateKeys.size
+    && !locationKeys.size
+    && !propKeys.size
+    && !terminologyKeys.size
+  ) return input;
+
+  const shouldDrop = (item: any, sets: Set<string>[]) => {
+    const key = entityKey(item);
+    return !!key && (all.has(key) || sets.some((set) => set.has(key)));
+  };
+  const out = { ...input };
+  if (Array.isArray(out.characters)) {
+    out.characters = out.characters.filter((item: any) => !shouldDrop(item, [characterKeys]));
+  }
+  if (Array.isArray(out.characterCandidates)) {
+    out.characterCandidates = out.characterCandidates.filter((item: any) => !shouldDrop(item, [characterKeys, candidateKeys]));
+  }
+  if (Array.isArray(out.locations)) {
+    out.locations = out.locations.filter((item: any) => !shouldDrop(item, [locationKeys]));
+  }
+  if (Array.isArray(out.props)) {
+    out.props = out.props.filter((item: any) => !shouldDrop(item, [propKeys]));
+  }
+  if (out.terminology && typeof out.terminology === 'object' && !Array.isArray(out.terminology) && terminologyKeys.size) {
+    out.terminology = Object.fromEntries(
+      Object.entries(out.terminology).filter(([key]) => !terminologyKeys.has(key)),
+    );
+  }
+  return out;
+}
+
 function entityFieldMeta(entity: any, key: string) {
   const meta = entity?.fieldMeta;
   return meta && typeof meta === 'object' && !Array.isArray(meta) && meta[key] && typeof meta[key] === 'object' && !Array.isArray(meta[key])
@@ -529,6 +596,169 @@ function mergeEntityArrayByKey(current: any, incoming: any, opts: { source: stri
   return { value: next, changed };
 }
 
+function appendMissingEntityArray(current: any, incoming: any) {
+  const currentList = Array.isArray(current) ? clonePlain(current) : [];
+  const incomingList = Array.isArray(incoming) ? incoming : [];
+  if (!incomingList.length) return currentList;
+  const existingKeys = new Set(currentList.map(entityKey).filter(Boolean));
+  for (const item of incomingList) {
+    const key = entityKey(item);
+    if (!key || existingKeys.has(key)) continue;
+    currentList.push(clonePlain(item));
+    existingKeys.add(key);
+  }
+  return currentList;
+}
+
+function entityKeysFrom(values: any) {
+  const keys = new Set<string>();
+  if (!Array.isArray(values)) return keys;
+  for (const item of values) {
+    const key = entityKey(item);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+function templateEntityLabel(entity: any, fallback: string) {
+  return firstText(
+    entity?.name,
+    entity?.title,
+    entity?.sceneName,
+    entity?.location,
+    entity?.role,
+    entity?.propType,
+    entity?.id,
+    fallback,
+  );
+}
+
+function templateChangeItem(entity: any, category: string) {
+  return {
+    key: entityKey(entity),
+    label: templateEntityLabel(entity, '未命名'),
+    category,
+    previewUrl: entityPreviewUrl(entity) || undefined,
+  };
+}
+
+function emptyWorldTemplateChangePreview() {
+  return {
+    additions: {
+      characters: [] as any[],
+      characterCandidates: [] as any[],
+      locations: [] as any[],
+      props: [] as any[],
+      terminology: [] as any[],
+    },
+    promotions: {
+      characterCandidatesToCharacters: [] as any[],
+    },
+    additionTotal: 0,
+    promotionTotal: 0,
+    changeTotal: 0,
+  };
+}
+
+function addEntityAdditions(out: any[], incoming: any, existingKeys: Set<string>, category: string) {
+  if (!Array.isArray(incoming)) return;
+  for (const item of incoming) {
+    const key = entityKey(item);
+    if (!key || existingKeys.has(key)) continue;
+    out.push(templateChangeItem(item, category));
+    existingKeys.add(key);
+  }
+}
+
+function computeWorldTemplateChangePreview(existingTemplate: any, incomingTemplate: any) {
+  const preview = emptyWorldTemplateChangePreview();
+  const existingCharacterKeys = entityKeysFrom(existingTemplate?.characters);
+  const existingCandidateKeys = entityKeysFrom(existingTemplate?.characterCandidates);
+  const existingAnyCharacterKeys = new Set<string>([...existingCharacterKeys, ...existingCandidateKeys]);
+
+  for (const item of Array.isArray(incomingTemplate?.characters) ? incomingTemplate.characters : []) {
+    const key = entityKey(item);
+    if (!key || existingCharacterKeys.has(key)) continue;
+    if (existingCandidateKeys.has(key)) {
+      preview.promotions.characterCandidatesToCharacters.push(templateChangeItem(item, 'characters'));
+    } else {
+      preview.additions.characters.push(templateChangeItem(item, 'characters'));
+    }
+    existingAnyCharacterKeys.add(key);
+  }
+
+  for (const item of Array.isArray(incomingTemplate?.characterCandidates) ? incomingTemplate.characterCandidates : []) {
+    const key = entityKey(item);
+    if (!key || existingAnyCharacterKeys.has(key)) continue;
+    preview.additions.characterCandidates.push(templateChangeItem(item, 'characterCandidates'));
+    existingAnyCharacterKeys.add(key);
+  }
+
+  addEntityAdditions(preview.additions.locations, incomingTemplate?.locations, entityKeysFrom(existingTemplate?.locations), 'locations');
+  addEntityAdditions(preview.additions.props, incomingTemplate?.props, entityKeysFrom(existingTemplate?.props), 'props');
+
+  const existingTerminology = existingTemplate?.terminology && typeof existingTemplate.terminology === 'object' && !Array.isArray(existingTemplate.terminology)
+    ? existingTemplate.terminology
+    : {};
+  const incomingTerminology = incomingTemplate?.terminology && typeof incomingTemplate.terminology === 'object' && !Array.isArray(incomingTemplate.terminology)
+    ? incomingTemplate.terminology
+    : {};
+  for (const key of Object.keys(incomingTerminology)) {
+    if (Object.prototype.hasOwnProperty.call(existingTerminology, key)) continue;
+    preview.additions.terminology.push({
+      key,
+      label: key,
+      category: 'terminology',
+    });
+  }
+
+  preview.additionTotal = Object.values(preview.additions).reduce((sum, list: any) => sum + (Array.isArray(list) ? list.length : 0), 0);
+  preview.promotionTotal = preview.promotions.characterCandidatesToCharacters.length;
+  preview.changeTotal = preview.additionTotal + preview.promotionTotal;
+  return preview;
+}
+
+function mergeMissingTerminology(current: any, incoming: any) {
+  const out = current && typeof current === 'object' && !Array.isArray(current)
+    ? { ...current }
+    : {};
+  const source = incoming && typeof incoming === 'object' && !Array.isArray(incoming)
+    ? incoming
+    : {};
+  for (const key of Object.keys(source)) {
+    if (!Object.prototype.hasOwnProperty.call(out, key)) out[key] = source[key];
+  }
+  return out;
+}
+
+function projectWorldTerminology(project: any) {
+  const styleBible = project?.styleBible && typeof project.styleBible === 'object' ? project.styleBible : {};
+  return styleBible.terminology || styleBible.terms || {};
+}
+
+function projectWorldLocations(project: any) {
+  const environments = Array.isArray(project?.environments) ? project.environments : [];
+  return environments.map((env: any) => ({
+    id: firstText(env.id, env.sceneId),
+    name: firstText(env.name, env.sceneName, env.title),
+    description: firstText(env.description, env.detail, env.intro),
+    atmosphere: firstText(env.atmosphere, env.mood),
+    imageUrl: firstText(env.imageUrl, env.rawUrl) || undefined,
+  }));
+}
+
+function projectWorldProps(project: any) {
+  const props = Array.isArray(project?.props) ? project.props : [];
+  return props.map((prop: any) => ({
+    id: firstText(prop.id, prop.propId),
+    name: firstText(prop.name, prop.title),
+    function: firstText(prop.function, prop.description, prop.detail),
+    ownership: firstText(prop.ownership, prop.owner),
+    visualFeatures: firstText(prop.visualFeatures, prop.appearance),
+    imageUrl: firstText(prop.imageUrl, prop.rawUrl) || undefined,
+  }));
+}
+
 function filterTemplateInclude(input: any, include: BuildWorldTemplateInclude | undefined) {
   const out = { ...(input && typeof input === 'object' ? input : {}) };
   if (include?.characters === false) {
@@ -539,6 +769,43 @@ function filterTemplateInclude(input: any, include: BuildWorldTemplateInclude | 
   if (include?.props === false) out.props = [];
   if (include?.terminology === false) out.terminology = {};
   return out;
+}
+
+function normalizeTerminologyEntryValue(value: any) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return firstText(value.meaning, value.description, value.value, value.desc, value.summary);
+  }
+  return firstText(value);
+}
+
+export function normalizeWorldTemplateTerminology(value: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  const addTerm = (keyValue: any, descValue: any) => {
+    const key = firstText(keyValue).slice(0, 120);
+    if (!key) return;
+    const desc = normalizeTerminologyEntryValue(descValue).slice(0, 1200);
+    out[key] = desc || key;
+  };
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        addTerm(item.term || item.name || item.title || item.key, item.meaning || item.description || item.value || item.desc);
+      } else {
+        addTerm(item, item);
+      }
+    }
+  } else if (value && typeof value === 'object') {
+    for (const [key, desc] of Object.entries(value)) addTerm(key, desc);
+  }
+  return out;
+}
+
+export function applyWorldTemplateTerminologyOverride(input: any, terminologyOverride: any) {
+  if (!input || typeof input !== 'object') return input;
+  return {
+    ...input,
+    terminology: normalizeWorldTemplateTerminology(terminologyOverride),
+  };
 }
 
 function mapReferencePanels(referenceLock: any) {
@@ -700,8 +967,6 @@ function preferredStyleTemplateFromProject(project: any) {
 export function buildWorldTemplateFromProject(project: any, opts: { templateId?: string; name?: string; include?: BuildWorldTemplateInclude } = {}) {
   const styleBible = project?.styleBible && typeof project.styleBible === 'object' ? project.styleBible : {};
   const worldRulesRaw = styleBible.worldRules || styleBible.world_rules || {};
-  const environments = Array.isArray(project?.environments) ? project.environments : [];
-  const props = Array.isArray(project?.props) ? project.props : [];
   const include = opts.include || {};
   const preferredStyleFields = preferredStyleTemplateFromProject(project);
   const characterSplit = includeEnabled(include, 'characters')
@@ -729,25 +994,12 @@ export function buildWorldTemplateFromProject(project: any, opts: { templateId?:
       forbiddenPlots: cleanList(styleBible.forbiddenPlots || styleBible.forbiddenRules, 12),
       toneBoundaries: cleanList(styleBible.toneBoundaries || styleBible.toneRules, 12),
     },
-    terminology: includeEnabled(include, 'terminology') ? (styleBible.terminology || styleBible.terms || {}) : {},
+    terminology: includeEnabled(include, 'terminology') ? projectWorldTerminology(project) : {},
     forbiddenRules: cleanList([styleBible.forbiddenRules, worldRulesRaw.forbiddenRules], 16),
     characters: characterSplit.characters,
     characterCandidates: characterSplit.characterCandidates,
-    locations: includeEnabled(include, 'locations') ? environments.map((env: any) => ({
-      id: firstText(env.id, env.sceneId),
-      name: firstText(env.name, env.sceneName, env.title),
-      description: firstText(env.description, env.detail, env.intro),
-      atmosphere: firstText(env.atmosphere, env.mood),
-      imageUrl: firstText(env.imageUrl, env.rawUrl) || undefined,
-    })) : [],
-    props: includeEnabled(include, 'props') ? props.map((prop: any) => ({
-      id: firstText(prop.id, prop.propId),
-      name: firstText(prop.name, prop.title),
-      function: firstText(prop.function, prop.description, prop.detail),
-      ownership: firstText(prop.ownership, prop.owner),
-      visualFeatures: firstText(prop.visualFeatures, prop.appearance),
-      imageUrl: firstText(prop.imageUrl, prop.rawUrl) || undefined,
-    })) : [],
+    locations: includeEnabled(include, 'locations') ? projectWorldLocations(project) : [],
+    props: includeEnabled(include, 'props') ? projectWorldProps(project) : [],
   };
 }
 
@@ -766,14 +1018,18 @@ export function buildWorldTemplateFromProjectSnapshot(
   const projectCharacterSplit = splitWorldCharactersFromProject(project);
   const snapshotCharacters = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characters);
   const snapshotCandidates = applyAssetAuthorityToSnapshotCharacters(project, snapshot.characterCandidates);
+  const characters = mergeWorldCharacterPools(snapshotCharacters, projectCharacterSplit.characters);
   const characterCandidates = removeCharactersAlreadyInPool(
     mergeWorldCharacterPools(snapshotCandidates, projectCharacterSplit.characterCandidates),
-    snapshotCharacters,
+    characters,
   );
   const projectedSnapshot = {
     ...snapshot,
-    characters: snapshotCharacters,
+    characters,
     characterCandidates,
+    locations: appendMissingEntityArray(snapshot.locations, projectWorldLocations(project)),
+    props: appendMissingEntityArray(snapshot.props, projectWorldProps(project)),
+    terminology: mergeMissingTerminology(snapshot.terminology, projectWorldTerminology(project)),
   };
   return filterTemplateInclude({
     ...projectedSnapshot,
@@ -835,7 +1091,57 @@ export function mergeWorldTemplateSnapshotIntoSource(
     }
   }
 
+  const candidateList = Array.isArray((next as any).characterCandidates) ? (next as any).characterCandidates : [];
+  const dedupedCandidates = removeCharactersAlreadyInPool(candidateList, (next as any).characters);
+  if (dedupedCandidates.length !== candidateList.length) {
+    (next as any).characterCandidates = dedupedCandidates;
+    changed = true;
+  }
+
   return { template: next, changed };
+}
+
+export function prepareWorldTemplateSaveInput(input: {
+  project: any;
+  mode: 'create' | 'update';
+  templateId?: string;
+  name?: string;
+  include?: BuildWorldTemplateInclude;
+  excludeEntityKeys?: WorldTemplateEntityExclude;
+  existingTemplate?: any;
+}) {
+  const rawInput = buildWorldTemplateFromProjectSnapshot(input.project, {
+    templateId: input.templateId || undefined,
+    name: input.name || undefined,
+    include: input.include,
+    mode: input.mode,
+  }) || buildWorldTemplateFromProject(input.project, {
+    templateId: input.templateId || undefined,
+    name: input.name || undefined,
+    include: input.include,
+  });
+  const changes = input.mode === 'update' && input.existingTemplate
+    ? computeWorldTemplateChangePreview(input.existingTemplate, rawInput)
+    : emptyWorldTemplateChangePreview();
+  const filteredInput = filterWorldTemplateEntityKeys(rawInput, input.excludeEntityKeys);
+  const finalInput = input.mode === 'update' && input.existingTemplate
+    ? mergeWorldTemplateSnapshotIntoSource(input.existingTemplate, filteredInput, {
+        name: input.name || undefined,
+        templateId: input.templateId,
+        include: input.include,
+      }).template
+    : filteredInput;
+  return {
+    rawInput,
+    filteredInput,
+    finalInput,
+    changes,
+    additions: changes.additions,
+    promotions: changes.promotions,
+    additionTotal: changes.additionTotal,
+    promotionTotal: changes.promotionTotal,
+    changeTotal: changes.changeTotal,
+  };
 }
 
 export function mergeProjectCharacterLocksIntoWorldTemplate(

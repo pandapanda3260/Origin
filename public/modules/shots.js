@@ -137,11 +137,26 @@ function _shotPlanReasonLabel(reason) {
     assets_changed: "资产库",
     duration_changed: "时长",
     emotion_changed: "情绪节奏",
+    world_changed: "世界观",
     upstream_changed_during_generation: "生成中上游变化",
     manual_shot_edit: "手动编辑",
+    legacy_unknown: "旧版镜头计划",
     unknown: "未知变化",
   };
   return map[reason] || reason || "上游变化";
+}
+
+export function _shotPlanChangeSubject(reasons) {
+  reasons = Array.isArray(reasons) ? reasons : [];
+  var labels = [];
+  reasons.forEach(function (reason) {
+    if (reason === "upstream_changed_during_generation") return;
+    var label = _shotPlanReasonLabel(reason);
+    if (label && labels.indexOf(label) < 0) labels.push(label);
+  });
+  if (labels.length) return labels.join("、");
+  if (reasons.indexOf("upstream_changed_during_generation") >= 0) return "生成期间的上游内容";
+  return "";
 }
 
 function _hasAnyAssetData() {
@@ -187,10 +202,11 @@ function _getShotPlanActionState() {
     };
   }
   if (status === "stale" || (hasShots && hasShotPlanFlag)) {
+    var subject = _shotPlanChangeSubject(reasons);
     return {
       label: "重新生成镜头计划",
       disabled: false,
-      hint: reasonText || "剧本/风格/资产已变化，建议重新生成镜头计划。",
+      hint: subject ? (subject + "已变化，建议重新生成镜头计划。") : (reasonText || "镜头计划依赖已变化，建议重新生成镜头计划。"),
     };
   }
   if (status === "legacy_unknown") {
@@ -696,14 +712,17 @@ export function renderShotList() {
     // 用户反馈：banner 左右边界应与镜头卡片对齐，去掉 mx-8 让 banner 撑满 wrap 容器宽度。
     spb.className = "upstream-stale-banner";
     var reasons = Array.isArray(project.shotPlanStaleReasons) ? project.shotPlanStaleReasons : [];
-    var reasonText = reasons.length ? "上游变化：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
+    var subject = _shotPlanChangeSubject(reasons);
+    var reasonText = reasons.length ? "变化来源：" + reasons.map(_shotPlanReasonLabel).join("、") : "";
     var message = "";
     if (shotPlanStatus === "failed") {
       message = "镜头计划生成失败，请重新生成。";
     } else if (shotPlanStatus === "legacy_unknown") {
       message = "当前镜头计划来自旧版本，建议校验后继续或重新生成。";
     } else {
-      message = "剧本/风格/资产已变化，当前镜头计划可能不是最新版本。";
+      message = subject
+        ? subject + "已变化，当前镜头计划可能不是最新版本。"
+        : "镜头计划依赖已变化，当前镜头计划可能不是最新版本。";
     }
     // 注：此前在 banner 右侧渲染 "确认仍可用" 和 "重新生成镜头计划" 两个 pill 按钮。
     // 用户反馈：banner 仅作提示用，相应的操作通过顶部"重新生成镜头计划"主按钮触发，
@@ -953,7 +972,9 @@ function _bindShotHoverHighlight() {
       }
     });
     if (matched.length && allParas[matched[0]]) {
-      var scrollWrap = panelBody.closest('.shots-right-col') || panelBody;
+      // 滚动容器就是 .script-ref-body 自己 (滚动已从 .shots-right-col 移入面板内,
+      // 修复滚动中 backdrop-filter 面板背景层不随滚的渲染伪影, 见 styles.css)。
+      var scrollWrap = panelBody;
       var paraEl = allParas[matched[0]];
       var wrapRect = scrollWrap.getBoundingClientRect();
       var paraRect = paraEl.getBoundingClientRect();

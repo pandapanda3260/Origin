@@ -9,6 +9,8 @@ import {
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { getJson } from '@/lib/kv-db';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
+import { looksLikeFiveActScript } from '@/lib/script-output-guard';
+import { appendScriptTimeline, buildDraftEvent, nextScriptTimelineVersion } from '@/lib/script-timeline';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -79,6 +81,12 @@ export async function POST(req: NextRequest) {
       .replace(/\n{3,}/g, '\n\n')
       .trim();
 
+    // 守门：输出不像五段式剧本（模型把指令当聊天回应）→ 不落库不重标
+    if (!looksLikeFiveActScript(scriptText)) {
+      writer.error('AI 没有按剧本格式输出，本次结果未保存，请再点一次"确认生成剧本"或补充描述后重试。');
+      return;
+    }
+
     // === 2. 情绪标记（非流式 JSON，带 3 次重试）===
     writer.phase('tag_emotions_start');
     writer.step('正在打情绪标签…');
@@ -97,8 +105,19 @@ export async function POST(req: NextRequest) {
     }
 
     // === 3. 写回项目 ===
+    let savedServerVersion: number | null = null;
+    let savedTimeline: any[] | null = null;
     if (projectId && proj) {
-      updateProjectForUser(projectId, user.id, {
+      const baseTimeline = (proj as any).scriptTimeline;
+      savedTimeline = appendScriptTimeline(baseTimeline, [
+        buildDraftEvent({
+          version: nextScriptTimelineVersion(baseTimeline),
+          script: scriptText,
+          source: 'generate',
+          emotionSegments: emotions.length ? emotions : undefined,
+        }),
+      ]);
+      const updated = updateProjectForUser(projectId, user.id, {
         scriptDraft: scriptText,
         script: scriptText,
         emotions,
@@ -106,7 +125,9 @@ export async function POST(req: NextRequest) {
         scriptReviewState: 'draft',
         scriptTargetDurationSec: durationSec || (proj as any).scriptTargetDurationSec || null,
         currentStep: 1,
+        scriptTimeline: savedTimeline,
       });
+      savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
     }
 
     writer.done({
@@ -115,6 +136,10 @@ export async function POST(req: NextRequest) {
       emotionSegments: emotions,
       emotions,
       durationSec: durationSec || (proj as any)?.scriptTargetDurationSec || null,
+      // 服务端已 version+1，带回给前端对齐 If-Match，避免后续 PUT 必撞 409
+      serverVersion: savedServerVersion ?? undefined,
+      // 前端必须把最新时间线写回内存，否则随后的整项目 PUT 会用旧数组盖掉这次 append
+      scriptTimeline: savedTimeline ?? undefined,
     });
   });
 }

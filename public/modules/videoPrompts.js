@@ -157,6 +157,49 @@ function _areAllVideoPromptsReady(groups) {
   });
 }
 
+/**
+ * 提示词页标题摘要（videoPromptsHint）的统一静态同步。
+ * 优先级：批量生成中（attach 的进度文案，不抢占）> 单条生成中（不抢占）
+ *        > 缺失摘要 "x/N 条已生成，缺少镜头 …" > 完成 "生成完成 N/N"
+ *        > 从未生成 "待生成… 0/N" > 空。
+ * 调用时机：页面渲染、批次 finish（含 terminal reattach）。
+ */
+function _syncVideoPromptsHeaderHint() {
+  var hint = $("videoPromptsHint");
+  if (!hint) return;
+  if (_videoPromptsGenerating) return;
+  if (!project || !project.shots || !project.shots.length) {
+    hint.textContent = "";
+    return;
+  }
+  var groups = getStoryboardGroups();
+  if (!groups.length) {
+    hint.textContent = "";
+    return;
+  }
+  var ready = 0;
+  var failed = 0;
+  var generating = 0;
+  for (var i = 0; i < groups.length; i++) {
+    var sb = project.storyboards && project.storyboards[i];
+    if (_isVideoPromptReady(sb)) ready++;
+    else if (sb && sb.videoPromptStatus === "failed") failed++;
+    else if (sb && sb.videoPromptStatus === "generating") generating++;
+  }
+  // 有单条任务在跑：让单条流程自己管状态，摘要不抢占
+  if (generating > 0) return;
+  if (ready >= groups.length) {
+    hint.textContent = "生成完成 " + ready + "/" + groups.length;
+    return;
+  }
+  if (ready === 0 && failed === 0) {
+    hint.textContent = "待生成… 0/" + groups.length;
+    return;
+  }
+  var missingLabels = _missingVideoPromptLabels(groups);
+  hint.textContent = ready + "/" + groups.length + " 条已生成，缺少镜头 " + missingLabels.join("、");
+}
+
 function _shouldBatchTargetVideoPrompt(sb, regenerateAll) {
   if (regenerateAll) return true;
   if (!sb) return true;
@@ -305,6 +348,47 @@ function _singleVideoPromptFailureMessage(errMsg, meta) {
     return "当前镜头的视频提示词仍在生成中，请稍后再试";
   }
   return diagnosed || "模型生成失败，请重试";
+}
+
+function _vpStaleReasonLabel(reason) {
+  var map = {
+    script_changed: "剧本",
+    style_bible_changed: "风格圣经",
+    assets_changed: "资产库",
+    duration_changed: "时长",
+    emotion_changed: "情绪节奏",
+    world_changed: "世界观",
+    upstream_changed_during_generation: "生成中上游变化",
+    manual_shot_edit: "手动编辑",
+    legacy_unknown: "旧版镜头计划",
+    storyboard_stale: "分镜图",
+    shot_prompt_stale: "分镜提示词",
+    unknown: "未知变化",
+  };
+  return map[reason] || reason || "";
+}
+
+export function _vpStaleNoticeTextForStoryboard(sb, gIdx, targetProject) {
+  var reasons = [];
+  if (sb && Array.isArray(sb.staleSourceReasons)) reasons = reasons.concat(sb.staleSourceReasons);
+  var flagReasons = targetProject && targetProject._staleFlagReasons && typeof targetProject._staleFlagReasons === "object"
+    ? targetProject._staleFlagReasons
+    : {};
+  var keyedReason = gIdx != null ? flagReasons["video_prompt_" + gIdx] : "";
+  if (keyedReason) reasons.push(keyedReason);
+  if (!reasons.length && sb && sb.staleSource === "shot_plan" && Array.isArray(targetProject && targetProject.shotPlanStaleReasons)) {
+    reasons = reasons.concat(targetProject.shotPlanStaleReasons);
+  }
+  var labels = [];
+  reasons.forEach(function (reason) {
+    if (reason === "upstream_changed_during_generation") return;
+    var label = _vpStaleReasonLabel(reason);
+    if (label && labels.indexOf(label) < 0) labels.push(label);
+  });
+  var subject = labels.length ? labels.join("、") : "";
+  if (!subject && reasons.indexOf("upstream_changed_during_generation") >= 0) subject = "生成期间的上游内容";
+  if (subject) return subject + "已变化，当前正式视频提示词可能需要重新生成或重新确认。";
+  return "分镜图或镜头计划已变化，当前正式视频提示词可能需要重新生成或重新确认。";
 }
 
 function _getVideoPromptPreflightPayload(err) {
@@ -968,6 +1052,7 @@ export function refreshPromptsPage() {
   _renderVpStoryboardFrames();
   renderVideoPromptList();
   _updateVideoPromptBulkButtonLabel();
+  _syncVideoPromptsHeaderHint();
   checkVideoPromptsConfirm();
   _scheduleVideoPromptBatchReattach("refresh");
 }
@@ -1309,10 +1394,11 @@ export function updateVpCard(gIdx, status, promptText, errMsg) {
 function _vpDraftNoticeHtml(sb, gIdx) {
   var parts = [];
   if (project && project._staleFlags && project._staleFlags["video_prompt_" + gIdx]) {
+    var staleText = _vpStaleNoticeTextForStoryboard(sb, gIdx, project);
     parts.push(
       '<div class="flex items-center gap-2 px-4 py-3 mb-3 rounded-xl bg-warning/10 border border-warning/20 text-warning text-xs font-medium">' +
       '<span class="material-symbols-outlined text-sm shrink-0">update</span>' +
-      '<span class="flex-1 min-w-0">上游信息已变化，当前正式视频提示词可能需要重新生成或重新确认。</span>' +
+      '<span class="flex-1 min-w-0">' + escapeHtml(staleText) + '</span>' +
       '</div>'
     );
   }
@@ -1597,7 +1683,11 @@ function _attachVideoPromptBatch(opts) {
   }
 
   function _refreshRunningHint() {
-    if (!hint) return;
+    // terminalAtAttach：批早已结束，本次 attach 只负责把卡片状态补齐，
+    // 不该制造"生成中…"进度文案（finish 也刻意不写 hint）。否则刷新/切回
+    // 项目后 hint 会永久停在"生成中… N/N"。finished 同理：完成文案写过之后
+    // 不允许迟到的回放再把它改回"生成中"。
+    if (!hint || finished || terminalAtAttach) return;
     var total = totalCount || groups.length || 0;
     hint.textContent = "生成中… " + (doneCount + failCount) + "/" + total;
   }
@@ -1647,11 +1737,9 @@ function _attachVideoPromptBatch(opts) {
       if (_isVideoPromptReady(project && project.storyboards && project.storyboards[j])) done++;
     }
     var missingLabels = _missingVideoPromptLabels(groups);
-    if (!terminalAtAttach && hint) {
-      hint.textContent = missingLabels.length
-        ? done + "/" + groups.length + " 条已生成，缺少镜头 " + missingLabels.join("、")
-        : done + "/" + groups.length + " 条已生成";
-    }
+    // 完成/缺失/待生成摘要统一由 sync 计算；terminal reattach 也走这里，
+    // 刷新后进入页面同样能看到"生成完成 N/N"。
+    _syncVideoPromptsHeaderHint();
 
     for (var jj = 0; jj < groups.length; jj++) {
       var sbJ = project && project.storyboards && project.storyboards[jj];
@@ -1838,6 +1926,9 @@ function _attachVideoPromptBatch(opts) {
 
   streamHandle = subscribeBatch(batchId, {
     onSnapshot: function (snap) {
+      // EventSource 自动重连会重发 snapshot 帧；finish 之后不允许它把
+      // "N/N 条已生成"覆盖回"生成中… N/N"。
+      if (finished) return;
       if (hint && snap && typeof snap.total === 'number') {
         hint.textContent = "生成中… " + (snap.succeeded || 0) + "/" + snap.total;
       }
@@ -2085,11 +2176,12 @@ export async function generateAllVideoPrompts(opts) {
     if (activeGeneratingCount) {
       if (hint) hint.textContent = "还有 " + activeGeneratingCount + " 条提示词正在生成";
       showToast("还有 " + activeGeneratingCount + " 条提示词正在生成，请稍后", "warn");
+      _videoPromptsGenerating = false;
     } else {
-      if (hint) hint.textContent = groups.length + "/" + groups.length + " 条已生成";
       showToast("所有镜头都已有提示词，可选择单个镜头重新生成", "ok");
+      _videoPromptsGenerating = false;
+      _syncVideoPromptsHeaderHint();
     }
-    _videoPromptsGenerating = false;
     if (btn) btn.disabled = false;
     _updateVideoPromptBulkButtonLabel(groups);
     return;

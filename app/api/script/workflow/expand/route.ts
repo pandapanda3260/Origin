@@ -3,6 +3,13 @@ import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
 import { chatStream } from '@/lib/llm';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
+import { looksLikeFiveActScript } from '@/lib/script-output-guard';
+import {
+  appendScriptTimeline,
+  buildDraftEvent,
+  buildInstructionEvent,
+  nextScriptTimelineVersion,
+} from '@/lib/script-timeline';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -18,6 +25,7 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const projectId: string | undefined = body.projectId;
   const currentScript: string = (body.script || '').toString();
+  const direction: string = (body.direction || '').toString().trim();
 
   const proj = projectId ? getProjectByIdForUser(projectId, user.id) : null;
   const baseScript = currentScript || (proj as any)?.scriptDraft || (proj as any)?.script || '';
@@ -49,15 +57,43 @@ export async function POST(req: NextRequest) {
       .replace(/\r\n?/g, '\n')
       .trim();
 
+    // 守门：输出不像五段式剧本（模型把指令当聊天回应）→ 不落库，原剧本不动
+    if (!looksLikeFiveActScript(cleanScript)) {
+      writer.error('AI 没有按剧本格式输出，本次扩充未生效，当前剧本保持不变，请重试。');
+      return;
+    }
+
+    let savedServerVersion: number | null = null;
+    let savedTimeline: any[] | null = null;
     if (projectId && proj) {
-      updateProjectForUser(projectId, user.id, {
+      const baseTimeline = (proj as any).scriptTimeline;
+      const instrEvt = buildInstructionEvent(direction || '扩充剧本', 'expand');
+      savedTimeline = appendScriptTimeline(baseTimeline, [
+        instrEvt,
+        buildDraftEvent({
+          version: nextScriptTimelineVersion(baseTimeline),
+          script: cleanScript,
+          source: 'expand',
+          instructionId: instrEvt.id,
+        }),
+      ]);
+      const updated = updateProjectForUser(projectId, user.id, {
         scriptDraft: cleanScript,
         script: cleanScript,
         scriptApproved: false,
         scriptReviewState: 'draft',
+        scriptTimeline: savedTimeline,
       });
+      savedServerVersion = typeof (updated as any)?.version === 'number' ? (updated as any).version : null;
     }
 
-    writer.done({ script: cleanScript, deltaTokens: Math.ceil(cleanScript.length / 2) });
+    // serverVersion：服务端已 version+1，带回前端对齐 If-Match，避免后续 PUT 必撞 409
+    // scriptTimeline：前端必须写回内存，否则随后的整项目 PUT 会用旧数组盖掉这次 append
+    writer.done({
+      script: cleanScript,
+      deltaTokens: Math.ceil(cleanScript.length / 2),
+      serverVersion: savedServerVersion ?? undefined,
+      scriptTimeline: savedTimeline ?? undefined,
+    });
   });
 }

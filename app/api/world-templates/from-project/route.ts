@@ -3,10 +3,10 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser } from '@/lib/projects-db';
 import {
-  buildWorldTemplateFromProject,
-  buildWorldTemplateFromProjectSnapshot,
+  applyWorldTemplateTerminologyOverride,
   getWorldTemplate,
-  mergeWorldTemplateSnapshotIntoSource,
+  prepareWorldTemplateSaveInput,
+  type WorldTemplateEntityExclude,
   upsertWorldTemplate,
 } from '@/lib/world-templates-db';
 
@@ -28,6 +28,18 @@ export async function POST(req: NextRequest) {
   if (!project) return jsonError('项目不存在', 404);
   const existingTemplate = mode === 'update' ? getWorldTemplate(user.id, templateId) : null;
   if (mode === 'update' && !existingTemplate) return jsonError('模板不存在', 404);
+  const dryRun = body.dryRun === true;
+  if (dryRun && mode === 'create') {
+    return jsonOk({
+      ok: true,
+      dryRun: true,
+      additions: { characters: [], characterCandidates: [], locations: [], props: [], terminology: [] },
+      promotions: { characterCandidatesToCharacters: [] },
+      additionTotal: 0,
+      promotionTotal: 0,
+      changeTotal: 0,
+    });
+  }
   if (mode === 'create') {
     const derivedId = `world_${String(projectId).replace(/[^A-Za-z0-9_.:-]+/g, '_').slice(0, 80)}`;
     if (getWorldTemplate(user.id, derivedId)) return jsonError('该项目已存在派生世界观模板，请选择更新已有模板或先删除旧模板', 409);
@@ -38,24 +50,44 @@ export async function POST(req: NextRequest) {
     props: body.include.props !== false,
     terminology: body.include.terminology !== false,
   } : undefined;
-  const snapshotInput = buildWorldTemplateFromProjectSnapshot(project, {
-    templateId: templateId || undefined,
-    name: body.name ? String(body.name) : undefined,
-    include,
+  const rawExclude = body.excludeEntityKeys && typeof body.excludeEntityKeys === 'object'
+    ? body.excludeEntityKeys
+    : {};
+  const legacyExcludeKeys = Array.isArray(body.excludeKeys) ? body.excludeKeys.map((key: any) => String(key || '').trim()).filter(Boolean) : [];
+  const excludeEntityKeys: WorldTemplateEntityExclude = {
+    all: legacyExcludeKeys,
+    characters: Array.isArray(rawExclude.characters) ? rawExclude.characters : [],
+    characterCandidates: Array.isArray(rawExclude.characterCandidates) ? rawExclude.characterCandidates : [],
+    locations: Array.isArray(rawExclude.locations) ? rawExclude.locations : [],
+    props: Array.isArray(rawExclude.props) ? rawExclude.props : [],
+    terminology: Array.isArray(rawExclude.terminology) ? rawExclude.terminology : [],
+  };
+  const hasTerminologyOverride = mode === 'create'
+    && Object.prototype.hasOwnProperty.call(body, 'terminologyOverride')
+    && include?.terminology !== false;
+  const prepared = prepareWorldTemplateSaveInput({
+    project,
     mode: mode as 'create' | 'update',
-  });
-  const input = snapshotInput || buildWorldTemplateFromProject(project, {
     templateId: templateId || undefined,
     name: body.name ? String(body.name) : undefined,
     include,
+    excludeEntityKeys,
+    existingTemplate,
   });
-  const finalInput = mode === 'update' && snapshotInput && existingTemplate
-    ? mergeWorldTemplateSnapshotIntoSource(existingTemplate, snapshotInput, {
-        name: body.name ? String(body.name) : undefined,
-        templateId,
-        include,
-      }).template
-    : input;
+  if (dryRun) {
+    return jsonOk({
+      ok: true,
+      dryRun: true,
+      additions: prepared.additions,
+      promotions: prepared.promotions,
+      additionTotal: prepared.additionTotal,
+      promotionTotal: prepared.promotionTotal,
+      changeTotal: prepared.changeTotal,
+    });
+  }
+  const finalInput = hasTerminologyOverride
+    ? applyWorldTemplateTerminologyOverride(prepared.finalInput, body.terminologyOverride)
+    : prepared.finalInput;
   const template = upsertWorldTemplate(user.id, finalInput);
   return jsonOk({ ok: true, template });
 }

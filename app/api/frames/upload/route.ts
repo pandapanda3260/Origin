@@ -221,6 +221,15 @@ export async function POST(req: NextRequest) {
       // 用户原则: 首帧变化不连带 stale 尾帧, 用户自决重做。
       storyboards[groupIdx] = nextStoryboard;
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'frame-upload');
+      // 上传即用当前上游输入重算并写入了新 sourceHash，权威数据侧同步清掉本槽位的
+      // stale 标记——与 batch executor 写盘点同一原则，防"图新标记旧"的孤儿标记。
+      const staleKey = isTail ? `tail_frame_${groupIdx}` : `storyboard_${groupIdx}`;
+      const prevStaleFlags = (fresh as any)._staleFlags;
+      if (prevStaleFlags && typeof prevStaleFlags === 'object' && prevStaleFlags[staleKey]) {
+        const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };
+        delete nextStaleFlags[staleKey];
+        return { storyboards, _staleFlags: nextStaleFlags };
+      }
       return { storyboards };
     });
 

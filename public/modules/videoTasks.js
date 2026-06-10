@@ -8,7 +8,6 @@
 import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=201';
 import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
 import { subscribeTask, subscribeBatch } from './backend_stream.js';
-import { getBackgroundStylizeCount } from './assets.js';
 import { showBillingPaywall } from './billing.js';
 import { describeVideoModelStatusFailure } from './video_model_status.js?v=1';
 import { firstFrameImageUrl } from './frameRecommendations.js?v=1';
@@ -723,10 +722,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         if (isTerminalBatchStatus(batchStatus)) return;
         if (!isRunningBatchStatus(batchStatus)) return;
 
-        var hint = $("batchHint");
         _setBatchStartDisabled(true);
-        if (hint) hint.textContent = "批量进度 " + (totalDone + totalFail) + "/" + total +
-          (totalFail ? "（失败 " + totalFail + "）" : "");
 
         if (_batchHandle) { try { _batchHandle.close(); } catch (_e) {} _batchHandle = null; }
 
@@ -763,8 +759,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           if (_seenDone[taskId] || _seenFailed[taskId]) return;
           _seenDone[taskId] = true;
           totalDone++;
-          if (hint) hint.textContent = "批量进度 " + (totalDone + totalFail) + "/" + total +
-            (totalFail ? "（失败 " + totalFail + "）" : "");
           var gi = (extra && typeof extra.groupIdx === "number") ? extra.groupIdx : null;
           var t = ensureTaskBound(taskId, gi);
           if (!t) return;
@@ -813,8 +807,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	          if (_seenFailed[taskId] || _seenDone[taskId]) return;
 	          _seenFailed[taskId] = true;
           totalFail++;
-          if (hint) hint.textContent = "批量进度 " + (totalDone + totalFail) + "/" + total +
-            (totalFail ? "（失败 " + totalFail + "）" : "");
 	          var t = findTaskByServerId(taskId);
 	          if (!t) return;
 	          var failPayload = payload || { reason: reason };
@@ -864,8 +856,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             if (isTerminalBatchStatus(snap.status)) {
               _stopReatPoll();
               _setBatchStartDisabled(false);
-              if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
-                (totalFail ? "（失败 " + totalFail + "）" : "");
             }
           } catch (e) {
             console.warn("[VideoReattach] poll failed:", e && e.message);
@@ -934,13 +924,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             if (!guard()) return;
             _stopReatPoll();
             _setBatchStartDisabled(false);
-            if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
-              (totalFail ? "（失败 " + totalFail + "）" : "");
           },
           onClose: function () {
             if (!guard()) return;
             if (_batchHandle === batchHandle) _batchHandle = null;
-            if (_reatPoll && hint) hint.textContent = "实时连接断开，继续轮询后端结果…";
           },
         });
         _batchHandle = batchHandle;
@@ -1068,17 +1055,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     } else if (tType === "char") {
       var charItem = project.assets && project.assets.characters && project.assets.characters[tIdx];
       if (charItem) {
-        if (t.task_type === "stylize") {
-          if (url && !charItem.pencilUrl) { _archiveOldImage(charItem, "stylize"); charItem.pencilUrl = url; delete charItem._pencilFailed; }
-          if (t.asset_id) charItem.pencilAssetId = t.asset_id;
-          if (t.fetch_status) charItem.fetchStatus = t.fetch_status;
-          saveProject(); if (url) showToast("角色「" + (charItem.name || tIdx) + "」风格图已在后台生成", "ok");
-        } else {
-          if (url && !charItem.realPhotoUrl) { _archiveOldImage(charItem, "character"); charItem.realPhotoUrl = url; charItem.imageUrl = url; charItem.rawUrl = url; }
-          if (t.asset_id) charItem.assetId = t.asset_id;
-          if (t.fetch_status) charItem.fetchStatus = t.fetch_status;
-          saveProject(); if (url) updateAssetCardImage("char", tIdx, "done", url);
-        }
+        if (url && !charItem.realPhotoUrl) { _archiveOldImage(charItem, "character"); charItem.realPhotoUrl = url; charItem.imageUrl = url; charItem.rawUrl = url; }
+        if (t.asset_id) charItem.assetId = t.asset_id;
+        if (t.fetch_status) charItem.fetchStatus = t.fetch_status;
+        saveProject(); if (url) updateAssetCardImage("char", tIdx, "done", url);
       }
     } else if (tType === "scene" || tType === "prop") {
       var list = tType === "scene" ? (project.assets && project.assets.scenes) : (project.assets && project.assets.props);
@@ -3551,39 +3531,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
    * 来获取每个分镜的生命周期事件。再也不用前端 plan-batch / 轮询。 */
   var _batchHandle = null;
 
-  function _getMissingPencilChars() {
-    if (!project || !project.assets || !Array.isArray(project.assets.characters)) return [];
-    return project.assets.characters.filter(function (c) {
-      var et = (c.entityType || "human").toString().toLowerCase();
-      if (et === "non-human") return false;      // 这类不需要转绘
-      if (!c.realPhotoUrl) return false;           // 第一步都没完成，跳过不计
-      return !c.pencilUrl;
-    });
-  }
-
-  async function _waitForPencilReady(hintEl) {
-    var MAX_WAIT_MS = 15 * 60 * 1000;
-    var start = Date.now();
-    var initialMissing = _getMissingPencilChars().length;
-    if (initialMissing === 0) return { ok: true };
-    while (Date.now() - start < MAX_WAIT_MS) {
-      var still = _getMissingPencilChars();
-      var doneNow = Math.max(0, initialMissing - still.length);
-      if (hintEl) hintEl.textContent = "风格图补全中 " + doneNow + "/" + initialMissing + "，视频生成将在就绪后自动开始…";
-      if (still.length === 0) return { ok: true };
-      // 后台托管为 0 说明之前任务已经失败退出，不会自己恢复
-      if (getBackgroundStylizeCount() === 0) return { ok: false, stuck: true };
-      await new Promise(function (r) { setTimeout(r, 4000); });
-    }
-    return { ok: false, timeout: true };
-  }
-
 	  async function startBatchGeneration() {
 	    _syncVideoRefs();
 	    if (!project || !project.storyboards) return;
-	    var hint = $("batchHint");
 	    _setBatchStartDisabled(true);
-	    await _reloadProjectFromServerForVideoBatch(hint);
+	    await _reloadProjectFromServerForVideoBatch(null);
 	    if (!project || !project.storyboards) {
 	      _setBatchStartDisabled(false);
 	      return;
@@ -3659,68 +3611,9 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       return;
     }
 
-    // 前置检查：视频生成硬依赖 pencilUrl（video_content_builder.py 里缺
-    // pencilUrl 的角色直接跳过），所以如果资产阶段的后台转绘还没跑完，
-    // 我们这里要等一等再提交，避免出来的视频少画角色
-    var missing = _getMissingPencilChars();
-    if (missing.length > 0) {
-      var bgRunning = getBackgroundStylizeCount();
-      var confirmMsg;
-      var confirmOk;
-      var confirmCancel;
-      if (bgRunning > 0) {
-        confirmMsg = "检测到 " + missing.length + " 个角色的风格图还在后台补全中（" +
-          bgRunning + " 个进行中）。视频画面里这些角色依赖风格图才能保持一致。\n\n" +
-          "要等风格图全部就绪再开始生成视频吗？";
-        confirmOk = "等待就绪再开始";
-        confirmCancel = "直接开始（可能缺角色）";
-      } else {
-        confirmMsg = "检测到 " + missing.length + " 个角色缺少风格图，且后台没有补全任务在跑。\n" +
-          "这些角色会被跳过画面。\n\n要先去资产页手动补全，还是直接开始？";
-        confirmOk = "直接开始";
-        confirmCancel = "返回资产页";
-      }
-      var waitDecision;
-      try {
-        waitDecision = await showConfirm("风格图未就绪", confirmMsg, confirmOk, confirmCancel);
-      } catch (_e) {
-        waitDecision = false;
-      }
-      if (bgRunning > 0) {
-        if (waitDecision) {
-          _setBatchStartDisabled(true);
-          if (hint) hint.textContent = "等待风格图补全…";
-          var waitResult = await _waitForPencilReady(hint);
-	          if (!waitResult.ok) {
-	            _setBatchStartDisabled(false);
-	            if (hint) hint.textContent = "";
-	            releaseBatchLocks();
-	            var stillMissing = _getMissingPencilChars().length;
-            showToast(
-              (waitResult.timeout ? "等待超时，" : "后台补全已停止，") +
-              "仍有 " + stillMissing + " 个角色缺风格图。可返回资产页手动重试或直接开始视频。",
-              "warn",
-            );
-            return;
-          }
-          // 就绪，继续走下面的流程
-        } else {
-          // 用户选"直接开始（可能缺角色）"——继续流程
-        }
-      } else {
-	        if (!waitDecision) {
-	          // 用户选"返回资产页"
-	          releaseBatchLocks();
-	          _setBatchStartDisabled(false);
-	          return;
-	        }
-      }
-    }
-
-    var preflightOk = await _runContinuityPreflight(indices, { count: indices.length, hintEl: hint });
+    var preflightOk = await _runContinuityPreflight(indices, { count: indices.length, hintEl: null });
     if (!preflightOk) {
       _setBatchStartDisabled(false);
-      if (hint) hint.textContent = "";
       releaseBatchLocks();
       return;
     }
@@ -3740,8 +3633,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       renderBatchClipList();
       showToast("将重新生成 " + indices.length + " 个分镜的视频", "ok");
     }
-    if (hint) hint.textContent = "正在提交批量任务…";
-
     if (_batchHandle) { try { _batchHandle.close(); } catch (_e) {} _batchHandle = null; }
 
     // 为每个分镜插入 UI placeholder（serverTaskId 暂空，等 task_started 回填）
@@ -3794,7 +3685,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       });
       if (startResult && startResult.aborted) {
         _setBatchStartDisabled(false);
-        if (hint) hint.textContent = "已取消：生成前检查未通过";
         indices.forEach(function (gi) {
           var t = _findTaskByGroup(gi);
           if (!t || isTerminal(t)) return;
@@ -3810,7 +3700,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       showConsistencyAggregateWarning(resp);
     } catch (e) {
       _setBatchStartDisabled(false);
-      if (hint) hint.textContent = "提交失败：" + ((e && e.message) || e);
       showToast("批量提交失败：" + _diagnoseApiError(((e && e.message) || e).toString()), "error");
       releaseBatchLocks();
       return;
@@ -3819,21 +3708,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (!resp || resp.error || !resp.batchId) {
       _setBatchStartDisabled(false);
       var errMsg = (resp && resp.error) || "未能创建批量任务";
-      if (hint) hint.textContent = errMsg;
       showToast(errMsg, "error");
       releaseBatchLocks();
       return;
     }
 
     var batchId = resp.batchId;
-    if (hint) hint.textContent = "已提交 " + indices.length + " 个分镜，等待后端生成…";
 
     var totalDone = 0, totalFail = 0, total = indices.length;
-    function updateHint() {
-      if (!hint) return;
-      hint.textContent = "批量进度 " + (totalDone + totalFail) + "/" + total +
-        (totalFail ? "（失败 " + totalFail + "）" : "");
-    }
 
     function findTaskByServerId(taskId) {
       if (!taskId) return null;
@@ -3886,7 +3768,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         _seenDone[data.taskId] = true;
       }
       totalDone++;
-      updateHint();
       var extra = (data && data.extra) || {};
       var gi = (typeof extra.groupIdx === "number") ? extra.groupIdx : null;
       var t = findTaskByServerId(data.taskId) || ensureTaskBound(data.taskId, gi);
@@ -3935,7 +3816,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         _seenFailed[data.taskId] = true;
       }
       totalFail++;
-      updateHint();
       var t = findTaskByServerId(data.taskId);
       if (!t) return;
       t.status = "failed";
@@ -3980,8 +3860,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	        if (isTerminalBatchStatus(snap.status)) {
 	          _stopPoll();
 	          _setBatchStartDisabled(false);
-	          if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
-	            (totalFail ? "（失败 " + totalFail + "）" : "");
 	          releaseBatchLocks();
 	        }
       } catch (e) {
@@ -4003,13 +3881,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       onBatchCompleted: function () {
         _stopPoll();
         _setBatchStartDisabled(false);
-        if (hint) hint.textContent = "批量完成 " + totalDone + "/" + total +
-          (totalFail ? "（失败 " + totalFail + "）" : "");
         releaseBatchLocks();
       },
       onClose: function () {
         _batchHandle = null;
-        if (_pollTimer && hint) hint.textContent = "实时连接断开，继续轮询后端结果…";
       },
     });
   }
