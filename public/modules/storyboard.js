@@ -248,7 +248,6 @@ var _storyboardTerminalReloadedByBatch = Object.create(null);
 var _storyboardTerminalReloadPendingByBatch = Object.create(null);
 var _storyboardTerminalReloadScheduledByBatch = Object.create(null);
 var _storyboardTerminalSnapshotHandledByBatch = Object.create(null);
-var _storyboardTailAutoStartedBySourceBatch = Object.create(null);
 var _storyboardTerminalReloadInFlight = null;
 var _storyboardBatchReconcilerRegistered = false;
 var _storyboardLastReconcileAt = 0;
@@ -400,32 +399,169 @@ function _scheduleStoryboardTerminalProjectReload(projectId, batchId, opts) {
   return _storyboardTerminalReloadInFlight;
 }
 
-async function _maybeAutoStartTailFramesFromCurrentProject(projectId, sourceBatchId, opts) {
-  if (!projectId || !sourceBatchId || !project || project.id !== projectId) return false;
-  opts = opts || {};
-  var key = _storyboardBatchKey(projectId, sourceBatchId);
-  if (_storyboardTailAutoStartedBySourceBatch[key]) return false;
-  if (opts.requireTerminalReload && !_storyboardTerminalReloadedByBatch[key]) return false;
-  _storyboardTailAutoStartedBySourceBatch[key] = true;
+// ============================================================
+// 尾帧逐镜头自动续链 (方案: 尾帧逐镜头自动续链-方案.md, 2026-06-10 Vasily 拍板)
+//
+// 不变量: solo && (建议|已请求) && 首帧 ready 且非手动上传 && 尾帧缺图
+//         && 未失败过 && 未显式删除 && 无在途 → 自动开该镜头的尾帧。
+// 状态驱动, 不绑定"哪个批次结束": 任何路径让首帧变 ready (批量任务/单卡
+// 重生/失败重试成功) 都触发。两层:
+//   1) 事件层: 首帧完成事件入口调 _scheduleTailChain, 3s 聚合一个批次;
+//   2) 兜底层: 进页/focus/对账时 _scheduleTailChainSweep 全量比对状态,
+//      页面不在场只是"晚开", 回页即补, 不再依赖 30 分钟批次窗口。
+// 取代旧的"批末一次性续链"(_maybeAutoStartTailFramesFromCurrentProject +
+// one-shot flag): 旧机制等最慢镜头、flag 静默消费后永不重试、页面不在场
+// 即永久丢链 (proj_1781093378957 实锤)。
+// ============================================================
+var TAIL_CHAIN_FLUSH_DELAY_MS = 3000;
+var _tailChainPendingByProject = Object.create(null);  // projectId -> {gIdx:true} 待续链
+var _tailChainStartedByProject = Object.create(null);  // projectId -> {gIdx:true} 本会话已自动开过(防共享缓存5sTTL内重复开批)
+var _tailChainBlockedByProject = Object.create(null);  // projectId -> {gIdx:true} 启动被拦/异常→本会话退出自动链(留手动)
+var _tailChainFlushTimer = null;
+var _tailChainFlushInFlight = null;
+var _tailChainSuppressedForRun = false;                // "重新生成全部"期间停用续链, 终态统一 includeReady 重做, 防中途链一次结尾再重做一次双扣费
+var _activeKeyframeProgressState = null;               // 首帧批量进行中的共享进度态; 续链批次并入同一标题进度
 
-  var targets = _tailKeyframeTargets(getStoryboardGroups(), {
-    failedOnly: !!opts.failedOnly,
-    includeReady: !!opts.includeReady,
-  });
-  if (!targets.length) return false;
-  var hint = opts.hintId === false ? null : $(opts.hintId || 'imagesHint');
-  if (hint) hint.textContent = "正在生成 " + targets.length + " 张尾帧关键帧…";
+/** 单镜头是否满足自动续链不变量。groups 可传入复用, 不传现取。 */
+function _tailChainEligible(gIdx, groups) {
+  if (!project || !project.id || !project.storyboards) return false;
+  groups = groups || getStoryboardGroups();
+  var group = groups[gIdx];
+  if (!group) return false;
+  var sb = project.storyboards[gIdx] || {};
+  // 合并段/低分 solo/未建议未请求/显式删除 → 统一由 wanted 一票否决
+  if (!_isTailKeyframeWanted(group, sb)) return false;
+  // 首帧必须 ready 且非手动上传 (上传不自动花积分, 方案 §6, 只亮"建议生成")
+  if (!_firstFrameUrl(sb) || _isFirstFrameFailed(sb)) return false;
+  var firstSource = String(((sb.frames && sb.frames.first) || {}).source || sb.firstFrameSource || '');
+  if (firstSource === 'uploaded') return false;
+  // 已有尾帧不自动重做; 失败过退出自动链 (防审核类失败无限自动重试烧积分)
+  if (_tailFrameImageUrl(sb)) return false;
+  if (_tailFrameStatusForBatch(sb) === 'failed') return false;
+  var started = _tailChainStartedByProject[project.id];
+  if (started && started[gIdx]) return false;
+  var blocked = _tailChainBlockedByProject[project.id];
+  if (blocked && blocked[gIdx]) return false;
+  return true;
+}
 
+/** 事件层入口: 某镜头首帧刚变 ready。projectId 必传(完成事件可能晚到, 用户已切项目)。 */
+function _scheduleTailChain(projectId, gIdx, reason) {
+  if (!projectId || _tailChainSuppressedForRun) return;
+  if (typeof gIdx === 'number') {
+    var pending = _tailChainPendingByProject[projectId] ||
+      (_tailChainPendingByProject[projectId] = Object.create(null));
+    pending[gIdx] = true;
+  }
+  // flush 只处理"当前项目"的 pending; 其他项目的积压由回页 sweep 接走
+  if (!project || project.id !== projectId) return;
+  if (_tailChainFlushTimer) return;
+  _tailChainFlushTimer = setTimeout(function () {
+    _tailChainFlushTimer = null;
+    _flushTailChain(reason || 'event');
+  }, TAIL_CHAIN_FLUSH_DELAY_MS);
+}
+
+/** 兜底层入口: 全量状态比对, 把所有满足不变量的镜头排入续链。幂等, 可随意重入。 */
+function _scheduleTailChainSweep(reason) {
+  if (!project || !project.id || _tailChainSuppressedForRun) return;
+  if (!project.shots || !project.shots.length) return;
+  var groups = getStoryboardGroups();
+  var any = false;
+  for (var i = 0; i < groups.length; i++) {
+    if (!_tailChainEligible(i, groups)) continue;
+    any = true;
+    var pending = _tailChainPendingByProject[project.id] ||
+      (_tailChainPendingByProject[project.id] = Object.create(null));
+    pending[i] = true;
+  }
+  if (any) _scheduleTailChain(project.id, null, reason || 'sweep');
+}
+
+/** 服务端在途 tail 批次已覆盖的 groupIdx (跨刷新防重: 本地 started 集合在 F5 后丢失)。 */
+async function _tailChainInflightGroupIdxs(projectId) {
+  var covered = Object.create(null);
   try {
-    await generateAllTailFrames({
-      targets: targets,
-      buttonId: opts.buttonId || 'btnGenAllImages',
-      progressState: opts.progressState || null,
+    var resp = await getActiveBatchesShared(projectId);
+    var batches = (resp && resp.batches) || [];
+    batches.forEach(function (b) {
+      if ((b.batchType || '') !== 'tail_frame_images') return;
+      if (_isStoryboardBatchTerminalStatus(_storyboardBatchStatus(b))) return;
+      (b.tasks || []).forEach(function (t) {
+        var target = _snapshotTaskTarget(t);
+        var extra = _snapshotTaskExtra(t);
+        var gIdx = _firstTaskNumber([target.groupIdx, extra.groupIdx, t.seq]);
+        if (gIdx != null) covered[gIdx] = true;
+      });
     });
-    return true;
   } catch (e) {
-    console.warn('[StoryboardTailAuto] auto tail-frame start failed:', (e && e.message) || e);
-    return false;
+    console.warn('[TailChain] active tail batch probe failed:', (e && e.message) || e);
+  }
+  return covered;
+}
+
+/** 续链启动被拦 (素材超限/提示词回存失败/启动异常): 本会话退出自动链并在卡片上留被动提示。 */
+function _markTailChainBlocked(projectId, targets, message) {
+  if (!projectId || !targets || !targets.length) return;
+  var blocked = _tailChainBlockedByProject[projectId] ||
+    (_tailChainBlockedByProject[projectId] = Object.create(null));
+  targets.forEach(function (t) {
+    var gIdx = (t && typeof t.groupIdx === 'number') ? t.groupIdx : null;
+    if (gIdx == null) return;
+    blocked[gIdx] = true;
+    if (project && project.id === projectId && message) {
+      try {
+        renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: '未自动生成: ' + message });
+      } catch (_) {}
+    }
+  });
+}
+
+async function _flushTailChain(reason) {
+  if (_tailChainFlushInFlight) { _scheduleTailChain(project && project.id, null, reason); return; }
+  if (!project || !project.id || _tailChainSuppressedForRun) return;
+  // 手动批量尾帧在跑: 等它结束再议 (它结束后状态变化会让 sweep/重排自然接上)
+  if (_tailFramesGenerating) { _scheduleTailChain(project.id, null, reason); return; }
+  var originId = project.id;
+  var pending = _tailChainPendingByProject[originId];
+  if (!pending || !Object.keys(pending).length) return;
+  var inflight = await _tailChainInflightGroupIdxs(originId);
+  if (!project || project.id !== originId) return; // 等待期间切了项目
+  var groups = getStoryboardGroups();
+  var targets = [];
+  Object.keys(pending).forEach(function (k) {
+    var gIdx = Number(k);
+    delete pending[k];
+    if (inflight[gIdx]) return;
+    if (!_tailChainEligible(gIdx, groups)) return;
+    targets.push({ groupIdx: gIdx, idx: gIdx, shotIndices: (groups[gIdx] && groups[gIdx].shotIndices) || [] });
+  });
+  if (!targets.length) return;
+  var started = _tailChainStartedByProject[originId] ||
+    (_tailChainStartedByProject[originId] = Object.create(null));
+  targets.forEach(function (t) { started[t.groupIdx] = true; });
+  console.log('[TailChain] auto-starting ' + targets.length + ' tail frame(s), reason=' + (reason || ''));
+  var hint = $('imagesHint');
+  if (hint) hint.textContent = '正在生成 ' + targets.length + ' 张尾帧关键帧…';
+  // 首帧批量进行中: 把链出的尾帧数加进标题进度 total (方案 §5 动态口径)。
+  // generateAllTailFrames 内部的 min-total 兜底只会取 max, 不会重复加。
+  if (_activeKeyframeProgressState) {
+    _activeKeyframeProgressState.total = Number(_activeKeyframeProgressState.total || 0) + targets.length;
+  }
+  _tailChainFlushInFlight = generateAllTailFrames({
+    targets: targets,
+    progressState: _activeKeyframeProgressState || null,
+    chainSource: 'tail-chain',
+  }).catch(function (e) {
+    console.warn('[TailChain] auto start failed:', (e && e.message) || e);
+    _markTailChainBlocked(originId, targets, ((e && e.message) || '启动异常').toString().slice(0, 80));
+  });
+  await _tailChainFlushInFlight;
+  _tailChainFlushInFlight = null;
+  // flush 期间可能又有首帧完成入队
+  if (project && project.id) {
+    var rest = _tailChainPendingByProject[project.id];
+    if (rest && Object.keys(rest).length) _scheduleTailChain(project.id, null, 'requeue');
   }
 }
 
@@ -467,6 +603,9 @@ export function registerStoryboardBatchReconciler() {
 export async function reattachStoryboardBatches() {
   _syncRefs();
   if (!project || !project.id) return;
+  // 尾帧续链兜底扫描: 不依赖活跃批次 (完成超过 30 分钟窗口的首帧也要补链),
+  // 所以放在 /api/batch/active 查询和它的空结果 early-return 之前。
+  _scheduleTailChainSweep('reconcile');
   var originId = project.id;
   var resp;
   try {
@@ -552,6 +691,7 @@ function _reattachImagesBatch(b) {
           _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
         }
         updateStoryboardCard(gIdx, "done", displayUrl);
+        _scheduleTailChain(originId, gIdx, 'reattach-first-done');
       }
     } else if (isFailed) {
       if (!_markRFailed(gIdx)) return;
@@ -568,17 +708,13 @@ function _reattachImagesBatch(b) {
     _imagesGenerating = false;
     _hideKeyframeHeaderProgress();
     checkImagesConfirm();
-    var terminalReloadKey = _storyboardBatchKey(originId, batchId);
     _scheduleStoryboardTerminalProjectReload(originId, batchId, {
       reason: "storyboard_images_terminal_snapshot",
       confirmImages: true,
     }).then(function () {
-      if (_storyboardTerminalReloadedByBatch[terminalReloadKey]) {
-        _maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {
-          requireTerminalReload: true,
-          buttonId: 'btnGenAllImages',
-        });
-      }
+      // 权威 reload 后用最新状态做续链兜底扫描; reload 失败也无妨,
+      // 资格判定基于本地状态保守跳过, 下一轮 reconcile sweep 会重试。
+      _scheduleTailChainSweep('images-terminal-snapshot');
     });
     return;
   }
@@ -662,17 +798,11 @@ function _reattachImagesBatch(b) {
         if (btn) btn.disabled = false;
         _stopTickR();
         _clearEtaR();
-        var terminalReloadKey = _storyboardBatchKey(originId, batchId);
         await _scheduleStoryboardTerminalProjectReload(originId, batchId, {
           reason: "storyboard_images_sse_completed",
           confirmImages: true,
         });
-        if (_storyboardTerminalReloadedByBatch[terminalReloadKey]) {
-          await _maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {
-            requireTerminalReload: true,
-            buttonId: 'btnGenAllImages',
-          });
-        }
+        _scheduleTailChainSweep('images-sse-completed');
       })();
     },
     onClose: function () {
@@ -738,7 +868,8 @@ function _reattachTailFrameBatch(b) {
       if (!_markTailRFailed(gIdx)) return;
       var errMsg = _snapshotTaskError(t, 120);
       var extraRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
-      _clearFailedTailFrameLocally(gIdx, errMsg, extra, originId);
+      // 用户已删除该尾帧 → 不回写失败、不渲染失败卡片 (30 分钟批次窗口内的重放)。
+      if (!_clearFailedTailFrameLocally(gIdx, errMsg, extra, originId)) return;
       var displayMsg = _tailFrameErrorDisplay(_tailFrameErrorRecordFromStoryboard(project.storyboards[gIdx], errMsg), errMsg);
       if (_tailFrameSafetyInfo(project.storyboards[gIdx]) || _isImageSafetyBlocked(extraRecord.imageSafetyAudit, extraRecord.message || displayMsg)) renderImageGrid();
       else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: displayMsg });
@@ -813,9 +944,13 @@ function _reattachTailFrameBatch(b) {
       if (!_markTailRFailed(gIdx2)) return;
       var errRecord2 = _tailFrameErrorRecordFromExtra(extra, errMsg2);
       var displayMsg2 = _tailFrameErrorDisplay(errRecord2, errMsg2);
-      _clearFailedTailFrameLocally(gIdx2, errMsg2, extra, originId);
-      if (_isImageSafetyBlocked(errRecord2.imageSafetyAudit, errRecord2.message || displayMsg2)) renderImageGrid();
-      else renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
+      if (_clearFailedTailFrameLocally(gIdx2, errMsg2, extra, originId)) {
+        if (_isImageSafetyBlocked(errRecord2.imageSafetyAudit, errRecord2.message || displayMsg2)) renderImageGrid();
+        else renderStoryboardFrameCard(gIdx2, 'tail', 'error', { errMsg: displayMsg2 });
+      } else {
+        // 已删除的尾帧: 只收掉可能残留的 loading/error 浮层, 不渲染失败。
+        renderStoryboardFrameCard(gIdx2, 'tail', 'done', {});
+      }
       _bumpTailRFailed();
       _renderTailEtaR();
     },
@@ -1223,16 +1358,36 @@ function _clearFailedStoryboardLocally(groupIdx, errMsg, extra, projectId) {
   });
 }
 
+/**
+ * 用户是否已对该组显式表态"不要尾帧"。delete-tail 把 tailFrameIntent 置 'none'
+ * (清图+清意图)；undefined/缺省 不算——只有显式 'none' 才触发各处的"失败不复活" gate。
+ */
+function _isTailFrameExplicitlyDeleted(sb) {
+  return !!sb && String(sb.tailFrameIntent || '') === 'none';
+}
+
+/**
+ * 返回 boolean: true = 失败状态已写入 storyboard；false = 被跳过(用户已删除该尾帧,
+ * 或项目已切走)。调用方在 false 时不要再渲染失败卡片/弹失败 toast。
+ *
+ * 为什么要 gate: 失败回写有多个迟到入口(reattach 终态快照 / SSE onTaskFailed /
+ * 5s poll)，而 /api/batch/active 会把 failed 批次保留 30 分钟。用户点"删除尾帧"
+ * 之后，任何一次 focus/刷新/重连 reconcile 都会重放这个失败并把卡片"复活"成
+ * 生成失败 + intent 翻回 'requested'，与删除语义("这一段不再需要尾帧")冲突。
+ */
 function _clearFailedTailFrameLocally(groupIdx, errMsg, extra, projectId) {
-  if (typeof groupIdx !== 'number' || !project) return;
+  if (typeof groupIdx !== 'number' || !project) return false;
   var originProjectId = projectId || (project && project.id);
-  if (!originProjectId) return;
+  if (!originProjectId) return false;
   var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
   var audit = errRecord.imageSafetyAudit || null;
   var msg = errRecord.message;
+  var applied = false;
   _safeWriteBack(originProjectId, function (proj) {
     if (!proj.storyboards) proj.storyboards = [];
     var sb = proj.storyboards[groupIdx] || {};
+    if (_isTailFrameExplicitlyDeleted(sb)) return;
+    applied = true;
     var prevTail = (sb.frames && sb.frames.tail) || null;
     var fallbackUrl = (prevTail && (prevTail.url || prevTail.lastKnownGoodUrl)) || sb.tailFrameUrl || "";
     sb.tailFrameLastError = msg;
@@ -1265,6 +1420,7 @@ function _clearFailedTailFrameLocally(groupIdx, errMsg, extra, projectId) {
     sb.frames = Object.assign({}, sb.frames || {}, { tail: nextTail });
     proj.storyboards[groupIdx] = sb;
   });
+  return applied;
 }
 
 function _imageSafetyAuditFromExtra(extra) {
@@ -7170,6 +7326,10 @@ function _tailFrameStatusForBatch(sb) {
 function _isTailKeyframeWanted(group, sb) {
   var idxs = (group && Array.isArray(group.shotIndices)) ? group.shotIndices : [];
   if (idxs.length > 1) return false;
+  // 用户点过"删除尾帧"(intent='none') → 自动批量/续链一律不再带上,
+  // 兑现删除按钮的承诺"下次批量重做不会再生成"。推荐分依然可能达标,
+  // 但推荐只保留为卡片上的被动提示, 用户可手动重新生成 (会翻回 'requested')。
+  if (_isTailFrameExplicitlyDeleted(sb)) return false;
   var intent = _tailFrameGenerationIntentForGroup(group, sb);
   return !!(intent && intent.wanted);
 }
@@ -7207,20 +7367,8 @@ function _tailKeyframeTargets(groups, opts) {
   return targets;
 }
 
-function _plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode) {
-  groups = groups || getStoryboardGroups();
-  buttonState = buttonState || {};
-  if (tailKeyframeMode === 'all') {
-    var allCount = 0;
-    for (var i = 0; i < groups.length; i++) {
-      var sb = (project.storyboards && project.storyboards[i]) || {};
-      if (_isTailKeyframeWanted(groups[i], sb)) allCount++;
-    }
-    return allCount;
-  }
-  if (tailKeyframeMode === 'failed') return (buttonState.failedTail || []).length;
-  return (buttonState.pendingTailKeyframes || []).length;
-}
+// (旧 _plannedTailKeyframeCountForProgress 已删: 逐镜头续链下尾帧不再预计数,
+//  排程器 flush 时把各批 target 数动态加进共享进度 total, 见 _flushTailChain。)
 
 function _isFirstFrameStale(gIdx) {
   return !!(project && project._staleFlags && project._staleFlags["storyboard_" + gIdx]);
@@ -7520,6 +7668,9 @@ export async function generateStoryboardSheet(gIdx, opts) {
           updateStoryboardCard(gIdx, "done", rawUrl);
         }
       }
+      // 逐镜头续链: 单卡生成/失败重试成功的首帧同样触发 (方案 §2 状态驱动,
+      // 不关心首帧是哪条路径变 ready 的)。
+      if (!isTail) _scheduleTailChain(originId, gIdx, 'single-first-done');
     }
 
     // 5 秒兜底轮询：SSE 偶尔丢事件，靠它从 /api/batch/<id> 拿权威结果
@@ -7907,6 +8058,12 @@ export async function generateStoryboardTailFrame(gIdx) {
               var extraRecordPoll = _tailFrameErrorRecordFromExtra(extraPoll, errMsgPoll);
               if (!synced || extraRecordPoll.imageSafetyAudit) _clearFailedTailFrameLocally(gIdx, errMsgPoll, extraPoll, originId);
               var latestSb = project && project.storyboards && project.storyboards[gIdx];
+              if (_isTailFrameExplicitlyDeleted(latestSb)) {
+                // 用户在生成期间删除了该尾帧: 不渲染失败、不弹失败 toast。
+                renderStoryboardFrameCard(gIdx, 'tail', 'done', {});
+                _gotResult = true;
+                continue;
+              }
               var errRecordPoll = _tailFrameErrorRecordFromStoryboard(latestSb, errMsgPoll);
               var errDisplayPoll = _tailFrameErrorDisplay(errRecordPoll, errMsgPoll);
               if (_tailFrameSafetyInfo(latestSb) || _isImageSafetyBlocked(extraRecordPoll.imageSafetyAudit || errRecordPoll.imageSafetyAudit, errMsgPoll)) {
@@ -7942,7 +8099,12 @@ export async function generateStoryboardTailFrame(gIdx) {
         var errRecordInner = _tailFrameErrorRecordFromExtra(extra, errMsgInner);
         var errDisplayInner = _tailFrameErrorDisplay(errRecordInner, errMsgInner);
         if (project && project.id === originId) {
-          _clearFailedTailFrameLocally(gIdx, errMsgInner, extra, originId);
+          if (!_clearFailedTailFrameLocally(gIdx, errMsgInner, extra, originId)) {
+            // 用户在生成期间删除了该尾帧: 只收掉浮层, 不渲染失败、不弹 toast。
+            renderStoryboardFrameCard(gIdx, 'tail', 'done', {});
+            _gotResult = true;
+            return;
+          }
           if (_isImageSafetyBlocked(errRecordInner.imageSafetyAudit, errRecordInner.message || errDisplayInner)) renderImageGrid();
           else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplayInner });
         }
@@ -7974,6 +8136,7 @@ export async function generateAllTailFrames(opts) {
   var skipNoFirst = 0;
   var skipMerged = 0;
   var skipLowScore = 0;
+  var skipDeleted = 0;
   if (!targets.length) {
     for (var i = 0; i < groups.length; i++) {
       var sb = project.storyboards[i] || {};
@@ -7981,6 +8144,8 @@ export async function generateAllTailFrames(opts) {
       // 低分 solo 不自动跟随(用户仍可在尾帧卡手动生成,手动不拦)。
       var _idxs = (groups[i] && groups[i].shotIndices) || [];
       if (_idxs.length > 1) { skipMerged++; continue; }
+      // 显式删除过的尾帧不自动重做 (删除按钮的承诺); 手动单卡生成不受影响。
+      if (_isTailFrameExplicitlyDeleted(sb)) { skipDeleted++; continue; }
       var tailIntent = _tailFrameGenerationIntentForGroup(groups[i], sb);
       if (!tailIntent.wanted) { skipLowScore++; continue; }
       if (!tailIntent.canGenerate) { skipNoFirst++; continue; }
@@ -7997,6 +8162,7 @@ export async function generateAllTailFrames(opts) {
     if (skipNoFirst > 0) _skipParts.push(skipNoFirst + ' 个缺彩色片段首帧');
     if (skipMerged > 0) _skipParts.push(skipMerged + ' 个合并片段(不建议尾帧)');
     if (skipLowScore > 0) _skipParts.push(skipLowScore + ' 个低分 solo 片段(可在尾帧卡手动生成)');
+    if (skipDeleted > 0) _skipParts.push(skipDeleted + ' 个已删除尾帧(可在尾帧卡手动重新生成)');
     var hintMsg = _skipParts.length
       ? '没有需要自动生成尾帧的片段:' + _skipParts.join('、')
       : '全部片段已有尾帧, 无需重新生成';
@@ -8010,6 +8176,11 @@ export async function generateAllTailFrames(opts) {
     if (materialBlockMessage) {
       showToast(materialBlockMessage, 'warn');
       renderImageGrid();
+      // 中止不再完全静默: 自动续链来源在卡片留被动提示, 且这些组本会话退出
+      // 自动链 (防 sweep 每 15s 重弹同一个 toast); 手动入口不画提示但同样登记,
+      // 用户修完素材后手动生成不受影响。
+      _markTailChainBlocked(originId, targets,
+        opts.chainSource === 'tail-chain' ? materialBlockMessage : '');
       _setTailFramesGenerating(false);
       return;
     }
@@ -8020,6 +8191,8 @@ export async function generateAllTailFrames(opts) {
       }
       renderImageGrid();
       checkImagesConfirm();
+      _markTailChainBlocked(originId, targets,
+        opts.chainSource === 'tail-chain' ? '尾帧画面描述保存失败' : '');
       _setTailFramesGenerating(false);
       return;
     }
@@ -8157,9 +8330,13 @@ export async function generateAllTailFrames(opts) {
       if (typeof gIdx !== 'number' || completedIdx[gIdx]) return;
       var errRecord = _tailFrameErrorRecordFromExtra(extra, errMsg);
       var errDisplay = _tailFrameErrorDisplay(errRecord, errMsg);
-      _clearFailedTailFrameLocally(gIdx, errMsg, extra, originId);
-      if (_isImageSafetyBlocked(errRecord.imageSafetyAudit, errRecord.message || errDisplay)) renderImageGrid();
-      else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
+      if (_clearFailedTailFrameLocally(gIdx, errMsg, extra, originId)) {
+        if (_isImageSafetyBlocked(errRecord.imageSafetyAudit, errRecord.message || errDisplay)) renderImageGrid();
+        else renderStoryboardFrameCard(gIdx, 'tail', 'error', { errMsg: errDisplay });
+      } else {
+        // 用户在批量生成期间删除了该尾帧: 不渲染失败 (进度计数仍按失败统计)。
+        renderStoryboardFrameCard(gIdx, 'tail', 'done', {});
+      }
       completedIdx[gIdx] = 'failed';
       failCount++;
       tailProgress.fail = Number(tailProgress.fail || 0) + 1;
@@ -8342,12 +8519,6 @@ export async function generateAllImages() {
     });
     tailKeyframeMode = buttonState.action === 'regenerate_all' ? 'all' : 'pending';
   }
-  var runTailKeyframesAfterFirst = buttonState.pendingTailKeyframes.length > 0 ||
-    buttonState.failedTail.length > 0 ||
-    buttonState.action === 'regenerate_all';
-  var plannedTailKeyframeCount = runTailKeyframesAfterFirst
-    ? _plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode)
-    : 0;
   if (!targets.length) {
     var tailOnlyTargets = _tailKeyframeTargets(groups, {
       failedOnly: tailKeyframeMode === 'failed',
@@ -8375,9 +8546,15 @@ export async function generateAllImages() {
   var keyframeProgressState = {
     done: 0,
     fail: 0,
-    total: totalCount + plannedTailKeyframeCount,
+    // 续链尾帧不再预计数: 排程器 flush 时把各批 target 数动态加进 total (方案 §5)
+    total: totalCount,
     startTs: Date.now(),
   };
+  // 共享给尾帧续链排程器: 首帧批量进行期间链出的尾帧并入同一标题进度。
+  // "重新生成全部"(tailKeyframeMode==='all') 期间停用逐镜头续链, 终态统一
+  // includeReady 重做全部尾帧 (显式动作的既有语义), 防止中途链一次结尾再重做一次双扣费。
+  _activeKeyframeProgressState = keyframeProgressState;
+  _tailChainSuppressedForRun = tailKeyframeMode === 'all';
   // 标题下方进度行：等真实跑完 1 张以后用实测速度，否则用保守初始猜测；
   // 并发估算来自当前前端图片并发常量，避免标题 ETA 和调度上限明显偏离。
   var diagBox = $("sbDiagnostic");
@@ -8437,6 +8614,10 @@ export async function generateAllImages() {
     targets.forEach(function (t) { updateStoryboardCard(t.groupIdx, "error", null, "启动失败"); });
     _imagesGenerating = false;
     _imagesStarting = false;
+    // 启动失败也要复位续链状态: 否则 regenerate_all 启动失败后 suppression
+    // 残留为 true, 逐镜头续链全站静默停摆。
+    _tailChainSuppressedForRun = false;
+    if (_activeKeyframeProgressState === keyframeProgressState) _activeKeyframeProgressState = null;
     if (btn) btn.disabled = false;
     _updateImagesActionButton(groups);
     return;
@@ -8446,24 +8627,44 @@ export async function generateAllImages() {
     if (finished) return;
     finished = true;
     _stopEtaTick();
-    if (!runTailKeyframesAfterFirst) {
-      _clearEta();
-    } else if (diagBox) {
-      diagBox.innerHTML = '';
+    var explicitRedoAllTails = tailKeyframeMode === 'all';
+    if (!explicitRedoAllTails) {
+      if (diagBox) diagBox.innerHTML = '';
+      // 续链尾帧在跑/已排队时不收标题进度 (让 generateAllTailFrames 自己收尾),
+      // 否则正常隐藏。
+      var chainPending = project && _tailChainPendingByProject[project.id] &&
+        Object.keys(_tailChainPendingByProject[project.id]).length > 0;
+      if (!_tailChainFlushInFlight && !_tailChainFlushTimer && !chainPending) {
+        _hideKeyframeHeaderProgress();
+      }
+    }
+    if (_activeKeyframeProgressState === keyframeProgressState && !explicitRedoAllTails) {
+      _activeKeyframeProgressState = null;
     }
     var done = project.storyboards.filter(function (s) { return s && s.imageUrl; }).length;
     if (hint) hint.textContent = done + "/" + groups.length + " 张关键帧已生成";
     var allSbDone = groups.every(function (_, i) { return project.storyboards[i] && project.storyboards[i].imageUrl; });
     if (failCount > 0) showToast(failCount + " 张关键帧生成失败，请手动重试", "warn");
-    if (runTailKeyframesAfterFirst) {
-      _maybeAutoStartTailFramesFromCurrentProject(originId, startResp.batchId, {
-        failedOnly: tailKeyframeMode === 'failed',
-        includeReady: tailKeyframeMode === 'all',
-        buttonId: 'btnGenAllImages',
-        hintId: 'imagesHint',
-        progressState: keyframeProgressState,
-      })
-        .finally(function () {
+    if (explicitRedoAllTails) {
+      // "重新生成全部关键帧"的既有显式语义: 首帧全部重做后, 同步重做全部
+      // 该有的尾帧 (includeReady)。期间逐镜头续链被 _tailChainSuppressedForRun
+      // 停用, 这里跑完统一恢复。
+      (async function () {
+        try {
+          var redoTargets = _tailKeyframeTargets(getStoryboardGroups(), { includeReady: true });
+          if (redoTargets.length) {
+            if (hint) hint.textContent = "正在生成 " + redoTargets.length + " 张尾帧关键帧…";
+            await generateAllTailFrames({
+              targets: redoTargets,
+              buttonId: 'btnGenAllImages',
+              progressState: keyframeProgressState,
+            });
+          }
+        } catch (e) {
+          console.warn('[TailChain] explicit redo-all tail pass failed:', (e && e.message) || e);
+        } finally {
+          if (_activeKeyframeProgressState === keyframeProgressState) _activeKeyframeProgressState = null;
+          _tailChainSuppressedForRun = false;
           _hideKeyframeHeaderProgress();
           _imagesGenerating = false;
           if (btn) btn.disabled = false;
@@ -8477,13 +8678,16 @@ export async function generateAllImages() {
           }
           checkImagesConfirm();
           setTimeout(function () { _checkAndSuggest("images"); }, 1000);
-        });
+        }
+      })();
       return;
     }
     if (allSbDone && groups.length > 0) showToast("全部关键帧已生成", "success");
     _imagesGenerating = false;
     if (btn) btn.disabled = false;
     checkImagesConfirm();
+    // 兜底扫描: 个别首帧完成事件丢失 (SSE 断/页面后台) 时, 终态后补一次续链
+    _scheduleTailChainSweep('images-finish');
     setTimeout(function () { _checkAndSuggest("images"); }, 1000);
   }
 
@@ -8519,6 +8723,9 @@ export async function generateAllImages() {
         updateStoryboardCard(groupIdx, "done", rawUrl);
       }
     }
+    // 逐镜头续链 (事件层): 这张首帧 ready 了, 它的尾帧不等整批结束。
+    // projectId 显式传 originId —— 完成事件可能晚到, 用户已切项目。
+    if (!isTail) _scheduleTailChain(originId, groupIdx, 'live-first-done');
     // 尾帧: UI 通过 renderStoryboardFrameCard 单独更新尾帧位, 不触碰首帧/主图 img
     if (hint) hint.textContent = "生成中… " + (doneCount + failCount) + "/" + totalCount;
     _renderEta();
@@ -9015,6 +9222,11 @@ export async function handleImageAction(e) {
     delSb.tailFrameSourceHash = null;
     delSb.tailFrameReferenceStatus = 'missing';
     delSb.tailFrameLastError = '';
+    // 失败元数据一并清掉, 避免残留触发安全提示/失败态展示。
+    delete delSb.tailFrameFailedAt;
+    delete delSb.tailFrameSafetyAudit;
+    delete delSb.tailFrameErrorCode;
+    delete delSb.tailFrameRecoveryHint;
     project.storyboards[gIdx] = delSb;
     saveProject();
     renderImageGrid();

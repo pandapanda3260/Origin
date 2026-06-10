@@ -3,7 +3,7 @@ import { loadProjectData } from './project.js?v=106';
 import { subscribeBatch, subscribeTask } from './backend_stream.js?v=300';
 import { renderAssetCard } from './render_hooks.js?v=300';
 import { attachShotsBatch } from './shots.js?v=114';
-import { reattachStoryboardBatches } from './storyboard.js?v=152';
+import { reattachStoryboardBatches } from './storyboard.js?v=154';
 import { showBillingPaywall } from './billing.js?v=114';
 import { invalidateAllMaterialPanels } from './material_image_panel.js?v=104';
 

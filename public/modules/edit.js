@@ -489,6 +489,7 @@ export function syncEditProject(p) {
 // 心跳恢复"导出中/成片中"的展示，所以这里只清 UI 态，不碰任何数据。
 function _teardownProjectScopedEditUi() {
   _editUiEpoch++;
+  try { _setPreviewLoading(false); } catch (_e) {}
   if (_exportStreamHandle) {
     try { _exportStreamHandle.close(); } catch (_e) {}
     _exportStreamHandle = null;
@@ -663,10 +664,14 @@ function _teardownProjectScopedEditUi() {
       _videoUrlHydrationPromise = null;
       if (changed && (!_ctx.getActivePage || _ctx.getActivePage() === "edit")) {
         _initDoubleBuffer();
+      } else if (!changed && _timelineVideoUrlsNeedRefresh()) {
+        // 重签没成功（逐条静默失败）：别让"加载中…"挂死在预览框上
+        _setPreviewLoading(false);
       }
     }).catch(function (err) {
       if (runId !== _videoUrlHydrationRunId) return;
       _videoUrlHydrationPromise = null;
+      _setPreviewLoading(false);
       console.warn("[Edit] video URL hydrate failed:", err);
     });
   }
@@ -1028,6 +1033,7 @@ function _teardownProjectScopedEditUi() {
     if (!hasImported) {
       if (guard) guard.hidden = false;
       if (workspace) workspace.hidden = true;
+      _setPreviewLoading(false);
       _renderEditGuardHint(readiness);
       _syncUndoRedoButtons();
       return;
@@ -2202,6 +2208,32 @@ function _teardownProjectScopedEditUi() {
     }
   }
 
+  /* ── 预览框加载提示（转圈 + 加载中…）──
+     进剪辑页瞬间视频地址可能还在签名、或首段视频还在缓冲；这段窗口期预览是
+     黑的、点播放又只是默默等待，用户以为是 bug（2026-06-11 反馈）。统一用
+     这个遮罩给出"在加载"的反馈：地址签名中 / 首段缓冲中 / 点播放后等待起播
+     都显示；起播成功、暂停、失败、切项目时隐藏。pointer-events:none 不挡点击。 */
+  function _setPreviewLoading(visible, label) {
+    var area = $("editPreviewArea");
+    if (!area) return;
+    var el = document.getElementById("editPreviewLoading");
+    if (!visible) {
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      return;
+    }
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "editPreviewLoading";
+      el.className = "edit-preview-loading";
+      el.innerHTML =
+        '<div class="edit-preview-loading-spinner"></div>' +
+        '<span class="edit-preview-loading-text"></span>';
+      area.appendChild(el);
+    }
+    var textEl = el.querySelector(".edit-preview-loading-text");
+    if (textEl) textEl.textContent = label || "加载中…";
+  }
+
   function _initDoubleBuffer() {
     var area = $("editPreviewArea");
     if (!area) return;
@@ -2260,7 +2292,13 @@ function _teardownProjectScopedEditUi() {
     var segs = _getTimelineSegs();
     if (segs.length > 0) {
       var url = _segVideoUrl(segs[0], 0);
-      if (url) {
+      if (url && _runtimeVideoUrlNeedsRefresh(url)) {
+        // 播放地址还没签名/已过期：现在塞给 <video> 必然 401 黑屏。先亮"加载中…"，
+        // 等 _scheduleTimelineVideoUrlHydration 重签完成后会带新地址重走 _initDoubleBuffer。
+        var placeholderWait = $("editPreviewPlaceholder");
+        if (placeholderWait) placeholderWait.hidden = true;
+        _setPreviewLoading(true);
+      } else if (url) {
         _editState._vidA.src = url;
         try { _editState._vidA.dataset.segIdx = "0"; } catch (_) {}
         var seg0In = segs[0].inPoint || 0;
@@ -2274,7 +2312,24 @@ function _teardownProjectScopedEditUi() {
         _editState._vidA.load();
         var placeholder = $("editPreviewPlaceholder");
         if (placeholder) placeholder.hidden = true;
+        // 首段缓冲完成前给出加载反馈；就绪/失败即撤。陈旧监听（重建后才触发）不碰新遮罩。
+        if (_editState._vidA.readyState < 2) {
+          _setPreviewLoading(true);
+          (function (vA) {
+            var hideInitLoading = function () {
+              vA.removeEventListener("loadeddata", hideInitLoading);
+              vA.removeEventListener("error", hideInitLoading);
+              if (vA === _editState._vidA) _setPreviewLoading(false);
+            };
+            vA.addEventListener("loadeddata", hideInitLoading);
+            vA.addEventListener("error", hideInitLoading);
+          })(_editState._vidA);
+        } else {
+          _setPreviewLoading(false);
+        }
       }
+    } else {
+      _setPreviewLoading(false);
     }
 
     _editState._preloaded = true;
@@ -2596,15 +2651,21 @@ function _teardownProjectScopedEditUi() {
     _buildSegStartTimes();
     _refreshTickCache();
     var segs = _tickCache.segs;
-    if (!segs.length) return;
+    if (!segs.length) {
+      // 之前这里静默 return，用户点播放毫无反应、以为页面坏了。
+      showToast("时间线上还没有可播放的片段", "warn");
+      return;
+    }
 
     if (_timelineVideoUrlsNeedRefresh()) {
+      _setPreviewLoading(true);
       showToast("正在刷新视频播放地址…", "warn");
       var hydration = _videoUrlHydrationPromise || _hydrateTimelineVideoUrls();
       _videoUrlHydrationPromise = hydration;
       hydration.then(function (changed) {
         if (_videoUrlHydrationPromise === hydration) _videoUrlHydrationPromise = null;
         if (_timelineVideoUrlsNeedRefresh()) {
+          _setPreviewLoading(false);
           showToast("视频播放地址刷新失败，请重新登录后再试", "error");
           return;
         }
@@ -2613,6 +2674,7 @@ function _teardownProjectScopedEditUi() {
       }).catch(function (err) {
         if (_videoUrlHydrationPromise === hydration) _videoUrlHydrationPromise = null;
         console.warn("[EditPlay] video URL hydrate failed:", err);
+        _setPreviewLoading(false);
         showToast("视频播放地址刷新失败，请重新登录后再试", "error");
       });
       return;
@@ -2674,6 +2736,7 @@ function _teardownProjectScopedEditUi() {
 
   function _editPause() {
     _editState.isPlaying = false;
+    _setPreviewLoading(false);
     if (_editState._rafId) {
       cancelAnimationFrame(_editState._rafId);
       _editState._rafId = null;
@@ -2738,6 +2801,7 @@ function _teardownProjectScopedEditUi() {
       if (settled) return;
       settled = true;
       cleanup();
+      _setPreviewLoading(false);
       console.warn("[EditPlay] video failed:", err);
       if (_editState.isPlaying) _editPause();
       showToast("视频播放失败: " + ((err && err.message) || "视频加载失败"), "warn");
@@ -2754,13 +2818,14 @@ function _teardownProjectScopedEditUi() {
       vid.play().catch(function (err) {
         if (err && err.name === "NotAllowedError" && !vid.muted) {
           vid.muted = true;
-          vid.play().then(function () { settled = true; cleanup(); vid.muted = false; }).catch(failPlayback);
+          vid.play().then(function () { settled = true; cleanup(); _setPreviewLoading(false); vid.muted = false; }).catch(failPlayback);
           return;
         }
         failPlayback(err);
       }).then(function () {
         settled = true;
         cleanup();
+        _setPreviewLoading(false);
       });
     };
 
@@ -2781,6 +2846,8 @@ function _teardownProjectScopedEditUi() {
     if (vid.readyState >= 3) {
       _seekAndPlay();
     } else {
+      // 视频还在缓冲：点了播放却要等 canplay，之前这段时间毫无反馈。
+      _setPreviewLoading(true);
       var handler = function () {
         vid.removeEventListener("canplay", handler);
         if (_editState.isPlaying) _seekAndPlay();

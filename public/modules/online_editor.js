@@ -10,6 +10,8 @@
  * - 消息通过 postMessage 在 iframe 和主页面之间传递
  */
 
+import { extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines } from '/modules/subtitle_format.js?v=300';
+
 var _oeCtx = null;
 var _vevFrame = null;
 var _vevDemoConfig = null;
@@ -39,6 +41,7 @@ var _vevDemoInitialAutoSyncKey = '';
 var _lastVevTimelineApplyToastKey = '';
 var _lastVevTimelineApplyToastAt = 0;
 var _syncMaterialsBusyFlag = false;
+var _clearTracksBusyFlag = false;
 var _hostKeydownBound = false;
 var _keepAlivePingTimer = null;
 var _keepAlivePingCallback = null;
@@ -77,6 +80,7 @@ function initOnlineEditor(ctx) {
   _eventsBound = true;
 
   // 绑定 UI 事件（保留占位 UI 作为 fallback）；真实连接在页面进入时懒加载。
+  _bindShortcutHelpButton();
   _bindToolbarEvents();
   _bindMediaPanelEvents();
   _bindInspectorEvents();
@@ -888,6 +892,31 @@ function _deriveServerExportPhase(payload) {
 // iframe 管理
 // ============================================================================
 
+// 中央加载遮罩：盖在 iframe 上方（z-index 3 < 返回热区的 4），幂等创建、可改文案。
+// 整个加载链路（连接→握手→绑定→建编辑器）期间黑屏无反馈，靠它兜住。
+function _showVevLoadingOverlay(title, subText) {
+  const container = document.getElementById('oeEditorContainer');
+  if (!container) return;
+  let overlay = document.getElementById('oeVevLoadingOverlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'oeVevLoadingOverlay';
+    overlay.className = 'oe-editor-empty-state';
+    overlay.style.cssText = 'position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:#0a0e14;margin:0;';
+    container.appendChild(overlay);
+  }
+  overlay.innerHTML = `
+    <span class="material-symbols-outlined animate-spin" style="font-size:34px;color:rgba(255,255,255,.6);">progress_activity</span>
+    <h2 style="margin:0;font-size:14px;color:rgba(255,255,255,.85);">${title}</h2>
+    ${subText ? `<p style="margin:0;font-size:11px;color:rgba(255,255,255,.35);max-width:70%;text-align:center;">${subText}</p>` : ''}
+  `;
+}
+
+function _removeVevLoadingOverlay() {
+  const overlay = document.getElementById('oeVevLoadingOverlay');
+  if (overlay) overlay.remove();
+}
+
 function _createVevDemoFrame(url) {
   const container = document.getElementById('oeEditorContainer');
   if (!container) {
@@ -912,20 +941,13 @@ function _createVevDemoFrame(url) {
     _vevFrame = null;
     _connectStarted = false;
     _setConnectionStatus('error', '连接失败');
+    _showVevLoadingOverlay('连接失败，准备重试…');
     _scheduleVevDemoAutoRetry(url, message);
   };
 
-  // 创建加载指示器
+  // 创建加载指示器（生命周期延长到编辑器真就绪：连接中 → 绑定项目中 → ready 才撤）
   _setConnectionStatus('pending', '加载中');
-  const loadingOverlay = document.createElement('div');
-  loadingOverlay.id = 'oeVevLoadingOverlay';
-  loadingOverlay.className = 'oe-editor-empty-state';
-  loadingOverlay.innerHTML = `
-    <span class="material-symbols-outlined animate-spin">progress_activity</span>
-    <h2>正在连接</h2>
-    <p title="${_escapeOnlineEditorHtml(url)}">视频剪辑服务加载中。</p>
-  `;
-  container.appendChild(loadingOverlay);
+  _showVevLoadingOverlay('正在连接剪辑服务…', `视频剪辑服务加载中（${_escapeOnlineEditorHtml(url)}）`);
 
   // 创建 iframe
   _vevFrame = document.createElement('iframe');
@@ -979,8 +1001,9 @@ function _createVevDemoFrame(url) {
     console.log('[OnlineEditor] VevDemo iframe 加载完成');
     _setConnectionStatus('pending', '等待就绪');
     frame.style.display = 'block';
-    const overlay = document.getElementById('oeVevLoadingOverlay');
-    if (overlay) overlay.remove();
+    // iframe load ≠ 编辑器就绪：后面还有握手→绑定→创建编辑器，期间 iframe 是黑的。
+    // 遮罩切到"绑定项目中"，等 _markVevDemoBoundReady 真就绪时才移除。
+    _showVevLoadingOverlay('正在绑定项目…');
     setTimeout(() => {
       if (_vevFrame === frame && !_isVevDemoReady) {
         _sendToVevDemo('origin:getState', { timestamp: Date.now(), source: 'iframe-load' });
@@ -1102,7 +1125,11 @@ async function _retryVevDemoConnection(options) {
 // 焦点在 iframe 内部时按键不会冒到父窗口，天然不会双触发。
 // ============================================================================
 
-const OEV_FORWARD_SHORTCUT_CODES = new Set(['Space', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'KeyC']);
+const OEV_FORWARD_SHORTCUT_CODES = new Set([
+  'Space', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'KeyC',
+  'KeyI', 'KeyO', 'KeyJ', 'KeyK', 'KeyL',
+  'Equal', 'Minus', 'NumpadAdd', 'NumpadSubtract',
+]);
 
 function _isEditableHostTarget(target) {
   const element = target instanceof Element ? target : null;
@@ -1119,6 +1146,7 @@ function _handleHostEditorKeydown(event) {
   if (event.repeat && (event.code === 'Space' || event.code === 'KeyC')) return;
   if (!_isOnlineEditorPageActive() || !_isVevDemoReady || !_vevFrame) return;
   if (document.getElementById('oeExportPlaybackModal')) return; // 导出回放弹窗打开时按键留给弹窗内 video
+  if (document.getElementById('oeShortcutHelpModal')) return; // 快捷键说明弹窗打开时不转发
   if (_isEditableHostTarget(event.target)) return;
   event.preventDefault();
   _sendToVevDemo('origin:editorShortcut', {
@@ -1140,6 +1168,78 @@ function _unbindHostEditorKeydown() {
   window.removeEventListener('keydown', _handleHostEditorKeydown);
 }
 
+// ============================================================================
+// 快捷键说明：顶栏圆圈问号按钮 → 弹窗清单（按键能力以壳层 dispatchEditorShortcut 为准）
+// ============================================================================
+
+const OEV_SHORTCUT_HELP_ITEMS = [
+  ['空格', '播放 / 暂停'],
+  ['→ / ←', '前进 / 后退 0.1 秒'],
+  ['Shift + → / ←', '前进 / 后退 5 秒'],
+  ['Fn + ← / Fn + →', '跳到整条时间线的开头 / 结尾'],
+  ['I / O', '跳到当前片段的开头 / 结尾'],
+  ['J / K / L', '快退 / 暂停 / 播放'],
+  ['+ / -', '时间线放大 / 缩小'],
+  ['C', '在播放头位置剪开片段（自动选中，无需先点选）'],
+];
+
+function _openShortcutHelpModal() {
+  _closeShortcutHelpModal();
+  const modal = document.createElement('div');
+  modal.id = 'oeShortcutHelpModal';
+  modal.className = 'fixed inset-0 z-[80] flex items-center justify-center bg-black/75 p-6 backdrop-blur-md';
+  const rows = OEV_SHORTCUT_HELP_ITEMS.map(([keys, desc]) => (
+    '<div style="display:flex;align-items:center;gap:14px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06);">'
+    + '<span style="flex:0 0 168px;"><kbd style="display:inline-block;padding:2px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.08);color:rgba(255,255,255,.85);font:12px ui-monospace,SFMono-Regular,monospace;">'
+    + keys + '</kbd></span>'
+    + '<span style="font-size:12px;line-height:1.5;color:rgba(255,255,255,.65);">' + desc + '</span>'
+    + '</div>'
+  )).join('');
+  modal.innerHTML = `
+    <div class="w-full rounded-2xl border border-white/10 bg-[#080d13] shadow-2xl shadow-black/50 overflow-hidden" style="max-width:430px;">
+      <div class="flex items-center justify-between gap-4 px-4 py-3 border-b border-white/10">
+        <div>
+          <p class="text-sm text-white/85">剪辑快捷键</p>
+          <p class="text-[11px] text-white/40">在剪辑器里随时可用；输入文字或弹窗打开时自动让位</p>
+        </div>
+        <button type="button" data-oe-shortcut-help-close class="w-8 h-8 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 flex items-center justify-center">
+          <span class="material-symbols-outlined text-base text-white/60">close</span>
+        </button>
+      </div>
+      <div style="padding:8px 16px 14px;">${rows}</div>
+    </div>
+  `;
+  modal.addEventListener('click', (event) => {
+    if (event.target === modal || event.target.closest('[data-oe-shortcut-help-close]')) {
+      _closeShortcutHelpModal();
+    }
+  });
+  document.body.appendChild(modal);
+  document.addEventListener('keydown', _onShortcutHelpKeydown, true);
+}
+
+function _closeShortcutHelpModal() {
+  const existing = document.getElementById('oeShortcutHelpModal');
+  if (existing) existing.remove();
+  document.removeEventListener('keydown', _onShortcutHelpKeydown, true);
+}
+
+function _onShortcutHelpKeydown(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    _closeShortcutHelpModal();
+  }
+}
+
+function _bindShortcutHelpButton() {
+  const btn = document.getElementById('oeBtnShortcutHelp');
+  if (!btn) return;
+  btn.onclick = (event) => {
+    event.preventDefault();
+    _openShortcutHelpModal();
+  };
+}
+
 function _destroyVevDemoFrame() {
   _unbindHostEditorKeydown();
   _clearKeepAlivePing();
@@ -1154,6 +1254,8 @@ function _destroyVevDemoFrame() {
   _connectStarted = false;
   _hasVevDemoMessage = false;
   _vevDemoInitialAutoSyncKey = '';
+  _clearTracksBusyFlag = false; // iframe 都没了，清空轨道的在途回执不可能再来
+  _messageHandlers.delete('vevdemo:tracksCleared');
   if (_messageListenerBound) {
     window.removeEventListener('message', _handleVevMessage);
     _messageListenerBound = false;
@@ -1346,6 +1448,7 @@ function _markVevDemoBoundReady(data, source, wasReady) {
   }
   _setConnectionStatus('ready', '已连接');
   _setOnlineEditorControlsReady(true);
+  _removeVevLoadingOverlay();
   const diagnostic = document.getElementById('oeVevDiagnostic');
   if (diagnostic) diagnostic.remove();
   console.log('[OnlineEditor] VevDemo 项目绑定已就绪:', source, data);
@@ -1487,8 +1590,10 @@ function _onExportError(data) {
     console.log('[OnlineEditor] 忽略已入库导出的迟到错误事件:', payload);
     return;
   }
-  console.error('[OnlineEditor] 导出错误:', payload.code, payload.message);
+  // raw 是剪辑 SDK 的原始回调，"未知错误"时唯一的线索在这里面。
+  console.error('[OnlineEditor] 导出错误:', payload.code, payload.message, payload.raw);
   _clearExportPollingTimer();
+  const failDetail = payload.message || (payload.code ? `错误码 ${payload.code}` : '剪辑服务未返回原因');
   _setExportState({
     phase: 'vev_export_failed',
     status: payload.status || 'failed',
@@ -1498,9 +1603,9 @@ function _onExportError(data) {
     callbackPosting: false,
     polling: false,
     retrying: false,
-    errorMsg: payload.message || 'VevDemo 导出失败',
+    errorMsg: failDetail,
   });
-  _oeCtx?.showToast?.(`导出失败: ${payload.message || '未知错误'}`, 'error');
+  _oeCtx?.showToast?.(`导出失败: ${failDetail}`, 'error');
 }
 
 function _onTimelineChange(data) {
@@ -1539,6 +1644,14 @@ function _onVevDemoStatus(data) {
     }
     if (data?.status === 'pong') {
       if (_keepAlivePingCallback) _keepAlivePingCallback();
+      return;
+    }
+    if (data?.status === 'switching-project') {
+      // 保活后切项目：壳层销毁旧编辑器重建新的，期间重现中央遮罩。
+      _showVevLoadingOverlay('正在切换项目…');
+      _setConnectionStatus('pending', '绑定项目中');
+      _setOnlineEditorControlsReady(false);
+      console.log('[OnlineEditor] VevDemo 正在切换底层工程:', data);
       return;
     }
     if (_isVevDemoAwaitingProjectBindingState(data)) {
@@ -1933,6 +2046,10 @@ function _assertVevMaterialsBelongToBoundProject(materials, source) {
 async function importMaterialsToVevDemo(resourceIds, options) {
   options = options || {};
   const silent = options.silent === true;
+  if (_clearTracksBusyFlag) {
+    if (!silent) _oeCtx?.showToast?.('正在清空轨道，请稍候再同步', 'warning');
+    return null;
+  }
   if (!_isVevDemoReady) {
     if (!silent) _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
     return null;
@@ -1989,7 +2106,15 @@ async function importMaterialsToVevDemo(resourceIds, options) {
 
     const shouldApplyTimeline = options.applyTimeline === true || (!silent && options.applyTimeline !== false);
     if (shouldApplyTimeline) {
-      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials);
+      // 手动同步（非 silent）：只在轨道为空时自动铺设，已有内容绝不覆盖用户手工编排；
+      // 铺设走"先销毁编辑器→写 Track→重建"流程，时间线 UI 立即生效（2026-06-11 需求）。
+      const applyOptions = silent ? undefined : { onlyIfTracksEmpty: true, recreateEditor: true };
+      const applied = await _applyCurrentEdlTimelineToVevDemo(reachableMaterials, applyOptions);
+      if (!silent && applied && applied.skipped === 'tracks_not_empty') {
+        _oeCtx?.showToast?.('素材已同步；轨道已有内容未改动（想重新铺设可先点「清空轨道」）', 'info');
+      } else if (!silent && applied && applied.ok && !applied.error && !applied.blocked) {
+        _oeCtx?.showToast?.('素材已同步，轨道已按当前剪辑方案自动铺设', 'success');
+      }
     }
 
     console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
@@ -2233,7 +2358,8 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         : [];
       if (materials.length) {
         const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, 'auto-edl-reuse');
-        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials);
+        // 自动路径尊重"用户清空过轨道"标记：清空后不许悄悄铺回（手动同步才铺）。
+        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials, { respectClearedMarker: true });
         return null;
       }
       console.warn('[OnlineEditor] 已有自动同步标记但未找到可用 VevDemo binding，重新执行完整同步:', signature);
@@ -2260,7 +2386,8 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         bgmCount: bgmTrackIds.length,
         signature,
       });
-      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials);
+      // 自动路径尊重"用户清空过轨道"标记（同上）。
+      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials, { respectClearedMarker: true });
     }
     return result;
   })();
@@ -2298,6 +2425,56 @@ function _resolveEdlEntryVideoTaskId(entry) {
     extract(entry._originVideoUrl) ||
     (Number.isInteger(Number(entry.groupIdx)) ? _currentVideoTaskIdForGroup(Number(entry.groupIdx)) : '')
   );
+}
+
+// ── 字幕 cue 构建（与一键成片 lib/edit-export.ts buildSrt 同一套规则） ──
+// 行来源：storyboards[gIdx].videoPrompt 提取；空则回退该段绑定镜头的 dialogue。
+// 时间分配：段内均分，首条 +0.15s 起，行间留 0.05s，段尾留 0.05s。
+function _vevSubtitleLinesForGroup(project, gIdx) {
+  const sbs = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  const sb = sbs[gIdx];
+  const lines = [];
+  const prompt = String(sb?.videoPrompt || '');
+  if (prompt) lines.push(...extractSubtitleLinesFromPrompt(prompt));
+  if (!lines.length) {
+    // legacy-compatible 口径：storyboard.shotIndices 有效就用，否则回退 [gIdx]
+    const raw = Array.isArray(sb?.shotIndices) && sb.shotIndices.length ? sb.shotIndices : null;
+    const normalized = (raw || [gIdx])
+      .map((v) => Number(v))
+      .filter((v) => Number.isInteger(v) && v >= 0 && v < shots.length);
+    const seen = new Set();
+    for (const shotIndex of normalized) {
+      if (seen.has(shotIndex)) continue;
+      seen.add(shotIndex);
+      const pieces = splitSubtitleDialogueLines(String(shots[shotIndex]?.dialogue || '').trim());
+      for (const p of pieces) {
+        if (p) lines.push(p);
+      }
+    }
+  }
+  return lines.filter(Boolean);
+}
+
+function _buildVevSubtitleCues(project, entries) {
+  const cues = [];
+  for (const entry of entries) {
+    if (!Number.isInteger(entry?.groupIdx)) continue;
+    const segStart = Number(entry.targetStartSec) || 0;
+    const segDur = Math.max(0, (Number(entry.targetEndSec) || 0) - segStart);
+    if (segDur <= 0) continue;
+    const lines = _vevSubtitleLinesForGroup(project, entry.groupIdx);
+    if (!lines.length) continue;
+    const usable = Math.max(0.5, segDur - 0.3);
+    const each = usable / lines.length;
+    for (let k = 0; k < lines.length; k++) {
+      const start = segStart + 0.15 + k * each;
+      const end = Math.min(segStart + segDur - 0.05, start + each - 0.05);
+      if (!(end > start)) continue;
+      cues.push({ text: lines[k], startSec: _roundVevSyncSec(start), endSec: _roundVevSyncSec(end) });
+    }
+  }
+  return cues;
 }
 
 function _buildCurrentVevTimelinePlan(materials) {
@@ -2381,6 +2558,7 @@ function _buildCurrentVevTimelinePlan(materials) {
     edlVersion: Number(edl?.version) || 0,
     totalDurationSec: cursorSec,
     video: entries,
+    subtitles: _buildVevSubtitleCues(project, entries),
     bgm: bgmTrackId && bgmSource ? {
       resourceId: bgmTrackId,
       source: bgmSource,
@@ -2391,7 +2569,7 @@ function _buildCurrentVevTimelinePlan(materials) {
   };
 }
 
-function _sendTimelinePlanToVevDemo(plan) {
+function _sendTimelinePlanToVevDemo(plan, options) {
   return new Promise((resolve, reject) => {
     if (!_isVevDemoReady) {
       const error = new Error('VevDemo 未就绪');
@@ -2424,7 +2602,7 @@ function _sendTimelinePlanToVevDemo(plan) {
       resolve(data);
     });
 
-    const sent = _sendToVevDemo('origin:applyTimeline', { plan });
+    const sent = _sendToVevDemo('origin:applyTimeline', { plan, options: options || {} });
     if (!sent) {
       clearTimeout(timeout);
       _messageHandlers.delete('vevdemo:timelineApplied');
@@ -2515,7 +2693,7 @@ function _showVevTimelineApplyToast(meta) {
   _oeCtx?.showToast?.(message, type);
 }
 
-async function _applyCurrentEdlTimelineToVevDemo(materials) {
+async function _applyCurrentEdlTimelineToVevDemo(materials, options) {
   const plan = _buildCurrentVevTimelinePlan(materials);
   if (plan?.ok === false) {
     console.warn('[OnlineEditor] VevDemo 时间线铺轨已拦截:', plan);
@@ -2527,8 +2705,25 @@ async function _applyCurrentEdlTimelineToVevDemo(materials) {
     return null;
   }
   try {
-    const result = await _sendTimelinePlanToVevDemo(plan);
+    const result = await _sendTimelinePlanToVevDemo(plan, options);
+    if (result && result.skipped === 'tracks_not_empty') {
+      // 手动同步的保护分支：轨道已有内容，不动用户的手工编排。
+      console.log('[OnlineEditor] VevDemo 轨道非空，跳过自动铺设:', result.existingTrackItemCount);
+      return result;
+    }
+    if (result && result.skipped === 'tracks_cleared_by_user') {
+      // 用户清空过轨道：自动铺设静默跳过，等用户手动点「同步素材」。
+      console.log('[OnlineEditor] 用户已清空轨道，自动铺设已跳过:', result.tracksClearedAt || '');
+      return result;
+    }
     console.log('[OnlineEditor] VevDemo 时间线铺轨完成:', result);
+    if (result && result.subtitleCount > 0 && result.subtitleApplied === false) {
+      // 字幕轨降级是软提示不拦流程；详细错误在壳层 console（subtitleError）
+      _oeCtx?.showToast?.('字幕轨写入失败，本次按无字幕铺轨', 'warning');
+      console.warn('[OnlineEditor] VevDemo 字幕轨已降级:', result.subtitleError || '(no detail)');
+    } else if (result && result.subtitleApplied && result.subtitleCount > 0) {
+      console.log(`[OnlineEditor] 字幕已随时间线铺入文字轨：${result.subtitleCount} 条`);
+    }
     return result;
   } catch (err) {
     console.warn('[OnlineEditor] VevDemo 时间线铺轨未完成:', err);
@@ -2657,6 +2852,7 @@ function _convertTimelineToEDL(timeline) {
 function _showSetupGuide(message, state, missingKeys) {
   const container = document.getElementById('oeEditorContainer');
   if (!container) return;
+  _removeVevLoadingOverlay();
   state = state || 'missing_config';
   missingKeys = Array.isArray(missingKeys) ? missingKeys : [];
   const stateMap = {
@@ -2764,6 +2960,8 @@ function _escapeOnlineEditorHtml(value) {
 function _showEditorDiagnostic(message, detail) {
   const container = document.getElementById('oeEditorContainer');
   if (!container) return;
+  // 撤掉中央遮罩，露出 iframe 配合顶部诊断条（SDK 可能有自己的报错画面）。
+  _removeVevLoadingOverlay();
 
   let diagnostic = document.getElementById('oeVevDiagnostic');
   if (!diagnostic) {
@@ -2888,6 +3086,103 @@ function _setOnlineEditorControlsReady(ready) {
         importMaterialsToVevDemo();
       }
     : null;
+  const clearBtn = document.getElementById('oeBtnClearTracks');
+  if (clearBtn) {
+    clearBtn.hidden = !ready;
+    clearBtn.disabled = !ready;
+    _renderClearTracksButtonLabel(false);
+    clearBtn.onclick = ready
+      ? (event) => {
+          event.preventDefault();
+          _handleClearTracksClick();
+        }
+      : null;
+  }
+}
+
+// ── 清空轨道（2026-06-11 需求：同步素材右侧新按钮）────────────────────
+// 点击清掉 VevDemo 工程里所有轨道内容（素材库不动）。之后再点「同步素材」，
+// 空轨道会按当前剪辑方案自动重新铺设（与首次进入剪辑器同款流程）。
+function _handleClearTracksClick() {
+  if (_clearTracksBusyFlag) return;
+  if (_syncMaterialsBusyFlag) {
+    _oeCtx?.showToast?.('正在同步素材，请稍候再清空轨道', 'warning');
+    return;
+  }
+  if (!_isVevDemoReady || !_isCurrentVevDemoProjectBindingReady()) {
+    _oeCtx?.showToast?.('VevDemo 未就绪，暂不能清空轨道', 'warning');
+    return;
+  }
+  const doClear = () => { _clearVevDemoTracks(); };
+  if (typeof _oeCtx?.showConfirm === 'function') {
+    _oeCtx.showConfirm(
+      '清空轨道',
+      '确定清空剪辑器里所有轨道内容？\n素材库不受影响；之后点「同步素材」可按当前剪辑方案重新自动铺设。',
+      doClear
+    );
+  } else {
+    doClear();
+  }
+}
+
+function _clearVevDemoTracks() {
+  if (_clearTracksBusyFlag) return Promise.resolve(null);
+  _setClearTracksBusy(true);
+  return new Promise((resolve) => {
+    // 桥侧流程 = 销毁编辑器 → 写空 Track → 重建编辑器；30s 给足重建时间。
+    const timeout = setTimeout(() => {
+      _messageHandlers.delete('vevdemo:tracksCleared');
+      _setClearTracksBusy(false);
+      _oeCtx?.showToast?.('清空轨道超时，未收到剪辑器回执，请刷新后重试', 'error');
+      resolve(null);
+    }, 30000);
+
+    _messageHandlers.set('vevdemo:tracksCleared', (data) => {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:tracksCleared');
+      _setClearTracksBusy(false);
+      if (data?.ok === false) {
+        console.error('[OnlineEditor] 清空轨道失败:', data);
+        _oeCtx?.showToast?.('清空轨道失败: ' + (data?.error || '未知错误'), 'error');
+        resolve(data);
+        return;
+      }
+      const cleared = Number(data?.clearedItemCount) || 0;
+      _oeCtx?.showToast?.(
+        cleared > 0
+          ? `已清空轨道（${cleared} 个片段）；点「同步素材」可重新自动铺设`
+          : '轨道本来就是空的；点「同步素材」可自动铺设',
+        'success'
+      );
+      resolve(data);
+    });
+
+    const sent = _sendToVevDemo('origin:clearTracks', {});
+    if (!sent) {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:tracksCleared');
+      _setClearTracksBusy(false);
+      _oeCtx?.showToast?.('清空轨道消息发送失败，请检查连接后重试', 'error');
+      resolve(null);
+    }
+  });
+}
+
+function _setClearTracksBusy(busy) {
+  _clearTracksBusyFlag = !!busy;
+  const clearBtn = document.getElementById('oeBtnClearTracks');
+  if (!clearBtn) return;
+  clearBtn.disabled = !!busy;
+  _renderClearTracksButtonLabel(busy);
+}
+
+function _renderClearTracksButtonLabel(busy) {
+  const clearBtn = document.getElementById('oeBtnClearTracks');
+  if (!clearBtn) return;
+  clearBtn.innerHTML = `
+    <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">${busy ? 'progress_activity' : 'layers_clear'}</span>
+    <span>${busy ? '清空中' : '清空轨道'}</span>
+  `;
 }
 
 function _setSyncMaterialsBusy(busy) {

@@ -37,7 +37,6 @@ record('running guard state and helpers exist', () => {
   assert.match(src, /var _storyboardReattachRunningByBatch = Object\.create\(null\);/);
   assert.match(src, /var _storyboardTerminalReloadScheduledByBatch = Object\.create\(null\);/);
   assert.match(src, /var _storyboardTerminalSnapshotHandledByBatch = Object\.create\(null\);/);
-  assert.match(src, /var _storyboardTailAutoStartedBySourceBatch = Object\.create\(null\);/);
   assert.match(src, /function _storyboardBatchKey\(projectId, batchId\)/);
   assert.match(src, /function _shouldSkipStoryboardRunningReattach\(projectId, batchId, b\)/);
 });
@@ -83,14 +82,25 @@ record('prompts failed/cancelled terminal snapshots do not subscribe repeatedly'
   assert(terminalIdx < subscribeIdx, 'terminal check must run before prompt subscribeBatch');
 });
 
-record('automatic tail-frame continuation is guarded once per source storyboard batch', () => {
-  const helper = section('async function _maybeAutoStartTailFramesFromCurrentProject', 'function _runStoryboardBatchReconcile');
-  const guardIdx = helper.indexOf('if (_storyboardTailAutoStartedBySourceBatch[key]) return false;');
-  const markIdx = helper.indexOf('_storyboardTailAutoStartedBySourceBatch[key] = true;');
-  const targetIdx = helper.indexOf('var targets = _tailKeyframeTargets(getStoryboardGroups(), {');
-  assert(guardIdx > -1, 'helper must skip already handled source batches');
-  assert(markIdx > guardIdx, 'helper must mark after checking the source batch guard');
-  assert(targetIdx > markIdx, 'helper must mark before computing targets so empty targets are not retried forever');
+record('per-shot tail chain dedupes via started/blocked sets and serialized flush', () => {
+  // 2026-06-10 起逐镜头续链取代批末 one-shot flag (方案: 尾帧逐镜头自动续链-方案.md)。
+  // 防重三件套: started 集合(本会话已自动开过) + flush 串行 + flush 时重算资格。
+  assert.match(src, /var _tailChainStartedByProject = Object\.create\(null\);/);
+  assert.match(src, /var _tailChainBlockedByProject = Object\.create\(null\);/);
+  const flush = section('async function _flushTailChain', 'function _runStoryboardBatchReconcile');
+  assert(flush.includes('if (_tailChainFlushInFlight) {'), 'flush must be serialized');
+  assert(flush.includes('if (_tailFramesGenerating) {'), 'flush must defer while a manual tail batch runs');
+  const inflightIdx = flush.indexOf('await _tailChainInflightGroupIdxs(originId)');
+  const eligibleIdx = flush.indexOf('if (!_tailChainEligible(gIdx, groups)) return;');
+  const startedIdx = flush.indexOf('started[t.groupIdx] = true;');
+  const generateIdx = flush.indexOf('generateAllTailFrames({');
+  assert(inflightIdx > -1, 'flush must probe active tail batches for cross-refresh dedupe');
+  assert(eligibleIdx > inflightIdx, 'flush must recheck eligibility after the inflight probe');
+  assert(startedIdx > eligibleIdx && startedIdx < generateIdx,
+    'flush must mark started before generateAllTailFrames so a concurrent sweep cannot double-start');
+  const eligible = section('function _tailChainEligible', '\n/** 事件层入口');
+  assert(eligible.includes('_tailChainStartedByProject[project.id]'), 'eligibility must consult started set');
+  assert(eligible.includes('_tailChainBlockedByProject[project.id]'), 'eligibility must consult blocked set');
 });
 
 record('tail-frame running state participates in the shared image button state', () => {

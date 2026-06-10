@@ -1,5 +1,5 @@
 import { $, apiRequest, apiUpload, escapeHtml, hydrateProtectedImageElements, showConfirm } from './utils.js?v=300';
-import { deriveAssetCardState } from './assets.js?v=169';
+import { deriveAssetCardState } from './assets.js?v=170';
 
 var _ctx = {};
 var _wired = false;

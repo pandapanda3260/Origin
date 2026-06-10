@@ -7,7 +7,7 @@ import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   hydrateProtectedImageElements } from './modules/utils.js?v=300';
 import { appStore } from './modules/store.js?v=300';
 import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js?v=300';
-import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js?v=302';
+import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js?v=303';
 import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
   refreshSettingsFormFromState, wireSettingsPageOnce } from './modules/settings.js?v=300';
 import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modules/tasks.js?v=300';
@@ -20,11 +20,11 @@ import { EPISODE_FIELDS } from './modules/episode_fields.js?v=102';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
-  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=107';
+  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=108';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js?v=302';
+  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js?v=303';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
@@ -41,7 +41,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=152';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=154';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -62,13 +62,13 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=169';
+  _openLightbox } from './modules/assets.js?v=170';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=202';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=211';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=212';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=114';
 import { mountPixelCard } from './modules/pixel_card.js?v=300';
 import { createSwLoading } from '/modules/loading.js?v=300';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=10';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=16';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
@@ -2391,6 +2391,15 @@ var _scriptEditInitialText = "";
     if (_ovSearchComposing && document.activeElement === search) return;
     var expected = _ovSearchValue();
     if (search.value !== expected) search.value = expected;
+    _ovSyncSearchClearButton(search);
+  }
+
+  function _ovSyncSearchClearButton(search) {
+    var clear = $("ovTaskSearchClear");
+    if (!clear) return;
+    if (!search) search = $("ovTaskSearch");
+    var current = search ? search.value : _ovSearchValue();
+    clear.hidden = !String(current || "").trim();
   }
 
   function _ovClearSearchInput(search) {
@@ -2683,6 +2692,12 @@ var _scriptEditInitialText = "";
     video.addEventListener("error", function () { setLoading(false); showPlayBtn(true); });
   }
 
+  function _ovPreviewPlayIconHtml() {
+    return '<svg class="vtd-preview-play-icon" viewBox="0 0 28 28" aria-hidden="true" focusable="false">' +
+      '<path d="M9.2 6.3c0-.9 1-1.45 1.78-.95l10.86 7.01c.7.45.7 1.48 0 1.93L10.98 21.3c-.78.5-1.78-.05-1.78-.95V6.3z"/>' +
+      '</svg>';
+  }
+
   function _ovThumbnailImgHtml(url) {
     url = String(url || "").trim();
     if (!url) return "";
@@ -2911,6 +2926,7 @@ var _scriptEditInitialText = "";
   }
 
   function _ovSyncToolbarState() {
+    _ovSyncSearchClearButton();
     var recharge = $("ovBillingRechargeBtn");
     if (recharge) {
       recharge.innerHTML = '<span class="material-symbols-outlined">rocket_launch</span>会员升级';
@@ -3630,7 +3646,7 @@ var _scriptEditInitialText = "";
         var _ovPlayUrl = task.composedVideoUrl || task.videoUrl;
         preview.innerHTML =
           '<video poster="' + escapeHtml(_ovThumbnailPosterUrl(task.thumbnail)) + '" controls playsinline preload="metadata"></video>' +
-          '<button type="button" class="vtd-preview-play" data-ov-action="preview-play" title="播放"><span class="material-symbols-outlined">play_arrow</span></button>' +
+          '<button type="button" class="vtd-preview-play" data-ov-action="preview-play" title="播放" aria-label="播放视频">' + _ovPreviewPlayIconHtml() + '</button>' +
           '<div class="vtd-preview-loading" data-ov-preview-loading hidden><span class="vtd-preview-spinner"></span><span>正在加载视频…</span></div>';
         var _ovPrevVideo = preview.querySelector("video");
         _ovApplyPreviewVideoSrc(_ovPrevVideo, _ovPlayUrl);
@@ -4026,6 +4042,21 @@ var _scriptEditInitialText = "";
         }
         _ovMarkSearchUserInput();
         _ovApplySearchInput(search);
+      });
+    }
+
+    var searchClear = $("ovTaskSearchClear");
+    if (searchClear) {
+      searchClear.addEventListener("click", function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        _ovSearchComposing = false;
+        _ovMarkSearchUserInput();
+        _ovClearSearchInput(search);
+        _ovRenderDashboard();
+        if (search && typeof search.focus === "function") {
+          try { search.focus({ preventScroll: true }); } catch (_) { search.focus(); }
+        }
       });
     }
 
@@ -8147,6 +8178,7 @@ var _scriptEditInitialText = "";
     initOnlineEditor({
       switchPage: (p) => switchPage(p),
       showToast: (msg, type) => showToast(msg, type || "info"),
+      showConfirm: (title, message, onOk) => showConfirm(title, message, onOk),
       getAuthToken: () => getAuthToken(),
       getProject: () => project,
       saveProject: () => saveProject(),

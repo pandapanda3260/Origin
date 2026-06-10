@@ -242,6 +242,10 @@ function _clearFailedTailFrameImageState(opts: {
       const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
       if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
+      // 用户已显式删除该尾帧 (delete-tail 把 tailFrameIntent 置 'none' 并已落盘):
+      // 迟到的失败不回写, 否则会把已删除的尾帧"复活"成生成失败。
+      // 与前端 storyboard.js _clearFailedTailFrameLocally 的同名 gate 对齐。
+      if (String((prev as any).tailFrameIntent || '') === 'none') return null;
       const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
         mode: 'single-shot-strict',
         explicitShotIndices: _targetShotIndices(opts.target, groupIdx),

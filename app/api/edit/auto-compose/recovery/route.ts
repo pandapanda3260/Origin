@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
-import { cleanStaleRunningComposeRuns, hasActiveComposeRun, pushEdlHistory } from '@/lib/edit-auto-compose-state';
+import { cleanStaleRunningComposeRuns, getComposeBootTs, hasActiveComposeRun, pushEdlHistory } from '@/lib/edit-auto-compose-state';
 import { patchProjectForUser } from '@/lib/projects-db';
 
 export const runtime = 'nodejs';
@@ -22,7 +22,8 @@ export async function POST(req: NextRequest) {
   let result: any = null;
   const patched = patchProjectForUser(projectId, user.id, (current) => {
     let editData = { ...(current.editData || {}) };
-    const cleaned = cleanStaleRunningComposeRuns(editData);
+    // 与 auto-compose 主路由同口径：重启孤儿（心跳早于本次进程启动）立即清，不等 10 分钟。
+    const cleaned = cleanStaleRunningComposeRuns(editData, undefined, getComposeBootTs());
     editData = cleaned.editData;
     if (hasActiveComposeRun(editData)) {
       result = { ok: false, status: 409, message: '已有一键成片任务正在运行，暂不能修改时间线基线' };

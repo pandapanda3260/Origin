@@ -9,7 +9,7 @@
  * 另行立项）。episodes[] 镜像机制保留，用于老多集项目兼容读。
  */
 import { showToast, escapeHtml, getAuthHeaders } from './utils.js?v=300';
-import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from './assets.js?v=169';
+import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from './assets.js?v=170';
 
 let _ctx = {};
 

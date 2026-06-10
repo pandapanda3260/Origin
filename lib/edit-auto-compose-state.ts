@@ -166,7 +166,20 @@ export function collectEditSegmentsForCompose(project: any): {
   return { usableSegments, skippedSegments, staleSegments };
 }
 
-export function cleanStaleRunningComposeRuns(editData: any, maxAgeMs = RUNNING_STALE_MS) {
+/**
+ * 进程启动时间戳：挂 globalThis 防 dev HMR 重载刷新（与 stage-inflight 同款）。
+ * 用途：composeRuns 里 status='running' 但心跳早于本次进程启动的任务，其执行
+ * 循环必然已随上一个进程死掉（auto-compose 跑在请求协程里，没有恢复机制），
+ * 不必等 10 分钟心跳过期——之前重启后用户点一键成片会被 ALREADY_RUNNING
+ * 挡最长 10 分钟（2026-06-11 排查实锤）。导出阶段的孤儿另有 exports-reap 收尸。
+ */
+export function getComposeBootTs(): number {
+  const g = globalThis as any;
+  if (!Number.isFinite(g.__QD_COMPOSE_BOOT_TS__)) g.__QD_COMPOSE_BOOT_TS__ = Date.now();
+  return g.__QD_COMPOSE_BOOT_TS__;
+}
+
+export function cleanStaleRunningComposeRuns(editData: any, maxAgeMs = RUNNING_STALE_MS, bootTsMs?: number) {
   const next = { ...(editData || {}) };
   const runs: ComposeRun[] = Array.isArray(next.composeRuns) ? next.composeRuns.map((r: any) => ({ ...r })) : [];
   const now = nowMs();
@@ -175,14 +188,20 @@ export function cleanStaleRunningComposeRuns(editData: any, maxAgeMs = RUNNING_S
     const run = runs[i];
     if (run?.status !== 'running') continue;
     const heartbeat = Date.parse(String(run.heartbeatAt || run.updatedAt || run.createdAt || ''));
+    // 心跳早于本次进程启动 = 执行循环已随上一个进程死掉，直接判孤儿，不等超时。
+    const orphanedByRestart = Number.isFinite(bootTsMs as number)
+      && Number.isFinite(heartbeat)
+      && heartbeat < (bootTsMs as number);
     const age = Number.isFinite(heartbeat) ? now - heartbeat : maxAgeMs + 1;
-    if (age <= maxAgeMs) continue;
+    if (!orphanedByRestart && age <= maxAgeMs) continue;
     runs[i] = {
       ...run,
       status: 'failed',
       recoverableFrom: run.recoverableFrom || recoverableFromPhase(run.phase),
-      errorCode: run.errorCode || 'STALE_RUNNING_CLEANED',
-      errorMessage: run.errorMessage || '上一次一键成片已超时中断，可从失败阶段重试',
+      errorCode: run.errorCode || (orphanedByRestart ? 'ORPHANED_BY_RESTART' : 'STALE_RUNNING_CLEANED'),
+      errorMessage: run.errorMessage || (orphanedByRestart
+        ? '服务重启中断了上一次一键成片，重新点一次即可'
+        : '上一次一键成片已超时中断，可从失败阶段重试'),
       updatedAt: nowIso(),
     };
     changed = true;

@@ -57,21 +57,30 @@ record('storyboard_images reattached SSE completion uses terminal reload schedul
   assert(block.includes('await _scheduleStoryboardTerminalProjectReload(originId, batchId, {'));
 });
 
-record('storyboard_images terminal reload gates automatic tail-frame continuation', () => {
+record('storyboard_images terminal paths hand off to the per-shot tail chain sweep', () => {
+  // 2026-06-10 起批末 one-shot 续链被逐镜头续链取代 (方案: 尾帧逐镜头自动续链-方案.md):
+  // 终态快照/SSE 完成两条路径在权威 reload 之后做状态驱动的兜底扫描, 不再依赖
+  // requireTerminalReload 一次性 flag (旧 flag 在条件不满足的瞬间被消费后永不重试)。
   const block = section('function _reattachImagesBatch', 'function _reattachTailFrameBatch');
-  assert(block.includes('var terminalReloadKey = _storyboardBatchKey(originId, batchId);'));
-  assert(block.includes('if (_storyboardTerminalReloadedByBatch[terminalReloadKey])'));
-  assert(block.includes('_maybeAutoStartTailFramesFromCurrentProject(originId, batchId, {'));
-  assert(block.includes('requireTerminalReload: true'));
+  const snapReloadIdx = block.indexOf('reason: "storyboard_images_terminal_snapshot"');
+  const snapSweepIdx = block.indexOf("_scheduleTailChainSweep('images-terminal-snapshot');");
+  assert(snapSweepIdx > snapReloadIdx && snapReloadIdx > -1, 'terminal snapshot must sweep after scheduling reload');
+  const sseReloadIdx = block.indexOf('reason: "storyboard_images_sse_completed"');
+  const sseSweepIdx = block.indexOf("_scheduleTailChainSweep('images-sse-completed');");
+  assert(sseSweepIdx > sseReloadIdx && sseReloadIdx > -1, 'SSE completion must sweep after awaiting reload');
+  // 逐张完成事件 (reattach 重放) 也即时入链, 不等批次终态
+  assert(block.includes("_scheduleTailChain(originId, gIdx, 'reattach-first-done');"));
 });
 
-record('automatic tail-frame helper reuses current project filters and existing generator', () => {
-  const helper = section('async function _maybeAutoStartTailFramesFromCurrentProject', 'function _runStoryboardBatchReconcile');
-  assert(helper.includes('if (_storyboardTailAutoStartedBySourceBatch[key]) return false;'));
-  assert(helper.includes('if (opts.requireTerminalReload && !_storyboardTerminalReloadedByBatch[key]) return false;'));
-  assert(helper.includes('_storyboardTailAutoStartedBySourceBatch[key] = true;'));
-  assert(helper.includes('var targets = _tailKeyframeTargets(getStoryboardGroups(), {'));
-  assert(helper.includes('await generateAllTailFrames({'));
+record('tail chain sweep runs on reconcile regardless of active batches', () => {
+  const dispatcher = section('export async function reattachStoryboardBatches()', 'function _reattachImagesBatch');
+  const sweepIdx = dispatcher.indexOf("_scheduleTailChainSweep('reconcile');");
+  const activeIdx = dispatcher.indexOf('getActiveBatchesShared(originId)');
+  assert(sweepIdx > -1, 'reconcile must trigger the tail chain sweep');
+  assert(activeIdx > sweepIdx, 'sweep must run before the active-batch query and its empty-result early return');
+  const flush = section('async function _flushTailChain', 'function _runStoryboardBatchReconcile');
+  assert(flush.includes('generateAllTailFrames({'), 'chain flush must reuse the existing batch generator');
+  assert(flush.includes("chainSource: 'tail-chain'"), 'chain flush must mark its source for abort visibility');
 });
 
 record('tail_frame_images terminal snapshot schedules authoritative reload without confirm check', () => {

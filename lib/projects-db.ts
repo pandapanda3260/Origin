@@ -22,7 +22,7 @@ import {
 } from './frame-workflow-state';
 import { buildShotPlanDependencyPatch } from './project-dependency-state';
 import { maybeMarkStyleBibleStale } from './script-style-state';
-import { cleanStaleRunningComposeRuns, markExportFailureInEditData } from './edit-auto-compose-state';
+import { cleanStaleRunningComposeRuns, getComposeBootTs, markExportFailureInEditData } from './edit-auto-compose-state';
 import {
   emptyScriptConsultState,
   isEmptyScriptConsultState,
@@ -545,7 +545,9 @@ function buildFailedExportTaskCleanupPatch(project: any, userId: number) {
 function buildStaleComposeRunCleanupPatch(project: any) {
   const editData = project?.editData;
   if (!editData) return null;
-  const cleaned = cleanStaleRunningComposeRuns(editData);
+  // bootTs：重启孤儿（心跳早于本次进程启动）在 GET 水合时就清掉，
+  // 前端"成片中"僵尸态刷新页面即自愈，不必等 10 分钟或点成片按钮。
+  const cleaned = cleanStaleRunningComposeRuns(editData, undefined, getComposeBootTs());
   return cleaned.changed ? { editData: cleaned.editData } : null;
 }
 

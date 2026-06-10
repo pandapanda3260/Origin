@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=237" />
+    <link rel="stylesheet" href="styles.css?v=241" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -361,10 +361,13 @@
             </div>
             <div class="vtd-header-actions">
               <input type="text" name="username" autocomplete="username" tabindex="-1" aria-hidden="true" style="position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none;">
-              <label class="vtd-search" for="ovTaskSearch">
-                <span class="material-symbols-outlined">search</span>
+              <div class="vtd-search">
+                <span class="material-symbols-outlined" aria-hidden="true">search</span>
                 <input type="search" id="ovTaskSearch" name="task_search" value="" aria-label="搜索视频任务" placeholder="搜索任务名称 / ID / 关键词" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" inputmode="search" data-form-type="other" data-lpignore="true" data-1p-ignore="true">
-              </label>
+                <button type="button" id="ovTaskSearchClear" class="vtd-search-clear" title="清空搜索" aria-label="清空搜索" hidden>
+                  <span class="material-symbols-outlined" aria-hidden="true">close</span>
+                </button>
+              </div>
               <button type="button" class="vtd-toolbar-btn" id="ovBillingRechargeBtn" title="会员升级">
                 <span class="material-symbols-outlined">rocket_launch</span>
                 会员升级
@@ -1835,12 +1838,12 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=169",
+        "/modules/assets.js":         "/modules/assets.js?v=170",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=300",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=300",
-        "/modules/edit.js":           "/modules/edit.js?v=302",
+        "/modules/edit.js":           "/modules/edit.js?v=303",
         "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
-        "/modules/episodes.js":       "/modules/episodes.js?v=107",
+        "/modules/episodes.js":       "/modules/episodes.js?v=108",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=300",
         "/modules/loading.js":        "/modules/loading.js?v=300",
         "/modules/project.js":        "/modules/project.js?v=106",
@@ -1850,7 +1853,7 @@
         "/modules/settings.js":       "/modules/settings.js?v=300",
         "/modules/shots.js":          "/modules/shots.js?v=114",
         "/modules/store.js":          "/modules/store.js?v=300",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=152",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=154",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=104",
@@ -1858,13 +1861,13 @@
         "/modules/toolbox.js":        "/modules/toolbox.js?v=202",
         "/modules/utils.js":          "/modules/utils.js?v=300",
         "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=113",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=302"
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=303"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=300"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=329"></script>
+    <script type="module" src="main.js?v=340"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");
@@ -2024,6 +2027,13 @@
         <button type="button" id="oeBtnSyncMaterials" hidden class="oe-sync-btn">
           <span class="material-symbols-outlined">sync</span>
           <span>同步素材</span>
+        </button>
+        <button type="button" id="oeBtnClearTracks" hidden class="oe-sync-btn" title="清空剪辑器所有轨道（素材库不受影响）">
+          <span class="material-symbols-outlined">layers_clear</span>
+          <span>清空轨道</span>
+        </button>
+        <button type="button" id="oeBtnShortcutHelp" class="oe-shortcut-help-btn" title="剪辑快捷键说明" aria-label="剪辑快捷键说明">
+          <span class="material-symbols-outlined">help</span>
         </button>
       </div>
     </header>

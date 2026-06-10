@@ -7,11 +7,13 @@ import {
   collectEditSegmentsForCompose,
   computeSegmentFingerprint,
   createComposeRun,
+  getComposeBootTs,
   hasActiveComposeRun,
   markExportFailureInEditData,
   pushEdlHistory,
   updateComposeRun,
   upsertComposeRun,
+  RUNNING_STALE_MS,
   type AutoComposePhase,
   type ComposeRun,
   type RecoverableFrom,
@@ -178,7 +180,9 @@ export async function POST(req: NextRequest) {
 
     const patched = patchProjectForUser(projectId, user.id, (current) => {
       let editData = ensureLegacyBaseline(current.editData || {});
-      const cleaned = cleanStaleRunningComposeRuns(editData);
+      // bootTs：心跳早于本次进程启动的 running 任务 = 重启孤儿，立即清掉，
+      // 不再让用户吃 10 分钟 ALREADY_RUNNING（分析/方案阶段没有 exports-reap 兜底）。
+      const cleaned = cleanStaleRunningComposeRuns(editData, RUNNING_STALE_MS, getComposeBootTs());
       editData = cleaned.editData;
 
       if (hasActiveComposeRun(editData)) {
@@ -545,6 +549,7 @@ export async function POST(req: NextRequest) {
 
     const startedAt = Date.now();
     let lastProgress = -1;
+    let lastHeartbeatMs = Date.now();
     while (Date.now() - startedAt < 2 * 60 * 60 * 1000) {
       const row = getExportRow(exportTaskId, user.id);
       if (!row) {
@@ -567,6 +572,12 @@ export async function POST(req: NextRequest) {
         lastProgress = progress;
         if (!writer.isClosed()) writer.event('export_progress', { taskId: exportTaskId, progress });
         patchRun(projectId, user.id, runId, { status: 'running', phase: 'export', exportTaskId });
+        lastHeartbeatMs = Date.now();
+      } else if (Date.now() - lastHeartbeatMs >= 30_000) {
+        // 心跳保活：ffmpeg 长阶段进度可能 10 分钟不动，若不刷 heartbeatAt，
+        // 活着的任务会被 cleanStaleRunningComposeRuns / 前端 10 分钟窗口误判成僵尸。
+        patchRun(projectId, user.id, runId, { status: 'running', phase: 'export', exportTaskId });
+        lastHeartbeatMs = Date.now();
       }
       if (status === 'completed') {
         const exportUrl = `/api/edit/export-file/${exportTaskId}`;

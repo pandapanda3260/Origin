@@ -80,7 +80,9 @@ assert(allTail.includes('tasks.forEach(_applyTailBatchSnapshotTask)'), 'tail-fra
 assert(allTail.includes('_markStoryboardBatchLocallyAttached(originId, startResp.batchId)'), 'generateAllTailFrames must register its batch against reconcile re-attach');
 
 const allFirst = section(storyboard, 'export async function generateAllImages', 'export async function confirmImages');
-assert(allFirst.includes('_plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode)'), 'first-frame batch generation should include planned tail keyframes in the header total');
+// 2026-06-10 逐镜头续链 (方案 §5): 尾帧不再预计数进 total, 改为排程器 flush 时动态加。
+assert(!allFirst.includes('totalCount + plannedTailKeyframeCount'), 'first-frame batch generation must not pre-count planned tail keyframes anymore');
+assert(allFirst.includes('_activeKeyframeProgressState = keyframeProgressState;'), 'first-frame batch generation should share progress state with the tail chain scheduler');
 assert(allFirst.includes('progressState: keyframeProgressState'), 'first-frame batch generation should pass shared progress into the tail batch');
 assert(allFirst.includes('_showKeyframeHeaderProgress('), 'first-frame batch generation should update header progress');
 assert(allFirst.includes('_hideKeyframeHeaderProgress();'), 'first-frame batch generation should hide header progress when finished');

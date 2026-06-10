@@ -1128,6 +1128,42 @@ body.is-online-editor-page .agent-panel {
   font-size: 16px;
 }
 
+.oe-shortcut-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  color: rgba(255, 255, 255, 0.64);
+  cursor: pointer;
+  line-height: 1;
+  transition: color 0.15s ease, transform 0.15s ease;
+}
+
+.oe-shortcut-help-btn:hover {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.oe-shortcut-help-btn:active {
+  transform: translateY(1px);
+}
+
+.oe-shortcut-help-btn:focus-visible {
+  outline: 2px solid rgba(34, 211, 238, 0.68);
+  outline-offset: 2px;
+}
+
+.oe-shortcut-help-btn .material-symbols-outlined {
+  font-size: 16px;
+  line-height: 1;
+}
+
 .oe-app-editor-main {
   min-width: 0;
   min-height: 0;
@@ -5062,13 +5098,13 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 16px;
+  padding: 0 10px 0 16px;
   border-radius: 16px;
   background: rgba(255,255,255,0.82);
   border: 1px solid rgba(144,164,174,0.28);
   box-shadow: 0 18px 48px rgba(15,23,42,0.035);
 }
-.vtd-search .material-symbols-outlined { font-size: 20px; color: #50606c; }
+.vtd-search > .material-symbols-outlined { font-size: 20px; color: #50606c; }
 .vtd-search input {
   appearance: none;
   -webkit-appearance: none;
@@ -5086,6 +5122,37 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   caret-color: #0b1320;
   font-size: 13px;
   font-weight: 700;
+}
+.vtd-search-clear {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b7c88;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease, transform 0.16s ease;
+}
+.vtd-search-clear[hidden] { display: none; }
+.vtd-search-clear:hover,
+.vtd-search-clear:focus-visible {
+  color: #0b1320;
+  background: rgba(11,19,32,0.08);
+}
+.vtd-search-clear:active { transform: scale(0.94); }
+.vtd-search-clear:focus-visible {
+  outline: 2px solid rgba(11,19,32,0.2);
+  outline-offset: 2px;
+}
+.vtd-search-clear .material-symbols-outlined {
+  font-size: 18px;
+  line-height: 1;
+  color: currentColor;
 }
 .vtd-search input::placeholder { color: rgba(82,97,104,0.62); }
 .vtd-search:focus-within {
@@ -8176,17 +8243,39 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 46px;
-  height: 46px;
+  width: 56px;
+  height: 56px;
   transform: translate(-50%, -50%);
   border-radius: 50%;
-  border: 0;
+  border: 1px solid rgba(255,255,255,0.58);
   display: grid;
   place-items: center;
-  color: #fff;
-  background: rgba(11,19,32,0.74);
-  backdrop-filter: blur(8px);
+  color: #0b1320;
+  background: rgba(248,251,255,0.92);
+  box-shadow: 0 16px 34px rgba(11,19,32,0.24), inset 0 1px 0 rgba(255,255,255,0.84);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   cursor: pointer;
+  transition: transform 0.16s ease, background 0.16s ease, box-shadow 0.16s ease;
+}
+.vtd-preview-play:hover {
+  transform: translate(-50%, -50%) scale(1.04);
+  background: #fff;
+  box-shadow: 0 18px 38px rgba(11,19,32,0.28), inset 0 1px 0 rgba(255,255,255,0.92);
+}
+.vtd-preview-play:active {
+  transform: translate(-50%, -50%) scale(0.98);
+}
+.vtd-preview-play:focus-visible {
+  outline: 2px solid rgba(255,255,255,0.92);
+  outline-offset: 3px;
+}
+.vtd-preview-play-icon {
+  width: 22px;
+  height: 22px;
+  display: block;
+  fill: currentColor;
+  transform: translateX(1px);
 }
 .vtd-preview-play .material-symbols-outlined { font-size: 30px; }
 .vtd-preview-empty,
@@ -8957,6 +9046,39 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
 @keyframes editLoadPulse {
   0%, 100% { opacity: 0.7; }
   50%      { opacity: 1; }
+}
+
+/* ══════ Edit Preview Loading（预览框"转圈+加载中…"遮罩）══════
+   z-index 取 19：盖住双缓冲 video(1~3)/转场黑幕(15)，但在字幕(20)/扫描线(20)
+   之下；pointer-events:none 不挡播放按钮等任何交互。由 edit.js
+   _setPreviewLoading() 创建/移除。 */
+.edit-preview-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 19;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(11, 19, 32, 0.6);
+  pointer-events: none;
+  animation: editLoadFadeIn 0.25s ease-out;
+}
+.edit-preview-loading .edit-preview-loading-spinner {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.12);
+  border-top-color: #67e8f9;
+  animation: editSpin 0.8s linear infinite;
+}
+.edit-preview-loading .edit-preview-loading-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.85);
+  letter-spacing: 0.08em;
+  animation: editLoadPulse 1.8s ease-in-out infinite;
 }
 
 /* ══════ Agent FAB ══════ */

@@ -6,7 +6,7 @@
  * callbacks through initVideoTasks(ctx).
  */
 import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=300';
-import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js?v=302';
+import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js?v=303';
 import { subscribeTask, subscribeBatch } from './backend_stream.js?v=300';
 import { showBillingPaywall } from './billing.js?v=114';
 import { describeVideoModelStatusFailure } from './video_model_status.js?v=1';

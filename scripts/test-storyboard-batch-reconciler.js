@@ -69,13 +69,18 @@ record('recent batch activity is learned from /api/batch/active results', () => 
   assert(block.includes('_markStoryboardBatchActivity();'));
 });
 
-record('live storyboard completion delegates tail-frame continuation to the shared helper', () => {
-  const block = section(storyboard, 'function finish() {', '// 已经在本地标记完成的 groupIdx');
-  assert(block.includes('_maybeAutoStartTailFramesFromCurrentProject(originId, startResp.batchId, {'));
-  assert(block.includes("failedOnly: tailKeyframeMode === 'failed'"));
-  assert(block.includes("includeReady: tailKeyframeMode === 'all'"));
+record('live storyboard completion feeds the per-shot tail chain, regenerate-all keeps explicit redo pass', () => {
+  // 2026-06-10 逐镜头续链 (方案: 尾帧逐镜头自动续链-方案.md): live 批次里每张首帧
+  // 完成即入链, 不等批末; finish 只兜底扫描。"重新生成全部"保留显式 includeReady
+  // 重做语义, 期间续链被 suppress 防双扣费。
+  const apply = section(storyboard, '  function _applyTaskCompleted(groupIdx, rawUrl, extra, serverVersion) {', '  function _applyTaskFailed(');
+  assert(apply.includes("if (!isTail) _scheduleTailChain(originId, groupIdx, 'live-first-done');"));
+  const block = section(storyboard, "    var explicitRedoAllTails = tailKeyframeMode === 'all';", '// 已经在本地标记完成的 groupIdx');
+  assert(block.includes('_tailKeyframeTargets(getStoryboardGroups(), { includeReady: true })'));
+  assert(block.includes('_tailChainSuppressedForRun = false;'));
   assert(block.includes('var remainingTailTargets = _tailKeyframeTargets(finalGroups);'));
-  assert(!block.includes('generateAllTailFrames({ targets: requestedTailTargets'));
+  assert(block.includes("_scheduleTailChainSweep('images-finish');"));
+  assert(!block.includes('_maybeAutoStartTailFramesFromCurrentProject'));
 });
 
 record('main storyboard import version stays aligned with workspace importmap', () => {
@@ -88,7 +93,10 @@ record('main storyboard import version stays aligned with workspace importmap', 
 
 record('main init imports and registers the reconciler after initial reattach', () => {
   assert(main.includes('registerStoryboardBatchReconciler'));
-  const initBlock = section(main, 'try { reattachStoryboardBatches(); }', '// Phase 3-B-10');
+  // 起始锚点用 init 块特有的 reattachVideoPromptBatches("init")：
+  // 'try { reattachStoryboardBatches(); }' 在 GlobalReconcile 块(focus/visibility
+  // 对账)里也出现，indexOf 会命中前者导致切错段。
+  const initBlock = section(main, 'reattachVideoPromptBatches("init")', '// Phase 3-B-10');
   const reattachIdx = initBlock.indexOf('reattachStoryboardBatches()');
   const registerIdx = initBlock.indexOf('registerStoryboardBatchReconciler()');
   assert(reattachIdx > -1, 'missing initial reattach');
