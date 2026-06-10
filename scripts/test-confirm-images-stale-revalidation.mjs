@@ -95,7 +95,7 @@ const spies = { saveProjectCalls: 0, switchPageCalls: [] };
 initStoryboard({
   getProject: () => project,
   saveProject: () => { spies.saveProjectCalls += 1; },
-  flushServerSave: async () => ({ ok: true }),
+  flushServerSave: async () => (spies.flushImpl ? spies.flushImpl() : { ok: true }),
   safeWriteBack: (id, fn) => { if (project && project.id === id) { fn(project); return true; } return false; },
   switchPage: (p) => { spies.switchPageCalls.push(p); },
   markDownstreamStale: () => {},
@@ -127,6 +127,7 @@ function resetScenario(p, behavior) {
   computeStaleBehavior = behavior;
   spies.saveProjectCalls = 0;
   spies.switchPageCalls.length = 0;
+  spies.flushImpl = null;
   fetchHits.length = 0;
   toastLog.length = 0;
 }
@@ -214,6 +215,103 @@ await scenario('D. 无本地 flag 时不发权威重算请求，直接放行', a
 
   assert.equal(computeHits(), 0, '无 flag 不应发 compute-stale');
   assert.deepEqual(spies.switchPageCalls, ['prompts']);
+});
+
+/* ---------- 场景 E：在飞守卫，连点只跑一条确认链 ---------- */
+await scenario('E. 在飞守卫：确认链未结束时连点被吞掉，只跳一次页', async () => {
+  resetScenario(makeProject({
+    name: 'e',
+    shotCount: 2,
+    storyboards: [sb('/api/images/file/e0', [0]), sb('/api/images/file/e1', [1])],
+    staleFlags: {},
+  }), { staleFlags: {} });
+
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  spies.flushImpl = async () => { await gate; return { ok: true }; };
+
+  const p1 = confirmImages();
+  const p2 = confirmImages(); // 第一条链还卡在 flush 上，这次点击应被守卫直接忽略
+  // 等 p1 走到 flush 的 gate 上（preflight 已发出），此时统计确认链的 preflight：
+  // 注意要在 release 之前断言——链结束后的 checkImagesConfirm 会另发一次
+  // 按钮态 preflight（_getFirstFramePreflightState），不属于确认链。
+  await new Promise((r) => setTimeout(r, 0));
+  const preflightHitsInFlight = fetchHits.filter((u) => u.includes('/api/batch/preflight')).length;
+  assert.equal(preflightHitsInFlight, 1, '连点不应跑出第二次确认链 preflight');
+  release();
+  await Promise.all([p1, p2]);
+
+  assert.deepEqual(spies.switchPageCalls, ['prompts'], '只允许一次跳转');
+
+  // 链结束后守卫应释放：再点一次可以正常走通
+  spies.switchPageCalls.length = 0;
+  await confirmImages();
+  assert.deepEqual(spies.switchPageCalls, ['prompts'], '守卫释放后再点应可正常确认');
+});
+
+/* ---------- 场景 F：flush 409(stale) → 新副本重打标记重试一次后放行 ---------- */
+await scenario('F. flush 遇 409 整包重载后，重打确认标记重试一次并放行', async () => {
+  resetScenario(makeProject({
+    name: 'f',
+    shotCount: 2,
+    storyboards: [sb('/api/images/file/f0', [0]), sb('/api/images/file/f1', [1])],
+    staleFlags: {},
+  }), { staleFlags: {} });
+
+  let flushCalls = 0;
+  spies.flushImpl = async () => {
+    flushCalls += 1;
+    if (flushCalls === 1) {
+      // 模拟 _serverSave 的 409 路径：内存被服务器最新整包替换（新对象、新 version），
+      // 本次 PUT 丢弃 → 确认标记没落盘。
+      project = makeProject({
+        name: 'f-reloaded',
+        shotCount: 2,
+        storyboards: [sb('/api/images/file/f0', [0]), sb('/api/images/file/f1', [1])],
+        staleFlags: {},
+      });
+      project.version = 99;
+      syncStoryboardProject(project);
+      return { ok: false, stale: true, serverVersion: 99 };
+    }
+    return { ok: true };
+  };
+
+  await confirmImages();
+
+  assert.equal(flushCalls, 2, '409 后应自动重试一次 flush');
+  assert.equal(project.imagesApproved, true, '确认标记应重打在重载后的新副本上');
+  assert.equal(project.shotsApproved, true);
+  assert.ok(Number(project.currentStep) >= 5, 'currentStep 应推进到 5');
+  assert.deepEqual(spies.switchPageCalls, ['prompts'], '重试成功应放行');
+  assert.ok(!toastText().includes('确认失败'), '不应弹"确认失败", got: ' + toastText().slice(0, 200));
+});
+
+/* ---------- 场景 G：连续两次 409 → 回滚 + 失败提示，不跳页 ---------- */
+await scenario('G. flush 二连 409 才按真失败回滚，不跳页', async () => {
+  resetScenario(makeProject({
+    name: 'g',
+    shotCount: 2,
+    storyboards: [sb('/api/images/file/g0', [0]), sb('/api/images/file/g1', [1])],
+    staleFlags: {},
+  }), { staleFlags: {} });
+
+  spies.flushImpl = async () => {
+    project = makeProject({
+      name: 'g-reloaded',
+      shotCount: 2,
+      storyboards: [sb('/api/images/file/g0', [0]), sb('/api/images/file/g1', [1])],
+      staleFlags: {},
+    });
+    syncStoryboardProject(project);
+    return { ok: false, stale: true };
+  };
+
+  await confirmImages();
+
+  assert.equal(spies.switchPageCalls.length, 0, '二连失败不得跳页');
+  assert.ok(toastText().includes('确认失败'), '应弹确认失败提示');
+  assert.ok(!project.imagesApproved, '确认标记应回滚（当前内存副本上不残留 true）');
 });
 
 console.log('');

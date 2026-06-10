@@ -129,8 +129,18 @@ function _formatAssetMissingLabels(labels) {
   return labels.slice(0, 3).join("、") + " 等 " + labels.length + " 项";
 }
 
+// 按钮文案随静态扫描结果切换：已有部分图、还有缺口 → "补齐全部图片"；
+// 其余（全没生成 / 全部已生成）保持 "生成全部图片"。口径同 _assetHeaderImageState。
+function _syncGenAssetImagesLabel() {
+  var label = $("btnGenAssetImagesLabel");
+  if (!label) return;
+  var img = _assetHeaderImageState();
+  label.textContent = img.done > 0 && img.missingLabels.length > 0 ? "补齐全部图片" : "生成全部图片";
+}
+
 function _syncAssetHeaderHint(options) {
   options = options || {};
+  _syncGenAssetImagesLabel();
   if (_hasActiveAssetImageBatchForCurrentProject()) return;
   var img = _assetHeaderImageState();
   // 部分缺失（=失败摘要位）优先于完成摘要
@@ -674,6 +684,9 @@ export function refreshAssetsPage() {
     return;
   }
   if (need) need.hidden = true;
+  // 刷新续接：后端的资产提取可能仍在跑（SSE 断开不中止 handler，见 lib/sse.ts），
+  // 查一把 /api/assets/extract/status，还在跑就接上进度横幅，别让空态误导用户重点。
+  try { _maybeResumeAssetExtract(); } catch (e) { console.warn("[Assets] resume check failed:", e); }
   if (hasAssets && hasAssetItems) {
     if (needExtract) needExtract.hidden = true;
     if (ready) ready.hidden = false;
@@ -846,6 +859,17 @@ export async function extractAssets() {
     var _errProgressBar = $("assetsExtractProgress");
     if (_errProgressBar) _errProgressBar.classList.remove("extract-bar-pulse");
     var errRaw = ((e && e.message) || e).toString();
+    if (errRaw.indexOf("已在后台进行中") !== -1) {
+      // 服务端防重命中：这项目已有一路提取在跑（典型场景：刷新后马上手点）。
+      // 不进失败态，直接续接那一路的进度。
+      _assetsExtracting = false;
+      if (btn) btn.disabled = false;
+      if (emptyBtn) emptyBtn.disabled = false;
+      _extractResume.lastCheckAt = 0;
+      try { _maybeResumeAssetExtract(); } catch (_) {}
+      checkAssetsConfirm();
+      return;
+    }
     var friendly = _diagnoseApiError(errRaw);
     _setExtractProgress(0, "提取失败", friendly);
     var _errBanner = $("assetsExtractBanner");
@@ -862,12 +886,163 @@ export async function extractAssets() {
   if (emptyBtn) emptyBtn.disabled = false;
 }
 
+// ── 刷新后续接后台提取 ──────────────────────────────────────────────
+// /api/assets/extract 是一次性 SSE：刷新断开后 handler 仍在后端跑完并落库
+// （lib/sse.ts cancel 只停外发）。这组函数在页面加载时查 in-flight 状态，
+// 还在跑就复用现有进度横幅接上，跑完拉权威项目走原成功渲染，全程不新增 UI。
+var _extractResume = { key: "", polling: false, timer: null, lastCheckAt: 0, handledEndAt: {} };
+
+function _extractStatusUrl(projectId) {
+  return "/api/assets/extract/status?projectId=" + encodeURIComponent(projectId);
+}
+
+function _maybeResumeAssetExtract() {
+  if (!project || !project.id) return;
+  if (_assetsExtracting || _extractResume.polling) return;
+  var key = String(project.id);
+  var now = Date.now();
+  if (_extractResume.key === key && now - _extractResume.lastCheckAt < 5000) return;
+  _extractResume.key = key;
+  _extractResume.lastCheckAt = now;
+  apiGet(_extractStatusUrl(key)).then(function (st) {
+    if (!st || _assetsExtracting || _extractResume.polling) return;
+    if (!project || String(project.id) !== key) return;
+    if (st.status === "running") { _beginExtractResume(key, st); return; }
+    if (!st.endedAt || _extractResume.handledEndAt[key] === st.endedAt) return;
+    _extractResume.handledEndAt[key] = st.endedAt;
+    if (st.status === "done" && !_assetItemsForConfirm().length) {
+      // 完成瞬间刷新：内存还是旧项目（无资产），补拉一次权威数据
+      _resumeFinishSuccess(key);
+    } else if (st.status === "error" && !_assetItemsForConfirm().length) {
+      // 上一轮在后台失败了：留在空态（按钮可重试），toast 告知原因即可
+      showToast("上次资产分析未完成：" + _diagnoseApiError(String(st.error || "提取中断")), "error");
+    }
+  }).catch(function (e) {
+    console.warn("[Assets] extract status check failed:", e);
+  });
+}
+
+function _beginExtractResume(key, st) {
+  if (_assetsExtracting || _extractResume.polling) return;
+  _assetsExtracting = true;
+  _extractResume.polling = true;
+  checkAssetsConfirm();
+  var btn = $("btnExtractAssets");
+  var emptyBtn = $("btnExtractAssetsEmpty");
+  if (btn) btn.disabled = true;
+  if (emptyBtn) emptyBtn.disabled = true;
+  var needExtract = $("assetsNeedExtract");
+  var ready = $("assetsReady");
+  var content = $("assetsContent");
+  var hadAssets = !!_assetItemsForConfirm().length;
+  if (needExtract) needExtract.hidden = true;
+  if (ready) ready.hidden = false;
+  if (content) content.hidden = !hadAssets;
+  if (!hadAssets) _hideAssetActions();
+  // 恢复"进行中"视觉：万一横幅残留着上次的失败图标，掰回转圈
+  var banner = $("assetsExtractBanner");
+  if (banner) {
+    var icon = banner.querySelector(".material-symbols-outlined");
+    if (icon && icon.textContent !== "progress_activity") {
+      icon.textContent = "progress_activity";
+      icon.classList.add("animate-spin");
+    }
+  }
+  var bar = $("assetsExtractProgress");
+  if (bar) bar.classList.add("extract-bar-pulse");
+  _setExtractProgress(st.pct || 25, "正在提取资产", st.step || "已在后台继续进行");
+
+  _extractResume.timer = setInterval(function () {
+    if (!project || String(project.id) !== key) { _stopExtractResume(); return; }
+    apiGet(_extractStatusUrl(key)).then(function (cur) {
+      if (!_extractResume.polling) return;
+      if (!project || String(project.id) !== key) { _stopExtractResume(); return; }
+      if (cur && cur.status === "running") {
+        _setExtractProgress(cur.pct || 25, "正在提取资产", cur.step || "");
+        return;
+      }
+      if (cur && cur.endedAt) _extractResume.handledEndAt[key] = cur.endedAt;
+      _stopExtractResume();
+      if (cur && cur.status === "done") { _resumeFinishSuccess(key); return; }
+      var msg = _diagnoseApiError(String((cur && cur.error) || "提取中断，请重试"));
+      _showExtractFailedBanner(msg);
+      showToast("资产分析失败：" + msg, "error");
+    }).catch(function (e) {
+      console.warn("[Assets] extract status poll failed:", e);
+    });
+  }, 2500);
+}
+
+function _stopExtractResume() {
+  if (_extractResume.timer) { clearInterval(_extractResume.timer); _extractResume.timer = null; }
+  _extractResume.polling = false;
+  _assetsExtracting = false;
+  var bar = $("assetsExtractProgress");
+  if (bar) bar.classList.remove("extract-bar-pulse");
+  var btn = $("btnExtractAssets");
+  var emptyBtn = $("btnExtractAssetsEmpty");
+  if (btn) btn.disabled = false;
+  if (emptyBtn) emptyBtn.disabled = false;
+  checkAssetsConfirm();
+}
+
+async function _resumeFinishSuccess(key) {
+  _setExtractProgress(95, "整理中", "正在同步最新资产");
+  var ok = false;
+  try { ok = _ctx.reloadProjectFromServer ? await _ctx.reloadProjectFromServer() : false; }
+  catch (e) { console.warn("[Assets] reload after extract resume failed:", e); }
+  if (!project || String(project.id) !== key) return;
+  if (!ok || !project.assets) {
+    _showExtractFailedBanner("提取已完成，但同步结果失败，请刷新页面查看");
+    return;
+  }
+  // 以下与 extractAssets 成功分支同口径（warnings 仅存在于 SSE 回包里，续接拿不到，略过）
+  var nc = (project.assets.characters || []).length;
+  var ns = (project.assets.scenes || []).length;
+  var np = (project.assets.props || []).length;
+  _setExtractProgress(100, "提取完成", nc + " 个角色，" + ns + " 个场景，" + np + " 个道具");
+  showToast("资产分析完成：共 " + nc + " 个角色、" + ns + " 个场景、" + np + " 个道具", "success");
+  setTimeout(function () { _ctx.checkAndSuggest && _ctx.checkAndSuggest("assetExtract"); }, 1500);
+  setTimeout(function () {
+    var b = $("assetsExtractBanner");
+    if (b) b.hidden = true;
+  }, 2000);
+  var contentEl = $("assetsContent");
+  if (contentEl) {
+    var staleBanner = contentEl.querySelector(".upstream-stale-banner");
+    if (staleBanner) staleBanner.remove();
+    contentEl.hidden = false;
+    contentEl.classList.remove("asset-cards-entrance");
+    void contentEl.offsetWidth;
+    contentEl.classList.add("asset-cards-entrance");
+    _scheduleAssetEntranceAnimationClear();
+  }
+  var needExtract = $("assetsNeedExtract");
+  var ready = $("assetsReady");
+  if (needExtract) needExtract.hidden = true;
+  if (ready) ready.hidden = false;
+  renderAssets({ animateEntrance: true, preserveScroll: false });
+  _showAssetActions();
+  checkAssetsConfirm();
+}
+
+function _showExtractFailedBanner(friendlyMsg) {
+  _setExtractProgress(0, "提取失败", friendlyMsg);
+  var banner = $("assetsExtractBanner");
+  if (banner) {
+    banner.hidden = false;
+    var icon = banner.querySelector(".animate-spin");
+    if (icon) { icon.classList.remove("animate-spin"); icon.textContent = "error"; }
+  }
+}
+
 export async function _showAssetActions() {
   var btnExtract = $("btnExtractAssets");
   var btnGen = $("btnGenAssetImages");
   var btnClean = $("btnCleanObsolete");
   if (btnExtract) btnExtract.hidden = false;
   if (btnGen) btnGen.hidden = false;
+  _syncGenAssetImagesLabel();
   if (btnClean) {
     var obsolete = await _detectObsoleteAssets();
     btnClean.hidden = obsolete.length === 0;
@@ -2195,23 +2370,23 @@ function _assetReviewGroupHtml(rows, type, title) {
   var body = groupRows.map(function (row) {
     var disabled = row.disabled ? " disabled" : "";
     var checked = row.checked ? " checked" : "";
-    return '<label class="flex items-center gap-3 rounded-xl border border-outline/10 bg-surface/80 px-3 py-3 hover:border-outline/25 transition-colors' + (row.disabled ? ' opacity-60' : '') + '" data-review-row="' + escapeHtml(row.id) + '">' +
-      '<span class="relative w-16 h-16 shrink-0 overflow-hidden rounded-lg border border-outline/10 bg-surface-container-highest/40">' +
+    return '<label class="flex items-center gap-2 rounded-xl border border-outline/10 bg-surface/80 px-3 py-2 hover:border-outline/25 transition-colors' + (row.disabled ? ' opacity-60' : '') + '" data-review-row="' + escapeHtml(row.id) + '">' +
+      '<span class="relative w-10 h-10 shrink-0 overflow-hidden rounded-lg border border-outline/10 bg-surface-container-highest/40">' +
         _assetReviewThumbHtml(row) +
       '</span>' +
       '<span class="min-w-0 flex-1">' +
         '<span class="block truncate text-sm font-bold text-on-surface">' + escapeHtml(row.name || "") + '</span>' +
-        '<span class="mt-1 block text-xs text-on-surface-variant">' + escapeHtml(row.status || "") + '</span>' +
+        '<span class="block truncate text-xs text-on-surface-variant">' + escapeHtml(row.status || "") + '</span>' +
       '</span>' +
       '<input type="checkbox" class="w-5 h-5 rounded border-outline/30 accent-primary shrink-0" data-review-checkbox data-row-id="' + escapeHtml(row.id) + '"' + checked + disabled + ' />' +
     '</label>';
   }).join("");
   return '<section class="asset-review-section">' +
-    '<div class="mb-3 flex items-center justify-between">' +
-      '<h4 class="text-xs font-bold uppercase tracking-[0.16em] text-on-surface-variant">' + escapeHtml(title) + '</h4>' +
+    '<div class="mb-2 flex items-center justify-between">' +
+      '<h4 class="text-xs font-bold uppercase tracking-wide text-on-surface-variant">' + escapeHtml(title) + '</h4>' +
       '<span class="text-[11px] text-on-surface-variant/70">' + groupRows.length + ' 项</span>' +
     '</div>' +
-    '<div class="grid grid-cols-1 md:grid-cols-2 gap-3">' + body + '</div>' +
+    '<div class="grid grid-cols-1 md:grid-cols-2 gap-2">' + body + '</div>' +
   '</section>';
 }
 
@@ -2290,27 +2465,27 @@ function _showAssetRegenerationReviewDialog() {
   _dismissAssetRegenerationReviewDialog();
   var overlay = document.createElement("div");
   overlay.id = "assetRegenerationReviewDialog";
-  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/35 backdrop-blur-sm px-4 py-6";
+  // 注意：本弹窗只能用 workspace-tailwind.css 里已编译的工具类（静态预编译，
+  // 缺类会静默失效——此前 max-w-5xl 没编译导致弹窗铺满全屏）。新增类先 grep。
+  overlay.className = "fixed inset-0 z-[9999] flex items-center justify-center bg-black/35 backdrop-blur-sm p-4";
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.innerHTML =
-    '<div class="w-full max-w-5xl max-h-[86vh] overflow-hidden rounded-[28px] bg-surface shadow-2xl border border-outline/10 flex flex-col">' +
-      '<div class="flex items-start justify-between gap-4 border-b border-outline/10 px-6 py-5">' +
-        '<div>' +
-          '<h3 class="text-xl font-bold text-on-surface">请确认重新生成范围：</h3>' +
-        '</div>' +
-        '<button type="button" class="w-10 h-10 rounded-full border border-outline/15 bg-surface-container-low text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high flex items-center justify-center transition-colors" data-review-close aria-label="关闭">' +
-          '<span class="material-symbols-outlined text-xl">close</span>' +
+    '<div class="w-full max-w-3xl max-h-[86vh] overflow-hidden rounded-[28px] bg-surface shadow-2xl border border-outline/10 flex flex-col">' +
+      '<div class="flex items-center justify-between gap-4 border-b border-outline/10 px-5 py-3">' +
+        '<h3 class="text-base font-bold text-on-surface">请确认重新生成范围：</h3>' +
+        '<button type="button" class="w-8 h-8 shrink-0 rounded-full border border-outline/15 bg-surface-container-low text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high flex items-center justify-center transition-colors" data-review-close aria-label="关闭">' +
+          '<span class="material-symbols-outlined text-lg">close</span>' +
         '</button>' +
       '</div>' +
-      '<div class="flex-1 overflow-y-auto px-6 py-5 space-y-6">' +
+      '<div class="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">' +
         _assetReviewGroupHtml(rows, "char", "角色 Characters") +
         _assetReviewGroupHtml(rows, "scene", "场景 Scenes") +
         _assetReviewGroupHtml(rows, "prop", "道具 Props") +
       '</div>' +
-      '<div class="flex items-center justify-end gap-3 border-t border-outline/10 px-6 py-5">' +
-        '<button type="button" class="h-11 px-7 rounded-full bg-surface-container-high text-on-surface-variant font-bold hover:bg-surface-container-highest transition-colors" data-review-close>取消</button>' +
-        '<button type="button" class="h-11 px-8 rounded-full bg-primary text-on-primary font-bold disabled:opacity-40 disabled:cursor-not-allowed hover:shadow-lg transition-all" data-review-confirm>确定</button>' +
+      '<div class="flex items-center justify-end gap-3 border-t border-outline/10 px-5 py-3">' +
+        '<button type="button" class="h-9 px-6 rounded-full bg-surface-container-high text-on-surface-variant text-sm font-bold hover:bg-surface-container-highest transition-colors" data-review-close>取消</button>' +
+        '<button type="button" class="h-9 px-6 rounded-full bg-primary text-on-primary text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed hover:shadow-lg transition-all" data-review-confirm>确定</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(overlay);
@@ -2526,6 +2701,22 @@ function _attachAssetImageBatch(opts) {
       pending: Math.max(0, totalTasks - processed),
     };
   }
+  // ETA 单调钳制（同镜头页 _clampKeyframeEta）：动态均值在两次完成之间会
+  // 持续上漂，显示层按墙钟倒数、估算骤降才跳变，保证"约剩 X 秒"只降不升。
+  var _etaClamp = { remain: 0, wallTs: 0 };
+  function _clampAssetEta(fresh) {
+    if (!(fresh > 0)) return fresh;
+    var now = Date.now();
+    if (!_etaClamp.wallTs) {
+      _etaClamp = { remain: fresh, wallTs: now };
+      return fresh;
+    }
+    var decayed = Math.max(1, Math.round(_etaClamp.remain - (now - _etaClamp.wallTs) / 1000));
+    var next = Math.min(decayed, fresh);
+    _etaClamp.remain = next;
+    _etaClamp.wallTs = now;
+    return next;
+  }
   function _refreshHint() {
     if (!hint) return;
     var counts = _assetBatchProgressCounts();
@@ -2543,7 +2734,7 @@ function _attachAssetImageBatch(opts) {
         avgSec = 35;
       }
       // 并发 3 → 实际墙钟时间约为 pending × avgSec ÷ 3
-      var remain = Math.ceil(pending * avgSec / 3);
+      var remain = _clampAssetEta(Math.ceil(pending * avgSec / 3));
       parts.push("约剩 " + remain + " 秒");
     }
     // 积分不足场景：所有 pending 都不会再跑（积分预扣环节失败），换一行更醒目的文案
@@ -2834,6 +3025,12 @@ function _attachAssetImageBatch(opts) {
  * 失败降级：接口挂了或没有 active batch → 默默返回，走 `_restoreAssetGenStatus`
  * 里的 orphan 兜底（处理 realPhotoUrl 没 pencilUrl 之类的历史碎片）。
  */
+/* 2026-06 · 全局唤醒对账会反复调 reattachActiveBatches（init 之外新增
+ * focus/visibilitychange/online 触发）。attach 是一次性闭包（SSE+轮询），
+ * 重复 attach 会叠订阅双轮询——按 batchId 防重。batch 终态后 attach
+ * 没有意义，所以注册表不需要清理（F5 模块重载自然清空）。 */
+var _reattachedBatchKeys = Object.create(null);
+
 export async function reattachActiveBatches(originId) {
   if (!originId) return { reattached: 0 };
   var data;
@@ -2856,6 +3053,8 @@ export async function reattachActiveBatches(originId) {
     if (bt === "shots") {
       var shotBatchStatus = b.status || (b.snapshot && b.snapshot.status) || "";
       if (shotBatchStatus !== "queued" && shotBatchStatus !== "running") return;
+      if (_reattachedBatchKeys["shots:" + b.batchId]) return;
+      _reattachedBatchKeys["shots:" + b.batchId] = true;
       try { attachShotsBatch(b.batchId); }
       catch (e) { console.warn("[Reattach] attachShotsBatch failed:", e); }
       reattachedCount++;
@@ -2870,6 +3069,9 @@ export async function reattachActiveBatches(originId) {
     if (bt !== "asset_images") {
       return;
     }
+    // 已 attach 过的批次整个跳过：闭包（SSE+轮询）全权管理中，
+    // 不要用 /api/batch/active 的缓存快照把卡片状态往回拨。
+    if (_reattachedBatchKeys["asset:" + b.batchId]) return;
     var tasks = b.tasks || [];
     var batchStatus = String(b.status || (b.snapshot && b.snapshot.status) || "").toLowerCase();
     var seqToTarget = {};
@@ -2900,6 +3102,9 @@ export async function reattachActiveBatches(originId) {
       _summarizeAssetImageGeneration($("assetImgHint"), { silent: true });
       return;
     }
+
+    if (_reattachedBatchKeys["asset:" + b.batchId]) return;
+    _reattachedBatchKeys["asset:" + b.batchId] = true;
 
     _attachAssetImageBatch({
       batchId: b.batchId,
@@ -4819,13 +5024,14 @@ function _worldTemplateCharacterPreviewUrls(tpl, limit) {
   var previewUrls = Array.isArray(tpl && tpl.characterPreviewUrls) ? tpl.characterPreviewUrls.filter(Boolean) : [];
   if (previewUrls.length) return previewUrls.slice(0, limit);
   return _worldTemplateCharacters(tpl).map(function (ch) {
-    return ch && (ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "");
+    return ch && (ch.previewUrl || ch.realPhotoUrl || ch.rawUrl || ch.imageUrl || "");
   }).filter(Boolean).slice(0, limit);
 }
 
 function _worldTemplateEntityPreviewUrl(item) {
   if (!item || typeof item !== "object") return "";
   return String(
+    item.previewUrl ||
     item.coverImageUrl ||
     item.thumbnailUrl ||
     item.thumbUrl ||
@@ -5076,6 +5282,48 @@ function _worldTemplateCurrentSaveEntities() {
       _worldTemplateProjectEntityList("props"),
     ]),
   };
+}
+
+function _worldTemplateSaveStylePreferenceText() {
+  var preference = _projectStyleTemplatePreferenceForWorldSnapshot && _projectStyleTemplatePreferenceForWorldSnapshot();
+  if (preference && preference.preferredStyleTemplateName) return preference.preferredStyleTemplateName;
+  if (preference && preference.preferredStyleTemplateId) return preference.preferredStyleTemplateId;
+  return "";
+}
+
+function _worldTemplateSaveEraText() {
+  var snapshot = project && project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"
+    ? project.worldTemplateSnapshot
+    : {};
+  var setting = snapshot.setting && typeof snapshot.setting === "object" ? snapshot.setting : {};
+  var styleBible = project && project.styleBible && typeof project.styleBible === "object"
+    ? project.styleBible
+    : {};
+  return String(setting.era || snapshot.era || snapshot.period || styleBible.era || "").trim();
+}
+
+function _worldTemplateSaveMetaHtml() {
+  var styleText = _worldTemplateSaveStylePreferenceText();
+  var eraText = _worldTemplateSaveEraText();
+  if (!styleText && !eraText) return "";
+  return (
+    '<section class="save-tpl-meta-card" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:12px;background:#FFFFFF;border:1px solid #DDE6F0;border-radius:14px;padding:14px 18px;box-shadow:0 8px 24px rgba(15,30,55,0.035);margin-bottom:16px">' +
+      (styleText
+        ? '<div style="display:flex;align-items:center;gap:10px;min-width:0;color:#172C43">' +
+            '<span class="material-symbols-outlined" style="font-size:20px;color:#3867D6;flex:0 0 auto">palette</span>' +
+            '<span style="font-size:13px;font-weight:800;color:#60748A;white-space:nowrap">风格偏好</span>' +
+            '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:850" title="' + escapeHtml(styleText) + '">' + escapeHtml(styleText) + '</span>' +
+          '</div>'
+        : '') +
+      (eraText
+        ? '<div style="display:flex;align-items:flex-start;gap:10px;min-width:0;color:#172C43">' +
+            '<span class="material-symbols-outlined" style="font-size:20px;color:#647A92;flex:0 0 auto;margin-top:1px">public</span>' +
+            '<span style="font-size:13px;font-weight:800;color:#60748A;white-space:nowrap;line-height:1.45">时代背景</span>' +
+            '<span style="min-width:0;font-size:13px;font-weight:700;line-height:1.45;color:#172C43;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden" title="' + escapeHtml(eraText) + '">' + escapeHtml(eraText) + '</span>' +
+          '</div>'
+        : '') +
+    '</section>'
+  );
 }
 
 function _worldTemplateSaveEntityThumbHtml(item, category) {
@@ -5381,6 +5629,7 @@ function _openSaveTemplateDialog() {
     _worldTemplateSaveEntitySectionHtml("characters", "角色", saveEntities.characters) +
     _worldTemplateSaveEntitySectionHtml("locations", "场景", saveEntities.locations) +
     _worldTemplateSaveEntitySectionHtml("props", "道具", saveEntities.props);
+  var saveMetaHtml = _worldTemplateSaveMetaHtml();
   var updateOptions = templates.map(function (tpl) {
     return '<option value="' + escapeHtml(tpl.id) + '"' + (tpl.id === currentWorldId ? ' selected' : '') + '>' + escapeHtml(tpl.name || tpl.id) + '</option>';
   }).join("");
@@ -5423,6 +5672,7 @@ function _openSaveTemplateDialog() {
             '<select id="saveTplUpdateSelect" style="width:100%;height:44px;padding:0 14px;background:#FFFFFF;border:1px solid #CFDAE6;border-radius:11px;color:#172C43;font-size:15px;font-weight:700;outline:none" ' + (templates.length ? '' : 'disabled') + '>' + updateOptions + '</select>' +
           '</div>' +
         '</section>' +
+        saveMetaHtml +
         '<div id="saveTplCreateBody" style="' + (defaultMode === "update" ? 'display:none' : '') + '">' +
           '<div class="save-tpl-entity-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr));gap:16px;margin-bottom:14px">' +
             entitySelectionHtml +
@@ -5856,9 +6106,12 @@ export function _collectLibraryAssets(proj) {
       });
     });
   }
-  if (proj.storyboards && proj.storyboards.length) {
-    proj.storyboards.forEach(function (sb, i) {
-      if (sb && sb.imageUrl) {
+	  if (proj.storyboards && proj.storyboards.length) {
+	    proj.storyboards.forEach(function (sb, i) {
+	      var vt = Array.isArray(proj.videoTasks) ? (proj.videoTasks[i] || {}) : {};
+	      var videoName = (sb && (sb.videoDisplayName || sb.videoFilename)) || vt.displayName || vt.filename || "";
+	      if (videoName) videoName = String(videoName).replace(/\.mp4$/i, "");
+	      if (sb && sb.imageUrl) {
         var sbDesc = _shotSummaryForStoryboard(sb, i);
         assets.push({
           type: "image",
@@ -5872,10 +6125,10 @@ export function _collectLibraryAssets(proj) {
       if (sb && sb.videoUrl) {
         var clipDesc = _shotSummaryForStoryboard(sb, i);
         assets.push({
-          type: "video",
-          category: "视频片段",
-          name: "片段 #" + (i + 1),
-          url: sb.videoUrl,
+	          type: "video",
+	          category: "视频片段",
+	          name: videoName || ("片段 #" + (i + 1)),
+	          url: sb.videoUrl,
           description: clipDesc,
           createdAt: proj.createdAt || 0
         });
@@ -5890,8 +6143,9 @@ export function _collectLibraryAssets(proj) {
         return sb && sb.videoUrl && sb.videoUrl === t.videoUrl;
       });
       if (dominated) return;
-      var taskGroupIdx = t._groupIdx != null ? Number(t._groupIdx) : null;
-      var taskName = Number.isFinite(taskGroupIdx) ? "片段 #" + (taskGroupIdx + 1) : "视频任务";
+	      var taskGroupIdx = t._groupIdx != null ? Number(t._groupIdx) : null;
+	      var taskName = t.displayName || t.filename || (Number.isFinite(taskGroupIdx) ? "片段 #" + (taskGroupIdx + 1) : "视频任务");
+	      taskName = String(taskName).replace(/\.mp4$/i, "");
       var taskDesc = Number.isFinite(taskGroupIdx) ? _shotSummaryForStoryboard((proj.storyboards || [])[taskGroupIdx], taskGroupIdx) : "生成视频任务";
       assets.push({
         type: "video",

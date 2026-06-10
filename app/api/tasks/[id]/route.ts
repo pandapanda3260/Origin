@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,13 +15,22 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
 
   const db = getDb();
   const v = db
-    .prepare<{ id: string; uid: number }, any>('SELECT * FROM video_tasks WHERE id = @id AND owner_id = @uid')
+    .prepare<{ id: string; uid: number }, any>(
+      `SELECT vt.*, p.title AS project_title, p.data_json AS project_data_json
+         FROM video_tasks vt
+         LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+        WHERE vt.id = @id AND vt.owner_id = @uid`,
+    )
     .get({ id, uid: user.id });
   if (v) {
     const protectedUrl = v.filename ? `/api/videos/file/${v.id}` : null;
+    const names = buildVideoSegmentNamesForRow(v);
     return jsonOk({
       taskId: v.id,
       type: 'video_segment',
+      filename: names.filename,
+      displayName: names.displayName,
+      downloadFilename: names.downloadFilename,
       status: v.status,
       progress: v.progress,
       url: v.filename ? buildSignedVideoUrl(v.id, user.id).url : null,

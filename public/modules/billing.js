@@ -90,19 +90,34 @@ function _ledgerLabel(item) {
   return _kindLabel(item && (item.kind || item.entry_type)) || '账务记录';
 }
 
+function _ledgerAccountParts() {
+  var user = (_summary && _summary.user) || {};
+  var accountName = String(user.displayName || user.display_name || user.username || '').trim() || '未命名账号';
+  var phone = String(user.phone || '').trim() || '未绑定';
+  return ['账号名称 ' + accountName, '注册手机号 ' + phone];
+}
+
+function _billingAccountName() {
+  var user = (_summary && _summary.user) || {};
+  return String(user.displayName || user.display_name || user.username || user.phone || '').trim();
+}
+
 // ---- 账务流水渲染（区块级，供整页渲染与翻页增量渲染复用）----
 function _ledgerRowsHtml() {
   return (_ledger || []).map(function (item) {
     var when = _fmtWhen(item.createdAt || item.created_at || '');
-	    var label = _ledgerLabel(item);
-	    var amount = Number(item.amount || 0);
-	    var amountText = (amount > 0 ? '+' : '') + amount;
+    var label = _ledgerLabel(item);
+    var amount = Number(item.amount || 0);
+    var amountText = (amount > 0 ? '+' : '') + amount;
     var balance = Number(item.balanceAfter || item.balance_after || 0);
-	    return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
-	      '<div class="min-w-0">' +
-	        '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
-	        '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + escapeHtml(when) + ' · 余额 ' + escapeHtml(balance) + '</div>' +
-	      '</div>' +
+    var meta = [when, '余额 ' + balance].concat(_ledgerAccountParts()).filter(Boolean).map(function (part) {
+      return escapeHtml(part);
+    }).join(' · ');
+    return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
+      '<div class="min-w-0">' +
+        '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
+        '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + meta + '</div>' +
+      '</div>' +
       '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
     '</div>';
   }).join('') || '<p class="text-sm text-on-surface-variant/50">暂无账务流水。</p>';
@@ -414,6 +429,8 @@ export function renderBillingPage() {
   }
   var subscription = _summary.subscription || {};
   var plan = (_summary.currentPlan && _summary.currentPlan.title) || 'Free';
+  var accountName = _billingAccountName();
+  var currentPlanLabel = (accountName ? accountName + ' · ' : '') + plan;
   var balances = _summary.balances || {};
   var plans = _summary.plans || [];
   var topups = _summary.topupPacks || [];
@@ -433,16 +450,26 @@ export function renderBillingPage() {
   //   - data-plan-code 只放在 CTA <button> 上，避免整卡 + 按钮双重触发 checkout
   //     （click 委托在下面 host.querySelectorAll('[data-plan-code]') 里）。
   // ----------------------------------------------------------------
+  function _formatMoney(cents) {
+    var amount = Number(cents || 0) / 100;
+    var body = amount % 1 === 0 ? amount.toFixed(0) : amount.toFixed(2);
+    return '¥' + body;
+  }
+  function _priorityLabel(value) {
+    var v = String(value || '');
+    if (v === 'priority') return '优先调度';
+    if (v === 'fast') return '快速调度';
+    if (v === 'normal') return '标准调度';
+    return v;
+  }
   function _formatPlanPrice(p) {
     var cents = Number(p.price_cents || 0);
     var cycle = (p.billing_cycle || 'month');
     // 免费档 / 企业自定义合约：不显示具体价格
     if (cents <= 0 && cycle !== 'month') return { price: '联系销售', cycle: '' };
     if (cents <= 0) return { price: '免费', cycle: '' };
-    var dollars = cents / 100;
-    var priceStr = '$' + (dollars % 1 === 0 ? dollars.toFixed(0) : dollars.toFixed(2));
-    var cycleLabel = cycle === 'year' ? '/yr' : '/mo';
-    return { price: priceStr, cycle: cycleLabel };
+    var cycleLabel = cycle === 'year' ? '/年' : '/月';
+    return { price: _formatMoney(cents), cycle: cycleLabel };
   }
   function _derivePlanFeatureItems(p) {
     var limits = p.limits || {};
@@ -462,15 +489,42 @@ export function renderBillingPage() {
         sub: '任务调度上限',
       });
     }
-    // 3) 单段长度
-    if (limits.maxVideoSeconds != null) {
+    // 3) 项目与存储
+    if (limits.projects != null || limits.storageGB != null) {
+      var quotaBits = [];
+      if (limits.projects != null) quotaBits.push(Number(limits.projects).toLocaleString() + ' 个项目');
+      if (limits.storageGB != null) quotaBits.push(Number(limits.storageGB).toLocaleString() + 'GB 存储');
+      items.push({
+        icon: 'inventory_2',
+        label: quotaBits.join(' / '),
+        sub: '项目与素材空间',
+      });
+    } else if (limits.maxVideoSeconds != null) {
       items.push({
         icon: 'timer',
         label: '单段 ' + Number(limits.maxVideoSeconds) + 's',
         sub: limits.maxCompositeSeconds ? '合成上限 ' + Number(limits.maxCompositeSeconds) + 's' : '',
       });
     }
-    // 4) 档位差异化特性（只取一条最能代表该档的）
+    // 4) 模型与支持
+    var models = Array.isArray(features.models) ? features.models.filter(Boolean).join(' / ') : String(features.models || '');
+    var serviceBits = [];
+    if (features.priority) serviceBits.push(_priorityLabel(features.priority));
+    if (features.support) serviceBits.push(String(features.support) + '支持');
+    if (models) {
+      items.push({
+        icon: 'auto_awesome',
+        label: models,
+        sub: serviceBits.join(' · '),
+      });
+    } else if (serviceBits.length) {
+      items.push({
+        icon: 'support_agent',
+        label: serviceBits.join(' · '),
+        sub: '服务权益',
+      });
+    }
+    // 兼容未来扩展字段：没有 models/support 时，用差异化特性兜底。
     var hi = null;
     if (features.premiumUnlimited)      hi = { icon: 'all_inclusive',       label: 'Premium 无限配额',   sub: '高级模型不限次数' };
     else if (features.premiumCredits)   hi = { icon: 'stars',               label: Number(features.premiumCredits).toLocaleString() + ' Premium 积分', sub: '额外高级模型配额' };
@@ -479,7 +533,7 @@ export function renderBillingPage() {
     else if (features.customDeal)       hi = { icon: 'support_agent',       label: '定制企业合约',       sub: '联系销售定制' };
     else if (features.commercial)       hi = { icon: 'verified_user',       label: '商用授权',           sub: '可用于商业交付' };
     else if (features.watermark)        hi = { icon: 'branding_watermark',  label: '含官方水印',         sub: '免费档默认' };
-    if (hi) items.push(hi);
+    if (hi && items.length < 4) items.push(hi);
     // 最多只渲染 4 条，避免卡片高度参差
     return items.slice(0, 4);
   }
@@ -500,7 +554,10 @@ export function renderBillingPage() {
     // 降到 text-4xl 让其视觉高度与付费档 "$299" 接近。
     var priceCls = _hasCjk(priceObj.price) ? 'text-4xl' : 'text-5xl';
     var featureItems = _derivePlanFeatureItems(p);
-    var subLabel = (p.billing_cycle === 'year' ? '年付套餐' : '月付套餐') + (p.features && p.features.topupAllowed ? ' · 可加购' : '');
+    var subLabelBits = [p.billing_cycle === 'year' ? '年付套餐' : '月付套餐'];
+    if (p.description) subLabelBits.push(p.description);
+    if (p.features && p.features.topupAllowed) subLabelBits.push('可加购');
+    var subLabel = subLabelBits.join(' · ');
     var creditsChip = Number(p.monthly_credits || 0) > 0
       ? '<div class="plan-credits-chip">' + (Number(p.monthly_credits).toLocaleString()) + ' 积分 / 月</div>'
       : '';
@@ -560,7 +617,7 @@ export function renderBillingPage() {
   // 每张档位卡用 .plan-topup-card 深底薄亮边 + cyan hover，积分数字走 cyan
   // 高亮。data-topup-code 保留不变，下面 host.querySelectorAll 仍能绑 click。
   var topupCards = regularTopups.map(function (p) {
-    var priceStr = '$' + ((p.price_cents || 0) / 100).toFixed(2);
+    var priceStr = _formatMoney(p.price_cents || 0);
     var credits = Number(p.credits || 0).toLocaleString();
     return '<button type="button" class="billing-card-topup plan-topup-card" data-topup-code="' + escapeHtml(p.code) + '">' +
       '<div class="plan-topup-title">' + escapeHtml(p.title || p.code) + '</div>' +
@@ -580,10 +637,10 @@ export function renderBillingPage() {
         '</div>' +
         '<div class="mb-6">' +
           '<div class="flex items-baseline gap-1">' +
-            '<span class="text-5xl font-bold plan-price-glow tracking-tighter">$3.5</span>' +
+            '<span class="text-5xl font-bold plan-price-glow tracking-tighter">' + escapeHtml(_formatMoney(trialPack.price_cents || 0)) + '</span>' +
             '<span class="text-[11px] font-bold text-[#ECEFF1]/30 uppercase">一次性</span>' +
           '</div>' +
-          '<div class="mt-2"><div class="plan-credits-chip">510 积分</div></div>' +
+          '<div class="mt-2"><div class="plan-credits-chip">' + escapeHtml(Number(trialPack.credits || 0).toLocaleString()) + ' 积分</div></div>' +
         '</div>' +
         '<ul class="space-y-4 flex-grow">' +
           '<li class="plan-feature-item"><span class="material-symbols-outlined plan-feature-icon">workspace_premium</span><div><div>永久</div></div></li>' +
@@ -627,7 +684,7 @@ export function renderBillingPage() {
           '<div class="min-w-0 flex-1">' +
             '<div class="text-[9px] font-bold tracking-[0.3em] text-[#ECEFF1]/50 uppercase">当前套餐 / Current Plan</div>' +
             '<div class="flex items-baseline gap-3 flex-wrap mt-1">' +
-              '<span class="text-3xl font-bold plan-price-glow tracking-tighter font-headline uppercase">' + escapeHtml(plan) + '</span>' +
+              '<span class="text-3xl font-bold plan-price-glow tracking-tighter font-headline uppercase">' + escapeHtml(currentPlanLabel) + '</span>' +
               '<span class="text-[10px] font-bold text-[#ECEFF1]/40 uppercase tracking-widest">' + escapeHtml(statusText) + (periodEnd ? ' · 到期 ' + escapeHtml(_fmtDate(periodEnd)) : '') + '</span>' +
             '</div>' +
             featureHtml +

@@ -17,6 +17,7 @@ import { getVevDemoMaterialBinding } from '@/lib/vevdemo-material-bindings';
 import { ensureVevDemoBindingForBgmTrack, ensureVevDemoBindingForUpload, ensureVevDemoBindingForVideoTask } from '@/lib/vevdemo-material-registration';
 import { getVevDemoProjectBinding } from '@/lib/vevdemo-project-bindings';
 import { dataPath } from '@/lib/runtime-paths';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -95,11 +96,12 @@ function readPositiveNumber(value: unknown, fallback: number): number {
 
 function videoMaterialBase(req: NextRequest, v: any, userId: number): MaterialItem {
   const signed = buildSignedVideoUrl(v.id, userId);
+  const names = buildVideoSegmentNamesForRow(v);
   return {
     id: v.id,
     url: toAbsoluteUrl(req, signed.url) || signed.url,
     type: 'video',
-    title: `片段 ${v.group_idx ?? ''}`,
+    title: names.displayName,
     durationSec: v.duration_sec,
     // 封面给签名 URL：VevDemo 跨域 iframe 的 <img> 海报带不了 Bearer，未签名会 401。
     coverUrl: v.cover_image_id
@@ -202,10 +204,12 @@ export async function GET(req: NextRequest) {
   // 查询视频任务（生成的片段）
   if (resourceIds.length > 0) {
     const placeholders = resourceIds.map(() => '?').join(',');
-    const videoRows = db.prepare(
-      `SELECT id, project_id, group_idx, prompt, duration_sec, cover_image_id
-       FROM video_tasks
-       WHERE owner_id = ? AND id IN (${placeholders}) AND status = 'completed'`,
+	    const videoRows = db.prepare(
+	      `SELECT vt.id, vt.project_id, vt.group_idx, vt.prompt, vt.filename, vt.duration_sec, vt.cover_image_id,
+	              p.title AS project_title, p.data_json AS project_data_json
+	         FROM video_tasks vt
+	         LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	        WHERE vt.owner_id = ? AND vt.id IN (${placeholders}) AND vt.status = 'completed'`,
     ).all(user.id, ...resourceIds) as any[];
 
     for (const v of videoRows) {
@@ -284,10 +288,12 @@ export async function POST(req: NextRequest) {
   // 查询视频任务
   const placeholders = resourceIds.map(() => '?').join(',');
   const videoRows = resourceIds.length > 0
-    ? db.prepare(
-      `SELECT id, project_id, group_idx, prompt, duration_sec, cover_image_id
-       FROM video_tasks
-       WHERE owner_id = ? AND id IN (${placeholders}) AND status = 'completed'`,
+	    ? db.prepare(
+	      `SELECT vt.id, vt.project_id, vt.group_idx, vt.prompt, vt.filename, vt.duration_sec, vt.cover_image_id,
+	              p.title AS project_title, p.data_json AS project_data_json
+	         FROM video_tasks vt
+	         LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	        WHERE vt.owner_id = ? AND vt.id IN (${placeholders}) AND vt.status = 'completed'`,
     ).all(user.id, ...resourceIds) as any[]
     : [];
 

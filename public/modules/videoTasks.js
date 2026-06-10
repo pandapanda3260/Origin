@@ -161,6 +161,17 @@ function _setBatchStartDisabled(disabled) {
     var btn = $(id);
     if (btn) btn.disabled = !!disabled;
   });
+  // 任何把按钮恢复可点的路径，都顺手清掉准备阶段提示，避免文案残留
+  if (!disabled) _setBatchGenerateHint("");
+}
+// 「生成全部片段」点击后到首个可见变化之间有多个串行网络请求（reload/保存/连续性AI检查），
+// 这里给英雄区一行阶段提示，让用户知道在等什么。文案为空时隐藏。
+function _setBatchGenerateHint(text) {
+  var el = $("batchGenerateHint");
+  if (!el) return;
+  var msg = (text == null ? "" : String(text)).trim();
+  el.textContent = msg;
+  el.hidden = !msg;
 }
 async function _reloadProjectFromServerForVideoBatch(hintEl) {
   if (!_ctx.reloadProjectFromServer) return false;
@@ -199,9 +210,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return {
       localId: "t_" + Date.now() + "_" + Math.random().toString(36).slice(2, 9),
       serverTaskId: "", prompt: (promptText || "").trim().slice(0, 200) || "(无描述)",
-      status: "submit", statusCn: "提交中", statusEn: "提交中",
-      videoUrl: "", localPath: "", blobUrl: "", previewOk: false,
-      autoImport: !!autoImport, createdAt: Date.now(),
+	      status: "submit", statusCn: "提交中", statusEn: "提交中",
+	      videoUrl: "", localPath: "", blobUrl: "", previewOk: false,
+	      filename: "", displayName: "", downloadFilename: "",
+	      autoImport: !!autoImport, createdAt: Date.now(),
       warnings: [],
       cardEl: null, videoEl: null,
       _badge: null, _busyWrap: null, _busyText: null, _videoWrap: null,
@@ -209,10 +221,28 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     };
   }
 
-  function isTerminal(t) { return t.status === "done" || t.status === "failed" || t.status === "timeout"; }
-  function _taskDisplayName(task) {
-    if (task && task._groupIdx != null && Number.isFinite(Number(task._groupIdx))) {
-      return "片段 " + (Number(task._groupIdx) + 1);
+	  function isTerminal(t) { return t.status === "done" || t.status === "failed" || t.status === "timeout"; }
+	  function _nameMetaFrom(value) {
+	    value = value || {};
+	    return {
+	      filename: value.filename || value.fileName || value.videoFilename || "",
+	      displayName: value.displayName || value.display_name || value.title || value.name || value.videoDisplayName || "",
+	      downloadFilename: value.downloadFilename || value.download_filename || value.videoDownloadFilename || "",
+	    };
+	  }
+	  function _applyVideoNameMeta(target, value) {
+	    if (!target || !value) return target;
+	    var meta = _nameMetaFrom(value);
+	    if (meta.filename) target.filename = meta.filename;
+	    if (meta.displayName) target.displayName = meta.displayName;
+	    if (meta.downloadFilename) target.downloadFilename = meta.downloadFilename;
+	    return target;
+	  }
+	  function _taskDisplayName(task) {
+	    var metaName = task && (task.displayName || task.title || task.name);
+	    if (metaName) return String(metaName);
+	    if (task && task._groupIdx != null && Number.isFinite(Number(task._groupIdx))) {
+	      return "片段 " + (Number(task._groupIdx) + 1);
     }
     var raw = (task && task.prompt || "").trim();
     var m = raw.match(/^片段\s*(\d+)/);
@@ -361,11 +391,15 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var protectedUrl = opts.protectedUrl || _protectedVideoUrlFrom(url);
     var taskId = opts.taskId || opts.serverTaskId || "";
     var durationSec = Number(opts.durationSec || 0);
-    var plannedDurationSec = Number(opts.plannedDurationSec || 0);
+	    var plannedDurationSec = Number(opts.plannedDurationSec || 0);
+	    var nameMeta = _nameMetaFrom(opts);
 
-    if (url) sb.videoUrl = url;
-    if (protectedUrl) sb._originVideoUrl = protectedUrl;
-    if (taskId) sb.videoTaskId = taskId;
+	    if (url) sb.videoUrl = url;
+	    if (protectedUrl) sb._originVideoUrl = protectedUrl;
+	    if (taskId) sb.videoTaskId = taskId;
+	    if (nameMeta.filename) sb.videoFilename = nameMeta.filename;
+	    if (nameMeta.displayName) sb.videoDisplayName = nameMeta.displayName;
+	    if (nameMeta.downloadFilename) sb.videoDownloadFilename = nameMeta.downloadFilename;
     if (durationSec > 0) sb.videoDurationSec = durationSec;
     if (plannedDurationSec > 0) sb.plannedDurationSec = plannedDurationSec;
     if (Array.isArray(opts.videoWarnings)) sb.videoWarnings = opts.videoWarnings;
@@ -380,8 +414,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (!vt || typeof vt !== "object") vt = {};
     vt.groupIdx = gIdx;
     if (taskId) vt.taskId = taskId;
-    if (url) vt.url = protectedUrl || url;
-    if (protectedUrl) vt.protectedUrl = protectedUrl;
+	    if (url) vt.url = protectedUrl || url;
+	    if (protectedUrl) vt.protectedUrl = protectedUrl;
+	    if (nameMeta.filename) vt.filename = nameMeta.filename;
+	    if (nameMeta.displayName) vt.displayName = nameMeta.displayName;
+	    if (nameMeta.downloadFilename) vt.downloadFilename = nameMeta.downloadFilename;
     if (durationSec > 0) vt.durationSec = durationSec;
     if (plannedDurationSec > 0) vt.plannedDurationSec = plannedDurationSec;
     if (Array.isArray(opts.videoWarnings)) vt.warnings = opts.videoWarnings;
@@ -640,6 +677,33 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return _reattachVideoTasks(options);
   }
 
+  /* 2026-06 · 全局唤醒对账（main.js focus/visibilitychange/online 分发）。
+   * 只在"本地没有任何闭包在跟踪任务"时才考虑重建：activeTaskCount()>0 说明
+   * 进行中的任务有自己的 SSE+降级轮询（backend_stream.js）盯着，不打断；
+   * =0 时先查 /api/batch/active（共享缓存），有视频批次（活跃或 30 分钟内
+   * 终态）才走 _restoreVideoTasks 全量重建——把切走期间完成的片段补进 UI。
+   * 完全没相关批次时零 DOM 操作，避免每次 focus 都闪列表。 */
+  var _videoWakeReconcileInFlight = false;
+  function reconcileVideoTasksOnWake(reason) {
+    _syncVideoRefs();
+    if (!project || !project.id) return;
+    if (activeTaskCount() > 0) return;
+    if (_videoWakeReconcileInFlight) return;
+    _videoWakeReconcileInFlight = true;
+    var pid = project.id;
+    getActiveBatchesShared(pid).then(function (resp) {
+      if (!project || project.id !== pid) return false;
+      var batches = (resp && resp.batches) || [];
+      var hasVideo = batches.some(function (b) { return b && isVideoSegmentBatchType(b.batchType || ""); });
+      if (!hasVideo) return false;
+      return _restoreVideoTasks({ projectId: pid });
+    }).catch(function (e) {
+      console.warn("[VideoWakeReconcile] failed:", (e && e.message) || e, reason || "");
+    }).finally(function () {
+      _videoWakeReconcileInFlight = false;
+    });
+  }
+
   async function _reattachVideoTasks(options) {
     var guard = _videoRestoreGuard(options);
     _syncVideoRefs();
@@ -685,8 +749,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           task._projectId = restoreProjectId;
           task.serverTaskId = st.taskId || st.task_id || "";
 
-          var result = st.result || {};
-          _mergeVideoWarnings(task, (result.extra && result.extra.videoWarnings) || _projectVideoWarnings(gIdx), false);
+	          var result = st.result || {};
+	          var resultNameMeta = Object.assign({}, result.patch || {}, result.extra || {}, result);
+	          _applyVideoNameMeta(task, resultNameMeta);
+	          _mergeVideoWarnings(task, (result.extra && result.extra.videoWarnings) || _projectVideoWarnings(gIdx), false);
           var resultUrl = result.resultUrl || result.url || (result.patch && result.patch.url) || "";
           var protectedUrl = result.protectedUrl || result.protected_url || (result.extra && result.extra.protectedUrl) || _protectedVideoUrlFrom(resultUrl);
 
@@ -696,10 +762,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             task.protectedUrl = protectedUrl;
             if (task.videoUrl && project && Array.isArray(project.storyboards)) {
               var dSec = (result.patch && result.patch.durationSec) || (result.extra && result.extra.durationSec);
-              _markGroupVideoCurrent(gIdx, task.videoUrl, {
-                protectedUrl: protectedUrl,
-                taskId: task.serverTaskId,
-                durationSec: dSec,
+	              _markGroupVideoCurrent(gIdx, task.videoUrl, {
+	                protectedUrl: protectedUrl,
+	                taskId: task.serverTaskId,
+	                filename: resultNameMeta.filename,
+	                displayName: resultNameMeta.displayName,
+	                downloadFilename: resultNameMeta.downloadFilename,
+	                durationSec: dSec,
                 plannedDurationSec: result.patch && result.patch.plannedDurationSec,
                 readyForEdit: result.extra && result.extra.readyForEdit,
                 videoWarnings: result.extra && result.extra.videoWarnings,
@@ -759,9 +828,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           if (_seenDone[taskId] || _seenFailed[taskId]) return;
           _seenDone[taskId] = true;
           totalDone++;
-          var gi = (extra && typeof extra.groupIdx === "number") ? extra.groupIdx : null;
-          var t = ensureTaskBound(taskId, gi);
-          if (!t) return;
+	          var gi = (extra && typeof extra.groupIdx === "number") ? extra.groupIdx : null;
+	          var t = ensureTaskBound(taskId, gi);
+	          if (!t) return;
+	          _applyVideoNameMeta(t, extra);
           var eIdx = gi != null ? gi : t._groupIdx;
           if (project && eIdx != null && Array.isArray(project.storyboards)) {
             if (!project.storyboards[eIdx]) project.storyboards[eIdx] = {};
@@ -786,10 +856,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
               // 段长就能用真实视频长度，避免计划时长和文件时长错位。
               var realDur = (extra && extra.durationSec) || 0;
               if (!realDur && extra && extra.patch && extra.patch.durationSec) realDur = extra.patch.durationSec;
-              _markGroupVideoCurrent(t._groupIdx, url, {
-                protectedUrl: protectedUrl,
-                taskId: taskId || t.serverTaskId,
-                durationSec: realDur,
+	              _markGroupVideoCurrent(t._groupIdx, url, {
+	                protectedUrl: protectedUrl,
+	                taskId: taskId || t.serverTaskId,
+	                filename: extra && extra.filename,
+	                displayName: extra && extra.displayName,
+	                downloadFilename: extra && extra.downloadFilename,
+	                durationSec: realDur,
                 plannedDurationSec: (extra && extra.plannedDurationSec) || (extra && extra.patch && extra.patch.plannedDurationSec),
                 readyForEdit: extra && extra.readyForEdit,
                 videoWarnings: extra && extra.videoWarnings,
@@ -912,10 +985,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             if (!t) return;
             _applyVideoTaskProgress(t, data);
           },
-          onTaskCompleted: function (data) {
-            if (!guard()) return;
-            applyCompleted(data.taskId, data.resultUrl || data.videoUrl || "", data.extra || {});
-          },
+	          onTaskCompleted: function (data) {
+	            if (!guard()) return;
+	            applyCompleted(data.taskId, data.resultUrl || data.videoUrl || "", Object.assign({}, data, data.extra || {}));
+	          },
           onTaskFailed: function (data) {
             if (!guard()) return;
 	            applyFailed(data.taskId, data.reason || data.errorMsg, data);
@@ -954,16 +1027,20 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           var url = t.result_url || "";
           var protectedUrl = t.protected_url || _protectedVideoUrlFrom(url);
 
-          if (isSucceeded && url && project && Array.isArray(project.storyboards)) {
-            _markGroupVideoCurrent(gIdx, url, {
-              protectedUrl: protectedUrl,
-              taskId: t.task_id,
-              durationSec: t.duration_sec,
-            });
-          }
+	          if (isSucceeded && url && project && Array.isArray(project.storyboards)) {
+	            _markGroupVideoCurrent(gIdx, url, {
+	              protectedUrl: protectedUrl,
+	              taskId: t.task_id,
+	              filename: t.filename,
+	              displayName: t.displayName || t.display_name || t.title || t.name,
+	              downloadFilename: t.downloadFilename || t.download_filename,
+	              durationSec: t.duration_sec,
+	            });
+	          }
 
-          var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
-          task.serverTaskId = t.task_id || "";
+	          var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
+	          _applyVideoNameMeta(task, t);
+	          task.serverTaskId = t.task_id || "";
           task._groupIdx = gIdx;
           task._projectId = restoreProjectId;
           _mergeVideoWarnings(task, _projectVideoWarnings(gIdx), false);
@@ -1026,11 +1103,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (t.task_type === "video") {
       if (!project.storyboards) project.storyboards = [];
       if (!project.storyboards[tIdx]) project.storyboards[tIdx] = {};
-      _markGroupVideoCurrent(tIdx, url, {
-        protectedUrl: protectedUrl,
-        taskId: t.task_id,
-        durationSec: t.duration_sec,
-      });
+	      _markGroupVideoCurrent(tIdx, url, {
+	        protectedUrl: protectedUrl,
+	        taskId: t.task_id,
+	        filename: t.filename,
+	        displayName: t.displayName || t.display_name || t.title || t.name,
+	        downloadFilename: t.downloadFilename || t.download_filename,
+	        durationSec: t.duration_sec,
+	      });
       if (t.asset_id) project.storyboards[tIdx].videoAssetId = t.asset_id;
       if (t.fetch_status) project.storyboards[tIdx].fetchStatus = t.fetch_status;
       project.storyboards[tIdx].videoTaskId = t.task_id;
@@ -1669,9 +1749,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
               delete sbDel.videoCoverUrl;
               delete sbDel.videoStatus;
               delete sbDel.videoMode;
-              delete sbDel.videoTaskFinishedAt;
-              delete sbDel.videoDurationSec;
-              delete sbDel.readyForEdit;
+	              delete sbDel.videoTaskFinishedAt;
+	              delete sbDel.videoDurationSec;
+	              delete sbDel.videoFilename;
+	              delete sbDel.videoDisplayName;
+	              delete sbDel.videoDownloadFilename;
+	              delete sbDel.readyForEdit;
               delete sbDel.videoWarnings;
               delete sbDel.videoIsCurrent;
               // 必须连带清掉 videoAssetId，否则 hydrateProjectAssetUrls 会用
@@ -2118,9 +2201,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return name;
   }
 
-  function _vhItemName(gIdx, item) {
-    return _vhSegmentName(gIdx) + " · " + _vhDateParts(item && item.created_at).short;
-  }
+	  function _vhItemName(gIdx, item) {
+	    var base = item && (item.displayName || item.display_name || item.title || item.name);
+	    if (!base) base = _vhSegmentName(gIdx);
+	    return base + " · " + _vhDateParts(item && item.created_at).short;
+	  }
 
   async function _openVideoHistoryModal(gIdx) {
     _syncVideoRefs();
@@ -2241,20 +2326,24 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         });
         var newUrl = (resp && resp.url) || item.url;
         var newProtected = (resp && resp.protectedUrl) || item.protected_url;
-        _markGroupVideoCurrent(gIdx, newUrl, {
-          protectedUrl: newProtected, taskId: item.task_id,
-          durationSec: (resp && resp.durationSec) || item.duration_sec,
-        });
+	        _markGroupVideoCurrent(gIdx, newUrl, {
+	          protectedUrl: newProtected, taskId: item.task_id,
+	          filename: (resp && resp.filename) || item.filename,
+	          displayName: (resp && resp.displayName) || item.displayName || item.display_name || item.title || item.name,
+	          downloadFilename: (resp && resp.downloadFilename) || item.downloadFilename || item.download_filename,
+	          durationSec: (resp && resp.durationSec) || item.duration_sec,
+	        });
         if (resp && resp.serverVersion != null) project.version = Number(resp.serverVersion) || project.version;
         if (resp && resp.edl) { if (!project.editData) project.editData = {}; project.editData.edl = resp.edl; }
         if (resp && resp.readiness) { if (!project.editData) project.editData = {}; project.editData.readiness = resp.readiness; }
         // 同步本页 live-row 任务的视频地址（让播放/缩略图指向新视频）
         try {
-          for (var i = 0; i < videoState.tasks.length; i++) {
-            var t = videoState.tasks[i];
-            if (t && Number(t._groupIdx) === gIdx) {
-              t.videoUrl = newUrl; t.protectedUrl = newProtected;
-              if (t.blobUrl) { try { URL.revokeObjectURL(t.blobUrl); } catch (_e) {} t.blobUrl = ""; }
+	          for (var i = 0; i < videoState.tasks.length; i++) {
+	            var t = videoState.tasks[i];
+	            if (t && Number(t._groupIdx) === gIdx) {
+	              t.videoUrl = newUrl; t.protectedUrl = newProtected;
+	              _applyVideoNameMeta(t, resp || item);
+	              if (t.blobUrl) { try { URL.revokeObjectURL(t.blobUrl); } catch (_e) {} t.blobUrl = ""; }
               t.previewOk = false;
               updateTaskCard(t);
               break;
@@ -2321,9 +2410,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return name;
   }
 
-  function _videoTaskDownloadName(task) {
-    var gIdx = task && task._groupIdx != null ? Number(task._groupIdx) : NaN;
-    if (Number.isFinite(gIdx)) return "origin_clip_" + String(gIdx + 1).padStart(2, "0") + ".mp4";
+	  function _videoTaskDownloadName(task) {
+	    if (task && task.downloadFilename) return String(task.downloadFilename);
+	    if (task && task.filename) return String(task.filename);
+	    if (task && task.displayName) return String(task.displayName).replace(/\.mp4$/i, "") + ".mp4";
+	    var gIdx = task && task._groupIdx != null ? Number(task._groupIdx) : NaN;
+	    if (Number.isFinite(gIdx)) return "origin_clip_" + String(gIdx + 1).padStart(2, "0") + ".mp4";
     return "origin_clip_" + ((task && task.serverTaskId) || Date.now()) + ".mp4";
   }
 
@@ -2460,11 +2552,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     _safeWriteBack(originId, function (proj) {
       if (!proj.storyboards) proj.storyboards = [];
       if (!proj.storyboards[gIdx]) proj.storyboards[gIdx] = {};
-      proj.storyboards[gIdx].videoUrl = protectedUrl || task.videoUrl;
-      if (task.videoAssetId) proj.storyboards[gIdx].videoAssetId = task.videoAssetId;
-      if (task.fetchStatus) proj.storyboards[gIdx].fetchStatus = task.fetchStatus;
-      if (task.serverTaskId) proj.storyboards[gIdx].videoTaskId = task.serverTaskId;
-      proj.storyboards[gIdx].videoStatus = task.status || "done";
+	      proj.storyboards[gIdx].videoUrl = protectedUrl || task.videoUrl;
+	      if (task.videoAssetId) proj.storyboards[gIdx].videoAssetId = task.videoAssetId;
+	      if (task.fetchStatus) proj.storyboards[gIdx].fetchStatus = task.fetchStatus;
+	      if (task.serverTaskId) proj.storyboards[gIdx].videoTaskId = task.serverTaskId;
+	      if (task.filename) proj.storyboards[gIdx].videoFilename = task.filename;
+	      if (task.displayName) proj.storyboards[gIdx].videoDisplayName = task.displayName;
+	      if (task.downloadFilename) proj.storyboards[gIdx].videoDownloadFilename = task.downloadFilename;
+	      proj.storyboards[gIdx].videoStatus = task.status || "done";
       proj.storyboards[gIdx].videoIsCurrent = true;
       delete proj.storyboards[gIdx].videoInvalidatedAt;
       delete proj.storyboards[gIdx].videoInvalidatedReason;
@@ -2472,9 +2567,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       var vt = proj.videoTasks[gIdx] || {};
       vt.groupIdx = gIdx;
       if (task.serverTaskId) vt.taskId = task.serverTaskId;
-      vt.url = protectedUrl || task.videoUrl;
-      if (protectedUrl) vt.protectedUrl = protectedUrl;
-      vt.status = "completed";
+	      vt.url = protectedUrl || task.videoUrl;
+	      if (protectedUrl) vt.protectedUrl = protectedUrl;
+	      if (task.filename) vt.filename = task.filename;
+	      if (task.displayName) vt.displayName = task.displayName;
+	      if (task.downloadFilename) vt.downloadFilename = task.downloadFilename;
+	      vt.status = "completed";
       vt.isCurrent = true;
       delete vt.outdated;
       delete vt.invalidatedAt;
@@ -2655,10 +2753,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         onTaskProgress: function (data) {
           _applyVideoTaskProgress(task, data);
         },
-        onTaskCompleted: function (data) {
-          var url = data.resultUrl || data.videoUrl || "";
-          var extra = (data && data.extra) || {};
-          var eIdx = (typeof extra.groupIdx === "number") ? extra.groupIdx : null;
+	        onTaskCompleted: function (data) {
+	          var url = data.resultUrl || data.videoUrl || "";
+	          var extra = (data && data.extra) || {};
+	          _applyVideoNameMeta(task, extra);
+	          _applyVideoNameMeta(task, data);
+	          var eIdx = (typeof extra.groupIdx === "number") ? extra.groupIdx : null;
           if (project && eIdx != null && Array.isArray(project.storyboards)) {
             if (!project.storyboards[eIdx]) project.storyboards[eIdx] = {};
             if (typeof extra.readyForEdit === "boolean") {
@@ -2675,9 +2775,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
             task.protectedUrl = protectedUrl;
             if (project && task._groupIdx != null && Array.isArray(project.storyboards)) {
               _markGroupVideoCurrent(task._groupIdx, url, {
-                protectedUrl: protectedUrl,
-                taskId: task.serverTaskId,
-                durationSec: extra && extra.durationSec,
+	                protectedUrl: protectedUrl,
+	                taskId: task.serverTaskId,
+	                filename: extra && extra.filename,
+	                displayName: extra && extra.displayName,
+	                downloadFilename: extra && extra.downloadFilename,
+	                durationSec: extra && extra.durationSec,
                 plannedDurationSec: extra && extra.plannedDurationSec,
                 readyForEdit: extra && extra.readyForEdit,
                 videoWarnings: extra && extra.videoWarnings,
@@ -2726,10 +2829,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       onProgress: function (data) {
         _applyVideoTaskProgress(task, data);
       },
-      onCompleted: function (data) {
-        var url = data.resultUrl || data.videoUrl || "";
-        var extra = (data && data.extra) || {};
-        var protectedUrl = extra.protectedUrl || _protectedVideoUrlFrom(url);
+	      onCompleted: function (data) {
+	        var url = data.resultUrl || data.videoUrl || "";
+	        var extra = (data && data.extra) || {};
+	        _applyVideoNameMeta(task, extra);
+	        _applyVideoNameMeta(task, data);
+	        var protectedUrl = extra.protectedUrl || _protectedVideoUrlFrom(url);
         // 簇 11：持久化链路产出的 assetId/fetchStatus 如果后端顺手带过来，
         // 就挂到 task 上，让 videoPipeline 能把"下载中→可播"写进分镜。
         if (data && data.assetId) task.videoAssetId = data.assetId;
@@ -2740,9 +2845,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           task.protectedUrl = protectedUrl;
           if (project && task._groupIdx != null && Array.isArray(project.storyboards)) {
             _markGroupVideoCurrent(task._groupIdx, url, {
-              protectedUrl: protectedUrl,
-              taskId: task.serverTaskId,
-              durationSec: extra && extra.durationSec,
+	              protectedUrl: protectedUrl,
+	              taskId: task.serverTaskId,
+	              filename: extra && extra.filename,
+	              displayName: extra && extra.displayName,
+	              downloadFilename: extra && extra.downloadFilename,
+	              durationSec: extra && extra.durationSec,
               plannedDurationSec: extra && extra.plannedDurationSec,
               readyForEdit: extra && extra.readyForEdit,
               videoWarnings: extra && extra.videoWarnings,
@@ -3514,6 +3622,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var handedOffLock = false;
 
     try {
+      showToast("正在检查相邻镜头衔接，通过后自动开始生成…", "info");
       var ok = await _runContinuityPreflight([gIdx], { count: 1 });
       if (!ok) return;
       await createWorkflowVideoTask(gIdx, Object.assign({}, _getDefaultBatchOpts(), { _videoGroupLockHeld: true }));
@@ -3535,11 +3644,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    _syncVideoRefs();
 	    if (!project || !project.storyboards) return;
 	    _setBatchStartDisabled(true);
+	    _setBatchGenerateHint("正在同步项目最新状态…");
 	    await _reloadProjectFromServerForVideoBatch(null);
 	    if (!project || !project.storyboards) {
 	      _setBatchStartDisabled(false);
 	      return;
 	    }
+	    _setBatchGenerateHint("");
 
 	    var batchOpts = _getDefaultBatchOpts();
 	    var groups = getStoryboardGroups();
@@ -3611,6 +3722,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       return;
     }
 
+    _setBatchGenerateHint("正在保存项目并做相邻镜头衔接检查（AI 检查，可能需要几十秒）…");
     var preflightOk = await _runContinuityPreflight(indices, { count: indices.length, hintEl: null });
     if (!preflightOk) {
       _setBatchStartDisabled(false);
@@ -3625,10 +3737,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         delete project.storyboards[j].videoTaskId;
         delete project.storyboards[j].videoCoverUrl;
         delete project.storyboards[j].videoStatus;
-        delete project.storyboards[j].videoMode;
-        delete project.storyboards[j].videoTaskFinishedAt;
-        delete project.storyboards[j].videoDurationSec;
-      });
+	        delete project.storyboards[j].videoMode;
+	        delete project.storyboards[j].videoTaskFinishedAt;
+	        delete project.storyboards[j].videoDurationSec;
+	        delete project.storyboards[j].videoFilename;
+	        delete project.storyboards[j].videoDisplayName;
+	        delete project.storyboards[j].videoDownloadFilename;
+	      });
       try { saveProject(); } catch (_e) {}
       renderBatchClipList();
       showToast("将重新生成 " + indices.length + " 个分镜的视频", "ok");
@@ -3669,6 +3784,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     });
 
     var resp;
+    _setBatchGenerateHint("正在提交生成任务…");
     try {
       var startResult = await _postVideoBatchStartWithPreflightHandling({
         batchType: "video_segments",
@@ -3714,6 +3830,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
 
     var batchId = resp.batchId;
+    _setBatchGenerateHint(""); // 任务已创建，进度交给片段卡片展示
 
     var totalDone = 0, totalFail = 0, total = indices.length;
 
@@ -3768,11 +3885,13 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         _seenDone[data.taskId] = true;
       }
       totalDone++;
-      var extra = (data && data.extra) || {};
-      var gi = (typeof extra.groupIdx === "number") ? extra.groupIdx : null;
-      var t = findTaskByServerId(data.taskId) || ensureTaskBound(data.taskId, gi);
-      if (!t) return;
-      var url = data.resultUrl || data.videoUrl || "";
+	      var extra = (data && data.extra) || {};
+	      var gi = (typeof extra.groupIdx === "number") ? extra.groupIdx : null;
+	      var t = findTaskByServerId(data.taskId) || ensureTaskBound(data.taskId, gi);
+	      if (!t) return;
+	      _applyVideoNameMeta(t, extra);
+	      _applyVideoNameMeta(t, data);
+	      var url = data.resultUrl || data.videoUrl || "";
       var gIdx = gi != null ? gi : t._groupIdx;
       if (project && gIdx != null && Array.isArray(project.storyboards)) {
         if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
@@ -3794,9 +3913,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         t.protectedUrl = protectedUrl;
         if (project && t._groupIdx != null && Array.isArray(project.storyboards)) {
           _markGroupVideoCurrent(t._groupIdx, url, {
-            protectedUrl: protectedUrl,
-            taskId: data && data.taskId,
-            durationSec: extra && extra.durationSec,
+	            protectedUrl: protectedUrl,
+	            taskId: data && data.taskId,
+	            filename: extra && extra.filename,
+	            displayName: extra && extra.displayName,
+	            downloadFilename: extra && extra.downloadFilename,
+	            durationSec: extra && extra.durationSec,
             plannedDurationSec: extra && extra.plannedDurationSec,
             readyForEdit: extra && extra.readyForEdit,
             videoWarnings: extra && extra.videoWarnings,
@@ -4033,8 +4155,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (!task.videoUrl) { showToast("无视频链接", "warn"); return; }
     try {
       var buf = await fetchVideoBuffer(task.videoUrl);
-      var blob = new Blob([buf], { type: "video/mp4" });
-      _downloadBlob(blob, "qd_" + (task.serverTaskId || Date.now()) + ".mp4");
+	      var blob = new Blob([buf], { type: "video/mp4" });
+	      _downloadBlob(blob, _videoTaskDownloadName(task));
     } catch (e) { showToast("下载失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error"); }
   }
 
@@ -4070,6 +4192,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
 export {
   _restoreVideoTasks,
+  reconcileVideoTasksOnWake,
   refreshBatchPage,
   startBatchGeneration,
   importAllGeneratedSegments,

@@ -136,81 +136,80 @@ function hasUsableAssetImage(item: any): boolean {
   ].some(nonEmptyAssetValue);
 }
 
-function worldImageUrl(world: any): string {
-  const panels = isRecord(world?.referencePanels)
-    ? world.referencePanels
-    : isRecord(world?.panels)
-      ? world.panels
-      : {};
-  return firstText(
-    panels.sheetUrl,
-    panels.headshotUrl,
-    panels.frontUrl,
-    panels.sideUrl,
-    panels.backUrl,
-    world?.realPhotoUrl,
-    world?.rawUrl,
-    world?.imageUrl,
-    world?.pencilUrl,
-  );
+function worldPanelsOf(world: any): Record<string, any> {
+  if (isRecord(world?.referencePanels)) return world.referencePanels;
+  if (isRecord(world?.panels)) return world.panels;
+  return {};
 }
 
-function buildInjectedPanels(world: any, asset: any): Record<string, any> | undefined {
-  const sourcePanels = isRecord(world?.referencePanels)
-    ? world.referencePanels
-    : isRecord(world?.panels)
-      ? world.panels
-      : {};
-  const sheetUrl = firstText(sourcePanels.sheetUrl, world?.realPhotoUrl, world?.imageUrl, world?.rawUrl, world?.pencilUrl);
-  const headshotUrl = firstText(sourcePanels.headshotUrl);
-  const frontUrl = firstText(sourcePanels.frontUrl);
-  const sideUrl = firstText(sourcePanels.sideUrl);
-  const backUrl = firstText(sourcePanels.backUrl);
-  const sourceImageUrl = firstText(sourcePanels.sourceImageUrl, sheetUrl, headshotUrl, frontUrl);
-  if (!sheetUrl && !headshotUrl && !frontUrl && !sideUrl && !backUrl && !sourceImageUrl) return undefined;
+function worldSceneOrPropImageUrl(world: any): string {
+  return firstText(world?.imageUrl, world?.rawUrl, world?.pencilUrl);
+}
+
+// 角色只认真三视图：模板里必须真的有 referencePanels.sheetUrl 才算有图。
+// 绝不拿特写/预览图（previewUrl/realPhotoUrl）冒充三视图——那会让卡片把特写当
+// 三视图展示、标"已完成"，并让"生成全部图片"跳过该角色，真三视图永远不补。
+function buildInjectedCharacterPanels(world: any, asset: any, originalUrl: string): Record<string, any> | undefined {
+  const sourcePanels = worldPanelsOf(world);
+  const sheetUrl = firstText(sourcePanels.sheetUrl);
+  if (!sheetUrl) return undefined;
   const entityType = normalizeCharacterEntityType(asset?.entityType || world?.entityType);
-  const schema = asset?.isCrowd
+  const schema = firstText(sourcePanels.schema) || (asset?.isCrowd
     ? 'anonymous-crowd-reference-v1'
     : entityType === 'non-human'
       ? 'non-human-character-sheet-v1'
-      : 'human-character-sheet-v1';
-  const panels: Record<string, any> = { schema };
-  writeNonEmpty(panels, 'sheetUrl', sheetUrl || sourceImageUrl);
-  writeNonEmpty(panels, 'headshotUrl', headshotUrl);
-  writeNonEmpty(panels, 'frontUrl', frontUrl);
-  writeNonEmpty(panels, 'sideUrl', sideUrl);
-  writeNonEmpty(panels, 'backUrl', backUrl);
+      : 'human-character-sheet-v1');
+  const sourceImageUrl = firstText(sourcePanels.sourceImageUrl, originalUrl, sheetUrl);
+  const panels: Record<string, any> = { schema, sheetUrl };
+  writeNonEmpty(panels, 'headshotUrl', sourcePanels.headshotUrl);
+  writeNonEmpty(panels, 'frontUrl', sourcePanels.frontUrl);
+  writeNonEmpty(panels, 'sideUrl', sourcePanels.sideUrl);
+  writeNonEmpty(panels, 'backUrl', sourcePanels.backUrl);
   writeNonEmpty(panels, 'sourceImageId', firstText(sourcePanels.sourceImageId, imageIdFromUrl(sourceImageUrl)));
   writeNonEmpty(panels, 'sourceImageUrl', sourceImageUrl);
   return panels;
 }
 
-function applyWorldImage(item: any, world: any, kind: AssetKind): { item: any; filled: boolean } {
-  if (hasUsableAssetImage(item)) return { item, filled: false };
-  const imageUrl = worldImageUrl(world);
-  if (!imageUrl) return { item, filled: false };
-  const next = { ...item };
-  if (kind === 'characters') {
-    writeNonEmpty(next, 'realPhotoUrl', firstText(world?.realPhotoUrl, imageUrl));
-    writeNonEmpty(next, 'imageUrl', firstText(world?.imageUrl, world?.rawUrl, imageUrl));
-    writeNonEmpty(next, 'rawUrl', firstText(world?.rawUrl, world?.imageUrl, imageUrl));
-    const panels = buildInjectedPanels(world, item);
-    if (panels) next.panels = panels;
-  } else {
-    writeNonEmpty(next, 'imageUrl', firstText(world?.imageUrl, world?.rawUrl, imageUrl));
-    writeNonEmpty(next, 'rawUrl', firstText(world?.rawUrl, world?.imageUrl, imageUrl));
-  }
-  next.reference = {
-    ...(isRecord(next.reference) ? next.reference : {}),
-    currentUrl: imageUrl,
-    lastKnownGoodUrl: imageUrl,
+function readyReference(existing: any, url: string) {
+  const reference = {
+    ...(isRecord(existing) ? existing : {}),
+    currentUrl: url,
+    lastKnownGoodUrl: url,
     status: 'ready',
     updatedAt: new Date().toISOString(),
     source: 'world_template',
   };
+  delete (reference as any).lastError;
+  return reference;
+}
+
+function applyWorldImage(item: any, world: any, kind: AssetKind): { item: any; filled: boolean } {
+  if (hasUsableAssetImage(item)) return { item, filled: false };
+  if (kind === 'characters') {
+    const sheetUrl = firstText(worldPanelsOf(world).sheetUrl);
+    // 没有真三视图：只注入文本，图留空走正常生成链（不标 ready、不挡"生成全部图片"）
+    if (!sheetUrl) return { item, filled: false };
+    // 资产契约：imageUrl/rawUrl/realPhotoUrl 三字段同源 = 三视图原图
+    const originalUrl = firstText(worldPanelsOf(world).sourceImageUrl, world?.imageUrl, world?.rawUrl, sheetUrl);
+    const next = { ...item };
+    next.imageUrl = originalUrl;
+    next.rawUrl = originalUrl;
+    next.realPhotoUrl = originalUrl;
+    const panels = buildInjectedCharacterPanels(world, item, originalUrl);
+    if (panels) next.panels = panels;
+    next.reference = readyReference(next.reference, originalUrl);
+    delete next.imageLastError;
+    delete next.imageFailedAt;
+    return { item: next, filled: true };
+  }
+  const imageUrl = worldSceneOrPropImageUrl(world);
+  if (!imageUrl) return { item, filled: false };
+  const next = { ...item };
+  writeNonEmpty(next, 'imageUrl', firstText(world?.imageUrl, world?.rawUrl, imageUrl));
+  writeNonEmpty(next, 'rawUrl', firstText(world?.rawUrl, world?.imageUrl, imageUrl));
+  next.reference = readyReference(next.reference, imageUrl);
   delete next.imageLastError;
   delete next.imageFailedAt;
-  if (next.reference) delete next.reference.lastError;
   return { item: next, filled: true };
 }
 

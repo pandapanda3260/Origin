@@ -107,7 +107,8 @@ function firstArray(...values: any[]) {
 
 function entityPreviewUrl(item: any) {
   return (
-    item?.coverImageUrl
+    item?.previewUrl
+    || item?.coverImageUrl
     || item?.thumbnailUrl
     || item?.realPhotoUrl
     || item?.rawUrl
@@ -808,15 +809,43 @@ export function applyWorldTemplateTerminologyOverride(input: any, terminologyOve
   };
 }
 
-function mapReferencePanels(referenceLock: any) {
+function mapReferencePanels(referenceLock: any, assetPanels?: any) {
+  const lock = referenceLock && typeof referenceLock === 'object' ? referenceLock : {};
+  const fallback = assetPanels && typeof assetPanels === 'object' ? assetPanels : {};
   const panels = {
-    sheetUrl: firstText(referenceLock?.sheetUrl),
-    headshotUrl: firstText(referenceLock?.headshotUrl),
-    frontUrl: firstText(referenceLock?.frontUrl),
-    sideUrl: firstText(referenceLock?.sideUrl),
-    backUrl: firstText(referenceLock?.backUrl),
+    schema: firstText(lock.schema, fallback.schema),
+    sheetUrl: firstText(lock.sheetUrl, fallback.sheetUrl),
+    headshotUrl: firstText(lock.headshotUrl, fallback.headshotUrl),
+    frontUrl: firstText(lock.frontUrl, fallback.frontUrl),
+    sideUrl: firstText(lock.sideUrl, fallback.sideUrl),
+    backUrl: firstText(lock.backUrl, fallback.backUrl),
+    sourceImageId: firstText(lock.sourceImageId, fallback.sourceImageId),
+    sourceImageUrl: firstText(lock.sourceImageUrl, fallback.sourceImageUrl),
   };
   return Object.fromEntries(Object.entries(panels).filter(([, value]) => value));
+}
+
+// 去掉空值字段：避免 ''/[]/{} 在 mergeWorldCharacterPools 等 spread 合并里
+// 把另一侧的非空值踩掉（空值不携带 = 合并时自动让位）。
+function compactWorldEntity(entity: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [key, value] of Object.entries(entity)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
+    if (Array.isArray(value)) {
+      if (!value.length) continue;
+      out[key] = value;
+      continue;
+    }
+    if (typeof value === 'object') {
+      const nested = compactWorldEntity(value);
+      if (!Object.keys(nested).length) continue;
+      out[key] = nested;
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
@@ -825,14 +854,19 @@ function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
   const visual = projectedLock?.visualLock || {};
   const performance = projectedLock?.performanceLock || {};
   const voice = projectedLock?.voiceLock || {};
-  const referencePanels = mapReferencePanels(projectedLock?.referenceLock || {});
+  // 三视图切片：锁的 referenceLock 优先，资产自己的 panels 兜底（没锁过的角色也能把真三视图带进模板）
+  const referencePanels = mapReferencePanels(projectedLock?.referenceLock || {}, sourceAsset?.panels);
+  // previewUrl 只用于模板卡片/弹窗展示（特写优先）；
+  // realPhotoUrl 保持与资产侧一致的语义 = 写实原图（角色即三视图原图），绝不存特写。
   const previewUrl = firstText(referencePanels.headshotUrl, referencePanels.frontUrl, referencePanels.sheetUrl, sourceAsset?.realPhotoUrl, sourceAsset?.imageUrl, sourceAsset?.rawUrl);
-  return {
+  const originalUrl = firstText(sourceAsset?.realPhotoUrl, sourceAsset?.imageUrl, sourceAsset?.rawUrl);
+  return compactWorldEntity({
     id: firstText(projectedLock?.characterId, sourceAsset?.id),
     characterId: firstText(projectedLock?.characterId, sourceAsset?.characterId),
     sourceAssetId: firstText(projectedLock?.sourceAssetId, sourceAsset?.id),
     name: firstText(projectedLock?.canonicalName, sourceAsset?.name, identity.role),
     aliases: cleanList(projectedLock?.aliases || [sourceAsset?.name, sourceAsset?.role], 12),
+    // 字段只取本字段：role/identity/description 不再互相回填（塌缩会把整段简介灌进 role）
     role: firstText(identity.role, sourceAsset?.role),
     identity: firstText(identity.identity, sourceAsset?.identity),
     entityType: identity.entityType === 'non-human' ? 'non-human' : 'human',
@@ -842,7 +876,7 @@ function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
     appearance: firstText(visual.appearance, sourceAsset?.appearance),
     clothing: firstText(visual.clothing, sourceAsset?.clothing),
     equipment: firstText(visual.equipment, sourceAsset?.equipment),
-    description: firstText(sourceAsset?.description, sourceAsset?.intro, identity.identity),
+    description: firstText(sourceAsset?.description, sourceAsset?.intro),
     temperament: firstText(performance.temperament, sourceAsset?.temperament),
     actionTraits: firstText(performance.actionTraits, sourceAsset?.actionTraits),
     gestureRules: cleanList(performance.gestureRules, 8),
@@ -850,7 +884,8 @@ function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
     signatureColors: cleanList(visual.signatureColors, 8),
     canonicalPrompt: sourceAsset ? '' : firstText(visual.canonicalPrompt),
     referencePanels,
-    realPhotoUrl: previewUrl || undefined,
+    previewUrl: previewUrl || undefined,
+    realPhotoUrl: originalUrl || undefined,
     imageUrl: firstText(sourceAsset?.imageUrl, sourceAsset?.rawUrl) || undefined,
     voiceHint: {
       voiceGender: firstText(voice.voiceGender) || undefined,
@@ -860,23 +895,28 @@ function mapCharacterLockToWorldCharacter(lock: any, sourceAsset?: any) {
       accent: firstText(voice.accent) || undefined,
       negativeRules: cleanList(voice.negativeRules, 8),
     },
-  };
+  });
 }
 
 function mapCharacterAssetToWorldCharacter(asset: any) {
-  return {
+  const referencePanels = mapReferencePanels({}, asset?.panels);
+  const originalUrl = firstText(asset.realPhotoUrl, asset.imageUrl, asset.rawUrl);
+  return compactWorldEntity({
     id: firstText(asset.characterId, asset.id),
     characterId: firstText(asset.characterId, asset.id),
     name: firstText(asset.name, asset.role),
     role: firstText(asset.role),
     identity: firstText(asset.identity),
     entityType: asset.entityType === 'non-human' ? 'non-human' : 'human',
-    appearance: firstText(asset.appearance, asset.detail, asset.intro),
+    appearance: firstText(asset.appearance, asset.detail),
     clothing: firstText(asset.clothing),
     equipment: firstText(asset.equipment),
-    realPhotoUrl: firstText(asset.realPhotoUrl, asset.imageUrl, asset.rawUrl) || undefined,
+    description: firstText(asset.description, asset.intro),
+    referencePanels,
+    previewUrl: firstText(referencePanels.headshotUrl, referencePanels.frontUrl, referencePanels.sheetUrl, originalUrl) || undefined,
+    realPhotoUrl: originalUrl || undefined,
     imageUrl: firstText(asset.imageUrl, asset.rawUrl) || undefined,
-  };
+  });
 }
 
 function splitWorldCharactersFromProject(project: any, characterIds?: string[]) {
@@ -1158,9 +1198,21 @@ export function mergeProjectCharacterLocksIntoWorldTemplate(
     const key = firstText(ch.characterId, ch.id, ch.name);
     if (key) byKey.set(key, ch);
   }
+  // 逐字段合并：项目侧非空值覆盖，空值不踩模板已有内容（防整体 spread 把模板字段冲掉）
   for (const ch of incoming) {
     const key = firstText(ch.characterId, ch.id, ch.name);
-    if (key) byKey.set(key, { ...(byKey.get(key) || {}), ...ch });
+    if (!key) continue;
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, ch);
+      continue;
+    }
+    const merged = { ...existing };
+    for (const [field, value] of Object.entries(ch)) {
+      if (isEmptyTemplateValue(value)) continue;
+      merged[field] = clonePlain(value);
+    }
+    byKey.set(key, merged);
   }
   return upsertWorldTemplate(userId, {
     ...template,

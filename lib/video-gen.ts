@@ -13,7 +13,7 @@
  *   保证前端 <video> 能正常播放并展示进度条 / 封面。
  */
 
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { resolveLLMConfig } from './llm';
@@ -51,6 +51,11 @@ import { getExternalEnvValue } from './env';
 import { buildVideoPromptSnapshot } from './video-prompt-lifecycle';
 import { normalizeVideoAspectRatio } from './aspect-ratio';
 import { recordUsageEventAndSettleCharge } from './usage-billing';
+import {
+  buildVideoSegmentNames,
+  buildVideoSegmentNamesForRow,
+  videoSegmentNameInputFromProject,
+} from './video-segment-names';
 
 export type VideoGenInput = {
   prompt: string;
@@ -480,6 +485,9 @@ export type VideoGenCompletedResult = {
   status: 'completed' | 'failed';
   url: string;
   protectedUrl: string;
+  filename?: string;
+  displayName?: string;
+  downloadFilename?: string;
   coverUrl: string | null;
   durationSec: number;
   realDurationSec?: number;
@@ -524,6 +532,9 @@ export type VideoGenUpstreamPendingResult = {
   status: 'upstream_pending';
   provider: 'volcengine_seedance_video';
   providerTaskId: string;
+  filename?: string;
+  displayName?: string;
+  downloadFilename?: string;
   durationSec: number;
   mode: 'real';
   videoAudit?: VideoGenCompletedResult['videoAudit'];
@@ -739,6 +750,58 @@ const DATA_DIR = getDataDir();
 const VIDEOS_DIR = join(DATA_DIR, 'videos');
 mkdirSync(VIDEOS_DIR, { recursive: true });
 
+function resolveVideoNamesForInput(user: UserRow, input: VideoGenInput, taskId: string) {
+  const project = input.projectId ? getProjectByIdForUser(input.projectId, user.id) : null;
+  const projectInput = videoSegmentNameInputFromProject(project, input.projectId);
+  if (input.projectId && Number.isInteger(input.groupIdx)) {
+    const ownerDir = join(VIDEOS_DIR, String(user.id));
+    const rows = getDb().prepare(
+      `SELECT filename
+         FROM video_tasks
+        WHERE owner_id = ?
+          AND project_id = ?
+          AND group_idx = ?
+          AND filename IS NOT NULL AND filename <> ''
+          AND COALESCE(status, '') <> 'failed'
+        ORDER BY created_at ASC, id ASC`,
+    ).all(user.id, input.projectId, input.groupIdx) as Array<{ filename?: string | null }>;
+    let maxCopyIndex = 0;
+    for (const row of rows) {
+      const raw = String(row.filename || '').trim();
+      const matched = raw.match(/^片段[0-9]+(?:（([0-9]+)）)?_/u);
+      if (matched) {
+        maxCopyIndex = Math.max(maxCopyIndex, matched[1] ? Number(matched[1]) || 1 : 1);
+      }
+    }
+    let copyIndex = Math.max(1, maxCopyIndex + 1, rows.length + 1);
+    while (copyIndex < 10000) {
+      const names = buildVideoSegmentNames({
+        ...projectInput,
+        taskId,
+        groupIdx: input.groupIdx,
+        filename: `${taskId}.mp4`,
+        copyIndex,
+      });
+      if (!rows.some((row) => String(row.filename || '').trim() === names.filename)
+        && !existsSync(join(ownerDir, names.filename))) {
+        return names;
+      }
+      copyIndex += 1;
+    }
+  }
+  return buildVideoSegmentNames({
+    ...projectInput,
+    taskId,
+    groupIdx: input.groupIdx,
+    filename: `${taskId}.mp4`,
+  });
+}
+
+function resolveVideoNamesForRecoveredRow(user: UserRow, row: any) {
+  const project = row?.project_id ? getProjectByIdForUser(String(row.project_id), user.id) : null;
+  return buildVideoSegmentNamesForRow(row, project);
+}
+
 /**
  * 主入口：生成 + 落 DB + 返回封装结果。
  *
@@ -761,7 +824,8 @@ export async function generateVideo(
   const taskId = input.taskId || randomUUID();
   const ownerDir = join(VIDEOS_DIR, String(user.id));
   mkdirSync(ownerDir, { recursive: true });
-  const filename = `${taskId}.mp4`;
+  const videoNames = resolveVideoNamesForInput(user, input, taskId);
+  const filename = videoNames.filename;
   const fullPath = join(ownerDir, filename);
   // 选择适配器（提前算，决定时长）
   const cfgIsGrok = /^grok-video/i.test(cfg.model || '');
@@ -1070,6 +1134,9 @@ export async function generateVideo(
             status: 'upstream_pending',
             provider: 'volcengine_seedance_video',
             providerTaskId: remoteId,
+            filename: videoNames.filename,
+            displayName: videoNames.displayName,
+            downloadFilename: videoNames.downloadFilename,
             durationSec: dur,
             mode: 'real',
             videoAudit,
@@ -1206,12 +1273,15 @@ export async function generateVideo(
 	          durationSec: finalDurationSec,
 	        });
 	        return {
-          taskId,
-          status: 'completed',
-          url: buildSignedVideoUrl(taskId, user.id).url,
-	          protectedUrl,
-	          coverUrl,
-	          durationSec: finalDurationSec,
+	          taskId,
+	          status: 'completed',
+	          url: buildSignedVideoUrl(taskId, user.id).url,
+		          protectedUrl,
+		          filename: videoNames.filename,
+		          displayName: videoNames.displayName,
+		          downloadFilename: videoNames.downloadFilename,
+		          coverUrl,
+		          durationSec: finalDurationSec,
 	          realDurationSec: tempoProbe.realDurationSec,
 	          mode,
 	          videoWarnings: tempoProbe.videoWarnings,
@@ -1619,12 +1689,15 @@ export async function generateVideo(
 		        db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
 	        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
 	        return {
-          taskId,
-          status: 'upstream_pending',
-          provider: 'volcengine_seedance_video',
-          providerTaskId: remoteId,
-          durationSec: dur,
-          mode: 'real',
+	          taskId,
+	          status: 'upstream_pending',
+	          provider: 'volcengine_seedance_video',
+	          providerTaskId: remoteId,
+	          filename: videoNames.filename,
+	          displayName: videoNames.displayName,
+	          downloadFilename: videoNames.downloadFilename,
+	          durationSec: dur,
+	          mode: 'real',
           videoAudit,
         };
       }
@@ -1832,12 +1905,15 @@ export async function generateVideo(
 	    durationSec: finalDurationSec,
 	  });
 
-  return {
-    taskId,
-    status: 'completed',
-    url: buildSignedVideoUrl(taskId, user.id).url,
-    protectedUrl,
-	      coverUrl,
+	  return {
+	    taskId,
+	    status: 'completed',
+	    url: buildSignedVideoUrl(taskId, user.id).url,
+	    protectedUrl,
+	    filename: videoNames.filename,
+	    displayName: videoNames.displayName,
+	    downloadFilename: videoNames.downloadFilename,
+		      coverUrl,
 	      durationSec: finalDurationSec,
 	      realDurationSec: tempoProbe.realDurationSec,
 	      mode,
@@ -2528,7 +2604,8 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
   const taskId = String(row.id);
   const ownerDir = join(VIDEOS_DIR, String(user.id));
   mkdirSync(ownerDir, { recursive: true });
-  const filename = row.filename || `${taskId}.mp4`;
+  const videoNames = resolveVideoNamesForRecoveredRow(user, row);
+  const filename = videoNames.filename || row.filename || `${taskId}.mp4`;
   const fullPath = join(ownerDir, filename);
 
   const buf = await retryDownload(videoUrl);
@@ -2626,9 +2703,12 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 		        groupIdx,
 		        shotIndices,
 		        taskId,
-	        status: 'completed',
-	        url: protectedUrl,
-	        coverUrl,
+		        status: 'completed',
+		        url: protectedUrl,
+		        filename: videoNames.filename,
+		        displayName: videoNames.displayName,
+		        downloadFilename: videoNames.downloadFilename,
+		        coverUrl,
 	        durationSec,
 	        tempoBudget: tempoBudget || previousTask.tempoBudget,
 	        warnings,
@@ -2640,10 +2720,13 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 	        ...sb,
 	        idx: groupIdx,
 	        shotIdx: firstShotForWrite?.idx ?? shotIndices[0] + 1,
-	        shotIndices,
-	        videoUrl: protectedUrl,
-	        videoTaskId: taskId,
-	        videoDurationSec: durationSec || sb.videoDurationSec,
+		        shotIndices,
+		        videoUrl: protectedUrl,
+		        videoTaskId: taskId,
+		        videoFilename: videoNames.filename,
+		        videoDisplayName: videoNames.displayName,
+		        videoDownloadFilename: videoNames.downloadFilename,
+		        videoDurationSec: durationSec || sb.videoDurationSec,
 	        videoWarnings: warnings,
 	      };
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-task-recovery');
@@ -2651,10 +2734,13 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
     });
   }
 
-  return {
-    taskId,
-	    protectedUrl,
-	    coverUrl,
+	  return {
+	    taskId,
+		    protectedUrl,
+		    filename: videoNames.filename,
+		    displayName: videoNames.displayName,
+		    downloadFilename: videoNames.downloadFilename,
+		    coverUrl,
 	    durationSec,
 	    realDurationSec: tempoProbe.realDurationSec,
 	    videoWarnings: tempoProbe.videoWarnings,
@@ -2739,16 +2825,22 @@ export function createSeedanceVideoProviderAdapter(): ProviderTaskAdapter {
               type: 'video_segment',
               groupIdx: videoRow.group_idx,
               url: final.protectedUrl,
-              coverUrl: final.coverUrl,
-              durationSec: final.durationSec,
-              taskId: final.taskId,
-            },
-            extra: {
-              mode: final.mode,
-              groupIdx: videoRow.group_idx,
-              durationSec: final.durationSec,
-              protectedUrl: final.protectedUrl,
-            },
+	              coverUrl: final.coverUrl,
+	              durationSec: final.durationSec,
+	              filename: final.filename,
+	              displayName: final.displayName,
+	              downloadFilename: final.downloadFilename,
+	              taskId: final.taskId,
+	            },
+	            extra: {
+	              mode: final.mode,
+	              groupIdx: videoRow.group_idx,
+	              durationSec: final.durationSec,
+	              protectedUrl: final.protectedUrl,
+	              filename: final.filename,
+	              displayName: final.displayName,
+	              downloadFilename: final.downloadFilename,
+	            },
           },
           raw: j,
         };

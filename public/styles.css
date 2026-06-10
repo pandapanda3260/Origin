@@ -4140,6 +4140,30 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   gap: 10px;
   flex-wrap: nowrap;
 }
+/* 点击后立刻有可见变化：禁用态变灰、不可点 */
+.batch-primary-action:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: 0 6px 14px rgba(7, 20, 38, 0.12);
+}
+.batch-primary-action:disabled:hover {
+  opacity: 0.55;
+  transform: none;
+}
+/* 生成前准备阶段的状态提示（同步/连续性检查/提交），由 videoTasks.js 控制显隐 */
+.batch-generate-hint {
+  margin: -6px 0 12px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 650;
+  color: #475569;
+  animation: batchGenerateHintPulse 1.6s ease-in-out infinite;
+}
+@keyframes batchGenerateHintPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
 .batch-stat-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(150px, 1fr));

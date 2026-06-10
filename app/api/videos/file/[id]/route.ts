@@ -5,6 +5,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { verifySignedVideoUrl } from '@/lib/signed-asset-url';
 import { dataPath } from '@/lib/runtime-paths';
+import { buildVideoSegmentContentDisposition, buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -22,7 +23,12 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   if (!id || !/^[a-zA-Z0-9-]+$/.test(id)) return new Response('bad id', { status: 400 });
 
   const db = getDb();
-  const row = db.prepare<{ id: string }, any>('SELECT * FROM video_tasks WHERE id = @id').get({ id });
+  const row = db.prepare<{ id: string }, any>(
+    `SELECT vt.*, p.title AS project_title, p.data_json AS project_data_json
+       FROM video_tasks vt
+       LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+      WHERE vt.id = @id`,
+  ).get({ id });
   if (!row || !row.filename) return new Response('not found', { status: 404 });
 
   const user = await getCurrentUser(req);
@@ -45,6 +51,8 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
   const stat = statSync(fullPath);
   const total = stat.size;
   const range = req.headers.get('range');
+  const names = buildVideoSegmentNamesForRow(row);
+  const contentDisposition = buildVideoSegmentContentDisposition(names.downloadFilename, 'inline');
 
   if (range) {
     const m = /bytes=(\d+)-(\d*)/.exec(range);
@@ -67,8 +75,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
           'Content-Type': 'video/mp4',
           'Content-Range': `bytes ${start}-${end}/${total}`,
           'Accept-Ranges': 'bytes',
-          'Content-Length': String(chunkSize),
-          'Cache-Control': 'private, max-age=3600',
+	          'Content-Length': String(chunkSize),
+	          'Content-Disposition': contentDisposition,
+	          'Cache-Control': 'private, max-age=3600',
         },
       });
     }
@@ -79,9 +88,10 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     status: 200,
     headers: {
       'Content-Type': 'video/mp4',
-      'Content-Length': String(total),
-      'Accept-Ranges': 'bytes',
-      'Cache-Control': 'private, max-age=3600',
+	      'Content-Length': String(total),
+	      'Accept-Ranges': 'bytes',
+	      'Content-Disposition': contentDisposition,
+	      'Cache-Control': 'private, max-age=3600',
     },
   });
 }

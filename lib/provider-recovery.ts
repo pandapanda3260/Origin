@@ -405,6 +405,85 @@ export async function pollBatchProviderTask(opts: {
   }
 }
 
+export function resumeReviewProviderTasksForPolling(opts: {
+  provider: ProviderRecoveryKey;
+  limit?: number;
+  nowMs?: number;
+}) {
+  const nowMs = opts.nowMs ?? Date.now();
+  const at = isoFromMs(nowMs);
+  const limit = Math.max(1, Math.min(100, Math.floor(opts.limit ?? 25)));
+  const rows = getDb()
+    .prepare<{ provider: string; limit: number }, {
+      id: string;
+      batch_id: string;
+      status_reason: string | null;
+      error_msg: string | null;
+      error_message: string | null;
+    }>(
+      `SELECT id, batch_id, status_reason, error_msg, error_message
+         FROM batch_tasks
+        WHERE status = 'needs_review'
+          AND provider = @provider
+          AND provider_task_id IS NOT NULL
+          AND provider_task_id != ''
+          AND (
+            COALESCE(status_reason, '') LIKE '%provider state requires review%'
+            OR COALESCE(status_reason, '') LIKE '%provider reconciliation%'
+            OR COALESCE(error_msg, '') LIKE '%provider state requires review%'
+            OR COALESCE(error_msg, '') LIKE '%provider reconciliation%'
+            OR COALESCE(error_message, '') LIKE '%provider state requires review%'
+            OR COALESCE(error_message, '') LIKE '%provider reconciliation%'
+          )
+        ORDER BY updated_at ASC
+        LIMIT @limit`,
+    )
+    .all({ provider: opts.provider, limit });
+
+  const resumed: string[] = [];
+  const batchIds = new Set<string>();
+  for (const row of rows) {
+    const previousReason = row.status_reason || row.error_msg || row.error_message || '';
+    try {
+      const update = getDb()
+        .prepare(
+          `UPDATE batch_tasks
+              SET runner_id = NULL,
+                  lease_expires_at = NULL,
+                  heartbeat_at = NULL,
+                  cancel_requested_at = NULL,
+                  next_retry_at = NULL,
+                  error_msg = NULL,
+                  error_message = NULL,
+                  last_checked_at = COALESCE(last_checked_at, @at),
+                  updated_at = @at
+            WHERE id = @taskId
+              AND status = 'needs_review'`,
+        )
+        .run({ taskId: row.id, at });
+      if (update.changes !== 1) continue;
+      transitionTaskStatus({
+        taskId: row.id,
+        from: 'needs_review',
+        to: 'upstream_pending',
+        reason: `provider_review_resumed:${opts.provider}`,
+        actor: 'provider-recovery',
+        meta: { previousReason },
+        nowMs,
+      });
+      resumed.push(row.id);
+      batchIds.add(row.batch_id);
+    } catch (error) {
+      console.error('[provider-recovery] resume review task failed:', row.id, error);
+    }
+  }
+
+  for (const batchId of batchIds) {
+    finalizeBatchFromTasks(batchId);
+  }
+  return { resumed: resumed.length, taskIds: resumed };
+}
+
 export async function pollDueBatchProviderTasks(opts: {
   provider: ProviderRecoveryKey;
   adapter: ProviderTaskAdapter;

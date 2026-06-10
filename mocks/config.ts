@@ -13,7 +13,8 @@ export const MOCK_CLIENT_CONFIG = {
     creditWarningThreshold: 10,
   },
   limits: {
-    maxProjects: 100,
+    // maxProjects 不再写死在这里：由 /api/config/client 按会员档（PLANS[].limits.projects）
+    // 动态下发，见 docs/series-episode-continue-plan.md §6.5。
     maxConcurrentVideoTasks: 4,
     maxAssetCount: 200,
   },

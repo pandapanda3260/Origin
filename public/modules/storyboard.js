@@ -88,6 +88,27 @@ function _keyframeRemainingSeconds(done, fail, total, startTs) {
   return Math.max(1, Math.ceil(pending * avg / _keyframeProgressConcurrency()));
 }
 
+// ETA 单调钳制：估算值 = 已耗时/已完成 的动态均值，两次完成之间没有新事件时
+// 均值被持续拉大，"约剩 8 秒"会回升到 13、18——倒计时上涨非常怪。
+// 这里记住上次显示值并按墙钟自然倒数（-1/秒），新估算只有更小（来了新完成）
+// 才允许跳变；同一轮生成用 total+startTs 做签名，换批/换轮自动重置。
+var _kfEtaClamp = { signature: "", remain: 0, wallTs: 0 };
+
+function _clampKeyframeEta(fresh, total, startTs) {
+  if (!(fresh > 0)) return fresh;
+  var sig = String(total || 0) + ":" + String(startTs || 0);
+  var now = Date.now();
+  if (_kfEtaClamp.signature !== sig) {
+    _kfEtaClamp = { signature: sig, remain: fresh, wallTs: now };
+    return fresh;
+  }
+  var decayed = Math.max(1, Math.round(_kfEtaClamp.remain - (now - _kfEtaClamp.wallTs) / 1000));
+  var next = Math.min(decayed, fresh);
+  _kfEtaClamp.remain = next;
+  _kfEtaClamp.wallTs = now;
+  return next;
+}
+
 function _formatKeyframeProgress(done, total, fail, startTs) {
   total = Math.max(0, Number(total) || 0);
   done = Math.max(0, Number(done) || 0);
@@ -95,7 +116,7 @@ function _formatKeyframeProgress(done, total, fail, startTs) {
   var visibleDone = Math.min(total || done + fail, done + fail);
   var lines = ["生成中… " + visibleDone + "/" + (total || "?")];
   if (fail > 0) lines.push(fail + " 张失败");
-  var remain = _keyframeRemainingSeconds(done, fail, total, startTs);
+  var remain = _clampKeyframeEta(_keyframeRemainingSeconds(done, fail, total, startTs), total, startTs);
   if (remain > 0) lines.push("约剩 " + remain + " 秒");
   return lines.join("，");
 }
@@ -270,6 +291,18 @@ function _isStoryboardBatchTerminalStatus(status) {
 function _clearStoryboardReattachRunning(projectId, batchId) {
   if (!projectId || !batchId) return;
   delete _storyboardReattachRunningByBatch[_storyboardBatchKey(projectId, batchId)];
+}
+
+/**
+ * 主流程（generateAllImages / generateAllTailFrames / 单卡重生成）启动批次后
+ * 立即登记：本前端已有活订阅。否则周期性 reconcile（interval/focus）会对同一个
+ * running 批再挂一个 reattach 订阅——两个 1s tick 用不同口径（跨批 vs 单批）
+ * 交替写标题进度行，表现为 "7/18" 和 "0/10" 半秒闪烁。
+ * 终态时 _shouldSkipStoryboardRunningReattach 的 terminal 分支会自动清掉该 key。
+ */
+function _markStoryboardBatchLocallyAttached(projectId, batchId) {
+  if (!projectId || !batchId) return;
+  _storyboardReattachRunningByBatch[_storyboardBatchKey(projectId, batchId)] = true;
 }
 
 function _markStoryboardBatchActivity() {
@@ -7266,6 +7299,17 @@ function _syncMergedStoryboardConfirmState(groups) {
   if (!topArea || !topBtn || !project || !project.shots || !project.shots.length) return;
 
   groups = groups || getStoryboardGroups();
+  // 确认链在飞期间（SSE/对账触发的重渲染会走到这里）保持忙态，
+  // 防止把按钮冲回可点状态造成二次入口。
+  if (_confirmImagesInFlight) {
+    topArea.hidden = false;
+    topBtn.disabled = true;
+    topBtn.innerHTML =
+      '<span class="shots-step-number">III</span>' +
+      '<span>确认中…</span>';
+    topBtn.title = "正在确认分镜图，请稍候";
+    return;
+  }
   var allFirstFramesReady = _allFirstFramesReady(groups);
   topArea.hidden = false;
   delete topBtn.dataset.confirmMode;
@@ -7399,6 +7443,7 @@ export async function generateStoryboardSheet(gIdx, opts) {
     showToast("首帧图 #" + (gIdx + 1) + " 生成失败: " + _diagnoseApiError(fErr), "error");
     return;
   }
+  _markStoryboardBatchLocallyAttached(originId, startResp.batchId);
   if (opts.applyEditDraft === true) _sbMarkFirstFrameCardPromptDraftCommitPending(gIdx);
 
   return new Promise(function (resolve) {
@@ -7780,6 +7825,7 @@ export async function generateStoryboardTailFrame(gIdx) {
     _clearFailedTailFrameLocally(gIdx, fErr, null, originId);
     return;
   }
+  _markStoryboardBatchLocallyAttached(originId, startResp.batchId);
 
   return new Promise(function (resolve) {
     var settled = false;
@@ -8009,6 +8055,7 @@ export async function generateAllTailFrames(opts) {
     _setTailFramesGenerating(false);
     return;
   }
+  _markStoryboardBatchLocallyAttached(originId, startResp.batchId);
   var externalProgressState = opts.progressState && typeof opts.progressState === 'object'
     ? opts.progressState
     : null;
@@ -8355,6 +8402,7 @@ export async function generateAllImages() {
       targets: targets,
       applyEditDraft: true,
     });
+    if (startResp && startResp.batchId) _markStoryboardBatchLocallyAttached(originId, startResp.batchId);
     _sbMarkFirstFrameCardPromptDraftCommitPendingForTargets(targets);
   } catch (e) {
     console.error('[generateAllImages] /api/batch/start failed:', e);
@@ -8577,9 +8625,41 @@ export async function generateAllImages() {
   });
 }
 
-export async function confirmImages() {
-  if (!project || !project.shots) { showToast("请先生成首帧图", "warn"); return; }
+// "确认分镜图"在飞标记：整条确认链是 2~4 个串行网络往返（保存镜头表 flush /
+// compute-stale 复核 / preflight / 整包 PUT），期间按钮若不锁、无忙态，用户会
+// 以为没点上而连点 → 并发跑出 N 条确认链：PUT 互相 409、toast 连环弹、最后
+// 突然跳页。守卫 + 忙态从根上掐掉并发入口。
+var _confirmImagesInFlight = false;
 
+function _setConfirmShotsBusy(busy) {
+  if (busy) {
+    var btn = $("btnConfirmShots");
+    if (!btn) return;
+    btn.disabled = true;
+    btn.innerHTML =
+      '<span class="shots-step-number">III</span>' +
+      '<span>确认中…</span>';
+    btn.title = "正在确认分镜图，请稍候";
+    return;
+  }
+  // 恢复走权威渲染，保证 disabled/文案与真实项目状态一致。
+  checkImagesConfirm();
+}
+
+export async function confirmImages() {
+  if (_confirmImagesInFlight) return;
+  if (!project || !project.shots) { showToast("请先生成首帧图", "warn"); return; }
+  _confirmImagesInFlight = true;
+  _setConfirmShotsBusy(true);
+  try {
+    await _confirmImagesInner();
+  } finally {
+    _confirmImagesInFlight = false;
+    _setConfirmShotsBusy(false);
+  }
+}
+
+async function _confirmImagesInner() {
   var accepted = await _acceptShotPlanForStoryboard();
   if (!accepted) return;
 
@@ -8664,6 +8744,28 @@ export async function confirmImages() {
       _rollbackConfirmState();
       showToast("确认失败：项目保存失败，请稍后重试", "error");
       return;
+    }
+    if (saved && saved.ok === false && saved.stale === true) {
+      // 409 stale：flushServerSave 已用服务器最新整包替换内存（批量刚完成时
+      // 后端 apply_patch_and_save 抢先 bump version 是常态，不是真冲突）。
+      // 本次 PUT 被丢弃 = 确认标记没落盘。在重载后的新副本上重打标记，
+      // 用对齐后的 version 再 flush 一次；二连败才按真失败回滚。
+      _syncRefs();
+      if (!project || !project.shots) {
+        showToast("确认失败：项目状态已变化，请重试", "error");
+        return;
+      }
+      prevShotsApproved = project.shotsApproved;
+      prevImagesApproved = project.imagesApproved;
+      prevCurrentStep = project.currentStep;
+      project.shotsApproved = true;
+      project.imagesApproved = true;
+      project.currentStep = Math.max(project.currentStep || 0, 5);
+      try {
+        saved = await _ctx.flushServerSave();
+      } catch (e2) {
+        saved = { ok: false };
+      }
     }
     if (saved && saved.ok === false) {
       _rollbackConfirmState();

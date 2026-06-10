@@ -85,5 +85,7 @@ assert(attach.includes('_markAssetBatchRejected(eventKey);'), 'panel rejected ta
 assert(attach.includes('_markAssetBatchFailed(_assetBatchEventKey(data, tgt));'), 'task_failed should mark SSE failed keys');
 assert(attach.includes('snapshotDoneCount = Math.max(snapshotDoneCount, snap.succeeded)'), 'SSE snapshot should update snapshot done count');
 assert(attach.includes('snapshotFailedCount = Math.max(snapshotFailedCount, snap.failed)'), 'SSE snapshot should update snapshot failed count');
+assert(attach.includes('function _clampAssetEta(fresh)'), 'asset ETA needs a monotonic clamp');
+assert(attach.includes('_clampAssetEta(Math.ceil(pending * avgSec / 3))'), 'asset hint ETA must pass through the monotonic clamp');
 
 console.log('asset header hint contract ok');

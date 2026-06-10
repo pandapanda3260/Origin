@@ -78,6 +78,11 @@ const EMPTY_DATA = {
   editData: null as any,
   episodes: [] as any[],
   currentEpisodeIdx: 0,
+  // 部—集逻辑（docs/series-episode-continue-plan.md）：一集=一个任务，
+  // seriesId=该部第一集的项目 id；episodeNumber=本任务是第几集；prevProjectId=上一集任务 id。
+  seriesId: null as any,
+  episodeNumber: null as any,
+  prevProjectId: null as any,
   preferences: null as any,
   scriptConsult: emptyScriptConsultState(),
 };
@@ -375,6 +380,10 @@ function rowToSummary(r: ProjectRow) {
     updatedAt: r.updated_at,
     version: Number(r.version) || 1,
     clientRequestId: data?.clientRequestId,
+    // 部—集字段：任务列表分组/集数计算用（无则为 null，老项目不受影响）
+    seriesId: data?.seriesId || null,
+    episodeNumber: cleanEpisodeNumber(data?.episodeNumber),
+    prevProjectId: data?.prevProjectId || null,
     assetCount: projectSummaryAssetCount(data),
     segmentCount,
     statusCounts,
@@ -517,6 +526,15 @@ export function listProjectsByUser(userId: number) {
   return rows.map(rowToSummary);
 }
 
+/** 配额检查用：只数行，不解析 data_json（docs/series-episode-continue-plan.md §6.5）。 */
+export function countProjectsForUser(userId: number): number {
+  const db = getDb();
+  const row = db
+    .prepare<{ uid: number }, { c: number }>('SELECT COUNT(*) AS c FROM projects WHERE owner_id = @uid')
+    .get({ uid: userId });
+  return Number(row?.c) || 0;
+}
+
 export function getProjectByIdForUser(id: string, userId: number) {
   const perfDiag = process.env.PERF_DIAG === '1';
   const t0 = perfDiag ? performance.now() : 0;
@@ -657,6 +675,9 @@ const NEW_PROJECT_ALLOWED_PAYLOAD_KEYS = new Set([
   'preferences',
   'episodes',
   'currentEpisodeIdx',
+  'seriesId',
+  'episodeNumber',
+  'prevProjectId',
   'clientRequestId',
 ]);
 
@@ -675,6 +696,14 @@ function cleanId(value: any): string | null {
 function cleanPlainObject(value: any): any | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return JSON.parse(JSON.stringify(value));
+}
+
+function cleanEpisodeNumber(value: any): number | null {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.round(n);
+  if (i < 1 || i > 100000) return null;
+  return i;
 }
 
 function buildEmptyEpisode(payload: any) {
@@ -747,6 +776,9 @@ function buildNewProjectData(userId: number, projectId: string, payload: any = {
     editData: null,
     episodes: [buildEmptyEpisode(payload)],
     currentEpisodeIdx: 0,
+    seriesId: cleanId(payload.seriesId),
+    episodeNumber: cleanEpisodeNumber(payload.episodeNumber),
+    prevProjectId: cleanId(payload.prevProjectId),
     preferences: cleanPlainObject(payload.preferences),
     clientRequestId: cleanId(payload.clientRequestId),
   };

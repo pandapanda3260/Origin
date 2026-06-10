@@ -34,12 +34,21 @@ function isWorkerProcess() {
   return process.env.ORIGIN_PROCESS_ROLE === 'worker' || envFlag('WORKER_ENABLED', false);
 }
 
+function expectsExternalWorker() {
+  return envFlag('EXPECT_WORKER', process.env.NODE_ENV === 'production');
+}
+
 // 启动时回收上次进程留下的孤儿 batch/export + 退款
 // 用 globalThis 标记避免 HMR 下重复 reap
 const reapKey = '__qd_batches_reaped__';
 const workerProcess = isWorkerProcess();
-const recoveryEnabled = workerProcess || envFlag('BATCH_RECOVERY_ENABLED', false);
-const reapOnStart = envFlag('REAP_ORPHANS_ON_START', !recoveryEnabled);
+const externalWorkerExpected = expectsExternalWorker();
+const localCoordinatorEnabled =
+  !workerProcess &&
+  !externalWorkerExpected &&
+  envFlag('LOCAL_WORKER_IN_WEB', process.env.NODE_ENV !== 'production');
+const recoveryEnabled = workerProcess || envFlag('BATCH_RECOVERY_ENABLED', false) || localCoordinatorEnabled;
+const reapOnStart = envFlag('REAP_ORPHANS_ON_START', !recoveryEnabled && !externalWorkerExpected);
 
 if (!isNextProductionBuild() && reapOnStart && !(globalThis as any)[reapKey]) {
   (globalThis as any)[reapKey] = true;

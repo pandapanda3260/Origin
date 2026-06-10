@@ -306,7 +306,7 @@ function testSnapshotFirstWorldExportUsesRuntimeOverlay() {
   assert.equal(character.equipment, '');
   assert.equal(character.temperament, '受惊');
   assert.equal(character.actionTraits, '直线坠落');
-  assert.equal(character.canonicalPrompt, '');
+  assert.ok(!character.canonicalPrompt, 'canonicalPrompt 应被资产权威清空');
   assert.ok(!/餐巾|餐布|筷子|火锅|涮肉|顾客/.test(JSON.stringify(character)), JSON.stringify(character));
 }
 
@@ -352,8 +352,9 @@ function testProjectWorldExportUsesAssetsCharactersWhenTopMissing() {
   assert.equal(character.name, '接引长老');
   assert.ok(!JSON.stringify(character.aliases || []).includes('涮肉'), JSON.stringify(character.aliases));
   assert.equal(character.clothing, '灰色宽袖长袍');
-  assert.equal(character.equipment, '');
-  assert.equal(character.canonicalPrompt, '');
+  // 空值字段在导出时不携带（compactWorldEntity），避免 '' 在合并里踩掉另一侧非空值
+  assert.ok(!character.equipment, 'equipment 应为空');
+  assert.ok(!character.canonicalPrompt, 'canonicalPrompt 应被资产权威清空');
 }
 
 testNonHumanExplicitEmptyFieldsClearDirtyLock();

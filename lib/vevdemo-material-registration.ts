@@ -10,6 +10,7 @@ import {
   type VevDemoMaterialBinding,
 } from './vevdemo-material-bindings';
 import { ensureVevDemoProjectBinding } from './vevdemo-project-registration';
+import { buildVideoSegmentNamesForRow } from './video-segment-names';
 
 const DEFAULT_TIMEOUT_MS = 12 * 60 * 1000;
 const DEFAULT_POLL_MS = 15 * 1000;
@@ -38,6 +39,8 @@ type VideoTaskRow = {
   group_idx?: number | null;
   prompt?: string | null;
   filename?: string | null;
+  project_title?: string | null;
+  project_data_json?: string | null;
   duration_sec?: number | null;
 };
 
@@ -294,11 +297,13 @@ async function publishMedia({ apiBase, vid }: { apiBase: string; vid: string }) 
 }
 
 function getVideoTask(videoTaskId: string, ownerId: number): VideoTaskRow {
-  const row = getDb().prepare(
-    `SELECT id, owner_id, project_id, group_idx, prompt, filename, duration_sec
-     FROM video_tasks
-     WHERE id = ? AND owner_id = ? AND status = 'completed' AND filename IS NOT NULL`,
-  ).get(videoTaskId, ownerId) as VideoTaskRow | undefined;
+	const row = getDb().prepare(
+	    `SELECT vt.id, vt.owner_id, vt.project_id, vt.group_idx, vt.prompt, vt.filename, vt.duration_sec,
+	            p.title AS project_title, p.data_json AS project_data_json
+	       FROM video_tasks vt
+	       LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	      WHERE vt.id = ? AND vt.owner_id = ? AND vt.status = 'completed' AND vt.filename IS NOT NULL`,
+	  ).get(videoTaskId, ownerId) as VideoTaskRow | undefined;
   if (!row) throw new Error(`video_task not found or not completed: ${videoTaskId}`);
   return row;
 }
@@ -336,7 +341,8 @@ async function registerVideoTaskMaterial(options: RegisterVideoTaskOptions): Pro
   const workflowTemplateId = envValue('VITE_VEV_UPLOAD_WORKFLOW_TEMPLATE_ID');
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   const pollMs = options.pollMs || DEFAULT_POLL_MS;
-  const title = `origin-${row.id}.mp4`;
+	  const names = buildVideoSegmentNamesForRow(row);
+	  const title = names.downloadFilename;
 
   let uploaded = false;
   let vid = existing?.vid || reusableSourceBinding?.vid || '';

@@ -265,6 +265,28 @@ function testWorldSyncDoesNotReuseClaimedExistingLock() {
   assert.ok(result.project.consistency.characters.some((lock: CharacterLock) => lock.characterId === 'world-b' && lock.canonicalName === '新名B'));
 }
 
+function testPreviewOnlyWorldCharacterDoesNotFabricateReference() {
+  // 退化路径：世界观角色只有特写预览（previewUrl/realPhotoUrl/headshot），没有真三视图。
+  // 期望：不把特写伪造成 referenceLock.sheetUrl，也不标 referenceStatus=ready，
+  // 让角色照常走生成链补真三视图。
+  const project = {
+    id: 'proj-preview-only',
+    selectedWorldTemplateId: 'tpl-world',
+    worldTemplateSnapshot: {
+      id: 'tpl-world',
+      characters: [worldCharacter({
+        referencePanels: { headshotUrl: '/world/preview-headshot.png' },
+        previewUrl: '/world/preview-headshot.png',
+        realPhotoUrl: '/world/preview-headshot.png',
+      })],
+    },
+  };
+  const result = syncWorldCharactersIntoConsistency(project, { now });
+  const lock = findLock(result.project);
+  assert.ok(!lock.referenceLock.sheetUrl, `sheetUrl 不应被伪造: ${lock.referenceLock.sheetUrl}`);
+  assert.notEqual(lock.referenceLock.referenceStatus, 'ready');
+}
+
 function testWorldReferenceBackfillPromotesMissingToReady() {
   let project: any = {
     id: 'proj-reference-ready',
@@ -297,6 +319,7 @@ testRepeatedWorldSyncDoesNotMarkChangedWhenNothingChanged();
 testWorldCharacterMatchDoesNotUseSharedRole();
 testWorldIdentityCollisionDoesNotBackfillSoftHumanFieldsIntoNonHumanAsset();
 testWorldSyncDoesNotReuseClaimedExistingLock();
+testPreviewOnlyWorldCharacterDoesNotFabricateReference();
 testWorldReferenceBackfillPromotesMissingToReady();
 
 console.log('[test-world-consistency-sync] all assertions passed');

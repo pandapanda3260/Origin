@@ -20,8 +20,8 @@ import { EPISODE_FIELDS } from './modules/episode_fields.js?v=101';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
-  _renderEpisodeTabs, _openNewEpisodeDialog, _createNewEpisode } from './modules/episodes.js?v=101';
-import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks,
+  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=103';
+import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
   confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
@@ -40,7 +40,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=144';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=147';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -61,10 +61,10 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=158';
+  _openLightbox } from './modules/assets.js?v=163';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=201';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=207';
-import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=106';
+import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=108';
 import { mountPixelCard } from './modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
 import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=8';
@@ -1464,6 +1464,15 @@ var _scriptEditInitialText = "";
       return false;
     }
 
+    return await _finalizeCreatedProject(serverProj);
+  }
+
+  /**
+   * 创建成功后的统一收尾：加入列表 → 激活上下文 → 概览任务列表同步 → 刷新。
+   * createNewProject 与"续写下一集"（episodes.js 新弹窗，经 ctx.finalizeCreatedProject）
+   * 共用这一份，避免双实现漂移（docs/series-episode-continue-plan.md §7）。
+   */
+  async function _finalizeCreatedProject(serverProj) {
     if (_clientFeatureEnabled("projectActivationGuard", true)) {
       addProjectToList(serverProj);
       var activated = await _activateProjectContext(serverProj.id, {
@@ -1957,6 +1966,51 @@ var _scriptEditInitialText = "";
         if (statusEl) statusEl.textContent = batchWatermark.checked ? "有水印" : "无水印";
       });
     }
+  }
+
+  /* ================================================================
+     全局唤醒对账（2026-06）
+     ----------------------------------------------------------------
+     修"切走再回来 / 电脑睡醒 / 网络恢复后，任务完成了页面不刷新"：
+     focus / visibilitychange→visible / online 时把"后台批次重挂/补课"
+     分发到各模块。storyboard 原本就有自己的 reconciler（focus/visibility/
+     interval），这里补 videoPrompts / assets / videoTasks 三家，并给
+     四家都盖上 online 事件。
+     幂等性依据：videoPrompts 有 _vpAttachedBatchesByKey、assets 有
+     _reattachedBatchKeys、storyboard 有 _shouldSkipStoryboardRunningReattach、
+     videoTasks 走 reconcileVideoTasksOnWake（本地有活跃闭包就不动）；
+     /api/batch/active 走 getActiveBatchesShared 共享缓存，一次唤醒
+     不会放大成多个 GET。
+     ================================================================ */
+  var _globalBatchReconcilerBound = false;
+  var _globalBatchReconcileLastAt = 0;
+  function _registerGlobalBatchReconciler() {
+    if (_globalBatchReconcilerBound) return;
+    _globalBatchReconcilerBound = true;
+    // 节流只限"两次对账的最小间隔"（focus/visibilitychange 常成对触发），
+    // 首次触发不等待。5s 与 getActiveBatchesShared 缓存 TTL(5s) 对齐——
+    // 降得更低拿到的也是同一份缓存，没有意义。
+    var THROTTLE_MS = 5000;
+    function run(reason) {
+      if (!project || !project.id) return;
+      if (_projectActivating) return;
+      var now = Date.now();
+      if (now - _globalBatchReconcileLastAt < THROTTLE_MS) return;
+      _globalBatchReconcileLastAt = now;
+      try { reattachVideoPromptBatches("wake:" + reason); }
+      catch (e) { console.warn("[GlobalReconcile] videoPrompts failed:", e); }
+      try { _restoreAssetGenStatus(); }
+      catch (e) { console.warn("[GlobalReconcile] assets failed:", e); }
+      try { reconcileVideoTasksOnWake(reason); }
+      catch (e) { console.warn("[GlobalReconcile] videoTasks failed:", e); }
+      try { reattachStoryboardBatches(); }
+      catch (e) { console.warn("[GlobalReconcile] storyboard failed:", e); }
+    }
+    window.addEventListener("focus", function () { run("focus"); });
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") run("visibilitychange");
+    });
+    window.addEventListener("online", function () { run("online"); });
   }
 
   /* ================================================================
@@ -7491,6 +7545,14 @@ var _scriptEditInitialText = "";
   /* ================================================================
      INIT
      ================================================================ */
+  // 启动链专用：判空绑定。元素缺失只 warn 不 throw——历史上任何一个按钮被
+  // 删掉都会让 init 在裸 $("id").addEventListener 处炸断，症状是整页静默空白。
+  function _bindClick(id, handler) {
+    var el = $(id);
+    if (el) el.addEventListener("click", handler);
+    else console.warn("[Init] 元素缺失，跳过绑定：#" + id);
+  }
+
 	  async function init() {
 	    var session = await ensureSession({ redirectOnInvalid: true, timeoutMs: 5000 });
 	    if (!session || session.status === "invalid") {
@@ -7531,6 +7593,9 @@ var _scriptEditInitialText = "";
         _ensureEpisodes();
         return project;
       },
+      // 续写下一集（一集=一个任务）：复用 createNewProject 的创建收尾，避免双实现漂移
+      finalizeCreatedProject: (p) => _finalizeCreatedProject(p),
+      newClientRequestId: () => _newClientRequestId(),
     });
     initVideoTasks({
       getProject: () => project,
@@ -7870,6 +7935,8 @@ var _scriptEditInitialText = "";
       catch (e) { console.warn("[Init] reattachStoryboardBatches failed:", e); }
       try { registerStoryboardBatchReconciler(); }
       catch (e) { console.warn("[Init] registerStoryboardBatchReconciler failed:", e); }
+      try { _registerGlobalBatchReconciler(); }
+      catch (e) { console.warn("[Init] globalBatchReconciler failed:", e); }
     }
     // Phase 3-B-10：世界观模板搬后端 /api/world-templates，启动时 prime 一次
     try { _primeWorldTemplates(); } catch (e) { console.warn("[Init] primeWorldTemplates failed:", e); }
@@ -7921,7 +7988,7 @@ var _scriptEditInitialText = "";
     } catch (e) { console.error("[ProjectInit]", e); }
 
     /* Script page — chat input */
-    $("btnGenScript").addEventListener("click", handleScriptInput);
+    _bindClick("btnGenScript", handleScriptInput);
     var ideaEl = $("ideaInput");
     if (ideaEl) {
       ideaEl.addEventListener("input", function () { chatAutoResize(ideaEl); });
@@ -8013,14 +8080,14 @@ var _scriptEditInitialText = "";
     });
 
     /* Assets page */
-    $("btnExtractAssets").addEventListener("click", extractAssets);
+    _bindClick("btnExtractAssets", extractAssets);
     var btnExtractAssetsEmpty = $("btnExtractAssetsEmpty");
     if (btnExtractAssetsEmpty) btnExtractAssetsEmpty.addEventListener("click", extractAssets);
-    $("btnGenAssetImages").addEventListener("click", generateAllAssetImages);
-	    $("btnConfirmAssets").addEventListener("click", confirmAssets);
+    _bindClick("btnGenAssetImages", generateAllAssetImages);
+	    _bindClick("btnConfirmAssets", confirmAssets);
 	    var btnConfirmAssetsTop = $("btnConfirmAssetsTop");
 	    if (btnConfirmAssetsTop) btnConfirmAssetsTop.addEventListener("click", confirmAssets);
-	    $("btnCleanObsolete").addEventListener("click", _showCleanObsoleteDialog);
+	    _bindClick("btnCleanObsolete", _showCleanObsoleteDialog);
     var _btnSaveTpl = $("btnSaveWorldTemplate");
     if (_btnSaveTpl) _btnSaveTpl.addEventListener("click", saveAsWorldTemplate);
     var _btnKnowledgeSnapshot = $("btnKnowledgeSnapshot");
@@ -8033,10 +8100,10 @@ var _scriptEditInitialText = "";
     if (propGrid) propGrid.addEventListener("click", handleAssetAction);
 
     /* Shots page */
-    $("btnGenShots").addEventListener("click", generateShots);
+    _bindClick("btnGenShots", generateShots);
     var btnGenShotsEmpty = $("btnGenShotsEmpty");
     if (btnGenShotsEmpty) btnGenShotsEmpty.addEventListener("click", generateShots);
-    $("btnConfirmShots").addEventListener("click", confirmImages);
+    _bindClick("btnConfirmShots", confirmImages);
     var slw = $("shotListWrap");
     if (slw) slw.addEventListener("click", handleShotAction);
     if (slw) slw.addEventListener("click", handleImageAction);
@@ -8058,7 +8125,7 @@ var _scriptEditInitialText = "";
     });
 
     /* Video prompts page (Phase 3) */
-    $("btnGenAllVideoPrompts").addEventListener("click", generateAllVideoPrompts);
+    _bindClick("btnGenAllVideoPrompts", generateAllVideoPrompts);
     var confirmVpTopBtn = $("btnConfirmVideoPromptsTop");
     if (confirmVpTopBtn) confirmVpTopBtn.addEventListener("click", confirmVideoPrompts);
     var vpList = $("videoPromptList");
@@ -8086,7 +8153,7 @@ var _scriptEditInitialText = "";
     }
 
     /* Segment generation page */
-    $("btnStartBatch").addEventListener("click", confirmSegmentsAndEnterEdit);
+    _bindClick("btnStartBatch", confirmSegmentsAndEnterEdit);
     var btnGenerateAllSegments = $("btnGenerateAllSegments");
     if (btnGenerateAllSegments) btnGenerateAllSegments.addEventListener("click", startBatchGeneration);
     var btnImportAllSegments = $("btnImportAllSegments");
@@ -8176,5 +8243,15 @@ var _scriptEditInitialText = "";
     attachAll();
   }
 
-  if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", init); }
-  else { init(); }
+  // 启动兜底：init 是 async，之前裸调用时任何未捕获异常都是 unhandledrejection——
+  // ready 标记设不上、遮罩也没人收，用户看到的就是一张无提示的静默空白页。
+  // 这里兜住：标记 boot ready（让 bootCSS 退场、静态壳可见）+ 把加载层切到错误态（带重试按钮）。
+  function _bootInit() {
+    init().catch(function (e) {
+      console.error("[Init] 启动失败:", e);
+      try { _markWorkspaceBootReady(); } catch (_) {}
+      try { swLoadError(_swStartupToken); } catch (_) {}
+    });
+  }
+  if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", _bootInit); }
+  else { _bootInit(); }

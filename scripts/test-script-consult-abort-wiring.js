@@ -6,10 +6,18 @@ const root = join(__dirname, '..');
 const utilsSource = readFileSync(join(root, 'public/modules/utils.js'), 'utf8');
 const scriptSource = readFileSync(join(root, 'public/modules/script.js'), 'utf8');
 
+// 注：前端超时改造后 apiPostStream 不再把 options.signal 直接塞进 fetch options，
+// 而是 externalSignal → 内部 AbortController 联动（外部 abort 转发进内部 ctl）。
+// 契约改锁这套接线，保护意图不变：外部 AbortController 必须能中断流式请求。
 assert.match(
   utilsSource,
-  /if \(options && options\.signal\) fetchOptions\.signal = options\.signal;/,
-  'apiPostStream must pass AbortController.signal into fetch options',
+  /const externalSignal = options\.signal;/,
+  'apiPostStream must read the external AbortController signal from options',
+);
+assert.match(
+  utilsSource,
+  /function onExternalAbort\(\)/,
+  'apiPostStream must forward external aborts into its internal controller',
 );
 
 assert.match(

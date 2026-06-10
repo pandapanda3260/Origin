@@ -13,7 +13,9 @@ export const PLANS = [
     price_cents: 0,
     billing_cycle: 'month',
     monthly_credits: 100,
-    limits: { concurrency: 1, projects: 5, storageGB: 1 },
+    // projects = 任务数上限，后端 POST /api/projects 权威拦截 + /api/config/client 按档下发
+    //（docs/series-episode-continue-plan.md §6.5，2026-06-10 拍板 Free100/Plus1000/Pro5000）
+    limits: { concurrency: 1, projects: 100, storageGB: 1 },
     features: { models: ['基础模型'], priority: 'normal', support: '社区' },
   },
   {
@@ -23,7 +25,7 @@ export const PLANS = [
     price_cents: 9900,
     billing_cycle: 'month',
     monthly_credits: 2000,
-    limits: { concurrency: 4, projects: 50, storageGB: 50 },
+    limits: { concurrency: 4, projects: 1000, storageGB: 50 },
     features: { models: ['全部模型'], priority: 'fast', support: '邮件' },
   },
   {
@@ -33,7 +35,7 @@ export const PLANS = [
     price_cents: 29900,
     billing_cycle: 'month',
     monthly_credits: 8000,
-    limits: { concurrency: 10, projects: 500, storageGB: 500 },
+    limits: { concurrency: 10, projects: 5000, storageGB: 500 },
     features: { models: ['全部模型 + 4K'], priority: 'priority', support: '专属客服' },
   },
 ];

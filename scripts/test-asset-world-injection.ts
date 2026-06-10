@@ -63,6 +63,21 @@ const worldTemplateSnapshot = {
         sheetUrl: '/world/crowd-sheet.png',
       },
     },
+    {
+      // 退化路径：模板角色只有特写预览，没有真三视图（referencePanels.sheetUrl）。
+      // 期望：文本照常注入，但绝不把特写伪造成 sheetUrl/卡面图，也不标 ready，
+      // 让角色留在"待生成"走正常生成链。
+      characterId: 'world-preview-only',
+      name: '特写候选',
+      role: '预览角色',
+      entityType: 'human',
+      appearance: '只有特写的候选',
+      previewUrl: '/world/preview-headshot.png',
+      realPhotoUrl: '/world/preview-headshot.png',
+      referencePanels: {
+        headshotUrl: '/world/preview-headshot.png',
+      },
+    },
   ],
   locations: [
     {
@@ -130,6 +145,13 @@ const assets = {
       isCrowd: true,
       appearance: 'LLM 群像',
     },
+    {
+      id: 'c6',
+      name: '特写候选',
+      role: 'LLM 角色',
+      entityType: 'human',
+      appearance: 'LLM 外观',
+    },
   ],
   scenes: [
     {
@@ -175,8 +197,11 @@ assert.equal(xiao.temperament, '沉静');
 assert.equal(xiao.actionTraits, '缓步上前');
 assert.equal(xiao.clothing, '本集青色短袍');
 assert.equal(xiao.equipment, '本集无装备');
-assert.equal(xiao.realPhotoUrl, '/api/images/file/11111111-1111-1111-1111-111111111111');
+// 资产契约：imageUrl/rawUrl/realPhotoUrl 三字段同源 = 三视图原图（不再把模板的特写预览写进 realPhotoUrl）
+assert.equal(xiao.realPhotoUrl, '/api/images/file/22222222-2222-2222-2222-222222222222');
+assert.equal(xiao.rawUrl, '/api/images/file/22222222-2222-2222-2222-222222222222');
 assert.equal(xiao.imageUrl, '/api/images/file/22222222-2222-2222-2222-222222222222');
+assert.equal(xiao.previewUrl, undefined);
 assert.equal(xiao.reference.status, 'ready');
 assert.equal(xiao.panels.schema, 'human-character-sheet-v1');
 assert.equal(xiao.panels.sheetUrl, '/api/images/file/22222222-2222-2222-2222-222222222222');
@@ -202,6 +227,17 @@ assert.equal(crowd.role, '考核者群体');
 assert.equal(crowd.panels.schema, 'anonymous-crowd-reference-v1');
 assert.equal(crowd.panels.sheetUrl, '/world/crowd-sheet.png');
 
+// 退化路径：模板只有特写预览（无真三视图）→ 文本注入、图保持待生成
+const previewOnly = result.assets.characters[5];
+assert.equal(previewOnly.role, '预览角色');
+assert.equal(previewOnly.appearance, '只有特写的候选');
+assert.equal(previewOnly.imageUrl, undefined);
+assert.equal(previewOnly.rawUrl, undefined);
+assert.equal(previewOnly.realPhotoUrl, undefined);
+assert.equal(previewOnly.previewUrl, undefined);
+assert.equal(previewOnly.panels, undefined);
+assert.equal(previewOnly.reference, undefined);
+
 const scene = result.assets.scenes[0];
 assert.equal(scene.description, '云海高台与青灰石阶');
 assert.equal(scene.atmosphere, '肃穆宏大');
@@ -219,7 +255,7 @@ assert.match(prop.features, /用于入门考核判定神迹/);
 assert.match(prop.features, /LLM 石纹/);
 assert.equal(prop.imageUrl, '/world/slate.png');
 
-assert.equal(result.stats.characters.injected, 3);
+assert.equal(result.stats.characters.injected, 4);
 assert.equal(result.stats.characters.imageFilled, 2);
 assert.equal(result.stats.scenes.injected, 1);
 assert.equal(result.stats.props.injected, 1);

@@ -522,10 +522,27 @@ export function syncEditProject(p) {
     return _protectedVideoUrlFrom(url) || _protectedUploadUrlFrom(url);
   }
 
-  function _segPersistedVideoUrl(seg) {
-    if (!seg) return '';
-    return seg._originVideoUrl || seg.protectedUrl || _protectedMediaUrlFrom(seg.videoUrl) || seg.videoUrl || '';
-  }
+	  function _segPersistedVideoUrl(seg) {
+	    if (!seg) return '';
+	    return seg._originVideoUrl || seg.protectedUrl || _protectedMediaUrlFrom(seg.videoUrl) || seg.videoUrl || '';
+	  }
+
+	  function _videoNameMetaForGroup(groupIdx) {
+	    var sb = project && Array.isArray(project.storyboards) ? (project.storyboards[groupIdx] || {}) : {};
+	    var vt = project && Array.isArray(project.videoTasks) ? (project.videoTasks[groupIdx] || {}) : {};
+	    var displayName = sb.videoDisplayName || vt.displayName || "";
+	    var filename = sb.videoFilename || vt.filename || "";
+	    var downloadFilename = sb.videoDownloadFilename || vt.downloadFilename || filename || "";
+	    if (!displayName && filename) displayName = String(filename).replace(/\.mp4$/i, "");
+	    return { displayName: displayName, filename: filename, downloadFilename: downloadFilename };
+	  }
+
+	  function _entryDisplayName(seg, fallbackGroupIdx) {
+	    if (seg && (seg.displayName || seg._mediaName || seg.name)) return seg.displayName || seg._mediaName || seg.name;
+	    var gIdx = seg && seg.groupIdx != null ? Number(seg.groupIdx) : fallbackGroupIdx;
+	    var meta = Number.isFinite(gIdx) ? _videoNameMetaForGroup(gIdx) : {};
+	    return meta.displayName || ("片段 " + ((Number.isFinite(gIdx) ? gIdx : 0) + 1));
+	  }
 
   async function _hydrateVideoEntryUrl(entry) {
     if (!entry) return;
@@ -642,13 +659,18 @@ export function syncEditProject(p) {
 	      if (sb.videoIsCurrent === false || (vt && vt.isCurrent === false)) continue;
 	      if (sb.importedToEdit !== true) continue;
       var shots = g.shots || [];
-      var dur = _resolveGroupImportDuration(gi);
-      segs.push({
-        groupIdx: g.groupIdx != null ? g.groupIdx : gi,
-        videoUrl: sb.videoUrl,
-        protectedUrl: _segPersistedVideoUrl(sb),
-        _originVideoUrl: _segPersistedVideoUrl(sb),
-        thumbnailUrl: sb.imageUrl || sb.rawUrl || "",
+	      var dur = _resolveGroupImportDuration(gi);
+	      var nameMeta = _videoNameMetaForGroup(gi);
+	      segs.push({
+	        groupIdx: g.groupIdx != null ? g.groupIdx : gi,
+	        videoUrl: sb.videoUrl,
+	        protectedUrl: _segPersistedVideoUrl(sb),
+	        _originVideoUrl: _segPersistedVideoUrl(sb),
+	        filename: nameMeta.filename,
+	        displayName: nameMeta.displayName,
+	        downloadFilename: nameMeta.downloadFilename,
+	        _mediaName: nameMeta.displayName,
+	        thumbnailUrl: sb.imageUrl || sb.rawUrl || "",
         shotIndices: g.shotIndices || [],
         duration: dur || 5,
         shots: shots,
@@ -830,14 +852,19 @@ export function syncEditProject(p) {
       var exists = _editState.edl.timeline.some(function (e) {
         return e && e.groupIdx === groupIdx;
       });
-      if (!exists) {
-        var dur = _sumGroupDuration(groupIdx);
-        _editState.edl.timeline.push({
-          groupIdx: groupIdx,
-          videoUrl: sb.videoUrl,
-          protectedUrl: _segPersistedVideoUrl(sb),
-          _originVideoUrl: _segPersistedVideoUrl(sb),
-          inPoint: 0,
+	      if (!exists) {
+	        var dur = _sumGroupDuration(groupIdx);
+	        var nameMeta = _videoNameMetaForGroup(groupIdx);
+	        _editState.edl.timeline.push({
+	          groupIdx: groupIdx,
+	          videoUrl: sb.videoUrl,
+	          protectedUrl: _segPersistedVideoUrl(sb),
+	          _originVideoUrl: _segPersistedVideoUrl(sb),
+	          filename: nameMeta.filename,
+	          displayName: nameMeta.displayName,
+	          downloadFilename: nameMeta.downloadFilename,
+	          _mediaName: nameMeta.displayName,
+	          inPoint: 0,
           outPoint: dur,
           duration: dur,
           transitionIn: { type: "cut", duration: 0 },
@@ -854,10 +881,17 @@ export function syncEditProject(p) {
       var trustedDur = _resolveTrustedActualDuration(groupIdx);
       _editState.edl.timeline.forEach(function (entry) {
         if (!entry || entry.groupIdx !== groupIdx) return;
-        entry.videoUrl = sb.videoUrl;
-        entry.protectedUrl = _segPersistedVideoUrl(sb);
-        entry._originVideoUrl = _segPersistedVideoUrl(sb);
-        if (trustedDur > 0 && (!entry.inPoint || Number(entry.inPoint) === 0)) {
+	        entry.videoUrl = sb.videoUrl;
+	        entry.protectedUrl = _segPersistedVideoUrl(sb);
+	        entry._originVideoUrl = _segPersistedVideoUrl(sb);
+	        var refreshedNameMeta = _videoNameMetaForGroup(groupIdx);
+	        if (refreshedNameMeta.filename) entry.filename = refreshedNameMeta.filename;
+	        if (refreshedNameMeta.displayName) {
+	          entry.displayName = refreshedNameMeta.displayName;
+	          entry._mediaName = refreshedNameMeta.displayName;
+	        }
+	        if (refreshedNameMeta.downloadFilename) entry.downloadFilename = refreshedNameMeta.downloadFilename;
+	        if (trustedDur > 0 && (!entry.inPoint || Number(entry.inPoint) === 0)) {
           entry.duration = trustedDur;
           entry.outPoint = trustedDur;
         }
@@ -1261,7 +1295,8 @@ export function syncEditProject(p) {
       var dur = _segDuration(seg);
       var w = _timelineDurationWidth(dur, pps);
       var left = _timelineSegmentLeft(starts[i], i, pps);
-      var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
+	      var gIdx = seg.groupIdx != null ? seg.groupIdx : i;
+	      var segName = _entryDisplayName(seg, gIdx);
 
       var tag = null;
       if (_editState.segmentTags && _editState.segmentTags.segments) {
@@ -1294,7 +1329,7 @@ export function syncEditProject(p) {
       block.style.bottom = "0";
       block.style.borderColor = color;
       block.dataset.segIdx = i;
-      block.title = "片段 " + (gIdx + 1) + " · " + dur.toFixed(1) + "s";
+	      block.title = segName + " · " + dur.toFixed(1) + "s";
 
       /* filmstrip background */
       var filmstripHtml = '<div class="edit-seg-filmstrip" data-gidx="' + gIdx + '"></div>';
@@ -1310,7 +1345,7 @@ export function syncEditProject(p) {
         '<div class="edit-seg-color-bar" style="background:' + color + '"></div>' +
         filmstripHtml +
         '<div class="edit-seg-overlay">' +
-          '<span class="edit-seg-label">' + (gIdx + 1) + '</span>' +
+	          '<span class="edit-seg-label">' + (gIdx + 1) + '</span>' +
           emotionHtml +
           '<span class="edit-seg-dur">' + dur.toFixed(1) + 's</span>' +
         '</div>' +
@@ -4491,15 +4526,18 @@ export function syncEditProject(p) {
         return;
       }
       segs.forEach(function (seg, i) {
-        var card = _buildMediaCard({
-          type: "clip",
-          idx: seg.groupIdx != null ? seg.groupIdx : i,
-          name: "片段 " + ((seg.groupIdx != null ? seg.groupIdx : i) + 1),
-          thumbUrl: seg.thumbnailUrl || "",
-          videoUrl: seg.videoUrl || "",
-          protectedUrl: _segPersistedVideoUrl(seg),
-          duration: seg.duration || 5,
-        });
+	        var card = _buildMediaCard({
+	          type: "clip",
+	          idx: seg.groupIdx != null ? seg.groupIdx : i,
+	          name: _entryDisplayName(seg, seg.groupIdx != null ? seg.groupIdx : i),
+	          thumbUrl: seg.thumbnailUrl || "",
+	          videoUrl: seg.videoUrl || "",
+	          protectedUrl: _segPersistedVideoUrl(seg),
+	          filename: seg.filename || "",
+	          displayName: seg.displayName || "",
+	          downloadFilename: seg.downloadFilename || "",
+	          duration: seg.duration || 5,
+	        });
         list.appendChild(card);
       });
     } else {
@@ -4570,9 +4608,12 @@ export function syncEditProject(p) {
         videoUrl: info.videoUrl,
         protectedUrl: info.protectedUrl || info.videoUrl,
         duration: info.duration,
-        mediaId: info.mediaId,
-        name: info.name,
-        kind: info.kind,
+	        mediaId: info.mediaId,
+	        name: info.name,
+	        filename: info.filename,
+	        displayName: info.displayName,
+	        downloadFilename: info.downloadFilename,
+	        kind: info.kind,
       }));
       ev.dataTransfer.effectAllowed = "copy";
     });
@@ -4723,8 +4764,11 @@ export function syncEditProject(p) {
     var kind = item.kind || _kindFromMime(mime);
     return {
       id: item.mediaId || item.id || "",
-      name: item.title || item.name || item.filename || "",
-      url: item.url || "",
+	      name: item.title || item.name || item.filename || "",
+	      filename: item.filename || "",
+	      displayName: item.displayName || item.display_name || item.title || item.name || "",
+	      downloadFilename: item.downloadFilename || item.download_filename || item.filename || "",
+	      url: item.url || "",
       protectedUrl: item.protectedUrl || item.url || "",
       thumbnailUrl: item.thumbnailUrl || item.coverUrl || "",
       duration: Number(item.durationSec || item.duration || 0) || 0,
@@ -4860,10 +4904,13 @@ export function syncEditProject(p) {
       inPoint: 0,
       outPoint: info.duration || 5,
       duration: info.duration || 5,
-      transitionIn: { type: "cut", duration: 0 },
-      _isExternalMedia: info.type === "upload",
-      _mediaName: info.name,
-      mediaId: info.mediaId || "",
+	      transitionIn: { type: "cut", duration: 0 },
+	      _isExternalMedia: info.type === "upload",
+	      _mediaName: info.name,
+	      filename: info.filename || "",
+	      displayName: info.displayName || info.name || "",
+	      downloadFilename: info.downloadFilename || info.filename || "",
+	      mediaId: info.mediaId || "",
     };
     _editState.edl.timeline.splice(targetIndex, 0, newEntry);
 

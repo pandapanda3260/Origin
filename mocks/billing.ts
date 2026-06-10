@@ -6,7 +6,7 @@ export const MOCK_BILLING_PLANS_LIST = [
     price_cents: 0,
     billing_cycle: 'month',
     monthly_credits: 100,
-    limits: { concurrency: 1, projects: 5, storageGB: 1 },
+    limits: { concurrency: 1, projects: 100, storageGB: 1 },
     features: { models: ['基础模型'], priority: 'normal', support: '社区' },
     isCurrent: true,
     isPopular: false,
@@ -18,7 +18,7 @@ export const MOCK_BILLING_PLANS_LIST = [
     price_cents: 9900,
     billing_cycle: 'month',
     monthly_credits: 2000,
-    limits: { concurrency: 4, projects: 50, storageGB: 50 },
+    limits: { concurrency: 4, projects: 1000, storageGB: 50 },
     features: { models: ['全部模型'], priority: 'fast', support: '邮件' },
     isCurrent: false,
     isPopular: true,
@@ -30,7 +30,7 @@ export const MOCK_BILLING_PLANS_LIST = [
     price_cents: 29900,
     billing_cycle: 'month',
     monthly_credits: 8000,
-    limits: { concurrency: 10, projects: 500, storageGB: 500 },
+    limits: { concurrency: 10, projects: 5000, storageGB: 500 },
     features: { models: ['全部模型 + 4K'], priority: 'priority', support: '专属客服' },
     isCurrent: false,
     isPopular: false,
@@ -44,7 +44,7 @@ export const MOCK_TOPUP_PACKS = [
 ];
 
 export const MOCK_BILLING_ME = {
-  user: { id: 1, phone: '19900000000', displayName: 'Mock User' },
+  user: { id: 1, username: 'mock_user', phone: '19900000000', displayName: 'Mock User' },
   currentPlan: {
     code: 'free',
     title: 'Free',

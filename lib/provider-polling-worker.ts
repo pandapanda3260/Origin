@@ -1,4 +1,4 @@
-import { pollDueBatchProviderTasks } from './provider-recovery';
+import { pollDueBatchProviderTasks, resumeReviewProviderTasksForPolling } from './provider-recovery';
 import { createSeedanceVideoProviderAdapter } from './video-gen';
 
 const PROVIDER_POLLING_LOOP_KEY = '__origin_provider_polling_loop__';
@@ -12,12 +12,18 @@ function envInt(name: string, fallback: number, min: number, max: number) {
 
 export async function runProviderPollingPass(opts: { limit?: number; nowMs?: number } = {}) {
   const adapter = createSeedanceVideoProviderAdapter();
-  return pollDueBatchProviderTasks({
+  const resumed = resumeReviewProviderTasksForPolling({
+    provider: 'volcengine_seedance_video',
+    limit: opts.limit,
+    nowMs: opts.nowMs,
+  });
+  const polled = await pollDueBatchProviderTasks({
     provider: 'volcengine_seedance_video',
     adapter,
     limit: opts.limit,
     nowMs: opts.nowMs,
   });
+  return { ...polled, resumed };
 }
 
 export function startProviderPollingLoop() {

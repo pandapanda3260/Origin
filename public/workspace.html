@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=234" />
+    <link rel="stylesheet" href="styles.css?v=235" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -779,7 +779,7 @@
                   <span class="material-symbols-outlined text-[16px]">delete_sweep</span>清理过时资产
                 </button>
 			                <button type="button" id="btnGenAssetImages" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden data-write-action>
-		                  <span class="asset-step-number">II</span>生成全部图片
+		                  <span class="asset-step-number">II</span><span id="btnGenAssetImagesLabel">生成全部图片</span>
 	                </button>
 				                <button type="button" id="btnConfirmAssetsTop" class="h-10 px-6 bg-primary text-on-primary rounded-full text-xs font-bold tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all flex items-center gap-2" hidden data-write-action>
 				                  <span class="asset-step-number">III</span>
@@ -1163,6 +1163,7 @@
                 </button>
               </div>
             </section>
+            <p id="batchGenerateHint" class="batch-generate-hint" hidden></p>
 
             <section class="batch-stat-grid" aria-label="片段生成统计">
               <div class="batch-stat-card">
@@ -1833,21 +1834,21 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=158",
-        "/modules/backend_stream.js": "/modules/backend_stream.js?v=100",
+        "/modules/assets.js":         "/modules/assets.js?v=163",
+        "/modules/backend_stream.js": "/modules/backend_stream.js?v=101",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=100",
         "/modules/edit.js":           "/modules/edit.js?v=138",
         "/modules/episode_fields.js": "/modules/episode_fields.js?v=101",
-        "/modules/episodes.js":       "/modules/episodes.js?v=102",
+        "/modules/episodes.js":       "/modules/episodes.js?v=103",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=100",
         "/modules/loading.js":        "/modules/loading.js?v=1",
         "/modules/project.js":        "/modules/project.js?v=105",
         "/modules/render_hooks.js":   "/modules/render_hooks.js?v=102",
-        "/modules/script.js":         "/modules/script.js?v=113",
+        "/modules/script.js":         "/modules/script.js?v=114",
         "/modules/settings.js":       "/modules/settings.js?v=101",
         "/modules/shots.js":          "/modules/shots.js?v=109",
         "/modules/store.js":          "/modules/store.js?v=100",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=144",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=147",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=101",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=103",
@@ -1855,13 +1856,13 @@
         "/modules/toolbox.js":        "/modules/toolbox.js?v=201",
         "/modules/utils.js":          "/modules/utils.js?v=203",
         "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=111",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=121"
+        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=123"
       }
     }
     </script>
     <script type="module" src="modules/store.js?v=100"></script>
     <script type="module" src="modules/utils.js?v=203"></script>
-    <script type="module" src="main.js?v=303"></script>
+    <script type="module" src="main.js?v=313"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

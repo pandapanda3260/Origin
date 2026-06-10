@@ -4,6 +4,7 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { syncEditProjectClips } from '@/lib/asset-library';
 import { resolveGroupImportDurationSec, resolveTrustedActualDurationSec } from '@/lib/edit-duration-runtime';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -63,6 +64,27 @@ function computeReadiness(proj: any) {
   };
 }
 
+function resolveSegmentNames(proj: any, groupIdx: number) {
+  const sb = Array.isArray(proj?.storyboards) ? proj.storyboards[groupIdx] || {} : {};
+  const vt = Array.isArray(proj?.videoTasks) ? proj.videoTasks[groupIdx] || {} : {};
+  const taskId = sb.videoTaskId || vt.taskId || vt.serverTaskId || vt.id || '';
+  if (taskId) {
+    return buildVideoSegmentNamesForRow({
+      id: taskId,
+      project_id: proj?.id,
+      group_idx: groupIdx,
+      filename: sb.videoFilename || vt.filename,
+    }, proj);
+  }
+  const displayName = String(sb.videoDisplayName || vt.displayName || `片段${groupIdx + 1}`).trim();
+  const downloadFilename = String(sb.videoDownloadFilename || vt.downloadFilename || `${displayName}.mp4`).trim();
+  return {
+    displayName,
+    filename: String(sb.videoFilename || vt.filename || downloadFilename).trim(),
+    downloadFilename,
+  };
+}
+
 function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; error?: string } {
   const edl = ensureEdl(proj);
   const sbs: any[] = Array.isArray(proj?.storyboards) ? [...proj.storyboards] : [];
@@ -103,12 +125,19 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
       sbs[idx] = { ...sb, importedToEdit: true };
       sbsTouched = true;
       const exists = edl.timeline.some((e: any) => e && e.groupIdx === idx);
-      if (!exists) {
-        const dur = sumGroupDuration(proj, idx);
-        edl.timeline.push({
-          groupIdx: idx,
-          videoUrl: sb.videoUrl,
-          inPoint: 0,
+	      if (!exists) {
+	        const dur = sumGroupDuration(proj, idx);
+	        const names = resolveSegmentNames(proj, idx);
+	        edl.timeline.push({
+	          groupIdx: idx,
+	          videoUrl: sb.videoUrl,
+	          protectedUrl: sb._originVideoUrl || vt?.protectedUrl || sb.videoUrl,
+	          _originVideoUrl: sb._originVideoUrl || vt?.protectedUrl || sb.videoUrl,
+	          filename: names.filename,
+	          displayName: names.displayName,
+	          downloadFilename: names.downloadFilename,
+	          _mediaName: names.displayName,
+	          inPoint: 0,
           outPoint: dur,
           duration: dur,
           transitionIn: { type: 'cut', duration: 0 },
@@ -249,9 +278,13 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
         videoUrl: typeof entry.videoUrl === 'string' ? entry.videoUrl.slice(0, 2000) : undefined,
         inPoint: Number.isFinite(Number(entry.inPoint)) ? Number(entry.inPoint) : 0,
         outPoint: Number.isFinite(Number(entry.outPoint)) ? Number(entry.outPoint) : undefined,
-        duration: Number.isFinite(Number(entry.duration)) ? Number(entry.duration) : undefined,
-        groupIdx: Number.isInteger(Number(entry.groupIdx)) ? Number(entry.groupIdx) : null,
-        transitionIn: entry.transitionIn && typeof entry.transitionIn === 'object'
+	        duration: Number.isFinite(Number(entry.duration)) ? Number(entry.duration) : undefined,
+	        groupIdx: Number.isInteger(Number(entry.groupIdx)) ? Number(entry.groupIdx) : null,
+	        filename: typeof entry.filename === 'string' ? entry.filename.slice(0, 240) : undefined,
+	        displayName: typeof entry.displayName === 'string' ? entry.displayName.slice(0, 220) : undefined,
+	        downloadFilename: typeof entry.downloadFilename === 'string' ? entry.downloadFilename.slice(0, 240) : undefined,
+	        _mediaName: typeof entry._mediaName === 'string' ? entry._mediaName.slice(0, 220) : undefined,
+	        transitionIn: entry.transitionIn && typeof entry.transitionIn === 'object'
           ? { type: String((entry.transitionIn as any).type || 'cut').slice(0, 32) }
           : (typeof entry.transitionIn === 'string' ? { type: entry.transitionIn.slice(0, 32) } : undefined),
       };

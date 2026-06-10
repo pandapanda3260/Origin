@@ -37,6 +37,10 @@ assert(storyboard.includes('pending * avg / _keyframeProgressConcurrency()'), 'E
 assert(storyboard.includes('"生成中… " + visibleDone'), 'keyframe progress should use the unified single-ellipsis wording');
 assert(!storyboard.includes('生成中……'), 'legacy double-ellipsis wording should not come back');
 
+// ETA 只降不升：动态均值在两次完成之间会上漂，显示层必须做单调钳制。
+assert(storyboard.includes('function _clampKeyframeEta(fresh, total, startTs)'), 'keyframe ETA needs a monotonic clamp');
+assert(storyboard.includes('_clampKeyframeEta(_keyframeRemainingSeconds(done, fail, total, startTs)'), 'formatted ETA must pass through the monotonic clamp');
+
 // 静态三态摘要：批次不活跃时按首帧口径显示 生成完成 N/N / 缺失明细 / 待生成。
 const staticSync = section(storyboard, 'function _syncShotsKeyframeHeaderHint()', 'function _ffeInitialAutoSaveState');
 assert(staticSync.includes('if (_imagesGenerating || _imagesStarting || _tailFramesGenerating) return;'), 'static summary must not preempt active batch progress');
@@ -45,6 +49,13 @@ assert(staticSync.includes('"待生成… 0/" + groups.length'), 'never-generate
 assert(staticSync.includes('张已生成，缺少镜头 '), 'partially generated storyboards should list missing shots');
 const confirmFn = section(storyboard, 'export function checkImagesConfirm()', 'Phase 3-B-8');
 assert(confirmFn.includes('_syncShotsKeyframeHeaderHint();'), 'page render and batch terminals should restore the static summary via checkImagesConfirm');
+
+// 防双订阅闪烁：主流程启动的批必须立即登记为"本地已订阅"，否则周期性
+// reconcile 会对同一个 running 批再挂 reattach——两个 1s tick 用跨批/单批
+// 两种口径交替写标题行（"7/18" vs "0/10" 半秒闪烁）。
+assert(storyboard.includes('function _markStoryboardBatchLocallyAttached(projectId, batchId)'), 'locally started batches need an attach registry helper');
+const attachMarks = storyboard.match(/_markStoryboardBatchLocallyAttached\(originId, startResp\.batchId\)/g) || [];
+assert(attachMarks.length >= 4, 'all four batch-start paths (bulk/single x first/tail) must register locally-attached, found ' + attachMarks.length);
 
 const reattachFirst = section(storyboard, 'function _reattachImagesBatch', 'function _reattachTailFrameBatch');
 assert(reattachFirst.includes('_showKeyframeHeaderProgress(rDoneCount, rTotal, rFailCount, rStartTs)'), 'first-frame reattach should restore header progress');
@@ -66,6 +77,7 @@ assert(allTail.includes('opts.progressState'), 'tail-frame batch generation shou
 assert(allTail.includes('_hideKeyframeHeaderProgress();'), 'tail-frame batch generation should hide header progress when finished');
 assert(allTail.includes('function _applyTailBatchSnapshotTask(t)'), 'tail-frame snapshot should replay tasks through the existing completedIdx dedupe path');
 assert(allTail.includes('tasks.forEach(_applyTailBatchSnapshotTask)'), 'tail-frame snapshot and poll should share task handling');
+assert(allTail.includes('_markStoryboardBatchLocallyAttached(originId, startResp.batchId)'), 'generateAllTailFrames must register its batch against reconcile re-attach');
 
 const allFirst = section(storyboard, 'export async function generateAllImages', 'export async function confirmImages');
 assert(allFirst.includes('_plannedTailKeyframeCountForProgress(groups, buttonState, tailKeyframeMode)'), 'first-frame batch generation should include planned tail keyframes in the header total');
@@ -74,6 +86,7 @@ assert(allFirst.includes('_showKeyframeHeaderProgress('), 'first-frame batch gen
 assert(allFirst.includes('_hideKeyframeHeaderProgress();'), 'first-frame batch generation should hide header progress when finished');
 assert(allFirst.includes('function _applyStoryboardBatchSnapshotTask(t)'), 'first-frame snapshot should replay tasks through existing seen-set handlers');
 assert(allFirst.includes('tasks.forEach(_applyStoryboardBatchSnapshotTask)'), 'first-frame snapshot and poll should share task handling');
+assert(allFirst.includes('_markStoryboardBatchLocallyAttached(originId, startResp.batchId)'), 'generateAllImages must register its batch against reconcile re-attach');
 assert(allFirst.includes('Math.min(snap.total, doneCount + failCount)'), 'first-frame snapshot should not overwrite cross-batch header progress with single-batch succeeded');
 
 assert(/\.\/modules\/storyboard\.js\?v=\d+/.test(main), 'main import should carry a storyboard.js cache version');

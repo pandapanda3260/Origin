@@ -804,17 +804,16 @@ function worldCharacterPatchFromTemplate(character: any, index: number): WorldCh
   const characterId = worldCharacterKey(character, index);
   const hardPaths = new Set<string>(['canonicalName']);
   const panels = character.referencePanels || character.panels || {};
-  const referenceUrl = panels.sheetUrl
-    || panels.headshotUrl
-    || panels.frontUrl
-    || character.realPhotoUrl
-    || character.imageUrl
-    || character.rawUrl
-    || character.pencilUrl;
+  // 参考图只认真三视图（panels.sheetUrl）。预览/特写（previewUrl/realPhotoUrl/headshot）
+  // 不能伪造成 sheetUrl、也不能撑起 referenceStatus=ready，否则假三视图会经角色锁
+  // 流进选角/首尾帧/视频参考链。
+  const sheetUrl = cleanText(panels.sheetUrl);
   const voiceHint = character.voiceHint || {};
+  // 字段只取本字段：role/identity 不再用 description 回填（塌缩会把整段简介灌进角色锁），
+  // appearance 同理不再吃简介（description/intro 是剧情文案，不是视觉硬锁）。
   const identityLock = stripEmptyObject({
-    role: character.role || character.identity || character.description,
-    identity: character.identity || character.description,
+    role: character.role,
+    identity: character.identity,
     entityType: character.entityType === 'non-human' ? 'non-human' : character.entityType === 'human' ? 'human' : undefined,
     species: character.species,
     gender: character.gender,
@@ -822,7 +821,7 @@ function worldCharacterPatchFromTemplate(character: any, index: number): WorldCh
   }) as Partial<CharacterIdentityLock> | undefined;
   for (const key of Object.keys(identityLock || {})) hardPaths.add(`identityLock.${key}`);
   const visualLock = stripEmptyObject({
-    appearance: character.appearance || character.detail || character.description || character.intro,
+    appearance: character.appearance || character.detail,
     clothing: character.clothing,
     equipment: character.equipment,
     scaleRule: character.scaleRule,
@@ -846,16 +845,20 @@ function worldCharacterPatchFromTemplate(character: any, index: number): WorldCh
     accent: voiceHint.accent || character.accent,
     negativeRules: voiceHint.negativeRules || character.voiceNegativeRules,
   }) as CharacterLockPatch['voiceLock'];
-  const referenceLock = stripEmptyObject({
-    sheetUrl: panels.sheetUrl || referenceUrl,
-    headshotUrl: panels.headshotUrl,
-    frontUrl: panels.frontUrl,
-    sideUrl: panels.sideUrl,
-    backUrl: panels.backUrl,
-    sourceImageId: panels.sourceImageId,
-    referenceStatus: referenceUrl ? 'ready' : undefined,
-    qualityScore: Number.isFinite(Number(panels.confidence)) ? Number(panels.confidence) : undefined,
-  }) as CharacterLockPatch['referenceLock'];
+  // 没有真三视图就不写 referenceLock：headshot/front 等散图不构成可用参考，
+  // 写进锁里会被前端兜底链当卡面展示（特写又回来了），也会误导下游引用。
+  const referenceLock = sheetUrl
+    ? stripEmptyObject({
+        sheetUrl,
+        headshotUrl: panels.headshotUrl,
+        frontUrl: panels.frontUrl,
+        sideUrl: panels.sideUrl,
+        backUrl: panels.backUrl,
+        sourceImageId: panels.sourceImageId,
+        referenceStatus: 'ready',
+        qualityScore: Number.isFinite(Number(panels.confidence)) ? Number(panels.confidence) : undefined,
+      }) as CharacterLockPatch['referenceLock']
+    : undefined;
   const patch: CharacterLockPatch = {
     sourceAssetId: cleanText(character.sourceAssetId || character.assetId) || undefined,
     canonicalName: cleanText(character.name || character.title || characterId) || characterId,

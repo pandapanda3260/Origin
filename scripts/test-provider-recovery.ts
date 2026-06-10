@@ -18,6 +18,7 @@ async function main() {
     pollBatchProviderTask,
     pollDueBatchProviderTasks,
     recordBatchTaskProviderSubmission,
+    resumeReviewProviderTasksForPolling,
   } = await import('../lib/provider-recovery');
   const durable = await import('../lib/durable-tasks');
 
@@ -222,6 +223,38 @@ async function main() {
   const missingProviderTask = db.prepare("SELECT status, error_msg FROM batch_tasks WHERE id = 'task-missing-provider-id'").get() as any;
   assert.equal(missingProviderTask.status, 'needs_review');
   assert.match(missingProviderTask.error_msg, /provider task id is missing/);
+
+  insertProviderTask('task-review-resumable', { status: 'needs_review', nextRetryAt: '2026-01-01T00:10:00.000Z' });
+  db.prepare(
+    `UPDATE batch_tasks
+        SET status_reason = 'lease expired; provider state requires review:video_segments',
+            error_msg = 'stale provider state'
+      WHERE id = 'task-review-resumable'`,
+  ).run();
+  insertProviderTask('task-review-manual', { status: 'needs_review' });
+  db.prepare(
+    `UPDATE batch_tasks
+        SET status_reason = 'manual review requested'
+      WHERE id = 'task-review-manual'`,
+  ).run();
+  const resumed = resumeReviewProviderTasksForPolling({
+    provider: 'volcengine_seedance_video',
+    limit: 10,
+    nowMs: baseNow,
+  });
+  assert.equal(resumed.resumed, 1);
+  assert.deepEqual(resumed.taskIds, ['task-review-resumable']);
+  const reviewResumable = db
+    .prepare("SELECT status, error_msg, next_retry_at FROM batch_tasks WHERE id = 'task-review-resumable'")
+    .get() as any;
+  assert.equal(reviewResumable.status, 'upstream_pending');
+  assert.equal(reviewResumable.error_msg, null);
+  assert.equal(reviewResumable.next_retry_at, null);
+  const reviewManual = db
+    .prepare("SELECT status FROM batch_tasks WHERE id = 'task-review-manual'")
+    .get() as any;
+  assert.equal(reviewManual.status, 'needs_review');
+  db.prepare("UPDATE batch_tasks SET next_retry_at = '2026-01-01T00:10:00.000Z' WHERE id = 'task-review-resumable'").run();
 
   insertProviderTask('task-poll-null-due');
   insertProviderTask('task-poll-due', { nextRetryAt: '2025-12-31T23:59:59.000Z' });

@@ -279,6 +279,43 @@ async function main() {
   assert.equal(recoveredUpstreamSnap.status, 'running');
   assert.equal(recoveredUpstreamSnap.tasks[0].status, 'upstream_pending');
 
+  const providerStaleBatchId = 'batch-provider-stale-running';
+  db.prepare(
+    `INSERT INTO batches
+      (id, owner_id, project_id, batch_type, status, total, runner_id, runner_heartbeat_at)
+     VALUES (?, ?, 'project-provider-stale-running', 'video_segments', 'running', 1, 'old-runner', '2020-01-01T00:00:00.000Z')`,
+  ).run(providerStaleBatchId, user.id);
+  db.prepare(
+    `INSERT INTO batch_tasks
+      (id, batch_id, seq, task_type, status, target_json, provider, provider_task_id, runner_id, lease_expires_at, heartbeat_at)
+     VALUES (
+       'task-provider-stale-running',
+       ?,
+       0,
+       'video_segments',
+       'running',
+       '{"groupIdx":0}',
+       'volcengine_seedance_video',
+       'seedance-remote-stale',
+       'old-runner',
+       '2020-01-01T00:00:00.000Z',
+       '2020-01-01T00:00:00.000Z'
+     )`,
+  ).run(providerStaleBatchId);
+  recoverStaleBatches(10);
+  const providerRecovered = db
+    .prepare(
+      `SELECT status, provider, provider_task_id, runner_id, error_msg
+         FROM batch_tasks
+        WHERE id = 'task-provider-stale-running'`,
+    )
+    .get() as any;
+  assert.equal(providerRecovered.status, 'upstream_pending');
+  assert.equal(providerRecovered.provider, 'volcengine_seedance_video');
+  assert.equal(providerRecovered.provider_task_id, 'seedance-remote-stale');
+  assert.equal(providerRecovered.runner_id, null);
+  assert.equal(providerRecovered.error_msg, null);
+
   const videoPendingBatchId = 'batch-video-upstream-active';
   db.prepare(
     `INSERT INTO batches (id, owner_id, project_id, batch_type, status, total)

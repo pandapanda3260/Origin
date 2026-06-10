@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -84,9 +85,14 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
       const tick = () => {
         if (closed) return;
         try {
-          const row = kind === 'export'
-            ? db.prepare<{ id: string; uid: number }, any>('SELECT * FROM exports WHERE id = @id AND owner_id = @uid').get({ id: taskId, uid: user.id })
-            : db.prepare<{ id: string; uid: number }, any>('SELECT * FROM video_tasks WHERE id = @id AND owner_id = @uid').get({ id: taskId, uid: user.id });
+	          const row = kind === 'export'
+	            ? db.prepare<{ id: string; uid: number }, any>('SELECT * FROM exports WHERE id = @id AND owner_id = @uid').get({ id: taskId, uid: user.id })
+	            : db.prepare<{ id: string; uid: number }, any>(
+	              `SELECT vt.*, p.title AS project_title, p.data_json AS project_data_json
+	                 FROM video_tasks vt
+	                 LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	                WHERE vt.id = @id AND vt.owner_id = @uid`,
+	            ).get({ id: taskId, uid: user.id });
           if (!row) {
             send('task_failed', { taskId, reason: '任务记录消失' });
             cleanup();
@@ -118,14 +124,23 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
                   exportedEdlSignature,
                   exportedEdlSignatureMeta,
                 });
-              } else {
-                const protectedUrl = row.filename ? `/api/videos/file/${row.id}` : '';
-                send('task_completed', {
-                  taskId,
-                  progress: 100,
-                  resultUrl: row.filename ? buildSignedVideoUrl(row.id, user.id).url : '',
-                  extra: { protectedUrl },
-                });
+	              } else {
+	                const protectedUrl = row.filename ? `/api/videos/file/${row.id}` : '';
+	                const names = buildVideoSegmentNamesForRow(row);
+	                send('task_completed', {
+	                  taskId,
+	                  progress: 100,
+	                  filename: names.filename,
+	                  displayName: names.displayName,
+	                  downloadFilename: names.downloadFilename,
+	                  resultUrl: row.filename ? buildSignedVideoUrl(row.id, user.id).url : '',
+	                  extra: {
+	                    protectedUrl,
+	                    filename: names.filename,
+	                    displayName: names.displayName,
+	                    downloadFilename: names.downloadFilename,
+	                  },
+	                });
               }
               cleanup();
               return;

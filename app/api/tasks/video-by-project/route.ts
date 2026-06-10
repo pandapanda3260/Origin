@@ -2,12 +2,13 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
-import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { buildSignedImageUrl, buildSignedVideoUrl } from '@/lib/signed-asset-url';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { storyboardShotIndices } from '@/lib/frame-workflow-state';
 import { syncEditProjectClips } from '@/lib/asset-library';
 import { getVevDemoMaterialBinding } from '@/lib/vevdemo-material-bindings';
 import { getVevDemoProjectBinding } from '@/lib/vevdemo-project-bindings';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -91,22 +92,39 @@ function getTargetVevProjectId(originProjectId: string): string | undefined {
   return binding?.vevProjectId || undefined;
 }
 
+function buildSignedCoverDisplayUrl(req: NextRequest, imageId: unknown, ownerId: number) {
+  const id = String(imageId || '').trim();
+  if (!id) return '';
+  try {
+    const url = new URL(buildSignedImageUrl(id, ownerId).url, req.url);
+    url.searchParams.set('w', '384');
+    return url.toString();
+  } catch {
+    return buildSignedImageUrl(id, ownerId).url;
+  }
+}
+
 function toProjectVideoLibraryItem(req: NextRequest, row: any, userId: number, project: any, currentEdlIds: Set<string>) {
   const taskId = String(row.id);
   const groupIdx = Number(row.group_idx);
   const signed = buildSignedVideoUrl(taskId, userId);
   const protectedUrl = `/api/videos/file/${encodeURIComponent(taskId)}`;
-  const coverUrl = row.cover_image_id ? `/api/images/file/${encodeURIComponent(String(row.cover_image_id))}` : '';
+  const coverUrl = buildSignedCoverDisplayUrl(req, row.cover_image_id, userId);
   const vevProjectId = getTargetVevProjectId(String(row.project_id || project?.id || ''));
   const binding = getVevDemoMaterialBinding('video_task', taskId, vevProjectId);
   const absoluteSignedUrl = new URL(signed.url, req.url).toString();
+  const names = buildVideoSegmentNamesForRow(row, project);
 
   return {
     id: taskId,
     task_id: taskId,
     taskId,
     resourceType: 'video_task',
-    title: `片段 ${Number.isInteger(groupIdx) && groupIdx >= 0 ? groupIdx + 1 : taskId}`,
+    title: names.displayName,
+    name: names.displayName,
+    displayName: names.displayName,
+    filename: names.filename,
+    downloadFilename: names.downloadFilename,
     groupIdx,
     group_idx: groupIdx,
     target_idx: groupIdx,
@@ -168,6 +186,9 @@ function clearStoryboardVideoFields(sb: any) {
   delete next.videoMode;
   delete next.videoTaskFinishedAt;
   delete next.videoDurationSec;
+  delete next.videoFilename;
+  delete next.videoDisplayName;
+  delete next.videoDownloadFilename;
   delete next.readyForEdit;
   delete next.videoWarnings;
   delete next.videoIsCurrent;
@@ -270,19 +291,25 @@ export async function GET(req: NextRequest) {
         (r: any) =>
           (r.status === 'succeeded' || r.status === 'done' || r.status === 'completed') && r.filename,
       )
-      .map((r: any) => {
-        const taskId = String(r.id);
-        const isCurrent =
+	      .map((r: any) => {
+	        const taskId = String(r.id);
+	        const names = buildVideoSegmentNamesForRow(r, project);
+	        const isCurrent =
           currentIds.includes(taskId) ||
           currentUrls.some((u: string) => stringContainsTaskId(u, taskId));
         return {
-          task_id: r.id,
-          target_idx: gi,
-          status: r.status,
+	          task_id: r.id,
+	          target_idx: gi,
+	          title: names.displayName,
+	          name: names.displayName,
+	          displayName: names.displayName,
+	          filename: names.filename,
+	          downloadFilename: names.downloadFilename,
+	          status: r.status,
           duration_sec: r.duration_sec,
           url: buildSignedVideoUrl(r.id, user.id).url,
           protected_url: `/api/videos/file/${r.id}`,
-          cover_url: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : '',
+          cover_url: buildSignedCoverDisplayUrl(req, r.cover_image_id, user.id),
           prompt: r.prompt || '',
           created_at: r.created_at,
           is_current: isCurrent,
@@ -310,19 +337,25 @@ export async function GET(req: NextRequest) {
     if (seen.has(gi)) continue;
     if (!rowBelongsToCurrentSlot(project, r)) continue;
     seen.add(gi);
-    const protectedUrl = r.filename ? `/api/videos/file/${r.id}` : '';
-    const resultUrl = r.filename ? buildSignedVideoUrl(r.id, user.id).url : '';
-    tasks.push({
-      task_id: r.id,
+	    const protectedUrl = r.filename ? `/api/videos/file/${r.id}` : '';
+	    const resultUrl = r.filename ? buildSignedVideoUrl(r.id, user.id).url : '';
+	    const names = buildVideoSegmentNamesForRow(r, project);
+	    tasks.push({
+	      task_id: r.id,
       task_type: 'video',
       target_type: 'storyboard',
-      target_idx: gi,
-      status: r.status,
+	      target_idx: gi,
+	      title: names.displayName,
+	      name: names.displayName,
+	      displayName: names.displayName,
+	      filename: names.filename,
+	      downloadFilename: names.downloadFilename,
+	      status: r.status,
       progress: r.progress,
       duration_sec: r.duration_sec,
       result_url: resultUrl,
       protected_url: protectedUrl,
-      cover_url: r.cover_image_id ? `/api/images/file/${r.cover_image_id}` : '',
+      cover_url: buildSignedCoverDisplayUrl(req, r.cover_image_id, user.id),
       error_msg: r.error_msg || '',
       prompt: r.prompt || '',
       created_at: r.created_at,
@@ -339,8 +372,13 @@ export async function GET(req: NextRequest) {
     durationSec: t.duration_sec,
     url: t.result_url || null,
     protectedUrl: t.protected_url || null,
-    coverUrl: t.cover_url || null,
-    createdAt: t.created_at,
+	    coverUrl: t.cover_url || null,
+	    title: t.title,
+	    name: t.name,
+	    displayName: t.displayName,
+	    filename: t.filename,
+	    downloadFilename: t.downloadFilename,
+	    createdAt: t.created_at,
     updatedAt: t.updated_at,
   }));
 
@@ -364,11 +402,13 @@ export async function POST(req: NextRequest) {
   const projectId = String(body?.projectId || '').trim();
   const groupIdx = Number(body?.groupIdx);
   const taskId = String(body?.taskId || '').trim();
-  if (!projectId) return jsonError('缺 projectId', 400);
-  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
-  if (!taskId) return jsonError('缺 taskId', 400);
+	  if (!projectId) return jsonError('缺 projectId', 400);
+	  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
+	  if (!taskId) return jsonError('缺 taskId', 400);
+	  const project = getProjectByIdForUser(projectId, user.id) as any;
+	  if (!project) return jsonError('项目不存在', 404);
 
-  const db = getDb();
+	  const db = getDb();
   const row = db
     .prepare<{ id: string; uid: number; pid: string }, any>(
       `SELECT id, group_idx, status, duration_sec, filename, cover_image_id
@@ -382,17 +422,21 @@ export async function POST(req: NextRequest) {
 
   const protectedUrl = `/api/videos/file/${row.id}`;
   const signedUrl = buildSignedVideoUrl(row.id, user.id).url;
-  const coverUrl = row.cover_image_id ? `/api/images/file/${row.cover_image_id}` : '';
-  const durationSec = Number(row.duration_sec) || 0;
+	  const coverUrl = row.cover_image_id ? `/api/images/file/${row.cover_image_id}` : '';
+	  const durationSec = Number(row.duration_sec) || 0;
+	  const names = buildVideoSegmentNamesForRow(row, project);
 
   const patched = patchProjectForUser(projectId, user.id, (fresh: any) => {
     const storyboards = Array.isArray(fresh?.storyboards) ? [...fresh.storyboards] : [];
     if (groupIdx >= storyboards.length || !storyboards[groupIdx]) return null;
 
     const sb = { ...storyboards[groupIdx] };
-    sb.videoUrl = signedUrl;
-    sb._originVideoUrl = protectedUrl;
-    sb.videoTaskId = row.id;
+	    sb.videoUrl = signedUrl;
+	    sb._originVideoUrl = protectedUrl;
+	    sb.videoTaskId = row.id;
+	    sb.videoFilename = names.filename;
+	    sb.videoDisplayName = names.displayName;
+	    sb.videoDownloadFilename = names.downloadFilename;
     if (coverUrl) sb.videoCoverUrl = coverUrl;
     if (durationSec > 0) sb.videoDurationSec = durationSec;
     sb.videoStatus = 'done';
@@ -410,8 +454,11 @@ export async function POST(req: NextRequest) {
     const vt: any = { ...prevVt };
     vt.groupIdx = groupIdx;
     vt.taskId = row.id;
-    vt.url = protectedUrl;
-    vt.protectedUrl = protectedUrl;
+	    vt.url = protectedUrl;
+	    vt.protectedUrl = protectedUrl;
+	    vt.filename = names.filename;
+	    vt.displayName = names.displayName;
+	    vt.downloadFilename = names.downloadFilename;
     if (durationSec > 0) vt.durationSec = durationSec;
     vt.status = 'completed';
     vt.isCurrent = true;
@@ -429,7 +476,16 @@ export async function POST(req: NextRequest) {
       edl.timeline = edl.timeline.map((entry: any) => {
         if (entry && Number(entry.groupIdx) === groupIdx) {
           touched = true;
-          return { ...entry, videoUrl: signedUrl, protectedUrl, _originVideoUrl: protectedUrl };
+	          return {
+	            ...entry,
+	            videoUrl: signedUrl,
+	            protectedUrl,
+	            _originVideoUrl: protectedUrl,
+	            filename: names.filename,
+	            displayName: names.displayName,
+	            downloadFilename: names.downloadFilename,
+	            _mediaName: names.displayName,
+	          };
         }
         return entry;
       });
@@ -465,8 +521,11 @@ export async function POST(req: NextRequest) {
     groupIdx,
     taskId: row.id,
     url: signedUrl,
-    protectedUrl,
-    coverUrl,
+	    protectedUrl,
+	    filename: names.filename,
+	    displayName: names.displayName,
+	    downloadFilename: names.downloadFilename,
+	    coverUrl,
     durationSec,
     readiness: computeReadiness(patched),
     edl: edl || null,

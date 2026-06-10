@@ -39,11 +39,16 @@ export async function GET(req: NextRequest) {
     .all({ uid: user.id });
 
   return jsonOk({
-	    user: { id: user.id, phone: user.phone, displayName: user.display_name },
+    user: { id: user.id, username: user.username, phone: user.phone, displayName: user.display_name },
     currentPlan: {
       code: plan.code,
       title: plan.title,
+      description: (plan as any).description || '',
+      price_cents: (plan as any).price_cents || 0,
+      billing_cycle: (plan as any).billing_cycle || 'month',
       monthly_credits: plan.monthly_credits,
+      limits: (plan as any).limits || {},
+      features: (plan as any).features || {},
       expiresAt: bal.periodEnd,
       autoRenew: !bal.cancelAtPeriodEnd,
       status: bal.planStatus,

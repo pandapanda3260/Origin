@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { getDb } from './db';
 import { storyboardShotIndices } from './frame-workflow-state';
+import { buildVideoSegmentNamesForRow } from './video-segment-names';
 
 export const SP_GENERATE_EDL = `你是工业级 AI 剪辑师。下面这组视频片段是同一个项目的连续故事节拍，请按
 **Walter Murch《眨眼之间》"剪辑六字诀"** + **行业短视频/电影叙事节奏** 给出剪辑方案。
@@ -71,8 +72,11 @@ export type EdlClip = {
   clipId: string;
   durationSec: number;
   groupIdx: number;
-  videoUrl: string;
-  prompt: string;
+	  videoUrl: string;
+	  displayName?: string;
+	  filename?: string;
+	  downloadFilename?: string;
+	  prompt: string;
   dialogue: string;
   hasDialogue: boolean;
 };
@@ -241,15 +245,19 @@ export function collectEdlGenerationContext(args: {
     return lines.join(' / ');
   };
 
-  const clips: EdlClip[] = finalVideos.map((v: any) => {
-    const gIdx = Number(v.group_idx);
-    const dialogue = dialogueForGroup(gIdx);
-    return {
-      clipId: v.id,
-      durationSec: Number(v.duration_sec) || 4,
-      groupIdx: gIdx,
-      videoUrl: `/api/videos/file/${v.id}`,
-      prompt: (v.prompt || '').slice(0, 300),
+	  const clips: EdlClip[] = finalVideos.map((v: any) => {
+	    const gIdx = Number(v.group_idx);
+	    const dialogue = dialogueForGroup(gIdx);
+	    const names = buildVideoSegmentNamesForRow(v, proj);
+	    return {
+	      clipId: v.id,
+	      durationSec: Number(v.duration_sec) || 4,
+	      groupIdx: gIdx,
+	      videoUrl: `/api/videos/file/${v.id}`,
+	      displayName: names.displayName,
+	      filename: names.filename,
+	      downloadFilename: names.downloadFilename,
+	      prompt: (v.prompt || '').slice(0, 300),
       dialogue,
       hasDialogue: dialogue.length > 0,
     };
@@ -317,10 +325,13 @@ export function normalizeGeneratedEdl(json: any, clips: EdlClip[], segTags: any[
         out: outSec,
         transitionIn: pickEnum(e.transitionIn, ['cut', 'fade', 'dissolve', 'wipe'], 'cut'),
         transitionOut: pickEnum(e.transitionOut, ['cut', 'fade', 'dissolve', 'wipe'], 'cut'),
-        note: String(e.note || '').slice(0, 200),
-        groupIdx: c.groupIdx,
-        videoUrl: c.videoUrl,
-      };
+	        note: String(e.note || '').slice(0, 200),
+	        groupIdx: c.groupIdx,
+	        videoUrl: c.videoUrl,
+	        displayName: c.displayName,
+	        filename: c.filename,
+	        downloadFilename: c.downloadFilename,
+	      };
     });
 
   if (aiEdl.length < clips.length) {
@@ -333,10 +344,13 @@ export function normalizeGeneratedEdl(json: any, clips: EdlClip[], segTags: any[
           out: c.durationSec,
           transitionIn: 'cut',
           transitionOut: 'cut',
-          note: '',
-          groupIdx: c.groupIdx,
-          videoUrl: c.videoUrl,
-        });
+	          note: '',
+	          groupIdx: c.groupIdx,
+	          videoUrl: c.videoUrl,
+	          displayName: c.displayName,
+	          filename: c.filename,
+	          downloadFilename: c.downloadFilename,
+	        });
       }
     }
     aiEdl.sort((a, b) => a.groupIdx - b.groupIdx);

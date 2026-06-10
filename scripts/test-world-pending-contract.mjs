@@ -30,7 +30,9 @@ assert.ok(mainSource.includes('btnKnowledgeSnapshot'));
 assert.ok(mainSource.includes('function _persistStyleWorldIntent(intent)'));
 assert.ok(mainSource.includes('return _flushStyleWorldIntent(job, 0);'));
 assert.ok(mainSource.includes('if (result && result.stale && attempt < 1)'));
-assert.ok(mainSource.includes('_persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null });'));
+// 注：清世界观后改成了 _persistStyleWorldIntent(...).then(重跑无世界观推荐) 链式调用
+// （风格页 freshness 修复），所以这里只锁调用本体，不锁行尾的 ");"。
+assert.ok(mainSource.includes('_persistStyleWorldIntent({ selectedWorldTemplateId: null, worldTemplateSnapshot: null })'));
 assert.ok(mainSource.includes('persistWorldTemplateSelection: (intent) => _persistStyleWorldIntent(intent)'));
 assert.ok(!mainSource.includes('confirmPendingWorldFacts'));
 assert.ok(!mainSource.includes('btnConfirmPendingWorldFacts'));

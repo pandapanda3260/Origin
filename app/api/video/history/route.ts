@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -19,13 +20,16 @@ export async function GET(req: NextRequest) {
   const db = getDb();
   const rows = db
     .prepare<{ uid: number; lim: number; projectId: string }, any>(
-      `SELECT id, project_id, group_idx, prompt, video_prompt_snapshot_json, status, progress, filename, duration_sec, cover_image_id, created_at, updated_at
-       FROM video_tasks
-       WHERE owner_id = @uid
-         AND status = 'completed'
-         AND (@projectId = '' OR project_id = @projectId)
-       ORDER BY created_at DESC
-       LIMIT @lim`,
+	      `SELECT vt.id, vt.project_id, vt.group_idx, vt.prompt, vt.video_prompt_snapshot_json, vt.status,
+	              vt.progress, vt.filename, vt.duration_sec, vt.cover_image_id, vt.created_at, vt.updated_at,
+	              p.title AS project_title, p.data_json AS project_data_json
+	         FROM video_tasks vt
+	         LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	        WHERE vt.owner_id = @uid
+	          AND vt.status = 'completed'
+	          AND (@projectId = '' OR vt.project_id = @projectId)
+	        ORDER BY vt.created_at DESC
+	       LIMIT @lim`,
     )
     .all({ uid: user.id, lim: limit, projectId });
 
@@ -38,14 +42,18 @@ export async function GET(req: NextRequest) {
     }
   };
 
-  const items = rows.map((r: any) => {
-    const protectedUrl = `/api/videos/file/${r.id}`;
-    const videoPromptSnapshot = parseSnapshot(r.video_prompt_snapshot_json);
-    return {
-      taskId: r.id,
-      projectId: r.project_id,
-      groupIdx: r.group_idx,
-      prompt: r.prompt,
+	  const items = rows.map((r: any) => {
+	    const protectedUrl = `/api/videos/file/${r.id}`;
+	    const videoPromptSnapshot = parseSnapshot(r.video_prompt_snapshot_json);
+	    const names = buildVideoSegmentNamesForRow(r);
+	    return {
+	      taskId: r.id,
+	      projectId: r.project_id,
+	      groupIdx: r.group_idx,
+	      filename: names.filename,
+	      displayName: names.displayName,
+	      downloadFilename: names.downloadFilename,
+	      prompt: r.prompt,
       videoPromptSnapshot,
       videoPromptHistory: videoPromptSnapshot?.content || r.prompt,
       videoPromptSnapshotLegacy: !videoPromptSnapshot?.content || !!videoPromptSnapshot?.legacy,

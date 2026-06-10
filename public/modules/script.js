@@ -1989,6 +1989,15 @@ export async function generateScript(idea, options) {
     idea = $("ideaInput").value.trim();
     if (!idea) { showToast("请输入创意", "warn"); return; }
   }
+  // 防呆（被动提示，不拦截）：超长原文大概率是多章合并文本，而改编只会"从开头
+  // 压缩成一集"，后面的章节根本进不了产出（实证见《第二集导入变第一集-根因排查报告》）。
+  // 提示用户自行裁剪，不挡流程。
+  if (fromSource && idea.length > 6000) {
+    showToast(
+      "原文较长（约 " + (Math.round(idea.length / 100) / 10) + " 千字）：改编会从开头压缩成单集剧本，靠后的章节不会进入本集。若只想改编其中一章，建议删去其余章节后再转换。",
+      "warn"
+    );
+  }
   if (!project) _ctx.createNewProject && _ctx.createNewProject();
   var originId = project.id;
   if (!fromSource) {
@@ -2084,6 +2093,14 @@ export async function generateScript(idea, options) {
       if (fromSource && resp.oneSentenceBrief) {
         proj.idea = resp.oneSentenceBrief;
         proj.name = resp.oneSentenceBrief.slice(0, 20) || proj.name;
+      }
+      // 关键：服务端 full-create 已把 oneSentence 落库（adapt=原文改编摘要，create=创意原文）。
+      // 前端内存必须同步镜像，否则随后的整项目 PUT 会带着旧值（新项目=空串）把它冲掉
+      // ——实证见《第二集导入变第一集-根因排查报告》§5-2。
+      if (fromSource) {
+        if (resp.oneSentenceBrief) proj.oneSentence = resp.oneSentenceBrief;
+      } else {
+        proj.oneSentence = idea;
       }
 	      proj.assets = null;
       proj.assetsApproved = false;

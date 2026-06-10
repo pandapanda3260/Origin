@@ -873,9 +873,11 @@ export function reapOrphanBatches() {
     for (const b of orphanBatches) {
       const runningTasks = db
         .prepare<{ bid: string }, any>(
-          "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
+          "SELECT id, provider, provider_task_id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
         )
         .all({ bid: b.id });
+      const providerHandoffTasks = runningTasks.filter(canResumeByProviderPolling);
+      const needsReviewTasks = runningTasks.filter((task: any) => !canResumeByProviderPolling(task));
       const queuedTasks = db
         .prepare<{ bid: string }, any>(
           "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'queued'",
@@ -927,12 +929,38 @@ export function reapOrphanBatches() {
             SET runner_id=NULL,
                 lease_expires_at=NULL,
                 heartbeat_at=NULL,
-                error_msg='orphaned by server restart; provider state requires review',
                 updated_at=?
           WHERE batch_id=? AND status='running'`,
       ).run(_nowIso(), b.id);
-      for (const t of runningTasks) {
+      for (const t of providerHandoffTasks) {
         try {
+          db.prepare(
+            `UPDATE batch_tasks
+                SET error_msg=NULL,
+                    next_retry_at=NULL,
+                    updated_at=?
+              WHERE id=? AND status='running'`,
+          ).run(_nowIso(), String(t.id));
+          transitionTaskStatus({
+            taskId: String(t.id),
+            from: 'running',
+            to: 'upstream_pending',
+            reason: `orphaned by server restart; provider polling resumed:${b.batch_type}`,
+            actor: 'worker',
+            runnerId: BATCH_RUNNER_ID,
+          });
+        } catch (e) {
+          console.error('[batch] reap running upstream_pending transition failed:', b.id, t.id, e);
+        }
+      }
+      for (const t of needsReviewTasks) {
+        try {
+          db.prepare(
+            `UPDATE batch_tasks
+                SET error_msg='orphaned by server restart; provider state requires review',
+                    updated_at=?
+              WHERE id=? AND status='running'`,
+          ).run(_nowIso(), String(t.id));
           transitionTaskStatus({
             taskId: String(t.id),
             from: 'running',
@@ -970,13 +998,22 @@ function isBatchLeaseStale(row: any, staleHeartbeatBefore: string, legacyCreated
   return !createdAt || createdAt < legacyCreatedBefore;
 }
 
+const PROVIDER_POLLABLE_TASK_PROVIDERS = new Set(['volcengine_seedance_video']);
+
+function canResumeByProviderPolling(row: any) {
+  const provider = String(row?.provider || '').trim();
+  const providerTaskId = String(row?.provider_task_id || '').trim();
+  return PROVIDER_POLLABLE_TASK_PROVIDERS.has(provider) && !!providerTaskId;
+}
+
 function claimBatchForRecovery(batchId: string) {
   const db = getDb();
   const staleHeartbeatBefore = _isoAgo(BATCH_HEARTBEAT_TIMEOUT_MS);
   const legacyCreatedBefore = _isoAgo(LEGACY_ORPHAN_GRACE_MS);
   const now = _nowIso();
   let claimed: any | null = null;
-  let interruptedTaskIds: string[] = [];
+  let providerHandoffTaskIds: string[] = [];
+  let needsReviewTaskIds: string[] = [];
 
   db.exec('BEGIN IMMEDIATE');
   try {
@@ -1006,20 +1043,43 @@ function claimBatchForRecovery(batchId: string) {
 
     const runningTasks = db
       .prepare<{ bid: string }, any>(
-        "SELECT id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
+        "SELECT id, provider, provider_task_id FROM batch_tasks WHERE batch_id = @bid AND status = 'running'",
       )
       .all({ bid: batchId });
-    interruptedTaskIds = runningTasks.map((task: any) => String(task.id)).filter(Boolean);
-    if (interruptedTaskIds.length) {
+    providerHandoffTaskIds = runningTasks
+      .filter(canResumeByProviderPolling)
+      .map((task: any) => String(task.id))
+      .filter(Boolean);
+    needsReviewTaskIds = runningTasks
+      .filter((task: any) => !canResumeByProviderPolling(task))
+      .map((task: any) => String(task.id))
+      .filter(Boolean);
+    if (runningTasks.length) {
       db.prepare(
         `UPDATE batch_tasks
             SET runner_id=NULL,
                 lease_expires_at=NULL,
                 heartbeat_at=NULL,
-                error_msg='interrupted by worker recovery; provider state requires review',
                 updated_at=?
           WHERE batch_id=? AND status='running'`,
       ).run(now, batchId);
+    }
+    for (const taskId of providerHandoffTaskIds) {
+      db.prepare(
+        `UPDATE batch_tasks
+            SET error_msg=NULL,
+                next_retry_at=NULL,
+                updated_at=?
+          WHERE id=? AND status='running'`,
+      ).run(now, taskId);
+    }
+    for (const taskId of needsReviewTaskIds) {
+      db.prepare(
+        `UPDATE batch_tasks
+            SET error_msg='interrupted by worker recovery; provider state requires review',
+                updated_at=?
+          WHERE id=? AND status='running'`,
+      ).run(now, taskId);
     }
 
     const counters = db
@@ -1049,14 +1109,30 @@ function claimBatchForRecovery(batchId: string) {
       batchId,
     );
 
-    claimed = { ...row, interruptedTaskIds };
+    claimed = { ...row, providerHandoffTaskIds, needsReviewTaskIds };
     db.exec('COMMIT');
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch {}
     throw e;
   }
 
-  for (const taskId of interruptedTaskIds) {
+  for (const taskId of providerHandoffTaskIds) {
+    try {
+      transitionTaskStatus({
+        taskId,
+        from: 'running',
+        to: 'upstream_pending',
+        reason: `worker recovery resumed provider polling:${claimed.batch_type}`,
+        actor: 'worker',
+        runnerId: BATCH_RUNNER_ID,
+        meta: { batchId },
+      });
+    } catch (e) {
+      console.error('[batch] recovery upstream_pending transition failed:', batchId, taskId, e);
+    }
+  }
+
+  for (const taskId of needsReviewTaskIds) {
     try {
       transitionTaskStatus({
         taskId,
@@ -1079,7 +1155,7 @@ export function recoverStaleBatches(limit = 8) {
   const db = getDb();
   try {
     releaseExpiredTaskLeases();
-    moveReleasedExpiredTasksToNeedsReview();
+    moveReleasedExpiredTasksToRecoverableState();
   } catch (e) {
     console.error('[batch] task lease recovery failed:', e);
   }
@@ -1148,12 +1224,12 @@ export function recoverStaleBatches(limit = 8) {
   return started;
 }
 
-function moveReleasedExpiredTasksToNeedsReview(limit = 100) {
+function moveReleasedExpiredTasksToRecoverableState(limit = 100) {
   const db = getDb();
   const now = _nowIso();
   const rows = db
     .prepare<{ now: string; limit: number }, any>(
-      `SELECT bt.id, bt.status, bt.batch_id, b.batch_type
+      `SELECT bt.id, bt.status, bt.batch_id, bt.provider, bt.provider_task_id, b.batch_type
          FROM batch_tasks bt
          JOIN batches b ON b.id = bt.batch_id
         WHERE bt.status = 'running'
@@ -1167,19 +1243,38 @@ function moveReleasedExpiredTasksToNeedsReview(limit = 100) {
 
   for (const row of rows) {
     try {
-      transitionTaskStatus({
-        taskId: String(row.id),
-        from: String(row.status) as any,
-        to: 'needs_review',
-        reason: `lease expired; provider state requires review:${row.batch_type || 'batch'}`,
-        actor: 'worker',
-        runnerId: BATCH_RUNNER_ID,
-        meta: { batchId: row.batch_id, previousStatus: row.status },
-      });
+      if (canResumeByProviderPolling(row)) {
+        db.prepare(
+          `UPDATE batch_tasks
+              SET error_msg=NULL,
+                  next_retry_at=NULL,
+                  updated_at=?
+            WHERE id=? AND status='running'`,
+        ).run(now, row.id);
+        transitionTaskStatus({
+          taskId: String(row.id),
+          from: String(row.status) as any,
+          to: 'upstream_pending',
+          reason: `lease expired; provider polling resumed:${row.batch_type || 'batch'}`,
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+          meta: { batchId: row.batch_id, previousStatus: row.status },
+        });
+      } else {
+        transitionTaskStatus({
+          taskId: String(row.id),
+          from: String(row.status) as any,
+          to: 'needs_review',
+          reason: `lease expired; provider state requires review:${row.batch_type || 'batch'}`,
+          actor: 'worker',
+          runnerId: BATCH_RUNNER_ID,
+          meta: { batchId: row.batch_id, previousStatus: row.status },
+        });
+      }
       db.prepare("UPDATE batches SET status='running', updated_at=? WHERE id=? AND status IN ('queued','running')")
         .run(_nowIso(), row.batch_id);
     } catch (e) {
-      console.error('[batch] expired task needs_review transition failed:', row.id, e);
+      console.error('[batch] expired task recovery transition failed:', row.id, e);
     }
   }
   return rows.length;

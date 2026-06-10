@@ -169,7 +169,9 @@ export function buildAssetAuthoritativeCharacterLock(lock: CharacterLock, asset:
     ...lock.visualLock,
     canonicalPrompt: '',
   };
-  const appearance = cleanAssetText(asset.appearance || asset.detail || asset.description || asset.intro);
+  // 外观只取外观类字段（appearance/detail），不再用简介(description/intro)回填——
+  // 简介是剧情文案，灌进视觉硬锁会污染下游生成提示词。
+  const appearance = cleanAssetText(asset.appearance || asset.detail);
   if (appearance) visualLock.appearance = appearance;
   if (hasOwn(asset, 'clothing')) visualLock.clothing = cleanAssetText(asset.clothing);
   if (hasOwn(asset, 'equipment')) visualLock.equipment = cleanAssetText(asset.equipment);
@@ -198,31 +200,37 @@ export function buildAssetAuthoritativeCharacterLock(lock: CharacterLock, asset:
   };
 }
 
+// 资产权威投影：以资产字段为真相源覆盖世界观角色。
+// 原则：每个字段只取自己（role≠identity≠description，不互相回填塌缩）；
+// 资产侧为空的字段直接删除而不是写 ''（'' 会在 spread 类合并里踩掉另一侧非空值，
+// 也避免"更新世界观"把模板字段抹成空串）。aliases 整组替换是有意的：
+// 用于清掉脏快照里的旧别名（见 test-character-lock-authority 防污染断言）。
 export function applyAssetAuthorityToWorldCharacter(character: any, asset: any | null | undefined): any {
   if (!character || typeof character !== 'object' || !asset || typeof asset !== 'object') return character;
   const entityType = inferEntityTypeFromCharacter(asset);
   const next = { ...character };
+  const setOrDelete = (key: string, value: string) => {
+    if (value) next[key] = value;
+    else delete next[key];
+  };
   const name = cleanAssetText(asset.name || asset.title);
-  const role = firstText(asset.role, asset.identity, asset.description, asset.intro, asset.name);
-  const identity = firstText(asset.identity, asset.description, asset.intro, asset.role);
-  const description = firstText(asset.description, asset.intro, asset.identity, asset.role);
   if (name) next.name = name;
   next.aliases = cleanList([
     asset.name,
     asset.role,
     ...(Array.isArray(asset.aliases) ? asset.aliases : []),
   ]);
-  next.role = role;
-  next.identity = identity;
-  next.description = description;
+  setOrDelete('role', cleanAssetText(asset.role));
+  setOrDelete('identity', cleanAssetText(asset.identity));
+  setOrDelete('description', cleanAssetText(asset.description || asset.intro));
   next.entityType = entityType;
-  next.species = entityType === 'non-human' ? cleanAssetText(asset.species) : '';
-  const appearance = cleanAssetText(asset.appearance || asset.detail || asset.description || asset.intro);
-  if (appearance) next.appearance = appearance;
+  if (entityType === 'non-human') setOrDelete('species', cleanAssetText(asset.species));
+  else delete next.species;
+  setOrDelete('appearance', cleanAssetText(asset.appearance || asset.detail));
   if (hasOwn(asset, 'clothing')) next.clothing = cleanAssetText(asset.clothing);
   if (hasOwn(asset, 'equipment')) next.equipment = cleanAssetText(asset.equipment);
-  next.temperament = cleanAssetText(asset.temperament);
-  next.actionTraits = cleanAssetText(asset.actionTraits);
+  setOrDelete('temperament', cleanAssetText(asset.temperament));
+  setOrDelete('actionTraits', cleanAssetText(asset.actionTraits));
   next.canonicalPrompt = '';
   return next;
 }

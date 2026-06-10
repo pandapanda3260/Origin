@@ -30,6 +30,7 @@ import {
 } from '@/lib/crowd-character';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { injectWorldTemplateIntoAssets, normalizeAssetMatchKey } from '@/lib/world-asset-injection';
+import { beginAssetExtract, progressAssetExtract, endAssetExtract } from '@/lib/assets-extract-inflight';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -64,6 +65,27 @@ export async function POST(req: NextRequest) {
       writer.error('当前没有剧本，请先生成或上传剧本');
       return;
     }
+    // 刷新续接 + 防重：登记 in-flight 状态（仅项目内提取；详见 lib/assets-extract-inflight.ts）。
+    // 客户端刷新断开 SSE 后 handler 会继续跑完落库，这里的登记让前端能查到并续接，
+    // 同时拦住同项目并发的第二路提取（每路 3 次 LLM 调用都会扣积分）。
+    const trackInflight = !!(projectId && proj);
+    if (trackInflight) {
+      const begin = beginAssetExtract(user.id, projectId!);
+      if (!begin.ok) {
+        writer.error('该项目的资产提取已在后台进行中，请稍候，完成后会自动写入项目');
+        return;
+      }
+    }
+    let inflightEnded = false;
+    const endInflight = (outcome: 'done' | 'error', errMsg?: string) => {
+      if (!trackInflight || inflightEnded) return;
+      inflightEnded = true;
+      endAssetExtract(user.id, projectId!, outcome, errMsg);
+    };
+    const stepInflight = (label: string, pct: number) => {
+      if (!trackInflight || inflightEnded) return;
+      progressAssetExtract(user.id, projectId!, label, pct);
+    };
     console.info(
       `[assets/extract] start projectId=${projectId || 'none'} scriptChars=${finalScript.length} ` +
       `styleBible=${styleBibleSource} worldTemplate=${worldTemplate ? 'yes' : 'none'}`,
@@ -108,6 +130,7 @@ export async function POST(req: NextRequest) {
     let parsed: any = { characters: [], environments: [], props: [] };
     try {
       writer.step('正在识别角色…');
+      stepInflight('正在识别角色…', 35);
       const characterStyleBible = styleBibleForCharacterAsset(styleBible);
       const sceneStyleBible = styleBibleForScenePrompt(styleBible);
       const characters = await chatCompleteJsonWithRetry(
@@ -139,6 +162,7 @@ export async function POST(req: NextRequest) {
       );
 
       writer.step('正在识别场景与道具…');
+      stepInflight('正在识别场景与道具…', 60);
       const characterRefs = characters.map((c: any, index: number) => ({
         id: c.id || `c${index + 1}`,
         name: c.name || '',
@@ -207,7 +231,9 @@ export async function POST(req: NextRequest) {
         props: normalizePropOwnership(props, characterRefs),
       };
     } catch (e: any) {
-      writer.error('资产抽取失败：' + (e?.message || String(e)));
+      const failMsg = '资产抽取失败：' + (e?.message || String(e));
+      endInflight('error', failMsg);
+      writer.error(failMsg);
       return;
     }
 
@@ -369,6 +395,7 @@ export async function POST(req: NextRequest) {
     writer.step('已识别角色 ' + parsed.characters.length + ' 个');
     writer.step('已识别场景 ' + parsed.environments.length + ' 个');
     writer.step('已识别道具 ' + parsed.props.length + ' 个');
+    stepInflight('正在整理资产…', 90);
 
     // 前端期望的资产结构：{characters, scenes, props}
     const assets = {
@@ -424,18 +451,23 @@ export async function POST(req: NextRequest) {
       const staleFlagReasons = { ...(((proj as any)._staleFlagReasons || {}) as Record<string, unknown>) };
       delete staleFlagReasons.assets;
       // 写回项目：兼容前端 project.assets.{characters/scenes/props} 老结构 + 新顶层结构
-      updateProjectForUser(projectId, user.id, {
-        characters: parsed.characters,
-        environments: parsed.environments,
-        props: parsed.props,
-        assets,
-        consistency: consistencyProject.consistency,
-        pendingWorldFacts: null,
-        _staleFlags: staleFlags,
-        _staleFlagReasons: staleFlagReasons,
-        assetsApproved: false,
-        currentStep: 2,
-      });
+      try {
+        updateProjectForUser(projectId, user.id, {
+          characters: parsed.characters,
+          environments: parsed.environments,
+          props: parsed.props,
+          assets,
+          consistency: consistencyProject.consistency,
+          pendingWorldFacts: null,
+          _staleFlags: staleFlags,
+          _staleFlagReasons: staleFlagReasons,
+          assetsApproved: false,
+          currentStep: 2,
+        });
+      } catch (e: any) {
+        endInflight('error', '资产写入失败：' + (e?.message || String(e)));
+        throw e;
+      }
       try {
         if (knowledgeContext) recordKnowledgeContextBestEffort({ ownerId: user.id, projectId, context: knowledgeContext });
       } catch (error) {
@@ -444,6 +476,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 前端读 resp.assets.{characters, scenes, props}，所以 done payload 必须有 assets 字段
+    endInflight('done');
     writer.done({
       assets,
       // 同时保留扁平字段，兼容其它老调用方

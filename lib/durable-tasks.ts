@@ -21,7 +21,7 @@ export const TASK_STATUS_TRANSITIONS: Record<DurableTaskStatus, DurableTaskStatu
   completed: [],
   failed: [],
   cancelled: [],
-  needs_review: ['queued', 'failed', 'cancelled'],
+  needs_review: ['queued', 'upstream_pending', 'failed', 'cancelled'],
 };
 
 export const DEFAULT_TASK_LEASE_MS = 60_000;

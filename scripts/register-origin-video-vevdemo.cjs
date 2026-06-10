@@ -322,7 +322,7 @@ async function main() {
   const sourcePath = path.join(DATA_DIR, 'videos', String(videoTask.owner_id), videoTask.filename);
   if (!fs.existsSync(sourcePath)) throw new Error(`Missing video file: ${sourcePath}`);
 
-  const title = argValue('title') || `origin-${videoTask.id}.mp4`;
+  const title = argValue('title') || videoTask.filename || `origin-${videoTask.id}.mp4`;
   const space = argValue('space', env.VITE_VEV_SPACE || 'origin');
   const apiBase = argValue('api-base', env.VITE_VEVDEMO_API_BASE || env.VEVDEMO_API_URL || 'http://127.0.0.1:3002');
   const workflowTemplateId = argValue('workflow-template-id', env.VITE_VEV_UPLOAD_WORKFLOW_TEMPLATE_ID || '');

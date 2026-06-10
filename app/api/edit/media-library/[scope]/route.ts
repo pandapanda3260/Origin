@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedUploadUrl, buildSignedVideoUrl } from '@/lib/signed-asset-url';
+import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,28 +27,41 @@ export async function GET(req: NextRequest, { params }: { params: { scope: strin
   // 视频任务（生成的片段）
   let videoRows: any[] = [];
   if (scope === 'project' && projectId) {
-    videoRows = db
-      .prepare<{ uid: number; pid: string }, any>(
-        `SELECT id, group_idx, prompt, duration_sec, cover_image_id, created_at FROM video_tasks
-         WHERE owner_id = @uid AND project_id = @pid AND status = 'completed' ORDER BY group_idx ASC`,
-      )
-      .all({ uid: user.id, pid: projectId });
-  } else {
-    videoRows = db
-      .prepare<{ uid: number }, any>(
-        `SELECT id, group_idx, prompt, duration_sec, cover_image_id, created_at FROM video_tasks
-         WHERE owner_id = @uid AND status = 'completed' ORDER BY created_at DESC`,
+	    videoRows = db
+	      .prepare<{ uid: number; pid: string }, any>(
+	        `SELECT vt.id, vt.project_id, vt.group_idx, vt.prompt, vt.filename, vt.duration_sec, vt.cover_image_id, vt.created_at,
+	                p.title AS project_title, p.data_json AS project_data_json
+	           FROM video_tasks vt
+	           LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	          WHERE vt.owner_id = @uid AND vt.project_id = @pid AND vt.status = 'completed'
+	          ORDER BY vt.group_idx ASC`,
+	      )
+	      .all({ uid: user.id, pid: projectId });
+	  } else {
+	    videoRows = db
+	      .prepare<{ uid: number }, any>(
+	        `SELECT vt.id, vt.project_id, vt.group_idx, vt.prompt, vt.filename, vt.duration_sec, vt.cover_image_id, vt.created_at,
+	                p.title AS project_title, p.data_json AS project_data_json
+	           FROM video_tasks vt
+	           LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
+	          WHERE vt.owner_id = @uid AND vt.status = 'completed'
+	          ORDER BY vt.created_at DESC`,
       )
       .all({ uid: user.id });
   }
-  for (const v of videoRows) {
-    const protectedUrl = `/api/videos/file/${v.id}`;
-    items.push({
-      mediaId: v.id,
-      kind: 'video',
-      source: 'generated',
-      title: `片段 ${v.group_idx ?? ''}`,
-      url: buildSignedVideoUrl(v.id, user.id).url,
+	  for (const v of videoRows) {
+	    const protectedUrl = `/api/videos/file/${v.id}`;
+	    const names = buildVideoSegmentNamesForRow(v);
+	    items.push({
+	      mediaId: v.id,
+	      kind: 'video',
+	      source: 'generated',
+	      title: names.displayName,
+	      name: names.displayName,
+	      displayName: names.displayName,
+	      filename: names.filename,
+	      downloadFilename: names.downloadFilename,
+	      url: buildSignedVideoUrl(v.id, user.id).url,
       protectedUrl,
       coverUrl: v.cover_image_id ? `/api/images/file/${v.cover_image_id}` : null,
       durationSec: v.duration_sec,
