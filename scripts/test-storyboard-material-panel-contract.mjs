@@ -75,7 +75,7 @@ assert.match(
 
 assert.match(
   assetsSource,
-  /import \{ invalidateAllMaterialPanels \} from '\.\/material_image_panel\.js\?v=\d+';[\s\S]*?function _invalidateMaterialPanelsAfterAssetChange\(\)[\s\S]*?invalidateAllMaterialPanels\(\)[\s\S]*?refreshStoryboardMaterialPanels/,
+  /import \{ invalidateAllMaterialPanels \} from '\/modules\/material_image_panel\.js';[\s\S]*?function _invalidateMaterialPanelsAfterAssetChange\(\)[\s\S]*?invalidateAllMaterialPanels\(\)[\s\S]*?refreshStoryboardMaterialPanels/,
   'asset module mutations must invalidate shared material panel cache and request visible slot refresh',
 );
 

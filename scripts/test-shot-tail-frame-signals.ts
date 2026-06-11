@@ -77,8 +77,12 @@ function testBatchExecutorKeepsSignalsInWriteShape() {
   assert.ok(start >= 0 && end > start, 'shots executor block should be locatable');
   const block = source.slice(start, end);
 
-  assert.match(block, /tailFrameSignals:\s*normalizeTailFrameSignals\(sh,\s*\{/);
-  assert.match(block, /shotType,\s*\n\s*camera,\s*\n\s*dialogue:\s*finalDialogue,\s*\n\s*durationSec:\s*duration/);
+  assert.match(block, /const normalizedPlan = normalizeGeneratedShotPlan\(shotsArr,\s*\{/);
+  assert.match(block, /shotsArr = normalizedPlan\.shots;/);
+
+  const normalizerSource = readFileSync(join(process.cwd(), 'lib/shot-plan-normalize.ts'), 'utf8');
+  assert.match(normalizerSource, /tailFrameSignals:\s*normalizeTailFrameSignals\(source,\s*\{/);
+  assert.match(normalizerSource, /shotType:\s*fields\.shotType,\s*\n\s*camera:\s*fields\.camera,\s*\n\s*dialogue,\s*\n\s*durationSec:\s*duration/);
 }
 
 testPreservesAndClampsModelSignals();

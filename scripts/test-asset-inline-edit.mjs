@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 globalThis.localStorage = {
   getItem() { return ''; },
@@ -73,9 +77,15 @@ class FakeElement {
     if (this._innerHTML.includes('data-scene-edit-cancel')) this._sceneButtons.cancel = new FakeElement('button');
   }
   get innerHTML() { return this._innerHTML; }
+  get childNodes() { return this.children; }
   appendChild(child) {
     child.parentNode = this;
     this.children.push(child);
+    return child;
+  }
+  removeChild(child) {
+    this.children = this.children.filter((item) => item !== child);
+    if (child) child.parentNode = null;
     return child;
   }
   remove() {
@@ -134,6 +144,7 @@ globalThis.document = {
   body: documentBody,
   documentElement: { clientWidth: 1440, clientHeight: 900 },
   createElement(tag) { return new FakeElement(tag); },
+  createTextNode(text) { return { nodeType: 3, textContent: String(text || ''), parentNode: null }; },
   getElementById(id) {
     const bodyMatch = findById(documentBody, id);
     if (bodyMatch) return bodyMatch;
@@ -149,7 +160,25 @@ globalThis.document = {
   removeEventListener() {},
 };
 
-const assets = await import('../public/modules/assets.js');
+function browserModuleImportUrl(entry) {
+  const srcDir = fileURLToPath(new URL('../public/modules/', import.meta.url));
+  const tmpDir = mkdtempSync(join(tmpdir(), 'origin-browser-modules-'));
+  process.on('exit', () => {
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  });
+
+  for (const name of readdirSync(srcDir)) {
+    if (!name.endsWith('.js')) continue;
+    const src = readFileSync(join(srcDir, name), 'utf8')
+      .replace(/(from\s+['"])\/modules\//g, '$1./')
+      .replace(/(import\s*\(\s*['"])\/modules\//g, '$1./');
+    writeFileSync(join(tmpDir, name), src);
+  }
+
+  return pathToFileURL(join(tmpDir, entry)).href;
+}
+
+const assets = await import(browserModuleImportUrl('assets.js'));
 const {
   handleAssetAction,
   initAssets,
@@ -212,11 +241,11 @@ function makeSceneEditorField(initial = '') {
   };
 }
 
-function makeEditCard(type, idx) {
-  const textEl = { classList: makeClassList(false), textContent: '' };
+function makeEditCard(type, idx, description = '旧描述') {
+  const textEl = { classList: makeClassList(false), textContent: description };
   const editEl = {
     classList: makeClassList(true),
-    value: '',
+    value: description,
     focus() {
       this.focused = true;
       document.activeElement = this;
@@ -274,15 +303,17 @@ function assertDescContract(html, placeholder) {
   assert.match(html, /data-action="edit-asset"/);
   assert.match(html, /asset-desc-text/);
   assert.match(html, /asset-desc-edit hidden/);
-  assert.match(html, /<textarea[^>]*rows="3"><\/textarea>/);
-  assert.match(html, new RegExp(placeholder));
+  assert.match(html, /<textarea[^>]*rows="4"><\/textarea>/);
+  if (placeholder) assert.match(html, new RegExp(placeholder));
 }
 
 function assertSceneDisplayContract(html, placeholder) {
-  assert.match(html, /<div class="asset-desc-wrap">/);
+  assert.match(html, /class="asset-desc-wrap[^"]*"/);
+  assert.match(html, /data-action="edit-scene-desc"/);
   assert.match(html, /asset-desc-text/);
+  assert.match(html, /asset-desc-edit hidden/);
+  assert.match(html, /<textarea[^>]*rows="4"><\/textarea>/);
   assert.match(html, new RegExp(placeholder));
-  assert.doesNotMatch(html, /asset-desc-edit/);
   assert.doesNotMatch(html, /data-scene-edit-field/);
 }
 
@@ -293,7 +324,7 @@ function assertSceneDisplayContract(html, placeholder) {
   const propContainer = document.getElementById('propGrid');
   renderAssetGrid('propGrid', [{ name: '戒指' }], 'prop', '');
   assert.equal(propContainer.children.length, 1);
-  assertDescContract(propContainer.children[0].innerHTML, '暂无道具描述');
+  assertDescContract(propContainer.children[0].innerHTML);
 
   const sceneContainer = document.getElementById('sceneGrid');
   renderAssetGrid('sceneGrid', [{ name: '宴会厅', imageUrl: '/scene.png', location: '旧地点', timeSetting: '夜晚', atmosphere: '安静，冷清' }], 'scene', '');
@@ -307,7 +338,9 @@ function assertSceneDisplayContract(html, placeholder) {
 async function assertEditableDescription(type, cat, newValue) {
   const fetchCalls = resetFetch();
   const ctx = makeCtx();
-  const item = { name: type === 'prop' ? '戒指' : '宴会厅', description: '旧描述' };
+  const item = type === 'prop'
+    ? { name: '戒指', description: '旧描述', features: '旧描述' }
+    : { name: '宴会厅', description: '旧描述' };
   const project = {
     styleBible: {},
     assets: { characters: [], scenes: [], props: [] },
@@ -323,7 +356,8 @@ async function assertEditableDescription(type, cat, newValue) {
 
   dom.editEl.value = newValue;
   dom.editEl.onblur();
-  assert.equal(item.description, newValue);
+  if (type === 'prop') assert.equal(item.features, newValue);
+  else assert.equal(item.description, newValue);
   assert.equal(item._descEdited, true);
   assert.equal(dom.textEl.textContent, newValue);
   assert.deepEqual(ctx.calls.stale[0], ['asset', { type, idx: 0, name: item.name }]);
@@ -387,15 +421,18 @@ await assertEditableDescription('prop', 'props', '新道具描述');
   handleAssetAction({ target: dom.otherButton('scene-more') });
   const menu = document.getElementById('sceneContextMenu');
   assert.ok(menu, 'scene: more menu opened');
-  assert.match(menu.innerHTML, /编辑场景信息/);
-  assert.match(menu.innerHTML, /查看历史/);
-  assert.match(menu.innerHTML, /引用到 AI 助手/);
+  assert.match(menu.innerHTML, /上传场景图/);
+  assert.match(menu.innerHTML, /下载图片/);
+  assert.match(menu.innerHTML, /历史记录/);
+  assert.match(menu.innerHTML, /删除场景/);
+  assert.doesNotMatch(menu.innerHTML, /编辑场景信息/);
+  assert.doesNotMatch(menu.innerHTML, /引用到 AI 助手/);
 }
 
 {
   const fetchCalls = resetFetch();
   const ctx = makeCtx();
-  const item = { name: '戒指', description: '旧描述' };
+  const item = { name: '戒指', description: '旧描述', features: '旧描述' };
   const project = { styleBible: {}, assets: { characters: [], scenes: [], props: [item] } };
   resetProject(project, ctx);
 

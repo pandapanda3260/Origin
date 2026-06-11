@@ -26,7 +26,25 @@ export async function POST(req: NextRequest) {
     const json = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
       user,
       buildRetagMessages(finalScript, durationSec || (proj as any)?.scriptTargetDurationSec),
-      { temperature: 0.4, maxTokens: 800, modelRole: 'structured' },
+      {
+        temperature: 0.4,
+        maxTokens: 800,
+        modelRole: 'structured',
+        traceName: 'retag.emotions',
+        tokenContext: {
+          projectId: proj ? projectId || null : null,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'script.workflow.retag-emotions',
+          moduleKey: 'script',
+          moduleLabel: '剧本页面',
+          featureKey: 'emotion_retag',
+          featureLabel: '情绪标签重标',
+          callItemType: 'project',
+          callItemId: proj ? projectId || null : null,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      },
       parseJsonLoose,
       'retag.emotions',
     );

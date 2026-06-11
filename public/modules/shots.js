@@ -1,6 +1,6 @@
-import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from './utils.js?v=300';
-import { subscribeBatch } from './backend_stream.js?v=300';
-import { segmentInfoForShot } from './frameRecommendations.js?v=1';
+import { $, escapeHtml, showToast, apiPost, apiGet, getAuthHeaders, stripStepTags } from '/modules/utils.js';
+import { subscribeBatch } from '/modules/backend_stream.js';
+import { segmentInfoForShot } from '/modules/frameRecommendations.js';
 import {
   ANGLES,
   CAMERA_MOVES,
@@ -18,7 +18,7 @@ import {
   normalizeLens,
   normalizeLight,
   normalizeShotType,
-} from './shotSchema.js?v=300';
+} from '/modules/shotSchema.js';
 
 let _ctx = {};
 let project = null;

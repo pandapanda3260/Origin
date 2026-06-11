@@ -2,13 +2,14 @@
  * Edit workbench module — extracted from main.js (stage 2 refactor).
  * Call initEdit(ctx) once at startup, then syncEditProject(p) whenever project changes.
  */
-import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, ApiError, getAuthHeaders, fetchVideoSignedUrl, fetchUploadSignedUrl, hydrateProtectedImageElements } from './utils.js?v=300';
-import { subscribeTask, subscribeBatch } from './backend_stream.js?v=300';
-import { showBillingPaywall } from './billing.js?v=114';
-import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js?v=300';
+import { $, escapeHtml, showToast, showConfirm, apiGet, apiPost, apiPostStream, formatTime, getAuthHeaders, fetchVideoSignedUrl, fetchUploadSignedUrl, hydrateProtectedImageElements } from '/modules/utils.js';
+import { subscribeTask, subscribeBatch } from '/modules/backend_stream.js';
+import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js';
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
 
-// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 117" 才能确认新代码加载到。
-console.log('%c[EDIT_JS_VERSION] 117 —— 下载按钮状态按导出完成态收口', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 118" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 118 —— 下载按钮仅在成片完成后可用', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+assertModuleSingleton("edit", import.meta.url);
 
 let _ctx = {};
 let project = null;
@@ -367,7 +368,7 @@ function _getEditExportState() {
       hint: "",
     };
   }
-  return { state: "export", label: "下载导出", sub: "Export", disabled: false, hint: "" };
+  return { state: "not-composed", label: "下载导出", sub: "Download", disabled: true, hint: "" };
 }
 
 function _syncEditExportButtonState() {
@@ -4201,10 +4202,6 @@ function _teardownProjectScopedEditUi() {
       _pulseAutoComposeButton();
       return;
     }
-    if (state.state === "export") {
-      _exportEditVideo();
-      return;
-    }
     if (state.state === "exporting") {
       showToast("导出正在进行中，请稍候", "warn");
       return;
@@ -4303,65 +4300,6 @@ function _teardownProjectScopedEditUi() {
       },
     });
     _exportStreamHandle = handle;
-  }
-
-  async function _exportEditVideo() {
-    var segs = _getTimelineSegs();
-    if (!segs || segs.length === 0) {
-      showToast("时间线上没有素材", "error");
-      return;
-    }
-    if (!_editActionStart("btnEditExport", "editCardExport", "#34d399", "正在下载导出…", "Exporting")) return;
-
-    var epoch = _editUiEpoch; // 纪元守卫：await 期间切项目则整段作废（防串台）
-    var exportEdl = _editState.edl ? _edlForPersistence(_editState.edl) : {
-      timeline: segs.map(function (s) {
-        return {
-          groupIdx: s.groupIdx,
-          videoUrl: _segPersistedVideoUrl(s),
-          inPoint: s.inPoint || 0,
-          outPoint: s.outPoint || s.duration || 0,
-          duration: s.duration || 0,
-        };
-      }),
-    };
-
-    try {
-      var resp = await apiPost("/api/edit/export", {
-        projectId: (project && project.id) || "",
-        edl: exportEdl,
-        edlVersion: _currentEditEdlVersion(),
-        segments: segs.map(function (s) {
-          return { groupIdx: s.groupIdx, videoUrl: _segPersistedVideoUrl(s), duration: s.duration };
-        }),
-      });
-
-      var taskId = resp.taskId;
-      if (!taskId) {
-        throw new Error(resp && resp.error ? resp.error : "任务创建失败");
-      }
-      if (epoch !== _editUiEpoch) return; // 提交期间已切项目：任务照跑，UI 交还 teardown
-      // E-2.2：taskId 通过 task_store 持久化（register 已在后端做过），前端只需要
-      // 在内存里缓存就够——不再 saveProject 写盘（Bug F 同款）。刷新后由
-      // _tryResumeExportStream() 从 editData 里读回重订。
-      if (project) {
-        if (!project.editData) project.editData = {};
-        project.editData.exportTaskId = taskId;
-        project.editData.exportUrl = "";
-      }
-      _syncEditExportButtonState();
-      showToast("导出任务已提交，正在处理…", "ok");
-      _attachExportStream(taskId);
-    } catch (e) {
-      if (epoch !== _editUiEpoch) return;
-      if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
-        showBillingPaywall(e.billing || null);
-      } else {
-        showToast("导出失败: " + _diagnoseApiError(((e && e.message) || e).toString()), "error");
-      }
-      _editActionEnd("btnEditExport", "editCardExport", "下载导出");
-      _syncEditExportButtonState();
-    }
   }
 
   // 时间线被手工改过后的轻确认弹窗：只有「确定」会动作（设为新基线并继续成片），

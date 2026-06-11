@@ -64,7 +64,25 @@ export async function POST(req: NextRequest) {
           { role: 'system', content: SP_EXPAND },
           { role: 'user', content: `当前剧本：\n${baseScript}` },
         ],
-        { temperature: 0.7, maxTokens: 3500, modelRole: 'brain' },
+        {
+          temperature: 0.7,
+          maxTokens: 3500,
+          modelRole: 'brain',
+          traceName: 'script.expand',
+          tokenContext: {
+            projectId: proj ? projectId || null : null,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'script.workflow.expand',
+            moduleKey: 'script',
+            moduleLabel: '剧本页面',
+            featureKey: 'script_expand',
+            featureLabel: '剧本扩充',
+            callItemType: 'project',
+            callItemId: proj ? projectId || null : null,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         (delta) => {
           buf += delta;
           writer.scriptChunk(delta);

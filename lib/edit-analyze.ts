@@ -215,7 +215,28 @@ export async function analyzeUsableSegments(args: {
   await chatStream(
     args.user,
     messages,
-    { temperature: 0.5, responseFormat: 'json_object', maxTokens: analyzeMaxTokens, modelRole: 'structured', reasoningEffort: 'none' },
+    {
+      temperature: 0.5,
+      responseFormat: 'json_object',
+      maxTokens: analyzeMaxTokens,
+      modelRole: 'structured',
+      reasoningEffort: 'none',
+      traceName: 'edit.analyze',
+      tokenContext: {
+        projectId: args.knowledge?.projectId || null,
+        projectTitleSnapshot: args.project?.title || null,
+        requestPath: 'edit_analyze',
+        routeName: 'edit.analyze',
+        moduleKey: 'edit',
+        moduleLabel: '剪辑页',
+        featureKey: 'edit_analyze',
+        featureLabel: '剪辑分析',
+        callItemType: 'project',
+        callItemId: args.knowledge?.projectId || null,
+        callItemLabel: args.project?.title || null,
+        runId: args.knowledge?.runId || null,
+      },
+    },
     (delta) => {
       raw += delta;
       args.onChunk?.(delta);

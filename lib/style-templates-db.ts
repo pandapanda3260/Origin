@@ -3,6 +3,7 @@ import { getDb, type UserRow } from './db';
 import { chatCompleteJsonWithRetry, parseJsonLoose, type ChatMessage } from './llm';
 import { resolveTextModelConfig } from './model-routing';
 import { getWorldTemplate } from './world-templates-db';
+import type { TokenUsageContext } from './token-usage';
 
 type StyleTemplateRow = {
   id: string;
@@ -629,6 +630,10 @@ export function recommendStyleTemplateForScriptByRules(userId: number, input: {
 export async function recommendStyleTemplateForScript(user: UserRow | number, input: {
   script?: string;
   worldTemplateSnapshot?: any;
+  projectId?: string | null;
+  projectTitleSnapshot?: string | null;
+  requestPath?: string | null;
+  routeName?: string | null;
 }) {
   const userId = styleRecommendationUserId(user);
   const ruleResult = recommendStyleTemplateForScriptByRules(userId, input);
@@ -673,7 +678,14 @@ function styleRecommendationUserId(user: UserRow | number) {
 
 async function recommendFeaturedStyleTemplateIdWithLLM(
   user: UserRow | null,
-  input: { script?: string; worldTemplateSnapshot?: any },
+  input: {
+    script?: string;
+    worldTemplateSnapshot?: any;
+    projectId?: string | null;
+    projectTitleSnapshot?: string | null;
+    requestPath?: string | null;
+    routeName?: string | null;
+  },
 ): Promise<LLMStyleTemplateDecision | null> {
   const script = String(input.script || '').trim();
   if (!script) return null;
@@ -682,6 +694,21 @@ async function recommendFeaturedStyleTemplateIdWithLLM(
   if (cfg.mode === 'fake') return null;
 
   const messages = buildStyleTemplateClassifierMessages(input);
+  const tokenContext: TokenUsageContext = {
+    projectId: input.projectId || null,
+    projectTitleSnapshot: input.projectTitleSnapshot || null,
+    requestPath: input.requestPath || null,
+    routeName: input.routeName || 'style-template-classifier',
+    moduleKey: 'style',
+    moduleLabel: '风格页面',
+    featureKey: 'style_template_classifier',
+    featureLabel: '风格模板推荐',
+    callItemType: input.projectId ? 'project' : 'script',
+    callItemId: input.projectId || null,
+    callItemLabel: input.projectTitleSnapshot || null,
+    operationKey: input.projectId ? `style-template-classifier:${input.projectId}` : 'style-template-classifier',
+    operationLabel: '风格模板推荐',
+  };
   const parsed = await chatCompleteJsonWithRetry(
     user,
     messages,
@@ -692,6 +719,7 @@ async function recommendFeaturedStyleTemplateIdWithLLM(
       reasoningEffort: null,
       maxAttempts: 2,
       traceName: 'style-template-classifier',
+      tokenContext,
     },
     (raw) => parseStyleClassifierJson(raw),
     'style-template-classifier',

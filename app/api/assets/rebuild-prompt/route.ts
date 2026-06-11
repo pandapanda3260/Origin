@@ -5,6 +5,7 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { sanitizePromptObject } from '@/lib/content-sanitize';
 import { appendCharacterCastingPrompt, omitCastingProfileFromStyleBible } from '@/lib/casting-profile';
 import { isAnonymousCrowdAsset } from '@/lib/crowd-character';
+import { getProjectByIdForUser } from '@/lib/projects-db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -62,6 +63,8 @@ export async function POST(req: NextRequest) {
   const item: any = sanitizePromptObject(body.item || body);
   const rawStyleBible: any = sanitizePromptObject(body.styleBible || null);
   const styleBible: any = omitCastingProfileFromStyleBible(rawStyleBible);
+  const projectId = String(body.projectId || item?.projectId || '').trim();
+  const project = projectId ? getProjectByIdForUser(projectId, user.id) : null;
 
   if (!item) return jsonError('缺 item 字段', 400);
 
@@ -79,7 +82,25 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: (target === 'char' || target === 'character') && isAnonymousCrowdAsset(item) ? SP_REBUILD_CROWD : SP_REBUILD },
         { role: 'user', content: ctx.join('\n\n') },
       ],
-      { temperature: 0.5, maxTokens: 400, modelRole: 'structured' },
+      {
+        temperature: 0.5,
+        maxTokens: 400,
+        modelRole: 'structured',
+        traceName: 'assets.rebuild-prompt',
+        tokenContext: {
+          projectId: project ? projectId : null,
+          projectTitleSnapshot: (project as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'assets.rebuild-prompt',
+          moduleKey: 'assets',
+          moduleLabel: '资产生成',
+          featureKey: 'asset_prompt_rebuild',
+          featureLabel: '资产提示词重写',
+          callItemType: target,
+          callItemId: String(item?.id || item?.name || '').trim() || null,
+          callItemLabel: String(item?.name || item?.id || '').trim() || null,
+        },
+      },
     );
   } catch (e: any) {
     return jsonError('提示词生成失败：' + (e?.message || String(e)), 502);

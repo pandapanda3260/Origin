@@ -236,12 +236,17 @@ export async function buildCustomCharacterFields(input: {
 }) {
   const prompt = cleanText(input.prompt, 4000);
   if (!input.imagePath) {
-    return structureTextCharacter(input.user, prompt, input.params);
+    return structureTextCharacter(input.user, prompt, input.params, input.tokenContext || null);
   }
   return structureVisionCharacter(input.user, input.imagePath, prompt, input.params, input.sourceType || 'image', input.tokenContext || null);
 }
 
-async function structureTextCharacter(user: UserRow, prompt: string, params: CustomCharacterParams) {
+async function structureTextCharacter(
+  user: UserRow,
+  prompt: string,
+  params: CustomCharacterParams,
+  tokenContext: TokenUsageContext | null,
+) {
   const cfg = resolveTextModelConfig(user, 'structured');
   if (cfg.mode === 'fake') return fallbackFields(prompt, params);
   const text = await chatComplete(user, [
@@ -263,6 +268,17 @@ async function structureTextCharacter(user: UserRow, prompt: string, params: Cus
     maxTokens: 1200,
     temperature: 0.2,
     traceName: 'custom-character-fields',
+    tokenContext: {
+      ...(tokenContext || {}),
+      ownerId: user.id,
+      usernameSnapshot: user.phone || user.display_name || user.username || null,
+      moduleKey: 'assets',
+      moduleLabel: '资产生成',
+      featureKey: 'custom_character_fields',
+      featureLabel: '自定义角色字段整理',
+      operationKey: tokenContext?.operationKey || tokenContext?.callItemId || undefined,
+      operationLabel: '自定义角色字段整理',
+    },
   });
   return normalizeCustomCharacterFields(parseJsonObject(text), params);
 }

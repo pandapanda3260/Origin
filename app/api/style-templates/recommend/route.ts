@@ -27,6 +27,10 @@ export async function GET(req: NextRequest) {
     const result = await recommendStyleTemplateForScript(user, {
       script: String((project as any).script || ''),
       worldTemplateSnapshot: (project as any).worldTemplateSnapshot || null,
+      projectId,
+      projectTitleSnapshot: (project as any).title || null,
+      requestPath: req.nextUrl.pathname,
+      routeName: 'style-templates.recommend',
     });
     persistAutoRecommendationIfStillEligible(projectId, user.id, result);
     return jsonOk(result);

@@ -405,7 +405,27 @@ export async function POST(req: NextRequest) {
     result = await chatCompleteJsonWithRetry(
       user,
       messages,
-      { modelRole: 'structured', maxTokens: 1200, temperature: 0.2, maxAttempts: 3, requestTimeoutMs: 30000 },
+      {
+        modelRole: 'structured',
+        maxTokens: 1200,
+        temperature: 0.2,
+        maxAttempts: 3,
+        requestTimeoutMs: 30000,
+        traceName: 'first-frame-draft-rewrite',
+        tokenContext: {
+          projectId,
+          projectTitleSnapshot: (project as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'frames.rewrite-draft',
+          moduleKey: 'frames',
+          moduleLabel: '首帧编辑',
+          featureKey: 'first_frame_draft_rewrite',
+          featureLabel: '首帧草稿对话改写',
+          callItemType: 'shot_group',
+          callItemId: String(groupIdx),
+          callItemLabel: `镜头组 ${groupIdx}`,
+        },
+      },
       parseFirstFrameRewriteResult,
       'first-frame-draft-rewrite',
     );

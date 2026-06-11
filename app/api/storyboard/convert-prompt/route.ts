@@ -140,7 +140,25 @@ export async function POST(req: NextRequest) {
           { role: 'system', content: SP_SHOT_TO_IMG_PROMPT },
           { role: 'user', content: userMsg },
         ],
-        { temperature: 0.5, maxTokens: 600, modelRole: 'structured' },
+        {
+          temperature: 0.5,
+          maxTokens: 600,
+          modelRole: 'structured',
+          traceName: 'storyboard.convert-prompt',
+          tokenContext: {
+            projectId: project ? projectId || null : null,
+            projectTitleSnapshot: (project as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'storyboard.convert-prompt',
+            moduleKey: 'storyboard',
+            moduleLabel: '分镜图',
+            featureKey: 'storyboard_image_prompt_convert',
+            featureLabel: '分镜图提示词生成',
+            callItemType: 'shot',
+            callItemId: String(shot?.id || shot?.uid || idx),
+            callItemLabel: `镜头 ${shot.idx ?? idx + 1}`,
+          },
+        },
         (delta) => {
           promptText += delta;
           writer.chunk(delta);

@@ -5,6 +5,7 @@ import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { syncEditProjectClips } from '@/lib/asset-library';
 import { resolveGroupImportDurationSec, resolveTrustedActualDurationSec } from '@/lib/edit-duration-runtime';
 import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
+import { buildEdlResult, collectEdlGenerationContext } from '@/lib/edit-edl';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -83,6 +84,80 @@ function resolveSegmentNames(proj: any, groupIdx: number) {
     filename: String(sb.videoFilename || vt.filename || downloadFilename).trim(),
     downloadFilename,
   };
+}
+
+function buildDeterministicTimelineFromClips(clips: any[]) {
+  const timeline = (Array.isArray(clips) ? clips : []).map((clip) => {
+    const duration = Math.max(0.1, Number(clip?.durationSec) || 4);
+    const displayName = String(clip?.displayName || `片段${Number(clip?.groupIdx) + 1}`).trim();
+    const filename = String(clip?.filename || clip?.downloadFilename || `${displayName}.mp4`).trim();
+    const downloadFilename = String(clip?.downloadFilename || filename).trim();
+    return {
+      clipId: String(clip?.clipId || '').trim(),
+      groupIdx: Number.isInteger(Number(clip?.groupIdx)) ? Number(clip.groupIdx) : null,
+      videoUrl: String(clip?.videoUrl || '').trim(),
+      filename,
+      displayName,
+      downloadFilename,
+      _mediaName: displayName,
+      inPoint: 0,
+      outPoint: duration,
+      duration,
+      transitionIn: { type: 'cut', duration: 0 },
+      transitionOut: { type: 'cut', duration: 0 },
+      note: '',
+    };
+  }).filter((entry) => entry.clipId && entry.videoUrl);
+  const totalDuration = timeline.reduce((sum, entry) => sum + (Number(entry.duration) || 0), 0);
+  return { timeline, totalDuration };
+}
+
+function syncStoryboardsImportedToTimeline(proj: any, timeline: any[]) {
+  const sbs: any[] = Array.isArray(proj?.storyboards) ? [...proj.storyboards] : [];
+  if (!sbs.length) return null;
+  const inTimeline = new Set<number>();
+  for (const entry of Array.isArray(timeline) ? timeline : []) {
+    const groupIdx = Number(entry?.groupIdx);
+    if (Number.isInteger(groupIdx)) inTimeline.add(groupIdx);
+  }
+  let touched = false;
+  for (let i = 0; i < sbs.length; i += 1) {
+    const sb = sbs[i];
+    if (!sb) continue;
+    const want = inTimeline.has(i);
+    if (!!sb.importedToEdit !== want) {
+      sbs[i] = { ...sb, importedToEdit: want };
+      touched = true;
+    }
+  }
+  return touched ? sbs : null;
+}
+
+function ensureCurrentVideosEdl(proj: any, projectId: string, userId: number) {
+  const prevEdl = ensureEdl(proj);
+  if (Array.isArray(prevEdl.timeline) && prevEdl.timeline.length > 0) {
+    return { changed: false, edl: prevEdl, storyboards: null as any[] | null };
+  }
+
+  const collected = collectEdlGenerationContext({
+    projectId,
+    userId,
+    project: proj,
+    targetDurationSec: Number((prevEdl as any).duration) || 0,
+    strictSegments: false,
+  }) as any;
+  if (!collected?.ok) {
+    return { changed: false, edl: prevEdl, storyboards: null as any[] | null, error: collected?.error || '当前还没有已生成的视频片段，先去片段页生成' };
+  }
+
+  const { timeline, totalDuration } = buildDeterministicTimelineFromClips(collected.clips || []);
+  if (!timeline.length) {
+    return { changed: false, edl: prevEdl, storyboards: null as any[] | null, error: '当前还没有可导入的视频片段' };
+  }
+
+  const edl = buildEdlResult({ narrative: '', pacingPlan: '' }, timeline, totalDuration, prevEdl) as Edl;
+  const storyboards = syncStoryboardsImportedToTimeline(proj, timeline);
+  return { changed: true, edl, storyboards };
 }
 
 function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; error?: string } {
@@ -325,6 +400,40 @@ export async function POST(req: NextRequest) {
   if (!projectId) return jsonError('缺 projectId', 400);
   const proj = getProjectByIdForUser(projectId, user.id) as any;
   if (!proj) return jsonError('项目不存在', 404);
+
+  if (String(body?.op || '') === 'ensure-current-videos-edl') {
+    const ensured = ensureCurrentVideosEdl(proj, projectId, user.id);
+    if (ensured.error) return jsonError(ensured.error, 400);
+    if (!ensured.changed) {
+      return jsonOk({
+        ok: true,
+        changed: false,
+        edl: ensured.edl,
+        readiness: computeReadiness(proj),
+        serverVersion: ensured.edl.version || 0,
+      });
+    }
+
+    const editData = { ...(proj.editData || {}), edl: ensured.edl };
+    const patch: any = { editData };
+    if (ensured.storyboards) patch.storyboards = ensured.storyboards;
+    const fresh = updateProjectForUser(projectId, user.id, patch) as any;
+    try {
+      syncEditProjectClips({ ownerId: user.id, projectId, timeline: ensured.edl.timeline || [] });
+    } catch (clipError) {
+      console.warn('[edit/timeline] pinned clip sync skipped:', clipError);
+    }
+    const finalProj = fresh || (ensured.storyboards ? { ...proj, storyboards: ensured.storyboards } : proj);
+    return jsonOk({
+      ok: true,
+      changed: true,
+      edl: ensured.edl,
+      readiness: computeReadiness(finalProj),
+      serverVersion: ensured.edl.version || 0,
+      projectVersion: Number(fresh?.version) || undefined,
+      storyboards: ensured.storyboards || undefined,
+    });
+  }
 
   const { edl, storyboards, error } = applyOp(proj, body);
   if (error) return jsonError(error, 400);

@@ -1,11 +1,14 @@
-import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from './utils.js?v=300';
-import { loadProjectData } from './project.js?v=106';
-import { subscribeBatch, subscribeTask } from './backend_stream.js?v=300';
-import { renderAssetCard } from './render_hooks.js?v=300';
-import { attachShotsBatch } from './shots.js?v=114';
-import { reattachStoryboardBatches } from './storyboard.js?v=156';
-import { showBillingPaywall } from './billing.js?v=114';
-import { invalidateAllMaterialPanels } from './material_image_panel.js?v=104';
+import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from '/modules/utils.js';
+import { loadProjectData } from '/modules/project.js';
+import { subscribeBatch, subscribeTask } from '/modules/backend_stream.js';
+import { renderAssetCard } from '/modules/render_hooks.js';
+import { attachShotsBatch } from '/modules/shots.js';
+import { reattachStoryboardBatches } from '/modules/storyboard.js';
+import { showBillingPaywall } from '/modules/billing.js';
+import { invalidateAllMaterialPanels } from '/modules/material_image_panel.js';
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
+
+assertModuleSingleton("assets", import.meta.url);
 
 const _getAuthHeaders = getAuthHeaders;
 

@@ -33,12 +33,13 @@ export async function POST(req: NextRequest) {
   let requestHistoryForWrite: { role: 'user' | 'assistant'; content: string; readyToDraft?: boolean }[] = [];
   let requestHistorySource: 'db_existing_plus_current_turn' | 'request_history_plus_current_turn' = 'db_existing_plus_current_turn';
   let requestIncludedHistory = Array.isArray(body.messages) || Array.isArray(body.history);
+  let project: any = null;
 
   // 取项目里已有的咨询历史（如果有）；默认请求体里的 history/messages 不参与写入。
   if (projectId) {
-    const proj = getProjectByIdForUser(projectId, user.id);
-    if (proj) {
-      const consult = normalizeScriptConsultState((proj as any).scriptConsult);
+    project = getProjectByIdForUser(projectId, user.id);
+    if (project) {
+      const consult = normalizeScriptConsultState(project.scriptConsult);
       const selection = selectConsultTurnHistory(consult.messages as any, body, dbHistoryOnly);
       history = selection.history as any;
       requestHistoryForWrite = selection.requestHistory;
@@ -78,7 +79,26 @@ export async function POST(req: NextRequest) {
     writer.step('正在分析意图…');
     let buf = '';
     const messages = buildConsultMessages(history, userMsg);
-    await chatStream(user, messages, { temperature: 0.6, maxTokens: 800, modelRole: 'brain' }, (delta) => {
+    await chatStream(user, messages, {
+      temperature: 0.6,
+      maxTokens: 800,
+      modelRole: 'brain',
+      traceName: 'script.consult_turn',
+      tokenContext: {
+        projectId: project ? projectId || null : null,
+        projectTitleSnapshot: project?.title || null,
+        requestPath: req.nextUrl.pathname,
+        routeName: 'script.workflow.consult.turn',
+        moduleKey: 'script',
+        moduleLabel: '剧本页面',
+        featureKey: 'script_consult_turn',
+        featureLabel: '剧本对话分析',
+        callItemType: 'project',
+        callItemId: project ? projectId || null : null,
+        callItemLabel: project?.title || null,
+        correlationId: requestId,
+      },
+    }, (delta) => {
       buf += delta;
       writer.aiChunk(delta);
     });

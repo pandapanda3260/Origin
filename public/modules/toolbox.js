@@ -1,4 +1,4 @@
-import { $, apiRequest, apiUpload, escapeHtml, fetchAssetSignedUrl, hydrateProtectedImageElements, showConfirm } from './utils.js?v=300';
+import { $, apiRequest, apiUpload, escapeHtml, fetchAssetSignedUrl, hydrateProtectedImageElements, showConfirm } from '/modules/utils.js';
 
 var _ctx = {};
 var _wired = false;

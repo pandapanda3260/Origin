@@ -639,6 +639,17 @@ body.billing-modal-lock {
   background: rgba(236, 239, 241, 0.2);
   color: rgba(236, 239, 241, 0.6);
 }
+.plan-cta.is-display-only:disabled {
+  opacity: 1;
+  background: #ECEFF1;
+  color: #0B1320;
+  box-shadow: none;
+}
+.plan-card.is-current .plan-cta.is-display-only:disabled {
+  background: #00E5FF;
+  color: #0B1320;
+  box-shadow: 0 0 24px rgba(0, 229, 255, 0.35);
+}
 
 /* ============================================================
    当前套餐状态卡（.plan-current-card）

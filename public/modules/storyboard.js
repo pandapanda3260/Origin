@@ -1,5 +1,5 @@
 import { $, escapeHtml, showToast, apiPost, apiPostStream, apiGet, getAuthHeaders, getActiveBatchesShared,
-  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from './utils.js?v=300';
+  consumeStreamStepTags, ApiError, hydrateProtectedImageElements } from '/modules/utils.js';
 import {
   materialPanelCandidateTilesForRole,
   materialPanelOrderedTiles,
@@ -22,11 +22,11 @@ import {
   setMaterialPanelUploading,
   shouldRefreshMaterialPanel,
   setMaterialPanel,
-} from './material_image_panel.js?v=104';
-import { attachDiagnostic } from './diagnostic.js?v=300';
-import { renderStoryboardCard, renderStoryboardFrameCard } from './render_hooks.js?v=300';
-import { subscribeBatch } from './backend_stream.js?v=300';
-import { showBillingPaywall } from './billing.js?v=114';
+} from '/modules/material_image_panel.js';
+import { attachDiagnostic } from '/modules/diagnostic.js';
+import { renderStoryboardCard, renderStoryboardFrameCard } from '/modules/render_hooks.js';
+import { subscribeBatch } from '/modules/backend_stream.js';
+import { showBillingPaywall } from '/modules/billing.js';
 import {
   canGenerateTailFrame as _canGenerateTailFrame,
   firstFrameImageUrl as _firstFrameImageUrl,
@@ -37,7 +37,10 @@ import {
   tailFrameImageUrl as _tailFrameImageUrl,
   tailFrameGenerationIntentForGroup as _tailFrameGenerationIntentForGroup,
   tailFrameSuggestionForGroup as _tailFrameSuggestionForGroup,
-} from './frameRecommendations.js?v=1';
+} from '/modules/frameRecommendations.js';
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
+
+assertModuleSingleton("storyboard", import.meta.url);
 
 let _ctx = {};
 let project = null;

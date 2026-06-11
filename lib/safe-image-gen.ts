@@ -14,6 +14,7 @@ import {
 } from './content-sanitize';
 import { recordContentFlag } from './content-flags';
 import { rewriteImagePromptForModerationLLM, type ImageSafetyRewriteInvalidReason } from './image-safety-rewrite';
+import type { TokenUsageContext } from './token-usage';
 
 type RewriteAttemptNote = {
   source: 'llm';
@@ -242,6 +243,31 @@ function markRewriteFailure(audit: FullImageGenerationSafetyAudit, reason: strin
   last.rewriteFailureReason = reason;
 }
 
+function imageRewriteTokenContext(input: ImageGenInput, audit: FullImageGenerationSafetyAudit): TokenUsageContext {
+  const kind = String(input.kind || 'other');
+  return {
+    projectId: input.projectId || null,
+    moduleKey: 'images',
+    moduleLabel: '图片生成',
+    featureKey: 'image_moderation_rewrite',
+    featureLabel: '图像安全改写',
+    callItemType: kind,
+    callItemId: input.assetRef || input.correlationId || audit.correlationId,
+    callItemLabel: input.assetRef || kind,
+    batchId: input.assetLibrary?.batchId || null,
+    taskId: input.assetRef || null,
+    correlationId: input.correlationId || audit.correlationId,
+    operationKey: `image-moderation-rewrite:${input.correlationId || audit.correlationId}`,
+    operationLabel: '图像安全改写',
+    meta: {
+      kind,
+      assetRef: input.assetRef || null,
+      assetLibraryStage: input.assetLibrary?.stage || null,
+      assetLibrarySource: input.assetLibrary?.source || null,
+    },
+  };
+}
+
 export async function generateImageWithModerationRecovery(
   user: UserRow,
   input: ImageGenInput,
@@ -345,8 +371,10 @@ export async function generateImageWithModerationRecovery(
       if (!kw.rewriteDiff.length || kw.rewrittenPrompt === submittedPrompt) {
         // 方向 B:关键词改写没动 → 用 LLM 把提示词中性化再重试;LLM 也救不回才放弃。
         const rewriteLLM = deps.rewriteLLMImpl || rewriteImagePromptForModerationLLM;
+        const tokenContext = imageRewriteTokenContext(input, audit);
         let llm = await rewriteLLM(user, submittedPrompt, {
           traceName: 'image-moderation-rewrite',
+          tokenContext,
         });
         appendRewriteAttemptNote(audit, {
           source: 'llm',
@@ -358,6 +386,11 @@ export async function generateImageWithModerationRecovery(
         if (!llm.changed) {
           llm = await rewriteLLM(user, submittedPrompt, {
             traceName: 'image-moderation-rewrite-retry',
+            tokenContext: {
+              ...tokenContext,
+              operationKey: `${tokenContext.operationKey}:retry`,
+              operationLabel: '图像安全改写重试',
+            },
           });
           appendRewriteAttemptNote(audit, {
             source: 'llm',

@@ -8,8 +8,8 @@
  * 旧的项目内 AI 自动续写接口已连路由一起摘除（拍板：写剧本是独立工作流，
  * 另行立项）。episodes[] 镜像机制保留，用于老多集项目兼容读。
  */
-import { showToast, escapeHtml, getAuthHeaders } from './utils.js?v=300';
-import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from './assets.js?v=172';
+import { showToast, escapeHtml, getAuthHeaders } from '/modules/utils.js';
+import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from '/modules/assets.js';
 
 let _ctx = {};
 
@@ -191,6 +191,38 @@ async function _fetchFullWorldTemplate(tplId) {
   return body.template;
 }
 
+function _worldTemplateIdOf(tpl) {
+  return String(tpl && (tpl.id || tpl.templateId || tpl.template_id) || "").trim();
+}
+
+function _currentWorldTemplateIdFromProject(project) {
+  var snapshot = project && project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"
+    ? project.worldTemplateSnapshot
+    : null;
+  return String(
+    (project && project.selectedWorldTemplateId) ||
+    _worldTemplateIdOf(snapshot) ||
+    ""
+  ).trim();
+}
+
+function _resolveCurrentWorldTemplateId(project, templates) {
+  var directId = _currentWorldTemplateIdFromProject(project);
+  templates = Array.isArray(templates) ? templates : [];
+  for (var i = 0; directId && i < templates.length; i++) {
+    if (_worldTemplateIdOf(templates[i]) === directId) return directId;
+  }
+
+  var projectId = String(project && project.id || "").trim();
+  if (!projectId) return "";
+  for (var j = 0; j < templates.length; j++) {
+    var tpl = templates[j] || {};
+    var sourceProjectId = String(tpl.sourceProjectId || tpl.source_project_id || "").trim();
+    if (sourceProjectId === projectId) return _worldTemplateIdOf(tpl);
+  }
+  return "";
+}
+
 export function _openNewEpisodeDialog() {
   var project = _project();
   if (!project || !project.id) {
@@ -205,8 +237,8 @@ export function _openNewEpisodeDialog() {
   var baseName = _stripEpisodeSuffix(project.name || project.title || "未命名剧");
   var curNum = _taskEpisodeNumber(project) || 1;
   var guessNum = curNum + 1; // 先用本地猜测渲染，异步算准后回填
-  var hasWorld = !!(project.selectedWorldTemplateId || (project.worldTemplateSnapshot && project.worldTemplateSnapshot.id));
-  var currentWorldId = String(project.selectedWorldTemplateId || (project.worldTemplateSnapshot && project.worldTemplateSnapshot.id) || "");
+  var currentWorldId = _currentWorldTemplateIdFromProject(project);
+  var hasWorld = !!(currentWorldId || (project.worldTemplateSnapshot && typeof project.worldTemplateSnapshot === "object"));
   // 可无视的被动提示（不硬拦）：当前集剧本还没确认也允许续写
   var softHint = (!project.script || !project.scriptApproved)
     ? '<p class="text-[11px] text-on-surface-variant/70 mb-3">提示：当前集剧本尚未确认，仍可先创建下一集任务。</p>'
@@ -279,19 +311,29 @@ export function _openNewEpisodeDialog() {
   });
   _fetchWorldTemplateOptions().then(function (templates) {
     if (!overlay.isConnected) return;
+    var blankRadio = overlay.querySelector('input[name="ceMode"][value="blank"]');
+    var templateRadio = overlay.querySelector('input[name="ceMode"][value="template"]');
     if (!templates.length) {
       selectEl.innerHTML = '<option value="">（暂无世界观模板）</option>';
-      var blankRadio = overlay.querySelector('input[name="ceMode"][value="blank"]');
-      if (blankRadio && !overlay.querySelector('input[name="ceMode"][value="template"]:checked')) blankRadio.checked = true;
+      if (blankRadio) blankRadio.checked = true;
       syncSelectEnabled();
       return;
     }
+    var resolvedWorldId = _resolveCurrentWorldTemplateId(project, templates);
     selectEl.innerHTML = templates.map(function (tpl) {
-      var id = escapeHtml(String(tpl.id || ""));
+      var rawId = _worldTemplateIdOf(tpl);
+      var id = escapeHtml(rawId);
       var name = escapeHtml(String(tpl.name || tpl.id || "未命名模板"));
-      var sel = currentWorldId && String(tpl.id) === currentWorldId ? " selected" : "";
+      var sel = resolvedWorldId && rawId === resolvedWorldId ? " selected" : "";
       return '<option value="' + id + '"' + sel + '>' + name + '</option>';
     }).join("");
+    if (resolvedWorldId) {
+      selectEl.value = resolvedWorldId;
+      if (templateRadio) templateRadio.checked = true;
+    } else if (blankRadio) {
+      blankRadio.checked = true;
+    }
+    syncSelectEnabled();
   }).catch(function (e) {
     if (!overlay.isConnected) return;
     selectEl.innerHTML = '<option value="">（模板列表加载失败）</option>';

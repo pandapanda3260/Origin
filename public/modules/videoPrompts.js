@@ -1,8 +1,8 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=300';
-import { attachDiagnostic } from './diagnostic.js?v=300';
-import { renderVpCard } from './render_hooks.js?v=300';
-import { subscribeBatch } from './backend_stream.js?v=300';
-import { firstFrameImageUrl } from './frameRecommendations.js?v=1';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from '/modules/utils.js';
+import { attachDiagnostic } from '/modules/diagnostic.js';
+import { renderVpCard } from '/modules/render_hooks.js';
+import { subscribeBatch } from '/modules/backend_stream.js';
+import { firstFrameImageUrl } from '/modules/frameRecommendations.js';
 
 let _ctx = {};
 let project = null;

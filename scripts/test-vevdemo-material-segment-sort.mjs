@@ -63,7 +63,7 @@ const sandbox = new Function(`
 `)();
 
 const names = (list) => list.map((x) => x.Name);
-const mk = (name) => ({ Name: `${name}第一章 混沌聖地收徒第1集.mp4` });
+const mk = (name) => ({ Name: `${name}第一章 混沌聖地收徒.mp4` });
 
 // 2a. 数字序而非字符串序；同片段多视频按（M）子序；全角/半角括号都认
 const sorted = sandbox.sortMaterialListBySegmentOrder([

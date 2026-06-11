@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=243" />
+    <link rel="stylesheet" href="styles.css?v=244" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -1837,37 +1837,47 @@
          改下面的 ?v=XX 一处即可。-->
     <script type="importmap">
     {
-      "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=172",
-        "/modules/backend_stream.js": "/modules/backend_stream.js?v=300",
-        "/modules/diagnostic.js":     "/modules/diagnostic.js?v=300",
-        "/modules/edit.js":           "/modules/edit.js?v=303",
-        "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
-        "/modules/episodes.js":       "/modules/episodes.js?v=110",
-        "/modules/error_hub.js":      "/modules/error_hub.js?v=300",
-        "/modules/loading.js":        "/modules/loading.js?v=300",
-        "/modules/project.js":        "/modules/project.js?v=106",
-        "/modules/render_hooks.js":   "/modules/render_hooks.js?v=300",
-        "/modules/script.js":         "/modules/script.js?v=117",
-        "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
-        "/modules/settings.js":       "/modules/settings.js?v=300",
-        "/modules/shots.js":          "/modules/shots.js?v=114",
-        "/modules/store.js":          "/modules/store.js?v=300",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=156",
-        "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
-        "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
-        "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=104",
-        "/modules/tasks.js":          "/modules/tasks.js?v=300",
-        "/modules/toolbox.js":        "/modules/toolbox.js?v=202",
-        "/modules/utils.js":          "/modules/utils.js?v=300",
-        "/modules/videoPrompts.js":   "/modules/videoPrompts.js?v=113",
-        "/modules/videoTasks.js":     "/modules/videoTasks.js?v=303"
-      }
+            "imports": {
+                    "/modules/assets.js": "/modules/assets.js?v=174",
+                    "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
+                    "/modules/billing.js": "/modules/billing.js?v=117",
+                    "/modules/character_custom.js": "/modules/character_custom.js?v=215",
+                    "/modules/diagnostic.js": "/modules/diagnostic.js?v=301",
+                    "/modules/edit.js": "/modules/edit.js?v=306",
+                    "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
+                    "/modules/episodes.js": "/modules/episodes.js?v=112",
+                    "/modules/error_hub.js": "/modules/error_hub.js?v=300",
+                    "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
+                    "/modules/holo_card.js": "/modules/holo_card.js?v=300",
+                    "/modules/loading.js": "/modules/loading.js?v=300",
+                    "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=105",
+                    "/modules/module_singleton_guard.js": "/modules/module_singleton_guard.js?v=1",
+                    "/modules/online_editor.js": "/modules/online_editor.js?v=25",
+                    "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
+                    "/modules/project.js": "/modules/project.js?v=108",
+                    "/modules/render_hooks.js": "/modules/render_hooks.js?v=301",
+                    "/modules/script.js": "/modules/script.js?v=118",
+                    "/modules/script_consult_state.js": "/modules/script_consult_state.js?v=300",
+                    "/modules/script_timeline.js": "/modules/script_timeline.js?v=2",
+                    "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
+                    "/modules/settings.js": "/modules/settings.js?v=301",
+                    "/modules/shotSchema.js": "/modules/shotSchema.js?v=300",
+                    "/modules/shots.js": "/modules/shots.js?v=115",
+                    "/modules/store.js": "/modules/store.js?v=301",
+                    "/modules/storyboard.js": "/modules/storyboard.js?v=158",
+                    "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
+                    "/modules/tasks.js": "/modules/tasks.js?v=301",
+                    "/modules/toolbox.js": "/modules/toolbox.js?v=203",
+                    "/modules/utils.js": "/modules/utils.js?v=300",
+                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=114",
+                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=306",
+                    "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
+            }
     }
     </script>
-    <script type="module" src="modules/store.js?v=300"></script>
+    <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=350"></script>
+    <script type="module" src="main.js?v=353"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

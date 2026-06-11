@@ -4,51 +4,52 @@
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
   consumeStreamStepTags, apiPost, apiGet, apiPostStream,
   getAuthToken, getAuthHeaders, checkAuth, ensureSession, getCachedAuthUser, getSessionUser, fetchAssetSignedUrl,
-  hydrateProtectedImageElements } from './modules/utils.js?v=300';
-import { appStore } from './modules/store.js?v=300';
-import { installGlobalHandlers as _installErrorHub } from './modules/error_hub.js?v=300';
-import { initEdit, syncEditProject, refreshEditPage, _initEditEvents } from '/modules/edit.js?v=303';
+  hydrateProtectedImageElements } from '/modules/utils.js';
+import { appStore } from '/modules/store.js';
+import { installGlobalHandlers as _installErrorHub } from '/modules/error_hub.js';
+import { initEdit, syncEditProject, refreshEditPage, _initEditEvents,
+  importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
 import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
-  refreshSettingsFormFromState, wireSettingsPageOnce } from './modules/settings.js?v=300';
-import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from './modules/tasks.js?v=300';
+  refreshSettingsFormFromState, wireSettingsPageOnce } from '/modules/settings.js';
+import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from '/modules/tasks.js';
 import { initProject, getProject, setProject, loadProject, loadProjectData, saveProject,
   _serializeProject, cleanupBlobUrls, _registerServerTask, _updateServerTaskStatus,
   _notifyServerTaskDone,
   _archiveOldImage, _safeWriteBack, _flushServerSave, fetchProjectByIdShared,
-  flushPendingProjectSaveOnUnload } from './modules/project.js?v=106';
-import { EPISODE_FIELDS } from './modules/episode_fields.js?v=102';
+  flushPendingProjectSaveOnUnload } from '/modules/project.js';
+import { EPISODE_FIELDS } from '/modules/episode_fields.js';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
-  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=110';
+  _renderEpisodeTabs, _openNewEpisodeDialog } from '/modules/episodes.js';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
-  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js?v=303';
+  confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
   generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
   refineVideoPrompt, handleVideoPromptAction,
   getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave,
-  reattachVideoPromptBatches } from './modules/videoPrompts.js?v=113';
+  reattachVideoPromptBatches } from '/modules/videoPrompts.js';
 import { initShots, syncShotsProject, refreshShotsPage, renderShotList,
   generateShots, acceptShotPlanForStoryboard, handleShotAction,
-  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from './modules/shots.js?v=114';
-import { initScrollAnchorGuard } from './modules/scroll_anchor_guard.js?v=1';
+  _syncSingleShotSlotsAfterInsert, _syncSingleShotSlotsAfterDelete } from '/modules/shots.js';
+import { initScrollAnchorGuard } from '/modules/scroll_anchor_guard.js';
 import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   refreshImagesPage, renderImageGrid,
   convertSinglePrompt, convertAllPrompts,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=156';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from '/modules/storyboard.js';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
   extractStyleBible,
   initScriptImportEvents, confirmScript, tagEmotions, renderEmotionSegments, renderScriptAnalysis,
   refreshScriptImportDraft, emotionBadgeHtml, showScriptEdit, showScriptDisplay, isScriptGenerating,
-  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from './modules/script.js?v=117';
+  recordManualScriptEditToTimeline, noteScriptDraftSuperseded } from '/modules/script.js';
 import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   renderAssets, renderAssetGrid, updateAssetCardImage, generateSingleAssetImage,
   generateAllAssetImages, checkAssetsConfirm, confirmAssets, handleAssetAction,
@@ -56,19 +57,20 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   refreshLibraryPage, _initLibraryEvents, _openVideoLightbox,
   resetLibraryState, _showAssetActions, _restoreAssetGenStatus, _diagnoseApiError,
   _toastErrorWithActions,
+  snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio,
   _syncAssetToStyleBible, _getAssetDescText, _getAssetName, _autoSyncUpstream,
   _checkEquipmentChange, _detectObsoleteAssets, _removeObsoleteAssets, _showCleanObsoleteDialog,
   _markDownstreamStale, _markDownstreamStaleFallback, _getShotGroupIndices,
   _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=172';
-import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=202';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=214';
-import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=114';
-import { mountPixelCard } from './modules/pixel_card.js?v=300';
-import { createSwLoading } from '/modules/loading.js?v=300';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=24';
+  _openLightbox } from '/modules/assets.js';
+import { initToolbox, refreshToolboxPage, _initToolboxEvents } from '/modules/toolbox.js';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from '/modules/character_custom.js';
+import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from '/modules/billing.js';
+import { mountPixelCard } from '/modules/pixel_card.js';
+import { createSwLoading } from '/modules/loading.js';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from '/modules/online_editor.js';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
@@ -233,6 +235,7 @@ var _scriptEditInitialText = "";
   var onlineEditorConfig = null;
   var _onlineEditorConfigPromise = null;
   var _createProjectInFlight = false;
+  var _newProjectDialogOpen = false;
   var _lastMaybeCreatedProject = null;
   var CLIENT_FEATURES = {};
   var _clientConfigPollTimer = null;
@@ -891,6 +894,203 @@ var _scriptEditInitialText = "";
     return _cleanProjectName(name) || _nextDefaultProjectNameFromList(list);
   }
 
+  function _newProjectWorldTemplateIdOf(tpl) {
+    return String(tpl && (tpl.id || tpl.templateId || tpl.template_id) || "").trim();
+  }
+
+  async function _fetchWorldTemplateOptionsForNewProject() {
+    try { await _primeWorldTemplates(); } catch (_) {}
+    var cached = _getWorldTemplates();
+    if (cached && cached.length) return cached;
+
+    var resp = await fetch("/api/world-templates", { headers: _getAuthHeaders() });
+    if (!resp.ok) throw new Error("世界观模板列表加载失败 (" + resp.status + ")");
+    var body = await resp.json().catch(function () { return {}; });
+    return (body && (body.templates || body.items)) || [];
+  }
+
+  async function _fetchWorldTemplateDetailForNewProject(tplId) {
+    var resp = await fetch("/api/world-templates/" + encodeURIComponent(tplId), {
+      headers: _getAuthHeaders(),
+    });
+    if (!resp.ok) throw new Error("世界观模板加载失败 (" + resp.status + ")");
+    var body = await resp.json().catch(function () { return {}; });
+    if (!body || !body.template) throw new Error("世界观模板数据为空");
+    return body.template;
+  }
+
+  async function _decorateNewProjectDraftWithWorldTemplate(draft, tplId, options) {
+    tplId = String(tplId || "").trim();
+    if (!draft || !tplId) return draft;
+    options = options || {};
+    if (typeof options.onStatus === "function") options.onStatus("正在载入世界观模板…");
+
+    var fullTpl = await _fetchWorldTemplateDetailForNewProject(tplId);
+    var snap = snapshotWorldTemplate(fullTpl);
+    draft.selectedWorldTemplateId = snap.id || tplId;
+    draft.worldTemplateSnapshot = snap;
+
+    var tplAspect = _normalizeWorldPreferredAspectRatio(
+      snap.preferredAspectRatio || snap.preferred_aspect_ratio
+    );
+    if (tplAspect) {
+      draft.styleOptions = Object.assign({}, draft.styleOptions || {}, {
+        aspectRatio: tplAspect,
+        aspectRatioDefaultVersion: _STYLE_ASPECT_DEFAULT_VERSION || "2026-05-14-9x16",
+      });
+    }
+    return draft;
+  }
+
+  async function _resolveDefaultNewProjectNameForDialog() {
+    try {
+      var list = await getProjectListFromServer();
+      if (!Array.isArray(list)) list = [];
+      return _resolveNewProjectName("", list);
+    } catch (_) {
+      return _resolveNewProjectName("", getProjectList());
+    }
+  }
+
+  function _openNewProjectDialog(options) {
+    if (_newProjectDialogOpen) return;
+    options = options || {};
+    _newProjectDialogOpen = true;
+
+    var overlay = document.createElement("div");
+    overlay.className = "fixed inset-0 z-[9998] flex items-center justify-center bg-black/50 backdrop-blur-sm";
+    overlay.style.animation = "fadeIn .2s ease";
+
+    var fallbackName = _resolveNewProjectName("", getProjectList());
+    overlay.innerHTML =
+      '<div class="bg-surface-container-lowest rounded-[2rem] p-8 w-[480px] max-w-[90vw] shadow-2xl border border-white/30" onclick="event.stopPropagation()">' +
+        '<div class="flex items-center justify-between mb-1">' +
+          '<h3 class="text-lg font-bold text-on-background">创建新任务</h3>' +
+          '<button type="button" id="npClose" class="text-on-surface-variant hover:text-primary transition-all" title="关闭">' +
+            '<span class="material-symbols-outlined">close</span>' +
+          '</button>' +
+        '</div>' +
+        '<p class="text-xs text-on-surface-variant mb-4">从空白任务开始，或先带入一个世界观模板，再进入剧本页继续创作。</p>' +
+        '<div class="mb-4">' +
+          '<label class="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/60 mb-1 block">任务名称</label>' +
+          '<input id="npName" type="text" class="w-full bg-surface-container-low rounded-xl p-2.5 text-sm text-on-surface border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none" />' +
+        '</div>' +
+        '<div class="mb-6 space-y-2">' +
+          '<label class="text-[10px] font-bold uppercase tracking-widest text-on-surface-variant/60 mb-1 block">世界观</label>' +
+          '<label class="flex items-center gap-2 text-sm text-on-surface cursor-pointer">' +
+            '<input type="radio" name="npMode" value="blank" checked />新建空白任务' +
+          '</label>' +
+          '<label class="flex items-center gap-2 text-sm text-on-surface cursor-pointer">' +
+            '<input type="radio" name="npMode" value="template" />选择世界观模板' +
+          '</label>' +
+          '<select id="npWorldSelect" class="w-full bg-surface-container-low rounded-xl p-2.5 text-sm text-on-surface border border-outline-variant/10 focus:ring-1 focus:ring-primary/30 focus:outline-none">' +
+            '<option value="">加载中…</option>' +
+          '</select>' +
+        '</div>' +
+        '<div class="flex gap-3">' +
+          '<button type="button" id="npCancel" class="flex-1 py-3 rounded-full text-sm font-bold text-on-surface-variant bg-surface-container hover:bg-surface-container-high transition-all">取消</button>' +
+          '<button type="button" id="npConfirm" class="flex-1 py-3 rounded-full text-sm font-bold text-on-primary bg-primary hover:opacity-90 transition-all shadow-lg flex items-center justify-center gap-2">' +
+            '<span class="material-symbols-outlined text-sm">add</span>确认' +
+          '</button>' +
+        '</div>' +
+        '<p id="npStatus" class="text-xs text-center text-on-surface-variant mt-4" hidden></p>' +
+      '</div>';
+
+    document.body.appendChild(overlay);
+
+    var nameInput = overlay.querySelector("#npName");
+    var selectEl = overlay.querySelector("#npWorldSelect");
+    var statusEl = overlay.querySelector("#npStatus");
+    var state = { nameDirty: false };
+    if (nameInput) {
+      nameInput.value = fallbackName;
+      nameInput.addEventListener("input", function () { state.nameDirty = true; });
+      try { nameInput.focus({ preventScroll: true }); nameInput.select(); } catch (_) {}
+    }
+
+    function close() {
+      overlay.remove();
+      _newProjectDialogOpen = false;
+    }
+
+    function syncSelectEnabled() {
+      var mode = overlay.querySelector('input[name="npMode"]:checked');
+      var useTpl = mode && mode.value === "template";
+      if (!selectEl) return;
+      selectEl.disabled = !useTpl;
+      selectEl.classList.toggle("opacity-60", !useTpl);
+      selectEl.classList.toggle("pointer-events-none", !useTpl);
+    }
+
+    overlay.querySelectorAll('input[name="npMode"]').forEach(function (r) {
+      r.addEventListener("change", syncSelectEnabled);
+    });
+    syncSelectEnabled();
+
+    _resolveDefaultNewProjectNameForDialog().then(function (name) {
+      if (!overlay.isConnected || state.nameDirty || !nameInput) return;
+      nameInput.value = name;
+    });
+
+    _fetchWorldTemplateOptionsForNewProject().then(function (templates) {
+      if (!overlay.isConnected || !selectEl) return;
+      if (!templates.length) {
+        selectEl.innerHTML = '<option value="">（暂无世界观模板）</option>';
+        syncSelectEnabled();
+        return;
+      }
+      selectEl.innerHTML = templates.map(function (tpl) {
+        var rawId = _newProjectWorldTemplateIdOf(tpl);
+        var id = escapeHtml(rawId);
+        var name = escapeHtml(String(tpl.name || tpl.id || "未命名模板"));
+        return '<option value="' + id + '">' + name + '</option>';
+      }).join("");
+      syncSelectEnabled();
+    }).catch(function (e) {
+      if (!overlay.isConnected || !selectEl) return;
+      selectEl.innerHTML = '<option value="">（模板列表加载失败）</option>';
+      showToast(((e && e.message) || e).toString(), "warn");
+      syncSelectEnabled();
+    });
+
+    overlay.addEventListener("click", function (ev) { if (ev.target === overlay) close(); });
+    overlay.querySelector("#npClose").addEventListener("click", close);
+    overlay.querySelector("#npCancel").addEventListener("click", close);
+    overlay.querySelector("#npConfirm").addEventListener("click", async function () {
+      var confirmBtn = overlay.querySelector("#npConfirm");
+      var mode = overlay.querySelector('input[name="npMode"]:checked');
+      var useTemplate = mode && mode.value === "template";
+      var tplId = useTemplate && selectEl ? String(selectEl.value || "").trim() : "";
+      if (useTemplate && !tplId) {
+        showToast("请选择一个世界观模板，或改为新建空白任务", "warn");
+        return;
+      }
+      var name = nameInput ? nameInput.value.trim() : "";
+      if (confirmBtn) confirmBtn.disabled = true;
+      if (statusEl) { statusEl.hidden = false; statusEl.textContent = "正在创建任务…"; }
+      try {
+        var ok = await createNewProject(name, {
+          worldTemplateId: tplId,
+          onStatus: function (text) {
+            if (statusEl) { statusEl.hidden = false; statusEl.textContent = text; }
+          },
+        });
+        if (ok !== false) {
+          close();
+          if (typeof options.afterCreated === "function") await options.afterCreated();
+        } else if (confirmBtn) {
+          confirmBtn.disabled = false;
+          if (statusEl) statusEl.textContent = "创建未完成，请检查提示后重试。";
+        }
+      } catch (e) {
+        var errMsg = ((e && e.message) || e).toString().slice(0, 160);
+        if (statusEl) statusEl.textContent = "创建失败: " + errMsg;
+        if (confirmBtn) confirmBtn.disabled = false;
+        showToast("新建任务失败: " + _diagnoseApiError(errMsg), "error");
+      }
+    });
+  }
+
   function saveProjectList(list) {
     localStorage.setItem(STORAGE_PROJECT_LIST, JSON.stringify(list));
   }
@@ -1231,7 +1431,7 @@ var _scriptEditInitialText = "";
       else {
         var el = document.createElement("div");
         el.id = "sw-project-skeleton";
-        el.style.cssText = "position:fixed;inset:0;z-index:35;display:flex;pointer-events:none;" +
+        el.style.cssText = "position:fixed;inset:0;z-index:55;display:flex;pointer-events:none;" +
           "align-items:center;justify-content:center;flex-direction:column;gap:14px;" +
           "background:rgba(10,10,12,0.72);backdrop-filter:blur(6px);" +
           "color:#e8e8ea;font-size:14px;font-family:inherit;" +
@@ -1326,14 +1526,15 @@ var _scriptEditInitialText = "";
    *
    * 返回 true = 成功，false = 失败（配额 / 网络）。
    */
-  async function createNewProject(name) {
+  async function createNewProject(name, options) {
     if (_createProjectInFlight) {
       showToast("正在创建任务，请稍候", "info");
       return false;
     }
+    options = options || {};
     _createProjectInFlight = true;
     try {
-      return await _createNewProjectLocked(name);
+      return await _createNewProjectLocked(name, options);
     } finally {
       _createProjectInFlight = false;
     }
@@ -1364,7 +1565,8 @@ var _scriptEditInitialText = "";
     return true;
   }
 
-  async function _createNewProjectLocked(name) {
+  async function _createNewProjectLocked(name, options) {
+    options = options || {};
     if (await _recoverMaybeCreatedProject(name)) return true;
     // Phase 5.9：配额检查以服务器列表为准，不再读 localStorage。
     // 历史症状：管理员等 legacy 用户的 `sw_project_list` 残留 10 条老元数据
@@ -1428,6 +1630,8 @@ var _scriptEditInitialText = "";
       }],
       currentEpisodeIdx: 0,
     };
+    await _decorateNewProjectDraftWithWorldTemplate(draft, options.worldTemplateId, options);
+    if (typeof options.onStatus === "function") options.onStatus("正在创建任务…");
 
     var serverProj = null;
     var quotaErr = null;
@@ -3830,23 +4034,14 @@ var _scriptEditInitialText = "";
     }
   }
 
-  async function _ovCreateProjectTask(btn) {
+  function _ovCreateProjectTask() {
     if (_ovProjectTaskCreating) return;
-    _ovProjectTaskCreating = true;
-    if (btn) btn.disabled = true;
-    try {
-      var ok = await createNewProject();
-      if (ok !== false) {
+    _openNewProjectDialog({
+      afterCreated: async function () {
         refreshOverview();
         switchPage("script");
-      }
-    } catch (e) {
-      console.error("[OverviewNewTask]", e);
-      showToast("新建任务失败", "error");
-    } finally {
-      _ovProjectTaskCreating = false;
-      if (btn) btn.disabled = false;
-    }
+      },
+    });
   }
 
   async function _ovDownloadVideo(task) {
@@ -4077,7 +4272,7 @@ var _scriptEditInitialText = "";
 
     var newTask = $("ovNewTaskBtn");
     if (newTask) newTask.addEventListener("click", function () {
-      _ovCreateProjectTask(newTask);
+      _ovCreateProjectTask();
     });
 
     var list = $("ovTaskList");
@@ -7714,6 +7909,9 @@ var _scriptEditInitialText = "";
       updateAssetCardImage: (type, idx, status, imgUrl, loadingText) => updateAssetCardImage(type, idx, status, imgUrl, loadingText),
       updateStoryboardCard: (gIdx, status, imgUrl, errMsg) => updateStoryboardCard(gIdx, status, imgUrl, errMsg),
       getStoryboardGroups: () => getStoryboardGroups(),
+      importGroupToTimeline,
+      removeGroupFromTimeline,
+      isGroupImported,
 	      vpFetchAndCache: (sb) => vpFetchAndCache(sb),
 	      vpGetCache: (sb) => vpGetCache(sb),
 	      getVpSelectedGroup: () => getVpSelectedGroup(),
@@ -8071,11 +8269,12 @@ var _scriptEditInitialText = "";
       if (_btnNew) _btnNew.addEventListener("click", async function () {
         try {
           console.log("[UI] btnNewProject clicked");
-          var ok = await createNewProject();
-          if (ok !== false) {
-            refreshOverview();
-            switchPage("script");
-          }
+          _openNewProjectDialog({
+            afterCreated: async function () {
+              refreshOverview();
+              switchPage("script");
+            },
+          });
         } catch (e) { console.error("[NewProject]", e); }
       });
 
@@ -8083,8 +8282,11 @@ var _scriptEditInitialText = "";
       if (_btnReset) _btnReset.addEventListener("click", async function () {
         try {
           console.log("[UI] btnResetProject clicked");
-          var ok = await createNewProject();
-          if (ok !== false) refreshOverview();
+          _openNewProjectDialog({
+            afterCreated: async function () {
+              refreshOverview();
+            },
+          });
         } catch (e) { console.error("[ResetProject]", e); }
       });
 

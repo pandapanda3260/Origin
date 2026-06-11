@@ -1,116 +1,143 @@
 /**
- * 前端缓存击穿（?v=）契约测试
+ * Frontend module cache-busting contract.
  *
- * 背景：2026-06-09 提交 5b4a053 把 edit.js / videoTasks.js 的 import 改成无 ?v
- * 的裸路径，loading.js 等新模块出生即无版本号。此后各会话"bump 版本"全部落空，
- * 浏览器长期跑旧 ESM 缓存，制造出"代码已修但浏览器仍是旧行为"的幽灵 bug
- * （实锤案例：2026-06-10 任务列表"继续制作"按已删除的旧 flag 口径跳资产页 + 整页空白）。
- *
- * 契约：
- *   1. public/main.js 与 public/modules/*.js 里所有本地模块 import 必须带 ?v=<数字>；
- *   2. 同一个目标文件在全仓引用（含 workspace.html 的 script/link 标签）版本号必须一致；
- *   3. workspace.html 引用的本地 js/css 必须带 ?v=。
- *
- * 运行：node scripts/test-frontend-cache-busting.mjs
+ * Source files must import local browser modules through canonical import-map
+ * keys only. workspace.html owns cache-busting versions for those keys.
  */
 import { readFileSync, readdirSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { basename, join, relative } from 'node:path';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const PUB = join(ROOT, 'public');
-
+const MODULES = join(PUB, 'modules');
 const failures = [];
-const refs = new Map(); // base -> Map(version -> [где])
 
-function record(base, version, where) {
-  if (!refs.has(base)) refs.set(base, new Map());
-  const m = refs.get(base);
-  if (!m.has(version)) m.set(version, []);
-  m.get(version).push(where);
+function publicPath(file) {
+  return relative(ROOT, file).replace(/\\/g, '/');
 }
 
 function lineOf(text, pos) {
-  const ls = text.lastIndexOf('\n', pos) + 1;
-  const le = text.indexOf('\n', pos);
-  return text.slice(ls, le === -1 ? text.length : le).trim();
+  const start = text.lastIndexOf('\n', pos) + 1;
+  const end = text.indexOf('\n', pos);
+  return text.slice(start, end === -1 ? text.length : end).trim();
 }
 
-// ── 1/2: JS 模块 import ──────────────────────────────────────────
-const jsFiles = [join(PUB, 'main.js'), ...readdirSync(join(PUB, 'modules'))
-  .filter((f) => f.endsWith('.js'))
-  .map((f) => join(PUB, 'modules', f))];
+function canonicalModuleKey(spec, file) {
+  const noQuery = spec.replace(/\?v=\d+$/, '');
+  if (noQuery.startsWith('/modules/')) return noQuery;
+  if (noQuery.startsWith('./modules/')) return '/modules/' + noQuery.slice('./modules/'.length);
+  if (noQuery.startsWith('modules/')) return '/modules/' + noQuery.slice('modules/'.length);
+  if (noQuery.startsWith('./') && publicPath(file).startsWith('public/modules/')) {
+    return '/modules/' + noQuery.slice(2);
+  }
+  return null;
+}
 
-const specRe = /(from\s*|^\s*import\s*)(['"])([^'"]+?)\2/gm;
-for (const file of jsFiles) {
+for (const [spec, expected] of [
+  ['modules/store.js?v=1', '/modules/store.js'],
+  ['/modules/store.js?v=1', '/modules/store.js'],
+]) {
+  const actual = canonicalModuleKey(spec, join(PUB, 'workspace.html'));
+  if (actual !== expected) {
+    failures.push(`[html-module-key-normalization] ${spec} -> ${actual}, expected ${expected}`);
+  }
+}
+
+function collectJsImports(file) {
   const src = readFileSync(file, 'utf8');
-  const fname = 'public/' + file.slice(PUB.length + 1).replace(/\\/g, '/');
-  for (const m of src.matchAll(specRe)) {
-    const spec = m[3];
-    const line = lineOf(src, m.index);
-    if (line.startsWith('*') || line.startsWith('//')) continue; // 注释示例
-    // 只管本地相对/绝对模块路径（裸包名/URL 不管）
-    if (!/^[./]/.test(spec)) continue;
-    if (!/\.js(\?|$)/.test(spec)) continue;
-    const base = basename(spec.replace(/\?v=\d+$/, ''));
-    const vm = spec.match(/\?v=(\d+)$/);
-    if (!vm) {
-      failures.push(`[无版本号] ${fname} → "${spec}"  （行：${line.slice(0, 90)}）`);
-      record(base, '(bare)', fname);
-    } else {
-      record(base, vm[1], fname);
+  const refs = [];
+  const patterns = [
+    /(?:\bfrom\s*['"]|\bimport\s*['"])([^'"]+?\.js(?:\?v=\d+)?)(['"])/g,
+    /\bimport\s*\(\s*['"]([^'"]+?\.js(?:\?v=\d+)?)(['"]\s*\))/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of src.matchAll(pattern)) {
+      const spec = match[1];
+      const key = canonicalModuleKey(spec, file);
+      if (!key) continue;
+      refs.push({ spec, key, line: lineOf(src, match.index) });
     }
+  }
+  return refs;
+}
+
+const jsFiles = [
+  join(PUB, 'main.js'),
+  ...readdirSync(MODULES)
+    .filter((file) => file.endsWith('.js'))
+    .map((file) => join(MODULES, file)),
+];
+
+const importedKeys = new Map();
+for (const file of jsFiles) {
+  for (const ref of collectJsImports(file)) {
+    const loc = `${publicPath(file)}: ${ref.line.slice(0, 140)}`;
+    if (/\?v=\d+$/.test(ref.spec)) {
+      failures.push(`[versioned-import] ${loc}`);
+    }
+    if (ref.spec !== ref.key) {
+      failures.push(`[non-canonical-import] ${publicPath(file)} imports "${ref.spec}", expected "${ref.key}"`);
+    }
+    if (!importedKeys.has(ref.key)) importedKeys.set(ref.key, []);
+    importedKeys.get(ref.key).push(publicPath(file));
   }
 }
 
-// ── 3: workspace.html 的 script/link 引用 + importmap ────────────
-// 注意：显式带 ?v= 的 import 说明符会**绕过** importmap（URL 不再命中无查询串的
-// map key）。因此 map 条目与各 import 现场的 ?v 必须同号，否则同一模块会按两个
-// URL 各加载一份实例（模块级状态分裂，历史踩坑：utils v201/v203 双实例）。
-const html = readFileSync(join(PUB, 'workspace.html'), 'utf8');
-const imRaw = html.match(/<script type="importmap">\s*([\s\S]*?)<\/script>/);
-if (imRaw) {
-  let im;
-  try { im = JSON.parse(imRaw[1]); } catch (e) {
-    failures.push(`[importmap 解析失败] ${e.message}`);
-  }
-  for (const [key, target] of Object.entries(im?.imports || {})) {
-    const base = basename(key.replace(/\?v=\d+$/, ''));
-    const vm = String(target).match(/\?v=(\d+)$/);
-    if (!vm) {
-      failures.push(`[无版本号] importmap → "${key}": "${target}"`);
-      record(base, '(bare)', 'workspace.html(importmap)');
-    } else {
-      record(base, vm[1], 'workspace.html(importmap)');
-    }
+const workspacePath = join(PUB, 'workspace.html');
+const workspace = readFileSync(workspacePath, 'utf8');
+const importMapMatch = workspace.match(/<script type="importmap">\s*([\s\S]*?)<\/script>/);
+if (!importMapMatch) failures.push('[missing-importmap] public/workspace.html');
+
+let importMap = {};
+if (importMapMatch) {
+  try {
+    importMap = JSON.parse(importMapMatch[1]).imports || {};
+  } catch (error) {
+    failures.push(`[invalid-importmap-json] ${error.message}`);
   }
 }
-for (const m of html.matchAll(/(?:src|href)="([^"]+\.(?:js|css)(?:\?v=\d+)?)"/g)) {
-  const spec = m[1];
+
+for (const [key, files] of importedKeys.entries()) {
+  if (!importMap[key]) {
+    failures.push(`[missing-importmap-entry] ${key} imported by ${[...new Set(files)].join(', ')}`);
+  }
+}
+
+for (const [key, target] of Object.entries(importMap)) {
+  if (!key.startsWith('/modules/') || !key.endsWith('.js')) {
+    failures.push(`[invalid-importmap-key] ${key}`);
+    continue;
+  }
+  const expectedPrefix = `${key}?v=`;
+  if (!String(target).startsWith(expectedPrefix) || !/\?v=\d+$/.test(String(target))) {
+    failures.push(`[invalid-importmap-target] ${key}: ${target}`);
+  }
+}
+
+for (const match of workspace.matchAll(/<(script|link)\b[^>]+(?:src|href)="([^"]+\.(?:js|css)(?:\?v=\d+)?)"/g)) {
+  const tag = match[1];
+  const spec = match[2];
   if (/^https?:\/\//.test(spec)) continue;
-  const base = basename(spec.replace(/\?v=\d+$/, ''));
-  const vm = spec.match(/\?v=(\d+)$/);
-  if (!vm) {
-    failures.push(`[无版本号] public/workspace.html → "${spec}"`);
-    record(base, '(bare)', 'public/workspace.html');
-  } else {
-    record(base, vm[1], 'public/workspace.html');
+  if (!/\?v=\d+$/.test(spec)) {
+    failures.push(`[unversioned-html-${tag}] ${spec}`);
+    continue;
   }
-}
-
-// ── 2: 同文件多版本冲突 ──────────────────────────────────────────
-for (const [base, vers] of refs) {
-  if (vers.size > 1) {
-    const detail = [...vers.entries()]
-      .map(([v, where]) => `v=${v} ← ${[...new Set(where)].join(', ')}`)
-      .join('；');
-    failures.push(`[版本分裂] ${base}：${detail}`);
+  if (tag !== 'script') continue;
+  const key = canonicalModuleKey(spec, workspacePath);
+  if (!key || !importMap[key]) continue;
+  const tagVersion = spec.match(/\?v=(\d+)$/)?.[1];
+  const mapVersion = String(importMap[key]).match(/\?v=(\d+)$/)?.[1];
+  if (tagVersion !== mapVersion) {
+    failures.push(`[html-importmap-version-split] ${spec} vs ${importMap[key]}`);
   }
 }
 
 if (failures.length) {
-  console.error(`✗ 前端缓存击穿契约不通过（${failures.length} 处）：\n`);
-  for (const f of failures) console.error('  ' + f);
-  console.error('\n规则：改 public 下任何 js 后，其 ?v= 必须全仓同步 +1（含模块互相 import 的级联）。');
+  console.error(`✗ frontend cache-busting contract failed (${failures.length})`);
+  for (const failure of failures) console.error(`  ${failure}`);
   process.exit(1);
 }
-console.log(`✓ 缓存击穿契约通过：${refs.size} 个本地资源引用全部带版本号且全仓一致`);
+
+console.log(
+  `✓ frontend cache-busting contract passed: ${importedKeys.size} imported modules, ${Object.keys(importMap).length} import-map entries`,
+);

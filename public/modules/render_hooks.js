@@ -14,7 +14,7 @@
  * 决定要不要置 `_pendingRerender`。
  */
 
-import { $, escapeHtml, hydrateProtectedImageElements } from './utils.js?v=300';
+import { $, escapeHtml, hydrateProtectedImageElements } from '/modules/utils.js';
 
 // ---------------------------------------------------------------------------
 // Asset card (角色/场景/道具)

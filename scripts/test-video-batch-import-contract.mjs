@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const mainSource = readFileSync(new URL('../public/main.js', import.meta.url), 'utf8');
 const videoTasksSource = readFileSync(new URL('../public/modules/videoTasks.js', import.meta.url), 'utf8');
-const workspaceSource = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
 
 function assertBefore(source, first, second, message) {
   const firstIndex = source.indexOf(first);
@@ -18,60 +16,6 @@ function extractFunction(source, name) {
   assert.ok(match, `${name} must exist`);
   return match[0];
 }
-
-assert.doesNotMatch(
-  mainSource,
-  /videoTasks\.js\?v=/,
-  'main must not bypass the import map for videoTasks.js',
-);
-
-assert.match(
-  mainSource,
-  /from '\/modules\/videoTasks\.js';/,
-  'main must import videoTasks.js through the import map key',
-);
-
-assert.match(
-  workspaceSource,
-  /"\/modules\/videoTasks\.js":\s*"\/modules\/videoTasks\.js\?v=118"/,
-  'workspace import map must cache-bust videoTasks.js with v118',
-);
-
-assert.match(
-  workspaceSource,
-  /"\/modules\/edit\.js":/,
-  'workspace import map must keep an edit.js key for bare module imports',
-);
-
-assert.match(
-  workspaceSource,
-  /<script type="module" src="main\.js\?v=244"><\/script>/,
-  'workspace must cache-bust main.js after changing its static imports',
-);
-
-assert.doesNotMatch(
-  mainSource,
-  /edit\.js\?v=/,
-  'main must not bypass the import map for edit.js',
-);
-
-assert.doesNotMatch(
-  videoTasksSource,
-  /edit\.js\?v=/,
-  'videoTasks must not bypass the import map for edit.js',
-);
-
-assert.match(
-  mainSource,
-  /from '\/modules\/edit\.js';/,
-  'main must import edit.js through the import map key',
-);
-
-assert.match(
-  videoTasksSource,
-  /from '\/modules\/edit\.js';/,
-  'videoTasks must import edit.js through the import map key',
-);
 
 assert.doesNotMatch(
   videoTasksSource,

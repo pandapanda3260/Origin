@@ -2,7 +2,7 @@
  * Settings module — model slots, load/save, settings page UI.
  * Extracted from main.js (stage 3 refactor).
  */
-import { escapeHtml, showToast, apiGet, apiPost, getAuthHeaders, checkAuth, $ } from './utils.js?v=300';
+import { escapeHtml, showToast, apiGet, apiPost, getAuthHeaders, checkAuth, $ } from '/modules/utils.js';
 const _getAuthHeaders = getAuthHeaders;
 const _checkAuth = checkAuth;
 

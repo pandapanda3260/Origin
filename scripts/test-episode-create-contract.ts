@@ -62,6 +62,10 @@ assert.ok(episodesSource.includes('project_quota_exceeded'), '配额 409 处理'
 assert.ok(episodesSource.includes('seriesId'), '部 id 字段');
 assert.ok(episodesSource.includes('prevProjectId'), '前集链字段');
 assert.ok(episodesSource.includes('snapshotWorldTemplate'), '世界观快照与风格页同款语义');
+assert.ok(episodesSource.includes('function _resolveCurrentWorldTemplateId(project, templates)'), '续写弹窗应解析本集世界观模板');
+assert.ok(episodesSource.includes('tpl.sourceProjectId || tpl.source_project_id'), '续写弹窗应支持按源任务识别本集世界观');
+assert.ok(episodesSource.includes('selectEl.value = resolvedWorldId'), '续写弹窗应默认选中本集世界观');
+assert.ok(episodesSource.includes('if (templateRadio) templateRadio.checked = true'), '续写弹窗应默认切到选择世界观模板');
 
 // —— main.js 契约 ——
 const mainSource = readFileSync(new URL('../public/main.js', import.meta.url), 'utf8');

@@ -34,7 +34,7 @@ assert.ok(assetsSource.includes('var aspectText = _projectAspectRatioPreferenceF
 
 // ---- 前端 episodes.js（续写下一集）----
 const episodesSource = readFileSync(new URL('../public/modules/episodes.js', import.meta.url), 'utf8');
-assert.ok(episodesSource.includes("import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from './assets.js';"));
+assert.match(episodesSource, /import \{ snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio \} from '\.\/assets\.js(?:\?v=\d+)?';/);
 // 继承上一集画幅时必须带 aspectRatioDefaultVersion，否则服务端迁移会把 16:9 翻回 9:16
 assert.ok(episodesSource.includes('aspectRatioDefaultVersion: prevStyleOpts.aspectRatioDefaultVersion || _EP_ASPECT_DEFAULT_VERSION'));
 // 模板记录的画幅优先于上一集继承

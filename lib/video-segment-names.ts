@@ -75,10 +75,10 @@ function normalizeCopyIndex(value: unknown): number {
 
 function looksLikeCurrentSegmentFilename(value: unknown): boolean {
   const raw = rawCleanText(value);
-  return /^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?.+第.+集\.mp4$/u.test(raw);
+  return /^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?.+\.mp4$/u.test(raw);
 }
 
-function parseSegmentFilenameParts(value: unknown): { projectTitle: string; episodeTitle: string } | null {
+function parseSegmentFilenameParts(value: unknown): { projectTitle: string; episodeTitle?: string } | null {
   const raw = stripMp4Ext(rawCleanText(value));
   const legacy = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?_第(.+?)集_(.+)$/u);
   if (legacy) {
@@ -92,6 +92,12 @@ function parseSegmentFilenameParts(value: unknown): { projectTitle: string; epis
     return {
       projectTitle: current[1],
       episodeTitle: `第${current[2]}集`,
+    };
+  }
+  const next = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?(.+)$/u);
+  if (next) {
+    return {
+      projectTitle: next[1],
     };
   }
   return null;
@@ -142,10 +148,9 @@ export function buildVideoSegmentNames(input: VideoSegmentNameInput): VideoSegme
   if (groupIdx != null && cleanText(input.projectId || input.projectTitle)) {
     const projectFallback = cleanFilenamePart(input.projectId, '未命名项目', 80);
     const projectName = cleanFilenamePart(input.projectTitle, projectFallback, 80);
-    const episodeLabel = cleanFilenamePart(buildVideoSegmentEpisodeLabel(input), '第1集', 24);
     const copyIndex = normalizeCopyIndex(input.copyIndex);
     const copySuffix = copyIndex > 1 ? `（${copyIndex}）` : '';
-    const displayName = `片段${groupIdx + 1}${copySuffix}${projectName}${episodeLabel}`;
+    const displayName = `片段${groupIdx + 1}${copySuffix}${projectName}`;
     const filename = `${displayName}.mp4`;
     return { displayName, filename, downloadFilename: filename };
   }

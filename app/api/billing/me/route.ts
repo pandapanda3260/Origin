@@ -87,5 +87,13 @@ export async function GET(req: NextRequest) {
 }
 
 function simplifyLedger(l: any) {
-  return { id: l.id, amount: l.amount, kind: l.kind, reason: l.reason, balanceAfter: l.balanceAfter, createdAt: l.createdAt };
+  return {
+    id: l.id,
+    amount: l.amount,
+    kind: l.kind,
+    reason: l.reason,
+    taskName: l.taskName || null,
+    balanceAfter: l.balanceAfter,
+    createdAt: l.createdAt,
+  };
 }

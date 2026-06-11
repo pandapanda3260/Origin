@@ -60,6 +60,12 @@ function loadVideoGen() {
     if (id === './video-reference-manifest') {
       return { hashString: (s) => String(s).length.toString(16), resolveGenerationDurationSec: (opts) => opts.plannedDurationSec || 5 };
     }
+    if (id === './video-segment-runtime') {
+      return {
+        buildTailRushedWarning: () => null,
+        shouldMarkTailRushedAfterProbe: () => false,
+      };
+    }
     if (id === './video-prompt-lifecycle') return { buildVideoPromptSnapshot: () => ({}) };
     if (id === './video-prompt-state') return {};
     if (id === './frame-workflow-state') {
@@ -76,6 +82,15 @@ function loadVideoGen() {
     }
     if (id === './runtime-paths') {
       return { getDataDir: () => path.join(root, 'data') };
+    }
+    if (id === './aspect-ratio') return { normalizeVideoAspectRatio: (ratio) => ratio || '9:16' };
+    if (id === './usage-billing') return { recordUsageEventAndSettleCharge: async () => ({}) };
+    if (id === './video-segment-names') {
+      return {
+        buildVideoSegmentNames: () => [],
+        buildVideoSegmentNamesForRow: () => [],
+        videoSegmentNameInputFromProject: () => ({}),
+      };
     }
     if (id === './provider-recovery') return {};
     return require(id);

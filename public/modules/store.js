@@ -3,6 +3,10 @@
  * Usage: const store = createStore(initialState);
  *        store.getState() / store.setState(fn) / store.subscribe(listener)
  */
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
+
+assertModuleSingleton("store", import.meta.url);
+
 export function createStore(initialState, onChange) {
   let state = initialState;
   const listeners = new Set();

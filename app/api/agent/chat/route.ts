@@ -184,7 +184,25 @@ export async function POST(req: NextRequest) {
     await chatStream(
       user,
       buildAgentMessages({ project: proj, refs, userMsg }),
-      { temperature: 0.5, maxTokens: 1000, modelRole: 'brain' },
+      {
+        temperature: 0.5,
+        maxTokens: 1000,
+        modelRole: 'brain',
+        traceName: 'agent.chat',
+        tokenContext: {
+          projectId: projectId && proj ? projectId : null,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'agent.chat',
+          moduleKey: 'agent',
+          moduleLabel: '智能助手',
+          featureKey: 'agent_chat',
+          featureLabel: 'Creative Agent 对话',
+          callItemType: 'project',
+          callItemId: projectId && proj ? projectId : null,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      },
       (delta) => {
         buf += delta;
         writer.chunk(delta);

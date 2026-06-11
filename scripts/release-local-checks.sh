@@ -106,7 +106,7 @@ run_isolated node scripts/test-first-frame-material-panels-route.mjs
 run_isolated node scripts/test-material-image-panel-state.mjs
 run_isolated node scripts/test-storyboard-material-panel-contract.mjs
 run_isolated npm run test:storyboard-index-rail-contract
-run_isolated node scripts/test-video-batch-import-contract.mjs
+run_isolated npm run verify:frontend
 run_isolated node scripts/test-tail-frame-no-auto-stale.js
 run_isolated node scripts/test-tail-frame-no-auto-stale-sqlite.js
 run_isolated npx tsx scripts/test-tail-frame-no-auto-stale.mjs

@@ -5,12 +5,14 @@
  * composition root and injects project/settings/videoState plus cross-domain
  * callbacks through initVideoTasks(ctx).
  */
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from './utils.js?v=300';
-import { importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js?v=303';
-import { subscribeTask, subscribeBatch } from './backend_stream.js?v=300';
-import { showBillingPaywall } from './billing.js?v=114';
-import { describeVideoModelStatusFailure } from './video_model_status.js?v=1';
-import { firstFrameImageUrl } from './frameRecommendations.js?v=1';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, formatTime, ApiError, getAuthHeaders, hydrateProtectedImageElements, showConsistencyAggregateWarning, getActiveBatchesShared } from '/modules/utils.js';
+import { subscribeTask, subscribeBatch } from '/modules/backend_stream.js';
+import { showBillingPaywall } from '/modules/billing.js';
+import { describeVideoModelStatusFailure } from '/modules/video_model_status.js';
+import { firstFrameImageUrl } from '/modules/frameRecommendations.js';
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
+
+assertModuleSingleton("videoTasks", import.meta.url);
 
 let _ctx = {};
 
@@ -19,6 +21,15 @@ let _ctx = {};
 // 调用，避免散落的 `_ctx.safeWriteBack &&` 判空逻辑。
 function _safeWriteBack(id, fn, serverVersion) {
   return _ctx.safeWriteBack ? _ctx.safeWriteBack(id, fn, serverVersion) : false;
+}
+function importGroupToTimeline(groupIdx) {
+  return _ctx.importGroupToTimeline ? _ctx.importGroupToTimeline(groupIdx) : false;
+}
+function removeGroupFromTimeline(groupIdx) {
+  return _ctx.removeGroupFromTimeline ? _ctx.removeGroupFromTimeline(groupIdx) : false;
+}
+function isGroupImported(groupIdx) {
+  return _ctx.isGroupImported ? _ctx.isGroupImported(groupIdx) : false;
 }
 let project = null;
 let settings = null;
@@ -1195,11 +1206,19 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
   // 预计时长展示在原算法基础上再 /3（用户口径调整：和实际后端调度并发后的体感更贴近）
   var _BATCH_ESTIMATE_DIVISOR = 3;
+  var _BATCH_ESTIMATE_MAX_DISPLAY_MIN = 120;
+
+  function _formatBatchEstimateText(minutes) {
+    var n = Math.ceil(Number(minutes) || 0);
+    if (!n || n < 0) return "—";
+    if (n > _BATCH_ESTIMATE_MAX_DISPLAY_MIN) return "~ " + _BATCH_ESTIMATE_MAX_DISPLAY_MIN + "+ 分钟";
+    return "~ " + Math.max(1, n) + " 分钟";
+  }
 
   function _fallbackBatchEstimateText(stats) {
     var sec = Number(stats && stats.plannedSec) || 0;
     if (!sec) return "—";
-    return "~ " + Math.max(1, Math.ceil(sec * 3 / 60 / _BATCH_ESTIMATE_DIVISOR)) + " 分钟";
+    return _formatBatchEstimateText(sec * 3 / 60 / _BATCH_ESTIMATE_DIVISOR);
   }
 
   function _batchEstimateText(stats) {
@@ -1207,7 +1226,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (!total) return "—";
     var avgSec = Number(_videoGenerationEstimate.averageSec);
     if (Number.isFinite(avgSec) && avgSec > 0) {
-      return "~ " + Math.max(1, Math.ceil(avgSec * total / 60 / _BATCH_ESTIMATE_DIVISOR)) + " 分钟";
+      return _formatBatchEstimateText(avgSec * total / 60 / _BATCH_ESTIMATE_DIVISOR);
     }
     return _fallbackBatchEstimateText(stats);
   }

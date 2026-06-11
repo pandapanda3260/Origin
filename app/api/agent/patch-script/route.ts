@@ -36,7 +36,25 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_PATCH },
         { role: 'user', content: `原剧本：\n${baseScript}\n\n修改意图：${intent}` },
       ],
-      { temperature: 0.6, maxTokens: 3500, modelRole: 'brain' },
+      {
+        temperature: 0.6,
+        maxTokens: 3500,
+        modelRole: 'brain',
+        traceName: 'agent.patch-script',
+        tokenContext: {
+          projectId,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'agent.patch-script',
+          moduleKey: 'script',
+          moduleLabel: '剧本页面',
+          featureKey: 'script_agent_patch',
+          featureLabel: '剧本智能修改',
+          callItemType: 'project',
+          callItemId: projectId,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      },
     );
   } catch (e: any) {
     return jsonError('修改失败：' + (e?.message || String(e)), 502);

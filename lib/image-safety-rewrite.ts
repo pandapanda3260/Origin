@@ -1,6 +1,7 @@
 import { chatComplete } from './llm';
 import type { UserRow } from './db';
 import type { RewriteDiff } from './content-sanitize';
+import type { TokenUsageContext } from './token-usage';
 
 /**
  * 图像审核拦截的 LLM 中性化改写(方向 B)。
@@ -75,7 +76,7 @@ function extractLLMErrorDetail(err: any): string | undefined {
 export async function rewriteImagePromptForModerationLLM(
   user: UserRow | null,
   prompt: string,
-  opts: { traceName?: string; chatImpl?: typeof chatComplete } = {},
+  opts: { traceName?: string; chatImpl?: typeof chatComplete; tokenContext?: TokenUsageContext | null } = {},
 ): Promise<ImageSafetyLLMRewrite> {
   const original = String(prompt || '');
   const noChange = (invalidReason?: ImageSafetyRewriteInvalidReason, invalidDetail?: string): ImageSafetyLLMRewrite => ({
@@ -109,6 +110,7 @@ export async function rewriteImagePromptForModerationLLM(
         // maxTokens 是期望产出预算,最终由统一预算层按模型上限夹取。改写后长度≈原文。
         maxTokens: Math.min(4096, Math.max(1024, Math.ceil(original.length * 1.6))),
         traceName: opts.traceName || 'image-moderation-rewrite',
+        ...(opts.tokenContext ? { tokenContext: opts.tokenContext } : {}),
       },
     );
   } catch (err: any) {

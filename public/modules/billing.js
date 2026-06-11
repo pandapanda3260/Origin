@@ -1,5 +1,5 @@
-import { ApiError, apiGet, apiPost, escapeHtml, showToast } from './utils.js?v=300';
-import { mountHoloCard } from './holo_card.js?v=300';
+import { ApiError, apiGet, apiPost, escapeHtml, showToast } from '/modules/utils.js';
+import { mountHoloCard } from '/modules/holo_card.js';
 
 let _ctx = {};
 let _summary = null;
@@ -71,6 +71,7 @@ function _reasonLabel(reason) {
   if (r.indexOf('batch:storyboard_prompts') === 0) return '分镜镜头生成';
   if (r.indexOf('batch:video_prompts') === 0) return '视频提示词生成';
   if (r.indexOf('batch:') === 0) return '图片生成';
+  if (r === 'continuity.check adjacent' || r.indexOf('continuity.check-adjacent') === 0) return '相邻镜头连续性检查';
   if (r.indexOf('refund:') === 0) return '生成失败退还';
   if (r === 'orphan export reap') return '导出超时退还';
   return '';
@@ -99,6 +100,10 @@ function _ledgerAccountParts() {
   return [accountName, phone];
 }
 
+function _ledgerTaskName(item) {
+  return String((item && (item.taskName || item.task_name)) || '').trim();
+}
+
 function _billingAccountName() {
   var user = (_summary && _summary.user) || {};
   return String(user.displayName || user.display_name || user.username || user.phone || '').trim();
@@ -112,13 +117,14 @@ function _ledgerRowsHtml() {
     var amount = Number(item.amount || 0);
     var amountText = (amount > 0 ? '+' : '') + amount;
     var balance = Number(item.balanceAfter || item.balance_after || 0);
-    var meta = [when, '余额 ' + balance].concat(_ledgerAccountParts()).filter(Boolean).map(function (part) {
+    var taskName = _ledgerTaskName(item);
+    var meta = [when, '余额 ' + balance].concat(_ledgerAccountParts()).concat(taskName ? [taskName] : []).filter(Boolean).map(function (part) {
       return escapeHtml(part);
     }).join(' · ');
     return '<div class="flex items-center justify-between gap-4 py-3 border-b border-outline-variant/10">' +
       '<div class="min-w-0">' +
         '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
-        '<div class="text-[11px] text-on-surface-variant/60 mt-1">' + meta + '</div>' +
+        '<div class="text-[11px] text-on-surface-variant/60 mt-1 truncate">' + meta + '</div>' +
       '</div>' +
       '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
     '</div>';
@@ -142,7 +148,7 @@ function _ledgerExportFilename() {
 function _ledgerExportCsv(items) {
   var accountParts = _ledgerAccountParts();
   var rows = [[
-    '时间', '明细', '金额', '余额', '账号名称', '注册手机号', '类型', '原因', '引用ID', '流水ID',
+    '时间', '明细', '金额', '余额', '账号名称', '注册手机号', '任务名', '类型', '原因', '引用ID', '流水ID',
   ]];
   (items || []).forEach(function (item) {
     rows.push([
@@ -152,6 +158,7 @@ function _ledgerExportCsv(items) {
       Number(item.balanceAfter || item.balance_after || 0),
       accountParts[0] || '',
       accountParts[1] || '',
+      _ledgerTaskName(item),
       item.kind || item.entry_type || '',
       item.reason || '',
       item.refId || item.ref_id || '',
@@ -605,10 +612,12 @@ export function renderBillingPage() {
     else regularTopups.push(p);
   });
 
-  // 当前档（含 free）一律渲染成卡片；非当前的 free 仍不展示（不做"降级到 free"卡）。
+  // Free 也要常驻展示：付费档退订到期后会自动降级为 free，
+  // 若付费状态下隐藏 free 卡，用户会误以为没有回退路径。
   var _curCode = subscription.plan_code || subscription.planCode || '';
-  var planCards = plans.filter(function (p) { return p.code !== 'free' || p.code === _curCode; }).map(function (p) {
-    var isCurrent = (subscription.plan_code || subscription.planCode || '') === p.code;
+  var planCards = plans.map(function (p) {
+    var isCurrent = _curCode === p.code;
+    var isFreePlan = p.code === 'free';
     var priceObj = _formatPlanPrice(p);
     var isCustom = priceObj.number === '联系销售';
     // 中文价格文案（免费 / 联系销售）在 text-5xl 下 CJK 字身比 "¥NNN" 数字视觉大很多，
@@ -631,8 +640,10 @@ export function renderBillingPage() {
         '</div>' +
       '</li>';
     }).join('');
-    // CTA 与"升级此套餐"互斥同位：当前付费档 → 取消/恢复；当前 free → 不可取消；非当前 → 升级/联系销售。
-    var isPaidCurrent = isCurrent && p.code !== 'free';
+    // CTA 与"升级此套餐"互斥同位：
+    // 当前付费档 → 取消/恢复；当前 free → 不可取消；
+    // 非当前 free → 只读说明（不能 checkout）；其它非当前档 → 升级/联系销售。
+    var isPaidCurrent = isCurrent && !isFreePlan;
     var ctaHtml;
     if (isPaidCurrent && cancelAtPeriodEnd) {
       ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-sub-action="resume">恢复自动续订</button>';
@@ -640,8 +651,9 @@ export function renderBillingPage() {
       // CTA 复用与其它套餐卡完全一致的 .plan-cta 样式，保证卡片 UI 统一（不再内联改色）。
       ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-sub-action="cancel">取消套餐订阅</button>';
     } else if (isCurrent) {
-      // 免费当前档：默认 :disabled 会让文字置灰看不清，这里强制白字 + 中性半透明底（非 cyan），保证可读。
-      ctaHtml = '<button type="button" class="billing-card-plan plan-cta" disabled style="color:#ECEFF1;opacity:1;background:rgba(255,255,255,0.12);box-shadow:none;">当前套餐</button>';
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta is-display-only" disabled>当前套餐</button>';
+    } else if (isFreePlan) {
+      ctaHtml = '<button type="button" class="billing-card-plan plan-cta is-display-only" disabled>' + (cancelAtPeriodEnd ? '到期后自动恢复' : '退订后自动恢复') + '</button>';
     } else if (isCustom) {
       ctaHtml = '<button type="button" class="billing-card-plan plan-cta" data-plan-code="' + escapeHtml(p.code) + '" disabled>联系销售</button>';
     } else {

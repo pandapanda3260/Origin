@@ -275,6 +275,10 @@ export async function POST(req: NextRequest) {
     return recommendStyleTemplateForScript(user, {
       script: finalScript,
       worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+      projectId,
+      projectTitleSnapshot: (currentProject as any)?.title || (proj as any)?.title || null,
+      requestPath: req.nextUrl.pathname,
+      routeName: 'script.workflow.extract-style-bible',
     });
   };
 

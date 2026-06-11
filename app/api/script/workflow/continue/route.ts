@@ -56,7 +56,25 @@ export async function POST(req: NextRequest) {
           ].filter(Boolean).join('\n\n'),
         },
       ],
-      { temperature: 0.8, maxTokens: 1200, modelRole: 'brain' },
+      {
+        temperature: 0.8,
+        maxTokens: 1200,
+        modelRole: 'brain',
+        traceName: 'script.continue',
+        tokenContext: {
+          projectId: proj ? projectId || null : null,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'script.workflow.continue',
+          moduleKey: 'script',
+          moduleLabel: '剧本页面',
+          featureKey: 'script_continue',
+          featureLabel: '剧本续写',
+          callItemType: 'project',
+          callItemId: proj ? projectId || null : null,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      },
       (delta) => {
         buf += delta;
         writer.scriptChunk(delta);

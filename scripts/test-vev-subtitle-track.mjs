@@ -1,21 +1,12 @@
 /**
- * 字幕自动进剪辑器文字轨 契约测试
+ * VevDemo subtitle material import contract.
  *
- * 背景（2026-06-11，方向A）：
- *   自动铺轨时把台词转成 VevDemo 工程文字轨：
- *   - Origin 侧 online_editor.js：_buildVevSubtitleCues 按"一键成片 buildSrt 同规则"
- *     生成 plan.subtitles（行来源 videoPrompt→dialogue 回退；段内均分时间）。
- *   - 壳层 fe/index.js：buildSubtitleLaneFromPlan 按火山直接剪辑协议生成
- *     Type:'text' 片段（TargetTime/FontSize/FontColor/transform），文字 lane 放 Track 最前；
- *     updateProject 失败自动去文字 lane 降级重试（fail-soft），视频铺轨永不因字幕挂掉。
- *
- *   fe/index.js 是未跟踪手改文件，vendor 重同步会静默冲掉——本测试兼当哨兵。
- *
- * 运行：node scripts/test-vev-subtitle-track.mjs
+ * 字幕 P0 不再直写 EditParam.Track 的 Type:'text'，而是：
+ *   Origin 生成 SRT -> bridge 上传 object subtitle -> CreateEditMaterial -> SearchEditMaterial 回读。
+ * 字幕是否进一步自动落入时间线字幕轨属于 P1 SDK 探针，不在本契约内承诺。
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines } from '../public/modules/subtitle_format.js';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const failures = [];
@@ -25,109 +16,95 @@ function assert(cond, label) {
   failures.push(label);
 }
 
-const shellJs = readFileSync(join(ROOT, 'vevdemo-1.0.6/fe/index.js'), 'utf8');
-const oeJs = readFileSync(join(ROOT, 'public/modules/online_editor.js'), 'utf8');
-const mainJs = readFileSync(join(ROOT, 'public/main.js'), 'utf8');
-
 function extract(source, name, label) {
   const match = source.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`));
   if (!match) throw new Error(`无法提取 ${label || name}`);
   return match[0];
 }
 
-// ── 1. 哨兵：关键代码在场 ───────────────────────────────────────
-assert(shellJs.includes('function buildSubtitleLaneFromPlan'), 'fe/index.js 应有 buildSubtitleLaneFromPlan（vendor 重同步冲掉即红）');
-assert(/track\.push\(subtitleLane\);[\s\S]{0,80}track\.push\(videoTrack\);/.test(shellJs), '文字 lane 必须在视频 lane 之前 push（协议要求文字放 Track 最前）');
-assert(/catch \(err\) \{[\s\S]{0,400}filter\(\(lane\) => !isSubtitleLane\(lane\)\)/.test(shellJs), 'updateProject 失败必须有去文字 lane 的 fail-soft 降级重试');
-assert(shellJs.includes('subtitleApplied'), '铺轨结果必须上报 subtitleApplied（Origin 侧降级提示依赖它）');
-assert(oeJs.includes('subtitles: _buildVevSubtitleCues(project, entries)'), 'plan 必须挂 subtitles（cue 列表）');
-assert(oeJs.includes("from '/modules/subtitle_format.js?v=300'"), 'online_editor.js 必须从 subtitle_format.js 取行提取函数（与 importmap 同号）');
-assert(oeJs.includes('字幕轨写入失败'), '降级时必须有软提示 toast');
-const oeVersionMatch = mainJs.match(/online_editor\.js\?v=(\d+)/);
-assert(oeVersionMatch && Number(oeVersionMatch[1]) >= 11, 'main.js 应引用 online_editor.js?v=11+（cache bump 纪律）');
+const shellJs = readFileSync(join(ROOT, 'vevdemo-1.0.6/fe/index.js'), 'utf8');
+const actionsJs = readFileSync(join(ROOT, 'vevdemo-1.0.6/fe/actions.js'), 'utf8');
+const materialTs = readFileSync(join(ROOT, 'vevdemo-1.0.6/fe/material.ts'), 'utf8');
+const oeJs = readFileSync(join(ROOT, 'public/modules/online_editor.js'), 'utf8');
+const workspaceHtml = readFileSync(join(ROOT, 'public/workspace.html'), 'utf8');
 
-// ── 2. 行为：Origin 侧 cue 构建（注入真实 subtitle_format 实现） ──
-const oeSandbox = new Function('extractSubtitleLinesFromPrompt', 'splitSubtitleDialogueLines', `
-  ${extract(oeJs, '_roundVevSyncSec')}
-  ${extract(oeJs, '_vevSubtitleLinesForGroup')}
-  ${extract(oeJs, '_buildVevSubtitleCues')}
-  return { _vevSubtitleLinesForGroup, _buildVevSubtitleCues };
-`)(extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines);
+// ── 1. 哨兵：旧 text lane 路线必须断开 ──────────────────────────
+assert(!shellJs.includes('function buildSubtitleLaneFromPlan'), 'fe/index.js 不应再保留 buildSubtitleLaneFromPlan');
+assert(!shellJs.includes('subtitleApplied'), '铺轨结果不应再上报 subtitleApplied 假成功');
+assert(!shellJs.includes('OriginSubtitle'), 'bridge 不应再构造 OriginSubtitle text item');
+assert(!/track\.push\(subtitleLane\)/.test(shellJs), 'buildTrackFromOriginPlan 不应 push subtitleLane');
 
-const project = {
-  storyboards: [
-    { videoPrompt: '少年抬头看向钟楼。林尘：「师父，我准备好了。」老者：「随我来。」' },
-    { videoPrompt: '(无台词标记的描述)', shotIndices: [1] },
-    {},
-  ],
-  shots: [
-    { dialogue: '' },
-    { dialogue: '林尘：师父，这是什么地方？\n老者：混沌圣地。' },
-    { dialogue: '旁白独白一句' },
-  ],
-};
+// ── 2. 哨兵：subtitle material 路线必须在场 ──────────────────────
+assert(materialTs.includes("type: 'subtitle'") && materialTs.includes("format: ['srt', 'vtt', 'ass']") && materialTs.includes("fileType: 'object'"), 'material.ts 必须声明 subtitle srt object');
+assert(shellJs.includes("import { getType } from './util.js'"), 'bridge 必须导入 getType 做 srt preflight');
+assert(shellJs.includes("getType('srt')"), 'bridge 必须显式 preflight getType("srt")');
+assert(shellJs.includes("new File([srtText], filename, { type: 'subtitle/srt' })"), 'SRT File MIME 必须让 getType 命中 srt');
+assert(shellJs.includes('function findSubtitleMaterialByName'), 'bridge 必须按 Name 做字幕防重');
+assert(shellJs.includes('function uploadSubtitleFile') && shellJs.includes('new Promise'), 'uploadMaterial callback 必须被 Promise 包装');
+assert(shellJs.includes('function readBackSubtitleMaterial') && shellJs.includes('EditMids: [editMid]'), '注册后必须强制 SearchEditMaterial 回读');
+assert(shellJs.includes('registerOriginMaterialToVevDemo(material)'), 'subtitle material 必须走 CreateEditMaterial 注册');
+assert(shellJs.includes('upload_result_missing_source'), '上传无可注册 source 时必须显式报 upload_result_missing_source');
+assert(shellJs.includes("case 'origin:importSubtitles'"), 'bridge 必须监听 origin:importSubtitles');
+assert(oeJs.includes("origin:importSubtitles"), 'Origin 必须发送独立字幕导入消息');
+assert(oeJs.includes('origin-subtitles-${originProjectId}-v${edlVersion}.srt'), '字幕文件名必须按 projectId+edlVersion 防重');
+assert(oeJs.includes('OEV_SUBTITLE_IMPORT_ACK_TIMEOUT_MS = 120000'), '字幕导入必须有独立 120s 回执预算');
 
-// 2a. videoPrompt 引号台词优先
-const linesFromPrompt = oeSandbox._vevSubtitleLinesForGroup(project, 0);
-assert(linesFromPrompt.length === 2 && linesFromPrompt[0].includes('师父，我准备好了'), `videoPrompt 应提取 2 行台词，实际：${JSON.stringify(linesFromPrompt)}`);
+// ── 3. 哨兵：自动铺轨根因锁 ────────────────────────────────────
+const autoFn = extract(oeJs, '_autoSyncCurrentEdlVideosToVevDemo');
+assert(autoFn.indexOf('_ensureCurrentVideosEdlForVevDemo') >= 0, '自动路径必须调用 ensure');
+assert(autoFn.indexOf('_ensureCurrentVideosEdlForVevDemo') < autoFn.indexOf('_collectCurrentEdlVideoResourceIds'), '自动路径 ensure 必须早于 EDL ids 采集');
+const importFn = extract(oeJs, 'importMaterialsToVevDemo');
+assert(importFn.indexOf('_ensureCurrentVideosEdlForVevDemo') >= 0, '手动同步路径必须调用 ensure');
+assert(importFn.indexOf('_ensureCurrentVideosEdlForVevDemo') < importFn.indexOf('_collectCurrentVideoResourceIds'), '手动同步 ensure 必须早于素材 ids 采集');
+assert(oeJs.includes("mode: 'fill-if-empty'"), 'applyTimeline 必须发送 fill-if-empty policy');
 
-// 2b. prompt 无台词 → 回退 shotIndices 绑定镜头的 dialogue
-const linesFromDialogue = oeSandbox._vevSubtitleLinesForGroup(project, 1);
-assert(linesFromDialogue.length === 2 && linesFromDialogue[1].includes('混沌圣地'), `dialogue 回退应切出 2 行，实际：${JSON.stringify(linesFromDialogue)}`);
+// ── 4. 哨兵：object subtitle 上传参数 ───────────────────────────
+assert(/RecordType:\s*category === 'image' \|\| fileType\.fileType === 'object' \? 2 : undefined/.test(actionsJs), 'object 上传必须设置 RecordType:2');
 
-// 2c. 无 shotIndices → 回退 [groupIdx]
-const linesFallback = oeSandbox._vevSubtitleLinesForGroup(project, 2);
-assert(linesFallback.length === 1, `无绑定时应回退 shots[groupIdx].dialogue，实际：${JSON.stringify(linesFallback)}`);
+// ── 5. 哨兵：缓存入口 ─────────────────────────────────────────
+assert(workspaceHtml.includes('"/modules/online_editor.js": "/modules/online_editor.js?v=25"'), 'workspace import map 应引用 online_editor.js?v=25');
 
-// 2d. 时间分配：段内均分 + 0.15 起步 + 段尾 -0.05；无台词段产出 0 条
-const entries = [
-  { groupIdx: 0, targetStartSec: 0, targetEndSec: 5 },
-  { groupIdx: 2, targetStartSec: 5, targetEndSec: 9 },
-];
-const cues = oeSandbox._buildVevSubtitleCues(project, entries);
-assert(cues.length === 3, `两段应产出 2+1=3 条 cue，实际 ${cues.length}`);
-const [c1, c2, c3] = cues;
-assert(Math.abs(c1.startSec - 0.15) < 0.02, `首条应 0.15s 起，实际 ${c1.startSec}`);
-assert(c2.startSec > c1.endSec, '同段两条 cue 不应重叠');
-assert(c2.endSec <= 4.95 + 0.001, `段尾应留 0.05s，实际 ${c2.endSec}`);
-assert(Math.abs(c3.startSec - 5.15) < 0.02 && c3.endSec <= 8.95 + 0.001, `第二段 cue 应落在段内，实际 ${c3.startSec}-${c3.endSec}`);
-
-// ── 3. 行为：壳层文字 lane 构建 ─────────────────────────────────
-const feSandbox = new Function(`
-  ${extract(shellJs, 'toTimelineTime')}
-  ${extract(shellJs, 'resolveCanvasSize')}
-  const SUBTITLE_FONT_COLOR = '#FFFFFFFF';
-  ${extract(shellJs, 'buildSubtitleLaneFromPlan')}
-  ${extract(shellJs, 'isSubtitleLane')}
-  ${extract(shellJs, 'laneItemCount')}
-  return { buildSubtitleLaneFromPlan, isSubtitleLane, laneItemCount };
+// ── 6. 行为：SRT 序列化 ───────────────────────────────────────
+const oeSandbox = new Function(`
+  ${extract(oeJs, '_formatSrtTimestamp')}
+  ${extract(oeJs, '_buildSrtFromVevSubtitleCues')}
+  return { _formatSrtTimestamp, _buildSrtFromVevSubtitleCues };
 `)();
-
-const plan = { subtitles: [
+assert(oeSandbox._formatSrtTimestamp(3723.456) === '01:02:03,456', 'SRT 时间格式应为 HH:MM:SS,mmm');
+const srt = oeSandbox._buildSrtFromVevSubtitleCues([
   { text: '第一句', startSec: 0.15, endSec: 2.3 },
   { text: '  ', startSec: 2.4, endSec: 3 },
-  { text: '第二句', startSec: 3, endSec: 4.9 },
-] };
-const lane = feSandbox.buildSubtitleLaneFromPlan(plan, 'ms', { Canvas: { Width: 1080, Height: 1920 } });
-assert(lane.length === 2, `空白文本应被跳过，lane 应 2 条，实际 ${lane.length}`);
-assert(lane[0].Type === 'text' && lane[0].Text === '第一句', 'text 片段应带 Type/Text');
-assert(lane[0].TargetTime[0] === 150 && lane[0].TargetTime[1] === 2300, `ms 单位换算错误：${JSON.stringify(lane[0].TargetTime)}`);
-assert(lane[0].FontColor === '#FFFFFFFF' && Number.isFinite(lane[0].FontSize), '应带 FontColor/FontSize');
-const tf = lane[0].Extra?.[0];
-assert(tf?.Type === 'transform' && tf.Width === 1080 && tf.PosY === Math.round(1920 * 0.82), `transform 布局错误：${JSON.stringify(tf)}`);
-assert(lane[0].OriginSubtitle === true, '应带 OriginSubtitle 标记便于识别');
+  { text: '第二句\n下一行', startSec: 3, endSec: 4.9 },
+  { text: '非法', startSec: 5, endSec: 4 },
+]);
+assert(srt.includes('1\n00:00:00,150 --> 00:00:02,300\n第一句'), 'SRT 应包含首条 cue');
+assert(srt.includes('2\n00:00:03,000 --> 00:00:04,900\n第二句\n下一行'), 'SRT 应保留规范化换行');
+assert(!srt.includes('非法') && srt.endsWith('\n'), 'SRT 应跳过非法 cue 并以换行结尾');
 
-// us 单位换算
-const laneUs = feSandbox.buildSubtitleLaneFromPlan({ subtitles: [{ text: 'x', startSec: 1, endSec: 2 }] }, 'us', null);
-assert(laneUs[0].TargetTime[0] === 1000000, 'us 单位应 ×1e6');
+// ── 7. 行为：递归判空和上传 source 提取 ────────────────────────
+const shellSandbox = new Function('console', `
+  ${extract(shellJs, 'readFirst')}
+  ${extract(shellJs, 'isSupportedVevSource')}
+  ${extract(shellJs, 'countTrackItemsByType')}
+  ${extract(shellJs, 'extractSupportedSubtitleVevSource')}
+  return { countTrackItemsByType, extractSupportedSubtitleVevSource };
+`)({ info() {}, warn() {} });
 
-// isSubtitleLane / laneItemCount
-assert(feSandbox.isSubtitleLane(lane) === true && feSandbox.isSubtitleLane([{ Type: 'video' }]) === false, 'isSubtitleLane 判定错误');
-assert(feSandbox.laneItemCount([lane, [{ Type: 'video' }]], 'text') === 2, 'laneItemCount 统计错误');
+const nestedTrack = [[
+  { Type: 'video', Source: 'vid://v1', TargetTime: [0, 1000] },
+  { Type: 'audio', Source: 'vid://a1', TargetTime: [0, 1000] },
+], { lanes: [{ Type: 'text', Text: '字幕', TargetTime: [0, 1000] }] }];
+assert(shellSandbox.countTrackItemsByType(nestedTrack) === 3, '递归 Type 计数应统计无 ID 的 Origin/SDK 项');
+assert(shellSandbox.countTrackItemsByType(nestedTrack, 'video') === 1, '递归 Type 计数应支持 type 过滤');
+assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { Source: 'tos://bucket/key.srt' } }).vevSource === 'tos://bucket/key.srt', 'Source 应优先作为 vevSource');
+assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { Vid: 'v123' } }).vevSource === 'vid://v123', 'Vid 应转换为 vid://');
+const missing = shellSandbox.extractSupportedSubtitleVevSource({ info: { Mid: 'm1', Oid: 'o1' } });
+assert(!missing.vevSource && missing.mid === 'm1' && missing.oid === 'o1', 'Mid/Oid 不应直接作为可注册 source');
 
 if (failures.length) {
   console.error(`✗ ${failures.length} 处断言失败：`);
   failures.forEach((f) => console.error(`  - ${f}`));
   process.exit(1);
 }
-console.log('✓ 字幕→剪辑器文字轨契约测试通过（哨兵+行为 共 21 断言）');
+
+console.log('✓ subtitle material import contract passed（哨兵+行为 共 34 断言）');

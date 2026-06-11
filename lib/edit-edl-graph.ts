@@ -430,6 +430,22 @@ function createGraph(user: UserRow, emit?: GraphEmit) {
             modelRole: 'structured',
             reasoningEffort: 'none',
             traceName: 'edl-graph.generate',
+            tokenContext: {
+              projectId: state.projectId,
+              projectTitleSnapshot: loaded.projectData?.title || null,
+              requestPath: 'edit_edl_graph',
+              routeName: 'edit-edl.graph',
+              moduleKey: 'edit',
+              moduleLabel: '剪辑页',
+              featureKey: 'edl_graph_generate',
+              featureLabel: '剪辑方案生成',
+              callItemType: 'edl_graph',
+              callItemId: state.threadId,
+              callItemLabel: loaded.projectData?.title || state.projectId,
+              runId: state.auditRunId || state.runId,
+              operationKey: `edl-graph:${state.threadId}:generate`,
+              operationLabel: '剪辑方案生成',
+            },
           },
           (delta) => {
             raw += delta;
@@ -499,6 +515,8 @@ function createGraph(user: UserRow, emit?: GraphEmit) {
           updatedAt: nowIso(),
         };
       }
+      const loaded = collectForState(state);
+      const projectTitle = loaded.ok ? loaded.projectData?.title || null : null;
       try {
         emitStep(emit, '正在修复剪辑方案 JSON…');
         const repaired = await chatComplete(
@@ -524,6 +542,22 @@ function createGraph(user: UserRow, emit?: GraphEmit) {
             modelRole: 'structured',
             reasoningEffort: 'none',
             traceName: 'edl-graph.repair',
+            tokenContext: {
+              projectId: state.projectId,
+              projectTitleSnapshot: projectTitle,
+              requestPath: 'edit_edl_graph',
+              routeName: 'edit-edl.graph',
+              moduleKey: 'edit',
+              moduleLabel: '剪辑页',
+              featureKey: 'edl_graph_repair',
+              featureLabel: '剪辑方案 JSON 修复',
+              callItemType: 'edl_graph',
+              callItemId: state.threadId,
+              callItemLabel: projectTitle || state.projectId,
+              runId: state.auditRunId || state.runId,
+              operationKey: `edl-graph:${state.threadId}:repair:${attempts + 1}`,
+              operationLabel: '剪辑方案 JSON 修复',
+            },
           },
         );
         return {

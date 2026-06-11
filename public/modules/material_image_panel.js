@@ -1,4 +1,4 @@
-import { apiGet, escapeHtml } from './utils.js?v=300';
+import { apiGet, escapeHtml } from '/modules/utils.js';
 
 export const MATERIAL_PANEL_ROLES = ['scene', 'char', 'prop'];
 export const MATERIAL_PANEL_CACHE_TTL_MS = 60000;

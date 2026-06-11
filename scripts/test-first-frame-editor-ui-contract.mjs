@@ -424,7 +424,7 @@ assert.doesNotMatch(
 
 assert.match(
   source,
-  /from '\.\/material_image_panel\.js\?v=\d+';/,
+  /import \{[\s\S]*?renderMaterialImagePanelHtml[\s\S]*?\} from '\/modules\/material_image_panel\.js';/,
   'first-frame editor must import the shared material panel renderer',
 );
 
@@ -694,8 +694,8 @@ assert.doesNotMatch(
 
 assert.match(
   styles,
-  /\.ffe-material-strip\s*\{[\s\S]*?grid-template-columns:\s*repeat\(var\(--ffe-material-slot-count\)/,
-  'first-frame material strip must size columns from the dynamic slot-count variable',
+  /\.ffe-material-strip\s*\{[\s\S]*?--ffe-material-slot-count:\s*5;[\s\S]*?--ffe-material-tile-min:\s*64px;[\s\S]*?grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(var\(--ffe-material-tile-min\),\s*1fr\)\);/,
+  'first-frame material strip must keep the slot-count variable while using wrapping min-size columns',
 );
 
 assert.match(

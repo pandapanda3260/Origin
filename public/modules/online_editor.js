@@ -10,7 +10,7 @@
  * - 消息通过 postMessage 在 iframe 和主页面之间传递
  */
 
-import { extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines } from '/modules/subtitle_format.js?v=300';
+import { extractSubtitleLinesFromPrompt, splitSubtitleDialogueLines } from '/modules/subtitle_format.js';
 
 var _oeCtx = null;
 var _vevFrame = null;
@@ -44,6 +44,7 @@ var _syncMaterialsBusyFlag = false;
 var _hostKeydownBound = false;
 var _keepAlivePingTimer = null;
 var _keepAlivePingCallback = null;
+var _vevDemoEnsureEdlInFlight = null;
 
 const OEV_KEEPALIVE_PING_TIMEOUT_MS = 3000;
 const OEV_IFRAME_LOAD_TIMEOUT_MS = 25000;
@@ -62,6 +63,8 @@ const OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_GRACE_MS = 60 * 1000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MIN_MS = 30000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_PER_ITEM_MS = 15000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MAX_MS = 180000;
+const OEV_TIMELINE_APPLY_ACK_TIMEOUT_MS = 30000;
+const OEV_SUBTITLE_IMPORT_ACK_TIMEOUT_MS = 120000;
 const OEV_TIMELINE_APPLY_TOAST_DEDUP_MS = 6000;
 
 // ============================================================================
@@ -296,6 +299,55 @@ async function _postMaterialImport(body, options) {
       : _materialSyncRequestTimeoutMs(requestBody)
   );
   return await _oeCtx?.apiPost?.('/api/volcengine/import', requestBody, 'POST', { timeoutMs });
+}
+
+function _applyEnsuredEdlToCurrentProject(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const project = _oeCtx?.getProject?.();
+  if (!project?.id) return;
+  if (payload.edl && typeof payload.edl === 'object') {
+    project.editData = { ...(project.editData || {}), edl: payload.edl };
+  }
+  if (Array.isArray(payload.storyboards)) {
+    project.storyboards = payload.storyboards;
+  }
+  const projectVersion = Number(payload.projectVersion);
+  if (Number.isFinite(projectVersion) && projectVersion > 0) {
+    const cur = Number(project.version || 0);
+    if (projectVersion > cur) project.version = projectVersion;
+  }
+}
+
+async function _ensureCurrentVideosEdlForVevDemo(options) {
+  options = options || {};
+  const project = _oeCtx?.getProject?.();
+  if (!project?.id) return null;
+  if (_vevDemoEnsureEdlInFlight) return _vevDemoEnsureEdlInFlight;
+
+  _vevDemoEnsureEdlInFlight = (async () => {
+    try {
+      const payload = await _oeCtx?.apiPost?.('/api/edit/timeline', {
+        projectId: project.id,
+        op: 'ensure-current-videos-edl',
+      }, 'POST', { timeoutMs: 30000 });
+      _applyEnsuredEdlToCurrentProject(payload);
+      if (payload?.changed) {
+        console.log('[OnlineEditor] 已为空 EDL 生成当前视频时间线:', {
+          projectId: project.id,
+          edlVersion: payload?.edl?.version || 0,
+          timelineCount: Array.isArray(payload?.edl?.timeline) ? payload.edl.timeline.length : 0,
+          source: options.source || '',
+        });
+      }
+      return payload || null;
+    } catch (err) {
+      console.warn('[OnlineEditor] ensure 当前视频 EDL 失败，继续现有同步流程:', err);
+      return { error: err };
+    } finally {
+      _vevDemoEnsureEdlInFlight = null;
+    }
+  })();
+  return _vevDemoEnsureEdlInFlight;
 }
 
 function _setConnectionStatus(variant, label) {
@@ -2054,6 +2106,7 @@ async function importMaterialsToVevDemo(resourceIds, options) {
     });
     return null;
   }
+  await _ensureCurrentVideosEdlForVevDemo({ silent, source: options.source || 'manual-import' });
   const ids = Array.isArray(resourceIds) && resourceIds.length > 0
     ? resourceIds
     : _collectCurrentVideoResourceIds();
@@ -2097,7 +2150,7 @@ async function importMaterialsToVevDemo(resourceIds, options) {
 
     const shouldApplyTimeline = options.applyTimeline === true || (!silent && options.applyTimeline !== false);
     if (shouldApplyTimeline) {
-      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials);
+      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials, { silent });
     }
 
     console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
@@ -2318,6 +2371,7 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
   }
   if (_vevDemoAutoVideoSyncInFlight) return _vevDemoAutoVideoSyncInFlight;
 
+  await _ensureCurrentVideosEdlForVevDemo({ silent: true, source: 'auto-edl' });
   const ids = _collectCurrentEdlVideoResourceIds();
   const bgmTrackIds = _collectCurrentBgmTrackIds();
   if (!ids.length && !bgmTrackIds.length) {
@@ -2341,7 +2395,7 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         : [];
       if (materials.length) {
         const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, 'auto-edl-reuse');
-        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials);
+        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials, { silent: true });
         return null;
       }
       console.warn('[OnlineEditor] 已有自动同步标记但未找到可用 VevDemo binding，重新执行完整同步:', signature);
@@ -2368,7 +2422,7 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         bgmCount: bgmTrackIds.length,
         signature,
       });
-      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials);
+      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials, { silent: true });
     }
     return result;
   })();
@@ -2476,6 +2530,42 @@ function _buildVevSubtitleCues(project, entries) {
   return cues;
 }
 
+function _formatSrtTimestamp(sec) {
+  const value = Math.max(0, Number(sec) || 0);
+  const totalMs = Math.round(value * 1000);
+  const ms = totalMs % 1000;
+  const totalSeconds = Math.floor(totalMs / 1000);
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const pad3 = (n) => String(n).padStart(3, '0');
+  return `${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)},${pad3(ms)}`;
+}
+
+function _buildSrtFromVevSubtitleCues(cues) {
+  const blocks = [];
+  (Array.isArray(cues) ? cues : []).forEach((cue) => {
+    const text = String(cue?.text || '').replace(/\r\n?/g, '\n').trim();
+    const start = Number(cue?.startSec);
+    const end = Number(cue?.endSec);
+    if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+    const normalizedText = text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('\n');
+    if (!normalizedText) return;
+    blocks.push([
+      String(blocks.length + 1),
+      `${_formatSrtTimestamp(start)} --> ${_formatSrtTimestamp(end)}`,
+      normalizedText,
+    ].join('\n'));
+  });
+  return blocks.length ? `${blocks.join('\n\n')}\n` : '';
+}
+
 function _buildCurrentVevTimelinePlan(materials) {
   const project = _oeCtx?.getProject?.();
   const edl = project?.editData?.edl;
@@ -2569,7 +2659,8 @@ function _buildCurrentVevTimelinePlan(materials) {
   };
 }
 
-function _sendTimelinePlanToVevDemo(plan) {
+function _sendTimelinePlanToVevDemo(plan, options) {
+  options = options || {};
   return new Promise((resolve, reject) => {
     if (!_isVevDemoReady) {
       const error = new Error('VevDemo 未就绪');
@@ -2585,7 +2676,7 @@ function _sendTimelinePlanToVevDemo(plan) {
       error.code = 'timeline_apply_timeout';
       error.reason = 'ack_timeout';
       reject(error);
-    }, 15000);
+    }, OEV_TIMELINE_APPLY_ACK_TIMEOUT_MS);
 
     _messageHandlers.set('vevdemo:timelineApplied', (data) => {
       clearTimeout(timeout);
@@ -2602,7 +2693,8 @@ function _sendTimelinePlanToVevDemo(plan) {
       resolve(data);
     });
 
-    const sent = _sendToVevDemo('origin:applyTimeline', { plan });
+    const policy = options.policy || { mode: 'fill-if-empty', silent: options.silent === true };
+    const sent = _sendToVevDemo('origin:applyTimeline', { plan, policy });
     if (!sent) {
       clearTimeout(timeout);
       _messageHandlers.delete('vevdemo:timelineApplied');
@@ -2612,6 +2704,78 @@ function _sendTimelinePlanToVevDemo(plan) {
       reject(error);
     }
   });
+}
+
+function _sendSubtitleImportToVevDemo(payload) {
+  return new Promise((resolve, reject) => {
+    if (!_isVevDemoReady) {
+      const error = new Error('VevDemo 未就绪');
+      error.code = 'vevdemo_not_ready';
+      error.reason = 'bridge_not_ready';
+      reject(error);
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      _messageHandlers.delete('vevdemo:subtitlesImported');
+      const error = new Error('未收到 VevDemo 字幕素材导入回执');
+      error.code = 'subtitle_import_timeout';
+      error.reason = 'ack_timeout';
+      reject(error);
+    }, OEV_SUBTITLE_IMPORT_ACK_TIMEOUT_MS);
+
+    _messageHandlers.set('vevdemo:subtitlesImported', (data) => {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:subtitlesImported');
+      if (data?.ok === false) {
+        const error = new Error(data?.error || 'VevDemo 字幕素材导入失败');
+        error.code = data?.code || '';
+        error.reason = data?.reason || '';
+        error.details = data?.details || null;
+        error.raw = data || null;
+        reject(error);
+        return;
+      }
+      resolve(data);
+    });
+
+    const sent = _sendToVevDemo('origin:importSubtitles', payload);
+    if (!sent) {
+      clearTimeout(timeout);
+      _messageHandlers.delete('vevdemo:subtitlesImported');
+      const error = new Error('发送字幕素材导入消息失败');
+      error.code = 'subtitle_import_send_failed';
+      error.reason = 'post_message_failed';
+      reject(error);
+    }
+  });
+}
+
+async function _importCurrentVevSubtitlesToVevDemo(plan, options) {
+  options = options || {};
+  const srtText = _buildSrtFromVevSubtitleCues(plan?.subtitles || []);
+  if (!srtText) return null;
+  const originProjectId = String(plan?.projectId || _oeCtx?.getProject?.()?.id || '').trim();
+  if (!originProjectId) return null;
+  const edlVersion = Number(plan?.edlVersion) || 0;
+  const filename = `origin-subtitles-${originProjectId}-v${edlVersion}.srt`;
+  try {
+    const result = await _sendSubtitleImportToVevDemo({
+      originProjectId,
+      edlVersion,
+      filename,
+      srtText,
+      vevSpace: _cleanOnlineEditorText(_vevDemoBoundVevSpace) || 'origin',
+    });
+    console.log('[OnlineEditor] VevDemo 字幕素材导入完成:', result);
+    return result;
+  } catch (err) {
+    console.warn('[OnlineEditor] VevDemo 字幕素材导入未完成:', err);
+    if (!options.silent) {
+      _oeCtx?.showToast?.('字幕素材导入失败，视频/BGM 已完成铺轨', 'warning');
+    }
+    return { error: err };
+  }
 }
 
 function _normalizeVevTimelineApplyError(err) {
@@ -2693,11 +2857,13 @@ function _showVevTimelineApplyToast(meta) {
   _oeCtx?.showToast?.(message, type);
 }
 
-async function _applyCurrentEdlTimelineToVevDemo(materials) {
+async function _applyCurrentEdlTimelineToVevDemo(materials, options) {
+  options = options || {};
+  const silent = options.silent === true;
   const plan = _buildCurrentVevTimelinePlan(materials);
   if (plan?.ok === false) {
     console.warn('[OnlineEditor] VevDemo 时间线铺轨已拦截:', plan);
-    _oeCtx?.showToast?.(plan.message || '部分素材还没准备好，已取消自动铺轨', 'warning');
+    if (!silent) _oeCtx?.showToast?.(plan.message || '部分素材还没准备好，已取消自动铺轨', 'warning');
     return { blocked: true, plan };
   }
   if (!plan) {
@@ -2705,20 +2871,24 @@ async function _applyCurrentEdlTimelineToVevDemo(materials) {
     return null;
   }
   try {
-    const result = await _sendTimelinePlanToVevDemo(plan);
+    const result = await _sendTimelinePlanToVevDemo(plan, { silent });
     console.log('[OnlineEditor] VevDemo 时间线铺轨完成:', result);
-    if (result && result.subtitleCount > 0 && result.subtitleApplied === false) {
-      // 字幕轨降级是软提示不拦流程；详细错误在壳层 console（subtitleError）
-      _oeCtx?.showToast?.('字幕轨写入失败，本次按无字幕铺轨', 'warning');
-      console.warn('[OnlineEditor] VevDemo 字幕轨已降级:', result.subtitleError || '(no detail)');
-    } else if (result && result.subtitleApplied && result.subtitleCount > 0) {
-      console.log(`[OnlineEditor] 字幕已随时间线铺入文字轨：${result.subtitleCount} 条`);
+    if (result?.skipped) {
+      const message = '轨道已有内容，未覆盖；如需按最新时间线重铺，请先清空轨道并稍候几秒后再点同步素材';
+      if (!silent) _oeCtx?.showToast?.(message, 'info');
+      console.log('[OnlineEditor] VevDemo 时间线铺轨跳过:', result);
+      return result;
+    }
+    if (result?.ok !== false && Array.isArray(plan.subtitles) && plan.subtitles.length > 0) {
+      _importCurrentVevSubtitlesToVevDemo(plan, { silent }).catch((err) => {
+        console.warn('[OnlineEditor] 字幕素材导入后台任务异常:', err);
+      });
     }
     return result;
   } catch (err) {
     console.warn('[OnlineEditor] VevDemo 时间线铺轨未完成:', err);
     const meta = _normalizeVevTimelineApplyError(err);
-    _showVevTimelineApplyToast(meta);
+    if (!silent) _showVevTimelineApplyToast(meta);
     return { error: err };
   }
 }

@@ -419,6 +419,7 @@ export async function processStyleBibleRun(claimedRow: StyleBibleRunRow) {
   ) as WorldContext;
   const draft = parseStyleBibleRunDraft(row);
   const maxTokens = resolveStageMaxTokens(row);
+  let project: ProjectRow | null = null;
   let messages = buildStyleBibleStageMessages(String(input.script || ''), {
     stage: row.stage,
     aspectRatio: input.styleOptions?.aspectRatio,
@@ -429,7 +430,7 @@ export async function processStyleBibleRun(claimedRow: StyleBibleRunRow) {
   });
   let knowledgeContext: any = null;
   try {
-    const project = getProjectByIdForUser(row.project_id, row.owner_id);
+    project = getProjectByIdForUser(row.project_id, row.owner_id) as ProjectRow | null;
     if (project) {
       const context = buildKnowledgeContextForStage({
         ownerId: row.owner_id,
@@ -471,6 +472,22 @@ export async function processStyleBibleRun(claimedRow: StyleBibleRunRow) {
         maxTokens,
         modelRole: 'styleBible',
         maxAttempts: 1,
+        tokenContext: {
+          projectId: row.project_id,
+          projectTitleSnapshot: (project as any)?.title || null,
+          requestPath: 'style_bible_worker',
+          routeName: 'style-bible.worker',
+          moduleKey: 'style',
+          moduleLabel: '风格页面',
+          featureKey: `style_bible_${row.stage}`,
+          featureLabel: `风格圣经生成 ${row.stage}`,
+          callItemType: 'style_bible_run',
+          callItemId: row.run_id,
+          callItemLabel: (project as any)?.title || row.project_id,
+          runId: row.run_id,
+          operationKey: `style-bible:${row.run_id}:${row.stage}`,
+          operationLabel: `风格圣经生成 ${row.stage}`,
+        },
       },
       (raw) => parseJsonLoose(raw),
       `styleBible.${row.stage}`,

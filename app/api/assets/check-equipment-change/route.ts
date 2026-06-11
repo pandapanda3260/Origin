@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { chatCompleteJsonWithRetry, parseJsonLoose } from '@/lib/llm';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
+import { getProjectByIdForUser } from '@/lib/projects-db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -13,6 +14,8 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
   const body = await req.json().catch(() => ({} as any));
+  const projectId = String(body.projectId || '').trim();
+  const project = projectId ? getProjectByIdForUser(projectId, user.id) : null;
 
   if (!body.before || !body.after) return jsonOk({ changed: false, items: [] });
 
@@ -23,7 +26,25 @@ export async function POST(req: NextRequest) {
         { role: 'system', content: SP_CHECK },
         { role: 'user', content: `对比：\n${JSON.stringify({ before: body.before, after: body.after })}` },
       ],
-      { temperature: 0.2, maxTokens: 500, modelRole: 'structured' },
+      {
+        temperature: 0.2,
+        maxTokens: 500,
+        modelRole: 'structured',
+        traceName: 'assets.check-equipment-change',
+        tokenContext: {
+          projectId: project ? projectId : null,
+          projectTitleSnapshot: (project as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'assets.check-equipment-change',
+          moduleKey: 'assets',
+          moduleLabel: '资产生成',
+          featureKey: 'asset_equipment_change_check',
+          featureLabel: '角色装备变化检查',
+          callItemType: 'asset',
+          callItemId: String(body.assetId || body.characterId || '').trim() || null,
+          callItemLabel: String(body.assetName || body.characterName || '').trim() || null,
+        },
+      },
       parseJsonLoose,
       'assets.check-equipment-change',
     );

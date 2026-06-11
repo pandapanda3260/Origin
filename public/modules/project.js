@@ -12,7 +12,10 @@ import {
   escapeHtml,
   fetchAssetSignedUrl,
   fetchVideoSignedUrl,
-} from './utils.js?v=300';
+} from '/modules/utils.js';
+import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
+
+assertModuleSingleton("project", import.meta.url);
 
 let _ctx = {};
 

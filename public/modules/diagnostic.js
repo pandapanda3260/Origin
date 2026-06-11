@@ -5,7 +5,7 @@
  * 渲染成可折叠的侧边卡片，让崔泽直观看到每次生成到底激活/跳过了哪些词库子集.
  *
  * 用法（在任何调用 apiPostStream 的地方）：
- *   import { attachDiagnostic, renderDiagnosticPanel } from './diagnostic.js';
+ *   import { attachDiagnostic, renderDiagnosticPanel } from '/modules/diagnostic.js';
  *   const diagBox = document.getElementById('shots-diagnostic');
  *   const captor = attachDiagnostic(diagBox);
  *   await apiPostStream(url, body, onChunk, captor.onEvent);
@@ -14,7 +14,7 @@
  * getLast 返回最近一次收到的 diagnostic 对象（没有则 null）.
  */
 
-import { escapeHtml } from './utils.js?v=300';
+import { escapeHtml } from '/modules/utils.js';
 
 const STAGE_LABEL = {
   shot_design: '分镜设计',

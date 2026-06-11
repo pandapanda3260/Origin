@@ -529,8 +529,56 @@ export function listLedger(userId: number, limit = 50, offset = 0) {
   const off = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
   const rows = db
     .prepare<{ uid: number; lim: number; off: number }, any>(
-      `SELECT * FROM credit_ledger WHERE user_id = @uid
-       ORDER BY created_at DESC LIMIT @lim OFFSET @off`,
+      `SELECT l.*,
+              COALESCE(
+                NULLIF(p_video.title, ''),
+                NULLIF(p_batch.title, ''),
+                NULLIF(p_image.title, ''),
+                NULLIF(p_export.title, ''),
+                NULLIF(p_event.title, ''),
+                NULLIF(e.project_title_snapshot, ''),
+                NULLIF(p_ref.title, ''),
+                NULLIF(e.call_item_label, '')
+              ) AS task_name
+         FROM credit_ledger l
+         LEFT JOIN video_tasks vt
+           ON vt.id = l.ref_id AND vt.owner_id = l.user_id
+         LEFT JOIN projects p_video
+           ON p_video.id = vt.project_id AND p_video.owner_id = l.user_id
+         LEFT JOIN batch_tasks bt
+           ON bt.id = l.ref_id
+         LEFT JOIN batches b
+           ON b.id = bt.batch_id AND b.owner_id = l.user_id
+         LEFT JOIN projects p_batch
+           ON p_batch.id = b.project_id AND p_batch.owner_id = l.user_id
+         LEFT JOIN images i
+           ON i.id = l.ref_id AND i.owner_id = l.user_id
+         LEFT JOIN projects p_image
+           ON p_image.id = i.project_id AND p_image.owner_id = l.user_id
+         LEFT JOIN exports x
+           ON x.id = l.ref_id AND x.owner_id = l.user_id
+         LEFT JOIN projects p_export
+           ON p_export.id = x.project_id AND p_export.owner_id = l.user_id
+         LEFT JOIN token_usage_events e
+           ON e.id = (
+             SELECT e2.id
+               FROM token_usage_events e2
+              WHERE e2.owner_id = l.user_id
+                AND (
+                  e2.ledger_id = l.id
+                  OR l.charge_ref_id = ('usage:text:' || e2.id)
+                  OR l.charge_ref_id = ('usage:image:' || e2.id)
+                  OR l.charge_ref_id = ('usage:video:' || e2.id)
+                )
+              ORDER BY e2.created_at DESC
+              LIMIT 1
+           )
+         LEFT JOIN projects p_event
+           ON p_event.id = e.project_id AND p_event.owner_id = l.user_id
+         LEFT JOIN projects p_ref
+           ON p_ref.id = l.ref_id AND p_ref.owner_id = l.user_id
+        WHERE l.user_id = @uid
+        ORDER BY l.created_at DESC LIMIT @lim OFFSET @off`,
     )
     .all({ uid: userId, lim, off });
   return rows.map((r: any) => ({
@@ -539,6 +587,7 @@ export function listLedger(userId: number, limit = 50, offset = 0) {
     kind: r.kind,
     reason: r.reason,
     refId: r.ref_id,
+    taskName: r.task_name || null,
     balanceAfter: r.balance_after,
     createdAt: r.created_at,
   }));

@@ -90,7 +90,25 @@ export async function POST(req: NextRequest) {
       worldContext,
     });
     try {
-      await chatStream(user, scriptMessages, { temperature: 0.8, maxTokens: 3000, modelRole: 'brain' }, (delta) => {
+      await chatStream(user, scriptMessages, {
+        temperature: 0.8,
+        maxTokens: 3000,
+        modelRole: 'brain',
+        traceName: 'script.consult_confirm',
+        tokenContext: {
+          projectId: proj ? projectId || null : null,
+          projectTitleSnapshot: (proj as any)?.title || null,
+          requestPath: req.nextUrl.pathname,
+          routeName: 'script.workflow.consult.confirm',
+          moduleKey: 'script',
+          moduleLabel: '剧本页面',
+          featureKey: 'script_consult_confirm',
+          featureLabel: '对话确认生成剧本',
+          callItemType: 'project',
+          callItemId: proj ? projectId || null : null,
+          callItemLabel: (proj as any)?.title || null,
+        },
+      }, (delta) => {
         scriptText += delta;
         writer.scriptChunk(delta);
       });
@@ -131,7 +149,25 @@ export async function POST(req: NextRequest) {
       const emoJson = await chatCompleteJsonWithRetry<{ emotions: any[] }>(
         user,
         buildRetagMessages(scriptText, durationSec || (proj as any)?.scriptTargetDurationSec),
-        { temperature: 0.4, maxTokens: 1200, modelRole: 'structured' },
+        {
+          temperature: 0.4,
+          maxTokens: 1200,
+          modelRole: 'structured',
+          traceName: 'script.consult_confirm.emotions',
+          tokenContext: {
+            projectId: proj ? projectId || null : null,
+            projectTitleSnapshot: (proj as any)?.title || null,
+            requestPath: req.nextUrl.pathname,
+            routeName: 'script.workflow.consult.confirm',
+            moduleKey: 'script',
+            moduleLabel: '剧本页面',
+            featureKey: 'script_consult_emotions',
+            featureLabel: '对话生成剧本情绪标签',
+            callItemType: 'project',
+            callItemId: proj ? projectId || null : null,
+            callItemLabel: (proj as any)?.title || null,
+          },
+        },
         (raw) => parseJsonLoose<{ emotions: any[] }>(raw),
         'emotions',
       );
