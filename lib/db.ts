@@ -1195,7 +1195,6 @@ function migrateAdminFoundationColumns(db: Database.Database) {
     addColumnIfMissing(db, 'users', 'disabled_at', 'disabled_at TEXT');
     migrateDropLegacyUserAdminColumn(db);
     addColumnIfMissing(db, 'admin_users', 'preview_user_id', 'preview_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL');
-    backfillAdminPreviewUsers(db);
   } catch (e) {
     console.warn('[db] migrateAdminFoundationColumns:', e);
   }
