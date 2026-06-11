@@ -76,7 +76,11 @@ strip_archive_metadata "$RELEASE_DIR"
 
 ARTIFACT="$OUT_DIR/origin-${RELEASE_ID}.tar.gz"
 CHECKSUM="$ARTIFACT.sha256"
-COPYFILE_DISABLE=1 tar -czf "$ARTIFACT" -C "$RELEASE_DIR" .
+TAR_METADATA_ARGS=()
+if tar --no-xattrs -cf /dev/null --files-from /dev/null >/dev/null 2>&1; then
+  TAR_METADATA_ARGS+=(--no-xattrs)
+fi
+COPYFILE_DISABLE=1 tar "${TAR_METADATA_ARGS[@]}" -czf "$ARTIFACT" -C "$RELEASE_DIR" .
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$OUT_DIR" && sha256sum "$(basename "$ARTIFACT")" > "$(basename "$CHECKSUM")")
