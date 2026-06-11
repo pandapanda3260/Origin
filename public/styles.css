@@ -1134,6 +1134,18 @@ body.is-online-editor-page .agent-panel {
   color: #d7fffb;
 }
 
+.oe-subtitle-import-btn {
+  border-color: rgba(148, 163, 184, 0.24);
+  background: rgba(148, 163, 184, 0.1);
+  color: rgba(226, 232, 240, 0.88);
+}
+
+.oe-subtitle-import-btn:hover:not(:disabled) {
+  border-color: rgba(148, 163, 184, 0.42);
+  background: rgba(148, 163, 184, 0.16);
+  color: #ffffff;
+}
+
 .oe-sync-btn:disabled {
   cursor: default;
   opacity: 0.54;

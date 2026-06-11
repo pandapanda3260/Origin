@@ -41,6 +41,7 @@ var _vevDemoInitialAutoSyncKey = '';
 var _lastVevTimelineApplyToastKey = '';
 var _lastVevTimelineApplyToastAt = 0;
 var _syncMaterialsBusyFlag = false;
+var _subtitleImportBusyFlag = false;
 var _hostKeydownBound = false;
 var _keepAlivePingTimer = null;
 var _keepAlivePingCallback = null;
@@ -60,6 +61,8 @@ const OEV_AUTO_VIDEO_SYNC_STORAGE_PREFIX = 'oeVevAutoVideoSync';
 const OEV_MATERIAL_REGISTER_TIMEOUT_MS = 12 * 60 * 1000;
 const OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_MAX_MS = 60 * 60 * 1000;
 const OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_GRACE_MS = 60 * 1000;
+const OEV_MATERIAL_IMPORT_JOB_START_TIMEOUT_MS = 30000;
+const OEV_MATERIAL_IMPORT_JOB_POLL_INTERVAL_MS = 5000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MIN_MS = 30000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_PER_ITEM_MS = 15000;
 const OEV_MATERIAL_IMPORT_ACK_TIMEOUT_MAX_MS = 180000;
@@ -299,6 +302,53 @@ async function _postMaterialImport(body, options) {
       : _materialSyncRequestTimeoutMs(requestBody)
   );
   return await _oeCtx?.apiPost?.('/api/volcengine/import', requestBody, 'POST', { timeoutMs });
+}
+
+function _onlineEditorDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+async function _pollMaterialImportJob(job, options) {
+  options = options || {};
+  let current = job || {};
+  const startedAt = Date.now();
+  const timeoutMs = Number(options.timeoutMs) > 0
+    ? Number(options.timeoutMs)
+    : OEV_MATERIAL_REGISTER_TIMEOUT_MS + OEV_MATERIAL_SYNC_REQUEST_TIMEOUT_GRACE_MS;
+  while (true) {
+    const status = String(current.status || '').trim();
+    if (status === 'completed') {
+      return current.result || { materials: [], total: 0, count: 0 };
+    }
+    if (status === 'failed') {
+      throw new Error(current.error || '素材同步后台任务失败');
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      return { pending: true, job: current };
+    }
+    await _onlineEditorDelay(OEV_MATERIAL_IMPORT_JOB_POLL_INTERVAL_MS);
+    if (!current.jobId) return { pending: true, job: current };
+    current = await _oeCtx?.apiGet?.(
+      `/api/volcengine/import/jobs/${encodeURIComponent(current.jobId)}`,
+      { timeoutMs: OEV_MATERIAL_IMPORT_JOB_START_TIMEOUT_MS },
+    );
+  }
+}
+
+async function _postMaterialImportAsync(body, options) {
+  options = options || {};
+  const requestBody = { ...(body || {}), async: true };
+  if (requestBody.autoRegister !== false && requestBody.registerTimeoutMs == null) {
+    requestBody.registerTimeoutMs = OEV_MATERIAL_REGISTER_TIMEOUT_MS;
+  }
+  const job = await _oeCtx?.apiPost?.('/api/volcengine/import', requestBody, 'POST', {
+    timeoutMs: OEV_MATERIAL_IMPORT_JOB_START_TIMEOUT_MS,
+  });
+  if (!job?.jobId) return job;
+  if (options.waitForCompletion === false) return { pending: true, job };
+  return await _pollMaterialImportJob(job, {
+    timeoutMs: options.timeoutMs || _materialSyncRequestTimeoutMs(requestBody),
+  });
 }
 
 function _applyEnsuredEdlToCurrentProject(payload) {
@@ -2051,7 +2101,7 @@ function _requestVevDemoReexport() {
  * 后端会优先补齐 VOD/EditMaterial binding；bridge 收到 vid:// 后会复用或创建 VevDemo 素材。
  * @param {string[]} resourceIds - 素材 ID 数组
  */
-// 素材是否可送进 VevDemo：浏览器侧可达(签名直链) 或 已有云端源(vid:// / tos:// / directurl:// / editMid) 都算可用。
+// 素材是否可送进 VevDemo：浏览器侧可达(签名直链) 或 已有云端源(vid:// / mid:// / tos:// / directurl:// / editMid) 都算可用。
 // 上传素材注册 VOD 后 browserReachable 仍为 false，但有 vevSource，必须放行，否则时间线拿不到它。
 function _isVevUsableMaterial(item) {
   if (!item) return false;
@@ -2123,12 +2173,18 @@ async function importMaterialsToVevDemo(resourceIds, options) {
     if (!silent) {
       _oeCtx?.showToast?.('首次同步会上传素材并等待转码，可能需要几分钟', 'info');
     }
-    // 调用后端获取素材；缺少 binding 的视频任务会在服务端自动注册到 VOD/VevDemo。
-    const payload = await _postMaterialImport({
+    // 调用后端获取素材；缺少 binding 的视频任务会在服务端后台注册到 VOD/VevDemo。
+    const payload = await _postMaterialImportAsync({
       projectId: _oeCtx?.getProject?.()?.id,
       resourceIds: ids,
       bgmTrackIds,
+    }, {
+      waitForCompletion: options.waitForCompletion !== false,
     });
+    if (payload?.pending) {
+      if (!silent) _oeCtx?.showToast?.('素材同步已在后台继续，稍后回到剪辑页会自动接上', 'info');
+      return { pending: true, job: payload.job || null, payload };
+    }
     const materials = Array.isArray(payload.materials) ? payload.materials : [];
     if (!materials.length) {
       if (!silent) _oeCtx?.showToast?.('没有找到可同步的视频素材', 'warning');
@@ -2145,12 +2201,15 @@ async function importMaterialsToVevDemo(resourceIds, options) {
     }
     _assertVevMaterialsBelongToBoundProject(reachableMaterials, options.source || 'manual-import');
 
-    // 发送到 VevDemo bridge：带 vevEditMid 的素材会直接复用；带 vid:// / tos:// / directurl:// 的素材会尝试注册。
+    // 发送到 VevDemo bridge：带 vevEditMid 的素材会直接复用；带 vid:// / mid:// / tos:// / directurl:// 的素材会尝试注册。
     await _sendMaterialsToVevDemo(reachableMaterials);
 
     const shouldApplyTimeline = options.applyTimeline === true || (!silent && options.applyTimeline !== false);
     if (shouldApplyTimeline) {
-      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials, { silent });
+      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials, {
+        silent,
+        subtitleVevSpace: _resolveSubtitleVevSpace(reachableMaterials),
+      });
     }
 
     console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
@@ -2395,7 +2454,10 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         : [];
       if (materials.length) {
         const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, 'auto-edl-reuse');
-        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials, { silent: true });
+        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials, {
+          silent: true,
+          subtitleVevSpace: _resolveSubtitleVevSpace(scopedMaterials),
+        });
         return null;
       }
       console.warn('[OnlineEditor] 已有自动同步标记但未找到可用 VevDemo binding，重新执行完整同步:', signature);
@@ -2422,7 +2484,10 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         bgmCount: bgmTrackIds.length,
         signature,
       });
-      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials, { silent: true });
+      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials, {
+        silent: true,
+        subtitleVevSpace: _resolveSubtitleVevSpace(result.reachableMaterials),
+      });
     }
     return result;
   })();
@@ -2564,6 +2629,35 @@ function _buildSrtFromVevSubtitleCues(cues) {
     ].join('\n'));
   });
   return blocks.length ? `${blocks.join('\n\n')}\n` : '';
+}
+
+function _resolveSubtitleVevSpace(materials) {
+  const list = Array.isArray(materials) ? materials : [];
+  for (const item of list) {
+    const space = _cleanOnlineEditorText(item?.vevSpace || item?.space);
+    if (space) return space;
+  }
+  return _cleanOnlineEditorText(_vevDemoBoundVevSpace) || 'origin';
+}
+
+function _subtitleImportFailureText(err) {
+  const raw = err?.raw && typeof err.raw === 'object' ? err.raw : {};
+  const code = _cleanOnlineEditorText(err?.code || raw.code);
+  const reason = _cleanOnlineEditorText(err?.reason || raw.reason);
+  let message = _cleanOnlineEditorText(err?.message || raw.error || '未知原因');
+  if (code === 'subtitle_import_timeout') {
+    message = '120 秒内未收到 VevDemo 字幕导入回执';
+  } else if (code === 'upload_result_missing_source') {
+    message = '字幕文件已上传，但 VevDemo 未返回可注册素材源';
+  } else if (code === 'subtitle_readback_failed') {
+    message = '字幕素材注册后未能从 VevDemo 素材库回读';
+  } else if (code === 'create_subtitle_material_failed') {
+    message = 'VevDemo 创建字幕素材失败';
+  } else if (code === 'subtitle_upload_failed') {
+    message = '字幕文件上传失败';
+  }
+  const meta = [code, reason].filter(Boolean).join('/');
+  return meta ? `${message}（${meta}）` : message;
 }
 
 function _buildCurrentVevTimelinePlan(materials) {
@@ -2765,16 +2859,81 @@ async function _importCurrentVevSubtitlesToVevDemo(plan, options) {
       edlVersion,
       filename,
       srtText,
-      vevSpace: _cleanOnlineEditorText(_vevDemoBoundVevSpace) || 'origin',
+      vevSpace: _cleanOnlineEditorText(options.vevSpace) || _resolveSubtitleVevSpace(options.materials),
     });
     console.log('[OnlineEditor] VevDemo 字幕素材导入完成:', result);
     return result;
   } catch (err) {
     console.warn('[OnlineEditor] VevDemo 字幕素材导入未完成:', err);
     if (!options.silent) {
-      _oeCtx?.showToast?.('字幕素材导入失败，视频/BGM 已完成铺轨', 'warning');
+      _oeCtx?.showToast?.(`字幕素材导入失败：${_subtitleImportFailureText(err)}；视频/BGM 已完成铺轨`, 'warning');
     }
     return { error: err };
+  }
+}
+
+async function importCurrentSubtitlesToVevDemo(options) {
+  options = options || {};
+  const silent = options.silent === true;
+  if (!_isVevDemoReady) {
+    if (!silent) _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
+    return null;
+  }
+  if (!_isCurrentVevDemoProjectBindingReady()) {
+    if (!silent) _oeCtx?.showToast?.('VevDemo 项目绑定未确认，暂不能导入字幕', 'warning');
+    return null;
+  }
+
+  try {
+    _setSubtitleImportBusy(true);
+    await _ensureCurrentVideosEdlForVevDemo({ silent, source: options.source || 'manual-subtitle-import' });
+    const ids = _collectCurrentEdlVideoResourceIds();
+    const bgmTrackIds = _collectCurrentBgmTrackIds();
+    if (!ids.length && !bgmTrackIds.length) {
+      if (!silent) _oeCtx?.showToast?.('当前没有可定位字幕时间线的视频素材，请先同步素材', 'warning');
+      return null;
+    }
+
+    const payload = await _postMaterialImport({
+      projectId: _oeCtx?.getProject?.()?.id,
+      resourceIds: ids,
+      bgmTrackIds,
+      autoRegister: false,
+    });
+    const materials = Array.isArray(payload?.materials)
+      ? payload.materials.filter((item) => _isVevUsableMaterial(item))
+      : [];
+    if (!materials.length) {
+      if (!silent) _oeCtx?.showToast?.('还没有可用的剪辑器素材，请先点同步素材，等视频/BGM 完成后再导入字幕', 'warning');
+      return { blocked: true, reason: 'materials_not_ready', payload };
+    }
+
+    const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, options.source || 'manual-subtitle-import');
+    const plan = _buildCurrentVevTimelinePlan(scopedMaterials);
+    if (plan?.ok === false) {
+      if (!silent) _oeCtx?.showToast?.(plan.message || '部分素材还没同步到 VevDemo，暂不能导入字幕', 'warning');
+      return { blocked: true, plan };
+    }
+    if (!plan || !Array.isArray(plan.subtitles) || !plan.subtitles.length) {
+      if (!silent) _oeCtx?.showToast?.('当前项目没有可导入的字幕文本', 'info');
+      return null;
+    }
+
+    const result = await _importCurrentVevSubtitlesToVevDemo(plan, {
+      silent,
+      materials: scopedMaterials,
+      vevSpace: _resolveSubtitleVevSpace(scopedMaterials),
+    });
+    if (result?.ok && !silent) {
+      _oeCtx?.showToast?.('字幕已导入剪辑器素材库', 'success');
+    }
+    return result;
+  } catch (err) {
+    console.warn('[OnlineEditor] 手动字幕导入失败:', err);
+    if (!silent) _oeCtx?.showToast?.(`字幕素材导入失败：${_subtitleImportFailureText(err)}`, 'warning');
+    return { error: err };
+  } finally {
+    _setSubtitleImportBusy(false);
   }
 }
 
@@ -2880,7 +3039,10 @@ async function _applyCurrentEdlTimelineToVevDemo(materials, options) {
       return result;
     }
     if (result?.ok !== false && Array.isArray(plan.subtitles) && plan.subtitles.length > 0) {
-      _importCurrentVevSubtitlesToVevDemo(plan, { silent }).catch((err) => {
+      _importCurrentVevSubtitlesToVevDemo(plan, {
+        silent,
+        vevSpace: options.subtitleVevSpace,
+      }).catch((err) => {
         console.warn('[OnlineEditor] 字幕素材导入后台任务异常:', err);
       });
     }
@@ -3234,18 +3396,35 @@ function _bindPreviewEvents() {
 
 function _setOnlineEditorControlsReady(ready) {
   const syncBtn = document.getElementById('oeBtnSyncMaterials');
-  if (!syncBtn) return;
-  syncBtn.hidden = !ready;
-  syncBtn.disabled = !ready;
+  const subtitleBtn = document.getElementById('oeBtnImportSubtitles');
+  if (syncBtn) {
+    syncBtn.hidden = !ready;
+    syncBtn.disabled = !ready;
+  }
+  if (subtitleBtn) {
+    subtitleBtn.hidden = !ready;
+    subtitleBtn.disabled = !ready;
+  }
   const syncHint = document.getElementById('oeSyncHint');
   if (syncHint) syncHint.hidden = !ready;
   _renderSyncMaterialsButtonLabel(false);
-  syncBtn.onclick = ready
-    ? (event) => {
-        event.preventDefault();
-        importMaterialsToVevDemo();
-      }
-    : null;
+  _renderSubtitleImportButtonLabel(false);
+  if (syncBtn) {
+    syncBtn.onclick = ready
+      ? (event) => {
+          event.preventDefault();
+          importMaterialsToVevDemo();
+        }
+      : null;
+  }
+  if (subtitleBtn) {
+    subtitleBtn.onclick = ready
+      ? (event) => {
+          event.preventDefault();
+          importCurrentSubtitlesToVevDemo();
+        }
+      : null;
+  }
 }
 
 function _setSyncMaterialsBusy(busy) {
@@ -3256,12 +3435,30 @@ function _setSyncMaterialsBusy(busy) {
   _renderSyncMaterialsButtonLabel(busy);
 }
 
+function _setSubtitleImportBusy(busy) {
+  _subtitleImportBusyFlag = !!busy;
+  const subtitleBtn = document.getElementById('oeBtnImportSubtitles');
+  if (!subtitleBtn) return;
+  subtitleBtn.disabled = !!busy;
+  _renderSubtitleImportButtonLabel(busy);
+}
+
 function _renderSyncMaterialsButtonLabel(busy, progressText) {
   const syncBtn = document.getElementById('oeBtnSyncMaterials');
   if (!syncBtn) return;
   const label = busy ? (progressText ? `同步中 ${progressText}` : '同步中') : '同步素材';
   syncBtn.innerHTML = `
     <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">sync</span>
+    <span>${label}</span>
+  `;
+}
+
+function _renderSubtitleImportButtonLabel(busy) {
+  const subtitleBtn = document.getElementById('oeBtnImportSubtitles');
+  if (!subtitleBtn) return;
+  const label = busy ? '导入中' : '导入字幕';
+  subtitleBtn.innerHTML = `
+    <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">closed_caption</span>
     <span>${label}</span>
   `;
 }

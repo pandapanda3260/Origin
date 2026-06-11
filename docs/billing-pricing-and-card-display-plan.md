@@ -49,7 +49,7 @@ checkout 三 provider 全占位（只建 pending 订单 + "[占位]"文案，且
 
 ### 3.1 开关
 
-`lib/billing-config.ts` `isDevAutopayEnabled()`：`BILLING_DEV_AUTOPAY=1` 强开 / `=0` 强关 / 未设置时**非生产默认开**（本地零配置可用；NODE_ENV=production 默认关）。**红线：生产严禁置 1，等于免费送积分。**
+`lib/billing-config.ts` `isDevAutopayEnabled()`：默认关闭；`BILLING_DEV_AUTOPAY=1` 仅允许非生产环境临时打开，`=0` 明确关闭；`NODE_ENV=production` 硬关闭，即使误设 `BILLING_DEV_AUTOPAY=1` 也不会到账。**红线：模拟支付不能在生产免费送积分。**
 
 ### 3.2 统一到账 `lib/billing-fulfill.ts`（新建）
 

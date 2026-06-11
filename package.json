@@ -37,6 +37,7 @@
     "test:cache-busting": "node scripts/test-frontend-cache-busting.mjs",
     "test:online-editor-keepalive": "node scripts/test-online-editor-keepalive.mjs",
     "test:vevdemo-material-sort": "node scripts/test-vevdemo-material-segment-sort.mjs",
+    "test:vevdemo-import-async": "node scripts/test-vevdemo-material-import-async.mjs",
     "test:vev-subtitle-track": "node scripts/test-vev-subtitle-track.mjs",
     "test:vev-canvas-follow": "node scripts/test-vev-canvas-follow.mjs",
     "test:sanitize": "node scripts/test-image-moderation-sanitizer.js",

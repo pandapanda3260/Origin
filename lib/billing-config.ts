@@ -51,14 +51,13 @@ export const TOPUP_PACKS = [
  * 模拟支付开关（2026-06-10 Vasily 拍板方向 B）：
  * 开启时 /api/billing/checkout 视为支付成功，立即统一到账（lib/billing-fulfill.ts），
  * 订阅续费也按"自动扣款成功"惰性重置（lib/credits.ts renewDueSubscription）。
- * 规则：BILLING_DEV_AUTOPAY=1 强开 / =0 强关 / 未设置时非生产环境默认开。
- * 红线：生产环境严禁置 1，等于免费送积分；真支付网关接入后此开关只做触发器替换，到账逻辑复用。
+ * 规则：默认关闭；BILLING_DEV_AUTOPAY=1 仅允许非生产环境临时打开。
+ * 红线：生产环境硬关闭，即使误设 BILLING_DEV_AUTOPAY=1 也不能免费送积分。
  */
 export function isDevAutopayEnabled(): boolean {
+  if (process.env.NODE_ENV === 'production') return false;
   const flag = String(process.env.BILLING_DEV_AUTOPAY || '').trim();
-  if (flag === '1') return true;
-  if (flag === '0') return false;
-  return process.env.NODE_ENV !== 'production';
+  return flag === '1';
 }
 
 export const ADMIN_MANUAL_ADJUST_LIMITS = {

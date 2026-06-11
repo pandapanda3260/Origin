@@ -210,7 +210,7 @@ iframe。VevDemo bridge 收到后会重建编辑器实例并切到对应工程�
 - VevDemo EditMaterial 创建或复用成功。
 
 `uploads` 表中的本地上传文件、需要 Origin cookie 的私有 URL，以及没有 `vid://` /
-`tos://` / `directurl://` 来源的素材，在当前阶段仍然不能自动注册为可拖拽素材。
+`mid://` / `tos://` / `directurl://` 来源的素材，在当前阶段仍然不能自动注册为可拖拽素材。
 
 ### Q: 如何手动注册单个 Origin 视频用于排查
 

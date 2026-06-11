@@ -62,7 +62,9 @@ assert(oeJs.includes("mode: 'fill-if-empty'"), 'applyTimeline 必须发送 fill-
 assert(/RecordType:\s*category === 'image' \|\| fileType\.fileType === 'object' \? 2 : undefined/.test(actionsJs), 'object 上传必须设置 RecordType:2');
 
 // ── 5. 哨兵：缓存入口 ─────────────────────────────────────────
-assert(workspaceHtml.includes('"/modules/online_editor.js": "/modules/online_editor.js?v=25"'), 'workspace import map 应引用 online_editor.js?v=25');
+assert(workspaceHtml.includes('"/modules/online_editor.js": "/modules/online_editor.js?v=26"'), 'workspace import map 应引用 online_editor.js?v=26');
+assert(workspaceHtml.includes('id="oeBtnImportSubtitles"'), 'Origin 顶栏必须提供手动导入字幕入口');
+assert(shellJs.includes("uploadAccept: 'image/*,.mp3,.mp4,.webm,.srt,.vtt,.ass'"), 'VevDemo 本地上传必须允许字幕文件扩展名');
 
 // ── 6. 行为：SRT 序列化 ───────────────────────────────────────
 const oeSandbox = new Function(`
@@ -98,8 +100,12 @@ assert(shellSandbox.countTrackItemsByType(nestedTrack) === 3, '递归 Type 计�
 assert(shellSandbox.countTrackItemsByType(nestedTrack, 'video') === 1, '递归 Type 计数应支持 type 过滤');
 assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { Source: 'tos://bucket/key.srt' } }).vevSource === 'tos://bucket/key.srt', 'Source 应优先作为 vevSource');
 assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { Vid: 'v123' } }).vevSource === 'vid://v123', 'Vid 应转换为 vid://');
-const missing = shellSandbox.extractSupportedSubtitleVevSource({ info: { Mid: 'm1', Oid: 'o1' } });
-assert(!missing.vevSource && missing.mid === 'm1' && missing.oid === 'o1', 'Mid/Oid 不应直接作为可注册 source');
+assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { uploadResult: { Source: 'mid://i123' } } }).vevSource === 'mid://i123', 'uploadResult.Source 应作为 vevSource');
+assert(shellSandbox.extractSupportedSubtitleVevSource({ info: { uploadResult: { Vid: 'v456' } } }).vevSource === 'vid://v456', 'uploadResult.Vid 应转换为 vid://');
+const midSource = shellSandbox.extractSupportedSubtitleVevSource({ info: { uploadResult: { Mid: 'i789', Oid: 'o1' } } });
+assert(midSource.vevSource === 'mid://i789' && midSource.mid === 'i789' && midSource.oid === 'o1', 'uploadResult.Mid 应转换为 mid://');
+const missing = shellSandbox.extractSupportedSubtitleVevSource({ info: { uploadResult: { Oid: 'o1' } } });
+assert(!missing.vevSource && !missing.mid && missing.oid === 'o1', '只有 Oid 时不应伪造可注册 source');
 
 if (failures.length) {
   console.error(`✗ ${failures.length} 处断言失败：`);
@@ -107,4 +113,4 @@ if (failures.length) {
   process.exit(1);
 }
 
-console.log('✓ subtitle material import contract passed（哨兵+行为 共 34 断言）');
+console.log('✓ subtitle material import contract passed');

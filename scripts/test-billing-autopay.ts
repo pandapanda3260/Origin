@@ -42,10 +42,18 @@ assert.deepEqual(
   ],
 );
 
-// —— 开关语义：1 开 / 0 关 / 未设置时非生产默认开 ——
+// —— 开关语义：默认关 / 非生产显式 1 开 / 0 关 / 生产硬关 ——
+process.env.NODE_ENV = 'development';
+delete process.env.BILLING_DEV_AUTOPAY;
+assert.equal(isDevAutopayEnabled(), false);
+process.env.BILLING_DEV_AUTOPAY = '1';
 assert.equal(isDevAutopayEnabled(), true);
 process.env.BILLING_DEV_AUTOPAY = '0';
 assert.equal(isDevAutopayEnabled(), false);
+process.env.NODE_ENV = 'production';
+process.env.BILLING_DEV_AUTOPAY = '1';
+assert.equal(isDevAutopayEnabled(), false);
+process.env.NODE_ENV = 'development';
 process.env.BILLING_DEV_AUTOPAY = '1';
 
 const db = getDb();

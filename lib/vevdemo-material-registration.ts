@@ -230,8 +230,32 @@ function extractMaterials(searchResult: any): any[] {
   if (Array.isArray(result.MaterialInfoList)) return result.MaterialInfoList;
   if (Array.isArray(result.EditMaterialList)) return result.EditMaterialList;
   if (Array.isArray(result.MaterialList)) return result.MaterialList;
+  if (Array.isArray(result.MaterialSet?.MaterialInfos)) return result.MaterialSet.MaterialInfos;
   if (Array.isArray(result)) return result;
   return [];
+}
+
+function readEditMaterialSource(item: any): string {
+  return String(
+    item?.Source ||
+    item?.source ||
+    item?.BasicInfo?.Source ||
+    item?.SourceInfo?.Source ||
+    item?.MaterialInfo?.Source ||
+    '',
+  ).trim();
+}
+
+function readEditMaterialMid(item: any): string {
+  return String(
+    item?.EditMid ||
+    item?.editMid ||
+    item?.MaterialId ||
+    item?.materialId ||
+    item?.Id ||
+    item?.id ||
+    '',
+  ).trim();
 }
 
 async function createOrReuseEditMaterial({
@@ -251,13 +275,13 @@ async function createOrReuseEditMaterial({
 }): Promise<EditMaterialResult> {
   async function findBySource() {
     const search = await postJson(apiBase, '/api/searchEditMaterial', { ProjectId: projectId, Space: space });
-    return extractMaterials(search).find((item) => String(item.Source || '') === vevSource);
+    return extractMaterials(search).find((item) => readEditMaterialSource(item) === vevSource);
   }
 
   const existing = await findBySource();
   if (existing) {
     return {
-      editMid: existing.EditMid || existing.editMid || existing.MaterialId || existing.Id || '',
+      editMid: readEditMaterialMid(existing),
       reused: true,
       raw: existing,
     };
@@ -280,7 +304,7 @@ async function createOrReuseEditMaterial({
   const createdMaterial = await findBySource();
   if (createdMaterial) {
     return {
-      editMid: createdMaterial.EditMid || createdMaterial.editMid || createdMaterial.MaterialId || createdMaterial.Id || '',
+      editMid: readEditMaterialMid(createdMaterial),
       reused: false,
       raw: { create: created, search: createdMaterial },
     };

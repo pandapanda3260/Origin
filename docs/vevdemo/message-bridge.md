@@ -8,8 +8,8 @@ postMessage protocol. Origin therefore uses a minimal local bridge in
 
 This bridge covers editor lifecycle, connectivity checks, browser-side Origin
 material URL probing, and a guarded EditMaterial registration path for materials
-that provide a Volcengine-supported source (`vid://`, `directurl://`, or
-`tos://`). Origin now auto-registers completed `video_task` MP4s into
+that provide a Volcengine-supported source (`vid://`, `mid://`,
+`directurl://`, or `tos://`). Origin now auto-registers completed `video_task` MP4s into
 Volcengine VOD / VevDemo before sending them to the bridge, so the happy path is
 real VevDemo material sync rather than a URL-only probe. Arbitrary Origin signed
 HTTP URLs remain probe-only and cannot be dragged into the VevDemo timeline by
@@ -53,7 +53,7 @@ Origin sends only materials that are marked browser-reachable. Materials with
 | `browserReachable` | Whether VevDemo running in the browser can fetch/probe this URL |
 | `cloudReachable` | Whether Volcengine cloud import can fetch this URL. Currently `false` for local Origin URLs. |
 | `requiresOriginAuth` | Whether the URL requires Origin cookie/session auth |
-| `vevSource` | Optional VevDemo `CreateEditMaterial` source. Must start with `vid://`, `directurl://`, or `tos://`. |
+| `vevSource` | Optional VevDemo `CreateEditMaterial` source. Must start with `vid://`, `mid://`, `directurl://`, or `tos://`. |
 | `vevEditMid` | Existing VevDemo EditMaterial id. When present, the bridge treats the material as already registered and does not call `CreateEditMaterial` again. |
 | `vevRegistrationReady` | Whether Origin believes this material is ready for VevDemo EditMaterial registration. |
 | `vevRegistrationReason` | Machine-readable reason when registration is not ready. |

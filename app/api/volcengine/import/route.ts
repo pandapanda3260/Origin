@@ -18,12 +18,20 @@ import { ensureVevDemoBindingForBgmTrack, ensureVevDemoBindingForUpload, ensureV
 import { getVevDemoProjectBinding } from '@/lib/vevdemo-project-bindings';
 import { dataPath } from '@/lib/runtime-paths';
 import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
+import {
+  buildVevDemoMaterialImportJobKey,
+  getOrStartVevDemoMaterialImportJob,
+  serializeVevDemoMaterialImportJob,
+} from '@/lib/vevdemo-material-import-jobs';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const BGM_DIR = dataPath('bgm');
 const BGM_META_FILE = join(BGM_DIR, '_meta.json');
+
+type RequestLike = Pick<NextRequest, 'url'>;
+type AuthenticatedUser = NonNullable<Awaited<ReturnType<typeof getCurrentUser>>>;
 
 interface MaterialItem {
   id: string;
@@ -38,7 +46,7 @@ interface MaterialItem {
   cloudReachable?: boolean;
   requiresOriginAuth?: boolean;
   /**
-   * Source accepted by VevDemo CreateEditMaterial, e.g. vid://, directurl:// or tos://.
+   * Source accepted by VevDemo CreateEditMaterial, e.g. vid://, mid://, directurl:// or tos://.
    * Origin signed HTTP URLs are intentionally not treated as VevDemo sources.
    */
   vevSource?: string | null;
@@ -95,7 +103,7 @@ function readPositiveNumber(value: unknown, fallback: number): number {
   return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
 }
 
-function videoMaterialBase(req: NextRequest, v: any, userId: number): MaterialItem {
+function videoMaterialBase(req: RequestLike, v: any, userId: number): MaterialItem {
   const signed = buildSignedVideoUrl(v.id, userId);
   const names = buildVideoSegmentNamesForRow(v);
   return {
@@ -114,7 +122,7 @@ function videoMaterialBase(req: NextRequest, v: any, userId: number): MaterialIt
   };
 }
 
-function uploadMaterialBase(req: NextRequest, u: any): MaterialItem {
+function uploadMaterialBase(req: RequestLike, u: any): MaterialItem {
   return {
     id: u.id,
     url: toAbsoluteUrl(req, `/api/volcengine/file/${u.id}`) || `/api/volcengine/file/${u.id}`,
@@ -156,7 +164,7 @@ function readBgmTitle(trackId: string): string {
   }
 }
 
-function bgmMaterialBase(req: NextRequest, trackId: string): MaterialItem {
+function bgmMaterialBase(req: RequestLike, trackId: string): MaterialItem {
   const safeId = assertSafeBgmTrackId(trackId);
   const url = `/api/edit/bgm/${encodeURIComponent(safeId)}`;
   return {
@@ -169,7 +177,7 @@ function bgmMaterialBase(req: NextRequest, trackId: string): MaterialItem {
   };
 }
 
-function toAbsoluteUrl(req: NextRequest, value: string | null | undefined): string | undefined {
+function toAbsoluteUrl(req: RequestLike, value: string | null | undefined): string | undefined {
   const raw = String(value || '').trim();
   if (!raw) return undefined;
   if (/^https?:\/\//i.test(raw)) return raw;
@@ -260,11 +268,7 @@ export async function GET(req: NextRequest) {
   return jsonOk({ materials, total: materials.length });
 }
 
-export async function POST(req: NextRequest) {
-  const user = await getCurrentUser(req);
-  if (!user) return jsonError('unauthorized', 401);
-
-  const body = await req.json().catch(() => ({}));
+async function runVevDemoMaterialImport(req: RequestLike, user: AuthenticatedUser, body: any) {
   const resourceIds: string[] = Array.isArray(body.resourceIds) ? body.resourceIds : [];
   const bgmTrackIds: string[] = Array.isArray(body.bgmTrackIds) ? body.bgmTrackIds : [];
   const originProjectId = String(body.projectId || '').trim();
@@ -280,7 +284,7 @@ export async function POST(req: NextRequest) {
   );
 
   if (resourceIds.length === 0 && bgmTrackIds.length === 0) {
-    return jsonError('resourceIds 和 bgmTrackIds 为空', 400);
+    throw new Error('resourceIds 和 bgmTrackIds 为空');
   }
 
   const db = getDb();
@@ -420,5 +424,41 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  return jsonOk({ materials, total: materials.length, count: materials.length });
+  return { materials, total: materials.length, count: materials.length };
+}
+
+export async function POST(req: NextRequest) {
+  const user = await getCurrentUser(req);
+  if (!user) return jsonError('unauthorized', 401);
+
+  const body = await req.json().catch(() => ({}));
+  const resourceIds: string[] = Array.isArray(body.resourceIds) ? body.resourceIds : [];
+  const bgmTrackIds: string[] = Array.isArray(body.bgmTrackIds) ? body.bgmTrackIds : [];
+  if (resourceIds.length === 0 && bgmTrackIds.length === 0) {
+    return jsonError('resourceIds 和 bgmTrackIds 为空', 400);
+  }
+
+  if (body.async === true || body.background === true) {
+    const originProjectId = String(body.projectId || '').trim();
+    const jobKey = buildVevDemoMaterialImportJobKey({
+      ownerId: user.id,
+      projectId: originProjectId,
+      resourceIds,
+      bgmTrackIds,
+      autoRegister: body.autoRegister,
+      forceRegister: body.forceRegister,
+    });
+    const reqContext: RequestLike = { url: req.url };
+    const { job, reused } = getOrStartVevDemoMaterialImportJob({
+      key: jobKey,
+      ownerId: user.id,
+      resourceCount: resourceIds.length,
+      bgmCount: bgmTrackIds.length,
+      forceNew: body.forceJob === true,
+      run: () => runVevDemoMaterialImport(reqContext, user, body),
+    });
+    return jsonOk({ ...serializeVevDemoMaterialImportJob(job), reused });
+  }
+
+  return jsonOk(await runVevDemoMaterialImport(req, user, body));
 }

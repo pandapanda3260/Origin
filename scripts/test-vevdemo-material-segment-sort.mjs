@@ -42,6 +42,34 @@ assert(
   normalizeBlock && normalizeBlock[0].indexOf('sortMaterialListBySegmentOrder(') < normalizeBlock[0].indexOf('.slice(start'),
   '排序必须发生在 .slice 分页之前',
 );
+assert(
+  normalizeBlock && normalizeBlock[0].includes('params.Offset') && normalizeBlock[0].includes('params.offset'),
+  '从系统导入分页必须兼容火山 SDK 传入的 Offset/offset',
+);
+assert(
+  normalizeBlock && normalizeBlock[0].includes('params.Limit') && normalizeBlock[0].includes('params.limit'),
+  '从系统导入分页必须兼容火山 SDK 传入的 Limit/limit',
+);
+assert(
+  shellJs.includes('const vid = originId ? originVideoSyntheticVid(originId) : realVid;'),
+  '"从系统导入"搜索结果必须始终使用 origin-video-task:<id> 合成 Vid，避免 SDK 直接按真实 Vid 重复创建素材',
+);
+assert(
+  shellJs.includes('function createOrReuseOriginEditMaterial'),
+  'fe/index.js 应包一层 createOrReuseOriginEditMaterial，按 Source 复用已有 edit material',
+);
+assert(
+  /createEditMaterial:\s*createOrReuseOriginEditMaterial/.test(shellJs),
+  'VevDemo actions.createEditMaterial 必须接到 Source 去重包装函数',
+);
+assert(
+  shellJs.includes('function dedupeEditMaterialResultBySource'),
+  '素材库 SearchEditMaterial 结果必须能按 Source 去重，隐藏 SDK 已创建的重复素材',
+);
+assert(
+  shellJs.includes('dedupeEditMaterialResultBySource(scopedResult.result)'),
+  'searchOriginScopedEditMaterial 返回前必须执行 Source 去重',
+);
 
 // ── 2. 行为：提取真实实现跑断言 ─────────────────────────────────
 function extract(name) {
@@ -112,9 +140,61 @@ assert(sandbox.sortMaterialListBySegmentOrder(null) === null, '非数组入参�
 assert(Array.isArray(sandbox.sortMaterialListBySegmentOrder([])), '空数组应原样返回');
 assert(sandbox.segmentOrderKeyForMaterial({}) === null, '无名条目排序键应为 null');
 
+// 2f. 火山 SDK 的分页控件传 Offset + Limit，不传 PageNum；必须能切到第二页
+const pagingSandbox = new Function(`
+  const activeOriginProjectId = 'pid-test';
+  const readSearchKeyword = () => '';
+  const matchesOriginVideoSearch = () => true;
+  const normalizeOriginVideoForSearch = (item) => item;
+  ${reMatch[0]}
+  ${extract('readMaterialDisplayNameForOrder')}
+  ${extract('segmentOrderKeyForMaterial')}
+  ${extract('sortMaterialListBySegmentOrder')}
+  ${extract('readPositivePagingNumber')}
+  ${extract('readNonNegativePagingOffset')}
+  ${extract('normalizeOriginProjectVideoSearchResult')}
+  return { normalizeOriginProjectVideoSearchResult };
+`)();
+
+const videos = Array.from({ length: 13 }, (_, i) => mk(`片段${13 - i}`));
+const firstOffsetPage = pagingSandbox.normalizeOriginProjectVideoSearchResult({ videos }, { Offset: 0, Limit: 2 });
+assert(
+  JSON.stringify(names(firstOffsetPage.VideoSet.VideoInfos)) === JSON.stringify([mk('片段1').Name, mk('片段2').Name]),
+  `Offset=0, Limit=2 应返回第一页，实际：${names(firstOffsetPage.VideoSet.VideoInfos).join(' | ')}`,
+);
+const secondOffsetPage = pagingSandbox.normalizeOriginProjectVideoSearchResult({ videos }, { Offset: 12, Limit: 12 });
+assert(
+  JSON.stringify(names(secondOffsetPage.VideoSet.VideoInfos)) === JSON.stringify([mk('片段13').Name]),
+  `Offset=12, Limit=12 应返回第二页剩余素材，实际：${names(secondOffsetPage.VideoSet.VideoInfos).join(' | ')}`,
+);
+const pageNumFallback = pagingSandbox.normalizeOriginProjectVideoSearchResult({ videos }, { PageNum: 2, PageSize: 2 });
+assert(
+  JSON.stringify(names(pageNumFallback.VideoSet.VideoInfos)) === JSON.stringify([mk('片段3').Name, mk('片段4').Name]),
+  `PageNum/PageSize 兼容路径应继续可用，实际：${names(pageNumFallback.VideoSet.VideoInfos).join(' | ')}`,
+);
+
+// 2g. SDK 重复 CreateEditMaterial 后，同 Source 只展示一次；无 Source 的本地素材不被误删
+const dedupeSandbox = new Function(`
+  ${extract('readFirst')}
+  ${extract('readEditMaterialSource')}
+  ${extract('dedupeMaterialListBySource')}
+  return { dedupeMaterialListBySource };
+`)();
+const deduped = dedupeSandbox.dedupeMaterialListBySource([
+  { Name: '片段1.mp4', Source: 'vid://same' },
+  { Name: '片段1 duplicate.mp4', Source: 'vid://same' },
+  { Name: '片段2.mp4', BasicInfo: { Source: 'vid://second' } },
+  { Name: '本地素材无 Source.mp4' },
+]);
+assert(deduped.changed === true, '重复 Source 应报告 changed=true');
+assert(
+  JSON.stringify(names(deduped.list)) === JSON.stringify(['片段1.mp4', '片段2.mp4', '本地素材无 Source.mp4']),
+  `同 Source 应只保留首个素材，实际：${names(deduped.list).join(' | ')}`,
+);
+
 if (failures.length) {
   console.error(`✗ ${failures.length} 处断言失败：`);
   failures.forEach((f) => console.error(`  - ${f}`));
   process.exit(1);
 }
-console.log('✓ vevdemo 素材片段排序契约测试通过（哨兵 + 行为 共 13 断言）');
+console.log('✓ vevdemo 素材片段排序/分页/导入去重契约测试通过');
