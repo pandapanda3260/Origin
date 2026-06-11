@@ -11,7 +11,10 @@ import { composeFinalImagePrompt } from '../lib/image-gen';
   });
   assert.match(prompt, /ANONYMOUS CROWD/);
   assert.match(prompt, /ONE single continuous image/);
-  assert.match(prompt, /faces must be varied/i);
+  assert.match(prompt, /face shape/i);
+  assert.match(prompt, /jawline/i);
+  assert.match(prompt, /eye shape/i);
+  assert.match(prompt, /repeated face templates/i);
   assert.doesNotMatch(prompt, /SAME PERSON/);
   assert.doesNotMatch(prompt, /FOUR panels/);
 }

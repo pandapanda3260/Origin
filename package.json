@@ -37,7 +37,7 @@
     "test:online-editor-keepalive": "node scripts/test-online-editor-keepalive.mjs",
     "test:vevdemo-material-sort": "node scripts/test-vevdemo-material-segment-sort.mjs",
     "test:vev-subtitle-track": "node scripts/test-vev-subtitle-track.mjs",
-    "test:oe-clear-tracks": "node scripts/test-oe-clear-tracks-contract.mjs",
+    "test:vev-canvas-follow": "node scripts/test-vev-canvas-follow.mjs",
     "test:sanitize": "node scripts/test-image-moderation-sanitizer.js",
     "test:moderation-recovery": "node scripts/test-image-moderation-recovery.js",
     "test:image-provider-routing": "tsx scripts/test-image-provider-routing.ts",

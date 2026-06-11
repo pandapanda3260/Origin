@@ -20,6 +20,7 @@
   --surface-high: #CFD8DC;
   --surface-highest: #CFD8DC;
   --top-announcement-height: 32px;
+  --sidebar-width: 256px;
 }
 
 /* ═══════════════════════════════════════════
@@ -34,8 +35,11 @@
 .batch-workbench-scroll { position: relative; }
 
 .sw-page-loading {
-  position: absolute;
-  inset: 0;
+  position: fixed;
+  top: var(--top-announcement-height);
+  right: 0;
+  bottom: 0;
+  left: var(--sidebar-width);
   z-index: 60;
   display: flex;
   flex-direction: column;
@@ -1210,6 +1214,21 @@ body.is-online-editor-page .agent-panel {
   color: rgba(255, 255, 255, 0.42);
   font-size: 12px;
   line-height: 1.5;
+}
+
+/* 等待态省略号：三个点逐个亮起循环（不依赖 content 动画，老 Safari 也能跑） */
+.oe-editor-empty-state .oe-wait-dots i {
+  font-style: normal;
+  opacity: 0;
+  animation: oe-wait-dot-in 1.4s infinite;
+}
+.oe-editor-empty-state .oe-wait-dots i:nth-child(2) { animation-delay: 0.25s; }
+.oe-editor-empty-state .oe-wait-dots i:nth-child(3) { animation-delay: 0.5s; }
+
+@keyframes oe-wait-dot-in {
+  0% { opacity: 0; }
+  25% { opacity: 1; }
+  100% { opacity: 1; }
 }
 
 @media (max-width: 980px) {
@@ -19139,9 +19158,9 @@ body.first-frame-editor-lock {
    ════════════════════════════════════════════════════════════════ */
 
 /* 宽度三处同步：288px → 256px */
-#sidebar { width: 256px; }
-main.main-area { margin-left: 256px; }
-#pageOnlineEditor:not([hidden]) { left: 256px; }
+#sidebar { width: var(--sidebar-width); }
+main.main-area { margin-left: var(--sidebar-width); }
+#pageOnlineEditor:not([hidden]) { left: var(--sidebar-width); }
 
 /* 侧栏自身上下留白：py-8(32px) → 顶 36 / 底 18（左右 px-6 不动）。
    顶部留 36 给 Logo 上方呼吸空间。 */

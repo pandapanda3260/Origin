@@ -92,8 +92,10 @@ export type VideoGenInput = {
    * 结构化台词列表（**新路径**）。每条 { speaker: '老板', text: '明天翻倍' }。
    * Seedance 适配会把 speaker 当"指定说话人"元信息（用来选音色/口型），
    * text 才是实际念出来的台词——避免把"老板"也当台词读出。
+   * shotIdx（可选，0-based，shots 数组维度）标记台词所属镜头，多镜头
+   * 合并片段靠它把"建议说完窗口"对齐到所属镜头时间轴。
    */
-  dialoguePairs?: Array<{ speaker: string; text: string }>;
+  dialoguePairs?: Array<{ speaker: string; text: string; shotIdx?: number }>;
   /**
    * 项目角色一致性主档 roster（多行字符串）。Seedance 路径会渲染成中文
    * characterLockBlock，包含 visual + performance + voice。
@@ -768,9 +770,9 @@ function resolveVideoNamesForInput(user: UserRow, input: VideoGenInput, taskId: 
     let maxCopyIndex = 0;
     for (const row of rows) {
       const raw = String(row.filename || '').trim();
-      const matched = raw.match(/^片段[0-9]+(?:（([0-9]+)）)?_/u);
+      const matched = raw.match(/^片段[0-9]+(?:(?:（([0-9]+)）)|(?:\(([0-9]+)\)))?/u);
       if (matched) {
-        maxCopyIndex = Math.max(maxCopyIndex, matched[1] ? Number(matched[1]) || 1 : 1);
+        maxCopyIndex = Math.max(maxCopyIndex, matched[1] || matched[2] ? Number(matched[1] || matched[2]) || 1 : 1);
       }
     }
     let copyIndex = Math.max(1, maxCopyIndex + 1, rows.length + 1);
@@ -1037,6 +1039,7 @@ export async function generateVideo(
           durationSec: dur,
           shotPlan: input.shotPlan,
           dialoguePairs: input.dialoguePairs,
+          tailReserveSec: input.tempoBudget?.endingReserveSec,
           characterLockRoster: input.characterLockRoster,
           voiceRoster: input.voiceRoster,
           prevTailSummary: input.prevTailSummary,
@@ -1340,6 +1343,7 @@ export async function generateVideo(
         ratio: aspectRatio,
         durationSec: dur,
         shotPlan: input.shotPlan,
+        tailReserveSec: input.tempoBudget?.endingReserveSec,
       });
       const independentReferenceImages = seedancePrompt.independentReferenceImages;
       const hasIndependentImageRefs = seedancePrompt.hasIndependentImageRefs;
@@ -1609,6 +1613,7 @@ export async function generateVideo(
             ratio: aspectRatio,
             durationSec: dur,
             shotPlan: input.shotPlan,
+            tailReserveSec: input.tempoBudget?.endingReserveSec,
             referenceImages: undefined,
             referenceImageRole: 'first_frame',
           });

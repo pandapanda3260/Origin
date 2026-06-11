@@ -14,7 +14,13 @@ export const TAIL_RUSHED_WARNING_KEY = 'tail_rushed';
 export const TAIL_RUSHED_WARNING_MESSAGE = '片段结尾仓促，请在镜头页增加对应片段的视频时长';
 export const SEGMENT_TEMPO_MAX_DURATION_SEC = 15;
 
-export type SegmentDialoguePair = { speaker: string; text: string };
+export type SegmentDialoguePair = {
+  speaker: string;
+  text: string;
+  /** 台词所属 shot 的 0-based 下标（shots 数组维度）。供视频提示词
+   *  按镜头时间轴分配"建议说完窗口"，多镜头合并片段防止窗口错位。 */
+  shotIdx?: number;
+};
 
 export type SegmentShotPlanItem = VideoPromptShotPlanItem & {
   emotion?: string;
@@ -133,7 +139,7 @@ export function collectSegmentDialoguePairs(shots: any[], groupShotIndices: numb
     if (!shot) continue;
     const raw = String(shot.dialogue || shot.scriptRef || '').trim();
     if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-    pairs.push(...parseDialogue(raw));
+    pairs.push(...parseDialogue(raw).map((pair) => ({ ...pair, shotIdx })));
   }
   return pairs;
 }

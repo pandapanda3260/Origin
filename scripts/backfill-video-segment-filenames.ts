@@ -96,6 +96,15 @@ function displayNameFromFilename(filename: string) {
   return String(filename || '').replace(/\.mp4$/i, '');
 }
 
+function segmentProjectKeyFromFilename(filename: string) {
+  const raw = displayNameFromFilename(String(filename || '').trim());
+  const legacy = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?_第(.+?)集_(.+)$/u);
+  if (legacy) return `${legacy[2]}\t第${legacy[1]}集`;
+  const current = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?(.+)第(.+?)集$/u);
+  if (current) return `${current[1]}\t第${current[2]}集`;
+  return '';
+}
+
 function textHasTaskId(value: unknown, taskId: string) {
   return typeof value === 'string' && taskId && value.includes(taskId);
 }
@@ -231,15 +240,19 @@ async function main() {
        FROM video_tasks vt
        LEFT JOIN projects p ON p.id = vt.project_id AND p.owner_id = vt.owner_id
       WHERE vt.filename IS NOT NULL AND vt.filename <> ''
-        AND vt.project_id IS NOT NULL AND vt.project_id <> ''
         AND vt.group_idx IS NOT NULL
+        AND (
+          (vt.project_id IS NOT NULL AND vt.project_id <> '')
+          OR vt.filename GLOB '片段*_第*集_*.mp4'
+          OR vt.filename GLOB '片段*第*集.mp4'
+        )
       ORDER BY vt.owner_id ASC, vt.project_id ASC, vt.group_idx ASC, vt.created_at ASC, vt.id ASC`,
   ).all() as Row[];
 
   const planned: PlannedChange[] = [];
   const copyCounts = new Map<string, number>();
   for (const row of rows) {
-    const key = `${row.owner_id}\t${row.project_id}\t${row.group_idx}`;
+    const key = `${row.owner_id}\t${row.project_id || row.project_title || segmentProjectKeyFromFilename(row.filename) || 'projectless'}\t${row.group_idx}`;
     const copyIndex = (copyCounts.get(key) || 0) + 1;
     copyCounts.set(key, copyIndex);
     const names = buildVideoSegmentNamesForRow(row, undefined, {

@@ -20,7 +20,7 @@ const names = buildVideoSegmentNames({
 });
 assert.equal(
   names.displayName,
-  '片段1_第1集_第一章混沌圣地 收徒',
+  '片段1第一章混沌圣地 收徒第1集',
 );
 assert.equal(names.filename, `${names.displayName}.mp4`);
 assert.equal(names.downloadFilename, names.filename);
@@ -33,7 +33,7 @@ const copyNames = buildVideoSegmentNames({
 });
 assert.equal(
   copyNames.displayName,
-  '片段1（2）_第1集_第一章混沌圣地 收徒',
+  '片段1（2）第一章混沌圣地 收徒第1集',
 );
 assert.equal(copyNames.filename, `${copyNames.displayName}.mp4`);
 
@@ -48,16 +48,24 @@ const rowNames = buildVideoSegmentNamesForRow({
     episodes: [{ title: '第1集' }, { title: '第2集' }, { title: '第三章' }],
   }),
 });
-assert.equal(rowNames.displayName, '片段12_第3集_项目名');
+assert.equal(rowNames.displayName, '片段12项目名第3集');
 
 const storedNames = buildVideoSegmentNamesForRow({
   id: 'task-id',
   project_id: 'proj_2',
   group_idx: 11,
-  filename: '片段12（3）_第3集_项目名.mp4',
+  filename: '片段12（3）项目名第3集.mp4',
   project_title: '项目名',
 });
-assert.equal(storedNames.filename, '片段12（3）_第3集_项目名.mp4');
+assert.equal(storedNames.filename, '片段12（3）项目名第3集.mp4');
+
+const orphanLegacyNames = buildVideoSegmentNamesForRow({
+  id: 'orphan-task',
+  project_id: '',
+  group_idx: 4,
+  filename: '片段5_第1集_新项目.mp4',
+}, undefined, { preferStoredFilename: false });
+assert.equal(orphanLegacyNames.filename, '片段5新项目第1集.mp4');
 
 const fallback = buildVideoSegmentNames({ taskId: 'plain-task' });
 assert.equal(fallback.filename, 'plain-task.mp4');

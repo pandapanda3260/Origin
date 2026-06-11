@@ -250,6 +250,50 @@ function testVideoPromptAuditUsesProjectedRoster() {
   assert.ok(!/餐巾|筷子/.test(serialized), serialized);
 }
 
+function testVideoPromptAuditKeepsDialogueShotIdx() {
+  const user = {
+    id: 1,
+    username: 'tester',
+    email: null,
+    phone: null,
+    display_name: 'tester',
+    password_hash: '',
+    email_verified: 1,
+    disabled_at: null,
+    token_revoked_at: null,
+    created_at: '2026-06-11T00:00:00.000Z',
+    updated_at: '2026-06-11T00:00:00.000Z',
+  };
+  const project = {
+    id: 'proj-audit-dialogue-shotidx',
+    title: '多镜头台词审计',
+    styleBible: {},
+    assets: {},
+    shots: [
+      {
+        visual: '大殿全景，众人沉默',
+        duration: 3,
+        dialogue: '',
+      },
+      {
+        visual: '切到接引长老近景',
+        duration: 4,
+        dialogue: '接引长老：此子并无惊人体质。',
+      },
+    ],
+    storyboards: [{
+      shotIndices: [0, 1],
+      videoPrompt: '大殿全景，随后切长老近景。',
+    }],
+  };
+  const audit = buildVideoPromptAudit(user, project, 0, { ratio: '9:16' });
+  assert.deepEqual(
+    audit.videoSubmission.dialoguePairs,
+    [{ speaker: '接引长老', text: '此子并无惊人体质。', shotIdx: 1 }],
+    'audit dialoguePairs must preserve owning shotIdx for multi-shot prompt windows',
+  );
+}
+
 function testSnapshotFirstWorldExportUsesRuntimeOverlay() {
   const project = {
     id: 'proj-snapshot-export',
@@ -365,6 +409,7 @@ testAmbiguousAliasDoesNotPickArbitraryAsset();
 testResolverReadsBothCharacterShapes();
 testBuildCharacterLockRosterUsesProjectedLock();
 testVideoPromptAuditUsesProjectedRoster();
+testVideoPromptAuditKeepsDialogueShotIdx();
 testSnapshotFirstWorldExportUsesRuntimeOverlay();
 testProjectWorldExportUsesAssetsCharactersWhenTopMissing();
 

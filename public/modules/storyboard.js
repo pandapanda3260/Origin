@@ -1423,6 +1423,39 @@ function _clearFailedTailFrameLocally(groupIdx, errMsg, extra, projectId) {
   return applied;
 }
 
+function _applyDeletedTailFrameLocally(groupIdx, payload, projectId) {
+  if (typeof groupIdx !== 'number' || !project) return false;
+  if (!projectId || project.id !== projectId) return false;
+  if (!Array.isArray(project.storyboards)) project.storyboards = [];
+
+  var prev = project.storyboards[groupIdx] || {};
+  var next = Object.assign({}, prev);
+  var frames = next.frames && typeof next.frames === 'object' ? Object.assign({}, next.frames) : {};
+  delete frames.tail;
+  next.frames = frames;
+  next.tailFrameUrl = '';
+  next.tailFramePrompt = '';
+  next.tailFrameIntent = 'none';
+  next.tailFrameIntentUpdatedAt = (payload && payload.tailFrameIntentUpdatedAt) || new Date().toISOString();
+  next.tailFrameSourceHash = null;
+  next.tailFrameReferenceStatus = 'missing';
+  next.tailFrameLastError = '';
+  delete next.tailFrameFailedAt;
+  delete next.tailFrameSafetyAudit;
+  delete next.tailFrameErrorCode;
+  delete next.tailFrameRecoveryHint;
+  project.storyboards[groupIdx] = next;
+
+  if (project._staleFlags && typeof project._staleFlags === 'object') {
+    delete project._staleFlags['tail_frame_' + groupIdx];
+  }
+  var serverVersion = Number(payload && payload.serverVersion);
+  if (Number.isFinite(serverVersion) && serverVersion > (Number(project.version) || 0)) {
+    project.version = serverVersion;
+  }
+  return true;
+}
+
 function _imageSafetyAuditFromExtra(extra) {
   extra = extra || {};
   return extra.imageSafetyAudit ||
@@ -9208,30 +9241,31 @@ export async function handleImageAction(e) {
     // 删后顶部 "重新生成全部" / 批量重试等都不会再带上此组的尾帧。
     // 如果用户只是想"重做一张"，应该使用 regen-tail；delete-tail 表达的是
     // "这一段不再需要尾帧"。
-    if (!project.storyboards) project.storyboards = [];
-    var delSb = project.storyboards[gIdx] || {};
-    if (delSb.frames && typeof delSb.frames === 'object') {
-      var nextFrames = Object.assign({}, delSb.frames);
-      delete nextFrames.tail;
-      delSb.frames = nextFrames;
+    if (!project.id) return;
+    var deleteOriginId = project.id;
+    try {
+      var deleteResp = await apiPost('/api/frames/delete', {
+        projectId: deleteOriginId,
+        groupIdx: gIdx,
+        frameType: 'tail_frame',
+      });
+      var deleteReloaded = await _reloadProjectFromServerForStoryboard(deleteOriginId);
+      if (!deleteReloaded) {
+        if (_applyDeletedTailFrameLocally(gIdx, deleteResp, deleteOriginId)) {
+          renderImageGrid();
+          checkImagesConfirm();
+          showToast('已删除尾帧并清除意图', 'info');
+          return;
+        }
+        showToast('已删除，请刷新页面查看', 'warn');
+        return;
+      }
+      renderImageGrid();
+      checkImagesConfirm();
+      showToast('已删除尾帧并清除意图', 'info');
+    } catch (err) {
+      showToast('删除尾帧失败: ' + _diagnoseApiError(((err && err.message) || err).toString()), 'error');
     }
-    delSb.tailFrameUrl = '';
-    delSb.tailFramePrompt = '';
-    delSb.tailFrameIntent = 'none';
-    delSb.tailFrameIntentUpdatedAt = new Date().toISOString();
-    delSb.tailFrameSourceHash = null;
-    delSb.tailFrameReferenceStatus = 'missing';
-    delSb.tailFrameLastError = '';
-    // 失败元数据一并清掉, 避免残留触发安全提示/失败态展示。
-    delete delSb.tailFrameFailedAt;
-    delete delSb.tailFrameSafetyAudit;
-    delete delSb.tailFrameErrorCode;
-    delete delSb.tailFrameRecoveryHint;
-    project.storyboards[gIdx] = delSb;
-    saveProject();
-    renderImageGrid();
-    checkImagesConfirm();
-    showToast('已删除尾帧并清除意图', 'info');
   } else if (action === "upload-tail") {
     _pickAndUploadTailFrame(gIdx);
   } else if (action === "upload-first") {

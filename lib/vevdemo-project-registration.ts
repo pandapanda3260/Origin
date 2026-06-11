@@ -11,7 +11,30 @@ type ProjectRow = {
   id: string;
   owner_id: number;
   title: string;
+  data_json?: string | null;
 };
+
+/**
+ * 画布尺寸跟随项目画面比例（与 edit.js _resolveCurrentExportFormat / 一键成片同口径）：
+ * styleOptions.aspectRatio → styleBible.aspectRatio → videoAspectRatio → 默认 9:16。
+ */
+export function resolveCanvasSizeForProjectData(dataJson: string | null | undefined): { width: number; height: number } {
+  let data: any = null;
+  try { data = dataJson ? JSON.parse(dataJson) : null; } catch { data = null; }
+  const candidates = [
+    data?.styleOptions?.aspectRatio,
+    data?.styleBible?.aspectRatio,
+    data?.videoAspectRatio,
+  ];
+  let ratio = '9:16';
+  for (const candidate of candidates) {
+    const r = String(candidate || '').trim();
+    if (/^(16:9|9:16|1:1|21:9|4:3|3:4)$/.test(r)) { ratio = r; break; }
+  }
+  if (ratio === '16:9' || ratio === '4:3' || ratio === '21:9') return { width: 1920, height: 1080 };
+  if (ratio === '1:1') return { width: 1024, height: 1024 };
+  return { width: 1080, height: 1920 };
+}
 
 const projectLocks = new Map<string, Promise<VevDemoProjectBinding>>();
 
@@ -44,7 +67,7 @@ function sanitizeProjectName(title: string, originProjectId: string) {
   return `${base}-${suffix}`;
 }
 
-function buildInitialEditParam(projectName: string, space: string) {
+function buildInitialEditParam(projectName: string, space: string, canvas?: { width: number; height: number }) {
   const now = Date.now();
   return {
     Project: {
@@ -76,8 +99,8 @@ function buildInitialEditParam(projectName: string, space: string) {
       },
     },
     Canvas: {
-      Width: 1080,
-      Height: 1920,
+      Width: canvas?.width || 1080,
+      Height: canvas?.height || 1920,
       BackgroundColor: '#000000FF',
     },
   };
@@ -115,7 +138,7 @@ async function signedVodRequest(action: string, body: Record<string, unknown>) {
 function getOriginProject(projectId: string, ownerId: number): ProjectRow {
   const row = getDb()
     .prepare<{ id: string; owner_id: number }, ProjectRow>(
-      'SELECT id, owner_id, title FROM projects WHERE id = @id AND owner_id = @owner_id',
+      'SELECT id, owner_id, title, data_json FROM projects WHERE id = @id AND owner_id = @owner_id',
     )
     .get({ id: projectId, owner_id: ownerId });
   if (!row) throw new Error(`Origin project not found or not owned by user: ${projectId}`);
@@ -129,7 +152,7 @@ async function createVevDemoProjectForOrigin(project: ProjectRow): Promise<VevDe
     ProjectName: projectName,
     Space: space,
     ProjectType: 'track',
-    EditParam: buildInitialEditParam(projectName, space),
+    EditParam: buildInitialEditParam(projectName, space, resolveCanvasSizeForProjectData(project.data_json)),
   });
   const error = apiError(data);
   if (error) {

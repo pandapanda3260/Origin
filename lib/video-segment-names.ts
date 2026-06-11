@@ -75,7 +75,26 @@ function normalizeCopyIndex(value: unknown): number {
 
 function looksLikeCurrentSegmentFilename(value: unknown): boolean {
   const raw = rawCleanText(value);
-  return /^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?_第.+集_.+\.mp4$/u.test(raw);
+  return /^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?.+第.+集\.mp4$/u.test(raw);
+}
+
+function parseSegmentFilenameParts(value: unknown): { projectTitle: string; episodeTitle: string } | null {
+  const raw = stripMp4Ext(rawCleanText(value));
+  const legacy = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?_第(.+?)集_(.+)$/u);
+  if (legacy) {
+    return {
+      episodeTitle: `第${legacy[1]}集`,
+      projectTitle: legacy[2],
+    };
+  }
+  const current = raw.match(/^片段[0-9]+(?:(?:（[0-9]+）)|(?:\([0-9]+\)))?(.+)第(.+?)集$/u);
+  if (current) {
+    return {
+      projectTitle: current[1],
+      episodeTitle: `第${current[2]}集`,
+    };
+  }
+  return null;
 }
 
 export function buildVideoSegmentEpisodeLabel(input: Pick<VideoSegmentNameInput, 'episodeIndex' | 'episodeTitle'>): string {
@@ -104,10 +123,16 @@ export function projectFromVideoSegmentDbRow(row: any) {
   } catch {
     data = {};
   }
+  const parsedName = parseSegmentFilenameParts(row?.filename);
+  const parsedEpisodes = parsedName?.episodeTitle
+    ? [{ title: parsedName.episodeTitle }]
+    : undefined;
   return {
     ...data,
-    id: row?.project_id || row?.projectId,
-    title: row?.project_title || row?.projectTitle || data?.title,
+    id: row?.project_id || row?.projectId || parsedName?.projectTitle,
+    title: row?.project_title || row?.projectTitle || data?.title || parsedName?.projectTitle,
+    currentEpisodeIdx: data?.currentEpisodeIdx ?? (parsedEpisodes ? 0 : undefined),
+    episodes: Array.isArray(data?.episodes) ? data.episodes : parsedEpisodes,
   };
 }
 
@@ -120,11 +145,7 @@ export function buildVideoSegmentNames(input: VideoSegmentNameInput): VideoSegme
     const episodeLabel = cleanFilenamePart(buildVideoSegmentEpisodeLabel(input), '第1集', 24);
     const copyIndex = normalizeCopyIndex(input.copyIndex);
     const copySuffix = copyIndex > 1 ? `（${copyIndex}）` : '';
-    const displayName = [
-      `片段${groupIdx + 1}${copySuffix}`,
-      episodeLabel,
-      projectName,
-    ].join('_');
+    const displayName = `片段${groupIdx + 1}${copySuffix}${projectName}${episodeLabel}`;
     const filename = `${displayName}.mp4`;
     return { displayName, filename, downloadFilename: filename };
   }

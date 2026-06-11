@@ -41,7 +41,6 @@ var _vevDemoInitialAutoSyncKey = '';
 var _lastVevTimelineApplyToastKey = '';
 var _lastVevTimelineApplyToastAt = 0;
 var _syncMaterialsBusyFlag = false;
-var _clearTracksBusyFlag = false;
 var _hostKeydownBound = false;
 var _keepAlivePingTimer = null;
 var _keepAlivePingCallback = null;
@@ -152,9 +151,7 @@ function _rebuildKeptAliveFrame() {
   _clearKeepAlivePing();
   _destroyVevDemoFrame();
   mountOnlineEditor();
-}
-
-function _cleanOnlineEditorText(value) {
+}function _cleanOnlineEditorText(value) {
   return String(value == null ? '' : value).trim();
 }
 
@@ -1254,8 +1251,6 @@ function _destroyVevDemoFrame() {
   _connectStarted = false;
   _hasVevDemoMessage = false;
   _vevDemoInitialAutoSyncKey = '';
-  _clearTracksBusyFlag = false; // iframe 都没了，清空轨道的在途回执不可能再来
-  _messageHandlers.delete('vevdemo:tracksCleared');
   if (_messageListenerBound) {
     window.removeEventListener('message', _handleVevMessage);
     _messageListenerBound = false;
@@ -2046,10 +2041,6 @@ function _assertVevMaterialsBelongToBoundProject(materials, source) {
 async function importMaterialsToVevDemo(resourceIds, options) {
   options = options || {};
   const silent = options.silent === true;
-  if (_clearTracksBusyFlag) {
-    if (!silent) _oeCtx?.showToast?.('正在清空轨道，请稍候再同步', 'warning');
-    return null;
-  }
   if (!_isVevDemoReady) {
     if (!silent) _oeCtx?.showToast?.('VevDemo 未就绪', 'warning');
     return null;
@@ -2106,15 +2097,7 @@ async function importMaterialsToVevDemo(resourceIds, options) {
 
     const shouldApplyTimeline = options.applyTimeline === true || (!silent && options.applyTimeline !== false);
     if (shouldApplyTimeline) {
-      // 手动同步（非 silent）：只在轨道为空时自动铺设，已有内容绝不覆盖用户手工编排；
-      // 铺设走"先销毁编辑器→写 Track→重建"流程，时间线 UI 立即生效（2026-06-11 需求）。
-      const applyOptions = silent ? undefined : { onlyIfTracksEmpty: true, recreateEditor: true };
-      const applied = await _applyCurrentEdlTimelineToVevDemo(reachableMaterials, applyOptions);
-      if (!silent && applied && applied.skipped === 'tracks_not_empty') {
-        _oeCtx?.showToast?.('素材已同步；轨道已有内容未改动（想重新铺设可先点「清空轨道」）', 'info');
-      } else if (!silent && applied && applied.ok && !applied.error && !applied.blocked) {
-        _oeCtx?.showToast?.('素材已同步，轨道已按当前剪辑方案自动铺设', 'success');
-      }
+      await _applyCurrentEdlTimelineToVevDemo(reachableMaterials);
     }
 
     console.log('[OnlineEditor] 同步素材到 VevDemo:', reachableMaterials.length);
@@ -2358,8 +2341,7 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         : [];
       if (materials.length) {
         const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, 'auto-edl-reuse');
-        // 自动路径尊重"用户清空过轨道"标记：清空后不许悄悄铺回（手动同步才铺）。
-        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials, { respectClearedMarker: true });
+        await _applyCurrentEdlTimelineToVevDemo(scopedMaterials);
         return null;
       }
       console.warn('[OnlineEditor] 已有自动同步标记但未找到可用 VevDemo binding，重新执行完整同步:', signature);
@@ -2386,8 +2368,7 @@ async function _autoSyncCurrentEdlVideosToVevDemo() {
         bgmCount: bgmTrackIds.length,
         signature,
       });
-      // 自动路径尊重"用户清空过轨道"标记（同上）。
-      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials, { respectClearedMarker: true });
+      await _applyCurrentEdlTimelineToVevDemo(result.reachableMaterials);
     }
     return result;
   })();
@@ -2425,6 +2406,24 @@ function _resolveEdlEntryVideoTaskId(entry) {
     extract(entry._originVideoUrl) ||
     (Number.isInteger(Number(entry.groupIdx)) ? _currentVideoTaskIdForGroup(Number(entry.groupIdx)) : '')
   );
+}
+
+// 画布尺寸跟随项目画面比例（与 edit.js _resolveCurrentExportFormat / 一键成片同口径；
+// 模块自持小函数不进 utils，防缓存级联）。
+function _resolveVevCanvasForProject(project) {
+  const candidates = [
+    project?.styleOptions?.aspectRatio,
+    project?.styleBible?.aspectRatio,
+    project?.videoAspectRatio,
+  ];
+  let ratio = '9:16';
+  for (const candidate of candidates) {
+    const r = String(candidate || '').trim();
+    if (/^(16:9|9:16|1:1|21:9|4:3|3:4)$/.test(r)) { ratio = r; break; }
+  }
+  if (ratio === '16:9' || ratio === '4:3' || ratio === '21:9') return { width: 1920, height: 1080, ratio: '16:9' };
+  if (ratio === '1:1') return { width: 1024, height: 1024, ratio: '1:1' };
+  return { width: 1080, height: 1920, ratio: '9:16' };
 }
 
 // ── 字幕 cue 构建（与一键成片 lib/edit-export.ts buildSrt 同一套规则） ──
@@ -2559,6 +2558,7 @@ function _buildCurrentVevTimelinePlan(materials) {
     totalDurationSec: cursorSec,
     video: entries,
     subtitles: _buildVevSubtitleCues(project, entries),
+    canvas: _resolveVevCanvasForProject(project),
     bgm: bgmTrackId && bgmSource ? {
       resourceId: bgmTrackId,
       source: bgmSource,
@@ -2569,7 +2569,7 @@ function _buildCurrentVevTimelinePlan(materials) {
   };
 }
 
-function _sendTimelinePlanToVevDemo(plan, options) {
+function _sendTimelinePlanToVevDemo(plan) {
   return new Promise((resolve, reject) => {
     if (!_isVevDemoReady) {
       const error = new Error('VevDemo 未就绪');
@@ -2602,7 +2602,7 @@ function _sendTimelinePlanToVevDemo(plan, options) {
       resolve(data);
     });
 
-    const sent = _sendToVevDemo('origin:applyTimeline', { plan, options: options || {} });
+    const sent = _sendToVevDemo('origin:applyTimeline', { plan });
     if (!sent) {
       clearTimeout(timeout);
       _messageHandlers.delete('vevdemo:timelineApplied');
@@ -2693,7 +2693,7 @@ function _showVevTimelineApplyToast(meta) {
   _oeCtx?.showToast?.(message, type);
 }
 
-async function _applyCurrentEdlTimelineToVevDemo(materials, options) {
+async function _applyCurrentEdlTimelineToVevDemo(materials) {
   const plan = _buildCurrentVevTimelinePlan(materials);
   if (plan?.ok === false) {
     console.warn('[OnlineEditor] VevDemo 时间线铺轨已拦截:', plan);
@@ -2705,17 +2705,7 @@ async function _applyCurrentEdlTimelineToVevDemo(materials, options) {
     return null;
   }
   try {
-    const result = await _sendTimelinePlanToVevDemo(plan, options);
-    if (result && result.skipped === 'tracks_not_empty') {
-      // 手动同步的保护分支：轨道已有内容，不动用户的手工编排。
-      console.log('[OnlineEditor] VevDemo 轨道非空，跳过自动铺设:', result.existingTrackItemCount);
-      return result;
-    }
-    if (result && result.skipped === 'tracks_cleared_by_user') {
-      // 用户清空过轨道：自动铺设静默跳过，等用户手动点「同步素材」。
-      console.log('[OnlineEditor] 用户已清空轨道，自动铺设已跳过:', result.tracksClearedAt || '');
-      return result;
-    }
+    const result = await _sendTimelinePlanToVevDemo(plan);
     console.log('[OnlineEditor] VevDemo 时间线铺轨完成:', result);
     if (result && result.subtitleCount > 0 && result.subtitleApplied === false) {
       // 字幕轨降级是软提示不拦流程；详细错误在壳层 console（subtitleError）
@@ -3086,108 +3076,6 @@ function _setOnlineEditorControlsReady(ready) {
         importMaterialsToVevDemo();
       }
     : null;
-  const clearBtn = document.getElementById('oeBtnClearTracks');
-  if (clearBtn) {
-    clearBtn.hidden = !ready;
-    clearBtn.disabled = !ready;
-    _renderClearTracksButtonLabel(false);
-    clearBtn.onclick = ready
-      ? (event) => {
-          event.preventDefault();
-          _handleClearTracksClick();
-        }
-      : null;
-  }
-}
-
-// ── 清空轨道（2026-06-11 需求：同步素材右侧新按钮）────────────────────
-// 点击清掉 VevDemo 工程里所有轨道内容（素材库不动）。之后再点「同步素材」，
-// 空轨道会按当前剪辑方案自动重新铺设（与首次进入剪辑器同款流程）。
-function _handleClearTracksClick() {
-  if (_clearTracksBusyFlag) return;
-  if (_syncMaterialsBusyFlag) {
-    _oeCtx?.showToast?.('正在同步素材，请稍候再清空轨道', 'warning');
-    return;
-  }
-  if (!_isVevDemoReady || !_isCurrentVevDemoProjectBindingReady()) {
-    _oeCtx?.showToast?.('VevDemo 未就绪，暂不能清空轨道', 'warning');
-    return;
-  }
-  const doClear = () => { _clearVevDemoTracks(); };
-  if (typeof _oeCtx?.showConfirm === 'function') {
-    _oeCtx.showConfirm(
-      '清空轨道',
-      '确定清空剪辑器里所有轨道内容？\n素材库不受影响；之后点「同步素材」可按当前剪辑方案重新自动铺设。',
-      doClear
-    );
-  } else {
-    doClear();
-  }
-}
-
-function _clearVevDemoTracks() {
-  if (_clearTracksBusyFlag) return Promise.resolve(null);
-  _setClearTracksBusy(true);
-  return new Promise((resolve) => {
-    // 桥侧流程 = 销毁编辑器 → 写空 Track → 重建编辑器；30s 给足重建时间。
-    const timeout = setTimeout(() => {
-      _messageHandlers.delete('vevdemo:tracksCleared');
-      _setClearTracksBusy(false);
-      _oeCtx?.showToast?.('清空轨道超时，未收到剪辑器回执，请刷新后重试', 'error');
-      resolve(null);
-    }, 30000);
-
-    _messageHandlers.set('vevdemo:tracksCleared', (data) => {
-      clearTimeout(timeout);
-      _messageHandlers.delete('vevdemo:tracksCleared');
-      _setClearTracksBusy(false);
-      if (data?.ok === false) {
-        console.error('[OnlineEditor] 清空轨道失败:', data);
-        _oeCtx?.showToast?.('清空轨道失败: ' + (data?.error || '未知错误'), 'error');
-        resolve(data);
-        return;
-      }
-      // 清空成功 = 用户明确要空轨道。编辑器重建会再触发一次 ready，若本会话
-      // 首次自动同步之前失败过，会借机重试并把轨道铺回去（2026-06-11 实锤）。
-      // 这里把"首次自动同步"标记为已消费，铺设只听用户手动点「同步素材」。
-      // 跨会话（刷新页面）由 EditParam.OriginTracksClearedAt 标记兜底。
-      _vevDemoInitialAutoSyncKey = `${_vevDemoBoundOriginProjectId}:${_vevDemoBoundVevProjectId}`;
-      const cleared = Number(data?.clearedItemCount) || 0;
-      _oeCtx?.showToast?.(
-        cleared > 0
-          ? `已清空轨道（${cleared} 个片段）；点「同步素材」可重新自动铺设`
-          : '轨道本来就是空的；点「同步素材」可自动铺设',
-        'success'
-      );
-      resolve(data);
-    });
-
-    const sent = _sendToVevDemo('origin:clearTracks', {});
-    if (!sent) {
-      clearTimeout(timeout);
-      _messageHandlers.delete('vevdemo:tracksCleared');
-      _setClearTracksBusy(false);
-      _oeCtx?.showToast?.('清空轨道消息发送失败，请检查连接后重试', 'error');
-      resolve(null);
-    }
-  });
-}
-
-function _setClearTracksBusy(busy) {
-  _clearTracksBusyFlag = !!busy;
-  const clearBtn = document.getElementById('oeBtnClearTracks');
-  if (!clearBtn) return;
-  clearBtn.disabled = !!busy;
-  _renderClearTracksButtonLabel(busy);
-}
-
-function _renderClearTracksButtonLabel(busy) {
-  const clearBtn = document.getElementById('oeBtnClearTracks');
-  if (!clearBtn) return;
-  clearBtn.innerHTML = `
-    <span class="material-symbols-outlined ${busy ? 'animate-spin' : ''}">${busy ? 'progress_activity' : 'layers_clear'}</span>
-    <span>${busy ? '清空中' : '清空轨道'}</span>
-  `;
 }
 
 function _setSyncMaterialsBusy(busy) {

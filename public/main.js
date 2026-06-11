@@ -20,7 +20,7 @@ import { EPISODE_FIELDS } from './modules/episode_fields.js?v=102';
 import { initEpisodes, syncEpisodesProject,
   _ensureEpisodes, _saveCurrentEpisode, _loadEpisode, _switchEpisode,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
-  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=108';
+  _renderEpisodeTabs, _openNewEpisodeDialog } from './modules/episodes.js?v=110';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
@@ -41,7 +41,7 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   updateStoryboardCard, checkImagesConfirm, generateStoryboardSheet,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
-  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=154';
+  reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from './modules/storyboard.js?v=156';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -62,13 +62,13 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _isStale, _clearStale, _applyServerStaleFlagsToProject,
   _primeWorldTemplates, _getWorldTemplates, _applyWorldTemplateReferenceFromStylePage,
   _primeStyleTemplates, _getStyleTemplates, _styleTemplatesLoaded, _applyStyleTemplateFromStylePage,
-  _openLightbox } from './modules/assets.js?v=170';
+  _openLightbox } from './modules/assets.js?v=172';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from './modules/toolbox.js?v=202';
-import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=212';
+import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from './modules/character_custom.js?v=214';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from './modules/billing.js?v=114';
 import { mountPixelCard } from './modules/pixel_card.js?v=300';
 import { createSwLoading } from '/modules/loading.js?v=300';
-import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=17';
+import { initOnlineEditor, mountOnlineEditor, onOnlineEditorPageEnter, destroyOnlineEditor, syncOnlineEditorProject, syncOnlineEditorProjectTitle } from './modules/online_editor.js?v=24';
 
 // Aliases so existing code using underscore-prefixed names keeps working
 var _getAuthToken = getAuthToken;
@@ -8178,7 +8178,6 @@ var _scriptEditInitialText = "";
     initOnlineEditor({
       switchPage: (p) => switchPage(p),
       showToast: (msg, type) => showToast(msg, type || "info"),
-      showConfirm: (title, message, onOk) => showConfirm(title, message, onOk),
       getAuthToken: () => getAuthToken(),
       getProject: () => project,
       saveProject: () => saveProject(),

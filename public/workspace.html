@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=241" />
+    <link rel="stylesheet" href="styles.css?v=243" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -1838,12 +1838,12 @@
     <script type="importmap">
     {
       "imports": {
-        "/modules/assets.js":         "/modules/assets.js?v=170",
+        "/modules/assets.js":         "/modules/assets.js?v=172",
         "/modules/backend_stream.js": "/modules/backend_stream.js?v=300",
         "/modules/diagnostic.js":     "/modules/diagnostic.js?v=300",
         "/modules/edit.js":           "/modules/edit.js?v=303",
         "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
-        "/modules/episodes.js":       "/modules/episodes.js?v=108",
+        "/modules/episodes.js":       "/modules/episodes.js?v=110",
         "/modules/error_hub.js":      "/modules/error_hub.js?v=300",
         "/modules/loading.js":        "/modules/loading.js?v=300",
         "/modules/project.js":        "/modules/project.js?v=106",
@@ -1853,7 +1853,7 @@
         "/modules/settings.js":       "/modules/settings.js?v=300",
         "/modules/shots.js":          "/modules/shots.js?v=114",
         "/modules/store.js":          "/modules/store.js?v=300",
-        "/modules/storyboard.js":     "/modules/storyboard.js?v=154",
+        "/modules/storyboard.js":     "/modules/storyboard.js?v=156",
         "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
         "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
         "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=104",
@@ -1867,7 +1867,7 @@
     </script>
     <script type="module" src="modules/store.js?v=300"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=341"></script>
+    <script type="module" src="main.js?v=350"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");
@@ -2028,10 +2028,6 @@
           <span class="material-symbols-outlined">sync</span>
           <span>同步素材</span>
         </button>
-        <button type="button" id="oeBtnClearTracks" hidden class="oe-sync-btn" title="清空剪辑器所有轨道（素材库不受影响）">
-          <span class="material-symbols-outlined">layers_clear</span>
-          <span>清空轨道</span>
-        </button>
         <button type="button" id="oeBtnShortcutHelp" class="oe-shortcut-help-btn" title="剪辑快捷键说明" aria-label="剪辑快捷键说明">
           <span class="material-symbols-outlined">help</span>
         </button>
@@ -2042,9 +2038,9 @@
       <!-- ═══ 火山 SDK / VevDemo 预留区域：真实编辑器将在此处承载 ═══ -->
       <div id="oeEditorContainer" class="oe-editor-frame-host" aria-label="VevDemo 在线剪辑器">
         <div class="oe-editor-empty-state">
-          <span class="material-symbols-outlined">video_settings</span>
-          <h2>等待连接</h2>
-          <p>正在准备在线剪辑服务。</p>
+          <span class="material-symbols-outlined animate-spin">progress_activity</span>
+          <h2>等待连接<span class="oe-wait-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span></h2>
+          <p>正在准备在线剪辑服务</p>
         </div>
       </div>
     </main>

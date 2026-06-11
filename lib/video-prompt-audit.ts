@@ -125,13 +125,13 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
       prompt;
   }
 
-  const dialoguePairs: Array<{ speaker: string; text: string }> = [];
+  const dialoguePairs: Array<{ speaker: string; text: string; shotIdx?: number }> = [];
   for (const si of shotIndices) {
     const sh = shots[si];
     if (!sh) continue;
     const raw = String(sh.dialogue || sh.scriptRef || '').trim();
     if (!raw || raw === '——' || raw === '-' || raw === '无') continue;
-    dialoguePairs.push(...parseDialogue(raw));
+    dialoguePairs.push(...parseDialogue(raw).map((pair) => ({ ...pair, shotIdx: si })));
   }
 
   const dialogueCharSum = cleanDialogueCharCount(dialoguePairs);
@@ -353,6 +353,18 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
       ...input,
       ratio: aspectRatio,
       durationSec: dur,
+    });
+    // 诚实标注：本审计页没有接 payload 决策（尾帧状态/能力/开关），固定按
+    // 多参考图 builder 预览。首尾帧片段的实际提交 prompt 以 batch 路径的
+    // videoPlan.promptAudit（已按 payloadMode 分叉）和完成后的 videoAudit 为准。
+    negativeNotes.push({
+      id: 'preview-builder-note',
+      title: '预览口径说明',
+      content:
+        '本页固定按"首帧+多参考图"builder 预览。若该片段实际以首尾帧模式提交' +
+        '（payloadMode=first_last_frame），实际 prompt 由首尾帧 builder 生成' +
+        '（无 --ratio/--duration 尾缀、含【首尾帧约束】块），以 videoPlan.promptAudit ' +
+        '与提交后的 videoAudit.finalPromptHash 为准。',
     });
     const submitBodyPreview: any = {
       model: cfg.model || cfg.source || 'unresolved',

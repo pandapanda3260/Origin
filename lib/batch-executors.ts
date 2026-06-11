@@ -93,7 +93,7 @@ import {
   computeVideoPromptSourceHash,
   normalizeVideoPromptContent,
 } from './video-prompt-lifecycle';
-import { buildSeedancePromptParts } from './video-prompt-runtime';
+import { buildSeedanceFirstLastFramePromptParts, buildSeedancePromptParts } from './video-prompt-runtime';
 import {
   buildEffectiveShotPlanForDuration,
   buildSegmentShotPlan,
@@ -2811,8 +2811,19 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     payloadModeReason,
     firstLastFrameMode,
   };
+	  // planned prompt 必须与实际提交同 builder：first_last_frame 时真实提交走
+	  // buildSeedanceFirstLastFramePromptParts（无 --ratio/--duration 尾缀、含
+	  // 首尾帧约束块），用多参 builder 预览会造成 planned vs videoAudit hash 永不一致。
 	  const plannedFinalPrompt = videoCfgIsVolcano
-    ? buildSeedancePromptParts(videoInput).finalPrompt
+    ? (firstLastFrameMode
+      ? buildSeedanceFirstLastFramePromptParts({
+          ...videoInput,
+          tailReserveSec: tempoBudget.endingReserveSec,
+        }).finalPrompt
+      : buildSeedancePromptParts({
+          ...videoInput,
+          tailReserveSec: tempoBudget.endingReserveSec,
+        }).finalPrompt)
     : prompt;
   let videoPlan: VideoGenerationPlan = buildVideoPlanSnapshot({
     projectId: ctx.projectId,

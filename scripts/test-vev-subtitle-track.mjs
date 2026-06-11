@@ -43,7 +43,8 @@ assert(shellJs.includes('subtitleApplied'), '铺轨结果必须上报 subtitleAp
 assert(oeJs.includes('subtitles: _buildVevSubtitleCues(project, entries)'), 'plan 必须挂 subtitles（cue 列表）');
 assert(oeJs.includes("from '/modules/subtitle_format.js?v=300'"), 'online_editor.js 必须从 subtitle_format.js 取行提取函数（与 importmap 同号）');
 assert(oeJs.includes('字幕轨写入失败'), '降级时必须有软提示 toast');
-assert(/online_editor\.js\?v=1[1-9]/.test(mainJs), 'main.js 应引用 online_editor.js?v=11+（cache bump 纪律）');
+const oeVersionMatch = mainJs.match(/online_editor\.js\?v=(\d+)/);
+assert(oeVersionMatch && Number(oeVersionMatch[1]) >= 11, 'main.js 应引用 online_editor.js?v=11+（cache bump 纪律）');
 
 // ── 2. 行为：Origin 侧 cue 构建（注入真实 subtitle_format 实现） ──
 const oeSandbox = new Function('extractSubtitleLinesFromPrompt', 'splitSubtitleDialogueLines', `

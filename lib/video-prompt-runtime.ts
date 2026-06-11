@@ -2,7 +2,11 @@ import { statSync } from 'node:fs';
 import { isIndependentMultiImageModeEnabled } from './feature-flags';
 import type { TailFrameSignals } from './shot-tail-frame-signals';
 import type { TargetEndStrategy } from './video-provider-capabilities';
-import { buildReferenceBriefLine, type ReferenceManifestItem } from './video-reference-manifest';
+import {
+  buildReferenceBriefLine,
+  cleanDialogueCharCountFromText,
+  type ReferenceManifestItem,
+} from './video-reference-manifest';
 
 export type VideoReferenceImage = {
   role: 'first_frame' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
@@ -49,7 +53,10 @@ export type SeedancePromptInput = {
   ratio: string;
   durationSec: number;
   shotPlan?: VideoPromptShotPlanItem[];
-  dialoguePairs?: Array<{ speaker: string; text: string }>;
+  dialoguePairs?: Array<{ speaker: string; text: string; shotIdx?: number }>;
+  /** tempoBudget.endingReserveSec 透传：首尾帧 tail_ready 时为 1.0s，
+   *  台词"建议说完窗口"和收声规则要与它一致，避免和尾帧落点打架。 */
+  tailReserveSec?: number;
   characterLockRoster?: string;
   voiceRoster?: string;
   prevTailSummary?: string;
@@ -259,19 +266,138 @@ function buildShotPlanBlock(shotPlan: VideoPromptShotPlanItem[] | undefined, req
   );
 }
 
-function buildDialogueBlock(dialoguePairs: Array<{ speaker: string; text: string }> | undefined): string {
+/** 开场气口锚点：窗口计算用 0.4s（提示词文案写"约 0.3~0.5 秒"，与
+ *  video-segment-runtime 的 openingReserveSec=0.3 兜底值兼容）。 */
+const DIALOGUE_HEAD_GAP_SEC = 0.4;
+/** 结尾收声预留下限：调用方可传 tempoBudget.endingReserveSec 抬高
+ *  （首尾帧 tail_ready 时是 1.0s），但不允许低于 0.4s。 */
+const DIALOGUE_TAIL_GAP_SEC = 0.4;
+
+export type DialoguePairPromptInput = {
+  speaker: string;
+  text: string;
+  /** 台词来自镜头表的第几个 shot（0-based，对应 shotPlan 的 idx-1）。
+   *  多镜头合并片段靠它把建议窗口对齐到所属镜头的时间轴。 */
+  shotIdx?: number;
+};
+
+function formatWindowSec(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function resolveDialogueTailGapSec(tailReserveSec?: number): number {
+  const n = Number(tailReserveSec);
+  return Number.isFinite(n) && n > DIALOGUE_TAIL_GAP_SEC ? n : DIALOGUE_TAIL_GAP_SEC;
+}
+
+/**
+ * 给每句台词分配"建议说完窗口"。
+ *
+ * 单镜头片段：在 [气口, 时长-尾留] 区间按净字数比例线性分配。
+ * 多镜头合并片段：先用 shotPlan 时长（等比缩放到请求时长）摆出各镜头的
+ * [start,end) 时间轴，每句台词只在**自己所属镜头**的区间内分配——
+ * 否则 shot1 无台词、shot2 有台词时，窗口会把第二镜的台词错误地
+ * 提示到片段开头（审查 finding，2026-06-11）。
+ *
+ * 返回 null = 放弃逐句窗口（无时长 / 多镜头但台词缺 shotIdx 映射 / 窗口
+ * 挤不下），此时只输出气口规则——宁缺毋错，不给误导性时间。
+ * 窗口是"建议节奏"不是硬时间码：模型只能粗略执行，写死到帧是假精确。
+ */
+function buildDialogueWindows(
+  pairs: DialoguePairPromptInput[],
+  durationSec?: number,
+  shotPlan?: VideoPromptShotPlanItem[],
+  tailReserveSec?: number,
+): Array<{ startSec: number; endSec: number }> | null {
+  const total = Number(durationSec);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const tailGap = resolveDialogueTailGapSec(tailReserveSec);
+  const plan = Array.isArray(shotPlan) ? shotPlan.filter(Boolean) : [];
+
+  // 多镜头：按 shotPlan 顺序累加时长（等比缩放到请求时长）→ 每镜 [start,end)
+  let spans: Map<number, { startSec: number; endSec: number }> | null = null;
+  if (plan.length > 1) {
+    const durations = plan.map((item) => {
+      const n = Number(item.durationSec);
+      return Number.isFinite(n) && n > 0 ? n : 4;
+    });
+    const planTotal = durations.reduce((sum, n) => sum + n, 0);
+    if (planTotal <= 0) return null;
+    const scale = total / planTotal;
+    spans = new Map();
+    let cursor = 0;
+    plan.forEach((item, i) => {
+      const len = durations[i] * scale;
+      const shotNo = Number.isFinite(Number(item.idx)) && Number(item.idx) > 0 ? Number(item.idx) : i + 1;
+      spans!.set(shotNo, { startSec: cursor, endSec: cursor + len });
+      cursor += len;
+    });
+  }
+
+  // 把台词按所属镜头分组；多镜头但映射不全 → 整体放弃窗口
+  const groups: Array<{ startSec: number; endSec: number; pairIdx: number[] }> = [];
+  if (spans) {
+    for (let i = 0; i < pairs.length; i += 1) {
+      const shotIdx = Number(pairs[i].shotIdx);
+      const span = Number.isFinite(shotIdx) ? spans.get(shotIdx + 1) : undefined;
+      if (!span) return null;
+      const last = groups[groups.length - 1];
+      if (last && last.startSec === span.startSec) {
+        last.pairIdx.push(i);
+      } else {
+        groups.push({ startSec: span.startSec, endSec: span.endSec, pairIdx: [i] });
+      }
+    }
+  } else if (plan.length > 1) {
+    return null;
+  } else {
+    groups.push({ startSec: 0, endSec: total, pairIdx: pairs.map((_, i) => i) });
+  }
+
+  const windows: Array<{ startSec: number; endSec: number }> = new Array(pairs.length);
+  for (const group of groups) {
+    const adjStart = Math.max(group.startSec, DIALOGUE_HEAD_GAP_SEC);
+    const adjEnd = Math.min(group.endSec, total - tailGap);
+    const usable = adjEnd - adjStart;
+    // 挤不下就整体放弃：0.5s/句 是能念出 2 个字的底线
+    if (usable < Math.max(1, group.pairIdx.length * 0.5)) return null;
+    const charCounts = group.pairIdx.map((i) => Math.max(1, cleanDialogueCharCountFromText(pairs[i].text)));
+    const charTotal = charCounts.reduce((sum, n) => sum + n, 0);
+    let consumedChars = 0;
+    group.pairIdx.forEach((pairIndex, k) => {
+      const startSec = adjStart + (consumedChars / charTotal) * usable;
+      consumedChars += charCounts[k];
+      const endSec = adjStart + (consumedChars / charTotal) * usable;
+      windows[pairIndex] = { startSec, endSec };
+    });
+  }
+  return windows;
+}
+
+function buildDialogueBlock(
+  dialoguePairs: DialoguePairPromptInput[] | undefined,
+  durationSec?: number,
+  shotPlan?: VideoPromptShotPlanItem[],
+  tailReserveSec?: number,
+): string {
   const dialogPairs = Array.isArray(dialoguePairs)
     ? dialoguePairs.filter((p) => p && p.text)
     : [];
 
   if (dialogPairs.length > 0) {
+    const windows = buildDialogueWindows(dialogPairs, durationSec, shotPlan, tailReserveSec);
+    const tailGap = resolveDialogueTailGapSec(tailReserveSec);
     const lines = dialogPairs
       .map((p, i) => {
         const cleanText = p.text.replace(/\s+/g, ' ');
         const sp = p.speaker
           ? `说话人: ${p.speaker}（必须由该角色开口配音，唇形要对得上）`
           : `说话人: 旁白`;
-        return `  [${i + 1}] ${sp}\n      台词内容: "${cleanText}"`;
+        const win = windows
+          ? `（建议在 ${formatWindowSec(windows[i].startSec)}s ~ ${formatWindowSec(windows[i].endSec)}s 内说完）`
+          : '';
+        return `  [${i + 1}]${win} ${sp}\n      台词内容: "${cleanText}"`;
       })
       .join('\n');
     return (
@@ -279,6 +405,13 @@ function buildDialogueBlock(dialoguePairs: Array<{ speaker: string; text: string
       lines +
       `\n` +
       `严格规则：\n` +
+      `  · 开口时机【最重要】：视频开场必须先留约 0.3~0.5 秒气口（呼吸 / 环境音 / 动作起手），` +
+      `第一句台词在气口之后才开口；严禁从第 0 帧开讲，严禁开场就处于"话说到一半"的状态\n` +
+      `  · 每句台词都要从第一个字完整念到最后一个字，句首的字严禁吞掉、弱化或淡入半个字\n` +
+      (windows
+        ? `  · 各句的"建议说完窗口"是节奏参考（允许 ±0.3 秒自然浮动），但第一句不得早于其窗口开始，` +
+          `最后一句必须在视频结束前约 ${formatWindowSec(tailGap)} 秒说完，不要贴边\n`
+        : '') +
       `  · "说话人:" 后面的角色名是元信息，**绝对不准念出来**（不要把"老板"、"帝王蟹队长"等角色名当成台词的一部分朗读）\n` +
       `  · 只有"台词内容:"引号里的字才是真正要念的台词\n` +
       `  · 每句台词的发声角色必须严格匹配上面"说话人:"指定的那个名字，` +
@@ -329,7 +462,7 @@ function isFixedCameraPlan(item: VideoPromptShotPlanItem): boolean {
   return saysFixed && !saysMoving;
 }
 
-function buildMotionOpeningBlock(shotPlan?: VideoPromptShotPlanItem[]): string {
+function buildMotionOpeningBlock(shotPlan?: VideoPromptShotPlanItem[], hasDialogue = false): string {
   const items = Array.isArray(shotPlan) ? shotPlan.filter(Boolean) : [];
   const hasPlan = items.length > 0;
   const fixedCount = items.filter(isFixedCameraPlan).length;
@@ -342,11 +475,19 @@ function buildMotionOpeningBlock(shotPlan?: VideoPromptShotPlanItem[]): string {
       ? `  · 每个镜头按镜头计划的 camera 执行：固定镜头保持机位固定，运动镜头才从第 1 帧按推/拉/横移/跟随等方向开始物理位移\n`
       : `  · 镜头从第 1 帧就要按镜头计划和【运镜系统】描述的方向开始物理位移（推/拉/横移/跟随等）\n`;
 
+  // 有台词时把"嘴唇微动"从微动作示例里拿掉，并明确"画面动 ≠ 开口"——
+  // 否则本块会把模型推向第 0 帧开讲，台词第一个字被吃（开头吃字根因之一）。
+  const microActionRule = hasDialogue
+    ? `  · 角色从第 1 帧就要有微动作（呼吸起伏 / 眨眼 / 手部小动作），不能像照片一样定格\n` +
+      `  · 开场动态指的是画面与肢体动作，**不等于开口说话**：本片段有台词，` +
+      `第一句台词必须等开场气口（约 0.3~0.5 秒）之后再开始，禁止第 0 帧就开口\n`
+    : `  · 角色从第 1 帧就要有微动作（呼吸起伏 / 眨眼 / 手部小动作 / 嘴唇微动），不能像照片一样定格\n`;
+
   return (
     `【开场动态强制】\n` +
     `视频第 0 帧就必须是动态画面，禁止前 0.3 秒呈现"参考图静帧定格"效果。\n` +
     cameraRule +
-    `  · 角色从第 1 帧就要有微动作（呼吸起伏 / 眨眼 / 手部小动作 / 嘴唇微动），不能像照片一样定格\n` +
+    microActionRule +
     `  · 多个视频拼成成片时，每段开头的那一瞬间必须无缝接得上"在动"，不能让人感觉切到一张静态封面\n\n`
   );
 }
@@ -445,13 +586,15 @@ export function buildSeedancePromptParts(input: SeedancePromptInput) {
     propRefs.length > 0;
   const hasAnyRef = hasIndependentImageRefs || hasColorRefs || !!input.referenceImagePath;
 
-  const dialogueBlock = buildDialogueBlock(input.dialoguePairs);
+  const hasDialoguePairs = Array.isArray(input.dialoguePairs)
+    && input.dialoguePairs.some((p) => p && p.text);
+  const dialogueBlock = buildDialogueBlock(input.dialoguePairs, input.durationSec, input.shotPlan, input.tailReserveSec);
   const shotPlanBlock = buildShotPlanBlock(input.shotPlan, input.durationSec);
   const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
   const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
   const independentReferenceBlock = buildIndependentReferencePromptBlock(independentReferenceImages);
   const targetEndConstraintBlock = buildTargetEndConstraintBlock(input, independentReferenceImages);
-  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan);
+  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan, hasDialoguePairs);
   const editablePrompt = stripEditablePromptTimingLines(input.prompt);
 
   let styleOverrideBlock = '';
@@ -526,7 +669,9 @@ export type SeedanceFirstLastFramePromptInput = {
   prompt: string;
   durationSec?: number;
   shotPlan?: VideoPromptShotPlanItem[];
-  dialoguePairs?: Array<{ speaker: string; text: string }>;
+  dialoguePairs?: Array<{ speaker: string; text: string; shotIdx?: number }>;
+  /** 见 SeedancePromptInput.tailReserveSec。首尾帧模式下尤其重要。 */
+  tailReserveSec?: number;
   characterLockRoster?: string;
   voiceRoster?: string;
   prevTailSummary?: string;
@@ -546,12 +691,14 @@ function buildFirstLastFrameConstraintBlock(): string {
 }
 
 export function buildSeedanceFirstLastFramePromptParts(input: SeedanceFirstLastFramePromptInput) {
-  const dialogueBlock = buildDialogueBlock(input.dialoguePairs);
+  const hasDialoguePairs = Array.isArray(input.dialoguePairs)
+    && input.dialoguePairs.some((p) => p && p.text);
+  const dialogueBlock = buildDialogueBlock(input.dialoguePairs, input.durationSec, input.shotPlan, input.tailReserveSec);
   const shotPlanBlock = buildShotPlanBlock(input.shotPlan, input.durationSec || 0);
   const characterLockBlock = buildCharacterLockBlock(input.characterLockRoster, input.voiceRoster);
   const continuityBlock = buildContinuityBlock(input.prevTailSummary, input.nextHeadSummary);
   const firstLastFrameBlock = buildFirstLastFrameConstraintBlock();
-  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan);
+  const motionOpeningBlock = buildMotionOpeningBlock(input.shotPlan, hasDialoguePairs);
   const editablePrompt = stripEditablePromptTimingLines(input.prompt || '');
 
   const ruleBlocks: VideoPromptRuleBlock[] = [

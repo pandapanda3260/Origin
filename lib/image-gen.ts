@@ -926,7 +926,7 @@ function forceStyleSuffix(
           : 'Style: photorealistic group reference photography, sharp focus, high detail, professional production reference quality.',
         'Layout: ONE single continuous image of an anonymous group. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
         'Subject: multiple unnamed people as a crowd/group asset. Capture the collective visual identity: approximate group size, density, age range, clothing system, posture distribution, and shared temperament.',
-        'Faces: faces must be varied and natural. Do NOT make everyone the same person. Do NOT clone one face across the group. No individual face is an identity target.',
+        'Faces: visible faces must be individually distinct while staying within the same broad population baseline. Ensure front-row and mid-row people differ in face shape, jawline, cheekbone structure, eye shape and spacing, nose bridge and tip, mouth and lip shape, brows, hairline, hairstyle, expression, and slight age variation. Similar uniforms, era, faction, and clothing rhythm are allowed; identical facial structure is not allowed. Avoid twins, cloned faces, mirrored duplicates, repeated face templates, and copy-pasted heads. No individual face is an identity target.',
         'Composition: slightly wide front-facing group reference, enough room to read scale, clothing rhythm, density, and emotional distribution.',
         'Background: simple neutral production-reference background; keep the group readable and isolated from distracting environments.',
         'CRITICAL: this is NOT a character model sheet. Do NOT generate headshot/front/side/back panels. Do NOT require the same person to appear multiple times.',

@@ -2,7 +2,7 @@
 /**
  * 测试 lib/visual-reference-state.ts 的 tail frame 部分 (P2.5a.T0 新增):
  *   - checkTailFramePreflight 对不同首帧状态的判定;
- *   - normalizeTailFrameState / markTailFrameReady / markTailFrameFailed 基本行为。
+ *   - normalizeTailFrameState / markTailFrameReady / markTailFrameFailed / markTailFrameDeleted 基本行为。
  *
  * 约定与其它 test:xxx 脚本一致, 用 ts.transpileModule + vm.runInNewContext。
  */
@@ -171,6 +171,60 @@ async function testNormalizeAndMarkTail() {
   assertEqual(failed.status, 'failed', 'no fallback → failed');
 }
 
+async function testMarkTailFrameDeletedClearsTailOnly() {
+  const mod = loadVisualReferenceState();
+  const prev = {
+    idx: 12,
+    shotIdx: 13,
+    shotIndices: [12],
+    tailFrameUrl: '/api/images/file/tail',
+    tailFramePrompt: 'old prompt',
+    tailFrameIntent: 'requested',
+    tailFrameIntentUpdatedAt: '2026-06-10T00:00:00.000Z',
+    tailFrameSourceHash: 'tail-hash',
+    tailFrameReferenceStatus: 'failed',
+    tailFrameLastError: 'blocked',
+    tailFrameFailedAt: '2026-06-10T00:01:00.000Z',
+    tailFrameSafetyAudit: { blocked: true },
+    tailFrameErrorCode: 'moderation_blocked',
+    tailFrameRecoveryHint: 'rewrite',
+    tailFrameHistory: [{ url: '/api/images/file/history-tail' }],
+    tailFrameBasePrompt: { content: 'base prompt' },
+    tailFrameBackup: { content: 'backup prompt' },
+    tailFrameEditDraft: { content: 'draft prompt' },
+    originalTailFramePrompt: 'original prompt',
+    tailFramePlanSummary: { ok: true },
+    frames: {
+      first: { url: '/api/images/file/first', status: 'ready' },
+      tail: { url: '/api/images/file/tail', status: 'failed' },
+    },
+  };
+  const deleted = mod.markTailFrameDeleted(prev, { at: '2026-06-11T00:00:00.000Z' });
+
+  assertEqual(deleted.idx, 12, 'idx preserved by helper');
+  assertEqual(deleted.shotIdx, 13, 'shotIdx preserved by helper');
+  assertEqual(deleted.shotIndices, [12], 'shotIndices preserved by helper');
+  assertEqual(deleted.frames.first.url, '/api/images/file/first', 'first frame preserved');
+  assertEqual(deleted.frames.tail, undefined, 'frames.tail deleted');
+  assertEqual(deleted.tailFrameUrl, '', 'tailFrameUrl cleared');
+  assertEqual(deleted.tailFramePrompt, '', 'tailFramePrompt cleared');
+  assertEqual(deleted.tailFrameIntent, 'none', 'intent = none');
+  assertEqual(deleted.tailFrameIntentUpdatedAt, '2026-06-11T00:00:00.000Z', 'intent timestamp set');
+  assertEqual(deleted.tailFrameSourceHash, null, 'source hash cleared');
+  assertEqual(deleted.tailFrameReferenceStatus, 'missing', 'reference status missing');
+  assertEqual(deleted.tailFrameLastError, '', 'last error cleared');
+  assertEqual(deleted.tailFrameFailedAt, undefined, 'failedAt deleted');
+  assertEqual(deleted.tailFrameSafetyAudit, undefined, 'safety audit deleted');
+  assertEqual(deleted.tailFrameErrorCode, undefined, 'error code deleted');
+  assertEqual(deleted.tailFrameRecoveryHint, undefined, 'recovery hint deleted');
+  assertEqual(deleted.tailFrameHistory, prev.tailFrameHistory, 'tail history preserved');
+  assertEqual(deleted.tailFrameBasePrompt, prev.tailFrameBasePrompt, 'base prompt preserved');
+  assertEqual(deleted.tailFrameBackup, prev.tailFrameBackup, 'backup preserved');
+  assertEqual(deleted.tailFrameEditDraft, prev.tailFrameEditDraft, 'edit draft preserved');
+  assertEqual(deleted.originalTailFramePrompt, prev.originalTailFramePrompt, 'original prompt preserved');
+  assertEqual(deleted.tailFramePlanSummary, prev.tailFramePlanSummary, 'plan summary preserved');
+}
+
 async function testFirstFrameFailureDoesNotFallbackToStoryboardSketch() {
   const mod = loadVisualReferenceState();
   const sb = {
@@ -197,6 +251,7 @@ async function main() {
     ['preflight: first frame failed rejected', testPreflightFirstFrameFailed],
     ['preflight: frames.first.status=ready alone passes', testPreflightFallbackStatusReady],
     ['normalize + markReady + markFailed basics', testNormalizeAndMarkTail],
+    ['markTailFrameDeleted clears only tail frame state', testMarkTailFrameDeletedClearsTailOnly],
     ['first frame failure does not fallback to storyboard sketch', testFirstFrameFailureDoesNotFallbackToStoryboardSketch],
   ];
   let pass = 0;

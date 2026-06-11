@@ -241,6 +241,28 @@ export function markTailFrameFailed(storyboard: any, error: any): TailFrameState
   };
 }
 
+export function markTailFrameDeleted(storyboard: any, opts?: { at?: string }): any {
+  const next = { ...(storyboard || {}) };
+  const frames = next.frames && typeof next.frames === 'object' ? { ...next.frames } : {};
+  delete frames.tail;
+  next.frames = frames;
+
+  next.tailFrameUrl = '';
+  next.tailFramePrompt = '';
+  next.tailFrameIntent = 'none';
+  next.tailFrameIntentUpdatedAt = opts?.at || new Date().toISOString();
+  next.tailFrameSourceHash = null;
+  next.tailFrameReferenceStatus = 'missing';
+  next.tailFrameLastError = '';
+
+  delete next.tailFrameFailedAt;
+  delete next.tailFrameSafetyAudit;
+  delete next.tailFrameErrorCode;
+  delete next.tailFrameRecoveryHint;
+
+  return next;
+}
+
 export type TailFramePreflightError = {
   reason: 'missing_first_frame' | 'invalid_first_frame_mode' | 'first_frame_failed';
   firstFrameMode?: string;

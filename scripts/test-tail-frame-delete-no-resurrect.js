@@ -22,6 +22,8 @@ const assert = require('node:assert/strict');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const storyboard = fs.readFileSync(path.join(REPO_ROOT, 'public/modules/storyboard.js'), 'utf8');
 const batches = fs.readFileSync(path.join(REPO_ROOT, 'lib/batches.ts'), 'utf8');
+const visualReferenceState = fs.readFileSync(path.join(REPO_ROOT, 'lib/visual-reference-state.ts'), 'utf8');
+const deleteRoute = fs.readFileSync(path.join(REPO_ROOT, 'app/api/frames/delete/route.ts'), 'utf8');
 
 const passed = [];
 const failed = [];
@@ -91,13 +93,42 @@ record('_isTailKeyframeWanted excludes explicitly deleted tails (auto-chain)', (
   assert(block.includes('if (_isTailFrameExplicitlyDeleted(sb)) return false;'));
 });
 
-record('delete-tail clears failure metadata so nothing re-triggers safety notice', () => {
+record('delete-tail calls authoritative API and reloads project', () => {
   const block = section(storyboard, '} else if (action === "delete-tail") {', '} else if (action === "upload-tail") {');
-  assert(block.includes("delSb.tailFrameIntent = 'none';"));
-  assert(block.includes('delete delSb.tailFrameFailedAt;'));
-  assert(block.includes('delete delSb.tailFrameSafetyAudit;'));
-  assert(block.includes('delete delSb.tailFrameErrorCode;'));
-  assert(block.includes('delete delSb.tailFrameRecoveryHint;'));
+  assert(block.includes("var deleteResp = await apiPost('/api/frames/delete'"), 'delete-tail must call frames/delete and keep response');
+  assert(block.includes("frameType: 'tail_frame'"), 'delete-tail must pass tail_frame');
+  assert(block.includes('try {'), 'delete-tail must catch API errors');
+  assert(block.includes('} catch (err) {'), 'delete-tail must catch API errors');
+  assert(block.includes('_diagnoseApiError'), 'delete-tail error toast must diagnose API errors');
+  assert(block.includes('await _reloadProjectFromServerForStoryboard(deleteOriginId)'), 'delete-tail must reload authoritative project');
+  assert(block.includes('_applyDeletedTailFrameLocally(gIdx, deleteResp, deleteOriginId)'), 'delete-tail must apply server-confirmed delete locally if reload fails');
+  assert(block.includes("showToast('已删除，请刷新页面查看', 'warn');"), 'delete-tail must report reload fallback when local apply is impossible');
+  assert(block.includes('renderImageGrid();'), 'delete-tail must refresh grid after reload');
+  assert(block.includes('checkImagesConfirm();'), 'delete-tail must refresh confirm state after reload');
+  assert(!block.includes('saveProject();'), 'delete-tail must not use debounced full-project PUT');
+  assert(!block.includes('delSb.'), 'delete-tail must not locally author deletion fields');
+});
+
+record('_applyDeletedTailFrameLocally mirrors confirmed delete without persistence', () => {
+  const block = section(storyboard, 'function _applyDeletedTailFrameLocally(', '\n  return true;\n}');
+  assert(block.includes('project.id !== projectId'), 'local delete mirror must guard project switch');
+  [
+    "next.tailFrameUrl = '';",
+    "next.tailFramePrompt = '';",
+    "next.tailFrameIntent = 'none';",
+    'next.tailFrameSourceHash = null;',
+    "next.tailFrameReferenceStatus = 'missing';",
+    "next.tailFrameLastError = '';",
+    'delete frames.tail;',
+    'delete next.tailFrameFailedAt;',
+    'delete next.tailFrameSafetyAudit;',
+    'delete next.tailFrameErrorCode;',
+    'delete next.tailFrameRecoveryHint;',
+    "delete project._staleFlags['tail_frame_' + groupIdx];",
+    'project.version = serverVersion;',
+  ].forEach((needle) => assert(block.includes(needle), `missing ${needle}`));
+  assert(!block.includes('saveProject();'), 'local delete mirror must not enqueue full-project PUT');
+  assert(!block.includes('_safeWriteBack'), 'local delete mirror must not call safe write-back');
 });
 
 record('server _clearFailedTailFrameImageState does not resurrect deleted tails', () => {
@@ -105,6 +136,41 @@ record('server _clearFailedTailFrameImageState does not resurrect deleted tails'
   assert(block.includes("if (String((prev as any).tailFrameIntent || '') === 'none') return null;"));
   // gate 必须在失败字段写入 storyboards 之前
   assert(block.indexOf("=== 'none') return null;") < block.indexOf('tailFrameFailedAt: failedAt'), 'server gate must run before failure fields are written');
+});
+
+record('markTailFrameDeleted centralizes tail delete field list', () => {
+  const block = section(visualReferenceState, 'export function markTailFrameDeleted(', 'export type TailFramePreflightError');
+  [
+    "next.tailFrameUrl = '';",
+    "next.tailFramePrompt = '';",
+    "next.tailFrameIntent = 'none';",
+    'next.tailFrameSourceHash = null;',
+    "next.tailFrameReferenceStatus = 'missing';",
+    "next.tailFrameLastError = '';",
+    'delete frames.tail;',
+    'delete next.tailFrameFailedAt;',
+    'delete next.tailFrameSafetyAudit;',
+    'delete next.tailFrameErrorCode;',
+    'delete next.tailFrameRecoveryHint;',
+  ].forEach((needle) => assert(block.includes(needle), `missing ${needle}`));
+  assert(!block.includes('shotIdx'), 'helper must not own shotIdx');
+  assert(!block.includes('shotIndices'), 'helper must not own shotIndices');
+});
+
+record('/api/frames/delete uses authoritative patch route', () => {
+  assert(deleteRoute.includes('patchProjectForUser(projectId, user.id'), 'route must use patchProjectForUser');
+  assert(deleteRoute.includes('markTailFrameDeleted(prev'), 'route must call markTailFrameDeleted');
+  assert(deleteRoute.includes("frameType !== 'tail_frame'"), 'route must reject non-tail frame types');
+  assert(deleteRoute.includes("jsonError('当前仅支持删除尾帧'"), 'route must not open first-frame delete behavior');
+  assert(deleteRoute.includes('tailFrameIntentUpdatedAt'), 'route must return delete timestamp for local UI fallback');
+});
+
+record('/api/frames/delete writes shot alignment and clears stale flag safely', () => {
+  assert(deleteRoute.includes("storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' })"), 'route must use single-shot-strict shot indices');
+  assert(deleteRoute.includes('maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, \'tail-frame-delete\')'), 'route must assert alignment');
+  assert(deleteRoute.includes('const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };'), 'route must copy stale flags map');
+  assert(deleteRoute.includes('delete nextStaleFlags[staleKey];'), 'route must delete only the tail stale key');
+  assert(deleteRoute.includes('return { storyboards, _staleFlags: nextStaleFlags };'), 'route must return whole stale flags map');
 });
 
 if (failed.length) {
