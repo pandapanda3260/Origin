@@ -14,7 +14,7 @@ Run from the repository root:
 bash scripts/build-release-artifact.sh
 ```
 
-`build-release-artifact.sh` runs `npm ci`, then `verify:release:local`, then packages the checked commit plus the generated `.next` output into `tmp/release-artifacts/origin-<release-id>.tar.gz` with a `.sha256` checksum. Prefer running it on Linux CI or a Linux staging host so the build environment matches production. `verify:release:local` runs TypeScript, the local deterministic test set, the workspace CSS build, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
+`build-release-artifact.sh` runs `npm ci`, then `verify:release:local`, then packages the checked commit plus the generated `.next` output into `tmp/release-artifacts/origin-<release-id>.tar.gz` with a `.sha256` checksum. The packager strips common macOS metadata such as `.DS_Store`, `._*`, and extended attributes before creating the tarball. Prefer running it on Linux CI or a Linux staging host so the build environment matches production. `verify:release:local` runs TypeScript, the local deterministic test set, the workspace CSS build, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
 
 The workspace page uses local generated assets instead of runtime CDN CSS/fonts. Make sure release artifacts include `public/fonts.css`, `public/workspace-tailwind.css`, `public/vendor/fonts/`, `public/workspace-tailwind.src.css`, and `tailwind.workspace.config.cjs`.
 

@@ -6,7 +6,7 @@
 #   bash /Users/mark/Documents/origin/scripts/check-prod-vs-local.sh
 #
 # Output file:
-#   /Users/mark/Documents/origin/scripts/check-prod-vs-local.out
+#   /Users/mark/Documents/origin/tmp/check-prod-vs-local-<timestamp>.out
 #
 # The host/key are pinned to the values the user gave; override via env if needed.
 

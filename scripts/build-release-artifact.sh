@@ -7,9 +7,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+export COPYFILE_DISABLE=1
+
 OUT_DIR="${ORIGIN_RELEASE_OUT_DIR:-$ROOT/tmp/release-artifacts}"
 SKIP_VERIFY="${ORIGIN_RELEASE_SKIP_VERIFY:-0}"
 ALLOW_DIRTY="${ORIGIN_RELEASE_ALLOW_DIRTY:-0}"
+
+strip_archive_metadata() {
+  local dir="$1"
+
+  find "$dir" -name ".DS_Store" -type f -delete
+  find "$dir" -name "._*" -type f -delete
+  find "$dir" -name ".AppleDouble" -type d -prune -exec rm -rf {} +
+
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -cr "$dir" 2>/dev/null || true
+  fi
+}
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "fatal: $ROOT is not a git worktree" >&2
@@ -39,7 +53,7 @@ if [ "$SKIP_VERIFY" != "1" ]; then
   npm ci
   npm run verify:release:local
   if [ "$ALLOW_DIRTY" != "1" ]; then
-    POST_VERIFY_DIRTY="$(git status --porcelain | grep -v ' tsconfig.tsbuildinfo$' || true)"
+    POST_VERIFY_DIRTY="$(git status --porcelain || true)"
     if [ -n "$POST_VERIFY_DIRTY" ]; then
       echo "fatal: release verification changed tracked files. Review and commit generated outputs before packaging." >&2
       echo "$POST_VERIFY_DIRTY" >&2
@@ -58,10 +72,11 @@ git archive --format=tar HEAD | tar -x -C "$RELEASE_DIR"
 cp -a "$ROOT/.next" "$RELEASE_DIR/.next"
 printf '%s\n' "$RELEASE_ID" > "$RELEASE_DIR/RELEASE_ID"
 printf '%s\n' "$REVISION" > "$RELEASE_DIR/REVISION"
+strip_archive_metadata "$RELEASE_DIR"
 
 ARTIFACT="$OUT_DIR/origin-${RELEASE_ID}.tar.gz"
 CHECKSUM="$ARTIFACT.sha256"
-tar -czf "$ARTIFACT" -C "$RELEASE_DIR" .
+COPYFILE_DISABLE=1 tar -czf "$ARTIFACT" -C "$RELEASE_DIR" .
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$OUT_DIR" && sha256sum "$(basename "$ARTIFACT")" > "$(basename "$CHECKSUM")")
