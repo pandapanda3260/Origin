@@ -27,6 +27,10 @@ import {
 } from '../lib/credits';
 import { fulfillPaidOrder } from '../lib/billing-fulfill';
 
+function setNodeEnv(value: string) {
+  (process.env as Record<string, string | undefined>)['NODE_ENV'] = value;
+}
+
 // —— 新定价数值锁（2026-06-10 拍板）——
 assert.equal(getPlan('plus')?.price_cents, 159900);
 assert.equal(getPlan('plus')?.monthly_credits, 80000);
@@ -43,17 +47,17 @@ assert.deepEqual(
 );
 
 // —— 开关语义：默认关 / 非生产显式 1 开 / 0 关 / 生产硬关 ——
-process.env.NODE_ENV = 'development';
+setNodeEnv('development');
 delete process.env.BILLING_DEV_AUTOPAY;
 assert.equal(isDevAutopayEnabled(), false);
 process.env.BILLING_DEV_AUTOPAY = '1';
 assert.equal(isDevAutopayEnabled(), true);
 process.env.BILLING_DEV_AUTOPAY = '0';
 assert.equal(isDevAutopayEnabled(), false);
-process.env.NODE_ENV = 'production';
+setNodeEnv('production');
 process.env.BILLING_DEV_AUTOPAY = '1';
 assert.equal(isDevAutopayEnabled(), false);
-process.env.NODE_ENV = 'development';
+setNodeEnv('development');
 process.env.BILLING_DEV_AUTOPAY = '1';
 
 const db = getDb();

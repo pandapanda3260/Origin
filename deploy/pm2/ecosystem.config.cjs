@@ -10,6 +10,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: process.env.PORT || '3000',
+        ORIGIN_ENV_FILE: process.env.ORIGIN_ENV_FILE || '/etc/origin/origin.env',
         ORIGIN_PROCESS_ROLE: 'web',
         ORIGIN_BATCH_INLINE_RUNNER: '0',
         ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD: '0',
@@ -30,6 +31,7 @@ module.exports = {
       instances: 1,
       env: {
         NODE_ENV: 'production',
+        ORIGIN_ENV_FILE: process.env.ORIGIN_ENV_FILE || '/etc/origin/origin.env',
         ORIGIN_PROCESS_ROLE: 'worker',
         ORIGIN_BATCH_RECOVERY_ENABLED: '1',
         ORIGIN_REAP_ORPHANS_ON_START: '0',

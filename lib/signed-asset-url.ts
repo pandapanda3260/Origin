@@ -1,14 +1,19 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import { isProductionBuildPhase, isSecretUsableForCurrentPhase } from './secret-safety';
 
 const DEFAULT_TTL_SECONDS = 3600;
 const MAX_TTL_SECONDS = 7 * 24 * 3600;
 
 function getSecret(): string {
-  return (
-    process.env.ASSET_URL_SECRET ||
-    process.env.JWT_SECRET ||
-    'dev-jwt-secret-please-change-me-32-bytes-long'
-  );
+  const assetSecret = process.env.ASSET_URL_SECRET || '';
+  if (assetSecret && isSecretUsableForCurrentPhase(assetSecret)) return assetSecret;
+  const fallbackSecret = process.env.JWT_SECRET || '';
+  if (isProductionBuildPhase() && fallbackSecret && isSecretUsableForCurrentPhase(fallbackSecret)) return fallbackSecret;
+  if (process.env.NODE_ENV === 'production' && !isProductionBuildPhase()) {
+    throw new Error('[signed-asset-url] Production requires non-placeholder ASSET_URL_SECRET with at least 32 bytes.');
+  }
+  if (fallbackSecret && isSecretUsableForCurrentPhase(fallbackSecret)) return fallbackSecret;
+  return 'dev-jwt-secret-please-change-me-32-bytes-long';
 }
 
 function signPayload(imageId: string, ownerId: number, exp: number): string {

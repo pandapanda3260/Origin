@@ -4,6 +4,8 @@ This project currently deploys as a Next.js app backed by SQLite/local file stor
 
 Current production as checked on 2026-05-25 uses systemd services `origin-web` and `origin-worker`, both with `WorkingDirectory=/opt/origin` and runtime env loaded from `/etc/origin/origin.env`.
 
+Before first launch on a new server, create `/etc/origin/origin.env` from `deploy/origin.env.example`, keep it mode `600`, and replace every `replace-with-*` value. `JWT_SECRET`, `ADMIN_JWT_SECRET`, and `ASSET_URL_SECRET` must be three different random values, for example from `openssl rand -hex 32`. `BILLING_DEV_AUTOPAY` must stay `0` for production.
+
 ## Pre-release checks
 
 Run from the repository root:
@@ -90,7 +92,7 @@ Use a staging host or staging process group with its own `ORIGIN_DATA_DIR`, `DB_
 npm ci
 npm run build:workspace-css
 npm run verify:release:local
-ORIGIN_APP_DIR=/opt/origin-staging pm2 start deploy/pm2/ecosystem.config.cjs --update-env
+ORIGIN_ENV_FILE=/etc/origin/origin.env ORIGIN_APP_DIR=/opt/origin-staging pm2 start deploy/pm2/ecosystem.config.cjs --update-env
 ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
 ```
 

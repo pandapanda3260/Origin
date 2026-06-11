@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { getDb } from './db';
 import { getExternalEnvLoadResult, getExternalEnvValue, loadExternalEnv } from './env';
 import { describeRuntimeStorage, getDataDir } from './runtime-paths';
+import { isPlaceholderSecret, secretByteLength } from './secret-safety';
 import { getServiceHeartbeat } from './service-heartbeat';
 import { readVevDemoUrlConfig } from './vevdemo-config';
 
@@ -154,17 +155,91 @@ function checkNeedsReviewBacklog(checks: Check[]) {
 function checkSecrets(checks: Check[]) {
   const production = process.env.NODE_ENV === 'production';
   const jwtSecret = readConfigValue('JWT_SECRET');
-  if (production && jwtSecret.length < 32) {
+  const adminJwtSecret = readConfigValue('ADMIN_JWT_SECRET');
+  const assetUrlSecret = readConfigValue('ASSET_URL_SECRET');
+  if (production && (secretByteLength(jwtSecret) < 32 || isPlaceholderSecret(jwtSecret))) {
     addCheck(checks, {
       name: 'secrets.jwt',
       status: 'fail',
-      message: 'production requires JWT_SECRET with at least 32 bytes',
+      message: isPlaceholderSecret(jwtSecret)
+        ? 'production JWT_SECRET must replace the example placeholder'
+        : 'production requires JWT_SECRET with at least 32 bytes',
     });
   } else {
     addCheck(checks, {
       name: 'secrets.jwt',
-      status: jwtSecret.length >= 32 ? 'ok' : 'warn',
-      message: jwtSecret.length >= 32 ? undefined : 'dev fallback JWT secret is active',
+      status: secretByteLength(jwtSecret) >= 32 && !isPlaceholderSecret(jwtSecret) ? 'ok' : 'warn',
+      message: secretByteLength(jwtSecret) >= 32 && !isPlaceholderSecret(jwtSecret)
+        ? undefined
+        : 'dev fallback JWT secret is active',
+    });
+  }
+  if (production && (secretByteLength(adminJwtSecret) < 32 || isPlaceholderSecret(adminJwtSecret))) {
+    addCheck(checks, {
+      name: 'secrets.adminJwt',
+      status: 'fail',
+      message: isPlaceholderSecret(adminJwtSecret)
+        ? 'production ADMIN_JWT_SECRET must replace the example placeholder'
+        : 'production requires ADMIN_JWT_SECRET with at least 32 bytes',
+    });
+  } else {
+    addCheck(checks, {
+      name: 'secrets.adminJwt',
+      status: secretByteLength(adminJwtSecret) >= 32 && !isPlaceholderSecret(adminJwtSecret) ? 'ok' : 'warn',
+      message: secretByteLength(adminJwtSecret) >= 32 && !isPlaceholderSecret(adminJwtSecret)
+        ? undefined
+        : 'admin auth uses development fallback secret',
+    });
+  }
+  if (production && jwtSecret && adminJwtSecret && jwtSecret === adminJwtSecret) {
+    addCheck(checks, {
+      name: 'secrets.adminJwtDistinct',
+      status: 'fail',
+      message: 'ADMIN_JWT_SECRET must be different from JWT_SECRET',
+    });
+  } else {
+    addCheck(checks, {
+      name: 'secrets.adminJwtDistinct',
+      status: jwtSecret && adminJwtSecret && jwtSecret === adminJwtSecret ? 'warn' : 'ok',
+      message: jwtSecret && adminJwtSecret && jwtSecret === adminJwtSecret
+        ? 'ADMIN_JWT_SECRET should differ from JWT_SECRET'
+        : undefined,
+    });
+  }
+  if (production && (secretByteLength(assetUrlSecret) < 32 || isPlaceholderSecret(assetUrlSecret))) {
+    addCheck(checks, {
+      name: 'secrets.assetUrl',
+      status: 'fail',
+      message: isPlaceholderSecret(assetUrlSecret)
+        ? 'production ASSET_URL_SECRET must replace the example placeholder'
+        : 'production requires ASSET_URL_SECRET with at least 32 bytes',
+    });
+  } else {
+    addCheck(checks, {
+      name: 'secrets.assetUrl',
+      status: secretByteLength(assetUrlSecret) >= 32 && !isPlaceholderSecret(assetUrlSecret) ? 'ok' : 'warn',
+      message: secretByteLength(assetUrlSecret) >= 32 && !isPlaceholderSecret(assetUrlSecret)
+        ? undefined
+        : 'signed media URLs use a development fallback secret',
+    });
+  }
+  if (
+    production
+    && assetUrlSecret
+    && (assetUrlSecret === jwtSecret || assetUrlSecret === adminJwtSecret)
+  ) {
+    addCheck(checks, {
+      name: 'secrets.assetUrlDistinct',
+      status: 'fail',
+      message: 'ASSET_URL_SECRET must be different from JWT_SECRET and ADMIN_JWT_SECRET',
+    });
+  } else {
+    addCheck(checks, {
+      name: 'secrets.assetUrlDistinct',
+      status: assetUrlSecret && (assetUrlSecret === jwtSecret || assetUrlSecret === adminJwtSecret) ? 'warn' : 'ok',
+      message: assetUrlSecret && (assetUrlSecret === jwtSecret || assetUrlSecret === adminJwtSecret)
+        ? 'ASSET_URL_SECRET should differ from JWT_SECRET and ADMIN_JWT_SECRET'
+        : undefined,
     });
   }
 }

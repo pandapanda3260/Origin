@@ -86,6 +86,7 @@
     "test:world-aspect-preference": "node scripts/test-world-aspect-preference-contract.mjs",
     "test:project-quota": "tsx scripts/test-project-quota.ts",
     "test:billing-autopay": "DB_PATH=${DB_PATH:-/tmp/qd-test-billing-autopay.sqlite} tsx scripts/test-billing-autopay.ts",
+    "test:production-secret-safety": "tsx scripts/test-production-secret-safety.ts",
     "prompt-eval:collect": "node scripts/prompt-sample-collect.mjs",
     "prompt-eval:report": "node scripts/prompt-eval.mjs",
     "start": "next start -p 3000",

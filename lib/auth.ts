@@ -6,15 +6,16 @@ import { compare, hash } from 'bcryptjs';
 import { jwtVerify, SignJWT } from 'jose';
 import type { NextRequest } from 'next/server';
 import { getDb, userToPublic, type UserRow } from './db';
+import { isProductionBuildPhase, isSecretUsableForCurrentPhase } from './secret-safety';
 import { clearUserAuthCache, isUserTokenStillValid } from './user-auth-cache';
 
 const SECRET = (() => {
   const env = process.env.JWT_SECRET;
-  if (env && env.length >= 32) return new TextEncoder().encode(env);
+  if (env && isSecretUsableForCurrentPhase(env)) return new TextEncoder().encode(env);
   // 生产环境：缺密钥或密钥过短 → 直接拒绝启动，避免用兜底密钥给攻击者自助伪造 token
-  if (process.env.NODE_ENV === 'production') {
+  if (process.env.NODE_ENV === 'production' && !isProductionBuildPhase()) {
     throw new Error(
-      '[auth] 生产环境必须设置 JWT_SECRET（≥32 字节）。请在环境变量中设置，然后重启服务。',
+      '[auth] 生产环境必须设置非占位 JWT_SECRET（≥32 字节）。请在环境变量中设置，然后重启服务。',
     );
   }
   console.warn('[auth] JWT_SECRET 未设置或长度不足 32 字节，开发环境使用兜底密钥。生产环境必须覆盖！');

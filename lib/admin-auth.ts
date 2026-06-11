@@ -3,6 +3,7 @@ import { jwtVerify, SignJWT } from 'jose';
 import type { NextRequest } from 'next/server';
 import { getDb, type AdminUserRow } from './db';
 import { ensureAdminPreviewUser } from './admin-shadow';
+import { isProductionBuildPhase, isSecretUsableForCurrentPhase } from './secret-safety';
 
 const ALG = 'HS256';
 const ADMIN_TOKEN_TTL = '12h';
@@ -42,12 +43,12 @@ function getAdminJwtSecret(): Uint8Array {
   if (adminSecret && userSecret && adminSecret === userSecret) {
     throw new Error('[admin-auth] ADMIN_JWT_SECRET must be different from JWT_SECRET.');
   }
-  if (adminSecret && adminSecret.length >= 32) {
+  if (adminSecret && isSecretUsableForCurrentPhase(adminSecret)) {
     cachedSecret = new TextEncoder().encode(adminSecret);
     return cachedSecret;
   }
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('[admin-auth] Production requires ADMIN_JWT_SECRET with at least 32 bytes.');
+  if (process.env.NODE_ENV === 'production' && !isProductionBuildPhase()) {
+    throw new Error('[admin-auth] Production requires non-placeholder ADMIN_JWT_SECRET with at least 32 bytes.');
   }
   if (!warnedDevSecret) {
     console.warn('[admin-auth] ADMIN_JWT_SECRET is missing or too short; using a development-only fallback.');

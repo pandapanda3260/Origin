@@ -85,6 +85,7 @@ run_isolated npm run test:visual-reference-state
 run_isolated npm run test:style-bible-runs
 run_isolated npm run test:provider-recovery
 run_isolated npm run test:online-editor-expiry
+run_isolated npm run test:production-secret-safety
 
 run_isolated npx tsx scripts/test-asset-library-backfill.ts
 run_isolated npx tsx scripts/test-asset-library-dual-write.ts

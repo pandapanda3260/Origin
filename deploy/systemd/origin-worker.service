@@ -6,11 +6,12 @@ After=network.target origin-web.service
 Type=simple
 WorkingDirectory=/opt/origin
 Environment=NODE_ENV=production
+Environment=ORIGIN_ENV_FILE=/etc/origin/origin.env
 Environment=ORIGIN_PROCESS_ROLE=worker
 Environment=ORIGIN_BATCH_RECOVERY_ENABLED=1
 Environment=ORIGIN_REAP_ORPHANS_ON_START=0
 Environment=ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD=1
-EnvironmentFile=-/etc/origin/origin.env
+EnvironmentFile=/etc/origin/origin.env
 ExecStart=/usr/bin/npm run worker
 Restart=always
 RestartSec=5

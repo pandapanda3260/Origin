@@ -45,7 +45,7 @@ The default pass criteria are lock/busy rate <= `0.1%`, write p99 <= `200ms`, an
 - Free disk under `ORIGIN_DATA_DIR`, with default warn threshold `min(20%, 10GiB)` and fail threshold `min(10%, 5GiB)`.
 - Storage mode and persistent-volume risk.
 - `needs_review` backlog against `ORIGIN_HEALTH_NEEDS_REVIEW_THRESHOLD`.
-- JWT production secret presence.
+- User JWT, admin JWT, and signed-media URL secret readiness. Production health fails on missing, duplicate, or example placeholder secrets.
 - VevDemo config completeness when enabled.
 - `origin-worker` heartbeat when `ORIGIN_EXPECT_WORKER=1`.
 
@@ -68,7 +68,7 @@ PM2:
 ```bash
 npm ci
 npm run build
-ORIGIN_APP_DIR=/opt/origin pm2 start deploy/pm2/ecosystem.config.cjs
+ORIGIN_ENV_FILE=/etc/origin/origin.env ORIGIN_APP_DIR=/opt/origin pm2 start deploy/pm2/ecosystem.config.cjs
 pm2 save
 sudo cp deploy/systemd/pm2-origin.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -81,7 +81,7 @@ systemd:
 
 ```bash
 sudo mkdir -p /etc/origin /var/lib/origin/data
-sudo cp deploy/origin.env.example /etc/origin/origin.env
+sudo install -m 600 deploy/origin.env.example /etc/origin/origin.env
 sudo cp deploy/systemd/origin-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now origin-web origin-worker
