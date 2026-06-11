@@ -10,6 +10,16 @@ const workspaceBaseUrl = (
   })()
 ).replace(/\/+$/, '');
 const workspaceSizeWarnBytes = Number(process.env.ORIGIN_WORKSPACE_SIZE_WARN_BYTES || 2 * 1024 * 1024);
+const workspaceShellWarnBytes = Number(process.env.ORIGIN_WORKSPACE_SHELL_WARN_BYTES || 2 * 1024 * 1024);
+
+function envFlag(name: string, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const normalized = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
 
 function sizeLabel(bytes: number) {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)}MB`;
@@ -31,11 +41,15 @@ async function resolveWorkspaceToken() {
   const directToken = (process.env.ORIGIN_WORKSPACE_SMOKE_TOKEN || '').trim();
   if (directToken) return directToken;
 
-  const username = (process.env.ORIGIN_WORKSPACE_SMOKE_USERNAME || '').trim();
+  const phone = (
+    process.env.ORIGIN_WORKSPACE_SMOKE_PHONE ||
+    process.env.ORIGIN_WORKSPACE_SMOKE_USERNAME ||
+    ''
+  ).trim();
   const password = process.env.ORIGIN_WORKSPACE_SMOKE_PASSWORD || '';
-  if (!username && !password) return null;
-  if (!username || !password) {
-    throw new Error('ORIGIN_WORKSPACE_SMOKE_USERNAME and ORIGIN_WORKSPACE_SMOKE_PASSWORD must be set together');
+  if (!phone && !password) return null;
+  if (!phone || !password) {
+    throw new Error('ORIGIN_WORKSPACE_SMOKE_PHONE and ORIGIN_WORKSPACE_SMOKE_PASSWORD must be set together');
   }
 
   const response = await fetch(`${workspaceBaseUrl}/api/auth/login`, {
@@ -44,7 +58,7 @@ async function resolveWorkspaceToken() {
       accept: 'application/json',
       'content-type': 'application/json',
     },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ phone, password }),
   });
   const { body } = await readJsonResponse(response);
   if (!response.ok || !body?.token) {
@@ -65,6 +79,40 @@ async function fetchWorkspaceJson(path: string, token: string) {
   return measured;
 }
 
+async function checkPublicWorkspaceSmoke() {
+  const workspaceResponse = await fetch(`${workspaceBaseUrl}/workspace`, {
+    headers: { accept: 'text/html' },
+  });
+  const workspaceHtml = await workspaceResponse.text();
+  if (!workspaceResponse.ok) throw new Error(`/workspace failed: http_${workspaceResponse.status}`);
+  const workspaceBytes = Buffer.byteLength(workspaceHtml);
+  const missingMarkers = [
+    'workspace-tailwind.css',
+    'fonts.css',
+    'main.js?v=',
+  ].filter((marker) => !workspaceHtml.includes(marker));
+  if (missingMarkers.length) {
+    throw new Error(`/workspace missing release asset markers: ${missingMarkers.join(', ')}`);
+  }
+  const workspacePrefix = workspaceBytes > workspaceShellWarnBytes ? 'warn' : 'ok';
+  const cacheControl = workspaceResponse.headers.get('cache-control') || '(missing)';
+  console.log(
+    `[health] ${workspacePrefix} workspace shell size=${sizeLabel(workspaceBytes)} cacheControl=${cacheControl}`,
+  );
+
+  const configResponse = await fetch(`${workspaceBaseUrl}/api/config/client`, {
+    headers: { accept: 'application/json' },
+  });
+  const configMeasured = await readJsonResponse(configResponse);
+  if (!configResponse.ok) throw new Error(`/api/config/client failed: http_${configResponse.status}`);
+  const hasFeatures = configMeasured.body && typeof configMeasured.body.features === 'object';
+  const hasLimits = configMeasured.body && typeof configMeasured.body.limits === 'object';
+  if (!hasFeatures || !hasLimits) {
+    throw new Error('/api/config/client missing features or limits object');
+  }
+  console.log(`[health] ok client config size=${sizeLabel(configMeasured.bytes)}`);
+}
+
 function extractProjectSummaries(body: any): any[] {
   if (Array.isArray(body)) return body;
   if (Array.isArray(body?.projects)) return body.projects;
@@ -75,7 +123,9 @@ function extractProjectSummaries(body: any): any[] {
 async function checkWorkspaceProjectSizes() {
   const token = await resolveWorkspaceToken();
   if (!token) {
-    console.log('[health] warn workspace-size skipped - set ORIGIN_WORKSPACE_SMOKE_TOKEN or username/password env');
+    const message = 'workspace-size skipped - set ORIGIN_WORKSPACE_SMOKE_TOKEN or phone/password env';
+    if (envFlag('ORIGIN_WORKSPACE_SMOKE_REQUIRED', false)) throw new Error(message);
+    console.log(`[health] warn ${message}`);
     return;
   }
 
@@ -106,6 +156,12 @@ async function main() {
     const body: any = await response.json().catch(() => ({}));
     const status = body?.status || `http_${response.status}`;
     console.log(`[health] ${status} ${baseUrl}`);
+    if (body?.release) {
+      const release = body.release;
+      console.log(
+        `[health] release releaseId=${release.releaseId || 'unknown'} revision=${release.revision || 'unknown'} buildId=${release.buildId || 'unknown'}`,
+      );
+    }
     if (Array.isArray(body?.checks)) {
       for (const check of body.checks) {
         const prefix = check.status === 'ok' ? 'ok' : check.status === 'warn' ? 'warn' : 'fail';
@@ -115,9 +171,10 @@ async function main() {
     if (!response.ok || body?.ok === false) process.exit(1);
 
     try {
+      await checkPublicWorkspaceSmoke();
       await checkWorkspaceProjectSizes();
     } catch (e: any) {
-      console.error(`[health] workspace-size failed: ${e?.message || String(e)}`);
+      console.error(`[health] workspace smoke failed: ${e?.message || String(e)}`);
       process.exit(1);
     }
   } catch (e: any) {

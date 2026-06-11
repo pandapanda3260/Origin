@@ -17,6 +17,11 @@ process.env.ORIGIN_ENV_FILE = emptyEnv;
 process.env.ORIGIN_DATA_DIR = join(tempDir, 'data');
 process.env.DB_PATH = join(tempDir, 'data', 'qd.sqlite');
 process.env.ORIGIN_EXPECT_WORKER = '0';
+process.env.ORIGIN_PROCESS_ROLE = 'web';
+process.env.ORIGIN_ALLOW_INSECURE_DOWNLOAD = '0';
+process.env.ORIGIN_BATCH_INLINE_RUNNER = '0';
+process.env.ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD = '0';
+process.env.ORIGIN_REAP_ORPHANS_ON_START = '0';
 process.env.ONLINE_EDITOR_ENABLED = '0';
 process.env.BILLING_DEV_AUTOPAY = '0';
 
@@ -49,6 +54,27 @@ async function main() {
   assert.equal(validSecretChecks.get('secrets.adminJwtDistinct')?.status, 'ok');
   assert.equal(validSecretChecks.get('secrets.assetUrl')?.status, 'ok');
   assert.equal(validSecretChecks.get('secrets.assetUrlDistinct')?.status, 'ok');
+  assert.equal(validSecretChecks.get('runtime.productionGuards')?.status, 'fail');
+  assert.match(validSecretChecks.get('runtime.productionGuards')?.message || '', /ORIGIN_EXPECT_WORKER/);
+
+  process.env.ORIGIN_EXPECT_WORKER = '1';
+  health = getRuntimeHealth();
+  let productionGuardChecks = new Map(health.checks.map((check) => [check.name, check]));
+  assert.equal(productionGuardChecks.get('runtime.productionGuards')?.status, 'ok');
+
+  process.env.BILLING_DEV_AUTOPAY = '1';
+  health = getRuntimeHealth();
+  productionGuardChecks = new Map(health.checks.map((check) => [check.name, check]));
+  assert.equal(productionGuardChecks.get('runtime.productionGuards')?.status, 'fail');
+  assert.match(productionGuardChecks.get('runtime.productionGuards')?.message || '', /BILLING_DEV_AUTOPAY/);
+
+  process.env.BILLING_DEV_AUTOPAY = '0';
+  process.env.ORIGIN_BATCH_INLINE_RUNNER = '1';
+  health = getRuntimeHealth();
+  productionGuardChecks = new Map(health.checks.map((check) => [check.name, check]));
+  assert.equal(productionGuardChecks.get('runtime.productionGuards')?.status, 'fail');
+  assert.match(productionGuardChecks.get('runtime.productionGuards')?.message || '', /ORIGIN_BATCH_INLINE_RUNNER/);
+  process.env.ORIGIN_BATCH_INLINE_RUNNER = '0';
 
   process.env.ADMIN_JWT_SECRET = process.env.JWT_SECRET;
   health = getRuntimeHealth();

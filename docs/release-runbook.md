@@ -11,13 +11,21 @@ Before first launch on a new server, create `/etc/origin/origin.env` from `deplo
 Run from the repository root:
 
 ```bash
-npm ci
-npm run verify:release:local
+bash scripts/build-release-artifact.sh
 ```
 
-`verify:release:local` runs TypeScript, the local deterministic test set, the workspace CSS build, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
+`build-release-artifact.sh` runs `npm ci`, then `verify:release:local`, then packages the checked commit plus the generated `.next` output into `tmp/release-artifacts/origin-<release-id>.tar.gz` with a `.sha256` checksum. Prefer running it on Linux CI or a Linux staging host so the build environment matches production. `verify:release:local` runs TypeScript, the local deterministic test set, the workspace CSS build, and `next build` with a temporary SQLite database and an empty external env file. It also clears provider API key env vars for the child process so release verification does not submit real image/video/model jobs.
 
 The workspace page uses local generated assets instead of runtime CDN CSS/fonts. Make sure release artifacts include `public/fonts.css`, `public/workspace-tailwind.css`, `public/vendor/fonts/`, `public/workspace-tailwind.src.css`, and `tailwind.workspace.config.cjs`.
+
+`npm run health:production` always checks the anonymous workspace shell and `/api/config/client`. To make the authenticated workspace smoke a hard release gate, configure either `ORIGIN_WORKSPACE_SMOKE_TOKEN` or both `ORIGIN_WORKSPACE_SMOKE_PHONE` and `ORIGIN_WORKSPACE_SMOKE_PASSWORD`, then set `ORIGIN_WORKSPACE_SMOKE_REQUIRED=1`. Use a dedicated smoke account, not a real customer account.
+
+When using phone/password smoke credentials, provision or rotate the account on the target environment after sourcing its env file:
+
+```bash
+set -a && . /etc/origin/origin.env && set +a
+npm run provision:workspace-smoke
+```
 
 `npm run lint` is not a release gate yet: the script exists, but this repository has no ESLint config or ESLint dependency, so `next lint` prompts for interactive setup.
 
@@ -93,7 +101,7 @@ npm ci
 npm run build:workspace-css
 npm run verify:release:local
 ORIGIN_ENV_FILE=/etc/origin/origin.env ORIGIN_APP_DIR=/opt/origin-staging pm2 start deploy/pm2/ecosystem.config.cjs --update-env
-ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
+ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health ORIGIN_WORKSPACE_SMOKE_REQUIRED=1 npm run health:production
 ```
 
 Smoke test staging:
@@ -101,22 +109,25 @@ Smoke test staging:
 ```bash
 curl -f http://127.0.0.1:3000/workspace >/dev/null
 curl -f http://127.0.0.1:3000/api/config/client >/dev/null
-ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
+ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health ORIGIN_WORKSPACE_SMOKE_REQUIRED=1 npm run health:production
 ```
 
 Also check the browser-visible flows that changed in this release: workspace load, storyboard/material panels, first-frame editor draft save/restore, video prompt generation state, admin token stats, admin time stats, and protected image thumbnails.
 
 ## Production rollout
 
-Do not deploy uncommitted local state. Commit the release, record the commit SHA, and upload the release into a staging directory on the server. Because current production systemd units point directly at `/opt/origin`, build the new code outside `/opt/origin`, then swap directories during a short maintenance window.
+Do not deploy uncommitted local state. Commit the release, build one release artifact, record the release id and commit SHA, and upload the artifact plus its `.sha256` file to the server. Because current production systemd units point directly at `/opt/origin`, extract the artifact outside `/opt/origin`, then swap directories during a short maintenance window. Do not run `next build` again on production; production should consume the already-built `.next` output from the artifact.
 
 ```bash
-# on server, after uploading/extracting the release into /opt/origin-next-<release-id>
+# on server, after uploading origin-<release-id>.tar.gz and .sha256
+cd /opt
+sha256sum -c /path/to/origin-<release-id>.tar.gz.sha256
+mkdir -p /opt/origin-next-<release-id>
+tar -xzf /path/to/origin-<release-id>.tar.gz -C /opt/origin-next-<release-id>
+
 cd /opt/origin-next-<release-id>
 set -a && . /etc/origin/origin.env && set +a
 npm ci
-npm run build:workspace-css
-npm run build
 
 cp -a /opt/origin/vevdemo-1.0.6 ./vevdemo-1.0.6
 
@@ -129,7 +140,7 @@ mv /opt/origin /opt/origin-backups/origin-<previous-release-id>
 mv /opt/origin-next-<release-id> /opt/origin
 systemctl start origin-web
 systemctl start origin-worker
-ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
+ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health ORIGIN_WORKSPACE_SMOKE_REQUIRED=1 npm run health:production
 ```
 
 Do not use the PM2 rollout command unless production has first been switched back to `pm2-origin.service` or a PM2-managed process list.
@@ -142,7 +153,7 @@ After reload:
 systemctl is-active origin-web origin-worker nginx
 journalctl -u origin-web -n 100 --no-pager
 journalctl -u origin-worker -n 100 --no-pager
-ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
+ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health ORIGIN_WORKSPACE_SMOKE_REQUIRED=1 npm run health:production
 curl -f http://127.0.0.1:3000/workspace >/dev/null
 curl -f http://127.0.0.1:3000/api/config/client >/dev/null
 ```
@@ -204,7 +215,7 @@ mv /opt/origin /opt/origin-failed-<release-id>
 mv /opt/origin-backups/origin-<previous-release-id> /opt/origin
 systemctl start origin-web
 systemctl start origin-worker
-ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health npm run health:production
+ORIGIN_HEALTH_URL=http://127.0.0.1:3000/api/health ORIGIN_WORKSPACE_SMOKE_REQUIRED=1 npm run health:production
 ```
 
 Restore SQLite only if the new code wrote data that the previous code cannot tolerate, or if health/smoke tests show data corruption. Restore from a backup created with `npm run backup:sqlite`, stop web and worker before restore, then start both again.

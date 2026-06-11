@@ -92,6 +92,7 @@
     "start": "next start -p 3000",
     "worker": "tsx scripts/origin-worker.ts",
     "health:production": "tsx scripts/check-production-health.ts",
+    "provision:workspace-smoke": "tsx scripts/provision-workspace-smoke-user.ts",
     "backup:sqlite": "tsx scripts/backup-sqlite.ts",
     "migrate:shot-plan-legacy": "tsx scripts/migrate-shot-plan-legacy.ts",
     "stress:sqlite": "tsx scripts/stress-sqlite-durable.ts",

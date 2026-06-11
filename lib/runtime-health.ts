@@ -1,4 +1,4 @@
-import { constants, existsSync, mkdirSync, statSync, statfsSync, accessSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, readFileSync, statSync, statfsSync, accessSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { getDb } from './db';
 import { getExternalEnvLoadResult, getExternalEnvValue, loadExternalEnv } from './env';
@@ -13,6 +13,23 @@ type Check = {
   message?: string;
   detail?: any;
 };
+
+function readReleaseFile(...parts: string[]) {
+  try {
+    const value = readFileSync(join(process.cwd(), ...parts), 'utf8').trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+function readReleaseIdentity() {
+  return {
+    releaseId: readReleaseFile('RELEASE_ID'),
+    revision: readReleaseFile('REVISION'),
+    buildId: readReleaseFile('.next', 'BUILD_ID'),
+  };
+}
 
 function envFlag(name: string, fallback: boolean) {
   const raw = process.env[name] || process.env[`ORIGIN_${name}`];
@@ -356,6 +373,52 @@ function checkStorageMode(checks: Check[]) {
   });
 }
 
+function checkProductionRuntimeGuards(checks: Check[]) {
+  const production = process.env.NODE_ENV === 'production';
+  if (!production) {
+    addCheck(checks, { name: 'runtime.productionGuards', status: 'ok', message: 'non-production runtime' });
+    return;
+  }
+
+  const role = process.env.ORIGIN_PROCESS_ROLE || 'web';
+  const violations: string[] = [];
+  if (envFlag('BILLING_DEV_AUTOPAY', false)) {
+    violations.push('BILLING_DEV_AUTOPAY must be off in production');
+  }
+  if (envFlag('ALLOW_INSECURE_DOWNLOAD', false)) {
+    violations.push('ORIGIN_ALLOW_INSECURE_DOWNLOAD must be off in production');
+  }
+  if (!envFlag('EXPECT_WORKER', true)) {
+    violations.push('ORIGIN_EXPECT_WORKER must stay on in production');
+  }
+  if (role === 'web') {
+    if (envFlag('BATCH_INLINE_RUNNER', false)) {
+      violations.push('ORIGIN_BATCH_INLINE_RUNNER must be off for production web');
+    }
+    if (envFlag('INLINE_ONLINE_EDITOR_DOWNLOAD', false)) {
+      violations.push('ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD must be off for production web');
+    }
+    if (envFlag('REAP_ORPHANS_ON_START', false)) {
+      violations.push('ORIGIN_REAP_ORPHANS_ON_START must be off for production web');
+    }
+  }
+
+  addCheck(checks, {
+    name: 'runtime.productionGuards',
+    status: violations.length ? 'fail' : 'ok',
+    message: violations.length ? violations.join('; ') : undefined,
+    detail: {
+      role,
+      billingDevAutopay: envFlag('BILLING_DEV_AUTOPAY', false),
+      allowInsecureDownload: envFlag('ALLOW_INSECURE_DOWNLOAD', false),
+      expectWorker: envFlag('EXPECT_WORKER', true),
+      batchInlineRunner: envFlag('BATCH_INLINE_RUNNER', false),
+      inlineOnlineEditorDownload: envFlag('INLINE_ONLINE_EDITOR_DOWNLOAD', false),
+      reapOrphansOnStart: envFlag('REAP_ORPHANS_ON_START', false),
+    },
+  });
+}
+
 export function getRuntimeHealth() {
   loadExternalEnv();
   const checks: Check[] = [];
@@ -368,6 +431,7 @@ export function getRuntimeHealth() {
   checkOnlineEditor(checks);
   checkOnlineEditorMaterialRegistration(checks);
   checkWorkerHeartbeat(checks);
+  checkProductionRuntimeGuards(checks);
 
   const hasFail = checks.some((check) => check.status === 'fail');
   const hasWarn = checks.some((check) => check.status === 'warn');
@@ -375,6 +439,7 @@ export function getRuntimeHealth() {
     ok: !hasFail,
     status: hasFail ? 'fail' : hasWarn ? 'degraded' : 'ok',
     role: process.env.ORIGIN_PROCESS_ROLE || 'web',
+    release: readReleaseIdentity(),
     env: {
       nodeEnv: process.env.NODE_ENV || null,
       external: getExternalEnvLoadResult(),

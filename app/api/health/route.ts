@@ -15,6 +15,7 @@ export async function GET() {
         ok: health.ok,
         status: health.status,
         role: health.role,
+        release: health.release,
         checks: health.checks.map((check) => ({
           name: check.name,
           status: check.status,

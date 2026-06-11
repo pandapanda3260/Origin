@@ -10,17 +10,20 @@
 #
 # The host/key are pinned to the values the user gave; override via env if needed.
 
-set -u
-
-OUT_FILE="${OUT_FILE:-/Users/mark/Documents/origin/scripts/check-prod-vs-local.out}"
-exec > >(tee "$OUT_FILE") 2>&1
-echo "# Output is also being written to: $OUT_FILE"
-echo "# Started at $(date)"
-
 HOST="${ORIGIN_HOST:-115.190.238.3}"
 USER_NAME="${ORIGIN_USER:-root}"
 KEY="${ORIGIN_KEY:-/Users/mark/Documents/key/origin2.pem}"
 LOCAL_REPO="${LOCAL_REPO:-/Users/mark/Documents/origin}"
+
+set -u
+
+DEFAULT_OUT_DIR="${ORIGIN_DIFF_OUT_DIR:-$LOCAL_REPO/tmp}"
+DEFAULT_OUT_FILE="$DEFAULT_OUT_DIR/check-prod-vs-local-$(date +%Y%m%dT%H%M%S).out"
+OUT_FILE="${OUT_FILE:-$DEFAULT_OUT_FILE}"
+mkdir -p "$(dirname "$OUT_FILE")"
+exec > >(tee "$OUT_FILE") 2>&1
+echo "# Output is also being written to: $OUT_FILE"
+echo "# Started at $(date)"
 
 SSH_OPTS=(-i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o BatchMode=yes)
 
@@ -36,6 +39,11 @@ run_remote() {
 }
 
 # -------- LOCAL --------
+LOCAL_REVISION="$(cd "$LOCAL_REPO" && git rev-parse HEAD 2>/dev/null || true)"
+LOCAL_BRANCH="$(cd "$LOCAL_REPO" && git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+LOCAL_BUILD_ID="$(cd "$LOCAL_REPO" && cat .next/BUILD_ID 2>/dev/null || true)"
+LOCAL_DIRTY_COUNT="$(cd "$LOCAL_REPO" && git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+
 section "LOCAL: host + node + git"
 echo "-- uname / sw_vers --"
 uname -a
@@ -45,6 +53,12 @@ node --version 2>/dev/null || echo "(no node on PATH)"
 npm --version 2>/dev/null || echo "(no npm on PATH)"
 echo "-- git HEAD --"
 ( cd "$LOCAL_REPO" && git rev-parse --abbrev-ref HEAD && git log --oneline -5 && git status --short )
+
+section "LOCAL: release identity"
+echo "branch=${LOCAL_BRANCH:-unknown}"
+echo "revision=${LOCAL_REVISION:-unknown}"
+echo "build_id=${LOCAL_BUILD_ID:-none}"
+echo "dirty_files=${LOCAL_DIRTY_COUNT:-unknown}"
 
 section "LOCAL: build artifacts"
 ( cd "$LOCAL_REPO" && \
@@ -73,6 +87,10 @@ if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 "${USER_NAME}@${HOST}" 'echo ok' 
   exit 0
 fi
 
+REMOTE_RELEASE_ID="$(run_remote 'cat /opt/origin/RELEASE_ID 2>/dev/null || true' | tr -d '\r' | head -1)"
+REMOTE_REVISION="$(run_remote 'cat /opt/origin/REVISION 2>/dev/null || (cd /opt/origin && git rev-parse HEAD 2>/dev/null) || true' | tr -d '\r' | head -1)"
+REMOTE_BUILD_ID="$(run_remote 'cat /opt/origin/.next/BUILD_ID 2>/dev/null || true' | tr -d '\r' | head -1)"
+
 section "REMOTE: host + kernel + uptime"
 run_remote 'uname -a; cat /etc/os-release 2>/dev/null | head -6; uptime; date'
 
@@ -91,8 +109,11 @@ run_remote 'ss -tlnp 2>/dev/null | grep -E ":3000|:80|:443" || (netstat -tlnp 2>
 section "REMOTE: /opt/origin layout"
 run_remote 'ls -la /opt/origin 2>/dev/null | head -40; echo; echo "-- backups --"; ls -la /opt/origin-backups 2>/dev/null | head -10'
 
-section "REMOTE: deployed git HEAD"
-run_remote 'cd /opt/origin && git rev-parse --abbrev-ref HEAD 2>/dev/null; git log --oneline -5 2>/dev/null; git status --short 2>/dev/null'
+section "REMOTE: deployed source identity"
+echo "release_id=${REMOTE_RELEASE_ID:-unknown}"
+echo "revision=${REMOTE_REVISION:-unknown}"
+echo "build_id=${REMOTE_BUILD_ID:-none}"
+run_remote 'cd /opt/origin && if [ -d .git ]; then git rev-parse --abbrev-ref HEAD 2>/dev/null; git log --oneline -5 2>/dev/null; git status --short 2>/dev/null; else echo "(release archive has no .git directory; using RELEASE_ID/REVISION files)"; fi'
 
 section "REMOTE: deployed BUILD_ID + .next mtime"
 run_remote 'cat /opt/origin/.next/BUILD_ID 2>/dev/null; stat -c "mtime=%y size=%s" /opt/origin/.next/BUILD_ID 2>/dev/null'
@@ -124,6 +145,24 @@ run_remote 'echo "--- worker ---"; journalctl -u origin-worker -n 30 --no-pager 
 
 section "REMOTE: nginx config presence"
 run_remote 'ls /etc/nginx/sites-enabled/ 2>/dev/null; nginx -t 2>&1 | head -5'
+
+section "SUMMARY: release parity"
+echo "local_revision=${LOCAL_REVISION:-unknown}"
+echo "remote_revision=${REMOTE_REVISION:-unknown}"
+if [ -n "${LOCAL_REVISION:-}" ] && [ -n "${REMOTE_REVISION:-}" ] && [ "$LOCAL_REVISION" = "$REMOTE_REVISION" ]; then
+  echo "revision_match=ok"
+else
+  echo "revision_match=warn"
+fi
+echo "local_build_id=${LOCAL_BUILD_ID:-none}"
+echo "remote_build_id=${REMOTE_BUILD_ID:-none}"
+if [ -n "${LOCAL_BUILD_ID:-}" ] && [ -n "${REMOTE_BUILD_ID:-}" ] && [ "$LOCAL_BUILD_ID" = "$REMOTE_BUILD_ID" ]; then
+  echo "build_id_match=ok"
+else
+  echo "build_id_match=info"
+  echo "build_id_note=different build ids are expected when local and production build separately; same-artifact deployment should make them match"
+fi
+echo "local_dirty_files=${LOCAL_DIRTY_COUNT:-unknown}"
 
 section "DONE"
 echo "Finished at $(date)"

@@ -40,12 +40,14 @@ The default pass criteria are lock/busy rate <= `0.1%`, write p99 <= `200ms`, an
 
 `GET /api/health` is safe for process managers. It checks:
 
+- Release identity from `RELEASE_ID`, `REVISION`, and `.next/BUILD_ID`.
 - SQLite can open and query.
 - `ORIGIN_DATA_DIR` is readable and writable.
 - Free disk under `ORIGIN_DATA_DIR`, with default warn threshold `min(20%, 10GiB)` and fail threshold `min(10%, 5GiB)`.
 - Storage mode and persistent-volume risk.
 - `needs_review` backlog against `ORIGIN_HEALTH_NEEDS_REVIEW_THRESHOLD`.
 - User JWT, admin JWT, and signed-media URL secret readiness. Production health fails on missing, duplicate, or example placeholder secrets.
+- Production runtime guardrails: simulated payment must be off, insecure downloads must be off, worker expectation must be on, and the web process must not own long-running job runners.
 - VevDemo config completeness when enabled.
 - `origin-worker` heartbeat when `ORIGIN_EXPECT_WORKER=1`.
 
