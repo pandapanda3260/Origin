@@ -2595,6 +2595,46 @@ function _buildVevSubtitleCues(project, entries) {
   return cues;
 }
 
+function _buildCurrentVevSubtitlePlan() {
+  const project = _oeCtx?.getProject?.();
+  const edl = project?.editData?.edl;
+  const timeline = Array.isArray(edl?.timeline) ? edl.timeline : [];
+  if (!project?.id || !timeline.length) return null;
+
+  const entries = [];
+  let cursorSec = 0;
+  timeline.forEach((entry, index) => {
+    if (!entry) return;
+    const inSec = _roundVevSyncSec(entry?.inPoint ?? entry?.in ?? 0);
+    let outSec = Number(entry?.outPoint ?? entry?.out);
+    if (!Number.isFinite(outSec) || outSec <= inSec) {
+      outSec = Number(entry?.duration) > 0 ? inSec + Number(entry.duration) : inSec;
+    }
+    outSec = _roundVevSyncSec(outSec);
+    const durationSec = Math.max(0.1, outSec - inSec);
+    const groupIdx = entry._isExternalMedia === true
+      ? null
+      : (Number.isInteger(Number(entry?.groupIdx)) ? Number(entry.groupIdx) : null);
+    if (groupIdx !== null) {
+      entries.push({
+        index,
+        groupIdx,
+        targetStartSec: cursorSec,
+        targetEndSec: cursorSec + durationSec,
+      });
+    }
+    cursorSec += durationSec;
+  });
+
+  return {
+    projectId: project.id,
+    edlVersion: Number(edl?.version) || 0,
+    totalDurationSec: cursorSec,
+    subtitles: _buildVevSubtitleCues(project, entries),
+    canvas: _resolveVevCanvasForProject(project),
+  };
+}
+
 function _formatSrtTimestamp(sec) {
   const value = Math.max(0, Number(sec) || 0);
   const totalMs = Math.round(value * 1000);
@@ -2866,7 +2906,7 @@ async function _importCurrentVevSubtitlesToVevDemo(plan, options) {
   } catch (err) {
     console.warn('[OnlineEditor] VevDemo 字幕素材导入未完成:', err);
     if (!options.silent) {
-      _oeCtx?.showToast?.(`字幕素材导入失败：${_subtitleImportFailureText(err)}；视频/BGM 已完成铺轨`, 'warning');
+      _oeCtx?.showToast?.(`字幕素材导入失败：${_subtitleImportFailureText(err)}`, 'warning');
     }
     return { error: err };
   }
@@ -2887,47 +2927,22 @@ async function importCurrentSubtitlesToVevDemo(options) {
   try {
     _setSubtitleImportBusy(true);
     await _ensureCurrentVideosEdlForVevDemo({ silent, source: options.source || 'manual-subtitle-import' });
-    const ids = _collectCurrentEdlVideoResourceIds();
-    const bgmTrackIds = _collectCurrentBgmTrackIds();
-    if (!ids.length && !bgmTrackIds.length) {
-      if (!silent) _oeCtx?.showToast?.('当前没有可定位字幕时间线的视频素材，请先同步素材', 'warning');
-      return null;
-    }
-
-    const payload = await _postMaterialImport({
-      projectId: _oeCtx?.getProject?.()?.id,
-      resourceIds: ids,
-      bgmTrackIds,
-      autoRegister: false,
-    });
-    const materials = Array.isArray(payload?.materials)
-      ? payload.materials.filter((item) => _isVevUsableMaterial(item))
-      : [];
-    if (!materials.length) {
-      if (!silent) _oeCtx?.showToast?.('还没有可用的剪辑器素材，请先点同步素材，等视频/BGM 完成后再导入字幕', 'warning');
-      return { blocked: true, reason: 'materials_not_ready', payload };
-    }
-
-    const scopedMaterials = _assertVevMaterialsBelongToBoundProject(materials, options.source || 'manual-subtitle-import');
-    const plan = _buildCurrentVevTimelinePlan(scopedMaterials);
-    if (plan?.ok === false) {
-      if (!silent) _oeCtx?.showToast?.(plan.message || '部分素材还没同步到 VevDemo，暂不能导入字幕', 'warning');
-      return { blocked: true, plan };
-    }
+    const plan = _buildCurrentVevSubtitlePlan();
     if (!plan || !Array.isArray(plan.subtitles) || !plan.subtitles.length) {
       if (!silent) _oeCtx?.showToast?.('当前项目没有可导入的字幕文本', 'info');
       return null;
     }
 
-    const result = await _importCurrentVevSubtitlesToVevDemo(plan, {
+    const importResult = await _importCurrentVevSubtitlesToVevDemo(plan, {
       silent,
-      materials: scopedMaterials,
-      vevSpace: _resolveSubtitleVevSpace(scopedMaterials),
+      vevSpace: _cleanOnlineEditorText(_vevDemoBoundVevSpace) || 'origin',
     });
-    if (result?.ok && !silent) {
+    if (!importResult?.ok) return importResult;
+
+    if (!silent) {
       _oeCtx?.showToast?.('字幕已导入剪辑器素材库', 'success');
     }
-    return result;
+    return importResult;
   } catch (err) {
     console.warn('[OnlineEditor] 手动字幕导入失败:', err);
     if (!silent) _oeCtx?.showToast?.(`字幕素材导入失败：${_subtitleImportFailureText(err)}`, 'warning');

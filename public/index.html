@@ -383,6 +383,28 @@
   /* 隐藏 Safari 在手机号字段右侧塞的"通讯录自动填充"图标 */
   #m_loginPhone::-webkit-contacts-auto-fill-button,
   #m_regPhone::-webkit-contacts-auto-fill-button { visibility:hidden !important; display:none !important; pointer-events:none; position:absolute; right:0; }
+  /* 统一 Chrome 自动填充与密码掩码的视觉，避免浏览器默认白底或长度泄露感的点阵。 */
+  #authModal input:-webkit-autofill,
+  #authModal input:-webkit-autofill:hover,
+  #authModal input:-webkit-autofill:focus,
+  #authModal input:-webkit-autofill:active {
+    -webkit-text-fill-color:#fff !important;
+    caret-color:#fff;
+    background-color:transparent !important;
+    background-image:none !important;
+    transition:background-color 9999s ease-out,color 9999s ease-out;
+  }
+  .m-secret-input { position:relative; width:100%; min-height:28px; display:flex; align-items:center; justify-content:center; }
+  .m-secret-input .m-secret-control { position:relative; z-index:1; }
+  .m-secret-mask { position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; gap:11px; opacity:0; pointer-events:none; transition:opacity 0.12s ease; }
+  .m-secret-mask i { width:7px; height:7px; border-radius:9999px; background:rgba(255,255,255,0.32); box-shadow:0 0 10px rgba(255,255,255,0.08); }
+  #authModal .m-secret-input.is-filled:not(.is-focused) .m-secret-control {
+    opacity:0;
+    color:transparent !important;
+    -webkit-text-fill-color:transparent !important;
+    caret-color:#fff;
+  }
+  #authModal .m-secret-input.is-filled:not(.is-focused) .m-secret-mask { opacity:1; }
   /* 导航项中文与"登录/注册"同一水平线:英文副标改为绝对定位,不再把中文顶上去 */
   #navLinks > a { position:relative; }
   #navLinks > a > span:last-child { position:absolute; top:100%; left:50%; transform:translateX(-50%); margin-top:1px; white-space:nowrap; }
@@ -536,7 +558,10 @@
       <div class="m-glass absolute right-0 w-60 h-60 rounded-full z-20">
         <div class="m-face-front p-8">
           <label id="m_loginSecretLabel" class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">密码 · Password</label>
-          <input id="m_loginPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.4em] p-0 placeholder:text-white/20 w-full text-xl" placeholder="••••••••" type="password" autocomplete="current-password" aria-label="登录密码"/>
+          <div class="m-secret-input">
+            <input id="m_loginPwd" class="m-secret-control bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.4em] p-0 placeholder:text-white/20 w-full text-xl" placeholder="••••••••" type="password" autocomplete="current-password" aria-label="登录密码"/>
+            <span class="m-secret-mask" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+          </div>
           <div class="m-otp-row mt-4" id="m_loginOtpRow" hidden>
             <input id="m_loginOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="6位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="登录验证码"/>
             <button id="m_loginOtpSendBtn" class="m-otp-send" type="button" onclick="handleLoginOtpSend()">发送验证码</button>
@@ -552,7 +577,10 @@
         </div>
         <div class="m-face-back p-7">
           <label class="text-[9px] font-black uppercase tracking-widest text-white/50 mb-2">设置密码 · Set Password</label>
-          <input id="m_regPwd" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.25em] p-0 placeholder:text-white/25 w-full text-base" placeholder="••••••••" type="password" autocomplete="new-password" aria-label="注册密码"/>
+          <div class="m-secret-input">
+            <input id="m_regPwd" class="m-secret-control bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.25em] p-0 placeholder:text-white/25 w-full text-base" placeholder="••••••••" type="password" autocomplete="new-password" aria-label="注册密码"/>
+            <span class="m-secret-mask" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+          </div>
           <div class="m-otp-row mt-4">
             <input id="m_regOtp" class="bg-transparent border-none focus:ring-0 text-center text-white font-mono tracking-[0.3em] p-0 placeholder:text-white/20 w-full text-base" placeholder="6位验证码" type="text" inputmode="numeric" autocomplete="one-time-code" aria-label="注册验证码"/>
             <button id="m_otpSendBtn" class="m-otp-send" type="button" onclick="handleSendOtp()">发送验证码</button>
@@ -633,6 +661,39 @@ function _focusModeField(delay) {
   }, delay || 0);
 }
 
+function _syncSecretMasks() {
+  document.querySelectorAll('#authModal .m-secret-control').forEach(function(input) {
+    var wrap = input.closest ? input.closest('.m-secret-input') : input.parentElement;
+    if (!wrap) return;
+    var autofilled = false;
+    try { autofilled = input.matches(':-webkit-autofill'); } catch (_) { autofilled = false; }
+    var filled = (!!input.value || autofilled) && !input.hidden && !input.disabled && !wrap.hidden;
+    wrap.classList.toggle('is-filled', filled);
+    wrap.classList.toggle('is-focused', document.activeElement === input);
+  });
+}
+
+function _setSecretVisible(input, visible) {
+  if (!input) return;
+  input.hidden = !visible;
+  input.disabled = !visible;
+  var wrap = input.closest ? input.closest('.m-secret-input') : input.parentElement;
+  if (wrap && wrap.classList && wrap.classList.contains('m-secret-input')) wrap.hidden = !visible;
+  _syncSecretMasks();
+}
+
+(function mountSecretMasks() {
+  var inputs = document.querySelectorAll('#authModal .m-secret-control');
+  inputs.forEach(function(input) {
+    ['input','change','focus','blur'].forEach(function(eventName) {
+      input.addEventListener(eventName, _syncSecretMasks);
+    });
+  });
+  [0, 80, 250, 600, 1200].forEach(function(delay) {
+    setTimeout(_syncSecretMasks, delay);
+  });
+})();
+
 function _isAnyOtpBusy() {
   return _otpBusy || _loginOtpBusy || _resetOtpBusy;
 }
@@ -705,6 +766,7 @@ function openAuthModal(e) {
   document.getElementById('authModal').classList.add('show');
   document.body.style.overflow = 'hidden';
   _swapFaces(_isFlipped);
+  [0, 120, 500].forEach(function(delay) { setTimeout(_syncSecretMasks, delay); });
   _focusModeField(80);
 }
 
@@ -807,8 +869,7 @@ function setLoginMode(mode) {
   var pwd = document.getElementById('m_loginPwd');
   if (label) label.textContent = _loginMode === 'otp' ? '验证码 · Code' : '密码 · Password';
   if (pwd) {
-    pwd.hidden = _loginMode !== 'password';
-    pwd.disabled = _loginMode !== 'password';
+    _setSecretVisible(pwd, _loginMode === 'password');
     pwd.type = 'password';
     pwd.placeholder = '••••••••';
     pwd.autocomplete = 'current-password';
@@ -834,13 +895,13 @@ function startResetPassword() {
   var pwd = document.getElementById('m_loginPwd');
   if (label) label.textContent = '新密码 · Reset';
   if (pwd) {
-    pwd.hidden = false;
-    pwd.disabled = false;
+    _setSecretVisible(pwd, true);
     pwd.type = 'password';
     pwd.placeholder = '新密码';
     pwd.autocomplete = 'new-password';
     pwd.setAttribute('aria-label', '新密码');
     try { pwd.focus({ preventScroll:true }); } catch (_) { try { pwd.focus(); } catch (_) {} }
+    _syncSecretMasks();
   }
   _setHidden('m_loginModeSwitch', true);
   _setLoginOtpPanel(false);
