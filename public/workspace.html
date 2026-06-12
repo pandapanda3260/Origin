@@ -70,7 +70,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=244" />
+    <link rel="stylesheet" href="styles.css?v=245" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -1852,7 +1852,7 @@
                     "/modules/loading.js": "/modules/loading.js?v=300",
                     "/modules/material_image_panel.js": "/modules/material_image_panel.js?v=105",
                     "/modules/module_singleton_guard.js": "/modules/module_singleton_guard.js?v=1",
-                    "/modules/online_editor.js": "/modules/online_editor.js?v=29",
+                    "/modules/online_editor.js": "/modules/online_editor.js?v=30",
                     "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
                     "/modules/project.js": "/modules/project.js?v=108",
                     "/modules/render_hooks.js": "/modules/render_hooks.js?v=301",
@@ -2034,10 +2034,6 @@
       <div class="oe-app-actions">
         <div id="oeExportStatusSlot" class="oe-export-status-slot" hidden></div>
         <span id="oeSyncHint" class="oe-sync-hint" hidden>把素材推送到剪辑器</span>
-        <button type="button" id="oeBtnImportSubtitles" hidden class="oe-sync-btn oe-subtitle-import-btn" title="重新生成并导入当前项目字幕">
-          <span class="material-symbols-outlined">closed_caption</span>
-          <span>导入字幕</span>
-        </button>
         <button type="button" id="oeBtnSyncMaterials" hidden class="oe-sync-btn">
           <span class="material-symbols-outlined">sync</span>
           <span>同步素材</span>
@@ -2192,7 +2188,6 @@
         <div class="oe-media-tabs flex flex-wrap gap-1 p-3 border-b border-white/5">
           <button type="button" class="oe-media-tab oe-media-tab--active" data-cat="import">导入</button>
           <button type="button" class="oe-media-tab" data-cat="素材">素材</button>
-          <button type="button" class="oe-media-tab" data-cat="字幕稿">字幕稿</button>
           <button type="button" class="oe-media-tab" data-cat="我的">我的</button>
           <button type="button" class="oe-media-tab" data-cat="AI">AI</button>
           <button type="button" class="oe-media-tab" data-cat="云素材">云</button>

@@ -1,5 +1,4 @@
 import { describeProject, searchEditMaterial, updateProject, getEffectList, submitEditTaskAsync, deleteEditMaterial, createEditMaterial, updateMediaPublishStatus, searchVideo, getVideoPlayInfo, mGetMaterial, uploadMaterial, listVideoClassifications } from './actions.js';
-import { getType } from './util.js';
 
 const VEV_PROJECT_ID = import.meta.env.VITE_VEV_PROJECT_ID || '';
 const VEV_GROUP_ID = import.meta.env.VITE_VEV_GROUP_ID || '';
@@ -12,9 +11,6 @@ const LOCAL_UPLOAD_AUTOCONFIRM_MASK_CLASS = 'origin-vevdemo-upload-autoconfirm-m
 const MATERIAL_SELECTOR_DIALOG_CLASS = 'origin-vevdemo-material-selector-dialog';
 const MATERIAL_SELECTOR_BODY_CLASS = 'origin-vevdemo-material-selector-body';
 const MATERIAL_SELECTOR_PAGINATION_CLASS = 'origin-vevdemo-material-selector-pagination';
-const SUBTITLE_MATERIAL_CARD_CLASS = 'origin-vevdemo-subtitle-material-card';
-const SUBTITLE_MATERIAL_THUMB_CLASS = 'origin-vevdemo-subtitle-material-thumb';
-const SUBTITLE_MATERIAL_LABEL_RE = /\borigin-subtitles-[\w-]+-v\d+\.(?:srt|vtt|ass)\b/i;
 const CUT_TOOLBAR_SELECTOR = '.toolsBar-NbkSYr .left-DP9tfU .iconWrapper-iB9U7K';
 const CUT_TOOLBAR_INDEX = 2;
 const CUT_TOOLBAR_ACTIVE_CLASS = 'active-ZEWa0z';
@@ -47,12 +43,10 @@ const originMaterialTitleCache = {
   bySource: new Map(),
   byEditMid: new Map(),
   byVid: new Map(),
-  latestSubtitleTitle: '',
 };
 const persistentOriginMaterialTitleItems = new Map();
 let originMaterialNamePolisherInstalled = false;
 let originMaterialNamePolishTimer = null;
-let originSubtitleMaterialCardTimer = null;
 let materialSelectorPaginationDockInstalled = false;
 let materialSelectorPaginationDockTimer = null;
 
@@ -2082,7 +2076,6 @@ function resetOriginMaterialTitleCache(projectId = activeOriginProjectId) {
   originMaterialTitleCache.bySource = new Map();
   originMaterialTitleCache.byEditMid = new Map();
   originMaterialTitleCache.byVid = new Map();
-  originMaterialTitleCache.latestSubtitleTitle = '';
   reapplyPersistentOriginMaterialTitles();
 }
 
@@ -2118,10 +2111,6 @@ function rememberOriginMaterialTitle(item, options = {}) {
   const title = readOriginMaterialTitle(item);
   if (!title) return;
   if (options.persist) rememberPersistentOriginMaterialTitle(item);
-  const type = String(item.type || item.Type || item.MaterialType || '').trim().toLowerCase();
-  if (type === 'subtitle' || /\.(srt|vtt|ass)$/i.test(title)) {
-    originMaterialTitleCache.latestSubtitleTitle = title;
-  }
   const binding = item.vevBinding || {};
   const taskIds = [
     item.id,
@@ -2237,47 +2226,6 @@ function renameEditMaterialItem(item, title) {
   return next;
 }
 
-function editMaterialLooksLikeSubtitle(item, title = '') {
-  const type = readMaterialType(item);
-  const name = String(title || readMaterialName(item) || '').trim();
-  return type === 'subtitle' || /\.(srt|vtt|ass)$/i.test(name);
-}
-
-function enhanceSubtitleEditMaterialItem(item, title = '') {
-  if (!item || !editMaterialLooksLikeSubtitle(item, title)) return item;
-  const name = String(title || readMaterialName(item) || item.Name || item.Title || item.id || 'Origin subtitles.srt').trim();
-  const format = (/\.(vtt)$/i.test(name) && 'VTT') || (/\.(ass)$/i.test(name) && 'ASS') || 'SRT';
-  const next = renameEditMaterialItem(item, name);
-  Object.assign(next, {
-    Type: 'subtitle',
-    type: 'subtitle',
-    MaterialType: 'subtitle',
-    materialType: 'subtitle',
-    Category: 'subtitle',
-    category: 'subtitle',
-    Format: format,
-    format,
-    FileType: 'object',
-    fileType: 'object',
-    DurationText: '字幕',
-    OriginSubtitleMaterial: true,
-  });
-  next.BasicInfo = {
-    ...(item.BasicInfo || {}),
-    ...(next.BasicInfo || {}),
-    Name: name,
-    Title: name,
-    DisplayName: name,
-    Type: 'subtitle',
-    MaterialType: 'subtitle',
-    Category: 'subtitle',
-    Format: format,
-    FileType: 'object',
-    DurationText: '字幕',
-  };
-  return next;
-}
-
 function applyOriginTitlesToEditMaterialResult(result) {
   if (!result || typeof result !== 'object') return result;
   let changed = false;
@@ -2286,11 +2234,7 @@ function applyOriginTitlesToEditMaterialResult(result) {
     const list = Array.isArray(result[key]) ? result[key] : null;
     if (!list) return;
     next[key] = list.map((item) => {
-      const title = titleForEditMaterial(item) || (editMaterialLooksLikeSubtitle(item) ? readMaterialName(item) : '');
-      if (editMaterialLooksLikeSubtitle(item, title)) {
-        changed = true;
-        return enhanceSubtitleEditMaterialItem(item, title);
-      }
+      const title = titleForEditMaterial(item);
       if (!title) return item;
       changed = true;
       return renameEditMaterialItem(item, title);
@@ -2300,11 +2244,7 @@ function applyOriginTitlesToEditMaterialResult(result) {
     next.MaterialSet = {
       ...result.MaterialSet,
       MaterialInfos: result.MaterialSet.MaterialInfos.map((item) => {
-        const title = titleForEditMaterial(item) || (editMaterialLooksLikeSubtitle(item) ? readMaterialName(item) : '');
-        if (editMaterialLooksLikeSubtitle(item, title)) {
-          changed = true;
-          return enhanceSubtitleEditMaterialItem(item, title);
-        }
+        const title = titleForEditMaterial(item);
         if (!title) return item;
         changed = true;
         return renameEditMaterialItem(item, title);
@@ -2322,12 +2262,6 @@ function escapeRegExp(value) {
 function replaceLegacyOriginMaterialText(value) {
   let next = String(value ?? '');
   if (!next) return next;
-  const subtitleTitle = String(originMaterialTitleCache.latestSubtitleTitle || '').trim();
-  if (subtitleTitle && /未知\s*Item|Unknown\s*Item/i.test(next)) {
-    next = next
-      .replace(/未知\s*Item/g, subtitleTitle)
-      .replace(/Unknown\s*Item/gi, subtitleTitle);
-  }
   if (originMaterialTitleCache.byTaskId.size <= 0) return next;
   originMaterialTitleCache.byTaskId.forEach((title, taskId) => {
     if (!taskId || !title || !next.includes(taskId)) return;
@@ -2345,7 +2279,7 @@ function shouldSkipOriginMaterialNamePolish(parent) {
 }
 
 function polishOriginMaterialNames(root = document.body) {
-  if (!root || (originMaterialTitleCache.byTaskId.size <= 0 && !originMaterialTitleCache.latestSubtitleTitle)) return;
+  if (!root || originMaterialTitleCache.byTaskId.size <= 0) return;
   const elements = [];
   if (root.nodeType === Node.ELEMENT_NODE) elements.push(root);
   if (root.querySelectorAll) {
@@ -2364,7 +2298,7 @@ function polishOriginMaterialNames(root = document.body) {
     acceptNode(node) {
       if (shouldSkipOriginMaterialNamePolish(node.parentElement)) return NodeFilter.FILTER_REJECT;
       const text = node.nodeValue || '';
-      return /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段|origin-subtitles-[\w-]+-v\d+\.(?:srt|vtt|ass)|未知\s*Item|Unknown\s*Item/iu.test(text)
+      return /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段/iu.test(text)
         ? NodeFilter.FILTER_ACCEPT
         : NodeFilter.FILTER_REJECT;
     },
@@ -2382,144 +2316,12 @@ function polishOriginMaterialNames(root = document.body) {
   });
 }
 
-function injectOriginSubtitleMaterialCardStyle() {
-  if (document.getElementById('origin-vevdemo-subtitle-material-card-style')) return;
-  const style = document.createElement('style');
-  style.id = 'origin-vevdemo-subtitle-material-card-style';
-  style.textContent = `
-    .${SUBTITLE_MATERIAL_CARD_CLASS} {
-      position: relative !important;
-      min-height: 156px !important;
-      padding-top: 108px !important;
-      box-sizing: border-box !important;
-    }
-
-    .${SUBTITLE_MATERIAL_CARD_CLASS} .${SUBTITLE_MATERIAL_THUMB_CLASS} {
-      position: absolute !important;
-      top: 0 !important;
-      left: 0 !important;
-      right: 0 !important;
-      height: 96px !important;
-      border-radius: 4px !important;
-      border: 1px solid rgba(46, 230, 214, 0.32) !important;
-      background:
-        linear-gradient(135deg, rgba(31, 44, 52, 0.98), rgba(14, 21, 25, 0.98)),
-        repeating-linear-gradient(0deg, rgba(255,255,255,0.08) 0 1px, transparent 1px 12px) !important;
-      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04) !important;
-      color: rgba(255,255,255,0.92) !important;
-      display: flex !important;
-      flex-direction: column !important;
-      align-items: center !important;
-      justify-content: center !important;
-      gap: 4px !important;
-      pointer-events: none !important;
-      overflow: hidden !important;
-    }
-
-    .${SUBTITLE_MATERIAL_CARD_CLASS} .${SUBTITLE_MATERIAL_THUMB_CLASS}::before,
-    .${SUBTITLE_MATERIAL_CARD_CLASS} .${SUBTITLE_MATERIAL_THUMB_CLASS}::after {
-      content: "" !important;
-      width: 68% !important;
-      height: 6px !important;
-      border-radius: 999px !important;
-      background: rgba(255,255,255,0.18) !important;
-      display: block !important;
-    }
-
-    .${SUBTITLE_MATERIAL_CARD_CLASS} .origin-subtitle-file-badge {
-      font-size: 18px !important;
-      line-height: 1 !important;
-      font-weight: 800 !important;
-      letter-spacing: 0 !important;
-      color: #2ee6d6 !important;
-    }
-
-    .${SUBTITLE_MATERIAL_CARD_CLASS} .origin-subtitle-file-meta {
-      font-size: 11px !important;
-      line-height: 1.2 !important;
-      letter-spacing: 0 !important;
-      color: rgba(255,255,255,0.72) !important;
-    }
-  `;
-  document.head.appendChild(style);
-}
-
-function findSubtitleMaterialCard(labelElement) {
-  let node = labelElement;
-  for (let i = 0; i < 7 && node && node !== document.body; i += 1) {
-    if (!(node instanceof Element)) {
-      node = node?.parentElement || null;
-      continue;
-    }
-    const text = getElementText(node);
-    const rect = node.getBoundingClientRect?.();
-    const hasMedia = Boolean(node.querySelector?.('img, video, canvas'));
-    const plausibleRect = rect
-      && rect.width >= 72
-      && rect.width <= 280
-      && rect.height >= 60
-      && rect.height <= 260;
-    if (SUBTITLE_MATERIAL_LABEL_RE.test(text) && plausibleRect && !hasMedia) {
-      return node;
-    }
-    node = node.parentElement;
-  }
-  return null;
-}
-
-function ensureSubtitleMaterialCard(card) {
-  if (!card || !(card instanceof Element)) return;
-  if (!SUBTITLE_MATERIAL_LABEL_RE.test(getElementText(card))) return;
-  card.classList.add(SUBTITLE_MATERIAL_CARD_CLASS);
-  if (card.querySelector?.(`.${SUBTITLE_MATERIAL_THUMB_CLASS}`)) return;
-  const thumb = document.createElement('div');
-  thumb.className = SUBTITLE_MATERIAL_THUMB_CLASS;
-  thumb.setAttribute('aria-hidden', 'true');
-  thumb.innerHTML = '<span class="origin-subtitle-file-badge">CC</span><span class="origin-subtitle-file-meta">字幕文件 · SRT</span>';
-  card.insertBefore(thumb, card.firstChild);
-}
-
-function polishOriginSubtitleMaterialCards(root = document.body) {
-  if (!root) return;
-  injectOriginSubtitleMaterialCardStyle();
-  const labels = [];
-  if (root.nodeType === Node.TEXT_NODE && SUBTITLE_MATERIAL_LABEL_RE.test(root.nodeValue || '')) {
-    labels.push(root.parentElement);
-  }
-  const walkerRoot = root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement;
-  if (walkerRoot) {
-    const walker = document.createTreeWalker(walkerRoot, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        if (shouldSkipOriginMaterialNamePolish(node.parentElement)) return NodeFilter.FILTER_REJECT;
-        return SUBTITLE_MATERIAL_LABEL_RE.test(node.nodeValue || '')
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_REJECT;
-      },
-    });
-    let node = walker.nextNode();
-    while (node && labels.length < 100) {
-      labels.push(node.parentElement);
-      node = walker.nextNode();
-    }
-  }
-  labels.filter(Boolean).forEach((element) => ensureSubtitleMaterialCard(findSubtitleMaterialCard(element)));
-}
-
 function scheduleOriginMaterialNamePolish() {
   if (originMaterialNamePolishTimer) window.clearTimeout(originMaterialNamePolishTimer);
   originMaterialNamePolishTimer = window.setTimeout(() => {
     originMaterialNamePolishTimer = null;
     polishOriginMaterialNames(document.body);
-    scheduleOriginSubtitleMaterialCardPolish();
   }, 60);
-}
-
-function scheduleOriginSubtitleMaterialCardPolish(delay = 80) {
-  if (originSubtitleMaterialCardTimer) window.clearTimeout(originSubtitleMaterialCardTimer);
-  originSubtitleMaterialCardTimer = window.setTimeout(() => {
-    originSubtitleMaterialCardTimer = null;
-    polishOriginSubtitleMaterialCards(document.body);
-  }, delay);
 }
 
 function installOriginMaterialNamePolisher() {
@@ -2529,12 +2331,12 @@ function installOriginMaterialNamePolisher() {
     let shouldPolish = false;
     mutations.forEach((mutation) => {
       if (mutation.type === 'characterData') {
-        shouldPolish = shouldPolish || /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段|origin-subtitles-[\w-]+-v\d+\.(?:srt|vtt|ass)|未知\s*Item|Unknown\s*Item/iu.test(mutation.target?.nodeValue || '');
+        shouldPolish = shouldPolish || /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段/iu.test(mutation.target?.nodeValue || '');
       }
       mutation.addedNodes?.forEach((node) => {
         if (shouldPolish) return;
         const text = node.textContent || '';
-        shouldPolish = /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段|origin-subtitles-[\w-]+-v\d+\.(?:srt|vtt|ass)|未知\s*Item|Unknown\s*Item/iu.test(text);
+        shouldPolish = /origin-[0-9a-f-]{36}|[0-9a-f-]{36}_片段/iu.test(text);
       });
     });
     if (shouldPolish) scheduleOriginMaterialNamePolish();
@@ -2880,10 +2682,6 @@ function collectPlanTimingSeconds(plan) {
     add(item?.targetEndSec);
     add(item?.transitionIn?.durationSec || item?.transitionIn?.duration);
     add(item?.transitionOut?.durationSec || item?.transitionOut?.duration);
-  });
-  (Array.isArray(plan?.subtitles) ? plan.subtitles : []).forEach((item) => {
-    add(item?.startSec);
-    add(item?.endSec);
   });
   add(plan?.bgm?.offsetSec);
   return seconds;
@@ -3529,14 +3327,6 @@ async function handleOriginApplyTimeline(plan, policyInput = {}) {
   };
 }
 
-function createSubtitleImportError(code, reason, message, details = {}) {
-  const err = new Error(message);
-  err.code = code;
-  err.reason = reason;
-  err.details = details;
-  return err;
-}
-
 function editMaterialListFromSearchResult(result) {
   const list =
     result?.Detail ||
@@ -3548,318 +3338,6 @@ function editMaterialListFromSearchResult(result) {
   return Array.isArray(list) ? list : [];
 }
 
-function readMaterialName(item) {
-  return String(readFirst({ item }, [
-    'item.Name',
-    'item.Title',
-    'item.name',
-    'item.title',
-    'item.DisplayName',
-    'item.displayName',
-    'item.BasicInfo.Name',
-    'item.BasicInfo.Title',
-    'item.BasicInfo.DisplayName',
-  ]) || '').trim();
-}
-
-function readMaterialType(item) {
-  return String(readFirst({ item }, [
-    'item.Type',
-    'item.type',
-    'item.BasicInfo.Type',
-    'item.BasicInfo.MaterialType',
-    'item.Category',
-    'item.category',
-  ]) || '').trim().toLowerCase();
-}
-
-function readMaterialEditMid(item) {
-  return String(readFirst({ item }, [
-    'item.EditMid',
-    'item.editMid',
-    'item.MaterialId',
-    'item.materialId',
-    'item.Id',
-    'item.id',
-  ]) || '').trim();
-}
-
-function materialLooksLikeSubtitle(item) {
-  const type = readMaterialType(item);
-  return !type || type === 'subtitle';
-}
-
-function rememberSubtitleMaterialTitle({ filename, originProjectId, vevSource, editMid, material }) {
-  const title = String(filename || readMaterialName(material) || '').trim();
-  if (!title) return;
-  const source = String(vevSource || material?.Source || material?.source || material?.BasicInfo?.Source || '').trim();
-  const mid = String(editMid || readMaterialEditMid(material) || '').trim();
-  rememberOriginMaterialTitle({
-    id: title,
-    filename: title,
-    title,
-    name: title,
-    type: 'subtitle',
-    originProjectId: originProjectId || activeOriginProjectId,
-    vevSource: source,
-    source,
-    vevEditMid: mid,
-    EditMid: mid,
-    MaterialId: mid,
-  }, { persist: true });
-  scheduleOriginMaterialNamePolish();
-}
-
-async function findSubtitleMaterialByName(projectId, vevSpace, filename) {
-  const search = await searchEditMaterial({ ProjectId: projectId, Space: vevSpace });
-  return editMaterialListFromSearchResult(search).find((item) => (
-    readMaterialName(item) === filename && materialLooksLikeSubtitle(item)
-  )) || null;
-}
-
-function extractSupportedSubtitleVevSource(uploadResult) {
-  console.info('[VevDemoBridge] subtitle upload complete raw result:', uploadResult);
-  const source = String(readFirst({ uploadResult }, [
-    'uploadResult.Source',
-    'uploadResult.source',
-    'uploadResult.info.Source',
-    'uploadResult.info.source',
-    'uploadResult.info.uploadResult.Source',
-    'uploadResult.info.uploadResult.source',
-    'uploadResult.info.uploadResult.Data.Source',
-    'uploadResult.info.uploadResult.Data.source',
-    'uploadResult.info.uploadResult.data.Source',
-    'uploadResult.info.uploadResult.data.source',
-    'uploadResult.info.Result.Source',
-    'uploadResult.info.result.Source',
-    'uploadResult.info.Result.source',
-    'uploadResult.info.result.source',
-  ]) || '').trim();
-  if (isSupportedVevSource(source)) return { vevSource: source, sourceKind: 'source' };
-
-  const vid = String(readFirst({ uploadResult }, [
-    'uploadResult.Vid',
-    'uploadResult.vid',
-    'uploadResult.info.Vid',
-    'uploadResult.info.vid',
-    'uploadResult.info.uploadResult.Vid',
-    'uploadResult.info.uploadResult.vid',
-    'uploadResult.info.uploadResult.Data.Vid',
-    'uploadResult.info.uploadResult.Data.vid',
-    'uploadResult.info.uploadResult.data.Vid',
-    'uploadResult.info.uploadResult.data.vid',
-    'uploadResult.info.Result.Vid',
-    'uploadResult.info.result.Vid',
-    'uploadResult.info.Result.vid',
-    'uploadResult.info.result.vid',
-  ]) || '').trim();
-  if (vid) {
-    const vevSource = isSupportedVevSource(vid) ? vid : `vid://${vid}`;
-    return { vevSource, sourceKind: 'vid', vid };
-  }
-
-  const oid = String(readFirst({ uploadResult }, [
-    'uploadResult.Oid',
-    'uploadResult.oid',
-    'uploadResult.ObjectKey',
-    'uploadResult.objectKey',
-    'uploadResult.info.Oid',
-    'uploadResult.info.oid',
-    'uploadResult.info.ObjectKey',
-    'uploadResult.info.objectKey',
-    'uploadResult.info.uploadResult.Oid',
-    'uploadResult.info.uploadResult.oid',
-    'uploadResult.info.uploadResult.ObjectKey',
-    'uploadResult.info.uploadResult.objectKey',
-    'uploadResult.info.uploadResult.Data.Oid',
-    'uploadResult.info.uploadResult.Data.oid',
-    'uploadResult.info.uploadResult.Data.ObjectKey',
-    'uploadResult.info.uploadResult.Data.objectKey',
-    'uploadResult.info.uploadResult.data.Oid',
-    'uploadResult.info.uploadResult.data.oid',
-    'uploadResult.info.uploadResult.data.ObjectKey',
-    'uploadResult.info.uploadResult.data.objectKey',
-    'uploadResult.info.Result.Oid',
-    'uploadResult.info.result.Oid',
-    'uploadResult.info.Result.ObjectKey',
-    'uploadResult.info.result.ObjectKey',
-  ]) || '').trim();
-  const mid = String(readFirst({ uploadResult }, [
-    'uploadResult.Mid',
-    'uploadResult.mid',
-    'uploadResult.info.Mid',
-    'uploadResult.info.mid',
-    'uploadResult.info.uploadResult.Mid',
-    'uploadResult.info.uploadResult.mid',
-    'uploadResult.info.uploadResult.Data.Mid',
-    'uploadResult.info.uploadResult.Data.mid',
-    'uploadResult.info.uploadResult.data.Mid',
-    'uploadResult.info.uploadResult.data.mid',
-    'uploadResult.info.Result.Mid',
-    'uploadResult.info.result.Mid',
-  ]) || '').trim();
-  if (mid) {
-    const vevSource = isSupportedVevSource(mid) ? mid : `mid://${mid}`;
-    return { vevSource, sourceKind: 'mid', oid, mid };
-  }
-  return { vevSource: '', sourceKind: '', oid, mid };
-}
-
-function uploadSubtitleFile(file, vevSpace) {
-  return new Promise((resolve, reject) => {
-    uploadMaterial(file, vevSpace, undefined, {
-      onComplete: (result) => resolve(result),
-      onError: (result) => reject(createSubtitleImportError(
-        'subtitle_upload_failed',
-        'upload_failed',
-        result?.error?.message || String(result?.error || 'subtitle upload failed'),
-        { result }
-      )),
-      onProgress: (result) => {
-        console.info('[VevDemoBridge] subtitle upload progress:', result?.info || result);
-      },
-    }).catch((err) => reject(createSubtitleImportError(
-      'subtitle_upload_failed',
-      'upload_setup_failed',
-      err?.message || String(err || 'subtitle upload setup failed'),
-      { error: err?.message || String(err || '') }
-    )));
-  });
-}
-
-async function readBackSubtitleMaterial({ projectId, vevSpace, filename, editMid, vevSource }) {
-  if (editMid) {
-    const byMid = await searchEditMaterial({ ProjectId: projectId, Space: vevSpace, EditMids: [editMid] });
-    const hitByMid = editMaterialListFromSearchResult(byMid).find((item) => materialLooksLikeSubtitle(item));
-    if (hitByMid) return hitByMid;
-  }
-  const search = await searchEditMaterial({ ProjectId: projectId, Space: vevSpace });
-  return editMaterialListFromSearchResult(search).find((item) => {
-    const source = String(item?.Source || item?.source || item?.BasicInfo?.Source || '').trim();
-    return materialLooksLikeSubtitle(item)
-      && (!filename || readMaterialName(item) === filename)
-      && (!vevSource || source === vevSource || !source);
-  }) || null;
-}
-
-async function handleOriginImportSubtitles(payload = {}) {
-  if (!activeVevProjectId || !activeVevGroupId) {
-    throw createSubtitleImportError(
-      'subtitle_project_not_ready',
-      'project_not_ready',
-      'VevDemo project is not ready for subtitle import',
-      {
-        hasProjectId: Boolean(activeVevProjectId),
-        hasGroupId: Boolean(activeVevGroupId),
-        activeOriginProjectId,
-      }
-    );
-  }
-
-  const filename = String(payload?.filename || '').trim();
-  const srtText = String(payload?.srtText || '');
-  const originProjectId = String(payload?.originProjectId || '').trim();
-  const vevSpace = String(payload?.vevSpace || 'origin').trim() || 'origin';
-  if (!filename || !srtText.trim()) {
-    throw createSubtitleImportError('subtitle_payload_invalid', 'payload_invalid', 'Subtitle payload is empty', { filename, hasText: Boolean(srtText.trim()) });
-  }
-
-  const typeInfo = getType('srt');
-  if (typeInfo?.type !== 'subtitle' || typeInfo?.fileType !== 'object') {
-    throw createSubtitleImportError('subtitle_srt_type_unresolved', 'type_unresolved', 'SRT subtitle material type is not configured', { typeInfo });
-  }
-
-  const existing = await findSubtitleMaterialByName(activeVevProjectId, vevSpace, filename);
-  if (existing) {
-    const editMid = readMaterialEditMid(existing);
-    const readBack = await readBackSubtitleMaterial({ projectId: activeVevProjectId, vevSpace, filename, editMid, vevSource: String(existing.Source || existing.source || '').trim() });
-    if (!readBack) {
-      throw createSubtitleImportError('subtitle_readback_failed', 'readback_missing', 'Existing subtitle material was not readable after name match', { filename, editMid });
-    }
-    rememberSubtitleMaterialTitle({
-      filename,
-      originProjectId,
-      vevSource: String(existing.Source || existing.source || readBack?.Source || readBack?.source || '').trim(),
-      editMid: editMid || readMaterialEditMid(readBack),
-      material: readBack || existing,
-    });
-    return {
-      ok: true,
-      reused: true,
-      filename,
-      originProjectId,
-      editMid: editMid || readMaterialEditMid(readBack),
-    };
-  }
-
-  const file = new File([srtText], filename, { type: 'subtitle/srt' });
-  const uploadResult = await uploadSubtitleFile(file, vevSpace);
-  const sourceInfo = extractSupportedSubtitleVevSource(uploadResult);
-  if (!sourceInfo.vevSource) {
-    throw createSubtitleImportError(
-      'upload_result_missing_source',
-      'upload_result_missing_source',
-      'Subtitle upload completed but did not return a supported VevDemo source',
-      {
-        filename,
-        originProjectId,
-        oid: sourceInfo.oid || '',
-        mid: sourceInfo.mid || '',
-      }
-    );
-  }
-
-  const material = {
-    id: filename,
-    title: filename,
-    name: filename,
-    type: 'subtitle',
-    vevProjectId: activeVevProjectId,
-    vevSpace,
-    vevSource: sourceInfo.vevSource,
-  };
-  const registered = await registerOriginMaterialToVevDemo(material);
-  if (!registered?.ok) {
-    throw createSubtitleImportError(
-      'create_subtitle_material_failed',
-      registered?.reason || 'create_edit_material_failed',
-      registered?.reason || 'CreateEditMaterial for subtitle failed',
-      { registered }
-    );
-  }
-
-  const readBack = await readBackSubtitleMaterial({
-    projectId: activeVevProjectId,
-    vevSpace,
-    filename,
-    editMid: registered.editMid,
-    vevSource: sourceInfo.vevSource,
-  });
-  if (!readBack) {
-    throw createSubtitleImportError(
-      'subtitle_readback_failed',
-      'readback_missing',
-      'Subtitle material was created but SearchEditMaterial did not return it',
-      { filename, editMid: registered.editMid, vevSource: sourceInfo.vevSource }
-    );
-  }
-  rememberSubtitleMaterialTitle({
-    filename,
-    originProjectId,
-    vevSource: sourceInfo.vevSource,
-    editMid: registered.editMid || readMaterialEditMid(readBack),
-    material: readBack,
-  });
-
-  return {
-    ok: true,
-    reused: false,
-    filename,
-    originProjectId,
-    editMid: registered.editMid || readMaterialEditMid(readBack),
-    sourceKind: sourceInfo.sourceKind,
-  };
-}
 
 function normalizeExportStatus(data = {}) {
   const root = data && typeof data === 'object' ? data : {};
@@ -4024,25 +3502,6 @@ function bindOriginBridge() {
             postToOrigin('vevdemo:timelineApplied', {
               ok: false,
               error: err?.message || String(err || 'apply timeline failed'),
-              code: err?.code || '',
-              reason: err?.reason || '',
-              details: err?.details || null,
-              ...getBridgeState(),
-            });
-          });
-        break;
-      case 'origin:importSubtitles':
-        handleOriginImportSubtitles(data)
-          .then((result) => postToOrigin('vevdemo:subtitlesImported', {
-            ok: true,
-            ...result,
-            ...getBridgeState(),
-          }))
-          .catch((err) => {
-            console.warn('[VevDemoBridge] import subtitles failed:', err);
-            postToOrigin('vevdemo:subtitlesImported', {
-              ok: false,
-              error: err?.message || String(err || 'import subtitles failed'),
               code: err?.code || '',
               reason: err?.reason || '',
               details: err?.details || null,

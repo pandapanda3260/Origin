@@ -6,7 +6,7 @@
  *   现改为三处跟随项目比例（与 edit.js _resolveCurrentExportFormat / 一键成片同口径）：
  *   1. lib/vevdemo-project-registration.ts 创建工程时按 project.data_json 算 Canvas；
  *   2. online_editor.js plan.canvas 带上口径结果；
- *   3. fe/index.js 铺轨时画布不一致则同步（字幕 lane 布局按新画布算）。
+ *   3. fe/index.js 铺轨时画布不一致则同步。
  *
  *   口径为双实现（lib ts + oe js），本测试锁两边关键值一致防漂移；
  *   fe/index.js 是未跟踪手改文件，vendor 重同步冲掉即红。
@@ -41,7 +41,7 @@ assert(libTs.includes('buildInitialEditParam(projectName, space, resolveCanvasSi
 assert(/Width: canvas\?\.width \|\| 1080/.test(libTs), 'buildInitialEditParam Canvas 应接收参数（默认 1080x1920 兜底）');
 assert(oeJs.includes('canvas: _resolveVevCanvasForProject(project)'), 'plan 必须挂 canvas（铺轨同步画布的数据源）');
 assert(shellJs.includes('function resolveTargetCanvasFromPlan'), 'fe/index.js 应有 resolveTargetCanvasFromPlan（vendor 冲掉即红）');
-assert(/const track = buildTrackFromOriginPlan\(plan, effectMap, timeUnit, editParamForLayout\)/.test(shellJs), '建轨必须用 editParamForLayout（字幕布局按新画布算）');
+assert(/const track = buildTrackFromOriginPlan\(plan, effectMap, timeUnit, editParamForLayout\)/.test(shellJs), '建轨必须用 editParamForLayout（布局按新画布算）');
 assert(/const nextEditParam = \{ \.\.\.editParamForLayout \}/.test(shellJs), 'nextEditParam 必须基于 editParamForLayout（画布写入 updateProject）');
 assert(shellJs.includes('canvasFollowed'), '铺轨结果应上报 canvasFollowed');
 
