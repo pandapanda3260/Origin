@@ -1,0 +1,20 @@
+{
+  "name": "fe",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "vite",
+    "dev": "vite"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "http-server": "^14.1.1",
+    "tt-uploader": "1.5.2-alpha.0"
+  },
+  "devDependencies": {
+    "vite": "^3.2.11"
+  }
+}
