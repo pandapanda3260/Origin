@@ -4,6 +4,7 @@ import { withAdminAudit, type AdminAuditContext } from '@/lib/admin-audit';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { ADMIN_THRESHOLDS, hoursAgoIso, minutesAgoIso } from '@/lib/admin-thresholds';
+import { batchReasonSql, batchTaskReasonSql, simpleTaskReasonSql } from '@/lib/admin-task-sql';
 import { getModelRoutingStatus } from '@/lib/model-routing';
 import { modelMetricsSnapshot } from '@/lib/observability-events';
 import { refundTaskLedger, transitionTaskStatus } from '@/lib/durable-tasks';
@@ -34,7 +35,7 @@ export async function GET(req: NextRequest) {
   const staleTasks = [
     ...db.prepare<{ since: string }, any>(
       `SELECT 'batch' AS source, id, owner_id AS ownerId, project_id AS projectId, batch_type AS kind,
-              status, COALESCE(error_message, '') AS reason,
+              status, ${batchReasonSql()} AS reason,
               COALESCE(runner_heartbeat_at, updated_at, created_at) AS lastSignalAt,
               created_at AS createdAt
          FROM batches
@@ -45,7 +46,7 @@ export async function GET(req: NextRequest) {
     ).all({ since: staleSince }),
     ...db.prepare<{ since: string }, any>(
       `SELECT 'batch_task' AS source, bt.id, b.owner_id AS ownerId, b.project_id AS projectId, b.batch_type AS kind,
-              bt.status, COALESCE(bt.error_message, bt.error_msg, '') AS reason,
+              bt.status, ${batchTaskReasonSql('bt')} AS reason,
               bt.updated_at AS lastSignalAt, bt.created_at AS createdAt
          FROM batch_tasks bt
          JOIN batches b ON b.id = bt.batch_id
@@ -56,7 +57,7 @@ export async function GET(req: NextRequest) {
     ).all({ since: staleSince }),
     ...db.prepare<{ since: string }, any>(
       `SELECT 'video_task' AS source, id, owner_id AS ownerId, project_id AS projectId, 'video' AS kind,
-              status, COALESCE(error_message, error_msg, '') AS reason,
+              status, ${simpleTaskReasonSql()} AS reason,
               updated_at AS lastSignalAt, created_at AS createdAt
          FROM video_tasks
         WHERE status = 'running'
@@ -66,7 +67,7 @@ export async function GET(req: NextRequest) {
     ).all({ since: staleSince }),
     ...db.prepare<{ since: string }, any>(
       `SELECT 'export' AS source, id, owner_id AS ownerId, project_id AS projectId, 'export' AS kind,
-              status, COALESCE(error_message, error_msg, '') AS reason,
+              status, ${simpleTaskReasonSql()} AS reason,
               updated_at AS lastSignalAt, created_at AS createdAt
          FROM exports
         WHERE status = 'running'
@@ -80,7 +81,7 @@ export async function GET(req: NextRequest) {
   const failedTasks = [
     ...db.prepare<{ since: string }, any>(
       `SELECT 'batch_task' AS source, bt.id, b.owner_id AS ownerId, b.project_id AS projectId, b.batch_type AS kind,
-              bt.status, COALESCE(bt.status_reason, bt.error_message, bt.error_msg, '') AS reason,
+              bt.status, ${batchTaskReasonSql('bt')} AS reason,
               bt.updated_at AS lastSignalAt, bt.created_at AS createdAt
          FROM batch_tasks bt
          JOIN batches b ON b.id = bt.batch_id
@@ -91,7 +92,7 @@ export async function GET(req: NextRequest) {
     ).all({ since: recentFailedSince }),
     ...db.prepare<{ since: string }, any>(
       `SELECT 'video_task' AS source, id, owner_id AS ownerId, project_id AS projectId, 'video' AS kind,
-              status, COALESCE(error_message, error_msg, '') AS reason,
+              status, ${simpleTaskReasonSql()} AS reason,
               updated_at AS lastSignalAt, created_at AS createdAt
          FROM video_tasks
         WHERE status = 'failed'
@@ -101,7 +102,7 @@ export async function GET(req: NextRequest) {
     ).all({ since: recentFailedSince }),
     ...db.prepare<{ since: string }, any>(
       `SELECT 'export' AS source, id, owner_id AS ownerId, project_id AS projectId, 'export' AS kind,
-              status, COALESCE(error_message, error_msg, '') AS reason,
+              status, ${simpleTaskReasonSql()} AS reason,
               updated_at AS lastSignalAt, created_at AS createdAt
          FROM exports
         WHERE status = 'failed'
@@ -119,7 +120,7 @@ export async function GET(req: NextRequest) {
             b.batch_type AS kind,
             bt.task_type AS taskType,
             bt.status,
-            COALESCE(bt.status_reason, bt.error_message, bt.error_msg, '') AS reason,
+            ${batchTaskReasonSql('bt')} AS reason,
             bt.provider,
             bt.provider_task_id AS providerTaskId,
             bt.idempotency_key AS idempotencyKey,

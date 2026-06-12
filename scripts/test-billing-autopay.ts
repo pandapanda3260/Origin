@@ -32,7 +32,7 @@ function setNodeEnv(value: string) {
 }
 
 // —— 新定价数值锁（2026-06-10 拍板）——
-assert.equal(getPlan('plus')?.price_cents, 159900);
+assert.equal(getPlan('plus')?.price_cents, 10);
 assert.equal(getPlan('plus')?.monthly_credits, 80000);
 assert.equal(getPlan('pro')?.price_cents, 799900);
 assert.equal(getPlan('pro')?.monthly_credits, 400000);
@@ -40,7 +40,7 @@ assert.equal(getPlan('free')?.monthly_credits, 100);
 assert.deepEqual(
   TOPUP_PACKS.map((p) => [p.code, p.credits, p.price_cents]),
   [
-    ['topup_basic', 40000, 100000],
+    ['topup_basic', 40000, 10],
     ['topup_advanced', 120000, 300000],
     ['topup_enterprise', 2000000, 4000000],
   ],

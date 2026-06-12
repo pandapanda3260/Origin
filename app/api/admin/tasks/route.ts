@@ -8,6 +8,7 @@ import { cancelBatchForUser } from '@/lib/batches';
 import { getDb } from '@/lib/db';
 import { requestTaskCancel, refundTaskLedger, nowIso } from '@/lib/durable-tasks';
 import { recordObservabilityEvent } from '@/lib/observability-events';
+import { batchReasonSql, batchTaskReasonSql, simpleTaskReasonSql } from '@/lib/admin-task-sql';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -106,7 +107,7 @@ function listBatches(filters: { status: string; q: string; limit: number }) {
             b.batch_type AS kind,
             NULL AS taskType,
             b.status,
-            COALESCE(b.error_message, '') AS reason,
+            ${batchReasonSql('b')} AS reason,
             b.total,
             b.succeeded,
             b.failed,
@@ -145,7 +146,7 @@ function listBatchTasks(filters: { status: string; q: string; limit: number }) {
             b.batch_type AS kind,
             bt.task_type AS taskType,
             bt.status,
-            COALESCE(bt.status_reason, bt.error_message, bt.error_msg, '') AS reason,
+            ${batchTaskReasonSql('bt')} AS reason,
             NULL AS total,
             NULL AS succeeded,
             NULL AS failed,
@@ -193,7 +194,7 @@ function listVideoTasks(filters: { status: string; q: string; limit: number }) {
             'video' AS kind,
             NULL AS taskType,
             vt.status,
-            COALESCE(vt.error_message, vt.error_msg, '') AS reason,
+            ${simpleTaskReasonSql('vt')} AS reason,
             NULL AS total,
             NULL AS succeeded,
             NULL AS failed,
@@ -237,7 +238,7 @@ function listExports(filters: { status: string; q: string; limit: number }) {
             'export' AS kind,
             NULL AS taskType,
             e.status,
-            COALESCE(e.error_message, e.error_msg, '') AS reason,
+            ${simpleTaskReasonSql('e')} AS reason,
             NULL AS total,
             NULL AS succeeded,
             NULL AS failed,

@@ -15,6 +15,7 @@ Scope: `/Users/mark/Documents/origin/vevdemo-1.0.6/fe/index.js`.
 | `vevdemo:ready` | After `new window.VeVEditor(...)` succeeds and `notifyOriginReady()` runs | `ready`, `projectId`, `groupId`, `region`, `bridgeVersion`, `timestamp` |
 | `vevdemo:status` | Origin ping/state acknowledgements and SDK export status side-channel | `status`, optional `payload` / `normalized`, bridge state |
 | `vevdemo:materialsImported` | After browser-side material URL probe | `mode`, `count`, `mediaIds`, `results`, `cloudReachable` |
+| `vevdemo:exportSubmitted` | After `submitEditTaskAsync` returns from VevDemo backend | `taskId`, full submit request/result, bridge state |
 | `vevdemo:exportStatus` | Every SDK `VeVEditor.Events.System.ExportStatus` event | `status`, `taskId`, `outputUrl`, `message`, `code`, `raw`, bridge state |
 | `vevdemo:exportComplete` | Only when normalized export status has an output URL and a complete-like status | `taskId`, `outputUrl`, `format: "mp4"`, `raw`, bridge state |
 | `vevdemo:exportError` | When normalized export status looks failed/cancelled/error | `taskId`, `code`, `message`, `raw`, bridge state |
@@ -31,8 +32,8 @@ Scope: `/Users/mark/Documents/origin/vevdemo-1.0.6/fe/index.js`.
 
 ## UI Contract Implications
 
-1. `vevdemo:exportStatus` and `vevdemo:exportComplete` can both be emitted for the same SDK export event.
-   Origin UI must treat `exportStatus` as display-only and must call `/api/online-editor/export-complete` only from `exportComplete`. External webhook callers use `/api/volcengine/export-callback` with HMAC.
+1. `vevdemo:exportSubmitted` is the durable tracking trigger. Origin records its `TaskId` through `/api/online-editor/vevdemo-export/submit` and lets the worker poll Volcengine `GetTaskList`.
+   `vevdemo:exportStatus` remains display/status input. `vevdemo:exportComplete` with an output URL is still a fast path to `/api/online-editor/export-complete`. External webhook callers use `/api/volcengine/export-callback` with HMAC.
 
 2. `origin:triggerExport` is not implemented as a real SDK export trigger in the current bridge. It falls into the generic acknowledgement path.
    Origin UI must not expose an automatic "re-export to VevDemo" action in P0.

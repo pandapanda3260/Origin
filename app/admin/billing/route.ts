@@ -65,14 +65,19 @@ export async function GET(req: NextRequest) {
         <button data-tab="users" data-active="true">余额</button>
         <button data-tab="orders">订单</button>
 	        <button data-tab="ledger">Ledger</button>
-	        <button data-tab="cost">成本观察</button>
-          <button data-tab="prices">价格表</button>
+	        <button data-tab="cost">成本与价格</button>
 	        <button data-tab="redeem">兑换码</button>
       </div>
       <div class="admin-table-wrap">
         <table class="admin-table">
           <thead data-billing-head="true"></thead>
           <tbody data-billing-table="true"><tr><td class="muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="admin-table-wrap" data-billing-extra-wrap="true" hidden>
+        <table class="admin-table">
+          <thead data-billing-extra-head="true"></thead>
+          <tbody data-billing-extra-table="true"></tbody>
         </table>
       </div>
       <div class="notice" data-billing-notice="true"></div>
@@ -89,6 +94,9 @@ export async function GET(req: NextRequest) {
 	      const metrics = document.querySelector('[data-billing-metrics="true"]');
       const head = document.querySelector('[data-billing-head="true"]');
       const table = document.querySelector('[data-billing-table="true"]');
+      const extraWrap = document.querySelector('[data-billing-extra-wrap="true"]');
+      const extraHead = document.querySelector('[data-billing-extra-head="true"]');
+      const extraTable = document.querySelector('[data-billing-extra-table="true"]');
       const notice = document.querySelector('[data-billing-notice="true"]');
       function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch])); }
       function setNotice(message, kind = '') { notice.textContent = message || ''; notice.dataset.kind = kind; }
@@ -136,6 +144,7 @@ export async function GET(req: NextRequest) {
         renderMetrics();
         document.querySelectorAll('[data-tab]').forEach((btn) => btn.dataset.active = btn.dataset.tab === state.tab ? 'true' : 'false');
 	        const data = state.data || {};
+        extraWrap.hidden = state.tab !== 'cost';
 	        if (state.tab === 'users') {
 	          head.innerHTML = '<tr><th>ID</th><th>用户</th><th>总积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>透支</th><th>计划</th><th>更新时间</th></tr>';
 	          table.innerHTML = rows(data.users, 9, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + Number(u.overdraftCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
@@ -153,9 +162,8 @@ export async function GET(req: NextRequest) {
               .concat((cost.userCost || []).map((r) => ({ dimension:'user', name:userLabel(r), detail:'userId ' + r.userId, ...r })));
             head.innerHTML = '<tr><th>维度</th><th>对象</th><th>实际成本</th><th>消耗积分</th><th>用量</th><th>样本</th></tr>';
 	          table.innerHTML = rows(costRows, 6, (r) => '<tr><td>' + esc(r.dimension) + '</td><td>' + esc(r.name) + '<div class="muted">' + esc(r.detail || '-') + '</div></td><td>¥' + cny(r.costMicros) + '</td><td>' + Number(r.chargedCredits || 0) + '</td><td>' + esc(usageText(r)) + '</td><td>' + Number(r.count || 0) + '</td></tr>');
-	        } else if (state.tab === 'prices') {
-	          head.innerHTML = '<tr><th>状态</th><th>Provider / Model</th><th>消耗类型</th><th>单位</th><th>人民币单价</th><th>美元单价</th><th>更新时间</th><th>来源</th></tr>';
-            table.innerHTML = rows(data.priceCatalog, 8, (p) => '<tr><td>' + esc(p.status) + '</td><td>' + esc([p.provider,p.model,p.modelRole].filter(Boolean).join(' / ')) + '</td><td>' + esc(p.consumptionType) + '</td><td>' + esc(p.unit) + '</td><td>¥' + cny(p.priceCnyMicrosPerUnit) + '</td><td>' + (p.priceUsdMicrosPerUnit == null ? '-' : '$' + cny(p.priceUsdMicrosPerUnit)) + '</td><td>' + esc(fmtDate(p.lastUpdatedAt)) + '</td><td>' + esc(p.sourceNote || '-') + '</td></tr>');
+            extraHead.innerHTML = '<tr><th>价格表：状态</th><th>Provider / Model</th><th>消耗类型</th><th>单位</th><th>人民币单价</th><th>美元单价</th><th>更新时间</th><th>来源</th></tr>';
+            extraTable.innerHTML = rows(data.priceCatalog, 8, (p) => '<tr><td>' + esc(p.status) + '</td><td>' + esc([p.provider,p.model,p.modelRole].filter(Boolean).join(' / ')) + '</td><td>' + esc(p.consumptionType) + '</td><td>' + esc(p.unit) + '</td><td>¥' + cny(p.priceCnyMicrosPerUnit) + '</td><td>' + (p.priceUsdMicrosPerUnit == null ? '-' : '$' + cny(p.priceUsdMicrosPerUnit)) + '</td><td>' + esc(fmtDate(p.lastUpdatedAt)) + '</td><td>' + esc(p.sourceNote || '-') + '</td></tr>');
 	        } else {
           head.innerHTML = '<tr><th>兑换码</th><th>积分</th><th>计划</th><th>使用</th><th>过期</th><th>备注</th><th>创建</th></tr>';
           table.innerHTML = rows(data.redeemCodes, 7, (r) => '<tr><td class="mono">' + esc(r.code) + '</td><td>' + Number(r.credits || 0) + '</td><td>' + esc(r.planCode || '-') + '</td><td>' + Number(r.usedCount || 0) + '/' + Number(r.maxUses || 0) + '</td><td>' + esc(fmtDate(r.expiresAt)) + '</td><td>' + esc(r.memo || '-') + '</td><td>' + esc(fmtDate(r.createdAt)) + '</td></tr>');

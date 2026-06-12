@@ -344,14 +344,25 @@ export async function POST(req: NextRequest) {
         || current.worldTemplateSnapshot
         || null;
       applyAutoStyleTemplateIfNeeded(current, preparedAutoStyleTemplateRecommendation);
+      const selectedWorldTemplateId = String(body.selectedWorldTemplateId || current.selectedWorldTemplateId || '').trim()
+        || cleanTemplateId(effectiveWorldTemplateSnapshot);
+      const selectedStyleTemplateId = String(body.selectedStyleTemplateId || current.selectedStyleTemplateId || '').trim()
+        || cleanTemplateId(effectiveStyleTemplateSnapshot);
       const autoStyleTemplateId = autoStyleTemplateRecommendation?.styleTemplate?.id || cleanTemplateId(effectiveStyleTemplateSnapshot);
+      const effectiveStyleTemplateId = autoStyleTemplateId || selectedStyleTemplateId || null;
+      const pendingGenerationContext = buildStyleBibleGenerationContext({
+        aspectRatio: effectiveStyleOptions.aspectRatio,
+        worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+        styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+        selectedWorldTemplateId,
+        selectedStyleTemplateId: effectiveStyleTemplateId,
+      });
       return {
         allowStyleBibleRunOverwrite: true,
         styleOptions: mergeStyleOptions(current.styleOptions || {}, effectiveStyleOptions),
-        ...(autoStyleTemplateRecommendation ? {
-          selectedStyleTemplateId: autoStyleTemplateId || null,
-          styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
-        } : {}),
+        selectedStyleTemplateId: effectiveStyleTemplateId,
+        styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+        styleBibleGenerationContext: pendingGenerationContext,
         styleBibleStatus: 'generating',
         styleBibleError: '',
         styleBibleErrorCode: null,
@@ -420,8 +431,11 @@ export async function POST(req: NextRequest) {
         styleBibleNextRetryAt: null,
         styleBibleHeartbeatAt: null,
         styleOptions: effectiveStyleOptions,
+        selectedStyleTemplateId: effectiveSelectedStyleTemplateId,
         styleTemplateSnapshot: effectiveStyleTemplateSnapshot,
+        selectedWorldTemplateId: effectiveSelectedWorldTemplateId,
         worldTemplateSnapshot: effectiveWorldTemplateSnapshot,
+        styleBibleGenerationContext,
       });
     } catch (error: any) {
       patchProjectForUser(projectId, user.id, (current: any) => {

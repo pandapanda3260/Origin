@@ -7,6 +7,7 @@ import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { normalizeScriptConsultState } from '@/lib/script-consult-state';
 import { isScriptConsultDbHistoryOnlyEnabled } from '@/lib/system-config';
 import { consultMessageHash, selectConsultTurnHistory } from '@/lib/script-consult-turn-state';
+import { detectScriptConsultReady, shouldAutoTriggerConsultConfirm } from '@/lib/script-consult-ready';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -103,13 +104,13 @@ export async function POST(req: NextRequest) {
       writer.aiChunk(delta);
     });
 
-    // 检查 [READY] 标志，前端据此判断"够不够生成完整剧本"
-    const readyIdx = buf.indexOf('[READY]');
-    const ready = readyIdx >= 0;
-    const outline = ready ? buf.slice(readyIdx + '[READY]'.length).trim() : '';
     // 去掉可能残留的 <step> 标签，对话场景不需要
     // 显示给用户的内容：把 [READY] 标记本身去掉，但保留前后所有文字（包括大纲）
     const replyMain = stripStepTags(buf.replace(/\[READY\]\s*/g, '').trim());
+    const rawReady = detectScriptConsultReady(buf);
+    const displayReady = detectScriptConsultReady(replyMain);
+    const ready = rawReady.markerReady || displayReady.heuristicReady;
+    const outline = displayReady.outline || rawReady.outline;
 
     // 把这一轮对话写回项目
     if (projectId) {
@@ -160,8 +161,8 @@ export async function POST(req: NextRequest) {
       outline,
       ready,
       readyToDraft: ready,
-      // 用户本轮消息直接含"确认/可以/直接生成"等意图时，前端会自动触发 confirm
-      shouldAutoTrigger: ready && /(确认|可以|直接.{0,3}生成|开始|就这样|没问题)/.test(userMsg),
+      // 只有模型明确输出 [READY]，且用户本轮是整句确认命令时，才自动触发 confirm。
+      shouldAutoTrigger: shouldAutoTriggerConsultConfirm(userMsg, rawReady.markerReady),
     });
   });
 }

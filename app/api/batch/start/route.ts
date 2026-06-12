@@ -5,7 +5,13 @@ import { ActiveVideoBatchConflictError, createBatch, findActiveBatchForType } fr
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { assertVideoPromptReadyForGroups, markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { resolveLLMConfig } from '@/lib/llm';
-import { getVideoSubmitMode, isFirstLastFrameVideoModeEnabled, isMultiShotSegmentEnabled } from '@/lib/feature-flags';
+import {
+  getVideoSubmitMode,
+  isFirstLastFrameVideoModeEnabled,
+  isIndependentMultiImageModeEnabled,
+  isMultiRefVideoModeEnabled,
+  isMultiShotSegmentEnabled,
+} from '@/lib/feature-flags';
 import { resolveLocalImagePath } from '@/lib/image-gen';
 import { InsufficientCreditsError } from '@/lib/credits';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
@@ -74,9 +80,9 @@ function videoPreflightMessage(item: any): string {
   if (reason === 'video_prompt_failed') return `${groupLabel} 视频提示词生成失败，请先重新生成视频提示词。`;
   if (reason === 'video_prompt_generating') return `${groupLabel} 视频提示词仍在生成中，请等待完成。`;
   if (reason === 'tail_pending' || reason === 'tail_frame_pending' || reason === 'first_last_frame_tail_pending') return `${groupLabel} 尾帧仍在生成中，请等待尾帧完成后再生成视频。`;
-  if (reason === 'tail_failed') return `${groupLabel} 尾帧生成失败，请重新生成尾帧或改用仅首帧模式。`;
-  if (reason === 'tail_file_missing') return `${groupLabel} 尾帧文件不可解析，请重新生成尾帧或改用仅首帧模式。`;
-  if (reason === 'tail_missing') return `${groupLabel} 缺少可用尾帧，已改用仅首帧模式。`;
+  if (reason === 'tail_failed') return `${groupLabel} 尾帧生成失败，请重新生成尾帧；若继续生成，将按当前配置改用首帧+多参考图或严格首帧通道。`;
+  if (reason === 'tail_file_missing') return `${groupLabel} 尾帧文件不可解析，请重新生成尾帧；若继续生成，将按当前配置改用首帧+多参考图或严格首帧通道。`;
+  if (reason === 'tail_missing') return `${groupLabel} 缺少可用尾帧，将按当前配置改用首帧+多参考图或严格首帧通道。`;
   if (reason === 'capability_unsupported' || reason === 'first_last_frame_capability_unsupported') return `${groupLabel} 当前视频模型不支持首尾帧模式，请切换模型或改用仅首帧模式。`;
   if (reason === 'feature_disabled' || reason === 'first_last_frame_feature_disabled') return `${groupLabel} 首尾帧视频模式当前未开启，请改用仅首帧模式。`;
   if (reason === 'reference_images_mode') return `${groupLabel} 当前为多参考图模式，尾帧不会作为 last_frame 参与本次视频生成。`;
@@ -469,6 +475,7 @@ export async function POST(req: NextRequest) {
     });
     const payloadBlocked: any[] = [];
     const payloadWarnings: any[] = [];
+    const independentMultiImageCapable = isMultiRefVideoModeEnabled() && isIndependentMultiImageModeEnabled();
     groupIdxs.forEach((groupIdx) => {
       const sb = storyboards[groupIdx] || {};
       const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
@@ -488,6 +495,7 @@ export async function POST(req: NextRequest) {
         tailFrameUrl,
         tailReferenceStatus: sb?.tailFrameReferenceStatus || sb?.frames?.tail?.referenceStatus,
         tailIntentRequested: sb?.tailFrameIntent === 'requested',
+        independentMultiImageCapable,
         multiShotSegment: shotIndices.length > 1,
       });
       if (decision.hardFail) {

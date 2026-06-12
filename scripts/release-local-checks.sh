@@ -99,6 +99,8 @@ run_isolated node scripts/test-script-consult-abort-wiring.js
 run_isolated npx tsx scripts/test-script-consult-contamination.ts
 run_isolated npx tsx scripts/test-script-consult-state.ts
 run_isolated npx tsx scripts/test-script-consult-turn-state.ts
+run_isolated npx tsx scripts/test-script-consult-ready.ts
+run_isolated node scripts/test-script-consult-command-ui.mjs
 run_isolated node scripts/test-sentinel-artifact-usage.js
 run_isolated npx tsx scripts/test-shot-tail-frame-signals.ts
 run_isolated npx tsx scripts/test-video-generation-estimate.ts

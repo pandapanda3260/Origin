@@ -121,13 +121,11 @@ export async function POST(req: NextRequest) {
       writer.error('AI 没有返回提示词，请稍后重试');
       return;
     }
-    const guard = guardMode === 'off'
-      ? { accepted: true, violations: [] }
-      : validateRefineOutput({
-          originalPrompt: currentPrompt,
-          refinedPrompt: refined,
-          facts: guardFacts,
-        });
+    const guard = validateRefineOutput({
+      originalPrompt: currentPrompt,
+      refinedPrompt: refined,
+      facts: guardFacts,
+    });
     if (projectId && project && knowledgeContext) {
       try {
         const stageTarget = {

@@ -18,6 +18,7 @@ import {
 import { resolveLocalImagePath } from '@/lib/image-gen';
 import {
   computeFirstLastFeatureEnabled,
+  deriveVideoSubmitInputMode,
   normalizeVideoSubmitMode,
   resolveVideoPayloadDecision,
   warnIfFirstLastConfigIgnored,
@@ -111,6 +112,7 @@ export async function POST(req: NextRequest) {
   let referenceImageRole: 'first_frame' | 'storyboard_sketch' | undefined;
   let seedanceImageMode: 'strict_first_frame' | 'reference_images' = submitMode === 'reference_images' ? 'reference_images' : 'strict_first_frame';
   let payloadModeReason: string | undefined;
+  let decisionWarnings: any[] = [];
   let referenceImages: VideoReferenceImage[] | undefined;
   let sceneReferencePath: string | undefined;
   let characterReferencePaths: string[] | undefined;
@@ -180,6 +182,7 @@ export async function POST(req: NextRequest) {
     const capability = resolveVideoModelCapability(cfg.model);
     const configuredSubmitMode = getVideoSubmitMode();
     const adminAllowsFirstLast = isFirstLastFrameVideoModeEnabled();
+    const independentMultiImageCapable = isMultiRefVideoModeEnabled() && isIndependentMultiImageModeEnabled();
     warnIfFirstLastConfigIgnored({ configuredSubmitMode, adminAllowsFirstLast });
     const featureEnabled = computeFirstLastFeatureEnabled({
       submitMode,
@@ -195,6 +198,7 @@ export async function POST(req: NextRequest) {
       tailFrameUrl,
       tailReferenceStatus: sb?.tailFrameReferenceStatus || sb?.frames?.tail?.referenceStatus,
       tailIntentRequested: sb?.tailFrameIntent === 'requested',
+      independentMultiImageCapable,
       multiShotSegment: groupShotIndices.length > 1,
     });
     if (decision.hardFail) {
@@ -206,15 +210,10 @@ export async function POST(req: NextRequest) {
     }
     firstLastFrameMode = decision.firstLastFrameMode;
     payloadModeReason = decision.reason;
-    const effectiveSubmitStrategy =
-      groupShotIndices.length > 1 && decision.reason === 'reference_images'
-        ? 'reference_images'
-        : submitMode;
-    seedanceImageMode = effectiveSubmitStrategy === 'reference_images' ? 'reference_images' : 'strict_first_frame';
-    const independentMultiImageMode =
-      isMultiRefVideoModeEnabled() &&
-      isIndependentMultiImageModeEnabled() &&
-      effectiveSubmitStrategy === 'reference_images';
+    decisionWarnings = decision.warning ? [decision.warning] : [];
+    const submitInputMode = deriveVideoSubmitInputMode(decision);
+    seedanceImageMode = submitInputMode.seedanceImageMode;
+    const independentMultiImageMode = submitInputMode.useIndependentReferenceImages;
 	    referenceImages = independentMultiImageMode
 	      ? manifestInImageOrder
 	          .filter((ref) => ref.localPath)
@@ -254,7 +253,7 @@ export async function POST(req: NextRequest) {
 	    durationSec = tempoBudget.safeDurationSec;
 	    shotPlan = buildEffectiveShotPlanForDuration(shotPlan, durationSec);
 	    if (tempoBudget.exceedsMaxDuration) {
-	      const warnings = [buildTailRushedWarning(tempoBudget)];
+	      const warnings = [...decisionWarnings, buildTailRushedWarning(tempoBudget)];
 	      patchProjectForUser(projectId, user.id, (fresh) => {
 	        if (!fresh) return null;
 	        const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
@@ -362,7 +361,7 @@ export async function POST(req: NextRequest) {
 	          plannedDurationSec,
 	          tempoBudget,
 	          prompt,
-	          warnings: [],
+	          warnings: decisionWarnings,
 	          isCurrent: true,
 	        };
 	        return { videoTasks };
@@ -402,7 +401,7 @@ export async function POST(req: NextRequest) {
 	      ? [{ message: '参考图提交失败，请检查图片或重试' }]
 	      : [];
 	    const returnedWarnings = 'videoWarnings' in result ? (result.videoWarnings || []) : [];
-	    const warnings = [...referenceWarnings, ...returnedWarnings];
+	    const warnings = [...decisionWarnings, ...referenceWarnings, ...returnedWarnings];
 	    if (result.status === 'upstream_pending') {
 	      return jsonOk({
         ok: true,

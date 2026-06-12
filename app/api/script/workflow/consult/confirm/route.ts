@@ -12,6 +12,7 @@ import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { looksLikeFiveActScript } from '@/lib/script-output-guard';
 import { appendScriptTimeline, buildDraftEvent, nextScriptTimelineVersion } from '@/lib/script-timeline';
 import { beginStageRun, progressStageRun, endStageRun, SCRIPT_GENERATE_STAGE } from '@/lib/stage-inflight';
+import { findLatestScriptConsultOutline } from '@/lib/script-consult-ready';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -38,8 +39,7 @@ export async function POST(req: NextRequest) {
       .filter((m) => m.role === 'user')
       .map((m) => m.content)
       .join(' ');
-    // AI 标记 [READY] 后给的大纲（已经是对创意的总结）
-    const outline = scriptConsult.outline || '';
+    const outline = findLatestScriptConsultOutline(consultMessages, scriptConsult.outline || '');
 
     // 优先用 AI 生成的大纲，因为它更完整；用户消息作为补充
     const oneSentence = (body.oneSentence || '').toString() || outline || allUserMsgs;

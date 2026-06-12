@@ -32,6 +32,7 @@ import {
 } from './feature-flags';
 import {
   computeFirstLastFeatureEnabled,
+  deriveVideoSubmitInputMode,
   normalizeVideoSubmitMode,
   resolveVideoPayloadDecision,
   warnIfFirstLastConfigIgnored,
@@ -2608,6 +2609,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     tailFramePath: tailFrameLocalPath,
     tailFrameUrl,
     tailReferenceStatus: String(sb?.tailFrameReferenceStatus || '').toLowerCase(),
+    independentMultiImageCapable,
     multiShotSegment: groupShotIndices.length > 1,
   });
   if (payloadDecision.hardFail) {
@@ -2621,11 +2623,8 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const firstLastFrameMode = payloadDecision.firstLastFrameMode;
   const payloadModeDecision = payloadDecision.payloadMode;
   const payloadModeReason = payloadDecision.reason;
-  const effectiveSubmitStrategy =
-    isMergedSegment && payloadDecision.reason === 'reference_images'
-      ? 'reference_images'
-      : requestedVideoSubmitMode;
-  independentMultiImageMode = independentMultiImageCapable && effectiveSubmitStrategy === 'reference_images';
+  const submitInputMode = deriveVideoSubmitInputMode(payloadDecision);
+  independentMultiImageMode = submitInputMode.useIndependentReferenceImages;
   if (payloadDecision.warning) videoWarnings.push(payloadDecision.warning);
   if (independentMultiImageMode && !canonicalFirstFrame?.localPath) {
     throw errorWithFailureStage(
@@ -2766,8 +2765,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       `dialoguePairs=${dialoguePairs.length} prev=${!!prevTailSummary} next=${!!nextHeadSummary}`,
   );
 
-	  const seedanceImageMode: VideoGenInput['seedanceImageMode'] =
-    effectiveSubmitStrategy === 'reference_images' ? 'reference_images' : 'strict_first_frame';
+	  const seedanceImageMode: VideoGenInput['seedanceImageMode'] = submitInputMode.seedanceImageMode;
 
 	  const videoInput = {
 	    prompt,

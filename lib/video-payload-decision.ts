@@ -9,6 +9,12 @@ export type TailFrameReferenceStatus =
   | 'file_missing';
 
 export type VideoPayloadMode = 'first_last_frame' | 'first_frame_multi_ref';
+export type VideoEffectiveStrategy = 'first_last_frame' | 'reference_images' | 'strict_first_frame';
+
+export type VideoSubmitInputMode = {
+  seedanceImageMode: 'reference_images' | 'strict_first_frame';
+  useIndependentReferenceImages: boolean;
+};
 
 export type VideoPayloadDecisionReason =
   | 'tail_ready'
@@ -37,6 +43,7 @@ export type VideoPayloadDecisionWarning = {
 export type VideoPayloadDecision = {
   submitMode: VideoSubmitMode;
   payloadMode: VideoPayloadMode;
+  effectiveStrategy: VideoEffectiveStrategy;
   reason: VideoPayloadDecisionReason;
   hardFail: boolean;
   failureCode?: string;
@@ -89,12 +96,13 @@ export function normalizeTailFrameReferenceStatus(opts: {
   tailFramePath?: string | null;
 }): TailFrameReferenceStatus {
   const raw = String(opts.status || '').trim().toLowerCase();
+  const hasUrl = !!String(opts.tailFrameUrl || '').trim();
   if (raw === 'missing' || raw === 'pending' || raw === 'ready' || raw === 'failed' || raw === 'file_missing') {
+    if (raw === 'pending' && !hasUrl) return 'missing';
     return raw;
   }
   // 历史数据里残留的 'stale' 值 (旧自动标记逻辑产物) 不再当作独立状态。
   // 落到 URL/path 判断, 文件能解析就当 ready, 不能就 file_missing。
-  const hasUrl = !!String(opts.tailFrameUrl || '').trim();
   if (!hasUrl) return 'missing';
   return opts.tailFramePath ? 'ready' : 'file_missing';
 }
@@ -104,10 +112,12 @@ function hardFail(
   reason: VideoPayloadDecisionReason,
   failureCode: string,
   failureMessage: string,
+  effectiveStrategy: VideoEffectiveStrategy = 'strict_first_frame',
 ): VideoPayloadDecision {
   return {
     submitMode,
     payloadMode: 'first_frame_multi_ref',
+    effectiveStrategy,
     reason,
     hardFail: true,
     failureCode,
@@ -115,17 +125,68 @@ function hardFail(
   };
 }
 
-function strictDecision(
+function firstFrameDecision(
   submitMode: VideoSubmitMode,
   reason: VideoPayloadDecisionReason,
+  effectiveStrategy: Exclude<VideoEffectiveStrategy, 'first_last_frame'>,
   decisionWarning?: VideoPayloadDecisionWarning,
 ): VideoPayloadDecision {
   return {
     submitMode,
     payloadMode: 'first_frame_multi_ref',
+    effectiveStrategy,
     reason,
     hardFail: false,
     warning: decisionWarning,
+  };
+}
+
+function independentMultiImageDisabledWarning(): VideoPayloadDecisionWarning {
+  return {
+    key: 'independent_multi_image_disabled',
+    level: 'warn',
+    reason: 'reference_images_mode',
+    message: '独立多图通道未开启，已使用严格首帧通道。',
+  };
+}
+
+function tailUnavailableWarning(
+  reason: VideoPayloadDecisionReason,
+  independentMultiImageCapable: boolean,
+): VideoPayloadDecisionWarning {
+  return {
+    key: independentMultiImageCapable ? 'tail_frame_reference_images_fallback' : 'tail_frame_strict_first_frame_fallback',
+    level: 'warn',
+    reason,
+    message: independentMultiImageCapable
+      ? '尾帧不可用，已改用首帧+多参考图通道；首帧将作为参考图参与，不再使用严格 first_frame 锚定。'
+      : '尾帧不可用，独立多图通道未开启，已使用严格首帧通道。',
+  };
+}
+
+function referenceImagesDecision(
+  submitMode: VideoSubmitMode,
+  independentMultiImageCapable: boolean,
+  reason: VideoPayloadDecisionReason = 'reference_images',
+): VideoPayloadDecision {
+  return firstFrameDecision(
+    submitMode,
+    reason,
+    independentMultiImageCapable ? 'reference_images' : 'strict_first_frame',
+    independentMultiImageCapable ? undefined : independentMultiImageDisabledWarning(),
+  );
+}
+
+export function deriveVideoSubmitInputMode(decision: VideoPayloadDecision): VideoSubmitInputMode {
+  if (decision.effectiveStrategy === 'reference_images') {
+    return {
+      seedanceImageMode: 'reference_images',
+      useIndependentReferenceImages: true,
+    };
+  }
+  return {
+    seedanceImageMode: 'strict_first_frame',
+    useIndependentReferenceImages: false,
   };
 }
 
@@ -138,6 +199,7 @@ export function resolveVideoPayloadDecision(opts: {
   tailFrameUrl?: string | null;
   tailReferenceStatus?: unknown;
   tailIntentRequested: boolean;
+  independentMultiImageCapable: boolean;
   /** 合并段（多镜头一段）：true 时强制参考模式（首帧+参考图），不进首尾帧。 */
   multiShotSegment?: boolean;
 }): VideoPayloadDecision {
@@ -149,10 +211,6 @@ export function resolveVideoPayloadDecision(opts: {
     tailFrameUrl: opts.tailFrameUrl,
     tailFramePath,
   });
-
-  if (submitMode === 'reference_images') {
-    return strictDecision(submitMode, 'reference_images');
-  }
 
   if (!firstFramePath) {
     return hardFail(
@@ -166,30 +224,35 @@ export function resolveVideoPayloadDecision(opts: {
   // 合并段：恒走参考模式（首帧 + 参考图），不进首尾帧 —— 合并段无尾锚点（方案 §3.0）。
   // flag OFF 或非合并段时此分支不触发，行为与历史一致。
   if (opts.multiShotSegment && isMultiShotSegmentEnabled()) {
-    return strictDecision(submitMode, 'reference_images');
+    return referenceImagesDecision(submitMode, opts.independentMultiImageCapable);
+  }
+
+  if (submitMode === 'reference_images') {
+    return referenceImagesDecision(submitMode, opts.independentMultiImageCapable);
   }
 
   if (submitMode === 'strict_first_frame') {
-    return strictDecision(submitMode, 'strict_first_frame');
+    return firstFrameDecision(submitMode, 'strict_first_frame', 'strict_first_frame');
   }
 
   const explicitFirstLast = submitMode === 'first_last_frame';
   if (!opts.capabilityFirstLastSupported) {
-    return strictDecision(submitMode, 'capability_unsupported');
+    return firstFrameDecision(submitMode, 'capability_unsupported', 'strict_first_frame');
   }
 
   if (!opts.firstLastFeatureEnabled) {
-    return strictDecision(submitMode, 'feature_disabled');
+    return firstFrameDecision(submitMode, 'feature_disabled', 'strict_first_frame');
   }
 
   if (!opts.tailIntentRequested) {
-    return strictDecision(submitMode, 'no_tail_intent');
+    return firstFrameDecision(submitMode, 'no_tail_intent', 'strict_first_frame');
   }
 
   if (tailStatus === 'ready' && tailFramePath) {
     return {
       submitMode,
       payloadMode: 'first_last_frame',
+      effectiveStrategy: 'first_last_frame',
       reason: 'tail_ready',
       hardFail: false,
       firstLastFrameMode: {
@@ -218,5 +281,10 @@ export function resolveVideoPayloadDecision(opts: {
     );
   }
 
-  return strictDecision(submitMode, reason);
+  return firstFrameDecision(
+    submitMode,
+    reason,
+    opts.independentMultiImageCapable ? 'reference_images' : 'strict_first_frame',
+    tailUnavailableWarning(reason, opts.independentMultiImageCapable),
+  );
 }

@@ -28,6 +28,7 @@ import {
   isEmptyScriptConsultState,
   normalizeScriptConsultState,
 } from './script-consult-state';
+import { correctLatestScriptConsultReadyForRead } from './script-consult-ready';
 import { isProjectCreatePayloadWhitelistEnabled } from './system-config';
 import { createEmptyEpisode } from '../public/modules/episode_fields.js';
 
@@ -170,7 +171,10 @@ function rowToPublic(r: ProjectRow) {
     ...EMPTY_DATA,
     ...data,
   });
-  normalized.scriptConsult = normalizeScriptConsultState(normalized.scriptConsult);
+  normalized.scriptConsult = correctLatestScriptConsultReadyForRead(
+    normalizeScriptConsultState(normalized.scriptConsult),
+    normalized.script,
+  );
   return {
     id: r.id,
     ownerId: r.owner_id,

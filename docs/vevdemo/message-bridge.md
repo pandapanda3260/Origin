@@ -22,6 +22,7 @@ themselves.
 | `vevdemo:ready` | After `new window.VeVEditor(...)` succeeds | `ready`, `projectId`, `groupId`, `region`, `bridgeVersion`, `timestamp` |
 | `vevdemo:status` | Response to Origin messages or SDK status callbacks | `status`, optional request/context fields, `ready`, `projectId`, `groupId`, `region`, `bridgeVersion`, `timestamp` |
 | `vevdemo:materialsImported` | After VevDemo probes Origin material URLs and optionally registers supported VevDemo sources | `mode: "browser-url-probe" | "create-edit-material"`, `count`, `registeredCount`, `probedCount`, `mediaIds`, `results`, `registrationResults`, `cloudReachable` |
+| `vevdemo:exportSubmitted` | After `submitEditTaskAsync` returns from the VevDemo backend | `taskId` / `providerTaskId`, full `submitRequest`, full `submitResult`, bridge state |
 | `vevdemo:exportStatus` | Normalized SDK export status event | `status`, `taskId`, `outputUrl`, `message`, `code`, `raw` |
 | `vevdemo:exportComplete` | Normalized SDK export event when a completed status includes an output URL | `taskId`, `outputUrl`, `format: "mp4"`, `raw` |
 | `vevdemo:exportError` | Normalized SDK export failure/cancel event | `taskId`, `code`, `message`, `raw` |
@@ -107,14 +108,21 @@ Unsupported rows remain explicit:
   cannot complete auto-registration and the row is returned with
   `vevRegistrationReady: false`.
 
-## Phase 5 Export Callback Boundary
+## Phase 5 Export Tracking Boundary
 
-When Origin receives `vevdemo:exportComplete` in the parent browser page, it
-records the remote result through `/api/online-editor/export-complete` using the
-current Origin login session. External webhooks must use
-`/api/volcengine/export-callback` and pass HMAC headers. Both paths write the
-same `exports.edl_json.vevDemo` shape. The `exports.filename` column remains
-`null` until the remote MP4 has been downloaded into `data/exports/<owner>/...`.
+When `submitEditTaskAsync` succeeds, the iframe posts `vevdemo:exportSubmitted`
+to the Origin parent. The parent records the Volcengine task id through
+`/api/online-editor/vevdemo-export/submit`; this writes `vevdemo_export_tasks`,
+not `exports`. Origin then polls
+`/api/online-editor/vevdemo-export/status?projectId=...` until the worker has
+converted the remote task into an `exports` row.
+
+When Origin receives `vevdemo:exportComplete` with an `outputUrl`, it still uses
+`/api/online-editor/export-complete` as a fast path. External webhooks must use
+`/api/volcengine/export-callback` and pass HMAC headers. All URL-bearing paths
+eventually write the same `exports.edl_json.vevDemo` shape. The
+`exports.filename` column remains `null` until the remote MP4 has been
+downloaded into `data/exports/<owner>/...`.
 
 Current P0 fields in `edl_json.vevDemo`:
 

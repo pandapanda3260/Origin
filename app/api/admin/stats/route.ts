@@ -34,7 +34,10 @@ export async function GET(req: NextRequest) {
 
   const paidUsers = db
     .prepare<[], { c: number }>(
-      `SELECT COUNT(DISTINCT user_id) AS c FROM billing_orders WHERE status='paid' AND amount_cents > 0`,
+      `SELECT COUNT(DISTINCT user_id) AS c
+         FROM billing_orders
+        WHERE status IN ('paid', 'applied')
+          AND amount_cents > 0`,
     )
     .get()?.c || 0;
 

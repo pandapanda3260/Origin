@@ -60,7 +60,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=246" />
+    <link rel="stylesheet" href="styles.css?v=248" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -291,15 +291,15 @@
             </span>
           </button>
           <div class="account-menu-separator"></div>
-          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
+          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
             <span class="material-symbols-outlined">explore</span>
             <span>个性化</span>
           </button>
-          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
+          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
             <span class="material-symbols-outlined">account_circle</span>
             <span>个人资料</span>
           </button>
-          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
+          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
             <span class="material-symbols-outlined">settings</span>
             <span>设置</span>
           </button>
@@ -1374,7 +1374,7 @@
 
               <!-- Preview player + action buttons -->
               <div class="edit-glass-panel p-3 flex flex-col overflow-hidden group min-w-0" id="editPreviewPanel" style="flex:1 1 0%">
-                <!-- 16:9 preview area — fills center panel -->
+                <!-- Project-aspect preview area — sized by edit.js from the active export format -->
                 <div class="relative w-full rounded-[16px] bg-[#0B1320] overflow-hidden shadow-2xl flex-1 min-h-0" id="editPreviewArea">
                     <div class="absolute inset-0 edit-scanlines z-20 pointer-events-none"></div>
                     <div class="absolute top-0 left-0 right-0 p-3 flex justify-between z-20 pointer-events-none">
@@ -1397,11 +1397,11 @@
                     <div id="editPreviewPlaceholder" class="flex flex-col items-center justify-center gap-3 text-white/20 absolute inset-0 z-10">
                       <span class="material-symbols-outlined text-5xl">movie</span>
                       <p class="text-sm tracking-wide">预览窗口</p>
-                      <p class="text-[10px] font-bold tracking-[0.15em] text-white/12 uppercase">Preview · 16:9</p>
+                      <p id="editPreviewFormatLabel" class="text-[10px] font-bold tracking-[0.15em] text-white/12 uppercase">Preview · 9:16</p>
                     </div>
                 </div>
                 <!-- Action buttons below preview -->
-                <div class="flex items-center justify-center gap-3 pt-3 pb-1 flex-shrink-0">
+                <div id="editPreviewActionRow" class="flex items-center justify-center gap-3 pt-3 pb-1 flex-shrink-0">
 
                   <div class="relative" id="editCardRefine" hidden>
                     <button type="button" id="btnEnterOnlineEditor" data-goto="onlineEditor" class="edit-action-pill group" style="--pill-accent:#22d3ee;--pill-glow:rgba(34,211,238,0.14)">
@@ -1836,10 +1836,10 @@
             "imports": {
                     "/modules/assets.js": "/modules/assets.js?v=175",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
-                    "/modules/billing.js": "/modules/billing.js?v=117",
+                    "/modules/billing.js": "/modules/billing.js?v=118",
                     "/modules/character_custom.js": "/modules/character_custom.js?v=217",
                     "/modules/diagnostic.js": "/modules/diagnostic.js?v=301",
-                    "/modules/edit.js": "/modules/edit.js?v=306",
+                    "/modules/edit.js": "/modules/edit.js?v=307",
                     "/modules/episode_fields.js": "/modules/episode_fields.js?v=103",
                     "/modules/episodes.js": "/modules/episodes.js?v=113",
                     "/modules/error_hub.js": "/modules/error_hub.js?v=300",
@@ -1852,7 +1852,7 @@
                     "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
                     "/modules/project.js": "/modules/project.js?v=110",
                     "/modules/render_hooks.js": "/modules/render_hooks.js?v=301",
-                    "/modules/script.js": "/modules/script.js?v=119",
+                    "/modules/script.js": "/modules/script.js?v=120",
                     "/modules/script_consult_state.js": "/modules/script_consult_state.js?v=300",
                     "/modules/script_timeline.js": "/modules/script_timeline.js?v=2",
                     "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",

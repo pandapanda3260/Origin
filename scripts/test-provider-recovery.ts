@@ -32,8 +32,10 @@ async function main() {
   assert.equal(seedance?.supportsRecoverByIdempotencyKey, 'unknown');
 
   const vevdemo = getProviderRecoveryCapability('vevdemo_export');
-  assert.equal(vevdemo?.integrationMode, 'callback');
-  assert.throws(() => assertPollingProvider('vevdemo_export'), /not polling-capable/);
+  assert.equal(vevdemo?.integrationMode, 'polling');
+  assert.equal(vevdemo?.supportsQueryByProviderTaskId, 'yes');
+  assert.equal(vevdemo?.p2Implementation, 'vevdemo_export_polling');
+  assert.equal(assertPollingProvider('vevdemo_export')?.key, 'vevdemo_export');
 
   const adapter = createNotImplementedProviderAdapter('volcengine_seedream_image');
   assert.equal(await adapter.recoverByKey?.('idem-smoke'), null);

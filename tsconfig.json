@@ -17,5 +17,5 @@
     "paths": { "@/*": ["./*"] }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", ".next-dev/types/**/*.ts"],
-  "exclude": ["node_modules", "reference-site", "vevdemo-1.0.6"]
+  "exclude": ["node_modules", "reference-site", "vevdemo-1.0.6", "_server_snapshot"]
 }

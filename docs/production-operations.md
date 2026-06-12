@@ -5,7 +5,7 @@
 | Service | Responsibility | Process owner |
 | --- | --- | --- |
 | `origin-web` | `/workspace`, `/admin`, auth, project APIs, status APIs, callback APIs | PM2/systemd |
-| `origin-worker` | Reclaim queued/stale batches, resume pending VevDemo downloads, poll recoverable video tasks | PM2/systemd |
+| `origin-worker` | Reclaim queued/stale batches, resume pending VevDemo downloads, poll recoverable video tasks and VevDemo export tasks | PM2/systemd |
 | VevDemo frontend | Static editor shell, usually behind Nginx/CDN | Vite build output or official hosting |
 | VevDemo backend | Volcengine tokens, project binding, upload/import/export calls | PM2/systemd or vendor backend |
 | SQLite/Postgres | Durable business state: users, projects, batches, tasks, exports, ledger, audit | Persistent disk or managed DB |
@@ -139,7 +139,7 @@ curl -X POST https://origin.example.com/api/admin/problem-queue \
 | --- | --- | --- |
 | 火山 Seedream image | `polling` | Capability row is tracked as `volcengine_seedream_image`; submit/query/recoverByKey remain research items before implementation. |
 | 火山 Seedance video | `polling` | Implemented for durable video batches: submit persists `provider_task_id`, moves the task to `upstream_pending`, and `origin-worker` polls `/contents/generations/tasks/{id}` through `lib/provider-polling-worker.ts`. |
-| VevDemo export | `callback` | Origin does not poll VevDemo. Callback writes terminal export state; missing/expired URLs go through near-expiry scan and re-export UI. |
+| VevDemo export | `polling` | Implemented for online-editor exports: browser submit events persist `provider_task_id` in `vevdemo_export_tasks`, `origin-worker` polls Volcengine `GetTaskList`, resolves output Vid to a playable URL when needed, then hands the URL to the existing `exports` download path. `vevdemo:exportComplete` with a URL remains a fast path. |
 
 The code-level capability registry lives in `lib/provider-recovery.ts`. Unknown support means "do not assume"; if a task only has a local `idempotency_key` and no `provider_task_id`, the recovery path must enter `needs_review` until a provider-specific `recoverByKey` implementation is verified.
 

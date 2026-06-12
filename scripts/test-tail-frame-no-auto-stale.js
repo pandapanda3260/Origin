@@ -90,6 +90,7 @@ record("resolveVideoPayloadDecision: 首帧+尾帧 ready → first_last_frame", 
     tailFrameUrl: '/api/images/file/00000000-0000-0000-0000-000000000001',
     tailReferenceStatus: 'ready',
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   assert.equal(d.payloadMode, 'first_last_frame');
   assert.equal(d.reason, 'tail_ready');
@@ -108,6 +109,7 @@ record("resolveVideoPayloadDecision: 历史脏数据 status='stale' 自动 norma
     tailFrameUrl: '/api/images/file/00000000-0000-0000-0000-000000000001',
     tailReferenceStatus: 'stale', // ← 历史脏数据, 应该被 normalize
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   assert.equal(d.payloadMode, 'first_last_frame', 'legacy stale should normalize to ready');
   assert.equal(d.reason, 'tail_ready');
@@ -124,6 +126,7 @@ record("resolveVideoPayloadDecision: 'failed' 还能软降级 (auto 模式)", ()
     tailFrameUrl: '/api/images/file/00000000-0000-0000-0000-000000000001',
     tailReferenceStatus: 'failed',
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   assert.equal(d.payloadMode, 'first_frame_multi_ref');
   assert.equal(d.reason, 'tail_failed');
@@ -140,6 +143,7 @@ record("resolveVideoPayloadDecision: 'pending' 还能硬挡", () => {
     tailFrameUrl: '/api/images/file/00000000-0000-0000-0000-000000000001',
     tailReferenceStatus: 'pending',
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   assert.equal(d.hardFail, true);
   assert.equal(d.reason, 'tail_pending');
@@ -155,6 +159,7 @@ record("resolveVideoPayloadDecision: 显式 first_last_frame + status=stale (nor
     tailFrameUrl: '/api/images/file/00000000-0000-0000-0000-000000000001',
     tailReferenceStatus: 'stale',
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   // 历史脏 status='stale' 在文件齐全的情况下被 normalize 成 ready, 显式 first_last_frame 也能走通,
   // 用户不会因为 DB 里残留的 stale 字段被无故 hard-fail。

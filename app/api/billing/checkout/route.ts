@@ -5,6 +5,12 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { getPlan, getTopupPack, isDevAutopayEnabled } from '@/lib/billing-config';
 import { fulfillPaidOrder, FulfillError } from '@/lib/billing-fulfill';
+import {
+  createWechatNativePayment,
+  generateWechatOutTradeNo,
+  WechatPayConfigError,
+  WechatPayGatewayError,
+} from '@/lib/wechat-pay';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,8 +22,8 @@ export const dynamic = 'force-dynamic';
  * 支付成功，同步走 lib/billing-fulfill.ts 统一到账（积分包→topup 桶；订阅→升档+
  * 订阅桶重置），返回 status='applied'，前端直接刷新余额，不跳支付页。
  *
- * 关闭时（生产默认）：保留 pending 订单 + 占位提示。真支付网关接入后，
- * 这里改为返回真实支付地址，fulfill 挪到回调里调用。
+ * 关闭时：微信支付走 Native 下单并返回二维码；支付成功回调验签后再调用
+ * fulfillPaidOrder。其它 provider 仍保留 pending 订单 + 占位提示。
  *
  * provider：'stripe' | 'wechat' | 'alipay'（不传默认 stripe；兑换码走 /api/billing/redeem 不经这里）。
  */
@@ -54,7 +60,7 @@ export async function POST(req: NextRequest) {
     return jsonError('需提供 planCode 或 packCode', 400);
   }
 
-  const orderId = randomUUID();
+  const orderId = provider === 'wechat' ? generateWechatOutTradeNo() : randomUUID();
   const db = getDb();
   db.prepare(
     `INSERT INTO billing_orders (id, user_id, kind, plan_code, provider, amount_cents, credits_added, status, meta_json)
@@ -79,7 +85,47 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 占位分支（生产默认）：支付通道未接，订单保持 pending。不再向用户展示测试兑换码。
+  if (provider === 'wechat') {
+    try {
+      const payment = await createWechatNativePayment({ orderId, description: title, amountCents });
+      const meta = {
+        title,
+        wechat: {
+          codeUrl: payment.codeUrl,
+          responseVerified: payment.responseVerified,
+          createdAt: new Date().toISOString(),
+        },
+      };
+      db.prepare(
+        `UPDATE billing_orders
+            SET meta_json = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`,
+      ).run(JSON.stringify(meta), orderId);
+      return jsonOk({
+        orderId,
+        status: 'pending',
+        provider: 'wechat',
+        codeUrl: payment.codeUrl,
+        qrCode: payment.qrCode,
+        message: '请使用微信扫码支付，支付完成后账务会自动刷新。',
+      });
+    } catch (e: any) {
+      db.prepare(
+        `UPDATE billing_orders
+            SET status = 'failed',
+                meta_json = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?`,
+      ).run(JSON.stringify({ title, error: e?.message || String(e) }), orderId);
+      if (e instanceof WechatPayConfigError || e instanceof WechatPayGatewayError) {
+        return jsonError(e.message, e.status);
+      }
+      return jsonError(e?.message || '微信支付下单失败', 502);
+    }
+  }
+
+  // 非微信 provider 仍是占位分支：支付通道未接，订单保持 pending。不再向用户展示测试兑换码。
   return jsonOk({
     orderId,
     payUrl: 'about:blank',

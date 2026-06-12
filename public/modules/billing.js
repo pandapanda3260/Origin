@@ -18,6 +18,7 @@ let _paymentMethod = 'wxpay';
 let _checkoutBusy = false;
 let _redeemBusy = false;
 let _subActionBusy = false;
+let _wechatPayDialog = null;
 // 每次 renderBillingPage() 重新渲染前，先销毁上一轮挂在 .plan-card 上的 holo
 // 效果，避免重复绑定 pointer 事件 / 泄漏 rAF。
 let _holoDestroys = [];
@@ -126,7 +127,7 @@ function _ledgerRowsHtml() {
         '<div class="text-sm font-medium text-on-surface truncate">' + escapeHtml(label) + '</div>' +
         '<div class="text-[11px] text-on-surface-variant/60 mt-1 truncate">' + meta + '</div>' +
       '</div>' +
-      '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-rose-500') + '">' + escapeHtml(amountText) + '</div>' +
+      '<div class="text-sm font-bold ' + (amount >= 0 ? 'text-emerald-600' : 'text-on-surface-variant/70') + '">' + escapeHtml(amountText) + '</div>' +
     '</div>';
   }).join('') || '<p class="text-sm text-on-surface-variant/50">暂无账务流水。</p>';
 }
@@ -391,6 +392,12 @@ export async function startCheckout(orderType, code, paymentMethod) {
     showToast((order.message ? String(order.message) : '支付成功，已到账。'), 'ok');
     return order;
   }
+  if (order && order.provider === 'wechat' && (order.qrCode || order.codeUrl || (order.providerPayload && order.providerPayload.code_url))) {
+    _pendingOrderNo = (order && (order.order_no || order.orderId)) || '';
+    renderBillingPage();
+    showWechatPayDialog(order);
+    return order;
+  }
   var navigated = submitCheckoutForm(order);
   if (!navigated) {
     // 支付通道尚未对接（占位）或未返回可用支付地址：把后端的引导文案如实展示，
@@ -416,6 +423,9 @@ export async function pollOrder(orderNo) {
 export function submitCheckoutForm(order) {
   order = order || {};
   var providerPayload = order.providerPayload || {};
+  if (order.provider === 'wechat' || providerPayload.provider === 'wechat') {
+    return false;
+  }
   var checkoutUrl = providerPayload.checkoutUrl || providerPayload.url || providerPayload.url_qrcode || providerPayload.pay_url || providerPayload.payment_url || providerPayload.cashier_url || providerPayload.code_url || providerPayload.qrcode || providerPayload.qr_url || order.payUrl || order.pay_url || '';
   // 'about:blank' 是后端占位 payUrl，不是真实支付地址，视为不可用。
   if (checkoutUrl && checkoutUrl !== 'about:blank') {
@@ -441,6 +451,99 @@ export function submitCheckoutForm(order) {
   document.body.appendChild(form);
   form.submit();
   return true;
+}
+
+function showWechatPayDialog(order) {
+  closeWechatPayDialog();
+  var orderNo = (order && (order.orderNo || order.order_no || order.orderId || order.id)) || '';
+  var qrCode = (order && order.qrCode) || '';
+  var codeUrl = (order && (order.codeUrl || order.code_url || (order.providerPayload && order.providerPayload.code_url))) || '';
+  if (!orderNo || !qrCode) {
+    showToast('微信支付二维码生成失败，请稍后重试。', 'warn');
+    return;
+  }
+  var overlay = document.createElement('div');
+  overlay.className = 'billing-wechat-pay-dialog';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.innerHTML =
+    '<div class="billing-wechat-pay-panel">' +
+      '<button type="button" class="billing-wechat-pay-close material-symbols-outlined" aria-label="关闭">close</button>' +
+      '<div class="billing-wechat-pay-title">微信扫码支付</div>' +
+      '<div class="billing-wechat-pay-sub">订单 ' + escapeHtml(orderNo) + '</div>' +
+      '<div class="billing-wechat-pay-qr-wrap"><img class="billing-wechat-pay-qr" alt="微信支付二维码" src="' + escapeHtml(qrCode) + '" /></div>' +
+      '<div class="billing-wechat-pay-status">等待支付确认…</div>' +
+      '<div class="billing-wechat-pay-actions">' +
+        '<button type="button" class="billing-wechat-pay-secondary" data-wechat-copy>复制链接</button>' +
+        '<button type="button" class="billing-wechat-pay-primary" data-wechat-refresh>我已支付</button>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  var statusEl = overlay.querySelector('.billing-wechat-pay-status');
+  var closed = false;
+  var closeBtn = overlay.querySelector('.billing-wechat-pay-close');
+  var refreshBtn = overlay.querySelector('[data-wechat-refresh]');
+  var copyBtn = overlay.querySelector('[data-wechat-copy]');
+  var timer = null;
+  var poll = async function (manual) {
+    if (closed) return;
+    if (statusEl) statusEl.textContent = manual ? '正在确认支付结果…' : '等待支付确认…';
+    try {
+      var current = await pollOrder(orderNo);
+      var st = String((current && current.status) || '');
+      if (st === 'applied') {
+        closed = true;
+        clearInterval(timer);
+        _pendingOrderNo = '';
+        closeWechatPayDialog();
+        await loadBillingSummary();
+        showToast('支付成功，账务已刷新。', 'ok');
+        return;
+      }
+      if (st === 'failed' || st === 'cancelled') {
+        closed = true;
+        clearInterval(timer);
+        _pendingOrderNo = '';
+        closeWechatPayDialog();
+        await loadBillingSummary();
+        showToast('支付未完成，请重新发起。', 'warn');
+        return;
+      }
+      if (statusEl) statusEl.textContent = manual ? '暂未收到支付结果，请稍候。' : '等待支付确认…';
+    } catch (_e) {
+      if (statusEl) statusEl.textContent = '支付结果确认失败，请稍后重试。';
+    }
+  };
+  if (closeBtn) closeBtn.addEventListener('click', closeWechatPayDialog);
+  overlay.addEventListener('click', function (ev) {
+    if (ev.target === overlay) closeWechatPayDialog();
+  });
+  if (refreshBtn) refreshBtn.addEventListener('click', function () { poll(true); });
+  if (copyBtn) copyBtn.addEventListener('click', function () {
+    if (!codeUrl || !navigator.clipboard) return showToast('复制失败', 'warn');
+    navigator.clipboard.writeText(String(codeUrl)).then(function () {
+      showToast('支付链接已复制', 'ok');
+    }, function () {
+      showToast('复制失败', 'warn');
+    });
+  });
+  timer = setInterval(function () { poll(false); }, 2500);
+  _wechatPayDialog = {
+    el: overlay,
+    close: function () {
+      closed = true;
+      clearInterval(timer);
+      if (overlay.parentElement) overlay.remove();
+    },
+  };
+  poll(false);
+}
+
+function closeWechatPayDialog() {
+  if (_wechatPayDialog && _wechatPayDialog.close) {
+    try { _wechatPayDialog.close(); } catch (_e) {}
+  }
+  _wechatPayDialog = null;
 }
 
 // 兑换码兑换：后端 /api/billing/redeem 已实现（成功返回 { ok, creditsAdded, message }，

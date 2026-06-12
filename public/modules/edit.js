@@ -539,6 +539,9 @@ function _teardownProjectScopedEditUi() {
 
   var _videoUrlHydrationRunId = 0;
   var _videoUrlHydrationPromise = null;
+  var _editPreviewFrameObserver = null;
+  var _editPreviewFrameResizeBound = false;
+  var _editPreviewFrameRaf = 0;
 
   var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
   var _PROTECTED_UPLOAD_RE = /\/api\/edit\/media\/([0-9a-fA-F-]{36})/;
@@ -1041,6 +1044,7 @@ function _teardownProjectScopedEditUi() {
     }
     if (guard) guard.hidden = true;
     if (workspace) workspace.hidden = false;
+    _syncEditPreviewFrameLayout();
 
     if (project && project.editData && project.editData.segmentTags) {
       _editState.segmentTags = project.editData.segmentTags;
@@ -1620,6 +1624,30 @@ function _teardownProjectScopedEditUi() {
     _processFilmstripQueue();
   }
 
+  function _drawVideoFrameCover(ctx, video, dstW, dstH) {
+    var vw = (video && video.videoWidth) || 0;
+    var vh = (video && video.videoHeight) || 0;
+    if (!vw || !vh) {
+      ctx.drawImage(video, 0, 0, dstW, dstH);
+      return;
+    }
+
+    var srcRatio = vw / vh;
+    var dstRatio = dstW / dstH;
+    var sx = 0;
+    var sy = 0;
+    var sw = vw;
+    var sh = vh;
+    if (srcRatio > dstRatio) {
+      sw = vh * dstRatio;
+      sx = (vw - sw) / 2;
+    } else if (srcRatio < dstRatio) {
+      sh = vw / dstRatio;
+      sy = (vh - sh) / 2;
+    }
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dstW, dstH);
+  }
+
   function _processFilmstripQueue() {
     if (_filmstripBusy || !_filmstripQueue.length) return;
     _filmstripBusy = true;
@@ -1656,7 +1684,7 @@ function _teardownProjectScopedEditUi() {
 
     tmpVid.onseeked = function () {
       try {
-        ctx.drawImage(tmpVid, 0, 0, 80, 60);
+        _drawVideoFrameCover(ctx, tmpVid, 80, 60);
         thumbs.push(canvas.toDataURL("image/jpeg", 0.5));
       } catch (e) { thumbs.push(""); }
       idx++;
@@ -2135,6 +2163,71 @@ function _teardownProjectScopedEditUi() {
 
   var _VID_STYLE = "position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;border-radius:8px;background:#000;";
 
+  function _syncEditPreviewFrameLayout() {
+    var panel = $("editPreviewPanel");
+    var area = $("editPreviewArea");
+    if (!panel || !area) return;
+
+    var fmt = _resolveCurrentExportFormat();
+    var label = $("editPreviewFormatLabel");
+    if (label) label.textContent = "Preview · " + (fmt.ratio || "9:16");
+
+    var panelW = panel.clientWidth || 0;
+    var panelH = panel.clientHeight || 0;
+    if (!panelW || !panelH) return;
+
+    var styles = window.getComputedStyle ? window.getComputedStyle(panel) : null;
+    var padL = styles ? (parseFloat(styles.paddingLeft) || 0) : 0;
+    var padR = styles ? (parseFloat(styles.paddingRight) || 0) : 0;
+    var padT = styles ? (parseFloat(styles.paddingTop) || 0) : 0;
+    var padB = styles ? (parseFloat(styles.paddingBottom) || 0) : 0;
+    var actionRow = $("editPreviewActionRow");
+    var actionH = actionRow ? ((actionRow.getBoundingClientRect && actionRow.getBoundingClientRect().height) || actionRow.offsetHeight || 0) : 0;
+    var boxW = Math.max(0, panelW - padL - padR);
+    var boxH = Math.max(0, panelH - padT - padB - actionH);
+    if (!boxW || !boxH) return;
+
+    var mediaRatio = Math.max(0.01, (fmt.width || 1080) / (fmt.height || 1920));
+    var w = boxW;
+    var h = w / mediaRatio;
+    if (h > boxH) {
+      h = boxH;
+      w = h * mediaRatio;
+    }
+    if (!w || !h) return;
+
+    area.style.setProperty("--edit-preview-frame-w", Math.round(w) + "px");
+    area.style.setProperty("--edit-preview-frame-h", Math.round(h) + "px");
+    panel.classList.add("edit-preview-aspect-ready");
+    _syncSubtitleOverlayLayout();
+  }
+
+  function _scheduleEditPreviewFrameLayout() {
+    if (_editPreviewFrameRaf) return;
+    _editPreviewFrameRaf = requestAnimationFrame(function () {
+      _editPreviewFrameRaf = 0;
+      _syncEditPreviewFrameLayout();
+    });
+  }
+
+  function _initEditPreviewFrameObserver() {
+    var panel = $("editPreviewPanel");
+    if (!panel) return;
+    var actionRow = $("editPreviewActionRow");
+    if (typeof ResizeObserver !== "undefined" && !_editPreviewFrameObserver) {
+      _editPreviewFrameObserver = new ResizeObserver(function () {
+        _scheduleEditPreviewFrameLayout();
+      });
+      _editPreviewFrameObserver.observe(panel);
+      if (actionRow) _editPreviewFrameObserver.observe(actionRow);
+    }
+    if (!_editPreviewFrameResizeBound) {
+      window.addEventListener("resize", _scheduleEditPreviewFrameLayout);
+      _editPreviewFrameResizeBound = true;
+    }
+    _scheduleEditPreviewFrameLayout();
+  }
+
   function _createVidElement() {
     var v = document.createElement("video");
     v.preload = "auto";
@@ -2238,6 +2331,7 @@ function _teardownProjectScopedEditUi() {
   function _initDoubleBuffer() {
     var area = $("editPreviewArea");
     if (!area) return;
+    _syncEditPreviewFrameLayout();
 
     if (_editState._vidA && _editState._vidA.parentNode) _editState._vidA.parentNode.removeChild(_editState._vidA);
     if (_editState._vidB && _editState._vidB.parentNode) _editState._vidB.parentNode.removeChild(_editState._vidB);
@@ -5022,6 +5116,8 @@ function _teardownProjectScopedEditUi() {
   }
 
   function _initEditEvents() {
+    _initEditPreviewFrameObserver();
+
     var btnAutoCompose = $("btnEditAutoCompose");
     if (btnAutoCompose) btnAutoCompose.addEventListener("click", _autoComposeEditVideo);
 

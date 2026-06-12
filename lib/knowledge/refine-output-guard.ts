@@ -33,10 +33,10 @@ export function factsForRefineGuardMode(
   if (mode === 'strict') return facts;
   return {
     dialogueTexts: [],
-    timeRangeTitles: [],
-    imageNumbers: [],
-    characterNamesOrIds: [],
-    referenceLabels: [],
+    timeRangeTitles: facts.timeRangeTitles,
+    imageNumbers: facts.imageNumbers,
+    characterNamesOrIds: facts.characterNamesOrIds,
+    referenceLabels: facts.referenceLabels,
   };
 }
 

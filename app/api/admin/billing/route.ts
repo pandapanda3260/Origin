@@ -281,10 +281,9 @@ function listRedeemCodes(limit: number) {
 function costSnapshot() {
   const db = getDb();
   const revenue = db.prepare<[], any>(
-    `SELECT currency, SUM(amount_cents) AS amountCents, COUNT(*) AS orders
+      `SELECT currency, SUM(amount_cents) AS amountCents, COUNT(*) AS orders
        FROM billing_orders
-      WHERE kind = 'topup'
-        AND status = 'paid'
+      WHERE status IN ('paid', 'applied')
         AND amount_cents > 0
       GROUP BY currency`,
   ).all();
@@ -362,7 +361,7 @@ function costSnapshot() {
       pointsRule: { cnyToCredits: 100, label: '1 元 = 100 积分' },
 	    statisticsStartAt: start?.firstAt || null,
 	    notes: [
-      '收入只统计 billing_orders.kind=topup 且 status=paid 的真实支付订单。',
+      '收入统计 billing_orders status=paid/applied 且 amount_cents>0 的真实支付订单。',
       'redeem / gift / positive adjust 单独列为赠送支出，不计入现金收入。',
       '模型维度成本只统计 ledger 新字段上线后的 provider/model/cost_micros 数据。',
     ],

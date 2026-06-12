@@ -13,6 +13,7 @@ import { reapOrphanExports, startExportsStaleReaper } from './exports-reap';
 import { recoverOrphanedOnlineEditorDownloads, requeuePendingOnlineEditorDownloads, startOnlineEditorDownloadWorker } from './online-editor-downloads';
 import { recoverRunningVideoTasks, startVideoRecoveryLoop } from './video-gen';
 import { startProviderPollingLoop } from './provider-polling-worker';
+import { startVevDemoExportPollingWorker } from './vevdemo-export-worker';
 import { startVideoPromptReaperLoop } from './video-prompt-reaper';
 
 installConsoleHook();
@@ -74,6 +75,7 @@ if (!isNextProductionBuild() && recoveryEnabled) {
   try { startBatchRecoveryLoop(); } catch (e) { console.error('[init] startBatchRecoveryLoop:', e); }
   try { startOnlineEditorDownloadWorker(); } catch (e) { console.error('[init] startOnlineEditorDownloadWorker:', e); }
   try { startProviderPollingLoop(); } catch (e) { console.error('[init] startProviderPollingLoop:', e); }
+  try { startVevDemoExportPollingWorker(); } catch (e) { console.error('[init] startVevDemoExportPollingWorker:', e); }
 } else if (!isNextProductionBuild()) {
   try { startBatchOrphanReaper(); } catch (e) { console.error('[init] startBatchOrphanReaper:', e); }
 }

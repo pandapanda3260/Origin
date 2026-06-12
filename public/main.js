@@ -4747,7 +4747,10 @@ var _scriptEditInitialText = "";
 		    var selectedName = _styleCurrentSelectedTemplateName();
 		    var text = "";
 		    var title = "";
-		    if (project.styleBibleStatus === "generating" && selectedName) {
+		    if (project.styleBibleStatus === "generating" && generatedStyleId) {
+		      text = "正在用：" + (generatedName || "已下线模板");
+		      title = "本次正在生成的风格圣经使用该风格模板。";
+		    } else if (project.styleBibleStatus === "generating" && selectedName) {
 		      text = "将用：" + selectedName;
 		      title = "正在生成的风格圣经将使用当前选择的风格模板。生成完成后会显示实际使用的模板。";
 		    } else if (project.styleBibleSource === "world_import") {

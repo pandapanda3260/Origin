@@ -1101,13 +1101,34 @@ function _applyStyleBibleResponse(proj, resp) {
   proj.styleBibleProgress = resp ? (resp.styleBibleProgress == null ? proj.styleBibleProgress : resp.styleBibleProgress) : proj.styleBibleProgress;
   proj.styleBibleNextRetryAt = resp ? (resp.styleBibleNextRetryAt || (resp.run && resp.run.nextRetryAt) || null) : null;
   proj.styleBibleHeartbeatAt = resp ? (resp.styleBibleHeartbeatAt || (resp.run && resp.run.heartbeatAt) || null) : null;
+  if (resp && Object.prototype.hasOwnProperty.call(resp, "styleOptions")) {
+    proj.styleOptions = resp.styleOptions || proj.styleOptions || {};
+  } else {
+    proj.styleOptions = proj.styleOptions || {};
+  }
+  if (resp && Object.prototype.hasOwnProperty.call(resp, "styleBibleGenerationContext")) {
+    proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
+  }
+  if (resp && resp.styleTemplateSnapshot) {
+    proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
+    var styleTplId = _styleTemplateIdFromSnapshot(resp.styleTemplateSnapshot) ||
+      (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.styleTemplateId) ||
+      resp.selectedStyleTemplateId;
+    if (styleTplId) proj.selectedStyleTemplateId = styleTplId;
+  } else if (resp && resp.selectedStyleTemplateId) {
+    proj.selectedStyleTemplateId = resp.selectedStyleTemplateId;
+  }
+  if (resp && resp.worldTemplateSnapshot) {
+    proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;
+    var worldTplId = _styleTemplateIdFromSnapshot(resp.worldTemplateSnapshot) ||
+      (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.worldTemplateId) ||
+      resp.selectedWorldTemplateId;
+    if (worldTplId) proj.selectedWorldTemplateId = worldTplId;
+  } else if (resp && resp.selectedWorldTemplateId) {
+    proj.selectedWorldTemplateId = resp.selectedWorldTemplateId;
+  }
   if (ready) {
     proj.styleBibleSourceHash = resp.styleBibleSourceHash || proj.styleBibleSourceHash || null;
-    if (Object.prototype.hasOwnProperty.call(resp || {}, "styleOptions")) {
-      proj.styleOptions = resp.styleOptions || proj.styleOptions || {};
-    } else {
-      proj.styleOptions = proj.styleOptions || {};
-    }
 	    proj.styleBibleRunId = null;
 	    proj.styleBibleStartedAt = null;
 	    proj.styleBibleStage = null;
@@ -1118,27 +1139,6 @@ function _applyStyleBibleResponse(proj, resp) {
 	    proj.styleBibleStaleSince = resp.styleBibleStaleSince || null;
 	    proj.styleBibleManuallyEditedAt = resp.styleBibleManuallyEditedAt || null;
 	    proj.styleBibleSource = resp.styleBibleSource || "generated";
-	    if (Object.prototype.hasOwnProperty.call(resp || {}, "styleBibleGenerationContext")) {
-	      proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
-	    }
-	    if (resp.styleTemplateSnapshot) {
-	      proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
-	      var styleTplId = _styleTemplateIdFromSnapshot(resp.styleTemplateSnapshot) ||
-	        (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.styleTemplateId) ||
-	        resp.selectedStyleTemplateId;
-	      if (!proj.selectedStyleTemplateId && styleTplId) proj.selectedStyleTemplateId = styleTplId;
-	    } else if (resp.selectedStyleTemplateId && !proj.selectedStyleTemplateId) {
-	      proj.selectedStyleTemplateId = resp.selectedStyleTemplateId;
-	    }
-	    if (resp.worldTemplateSnapshot) {
-	      proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;
-	      var worldTplId = _styleTemplateIdFromSnapshot(resp.worldTemplateSnapshot) ||
-	        (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.worldTemplateId) ||
-	        resp.selectedWorldTemplateId;
-	      if (!proj.selectedWorldTemplateId && worldTplId) proj.selectedWorldTemplateId = worldTplId;
-	    } else if (resp.selectedWorldTemplateId && !proj.selectedWorldTemplateId) {
-	      proj.selectedWorldTemplateId = resp.selectedWorldTemplateId;
-	    }
 	  }
   if (ready && proj._staleFlags) delete proj._staleFlags["style_bible"];
   return ready;
@@ -1712,6 +1712,7 @@ export async function handleScriptInput() {
     // 已有剧本 → 走改本
     await reviseScript(idea);
   } else {
+    if (await _handleConsultConfirmCommand(idea)) return;
     var sourceClass = _classifySourceTextInput(idea);
     if (sourceClass === "high") {
       await generateScript(idea, { fromSource: true });
@@ -1722,6 +1723,43 @@ export async function handleScriptInput() {
       await _consultTurn(idea);
     }
   }
+}
+
+function _isExplicitScriptDraftConfirmCommand(text) {
+  var normalized = String(text || "").trim().replace(/\s+/g, "").replace(/[。！!．.~～…]+$/, "");
+  return /^(确认生成剧本|生成剧本|开始生成剧本|生成草稿|确认生成草稿|就这样生成剧本|就这样吧|没问题)$/.test(normalized);
+}
+
+function _lastConsultAssistantReady() {
+  var sc = (project && project.scriptConsult) || {};
+  var msgs = Array.isArray(sc.messages) ? sc.messages : [];
+  if (!msgs.length) return false;
+  var last = msgs[msgs.length - 1] || {};
+  var role = last.role;
+  return (role === "assistant" || role === "ai") && last.readyToDraft === true;
+}
+
+function _hasReadyConsultDraftCommandTarget() {
+  if (document.querySelector("#chatMessages .btn-confirm-draft")) return true;
+  var sc = (project && project.scriptConsult) || {};
+  if (sc.ready === true) return true;
+  return _lastConsultAssistantReady();
+}
+
+async function _handleConsultConfirmCommand(idea) {
+  if (!_isExplicitScriptDraftConfirmCommand(idea)) return false;
+  if (!_hasReadyConsultDraftCommandTarget()) {
+    showToast("请先让 AI 输出完整大纲，再确认生成剧本", "warn");
+    return true;
+  }
+  var input = $("ideaInput");
+  if (input) {
+    input.value = "";
+    chatAutoResize(input);
+  }
+  chatAddMsg("user", escapeHtml(idea));
+  await _consultConfirm();
+  return true;
 }
 
 function _classifySourceTextInput(text) {
@@ -2322,7 +2360,7 @@ function _updateScriptInputPlaceholder() {
   var sc = (project && project.scriptConsult) || {};
   var hasHistory = Array.isArray(sc.messages) && sc.messages.length > 0;
   el.placeholder = hasHistory
-    ? '继续补充你的想法，觉得聊够了就点「确认生成剧本」'
+    ? '继续补充你的想法，觉得聊够了就输入或点击「确认生成剧本」'
     : '聊聊你想拍什么，AI 先陪你把需求聊清楚…';
 }
 

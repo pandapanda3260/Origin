@@ -91,8 +91,12 @@ export const getEffectList = async (params) => {
 };
 
 // 提交剪辑任务
+export const submitEditTaskAsyncRaw = async (params) => {
+  return await post('/api/submitEditTaskAsync', params);
+};
+
 export const submitEditTaskAsync = async (params) => {
-  const res = await post('/api/submitEditTaskAsync', params);
+  const res = await submitEditTaskAsyncRaw(params);
   return res.Result;
 };
 

@@ -44,6 +44,7 @@ var _hostKeydownBound = false;
 var _keepAlivePingTimer = null;
 var _keepAlivePingCallback = null;
 var _vevDemoEnsureEdlInFlight = null;
+var _vevDemoExportRestoreInFlight = null;
 
 const OEV_KEEPALIVE_PING_TIMEOUT_MS = 3000;
 const OEV_IFRAME_LOAD_TIMEOUT_MS = 25000;
@@ -51,6 +52,7 @@ const OEV_IFRAME_READY_TIMEOUT_MS = 10000;
 const OEV_IFRAME_AUTO_RETRY_DELAY_MS = 3000;
 const OEV_IFRAME_AUTO_RETRY_MAX = 2;
 const OEV_EXPORT_STORAGE_ID_KEY = 'oeLastExportId';
+const OEV_EXPORT_STORAGE_PROJECT_KEY = 'oeLastExportProjectId';
 const OEV_EXPORT_STORAGE_UPDATED_KEY = 'oeLastExportUpdatedAt';
 const OEV_EXPORT_STORAGE_STALE_MS = 24 * 60 * 60 * 1000;
 const OEV_EXPORT_POLL_INTERVAL_MS = 3000;
@@ -96,7 +98,7 @@ function initOnlineEditor(ctx) {
  */
 function onOnlineEditorPageEnter() {
   if (!_oeCtx) return;
-  _restoreExportStateFromStorage();
+  _restoreExportStateFromServerThenStorage();
   syncOnlineEditorProjectTitle();
   _verifyKeptAliveFrame();
 }
@@ -456,7 +458,9 @@ function restoreOnlineEditorState(state) {
 function _createDefaultExportState() {
   return {
     exportId: null,
+    vevExportTaskId: null,
     vevTaskId: null,
+    vevProviderTaskId: null,
     vevPayload: null,
     phase: 'idle',
     status: null,
@@ -712,22 +716,32 @@ function _bindExportStatusCardActions(slot) {
 
 function _refreshCurrentExportStatusOnce() {
   const exportId = _exportState.exportId;
-  if (!exportId) {
+  const projectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+  if (!exportId && !_exportState.vevExportTaskId) {
     _oeCtx?.showToast?.('没有可刷新的导出任务', 'warning');
     return;
   }
-  _refreshPersistedExportUpdatedAt();
-  _fetchAndApplyExportStatus(exportId, _exportState.stateVersion, { allowPolling: false });
+  if (exportId) {
+    _refreshPersistedExportUpdatedAt();
+    _fetchAndApplyExportStatus(exportId, _exportState.stateVersion, { allowPolling: false });
+  } else if (projectId) {
+    _fetchAndApplyVevDemoExportTaskStatus(projectId, _exportState.stateVersion, { allowPolling: false });
+  }
 }
 
 function _continueExportStatusPolling() {
   const exportId = _exportState.exportId;
-  if (!exportId) {
+  const projectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+  if (!exportId && !_exportState.vevExportTaskId) {
     _oeCtx?.showToast?.('没有可继续等待的导出任务', 'warning');
     return;
   }
-  _refreshPersistedExportUpdatedAt();
-  _startExportStatusPolling(exportId);
+  if (exportId) {
+    _refreshPersistedExportUpdatedAt();
+    _startExportStatusPolling(exportId);
+  } else if (projectId) {
+    _startVevDemoExportTaskPolling(projectId);
+  }
 }
 
 function _downloadReadyExport() {
@@ -809,7 +823,9 @@ function _formatOnlineEditorExportError(message) {
 function _persistExportId(exportId) {
   if (!exportId) return;
   try {
+    const projectId = String(_oeCtx?.getProject?.()?.id || '').trim();
     localStorage.setItem(OEV_EXPORT_STORAGE_ID_KEY, String(exportId));
+    if (projectId) localStorage.setItem(OEV_EXPORT_STORAGE_PROJECT_KEY, projectId);
     localStorage.setItem(OEV_EXPORT_STORAGE_UPDATED_KEY, new Date().toISOString());
   } catch (err) {
     console.warn('[OnlineEditor] 保存导出状态失败:', err);
@@ -829,6 +845,7 @@ function _refreshPersistedExportUpdatedAt() {
 function _clearPersistedExportState() {
   try {
     localStorage.removeItem(OEV_EXPORT_STORAGE_ID_KEY);
+    localStorage.removeItem(OEV_EXPORT_STORAGE_PROJECT_KEY);
     localStorage.removeItem(OEV_EXPORT_STORAGE_UPDATED_KEY);
   } catch (err) {
     console.warn('[OnlineEditor] 清理导出状态失败:', err);
@@ -839,6 +856,12 @@ function _readPersistedExportState() {
   try {
     const exportId = localStorage.getItem(OEV_EXPORT_STORAGE_ID_KEY);
     if (!exportId) return null;
+    const currentProjectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+    const storedProjectId = String(localStorage.getItem(OEV_EXPORT_STORAGE_PROJECT_KEY) || '').trim();
+    if (!currentProjectId || !storedProjectId || storedProjectId !== currentProjectId) {
+      _clearPersistedExportState();
+      return null;
+    }
     const updatedAt = localStorage.getItem(OEV_EXPORT_STORAGE_UPDATED_KEY);
     const updatedTime = updatedAt ? new Date(updatedAt).getTime() : 0;
     if (!Number.isFinite(updatedTime) || Date.now() - updatedTime > OEV_EXPORT_STORAGE_STALE_MS) {
@@ -850,6 +873,28 @@ function _readPersistedExportState() {
     console.warn('[OnlineEditor] 读取导出状态失败:', err);
     return null;
   }
+}
+
+function _restoreExportStateFromServerThenStorage() {
+  const projectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+  if (!projectId || !_oeCtx?.apiGet) {
+    _restoreExportStateFromStorage();
+    return;
+  }
+  if (_vevDemoExportRestoreInFlight?.projectId === projectId) return;
+  const versionAtStart = _exportState.stateVersion || 0;
+  _vevDemoExportRestoreInFlight = { projectId };
+  _fetchAndApplyVevDemoExportTaskStatus(projectId, versionAtStart, { restore: true, allowPolling: false })
+    .then((restored) => {
+      if (!restored) _restoreExportStateFromStorage();
+    })
+    .catch((err) => {
+      console.warn('[OnlineEditor] 服务端导出状态恢复失败，尝试本地兜底:', err);
+      _restoreExportStateFromStorage();
+    })
+    .finally(() => {
+      if (_vevDemoExportRestoreInFlight?.projectId === projectId) _vevDemoExportRestoreInFlight = null;
+    });
 }
 
 function _restoreExportStateFromStorage() {
@@ -905,6 +950,38 @@ async function _fetchAndApplyExportStatus(exportId, requestVersion, options) {
   }
 }
 
+async function _fetchAndApplyVevDemoExportTaskStatus(projectId, requestVersion, options) {
+  options = options || {};
+  if (!projectId || !_oeCtx?.apiGet) return null;
+  try {
+    const payload = await _oeCtx.apiGet(`/api/online-editor/vevdemo-export/status?projectId=${encodeURIComponent(projectId)}`);
+    if (requestVersion !== _exportState.stateVersion) return null;
+    if (payload?.detail) throw new Error(payload.detail);
+    const task = payload?.task || null;
+    if (!task) return null;
+    _applyVevDemoExportTaskStatus(task);
+    if (task.exportId) {
+      _persistExportId(task.exportId);
+      await _fetchAndApplyExportStatus(task.exportId, _exportState.stateVersion, { allowPolling: false });
+    }
+    return payload;
+  } catch (err) {
+    if (requestVersion !== _exportState.stateVersion) return null;
+    if (err?.status === 401 || err?.status === 404 || /不存在|unauthorized|认证|not found/i.test(String(err?.message || ''))) {
+      return null;
+    }
+    console.warn('[OnlineEditor] 获取 VevDemo 导出任务状态失败:', err);
+    if (options.allowPolling) {
+      _setExportState({
+        phase: 'polling_paused',
+        errorMsg: err?.message || '获取 VevDemo 导出任务状态失败',
+        polling: false,
+      });
+    }
+    return null;
+  }
+}
+
 function _startExportStatusPolling(exportId) {
   if (!exportId) return;
   _clearExportPollingTimer();
@@ -939,12 +1016,85 @@ function _startExportStatusPolling(exportId) {
   tick();
 }
 
+function _startVevDemoExportTaskPolling(projectId) {
+  if (!projectId) return;
+  _clearExportPollingTimer();
+  _exportPollingStartedAt = Date.now();
+  const version = _exportState.stateVersion;
+  _setExportState({ polling: true, errorMsg: _exportState.errorMsg || '' });
+
+  const tick = async () => {
+    if (version !== _exportState.stateVersion) return;
+    if (Date.now() - _exportPollingStartedAt > OEV_EXPORT_POLL_MAX_MS) {
+      _clearExportPollingTimer();
+      _setExportState({
+        phase: 'polling_paused',
+        polling: false,
+        errorMsg: '导出耗时较长，可继续等待或手动刷新状态。',
+      });
+      return;
+    }
+
+    const payload = await _fetchAndApplyVevDemoExportTaskStatus(projectId, version, { allowPolling: true });
+    if (version !== _exportState.stateVersion) return;
+    const task = payload?.task || null;
+    if (task?.exportId) {
+      _startExportStatusPolling(task.exportId);
+      return;
+    }
+
+    if (_isExportPollingTerminalPhase(_exportState.phase)) {
+      _clearExportPollingTimer();
+      _setExportState({ polling: false });
+      return;
+    }
+
+    _exportPollingTimer = setTimeout(tick, OEV_EXPORT_POLL_INTERVAL_MS);
+  };
+
+  tick();
+}
+
 function _isExportPollingTerminalPhase(phase) {
   return phase === 'ready'
     || phase === 'vev_export_failed'
     || phase === 'origin_callback_failed'
     || phase === 'origin_download_failed'
     || phase === 'polling_paused';
+}
+
+function _applyVevDemoExportTaskStatus(task) {
+  if (!task) return;
+  const phase = _deriveVevDemoExportTaskPhase(task);
+  _setExportState({
+    vevExportTaskId: task.id || _exportState.vevExportTaskId,
+    vevTaskId: task.providerTaskId || _exportState.vevTaskId,
+    vevProviderTaskId: task.providerTaskId || _exportState.vevProviderTaskId,
+    exportId: task.exportId || _exportState.exportId,
+    phase,
+    status: task.status || _exportState.status,
+    remoteUrl: task.outputUrl || _exportState.remoteUrl,
+    errorMsg: task.errorMsg || '',
+    polling: !['ready', 'submit_failed', 'remote_failed', 'origin_download_failed', 'needs_review'].includes(String(task.status || '')),
+    callbackPosting: false,
+    vevPayload: {
+      ...(task || {}),
+      taskId: task.providerTaskId || task.provider_task_id || null,
+      outputUrl: task.outputUrl || null,
+    },
+    callbackDedupKey: task.providerTaskId || _exportState.callbackDedupKey,
+  });
+}
+
+function _deriveVevDemoExportTaskPhase(task) {
+  const status = String(task?.status || '').toLowerCase();
+  if (status === 'ready') return 'ready';
+  if (status === 'origin_downloading') return 'origin_downloading';
+  if (status === 'origin_download_failed') return 'origin_download_failed';
+  if (status === 'remote_completed') return 'origin_waiting_download';
+  if (status === 'submit_failed' || status === 'remote_failed') return 'vev_export_failed';
+  if (status === 'needs_review') return 'polling_paused';
+  return 'vev_exporting';
 }
 
 function _applyServerExportStatus(payload) {
@@ -1441,6 +1591,10 @@ function _handleVevMessage(event) {
       _onExportComplete(data);
       break;
 
+    case 'vevdemo:exportSubmitted':
+      _onExportSubmitted(data);
+      break;
+
     case 'vevdemo:exportStatus':
       _onVevDemoStatus(data);
       break;
@@ -1641,6 +1795,77 @@ async function _bindCurrentOriginProjectToVevDemo() {
   }
 }
 
+function _normalizeVevExportSubmittedPayload(data) {
+  const submitResult = data?.submitResult || data?.rawResult || data?.result || {};
+  const result = submitResult?.Result || submitResult?.result || data?.result || {};
+  const taskId = data?.providerTaskId
+    || data?.taskId
+    || submitResult?.TaskId
+    || submitResult?.taskId
+    || result?.TaskId
+    || result?.taskId
+    || result?.EditTaskId
+    || result?.editTaskId
+    || null;
+  return {
+    taskId: taskId ? String(taskId).trim() : '',
+    submitRequest: data?.submitRequest || {},
+    submitResult,
+    result,
+    raw: data || {},
+  };
+}
+
+async function _onExportSubmitted(data) {
+  const payload = _normalizeVevExportSubmittedPayload(data);
+  const project = _oeCtx?.getProject?.();
+  if (!project?.id) {
+    console.warn('[OnlineEditor] 收到 VevDemo 导出提交，但当前项目不存在:', data);
+    return;
+  }
+  if (!payload.taskId) {
+    console.warn('[OnlineEditor] 收到 VevDemo 导出提交，但缺少 TaskId:', data);
+    return;
+  }
+
+  _replaceExportState({
+    phase: 'vev_exporting',
+    status: 'submitted',
+    vevTaskId: payload.taskId,
+    vevProviderTaskId: payload.taskId,
+    vevPayload: payload,
+    callbackDedupKey: payload.taskId,
+    polling: true,
+    errorMsg: '',
+  });
+
+  try {
+    const response = await _oeCtx?.apiPost?.('/api/online-editor/vevdemo-export/submit', {
+      projectId: project.id,
+      vevProjectId: _vevDemoBoundVevProjectId || data?.projectId || data?.vevProjectId || '',
+      vevGroupId: _vevDemoBoundVevGroupId || data?.groupId || data?.vevGroupId || '',
+      vevSpace: _vevDemoBoundVevSpace || data?.vevSpace || '',
+      providerTaskId: payload.taskId,
+      submitRequest: payload.submitRequest,
+      submitResult: payload.submitResult,
+    });
+    if (!response?.success || !response?.task) {
+      throw new Error(response?.detail || response?.error || 'Origin 未能记录 VevDemo 导出任务');
+    }
+    _applyVevDemoExportTaskStatus(response.task);
+    _startVevDemoExportTaskPolling(project.id);
+  } catch (err) {
+    console.error('[OnlineEditor] VevDemo 导出任务记录失败:', err);
+    _setExportState({
+      phase: 'origin_callback_failed',
+      callbackPosting: false,
+      polling: false,
+      errorMsg: err?.message || 'Origin 记录导出任务失败',
+    });
+    _oeCtx?.showToast?.('导出已提交，但 Origin 记录任务失败，可刷新页面后重试', 'error');
+  }
+}
+
 function _onExportComplete(data) {
   const payload = _normalizeVevExportPayload(data);
   const key = _getExportCallbackDedupKey(payload);
@@ -1686,8 +1911,25 @@ function _onExportError(data) {
   }
   // raw 是剪辑 SDK 的原始回调，"未知错误"时唯一的线索在这里面。
   console.error('[OnlineEditor] 导出错误:', payload.code, payload.message, payload.raw);
-  _clearExportPollingTimer();
   const failDetail = payload.message || (payload.code ? `错误码 ${payload.code}` : '剪辑服务未返回原因');
+  if (_exportState.vevExportTaskId || _exportState.vevProviderTaskId) {
+    const projectId = String(_oeCtx?.getProject?.()?.id || '').trim();
+    _setExportState({
+      phase: 'vev_exporting',
+      status: payload.status || _exportState.status || 'remote_checking',
+      vevTaskId: payload.taskId || _exportState.vevTaskId,
+      vevPayload: payload,
+      callbackDedupKey: key || _exportState.callbackDedupKey,
+      callbackPosting: false,
+      polling: true,
+      retrying: false,
+      errorMsg: `${failDetail}；Origin 正在继续查询远端任务`,
+    });
+    if (projectId) _startVevDemoExportTaskPolling(projectId);
+    _oeCtx?.showToast?.('SDK 返回导出失败，Origin 正在继续查询远端任务状态', 'warning');
+    return;
+  }
+  _clearExportPollingTimer();
   _setExportState({
     phase: 'vev_export_failed',
     status: payload.status || 'failed',
@@ -1882,7 +2124,7 @@ async function _registerProjectVideoForVevDemo(payload) {
 function _normalizeVevExportPayload(data) {
   const raw = data?.status === 'export-status' && data?.payload ? data.payload : (data || {});
   return {
-    taskId: raw.taskId || raw.exportId || raw.id || null,
+    taskId: raw.providerTaskId || raw.taskId || raw.TaskId || raw.exportId || raw.id || null,
     outputUrl: raw.outputUrl || raw.url || raw.downloadUrl || null,
     duration: raw.duration ?? raw.durationSec ?? null,
     format: raw.format || 'mp4',

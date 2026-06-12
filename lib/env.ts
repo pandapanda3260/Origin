@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 const DEFAULT_EXTERNAL_ENV_FILES = [
   '/Users/mark/Documents/key/origin.env.local',
   '/Users/mark/Documents/key/openai.env.local',
+  '/Users/mark/Documents/key/origin-wechat-pay.env.local',
 ];
 
 let loaded = false;

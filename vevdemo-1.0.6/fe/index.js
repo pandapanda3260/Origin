@@ -1,4 +1,4 @@
-import { describeProject, searchEditMaterial, updateProject, getEffectList, submitEditTaskAsync, deleteEditMaterial, createEditMaterial, updateMediaPublishStatus, searchVideo, getVideoPlayInfo, mGetMaterial, uploadMaterial, listVideoClassifications } from './actions.js';
+import { describeProject, searchEditMaterial, updateProject, getEffectList, submitEditTaskAsyncRaw, deleteEditMaterial, createEditMaterial, updateMediaPublishStatus, searchVideo, getVideoPlayInfo, mGetMaterial, uploadMaterial, listVideoClassifications } from './actions.js';
 
 const VEV_PROJECT_ID = import.meta.env.VITE_VEV_PROJECT_ID || '';
 const VEV_GROUP_ID = import.meta.env.VITE_VEV_GROUP_ID || '';
@@ -3368,6 +3368,31 @@ function normalizeExportStatus(data = {}) {
   return { status, taskId, outputUrl, message, code, raw: data };
 }
 
+function extractSubmitTaskId(raw) {
+  const root = raw && typeof raw === 'object' ? raw : {};
+  const result = root.Result || root.result || root.Payload || root.payload || root;
+  const scoped = { root, result };
+  return readFirst(scoped, [
+    'root.taskId', 'root.TaskId', 'root.task_id', 'root.EditTaskId', 'root.editTaskId',
+    'result.taskId', 'result.TaskId', 'result.task_id', 'result.EditTaskId', 'result.editTaskId',
+  ]);
+}
+
+async function submitEditTaskAsyncWithOriginTracking(params) {
+  const res = await submitEditTaskAsyncRaw(params);
+  const result = res?.Result;
+  const taskId = extractSubmitTaskId(res);
+  postToOrigin('vevdemo:exportSubmitted', {
+    taskId,
+    providerTaskId: taskId,
+    submitRequest: params,
+    submitResult: res,
+    result,
+    ...getBridgeState(),
+  });
+  return result;
+}
+
 function isExportComplete(normalized) {
   const text = String(normalized.status || '').toLowerCase();
   return Boolean(normalized.outputUrl) && (
@@ -3589,7 +3614,7 @@ window.newVeVEditor = (pid, gid)=>{
       updateProject,
       searchEditMaterial: searchOriginScopedEditMaterial,
       getEffectList,
-      submitEditTaskAsync,
+      submitEditTaskAsync: submitEditTaskAsyncWithOriginTracking,
       deleteEditMaterial,
       createEditMaterial: createOrReuseOriginEditMaterial,
       updateMediaPublishStatus,

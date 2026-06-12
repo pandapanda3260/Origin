@@ -20,7 +20,7 @@ export type ProviderRecoveryCapability = {
   supportsQueryByProviderTaskId: ProviderCapabilityFlag;
   supportsRecoverByIdempotencyKey: ProviderCapabilityFlag;
   recoveryStrategy: string;
-  p2Implementation: 'interface_only' | 'seedance_video_first' | 'callback_only';
+  p2Implementation: 'interface_only' | 'seedance_video_first' | 'callback_only' | 'vevdemo_export_polling';
 };
 
 export type ProviderSubmitContext = {
@@ -539,12 +539,12 @@ export const PROVIDER_RECOVERY_CAPABILITIES: Record<ProviderRecoveryKey, Provide
   vevdemo_export: {
     key: 'vevdemo_export',
     label: 'VevDemo export',
-    integrationMode: 'callback',
+    integrationMode: 'polling',
     supportsSubmitIdempotencyKey: 'no',
-    supportsQueryByProviderTaskId: 'no',
+    supportsQueryByProviderTaskId: 'yes',
     supportsRecoverByIdempotencyKey: 'no',
-    recoveryStrategy: 'Callback-only. Origin does not poll VevDemo; missing callback or expired URL is handled by near-expiry scan and re-export UI.',
-    p2Implementation: 'callback_only',
+    recoveryStrategy: 'Persist the VevDemo export task id after SubmitEditTaskAsync, poll Volcengine GetTaskList by provider task id, then hand completed remote URLs to the existing Origin export download path.',
+    p2Implementation: 'vevdemo_export_polling',
   },
 };
 

@@ -1088,6 +1088,7 @@ function bootstrap(db: Database.Database) {
   migrateExportEdlVersionColumn(db);
   migrateExportLocalDownloadColumns(db);
   migrateExportProviderColumns(db);
+  migrateVevDemoExportTasks(db);
   migrateStoryboardMaterialImageIndex(db);
   migrateAdminFoundationColumns(db);
   migrateAdminGovernanceColumns(db);
@@ -1140,6 +1141,48 @@ function addColumnIfMissing(db: Database.Database, table: string, column: string
 function columnExists(db: Database.Database, table: string, column: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   return cols.some((c) => c.name === column);
+}
+
+function migrateVevDemoExportTasks(db: Database.Database) {
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS vevdemo_export_tasks (
+        id                 TEXT PRIMARY KEY,
+        owner_id           INTEGER NOT NULL,
+        project_id         TEXT NOT NULL,
+        vev_project_id     TEXT,
+        vev_group_id       TEXT,
+        vev_space          TEXT,
+        provider_task_id   TEXT,
+        submit_request_json TEXT NOT NULL DEFAULT '{}',
+        submit_result_json  TEXT NOT NULL DEFAULT '{}',
+        poll_result_json    TEXT NOT NULL DEFAULT '{}',
+        output_url         TEXT,
+        output_vid         TEXT,
+        export_id          TEXT,
+        status             TEXT NOT NULL DEFAULT 'submitted',
+        error_msg          TEXT,
+        retry_count        INTEGER NOT NULL DEFAULT 0,
+        last_checked_at    TEXT,
+        next_retry_at      TEXT,
+        created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_vevdemo_export_tasks_provider_task
+        ON vevdemo_export_tasks(provider_task_id)
+        WHERE provider_task_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_vevdemo_export_tasks_project
+        ON vevdemo_export_tasks(owner_id, project_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_vevdemo_export_tasks_status
+        ON vevdemo_export_tasks(status, next_retry_at, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_vevdemo_export_tasks_export
+        ON vevdemo_export_tasks(export_id)
+        WHERE export_id IS NOT NULL;
+    `);
+  } catch (e) {
+    console.warn('[db] migrateVevDemoExportTasks failed:', e);
+  }
 }
 
 function migratePhoneIdentityColumns(db: Database.Database) {

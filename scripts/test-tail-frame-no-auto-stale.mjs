@@ -220,6 +220,7 @@ recordTest('video 决策: 首帧 + 尾帧都 ready → first_last_frame', () => 
     tailFrameUrl,
     tailReferenceStatus: sb.tailFrameReferenceStatus,
     tailIntentRequested: sb.tailFrameIntent === 'requested',
+    independentMultiImageCapable: true,
   });
   assert.equal(decision.payloadMode, 'first_last_frame');
   assert.equal(decision.reason, 'tail_ready');
@@ -239,6 +240,7 @@ recordTest('video 决策: 历史脏数据 status="stale" 也走 first_last_frame
     tailFrameUrl,
     tailReferenceStatus: 'stale', // 历史脏数据
     tailIntentRequested: true,
+    independentMultiImageCapable: true,
   });
   assert.equal(decision.payloadMode, 'first_last_frame', 'legacy stale should normalize to ready');
   assert.equal(decision.reason, 'tail_ready');

@@ -250,15 +250,24 @@ npx tsx scripts/register-origin-video-vevdemo.cjs <video_task_id> --owner <owner
 
 ### Q: 导出完成后 Origin 如何记录结果
 
-当前有两条入口，底层写入同一张 `exports` 表：
+当前主路径是“提交先入任务表，完成后再写 `exports`”：
 
-- 浏览器会话路径：Origin 父页面收到 `vevdemo:exportComplete` 后调用
+- 浏览器提交路径：VevDemo iframe 的 `submitEditTaskAsync` 仍向 SDK 返回
+  `res.Result`，同时把完整 submit 响应旁路发给 Origin 父页。父页调用
+  `/api/online-editor/vevdemo-export/submit`，按当前 Origin 项目和用户把
+  `TaskId` 写入 `vevdemo_export_tasks`。这一步不会预先写 `exports`，避免没有
+  `outputUrl` 时被旧逻辑落成终态 failed。
+- Worker 轮询路径：`origin-worker` 通过 `GetTaskList` 查询远端任务；如果火山只给
+  产物 Vid，再走 `GetVideoPlayInfo` 取播放地址。拿到 URL 后才调用现有
+  `saveVevDemoExportRecord` 写 `exports`，随后复用原本的本地下载队列。
+- 浏览器快路径：Origin 父页面收到带 URL 的 `vevdemo:exportComplete` 后仍可调用
   `/api/online-editor/export-complete`。这条路径依赖当前登录用户的
-  `Authorization`，用于 iframe 内编辑器的 P0 闭环。
+  `Authorization`，作为 SDK 直接返回 URL 时的快速闭环。
 - 外部 webhook 路径：VevDemo 后端或火山云端回调
   `/api/volcengine/export-callback`。生产环境必须携带 HMAC 头，不允许把
   callback secret 放进前端。HMAC webhook 没有 Origin 登录态，请在 body 里提供
   `projectId`（Origin 会从项目归属推导 owner）或显式 `ownerId`。
 
-两条路径都会把远程 MP4 地址写入 `exports.edl_json.vevDemo`。只有下载队列把远程
-MP4 落到 `data/exports/<owner>/...` 后，`exports.filename` 才会被置位。
+最终只有 `exports` 负责本地下载和播放。`vevdemo_export_tasks` 只保存提交、轮询、
+远端完成和下载对账状态，不新增第二条下载路径。只有下载队列把远程 MP4 落到
+`data/exports/<owner>/...` 后，`exports.filename` 才会被置位。
