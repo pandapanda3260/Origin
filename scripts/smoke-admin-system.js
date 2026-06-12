@@ -58,9 +58,11 @@ function withDb(callback) {
 
 async function main() {
   const cookie = await login();
-  for (const pagePath of ['/admin/config', '/admin/key-pool', '/admin/storage']) {
-    const page = await request(pagePath, { headers: { cookie } });
-    assert(page.res.status === 200, `${pagePath} failed: ${page.res.status} ${page.text}`);
+  // 配置/Key池/存储/Admin账号已合并为 /admin/system（2026-06 瘦身）。
+  const page = await request('/admin/system', { headers: { cookie } });
+  assert(page.res.status === 200, `/admin/system failed: ${page.res.status} ${page.text}`);
+  for (const marker of ['data-config-banner-enabled="true"', 'data-key-pool-table="true"', 'data-storage-table="true"', 'data-staff-table="true"', 'id="logs"']) {
+    assert(page.text.includes(marker), `/admin/system should render merged pane marker ${marker}`);
   }
 
   const cfg = await request('/api/admin/config', { headers: { cookie } });

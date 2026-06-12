@@ -36,6 +36,20 @@
       "replacement": "深色污痕、烟尘与战后磨损",
       "type": "phrase_replace",
       "reason": "preserve post-battle texture without explicit injury detail"
+    },
+    {
+      "slot": "graphic_gore_detail",
+      "pattern": "(血泊|鲜血(?:四溅|喷涌|喷薄|飞溅)?|血肉模糊|残肢|断肢|爆头|断头(?!台)|内脏外露)",
+      "replacement": "深色污痕、烟尘与战后磨损",
+      "type": "phrase_replace",
+      "reason": "remove graphic gore details while preserving a battle aftermath tone"
+    },
+    {
+      "slot": "corpse_gore_clause",
+      "pattern": "(尸体[^。；\\n]{0,40}(?:痛苦|扭曲|血|残肢|断肢|断头|爆头|内脏)|(?:痛苦|扭曲|血肉模糊)[^。；\\n]{0,40}尸体)",
+      "replacement": "地面留下凌乱的战后痕迹与散落道具",
+      "type": "clause_replace",
+      "reason": "avoid corpse-focused graphic framing while preserving aftermath context"
     }
   ],
   "unknown": [
@@ -65,6 +79,20 @@
       "pattern": "(black fur|dark hair|fur)\\s+(snagged|caught|stuck)\\s+(on|near)\\s+(one end|the tip|the blade|the edge)",
       "replacement": "dark fabric fibers caught near the tip",
       "type": "phrase_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    },
+    {
+      "slot": "graphic_gore_detail",
+      "pattern": "(血泊|鲜血(?:四溅|喷涌|喷薄|飞溅)?|血肉模糊|残肢|断肢|爆头|断头(?!台)|内脏外露)",
+      "replacement": "深色污痕、烟尘与战后磨损",
+      "type": "phrase_replace",
+      "reason": "safe fallback for ambiguous moderation categories"
+    },
+    {
+      "slot": "corpse_gore_clause",
+      "pattern": "(尸体[^。；\\n]{0,40}(?:痛苦|扭曲|血|残肢|断肢|断头|爆头|内脏)|(?:痛苦|扭曲|血肉模糊)[^。；\\n]{0,40}尸体)",
+      "replacement": "地面留下凌乱的战后痕迹与散落道具",
+      "type": "clause_replace",
       "reason": "safe fallback for ambiguous moderation categories"
     }
   ]

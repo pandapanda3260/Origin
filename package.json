@@ -8,7 +8,7 @@
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "verify:release:local": "bash scripts/release-local-checks.sh",
-    "verify:frontend": "npm run test:cache-busting && node scripts/test-video-batch-import-contract.mjs",
+    "verify:frontend": "npm run test:cache-busting && node scripts/test-workspace-route-default.mjs && node scripts/test-video-batch-import-contract.mjs",
     "check:admin-governance": "node scripts/check-admin-governance.js",
     "check:model-fetch": "node scripts/check-direct-model-fetch.js",
     "check:usage-price-coverage": "tsx scripts/check-usage-price-coverage.ts",

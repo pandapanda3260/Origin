@@ -21,3 +21,5 @@ reference-site/__pycache__/
 .playwright-mcp/
 tsconfig.tsbuildinfo
 tmp/
+_server_snapshot/
+_pull_server_snapshot.sh

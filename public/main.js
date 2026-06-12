@@ -152,6 +152,8 @@ var _scriptEditInitialText = "";
   // 注意：billing 不再是独立 page，而是顶层 modal（#billingModal），所以不放进 PAGES。
   // 顶部任务列表卡片走 data-goto="overview"，会员升级按钮走 switchPage("billing")。
   var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "toolbox", "profile", "settings", "onlineEditor"];
+  // 下线但暂不删除的工作台旧页面。保留 DOM/模块，统一阻止导航、hash 直达和历史恢复。
+  var DISABLED_WORKSPACE_PAGES = ["profile", "settings"];
   var SIDEBAR_PIPELINE_PAGES = ["script", "style", "assets", "shots", "prompts", "batch", "edit"];
   var settings = {
     models: {
@@ -244,6 +246,7 @@ var _scriptEditInitialText = "";
     page = String(page || "");
     if (page === "online-editor") page = "onlineEditor";
     if (page === "images") page = "shots";
+    if (DISABLED_WORKSPACE_PAGES.indexOf(page) !== -1) return "";
     if (PAGES.indexOf(page) === -1) return "";
     return page;
   }
@@ -306,21 +309,19 @@ var _scriptEditInitialText = "";
 
   function _readRememberedWorkspacePage(options) {
     var page = "";
+    var hasWorkspacePageHash = false;
     try {
       var hash = String(window.location.hash || "");
       var prefix = "#" + WORKSPACE_ACTIVE_PAGE_HASH_KEY + "=";
-      if (hash.indexOf(prefix) === 0) page = decodeURIComponent(hash.slice(prefix.length));
+      if (hash.indexOf(prefix) === 0) {
+        hasWorkspacePageHash = true;
+        page = decodeURIComponent(hash.slice(prefix.length));
+      }
     } catch (_) {}
-    if (!page) {
-      try { page = window.sessionStorage.getItem(WORKSPACE_ACTIVE_PAGE_KEY) || ""; } catch (_) {}
+    if (!hasWorkspacePageHash) {
+      return _isWorkspacePageOpenable("overview", options);
     }
-    if (!page) {
-      try { page = (window.history && window.history.state && window.history.state[WORKSPACE_ACTIVE_PAGE_STATE_KEY]) || ""; } catch (_) {}
-    }
-    if (!page) {
-      try { page = window.localStorage.getItem(WORKSPACE_ACTIVE_PAGE_FALLBACK_KEY) || ""; } catch (_) {}
-    }
-    return _isWorkspacePageOpenable(page, options);
+    return _isWorkspacePageOpenable(page, options) || _isWorkspacePageOpenable("overview", options);
   }
 
   /* ================================================================
@@ -2061,11 +2062,10 @@ var _scriptEditInitialText = "";
   function switchPage(page, options) {
     options = options || {};
     // TODO(remove-after-phase7): remove legacy online-editor route alias once Online Editor Phase 7 passes.
-    if (page === "online-editor") page = "onlineEditor";
-    if (page === "images") page = "shots";
     // billing 不再是独立 page，而是浮层弹窗，提前 return 不影响当前 activePage
     if (page === "billing") { openBillingModal(); return; }
-    if (PAGES.indexOf(page) === -1) return;
+    page = _normalizeWorkspacePage(page);
+    if (!page) return;
     if (activePage === "prompts" && page !== "prompts") {
       flushVideoPromptAutoSave().catch(function (e) { console.warn("[VideoPromptDraft] leave-page flush failed:", e); });
     }
@@ -7847,6 +7847,13 @@ var _scriptEditInitialText = "";
 	  async function init() {
 	    var session = await ensureSession({ redirectOnInvalid: true, timeoutMs: 5000 });
 	    if (!session || session.status === "invalid") {
+	      _syncWorkspaceBootPage("overview");
+	      _markWorkspaceBootReady();
+	      try {
+	        if (window.location.pathname !== "/" || window.location.search !== "?auth=1") {
+	          window.location.replace("/?auth=1");
+	        }
+	      } catch (_) {}
 	      return;
 	    }
 	    if (session.status === "valid" && session.user && session.user.id && Number(_currentUid || 0) !== Number(session.user.id)) {

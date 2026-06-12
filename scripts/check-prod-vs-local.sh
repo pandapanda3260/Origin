@@ -14,6 +14,9 @@ HOST="${ORIGIN_HOST:-115.190.238.3}"
 USER_NAME="${ORIGIN_USER:-root}"
 KEY="${ORIGIN_KEY:-/Users/mark/Documents/key/origin2.pem}"
 LOCAL_REPO="${LOCAL_REPO:-/Users/mark/Documents/origin}"
+REMOTE_APP_DIR="${REMOTE_APP_DIR:-/var/www/myapp}"
+REMOTE_DATA_DIR="${REMOTE_DATA_DIR:-$REMOTE_APP_DIR/data}"
+REMOTE_COMPOSE_CMD="${REMOTE_COMPOSE_CMD:-docker compose}"
 
 set -u
 
@@ -87,51 +90,51 @@ if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 "${USER_NAME}@${HOST}" 'echo ok' 
   exit 0
 fi
 
-REMOTE_RELEASE_ID="$(run_remote 'cat /opt/origin/RELEASE_ID 2>/dev/null || true' | tr -d '\r' | head -1)"
-REMOTE_REVISION="$(run_remote 'cat /opt/origin/REVISION 2>/dev/null || (cd /opt/origin && git rev-parse HEAD 2>/dev/null) || true' | tr -d '\r' | head -1)"
-REMOTE_BUILD_ID="$(run_remote 'cat /opt/origin/.next/BUILD_ID 2>/dev/null || true' | tr -d '\r' | head -1)"
+REMOTE_RELEASE_ID="$(run_remote "cat '$REMOTE_APP_DIR/RELEASE_ID' 2>/dev/null || true" | tr -d '\r' | head -1)"
+REMOTE_REVISION="$(run_remote "cat '$REMOTE_APP_DIR/REVISION' 2>/dev/null || (cd '$REMOTE_APP_DIR' && git rev-parse HEAD 2>/dev/null) || true" | tr -d '\r' | head -1)"
+REMOTE_BUILD_ID="$(run_remote "cd '$REMOTE_APP_DIR' && ($REMOTE_COMPOSE_CMD exec -T origin-web cat /app/.next/BUILD_ID 2>/dev/null || cat .next/BUILD_ID 2>/dev/null || true)" | tr -d '\r' | head -1)"
 
 section "REMOTE: host + kernel + uptime"
 run_remote 'uname -a; cat /etc/os-release 2>/dev/null | head -6; uptime; date'
 
-section "REMOTE: node / npm / pm2 versions"
-run_remote 'echo "-- node --"; node --version 2>/dev/null || echo none; echo "-- npm --"; npm --version 2>/dev/null || echo none; echo "-- pm2 --"; pm2 -v 2>/dev/null || echo none; echo "-- ffmpeg --"; ffmpeg -version 2>/dev/null | head -1 || echo none'
+section "REMOTE: node / npm / docker versions"
+run_remote 'echo "-- node --"; node --version 2>/dev/null || echo none; echo "-- npm --"; npm --version 2>/dev/null || echo none; echo "-- docker --"; docker --version 2>/dev/null || echo none; echo "-- compose --"; docker compose version 2>/dev/null || echo none; echo "-- ffmpeg --"; ffmpeg -version 2>/dev/null | head -1 || echo none'
 
 section "REMOTE: services (systemd)"
-run_remote 'for svc in origin-web origin-worker pm2-origin nginx; do printf "%-18s active=%s enabled=%s\n" "$svc" "$(systemctl is-active $svc 2>&1)" "$(systemctl is-enabled $svc 2>&1)"; done'
+run_remote 'for svc in origin-web origin-worker vevdemo-backend docker nginx; do printf "%-18s active=%s enabled=%s\n" "$svc" "$(systemctl is-active $svc 2>&1)" "$(systemctl is-enabled $svc 2>&1)"; done'
 
-section "REMOTE: services (PM2 list, if any)"
-run_remote 'pm2 list 2>/dev/null || echo "(pm2 not running or no list)"'
+section "REMOTE: services (Docker Compose)"
+run_remote "cd '$REMOTE_APP_DIR' && $REMOTE_COMPOSE_CMD ps 2>/dev/null || echo '(docker compose not available or app dir missing)'"
 
 section "REMOTE: listening ports"
-run_remote 'ss -tlnp 2>/dev/null | grep -E ":3000|:80|:443" || (netstat -tlnp 2>/dev/null | grep -E ":3000|:80|:443")'
+run_remote 'ss -tlnp 2>/dev/null | grep -E ":3000|:3002|:8084|:80|:443" || (netstat -tlnp 2>/dev/null | grep -E ":3000|:3002|:8084|:80|:443")'
 
-section "REMOTE: /opt/origin layout"
-run_remote 'ls -la /opt/origin 2>/dev/null | head -40; echo; echo "-- backups --"; ls -la /opt/origin-backups 2>/dev/null | head -10'
+section "REMOTE: app layout"
+run_remote "ls -la '$REMOTE_APP_DIR' 2>/dev/null | head -50; echo; echo '-- legacy /opt/origin --'; ls -la /opt/origin 2>/dev/null | head -10 || echo '(not present)'"
 
 section "REMOTE: deployed source identity"
 echo "release_id=${REMOTE_RELEASE_ID:-unknown}"
 echo "revision=${REMOTE_REVISION:-unknown}"
 echo "build_id=${REMOTE_BUILD_ID:-none}"
-run_remote 'cd /opt/origin && if [ -d .git ]; then git rev-parse --abbrev-ref HEAD 2>/dev/null; git log --oneline -5 2>/dev/null; git status --short 2>/dev/null; else echo "(release archive has no .git directory; using RELEASE_ID/REVISION files)"; fi'
+run_remote "cd '$REMOTE_APP_DIR' && if [ -d .git ]; then git rev-parse --abbrev-ref HEAD 2>/dev/null; git log --oneline -5 2>/dev/null; git status --short 2>/dev/null; else echo '(release archive has no .git directory; using RELEASE_ID/REVISION files)'; fi"
 
 section "REMOTE: deployed BUILD_ID + .next mtime"
-run_remote 'cat /opt/origin/.next/BUILD_ID 2>/dev/null; stat -c "mtime=%y size=%s" /opt/origin/.next/BUILD_ID 2>/dev/null'
+run_remote "cd '$REMOTE_APP_DIR' && ($REMOTE_COMPOSE_CMD exec -T origin-web sh -lc 'cat /app/.next/BUILD_ID; stat -c \"mtime=%y size=%s\" /app/.next/BUILD_ID' 2>/dev/null || true)"
 
 section "REMOTE: deployed package.json key fields"
-run_remote 'awk "/\"name\"|\"version\"|\"next\"|\"react\"|\"better-sqlite3\"|\"@napi-rs\\/canvas\"|\"@langchain\"/" /opt/origin/package.json | head -30'
+run_remote "awk '/\"name\"|\"version\"|\"next\"|\"react\"|\"better-sqlite3\"|\"@napi-rs\\/canvas\"|\"@langchain\"/' '$REMOTE_APP_DIR/package.json' | head -30"
 
-section "REMOTE: /etc/origin/origin.env keys (values masked)"
-run_remote 'if [ -f /etc/origin/origin.env ]; then sed -E "s/=.*/=***/" /etc/origin/origin.env; else echo "(no /etc/origin/origin.env)"; fi'
+section "REMOTE: env keys (values masked)"
+run_remote "if [ -f '$REMOTE_APP_DIR/.env' ]; then sed -E 's/=.*/=***/' '$REMOTE_APP_DIR/.env'; elif [ -f /etc/origin/origin.env ]; then sed -E 's/=.*/=***/' /etc/origin/origin.env; else echo '(no env file)'; fi"
 
 section "REMOTE: ORIGIN_DATA_DIR layout + disk"
-run_remote 'echo "-- /var/lib/origin --"; ls -la /var/lib/origin 2>/dev/null; echo; echo "-- data dir size --"; du -sh /var/lib/origin/data 2>/dev/null; echo; echo "-- df --"; df -h /var/lib/origin 2>/dev/null; df -h /opt/origin 2>/dev/null'
+run_remote "echo '-- data dir --'; ls -la '$REMOTE_DATA_DIR' 2>/dev/null; echo; echo '-- data dir size --'; du -sh '$REMOTE_DATA_DIR' 2>/dev/null; echo; echo '-- df --'; df -h '$REMOTE_DATA_DIR' 2>/dev/null; df -h '$REMOTE_APP_DIR' 2>/dev/null"
 
 section "REMOTE: SQLite db sanity"
-run_remote 'ls -la /var/lib/origin/data/qd.sqlite* 2>/dev/null; echo; echo "-- backups --"; ls -la /var/lib/origin/backups 2>/dev/null | head -10'
+run_remote "ls -la '$REMOTE_DATA_DIR'/qd.sqlite* 2>/dev/null; echo; echo '-- backups --'; ls -la '$REMOTE_DATA_DIR'/backups 2>/dev/null | head -10 || true"
 
 section "REMOTE: vevdemo runtime bundle"
-run_remote 'ls -la /opt/origin/vevdemo-1.0.6 2>/dev/null | head -10 || echo "(not present)"'
+run_remote "ls -la '$REMOTE_APP_DIR/vevdemo-1.0.6' 2>/dev/null | head -10 || echo '(not present)'"
 
 section "REMOTE: health endpoint"
 run_remote 'curl -sS -m 8 http://127.0.0.1:3000/api/health || echo "(health endpoint not reachable)"'
@@ -140,8 +143,7 @@ section "REMOTE: workspace / client config smoke"
 run_remote 'curl -s -o /dev/null -w "workspace HTTP=%{http_code}\n" -m 8 http://127.0.0.1:3000/workspace; curl -s -o /dev/null -w "client-config HTTP=%{http_code}\n" -m 8 http://127.0.0.1:3000/api/config/client'
 
 section "REMOTE: recent web/worker logs (last 30 lines)"
-run_remote 'journalctl -u origin-web -n 30 --no-pager 2>/dev/null || echo "(no journalctl for origin-web)"'
-run_remote 'echo "--- worker ---"; journalctl -u origin-worker -n 30 --no-pager 2>/dev/null || echo "(no journalctl for origin-worker)"'
+run_remote "cd '$REMOTE_APP_DIR' && $REMOTE_COMPOSE_CMD logs --tail=30 origin-web origin-worker 2>/dev/null || echo '(no compose logs)'"
 
 section "REMOTE: nginx config presence"
 run_remote 'ls /etc/nginx/sites-enabled/ 2>/dev/null; nginx -t 2>&1 | head -5'

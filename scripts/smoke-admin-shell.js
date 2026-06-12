@@ -37,22 +37,30 @@ function navHrefs(html) {
 }
 
 async function main() {
-  const unauth = await request('/admin/users', { redirect: 'manual' });
-  assert(unauth.res.status === 302, `unauth /admin/users should return 302, got ${unauth.res.status}`);
+  // 2026-06 瘦身后导航为 7 页：/admin /admin/search /admin/billing /admin/usage-stats /admin/system /admin/content /admin/knowledge。
+  const unauth = await request('/admin/search', { redirect: 'manual' });
+  assert(unauth.res.status === 302, `unauth /admin/search should return 302, got ${unauth.res.status}`);
   assert((unauth.res.headers.get('location') || '').includes('/admin/login'), 'unauth redirect should target /admin/login');
 
   const cookie = await login();
-  const users = await request('/admin/users', { headers: { cookie } });
-  assert(users.res.status === 200, `authenticated /admin/users should return 200, got ${users.res.status}`);
-  assert(activeHref(users.text) === '/admin/users', 'active nav href for /admin/users is incorrect');
-  assert(users.text.includes('data-user-search="true"'), '/admin/users should render the user search control');
-  assert(users.text.includes('/api/admin/users'), '/admin/users should be wired to the admin users API');
-  assert(!users.text.includes('P1-B 接入'), '/admin/users should not render the old placeholder panel');
+  const search = await request('/admin/search', { headers: { cookie } });
+  assert(search.res.status === 200, `authenticated /admin/search should return 200, got ${search.res.status}`);
+  assert(activeHref(search.text) === '/admin/search', 'active nav href for /admin/search is incorrect');
+  assert(search.text.includes('data-admin-search-input="true"'), '/admin/search should render the search control');
+  assert(search.text.includes('data-users-table="true"'), '/admin/search should render the merged users table');
+  assert(search.text.includes('/api/admin/users'), '/admin/search should be wired to the admin users API');
 
   const home = await request('/admin', { headers: { cookie } });
   assert(home.res.status === 200, `authenticated /admin should return 200, got ${home.res.status}`);
   const hrefs = navHrefs(home.text);
-  assert(hrefs.length >= 8, `expected admin nav links, got ${hrefs.length}`);
+  assert(hrefs.length === 7, `expected exactly 7 admin nav links after slimdown, got ${hrefs.length}`);
+  const expectedHrefs = ['/admin', '/admin/search', '/admin/billing', '/admin/usage-stats', '/admin/system', '/admin/content', '/admin/knowledge'];
+  for (const expected of expectedHrefs) {
+    assert(hrefs.includes(expected), `nav should include ${expected}`);
+  }
+  for (const removed of ['/admin/users', '/admin/tasks', '/admin/token-stats', '/admin/time-stats', '/admin/staff', '/admin/config', '/admin/key-pool', '/admin/storage']) {
+    assert(!hrefs.includes(removed), `nav should no longer include retired page ${removed}`);
+  }
   for (const href of hrefs) {
     const page = await request(href, { headers: { cookie } });
     assert(page.res.status === 200, `nav href ${href} should return 200, got ${page.res.status}`);
@@ -71,8 +79,8 @@ async function main() {
   const clearedCookie = logout.res.headers.get('set-cookie') || '';
   assert(/admin_token=;/.test(clearedCookie) || /Max-Age=0/i.test(clearedCookie), 'logout did not clear admin_token cookie');
 
-  const afterLogout = await request('/admin/tasks', { redirect: 'manual' });
-  assert(afterLogout.res.status === 302, `after logout /admin/tasks without cookie should return 302, got ${afterLogout.res.status}`);
+  const afterLogout = await request('/admin/system', { redirect: 'manual' });
+  assert(afterLogout.res.status === 302, `after logout /admin/system without cookie should return 302, got ${afterLogout.res.status}`);
 
   console.log('admin shell smoke ok: server gate, nav active state, nav hrefs, and logout flow passed');
 }

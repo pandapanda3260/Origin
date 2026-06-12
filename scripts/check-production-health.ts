@@ -111,6 +111,47 @@ async function checkPublicWorkspaceSmoke() {
     throw new Error('/api/config/client missing features or limits object');
   }
   console.log(`[health] ok client config size=${sizeLabel(configMeasured.bytes)}`);
+  await checkStaticAssetCache(workspaceHtml);
+}
+
+async function checkStaticAssetCache(workspaceHtml: string) {
+  const assetPaths = Array.from(new Set([
+    ...Array.from(workspaceHtml.matchAll(/(?:src|href)="([^"]+\.(?:js|css|png)(?:\?v=\d+)?)"/g)).map((m) => m[1]),
+    ...Array.from(workspaceHtml.matchAll(/"(\/modules\/[^"]+?\.js\?v=\d+)"/g)).map((m) => m[1]),
+  ]))
+    .filter((path) => (
+      path.startsWith('/') ||
+      path.startsWith('main.js') ||
+      path.startsWith('styles.css') ||
+      path.startsWith('workspace-tailwind.css') ||
+      path.startsWith('fonts.css') ||
+      path.startsWith('originrise-logo.png') ||
+      path.startsWith('modules/')
+    ));
+  const sample = assetPaths
+    .filter((path) => /(?:^|\/)(?:main\.js|styles\.css|workspace-tailwind\.css|fonts\.css|originrise-logo\.png)|\/modules\//.test(path))
+    .slice(0, 8);
+  const weak: string[] = [];
+  for (const rawPath of sample) {
+    const url = new URL(rawPath, `${workspaceBaseUrl}/workspace`);
+    const response = await fetch(url, { method: 'HEAD' });
+    if (!response.ok) {
+      weak.push(`${url.pathname}:http_${response.status}`);
+      continue;
+    }
+    const cache = response.headers.get('cache-control') || '';
+    const isLogo = url.pathname.endsWith('/originrise-logo.png');
+    const hasZeroTtl = /(?:^|,)\s*(?:public,\s*)?max-age=0(?:\s*[,;]|$)/i.test(cache);
+    const ok = isLogo
+      ? !hasZeroTtl && /max-age=(?:[1-9]\d{3,}|86400)/.test(cache)
+      : !hasZeroTtl && /max-age=31536000/.test(cache) && /immutable/.test(cache);
+    if (!ok) weak.push(`${url.pathname}:${cache || 'missing'}`);
+  }
+  if (weak.length) {
+    console.log(`[health] warn static asset cache is weak: ${weak.slice(0, 4).join(', ')}`);
+  } else {
+    console.log(`[health] ok static asset cache headers`);
+  }
 }
 
 function extractProjectSummaries(body: any): any[] {

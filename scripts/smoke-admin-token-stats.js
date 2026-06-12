@@ -91,13 +91,18 @@ async function main() {
   const fx = createFixture();
   try {
     const cookie = await login();
-    const page = await request('/admin/token-stats', { headers: { cookie } });
-    assert(page.res.status === 200, `token stats page failed: ${page.res.status} ${page.text}`);
-    assert(page.text.includes('data-token-range="true"'), 'token stats page should render range filter');
-    assert(page.text.includes('/api/admin/token-stats'), 'token stats page should be wired to token stats API');
-    assert(page.text.includes('Token 统计不是现金成本统计'), 'token stats page should explain token is not cash cost');
+    // Token 统计已并入 /admin/usage-stats（2026-06 瘦身，Token tab）。
+    const page = await request('/admin/usage-stats', { headers: { cookie } });
+    assert(page.res.status === 200, `usage stats page failed: ${page.res.status} ${page.text}`);
+    assert(page.text.includes('data-tok-range="true"'), 'usage stats page should render token range filter');
+    assert(page.text.includes('data-tim-range="true"'), 'usage stats page should render time range filter');
+    assert(page.text.includes('/api/admin/token-stats'), 'usage stats page should be wired to token stats API');
+    assert(page.text.includes('/api/admin/time-stats'), 'usage stats page should be wired to time stats API');
 
     const base = `/api/admin/token-stats?range=30d&q=${encodeURIComponent(fx.id)}`;
+    const summaryProbe = await request(`${base}&view=summary`, { headers: { cookie } });
+    assert(summaryProbe.res.status === 200, `summary probe failed: ${summaryProbe.res.status} ${summaryProbe.text}`);
+    assert((summaryProbe.json.notes || []).some((note) => note.includes('Token 统计不是现金成本统计')), 'token stats API should keep the not-cash-cost note (page renders it dynamically)');
     for (const view of ['summary', 'users', 'categories', 'calls']) {
       const result = await request(`${base}&view=${view}`, { headers: { cookie } });
       assert(result.res.status === 200, `${view} failed: ${result.res.status} ${result.text}`);

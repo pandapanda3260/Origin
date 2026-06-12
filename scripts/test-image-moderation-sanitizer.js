@@ -96,6 +96,18 @@ const cases = [
     input: 'CHARACTER LOCK:\n猪八戒: 灰蓝粗布僧袍半敞，圆胖身形。\nPROP LOCK:\n九齿钉耙金属表面有烟尘。',
     expected: '衣袍松垮但完整覆盖身体',
   },
+  {
+    name: 'graphic gore details',
+    category: 'violence',
+    input: '一名战士倒在血泊中，内脏外露，鲜血四溅喷涌，断肢散落一地。',
+    expected: '深色污痕、烟尘与战后磨损',
+  },
+  {
+    name: 'corpse gore clause',
+    category: 'violence',
+    input: '尸体面部痛苦扭曲，地面血肉模糊，背景烟尘翻涌。',
+    expected: '地面留下凌乱的战后痕迹与散落道具',
+  },
 ];
 
 const negativeCases = [
@@ -114,6 +126,14 @@ const negativeCases = [
   {
     name: 'zhu bajie body hair feature',
     input: '猪八戒耳后短毛清晰，蓝灰僧衣完整覆盖身体。',
+  },
+  {
+    name: 'guillotine prop is not decapitation gore',
+    input: '古旧断头台作为远景道具，木纹清晰，没有人物受伤画面。',
+  },
+  {
+    name: 'corpse as non-graphic investigation prop',
+    input: '法医办公室墙上贴着尸体检验报告的道具文字，画面重点是冷色灯光。',
   },
 ];
 

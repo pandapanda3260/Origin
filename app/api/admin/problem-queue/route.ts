@@ -29,6 +29,7 @@ export async function GET(req: NextRequest) {
   const staleSince = minutesAgoIso(ADMIN_THRESHOLDS.staleTaskMinutes);
   const failureSince = minutesAgoIso(ADMIN_THRESHOLDS.heavyFailureWindowMinutes);
   const refundSince = hoursAgoIso(ADMIN_THRESHOLDS.refundRatioWindowHours);
+  const recentFailedSince = hoursAgoIso(ADMIN_THRESHOLDS.recentFailedHours);
 
   const staleTasks = [
     ...db.prepare<{ since: string }, any>(
@@ -74,6 +75,41 @@ export async function GET(req: NextRequest) {
         LIMIT 30`,
     ).all({ since: staleSince }),
   ].sort((a, b) => String(a.lastSignalAt || '').localeCompare(String(b.lastSignalAt || ''))).slice(0, 40);
+
+  // 近 24h 终态失败任务（与"卡住"分开：卡住 = running 超时无心跳，失败 = 已终态 failed）。
+  const failedTasks = [
+    ...db.prepare<{ since: string }, any>(
+      `SELECT 'batch_task' AS source, bt.id, b.owner_id AS ownerId, b.project_id AS projectId, b.batch_type AS kind,
+              bt.status, COALESCE(bt.status_reason, bt.error_message, bt.error_msg, '') AS reason,
+              bt.updated_at AS lastSignalAt, bt.created_at AS createdAt
+         FROM batch_tasks bt
+         JOIN batches b ON b.id = bt.batch_id
+        WHERE bt.status = 'failed'
+          AND bt.updated_at > @since
+        ORDER BY bt.updated_at DESC
+        LIMIT 30`,
+    ).all({ since: recentFailedSince }),
+    ...db.prepare<{ since: string }, any>(
+      `SELECT 'video_task' AS source, id, owner_id AS ownerId, project_id AS projectId, 'video' AS kind,
+              status, COALESCE(error_message, error_msg, '') AS reason,
+              updated_at AS lastSignalAt, created_at AS createdAt
+         FROM video_tasks
+        WHERE status = 'failed'
+          AND updated_at > @since
+        ORDER BY updated_at DESC
+        LIMIT 30`,
+    ).all({ since: recentFailedSince }),
+    ...db.prepare<{ since: string }, any>(
+      `SELECT 'export' AS source, id, owner_id AS ownerId, project_id AS projectId, 'export' AS kind,
+              status, COALESCE(error_message, error_msg, '') AS reason,
+              updated_at AS lastSignalAt, created_at AS createdAt
+         FROM exports
+        WHERE status = 'failed'
+          AND updated_at > @since
+        ORDER BY updated_at DESC
+        LIMIT 30`,
+    ).all({ since: recentFailedSince }),
+  ].sort((a, b) => String(b.lastSignalAt || '').localeCompare(String(a.lastSignalAt || ''))).slice(0, 40);
 
   const needsReviewTasks = db.prepare<[], any>(
     `SELECT bt.id,
@@ -198,6 +234,7 @@ export async function GET(req: NextRequest) {
   return jsonOk({
     thresholds: ADMIN_THRESHOLDS,
     staleTasks,
+    failedTasks,
     needsReviewTasks,
     contentRisks,
     abnormalAccounts,

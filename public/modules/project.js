@@ -28,6 +28,7 @@ function _uPrefix() { return _ctx.uPrefix || ''; }
 function _EPISODE_FIELDS() { return _ctx.EPISODE_FIELDS || []; }
 const _MAX_IMAGE_HISTORY = 20;
 const _VP_CACHE_VERSION = 2;
+const LEGACY_STORYBOARD_ARCHIVE_UI_ENABLED = false;
 
 // Auth helpers — use imported names directly
 const _getAuthHeaders = getAuthHeaders;
@@ -164,6 +165,7 @@ function _openLegacyStoryboardArchive() {
 }
 
 function _maybeShowLegacyStoryboardArchiveNotice(proj) {
+  if (!LEGACY_STORYBOARD_ARCHIVE_UI_ENABLED) return;
   var archive = Array.isArray(proj && proj.legacyStoryboardArchive) ? proj.legacyStoryboardArchive : [];
   var count = Number(proj && proj.legacyStoryboardArchiveLastCount) || archive.length || 0;
   if (!proj || !proj.id || count <= 0 || !archive.length) return;
@@ -180,12 +182,17 @@ function _maybeShowLegacyStoryboardArchiveNotice(proj) {
 
 function _updateLegacyStoryboardArchiveEntry(proj) {
   var entry = document.getElementById("legacyStoryboardArchiveEntry");
+  var nav = document.getElementById("navLegacyStoryboardArchive");
+  if (nav) {
+    nav.hidden = true;
+    nav.classList.add("hidden");
+  }
+  if (entry) entry.classList.add("hidden");
+  if (!LEGACY_STORYBOARD_ARCHIVE_UI_ENABLED) return;
   if (!entry) return;
   var archive = Array.isArray(proj && proj.legacyStoryboardArchive) ? proj.legacyStoryboardArchive : [];
   if (!proj || !archive.length) {
     entry.classList.add("hidden");
-    var navEmpty = document.getElementById("navLegacyStoryboardArchive");
-    if (navEmpty) navEmpty.hidden = true;
     return;
   }
   entry.classList.remove("hidden");
@@ -195,14 +202,6 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
   if (btn && !btn.__legacyArchiveBound) {
     btn.__legacyArchiveBound = true;
     btn.addEventListener("click", _openLegacyStoryboardArchive);
-  }
-  var nav = document.getElementById("navLegacyStoryboardArchive");
-  if (nav) {
-    nav.hidden = false;
-    if (!nav.__legacyArchiveBound) {
-      nav.__legacyArchiveBound = true;
-      nav.addEventListener("click", _openLegacyStoryboardArchive);
-    }
   }
 }
 

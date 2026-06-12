@@ -8,7 +8,12 @@
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { EPISODE_FIELDS, createEmptyEpisode, mirrorEpisodeFields } from '../public/modules/episode_fields.js';
+import {
+  EPISODE_FIELDS,
+  createEmptyEpisode,
+  mirrorEpisodeFields,
+  nextAvailableEpisodeNumber,
+} from '../public/modules/episode_fields.js';
 
 // —— 镜像机制兼容读保留 ——
 const expectedFields = [
@@ -48,6 +53,11 @@ for (const field of EPISODE_FIELDS) {
   assert.ok(Object.prototype.hasOwnProperty.call(mirrored, field), `missing mirrored field ${field}`);
 }
 
+assert.equal(nextAvailableEpisodeNumber([1], 2), 2, '只有第1集时应创建第2集');
+assert.equal(nextAvailableEpisodeNumber([1, 3], 2), 2, '删除第2集后应补第2集');
+assert.equal(nextAvailableEpisodeNumber([1, 2, 3], 2), 4, '无缺口时继续追加下一集');
+assert.equal(nextAvailableEpisodeNumber([1, 2], 1), 3, '起点被占用时应向后找最小可用集号');
+
 // —— AI 续写摘除锁 ——
 const episodesSource = readFileSync(new URL('../public/modules/episodes.js', import.meta.url), 'utf8');
 assert.ok(!episodesSource.includes('/api/script/workflow/episode-create'), 'AI 续写调用不应回归 episodes.js');
@@ -66,10 +76,16 @@ assert.ok(episodesSource.includes('function _resolveCurrentWorldTemplateId(proje
 assert.ok(episodesSource.includes('tpl.sourceProjectId || tpl.source_project_id'), '续写弹窗应支持按源任务识别本集世界观');
 assert.ok(episodesSource.includes('selectEl.value = resolvedWorldId'), '续写弹窗应默认选中本集世界观');
 assert.ok(episodesSource.includes('if (templateRadio) templateRadio.checked = true'), '续写弹窗应默认切到选择世界观模板');
+assert.ok(episodesSource.includes('nextAvailableEpisodeNumber(occupied, curNum + 1)'), '续写弹窗应按最小可用集号补缺口');
+assert.ok(episodesSource.includes('state.closed = true'), '关闭/取消应标记弹窗已取消');
+assert.ok(episodesSource.includes('state.abortController.abort()'), '关闭/取消应中断未完成请求');
+assert.ok(episodesSource.includes('if (state.closed) return;'), '确认前应检查弹窗取消状态');
 
 // —— main.js 契约 ——
 const mainSource = readFileSync(new URL('../public/main.js', import.meta.url), 'utf8');
-assert.match(mainSource, /\.\/modules\/episode_fields\.js\?v=\d+/);
+assert.match(mainSource, /from ['"]\/modules\/episode_fields\.js['"]/);
+const workspaceSource = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
+assert.match(workspaceSource, /"\/modules\/episode_fields\.js":\s*"\/modules\/episode_fields\.js\?v=\d+"/);
 assert.ok(!/var\s+EPISODE_FIELDS\s*=/.test(mainSource), 'EPISODE_FIELDS 单一来源');
 assert.ok(mainSource.includes('finalizeCreatedProject'), '创建收尾统一函数（新建/续写共用）');
 assert.ok(!mainSource.includes('_createNewEpisode'), '旧 AI 续写入口引用应清除');

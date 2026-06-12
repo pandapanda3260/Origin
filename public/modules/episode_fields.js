@@ -31,6 +31,24 @@ function finiteDuration(value) {
   return Math.min(60 * 60, Math.round(n));
 }
 
+export function normalizeEpisodeNumber(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n) || n < 1) return null;
+  return Math.round(n);
+}
+
+export function nextAvailableEpisodeNumber(existingNumbers, startNumber) {
+  var used = {};
+  (Array.isArray(existingNumbers) ? existingNumbers : []).forEach(function (value) {
+    var n = normalizeEpisodeNumber(value);
+    if (n) used[n] = true;
+  });
+
+  var candidate = normalizeEpisodeNumber(startNumber) || 1;
+  while (used[candidate]) candidate += 1;
+  return candidate;
+}
+
 export function createEmptyEpisode(input) {
   input = input && typeof input === "object" ? input : {};
   return {

@@ -12,38 +12,28 @@
     <script>
       (function () {
         var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "toolbox", "profile", "settings", "onlineEditor"];
+        var disabledPages = ["profile", "settings"];
         var hashKey = "workspacePage";
         function normalize(page) {
           page = String(page || "");
           if (page === "online-editor") page = "onlineEditor";
           if (page === "images") page = "shots";
+          if (disabledPages.indexOf(page) !== -1) return "";
           if (pages.indexOf(page) === -1) return "";
           return page;
         }
-        function readStorage(storage, key) {
-          try { return storage.getItem(key) || ""; } catch (_) { return ""; }
-        }
-        function currentPrefix() {
-          try {
-            var user = JSON.parse(window.localStorage.getItem("sw_auth_user") || "{}");
-            return user && user.id ? ("u" + user.id + "_") : "";
-          } catch (_) {
-            return "";
-          }
-        }
-        var prefix = currentPrefix();
         var page = "";
+        var hasWorkspacePageHash = false;
         try {
           var hash = String(window.location.hash || "");
           var hashPrefix = "#" + hashKey + "=";
-          if (hash.indexOf(hashPrefix) === 0) page = decodeURIComponent(hash.slice(hashPrefix.length));
+          if (hash.indexOf(hashPrefix) === 0) {
+            hasWorkspacePageHash = true;
+            page = decodeURIComponent(hash.slice(hashPrefix.length));
+          }
         } catch (_) {}
-        if (!page) page = readStorage(window.sessionStorage, prefix + "sw_workspace_active_page");
-        if (!page) {
-          try { page = (window.history && window.history.state && window.history.state.originWorkspaceActivePage) || ""; } catch (_) {}
-        }
-        if (!page) page = readStorage(window.localStorage, prefix + "sw_workspace_active_page_fallback");
-        page = normalize(page);
+        if (!hasWorkspacePageHash) page = "overview";
+        page = normalize(page) || "overview";
         document.documentElement.setAttribute("data-workspace-boot-page", page || "overview");
       })();
     </script>
@@ -70,7 +60,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=245" />
+    <link rel="stylesheet" href="styles.css?v=246" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -269,12 +259,12 @@
             <span class="material-symbols-outlined">frame_person</span>
             <span>角色定制</span>
           </button>
-          <button type="button" id="navProfile" data-page="profile" title="创作偏好" hidden
+          <button type="button" id="navProfile" data-page="profile" title="创作偏好" hidden data-retired-surface="creator-profile"
             class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
             <span class="material-symbols-outlined">fingerprint</span>
             <span>创作偏好</span>
           </button>
-          <button type="button" id="navLegacyStoryboardArchive" title="旧版多镜头生成历史" hidden
+          <button type="button" id="navLegacyStoryboardArchive" title="旧版多镜头生成历史" hidden data-retired-surface="legacy-storyboard-archive"
             class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
             <span class="material-symbols-outlined">inventory_2</span>
             <span>旧版归档</span>
@@ -282,7 +272,7 @@
         </div>
 
       <div class="mt-auto shrink-0 pt-4 border-t border-outline-variant/10 relative z-10 pl-6 space-y-1">
-        <button type="button" id="navSettings" data-page="settings" title="设置" hidden
+        <button type="button" id="navSettings" data-page="settings" title="设置" hidden data-retired-surface="settings-page"
           class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
           <span class="material-symbols-outlined">settings</span>
           <span>设置</span>
@@ -301,15 +291,15 @@
             </span>
           </button>
           <div class="account-menu-separator"></div>
-          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
+          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
             <span class="material-symbols-outlined">explore</span>
             <span>个性化</span>
           </button>
-          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
+          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
             <span class="material-symbols-outlined">account_circle</span>
             <span>个人资料</span>
           </button>
-          <button type="button" class="account-menu-item" disabled role="menuitem" aria-disabled="true">
+          <button type="button" class="account-menu-item" disabled hidden role="menuitem" aria-disabled="true" data-retired-surface="account-menu-placeholder">
             <span class="material-symbols-outlined">settings</span>
             <span>设置</span>
           </button>
@@ -1368,8 +1358,14 @@
                   </label>
                 </div>
                 <div class="edit-media-tabs" role="tablist" aria-label="素材来源">
-                  <button type="button" class="edit-media-tab edit-media-tab--active" data-tab="clips" role="tab" aria-selected="true">片段 Clips</button>
-                  <button type="button" class="edit-media-tab" data-tab="uploads" role="tab" aria-selected="false">上传 Upload</button>
+                  <button type="button" class="edit-media-tab edit-media-tab--active" data-tab="clips" role="tab" aria-selected="true">
+                    <span class="edit-media-tab-cn">片段</span>
+                    <span class="edit-media-tab-en">Clips</span>
+                  </button>
+                  <button type="button" class="edit-media-tab" data-tab="uploads" role="tab" aria-selected="false">
+                    <span class="edit-media-tab-cn">上传</span>
+                    <span class="edit-media-tab-en">Upload</span>
+                  </button>
                 </div>
                 <div class="flex-1 overflow-y-auto edit-hide-scrollbar px-3 pb-3 space-y-3" id="editMediaList">
                   <p class="text-xs edit-label text-center mt-8" style="letter-spacing:0.15em">暂无素材</p>
@@ -1751,7 +1747,7 @@
             </details>
           </section>
 
-          <section id="legacyStoryboardArchiveEntry" class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mt-6 mb-6 hidden">
+          <section id="legacyStoryboardArchiveEntry" class="bg-surface-container-lowest rounded-xl p-8 border border-outline-variant/10 shadow-sm mt-6 mb-6 hidden" data-retired-surface="legacy-storyboard-archive">
             <div class="flex items-center justify-between gap-4">
               <div>
                 <div class="flex items-center gap-2 mb-1">
@@ -1838,14 +1834,14 @@
     <script type="importmap">
     {
             "imports": {
-                    "/modules/assets.js": "/modules/assets.js?v=174",
+                    "/modules/assets.js": "/modules/assets.js?v=175",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
                     "/modules/billing.js": "/modules/billing.js?v=117",
-                    "/modules/character_custom.js": "/modules/character_custom.js?v=215",
+                    "/modules/character_custom.js": "/modules/character_custom.js?v=217",
                     "/modules/diagnostic.js": "/modules/diagnostic.js?v=301",
                     "/modules/edit.js": "/modules/edit.js?v=306",
-                    "/modules/episode_fields.js": "/modules/episode_fields.js?v=102",
-                    "/modules/episodes.js": "/modules/episodes.js?v=112",
+                    "/modules/episode_fields.js": "/modules/episode_fields.js?v=103",
+                    "/modules/episodes.js": "/modules/episodes.js?v=113",
                     "/modules/error_hub.js": "/modules/error_hub.js?v=300",
                     "/modules/frameRecommendations.js": "/modules/frameRecommendations.js?v=1",
                     "/modules/holo_card.js": "/modules/holo_card.js?v=300",
@@ -1854,9 +1850,9 @@
                     "/modules/module_singleton_guard.js": "/modules/module_singleton_guard.js?v=1",
                     "/modules/online_editor.js": "/modules/online_editor.js?v=30",
                     "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
-                    "/modules/project.js": "/modules/project.js?v=108",
+                    "/modules/project.js": "/modules/project.js?v=110",
                     "/modules/render_hooks.js": "/modules/render_hooks.js?v=301",
-                    "/modules/script.js": "/modules/script.js?v=118",
+                    "/modules/script.js": "/modules/script.js?v=119",
                     "/modules/script_consult_state.js": "/modules/script_consult_state.js?v=300",
                     "/modules/script_timeline.js": "/modules/script_timeline.js?v=2",
                     "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
@@ -1869,7 +1865,7 @@
                     "/modules/tasks.js": "/modules/tasks.js?v=301",
                     "/modules/toolbox.js": "/modules/toolbox.js?v=203",
                     "/modules/utils.js": "/modules/utils.js?v=300",
-                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=114",
+                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=115",
                     "/modules/videoTasks.js": "/modules/videoTasks.js?v=306",
                     "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
             }
@@ -1877,7 +1873,7 @@
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=353"></script>
+    <script type="module" src="main.js?v=357"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

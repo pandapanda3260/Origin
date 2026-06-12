@@ -4,10 +4,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  const devHint = process.env.NODE_ENV === 'production'
-    ? ''
-    : '<p class="hint">开发默认：admin 账号 <code>origin-admin</code>，密码 <code>origin-admin-dev-2026!</code></p>';
-  return new NextResponse(LOGIN_HTML.replace('<!--DEV_HINT-->', devHint), {
+  return new NextResponse(LOGIN_HTML, {
     headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
   });
 }
@@ -23,8 +20,6 @@ const LOGIN_HTML = `<!doctype html>
     main { width:min(420px, calc(100vw - 32px)); }
     h1 { margin:0 0 8px; font-size:24px; line-height:1.2; letter-spacing:.01em; }
     p { margin:0 0 28px; color:#8f9baa; font-size:13px; }
-    .hint { margin:-16px 0 18px; color:#aab6c3; }
-    code { color:#d8f3ff; }
     form { display:grid; gap:14px; padding:28px; border:1px solid rgba(255,255,255,.12); background:rgba(255,255,255,.05); border-radius:8px; }
     label { display:grid; gap:7px; font-size:12px; color:#aab6c3; }
     input { height:42px; border-radius:6px; border:1px solid rgba(255,255,255,.16); background:#111923; color:#fff; padding:0 12px; font-size:13px; line-height:1.4; outline:none; }
@@ -37,10 +32,9 @@ const LOGIN_HTML = `<!doctype html>
   <main>
     <h1>ORIGIN Admin</h1>
     <p>独立后台入口。普通工作台账号不可登录这里。</p>
-    <!--DEV_HINT-->
-    <form id="loginForm">
-      <label>管理员账号<input id="username" autocomplete="username" required /></label>
-      <label>密码<input id="password" type="password" autocomplete="current-password" required /></label>
+    <form id="loginForm" autocomplete="off">
+      <label>管理员账号<input id="username" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true" required /></label>
+      <label>密码<input id="password" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" required /></label>
       <div id="error" class="error"></div>
       <button type="submit">登录后台</button>
     </form>

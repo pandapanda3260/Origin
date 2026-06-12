@@ -131,10 +131,12 @@ function readRow(table, id) {
 
 async function main() {
   const cookie = await login();
-  const page = await request('/admin/tasks', { headers: { cookie } });
-  assert(page.res.status === 200, `admin tasks page failed: ${page.res.status} ${page.text}`);
-  assert(page.text.includes('/api/admin/tasks'), 'tasks page should be wired to /api/admin/tasks');
-  assert(!page.text.includes('P1-D 接入'), 'tasks page should not render the old placeholder panel');
+  // 任务管理已并入问题队列首页（2026-06 瘦身）。
+  const page = await request('/admin', { headers: { cookie } });
+  assert(page.res.status === 200, `admin home (merged tasks) page failed: ${page.res.status} ${page.text}`);
+  assert(page.text.includes('/api/admin/tasks'), 'home page should be wired to /api/admin/tasks');
+  assert(page.text.includes('data-task-search="true"'), 'home page should render the merged task toolbar');
+  assert(page.text.includes('id="needsReview"'), 'home page should render the needs_review card');
 
   const fx = createFixtures();
   try {

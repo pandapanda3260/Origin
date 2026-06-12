@@ -19,7 +19,10 @@ var _refUploading = false;
 var _ref = null;
 var _listCache = { key: '', items: null, loadedAt: 0 };
 var _generationFitRaf = 0;
+var _draftPollTimer = 0;
+var _draftPollInFlight = false;
 var _LIST_CACHE_TTL_MS = 2 * 60 * 1000;
+var _DRAFT_POLL_INTERVAL_MS = 5000;
 var _form = {
   name: '',
   prompt: '',
@@ -69,6 +72,101 @@ function _storeListCache() {
 
 function _invalidateListCache() {
   _listCache = { key: '', items: null, loadedAt: 0 };
+}
+
+function _draftVersionStatus(item) {
+  var version = item && item.currentVersion || null;
+  return String(version && version.status || '');
+}
+
+function _draftStatusMap() {
+  var out = {};
+  (_drafts || []).forEach(function (item) {
+    if (item && item.id) out[item.id] = _draftVersionStatus(item);
+  });
+  return out;
+}
+
+function _hasRunningDrafts() {
+  if (_selectedCharacter && _selectedCharacter.lifecycleStatus === 'draft' && _selectedVersion && _selectedVersion.status === 'running') {
+    return true;
+  }
+  return (_drafts || []).some(function (item) {
+    return _draftVersionStatus(item) === 'running';
+  });
+}
+
+function _clearDraftPoll() {
+  if (_draftPollTimer) {
+    clearTimeout(_draftPollTimer);
+    _draftPollTimer = 0;
+  }
+}
+
+function _shouldPollDrafts() {
+  if (_view !== 'draftEditor') return false;
+  if (typeof document !== 'undefined' && document.hidden) return false;
+  return _hasRunningDrafts();
+}
+
+function _syncDraftPolling() {
+  if (!_shouldPollDrafts()) {
+    _clearDraftPoll();
+    return;
+  }
+  if (_draftPollTimer || _draftPollInFlight) return;
+  _draftPollTimer = setTimeout(_pollRunningDrafts, _DRAFT_POLL_INTERVAL_MS);
+}
+
+function _findDraft(id) {
+  id = String(id || '');
+  return (_drafts || []).find(function (item) { return item && item.id === id; }) || null;
+}
+
+function _notifyDraftTransition(draft, status) {
+  var fields = draft && draft.current || {};
+  var name = String(fields.name || draft && draft.title || '角色草稿').trim();
+  if (status === 'completed') {
+    _toast('草稿「' + name + '」已生成完成', 'ok');
+  } else if (status === 'failed') {
+    var version = draft && draft.currentVersion || {};
+    _toast(_versionErrorText(version) || ('草稿「' + name + '」生成失败'), 'warn');
+  }
+}
+
+async function _pollRunningDrafts() {
+  _draftPollTimer = 0;
+  if (!_shouldPollDrafts() || _draftPollInFlight) return;
+  _draftPollInFlight = true;
+  var before = _draftStatusMap();
+  var selectedId = _selectedCharacterId;
+  var selectedWasRunning = _selectedVersion && _selectedVersion.status === 'running';
+  try {
+    await _loadDrafts();
+    var transitions = [];
+    (_drafts || []).forEach(function (item) {
+      var prev = before[item && item.id];
+      var next = _draftVersionStatus(item);
+      if (prev === 'running' && next && next !== 'running') transitions.push({ item: item, status: next });
+    });
+
+    var selectedDraft = _findDraft(selectedId);
+    var selectedStatus = _draftVersionStatus(selectedDraft);
+    if (selectedId && selectedWasRunning && selectedStatus && selectedStatus !== 'running') {
+      await _loadCharacter(selectedId);
+    } else {
+      _render();
+    }
+
+    transitions.forEach(function (transition) {
+      _notifyDraftTransition(transition.item, transition.status);
+    });
+  } catch (_) {
+    _render();
+  } finally {
+    _draftPollInFlight = false;
+    _syncDraftPolling();
+  }
 }
 
 async function _jsonFetch(url, opts) {
@@ -299,6 +397,18 @@ function _versionErrorText(version) {
   var fields = version && version.fields || {};
   var referenceError = fields.reference && fields.reference.lastError && fields.reference.lastError.message;
   return String(version && version.errorMessage || fields.imageLastError || referenceError || '').trim();
+}
+
+function _versionIsGenerating(version) {
+  return String(version && version.status || '').toLowerCase() === 'running';
+}
+
+function _previewIsGenerating() {
+  if (_busy || _versionIsGenerating(_selectedVersion)) return true;
+  if (_selectedVersion) return false;
+  return (_drafts || []).some(function (item) {
+    return _versionIsGenerating(item && item.currentVersion);
+  });
 }
 
 function _listHtml() {
@@ -819,8 +929,12 @@ function _previewHtml() {
   var fields = _selectedVersion && _selectedVersion.fields || null;
   var url = fields && (fields.imageUrl || fields.rawUrl || fields.realPhotoUrl || fields.reference && fields.reference.lastAttemptUrl) || '';
   var errorText = _versionErrorText(_selectedVersion);
-  if (_busy) {
-    return '<div class="toolbox-preview-empty"><span class="material-symbols-outlined toolbox-spin">progress_activity</span><p>正在生成角色设定图</p></div>';
+  if (_previewIsGenerating()) {
+    return '<div class="toolbox-preview-empty character-preview-generating" aria-live="polite">' +
+      '<span class="material-symbols-outlined toolbox-spin">progress_activity</span>' +
+      '<p>角色设定图生成中</p>' +
+      '<small>完成后会自动显示在这里</small>' +
+    '</div>';
   }
   if (!url) {
     return '<div class="toolbox-preview-empty"><span class="material-symbols-outlined">portrait</span><p>' + (errorText ? '生成失败' : '角色图将在这里显示') + '</p>' +
@@ -966,8 +1080,13 @@ function _render() {
   if (!root) return;
   root.innerHTML = _view === 'draftEditor' ? _draftEditorHtml() : _view === 'confirmedEditor' ? _confirmedEditorHtml() : _listHtml();
   hydrateProtectedImageElements(root);
-  if (_view === 'draftEditor') _scheduleGenerationFit();
-  else _clearGenerationFit();
+  if (_view === 'draftEditor') {
+    _scheduleGenerationFit();
+    _syncDraftPolling();
+  } else {
+    _clearGenerationFit();
+    _clearDraftPoll();
+  }
 }
 
 function _hasRenderedView() {
@@ -1233,6 +1352,62 @@ async function _saveCardDescription(id, text) {
   return data;
 }
 
+function _normalizeDraftMatchText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function _draftCreatedAfter(item, startedAt) {
+  var version = item && item.currentVersion || {};
+  var t = Date.parse(version.createdAt || item.createdAt || item.updatedAt || '');
+  if (!t) return true;
+  return t >= startedAt - 30000;
+}
+
+function _draftHasInputRef(item, refId) {
+  if (!refId) return true;
+  var version = item && item.currentVersion || {};
+  var refs = Array.isArray(version.inputRefs) ? version.inputRefs : [];
+  return refs.some(function (ref) {
+    return String(ref && (ref.refId || ref.id || ref.mediaId) || '') === refId;
+  });
+}
+
+function _draftMatchesGenerateInput(item, submitted, startedAt) {
+  if (!item || item.lifecycleStatus !== 'draft') return false;
+  if (!_draftCreatedAfter(item, startedAt)) return false;
+  if (!_draftHasInputRef(item, submitted.refId)) return false;
+  var version = item.currentVersion || {};
+  var prompt = _normalizeDraftMatchText(submitted.prompt);
+  var versionPrompt = _normalizeDraftMatchText(version.prompt);
+  if (prompt && versionPrompt !== prompt) return false;
+  var name = _normalizeDraftMatchText(submitted.name);
+  if (name) {
+    var fields = item.current || {};
+    var title = _normalizeDraftMatchText(item.title || fields.name || '');
+    if (title !== name && _normalizeDraftMatchText(fields.name) !== name) return false;
+  }
+  return true;
+}
+
+async function _recoverSubmittedDraftAfterGenerateError(startedAt, submitted) {
+  await _loadDrafts();
+  var draft = (_drafts || []).find(function (item) {
+    return _draftMatchesGenerateInput(item, submitted, startedAt);
+  });
+  if (!draft || !draft.id) return false;
+  _selectedCharacterId = draft.id;
+  await _loadCharacter(draft.id);
+  var version = _selectedVersion || draft.currentVersion || {};
+  if (version.status === 'completed') {
+    _toast('角色生成已完成，已恢复到草稿', 'ok');
+  } else if (version.status === 'failed') {
+    _toast(_versionErrorText(version) || '角色生成失败，本次尝试已存入草稿', 'warn');
+  } else {
+    _toast('角色生成已提交，正在后台生成，可稍后在草稿箱查看', 'info');
+  }
+  return true;
+}
+
 async function _generate() {
   if (_busy) return;
   if (_refUploading) throw new Error('参考图仍在上传，请上传完成后再生成');
@@ -1241,16 +1416,22 @@ async function _generate() {
   _setBusy(true);
   _render();
   var revealPreview = false;
+  var startedAt = Date.now();
+  var submitted = {
+    name: String(_form.name || '').trim(),
+    prompt: _form.prompt || '',
+    refId: _ref && _ref.refId || '',
+  };
   try {
     var data = await _jsonFetch('/api/character-custom/generate', {
       method: 'POST',
       body: JSON.stringify({
         draft: true,
         projectId: _projectId() || null,
-        name: String(_form.name || '').trim(),
-        prompt: _form.prompt || '',
+        name: submitted.name,
+        prompt: submitted.prompt,
         params: _form.params,
-        mediaId: _ref && _ref.refId || '',
+        mediaId: submitted.refId,
       }),
       timeoutMs: 600000,
     });
@@ -1263,6 +1444,12 @@ async function _generate() {
       return;
     }
     _toast(data.referenceStatus === 'failed' ? '角色图已生成，但参考切片自动裁切没成功，可重新生成试试' : '角色生成完成', data.referenceStatus === 'failed' ? 'warn' : 'ok');
+  } catch (e) {
+    if (await _recoverSubmittedDraftAfterGenerateError(startedAt, submitted)) {
+      revealPreview = true;
+      return;
+    }
+    throw e;
   } finally {
     _setBusy(false);
     _render();
@@ -1300,6 +1487,15 @@ export function _initCharacterCustomEvents() {
   if (_wired) return;
   _wired = true;
   window.addEventListener('resize', _scheduleGenerationFit);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      _clearDraftPoll();
+      return;
+    }
+    if (_view === 'draftEditor' && _hasRunningDrafts()) {
+      _pollRunningDrafts();
+    }
+  });
   document.addEventListener('click', function (ev) {
     var activeNameInput = document.querySelector('[data-character-name-input]:not(.hidden)');
     if (activeNameInput) {

@@ -6910,9 +6910,10 @@ export async function _checkEquipmentChange(charIdx, oldDescText) {
 }
 
 export async function _detectObsoleteAssets() {
-  if (!project || !project.assets) return [];
+  if (!project || !project.id || !project.assets) return [];
   try {
     var resp = await apiPost("/api/orchestration/detect-obsolete", {
+      projectId: project.id,
       project: { assets: project.assets, shots: project.shots },
     });
     return resp.obsolete || [];

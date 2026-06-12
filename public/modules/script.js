@@ -1,4 +1,4 @@
-import { $, escapeHtml, showToast, showConfirm, apiPost, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from '/modules/utils.js';
+import { $, escapeHtml, showToast, showConfirm, apiPost, apiGet, apiPostStream, consumeStreamStepTags, stripStepTags, getAuthHeaders, friendlyGatewayTransientError } from '/modules/utils.js';
 import { emptyScriptConsultState, isEmptyScriptConsultState } from '/modules/script_consult_state.js';
 import {
   appendScriptTimeline, buildDraftEvent, buildSystemEvent,

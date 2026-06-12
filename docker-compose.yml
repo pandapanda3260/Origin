@@ -1,0 +1,95 @@
+services:
+  origin-web:
+    build:
+      context: .
+      target: origin
+    image: origin-app:${ORIGIN_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      ORIGIN_ENV_FILE: /app/.env
+      ORIGIN_PROCESS_ROLE: web
+      ORIGIN_BATCH_INLINE_RUNNER: "0"
+      ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD: "0"
+      ORIGIN_REAP_ORPHANS_ON_START: "0"
+      ORIGIN_EXPECT_WORKER: "1"
+      ORIGIN_DATA_DIR: /var/lib/origin/data
+      DB_PATH: /var/lib/origin/data/qd.sqlite
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/var/lib/origin/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  origin-worker:
+    image: origin-app:${ORIGIN_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      origin-web:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      ORIGIN_ENV_FILE: /app/.env
+      ORIGIN_PROCESS_ROLE: worker
+      ORIGIN_BATCH_RECOVERY_ENABLED: "1"
+      ORIGIN_REAP_ORPHANS_ON_START: "0"
+      ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD: "1"
+      ORIGIN_DATA_DIR: /var/lib/origin/data
+      DB_PATH: /var/lib/origin/data/qd.sqlite
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/var/lib/origin/data
+    command: ["npm", "run", "worker"]
+
+  vevdemo-api:
+    build:
+      context: .
+      target: vevdemo-api
+    image: origin-vevdemo-api:${ORIGIN_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      ORIGIN_ENV_FILE: /app/.env
+      PORT: "3002"
+      VEVDEMO_BACKEND_PORT: "3002"
+    volumes:
+      - ./.env:/app/.env:ro
+    ports:
+      - "127.0.0.1:3002:3002"
+
+  vevdemo-fe:
+    build:
+      context: .
+      target: vevdemo-fe
+    image: origin-vevdemo-fe:${ORIGIN_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      vevdemo-api:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      ORIGIN_ENV_FILE: /app/.env
+      VEVDEMO_BASE_PATH: /vevdemo/
+    volumes:
+      - ./.env:/app/.env:ro
+    ports:
+      - "127.0.0.1:8084:8084"

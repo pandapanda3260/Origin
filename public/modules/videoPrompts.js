@@ -1419,17 +1419,34 @@ function _vpStatusBannerHtml(sb) {
     '</div>';
 }
 
+function _vpSensitiveHitTerm(hit) {
+  return String((hit && (hit.term || hit.word)) || '').trim();
+}
+
+function _vpSensitiveTerms(hits) {
+  var seen = {};
+  var out = [];
+  (hits || []).forEach(function (hit) {
+    var term = _vpSensitiveHitTerm(hit);
+    if (!term || seen[term]) return;
+    seen[term] = true;
+    out.push(term);
+  });
+  return out;
+}
+
 function _vpSensitiveBannerHtml(parsed, parsePending, gIdx) {
   if (parsePending) {
     return '';
   }
   var sensitiveHits = (parsed && parsed.sensitiveHits) || [];
   if (!sensitiveHits.length) return '';
-  var senWords = sensitiveHits.map(function (h) { return h.word; });
+  var senWords = _vpSensitiveTerms(sensitiveHits);
+  if (!senWords.length) return '';
   return '' +
     '<div class="flex items-center gap-3 px-4 py-3 mb-3 rounded-xl bg-error/8 border border-error/15">' +
     '<span class="material-symbols-outlined text-error text-base shrink-0">shield</span>' +
-    '<span class="flex-1 text-xs text-error font-medium">检测到 ' + sensitiveHits.length + ' 个可能触发审核的词汇：' +
+    '<span class="flex-1 text-xs text-error font-medium">检测到 ' + senWords.length + ' 个可能触发审核的词汇：' +
     '<span class="font-bold">' + escapeHtml(senWords.join('、')) + '</span></span>' +
     '<button type="button" class="shrink-0 px-4 py-1.5 bg-error text-on-error rounded-full text-[10px] font-bold tracking-wide hover:opacity-90 transition-all active:scale-95" data-action="fix-sensitive" data-gidx="' + gIdx + '">一键替换</button>' +
     '</div>';
@@ -2468,7 +2485,8 @@ async function _aiFixSensitiveWords(gIdx) {
   } catch (e) { console.warn('[ScanSensitive] failed:', e); hits = []; }
   if (!hits.length) { showToast("未检测到敏感词", "ok"); return; }
 
-  var wordList = hits.map(function (h) { return h.word; });
+  var wordList = _vpSensitiveTerms(hits);
+  if (!wordList.length) { showToast("未检测到敏感词", "ok"); return; }
   var instruction =
     "请仅替换以下可能触发视频生成API内容审核的敏感词汇，" +
     "替换为含义相近但更温和的视觉描述表达（保留画面动作含义）。" +

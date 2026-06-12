@@ -10,6 +10,7 @@
  */
 import { showToast, escapeHtml, getAuthHeaders } from '/modules/utils.js';
 import { snapshotWorldTemplate, _normalizeWorldPreferredAspectRatio } from '/modules/assets.js';
+import { normalizeEpisodeNumber, nextAvailableEpisodeNumber } from '/modules/episode_fields.js';
 
 let _ctx = {};
 
@@ -109,9 +110,7 @@ export function _getPreviousEpisodeAssets() {
 
 /** 本任务的集号：优先部—集字段 episodeNumber（一集=一任务模型），无则视为第 1 集。 */
 function _taskEpisodeNumber(project) {
-  var n = Number(project && project.episodeNumber);
-  if (Number.isFinite(n) && n >= 1) return Math.round(n);
-  return null;
+  return normalizeEpisodeNumber(project && project.episodeNumber);
 }
 
 export function _renderEpisodeTabs() {
@@ -155,12 +154,23 @@ function _stripEpisodeSuffix(name) {
   return String(name || "").replace(/\s*第\s*\d+\s*集\s*$/, "").trim();
 }
 
-/** 拉任务列表，按 seriesId 计算下一集集号：max(episodeNumber)+1，删中间集不补号。 */
-async function _computeNextEpisodeNumber(project) {
+function _fetchOptionsWithSignal(base, signal) {
+  var options = Object.assign({}, base || {});
+  if (signal) options.signal = signal;
+  return options;
+}
+
+function _isAbortError(error) {
+  return !!(error && (error.name === "AbortError" || error.code === 20));
+}
+
+/** 拉任务列表，按 seriesId 计算下一集集号：优先填补当前集之后的最小缺口。 */
+async function _computeNextEpisodeNumber(project, signal) {
   var sid = project.seriesId || project.id;
-  var maxNum = _taskEpisodeNumber(project) || 1;
+  var curNum = _taskEpisodeNumber(project) || 1;
+  var occupied = [curNum];
   try {
-    var resp = await fetch("/api/projects", { headers: getAuthHeaders() });
+    var resp = await fetch("/api/projects", _fetchOptionsWithSignal({ headers: getAuthHeaders() }, signal));
     if (resp.ok) {
       var body = await resp.json().catch(function () { return {}; });
       var items = (body && (body.projects || body.items)) || [];
@@ -168,23 +178,27 @@ async function _computeNextEpisodeNumber(project) {
         if (!p) return;
         var inSeries = (p.seriesId && p.seriesId === sid) || p.id === sid;
         if (!inSeries) return;
-        var n = Number(p.episodeNumber);
-        if (Number.isFinite(n) && n > maxNum) maxNum = Math.round(n);
+        var n = _taskEpisodeNumber(p);
+        if (!n && p.id === sid) n = 1;
+        if (n) occupied.push(n);
       });
     }
-  } catch (_) { /* 列表拉取失败时退化为本地 episodeNumber+1 */ }
-  return { seriesId: sid, nextNumber: maxNum + 1 };
+  } catch (e) {
+    if (_isAbortError(e)) throw e;
+    // 列表拉取失败时退化为本地 episodeNumber+1。
+  }
+  return { seriesId: sid, nextNumber: nextAvailableEpisodeNumber(occupied, curNum + 1) };
 }
 
-async function _fetchWorldTemplateOptions() {
-  var resp = await fetch("/api/world-templates", { headers: getAuthHeaders() });
+async function _fetchWorldTemplateOptions(signal) {
+  var resp = await fetch("/api/world-templates", _fetchOptionsWithSignal({ headers: getAuthHeaders() }, signal));
   if (!resp.ok) throw new Error("世界观模板列表加载失败 (" + resp.status + ")");
   var body = await resp.json().catch(function () { return {}; });
   return (body && (body.templates || body.items)) || [];
 }
 
-async function _fetchFullWorldTemplate(tplId) {
-  var resp = await fetch("/api/world-templates/" + encodeURIComponent(tplId), { headers: getAuthHeaders() });
+async function _fetchFullWorldTemplate(tplId, signal) {
+  var resp = await fetch("/api/world-templates/" + encodeURIComponent(tplId), _fetchOptionsWithSignal({ headers: getAuthHeaders() }, signal));
   if (!resp.ok) throw new Error("世界观模板加载失败 (" + resp.status + ")");
   var body = await resp.json().catch(function () { return {}; });
   if (!body || !body.template) throw new Error("世界观模板数据为空");
@@ -284,7 +298,15 @@ export function _openNewEpisodeDialog() {
   var nameInput = overlay.querySelector("#ceName");
   var selectEl = overlay.querySelector("#ceWorldSelect");
   var epNumText = overlay.querySelector("#ceEpNumText");
-  var state = { seriesId: project.seriesId || project.id, nextNumber: guessNum, nameDirty: false };
+  var abortController = typeof AbortController === "function" ? new AbortController() : null;
+  var state = {
+    seriesId: project.seriesId || project.id,
+    nextNumber: guessNum,
+    nameDirty: false,
+    closed: false,
+    abortController: abortController,
+  };
+  var signal = abortController ? abortController.signal : undefined;
 
   nameInput.value = baseName + " 第" + guessNum + "集";
   nameInput.addEventListener("input", function () { state.nameDirty = true; });
@@ -302,14 +324,16 @@ export function _openNewEpisodeDialog() {
   syncSelectEnabled();
 
   // 异步：算准集号（按 seriesId 扫任务列表）+ 拉世界观模板下拉
-  _computeNextEpisodeNumber(project).then(function (res) {
+  _computeNextEpisodeNumber(project, signal).then(function (res) {
     if (!overlay.isConnected) return;
     state.seriesId = res.seriesId;
     state.nextNumber = res.nextNumber;
     if (epNumText) epNumText.textContent = "第 " + res.nextNumber + " 集";
     if (!state.nameDirty) nameInput.value = baseName + " 第" + res.nextNumber + "集";
+  }).catch(function (e) {
+    if (!_isAbortError(e)) console.warn("[continueEpisode] 计算集号失败:", e);
   });
-  _fetchWorldTemplateOptions().then(function (templates) {
+  _fetchWorldTemplateOptions(signal).then(function (templates) {
     if (!overlay.isConnected) return;
     var blankRadio = overlay.querySelector('input[name="ceMode"][value="blank"]');
     var templateRadio = overlay.querySelector('input[name="ceMode"][value="template"]');
@@ -336,21 +360,35 @@ export function _openNewEpisodeDialog() {
     syncSelectEnabled();
   }).catch(function (e) {
     if (!overlay.isConnected) return;
+    if (_isAbortError(e)) return;
     selectEl.innerHTML = '<option value="">（模板列表加载失败）</option>';
     showToast(((e && e.message) || e).toString(), "warn");
   });
 
-  function close() { overlay.remove(); }
-  overlay.addEventListener("click", function (ev) { if (ev.target === overlay) close(); });
+  function close(ev) {
+    if (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+    state.closed = true;
+    if (state.abortController) state.abortController.abort();
+    overlay.remove();
+  }
+  overlay.addEventListener("click", function (ev) { if (ev.target === overlay) close(ev); });
   overlay.querySelector("#ceClose").addEventListener("click", close);
   overlay.querySelector("#ceCancel").addEventListener("click", close);
-  overlay.querySelector("#ceConfirm").addEventListener("click", function () {
+  overlay.querySelector("#ceConfirm").addEventListener("click", function (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (state.closed) return;
     _confirmContinueEpisode(overlay, state, baseName);
   });
 }
 
 async function _confirmContinueEpisode(overlay, state, baseName) {
   if (_continueInFlight) return;
+  if (state && state.closed) return;
+  if (!overlay || !overlay.isConnected) return;
   var project = _project();
   if (!project || !project.id) { overlay.remove(); return; }
 
@@ -405,8 +443,9 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
 
     // 2) 世界观：拉全量模板 → 与风格页同款快照语义（snapshotWorldTemplate 剥离 styleBible）
     if (useTemplate) {
+      if (state && state.closed) return;
       if (statusEl) statusEl.textContent = "正在载入世界观模板…";
-      var fullTpl = await _fetchFullWorldTemplate(tplId);
+      var fullTpl = await _fetchFullWorldTemplate(tplId, state && state.abortController ? state.abortController.signal : undefined);
       var snap = snapshotWorldTemplate(fullTpl);
       payload.selectedWorldTemplateId = snap.id || tplId;
       payload.worldTemplateSnapshot = snap;
@@ -424,11 +463,13 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
     }
 
     // 3) 创建（后端按会员档做配额权威拦截，409 project_quota_exceeded）
-    var resp = await fetch("/api/projects", {
+    if (state && state.closed) return;
+    var resp = await fetch("/api/projects", _fetchOptionsWithSignal({
       method: "POST",
       headers: Object.assign({}, getAuthHeaders(), { "Content-Type": "application/json" }),
       body: JSON.stringify(payload),
-    });
+    }, state && state.abortController ? state.abortController.signal : undefined));
+    if (state && state.closed) return;
     if (resp.status === 409) {
       var err = await resp.json().catch(function () { return {}; });
       if (err && err.error === "project_quota_exceeded") {
@@ -441,6 +482,7 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
       throw new Error((errBody && (errBody.detail || errBody.error)) || ("创建失败 (" + resp.status + ")"));
     }
     var serverProj = await resp.json();
+    if (state && state.closed) return;
     if (!serverProj || !serverProj.id) throw new Error("后端没有返回新任务数据");
 
     // 4) 回填源任务的部—集字段（首次续写：seriesId=自身 id、episodeNumber=1）。
@@ -471,12 +513,14 @@ async function _confirmContinueEpisode(overlay, state, baseName) {
     // 5) 统一收尾（与新建任务同一条路径）→ 落到空白剧本页
     if (statusEl) statusEl.textContent = "任务已创建，正在打开…";
     var ok = _ctx.finalizeCreatedProject ? await _ctx.finalizeCreatedProject(serverProj) : false;
+    if (state && state.closed) return;
     overlay.remove();
     if (ok) {
       _ctx.switchPage("script");
       showToast("第 " + state.nextNumber + " 集任务已创建" + (useTemplate ? "，世界观已带入" : "") + "，请输入剧本。", "success");
     }
   } catch (e) {
+    if ((state && state.closed) || _isAbortError(e)) return;
     var errMsg = ((e && e.message) || e).toString().slice(0, 160);
     if (statusEl) statusEl.textContent = "创建失败: " + errMsg;
     if (confirmBtn) confirmBtn.disabled = false;

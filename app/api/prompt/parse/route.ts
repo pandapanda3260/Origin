@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
+import { scanSensitiveText } from '@/lib/sensitive-keywords';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -39,11 +40,6 @@ const MOTION_KEYWORDS = [
   'orbit', 'aerial', 'handheld', 'slow-motion', 'pov', 'static', 'crane',
 ];
 
-const SENSITIVE_KEYWORDS = [
-  'nude', 'naked', 'sex', 'gore', 'blood',
-  '裸', '色情', '血腥',
-];
-
 export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
@@ -54,7 +50,7 @@ export async function POST(req: NextRequest) {
 
   const segments = splitIntoSegments(text);
   const motionTags = collectMotionTags(text);
-  const sensitiveHits = collectSensitive(text);
+  const sensitiveHits = scanSensitiveText(text);
 
   return jsonOk({ segments, motionTags, sensitiveHits });
 }
@@ -151,14 +147,4 @@ function collectMotionTags(text: string) {
     if (lower.includes(target) || text.includes(k)) hits.add(k);
   }
   return Array.from(hits);
-}
-
-function collectSensitive(text: string) {
-  const lower = text.toLowerCase();
-  const hits: { word: string; index: number }[] = [];
-  for (const k of SENSITIVE_KEYWORDS) {
-    const i = lower.indexOf(k.toLowerCase());
-    if (i >= 0) hits.push({ word: k, index: i });
-  }
-  return hits;
 }

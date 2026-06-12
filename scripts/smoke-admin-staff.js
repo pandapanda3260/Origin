@@ -97,11 +97,11 @@ function cleanupAdmin(adminId) {
 
 async function main() {
   const cookie = await login();
-  const page = await request('/admin/staff', { headers: { cookie } });
-  assert(page.res.status === 200, `staff page failed: ${page.res.status} ${page.text}`);
-  assert(page.text.includes('data-staff-table="true"'), 'staff page should render staff table');
-  assert(page.text.includes('/api/admin/staff'), 'staff page should be wired to /api/admin/staff');
-  assert(!page.text.includes('P1-B 接入'), 'staff page should not render the old placeholder panel');
+  // Admin 账号已并入 /admin/system（2026-06 瘦身）。
+  const page = await request('/admin/system', { headers: { cookie } });
+  assert(page.res.status === 200, `system page (merged staff) failed: ${page.res.status} ${page.text}`);
+  assert(page.text.includes('data-staff-table="true"'), 'system page should render staff table');
+  assert(page.text.includes('/api/admin/staff'), 'system page should be wired to /api/admin/staff');
 
   const list = await request('/api/admin/staff', { headers: { cookie } });
   assert(list.res.status === 200, `list staff failed: ${list.res.status} ${list.text}`);

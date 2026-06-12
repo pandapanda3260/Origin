@@ -13077,8 +13077,10 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   min-width: 0;
   min-height: 42px;
   display: inline-flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  gap: 1px;
   padding: 0 6px;
   border-radius: 9999px;
   font-family: 'Space Grotesk', 'Inter', sans-serif;
@@ -13093,6 +13095,22 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(255,255,255,0.045);
   transition: background-color 0.08s ease, border-color 0.08s ease, color 0.08s ease, box-shadow 0.08s ease;
+}
+.edit-media-tab-cn,
+.edit-media-tab-en {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.edit-media-tab-cn {
+  font-size: 11px;
+}
+.edit-media-tab-en {
+  font-size: 10px;
+  letter-spacing: 0.08em;
 }
 .edit-media-tab:hover:not(.edit-media-tab--active):not([aria-selected="true"]) {
   color: rgba(255,255,255,0.92);

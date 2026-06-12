@@ -14,32 +14,29 @@ type AdminShellOptions = {
 
 type AdminPageOptions = Omit<AdminShellOptions, 'adminUsername'>;
 
+// 七页三分组（2026-06 瘦身定版）：运营=每天看；账务=对账看；系统=出事/配置看。
+// 任务管理并入问题队列；用户管理并入客服检索；Token/时间统计合并为用量统计；
+// 系统配置/Key池/存储/Admin账号合并为系统与安全；知识库三子页合并为单页三 tab。
 const NAV_GROUPS = [
   {
-    title: '运营管理',
+    title: '运营',
     items: [
       { href: '/admin', label: '问题队列', icon: 'queue' },
-    ],
-  },
-  {
-    title: '用户与业务',
-    items: [
-      { href: '/admin/users', label: '用户管理', icon: 'users' },
-      { href: '/admin/billing', label: '财务积分', icon: 'coin' },
-      { href: '/admin/token-stats', label: 'Token 统计', icon: 'activity' },
-      { href: '/admin/time-stats', label: '时间统计', icon: 'activity' },
       { href: '/admin/search', label: '客服检索', icon: 'search' },
-      { href: '/admin/tasks', label: '任务管理', icon: 'task' },
     ],
   },
   {
-    title: '系统与配置',
+    title: '账务',
     items: [
-      { href: '/admin/staff', label: 'Admin 账号', icon: 'staff' },
-      { href: '/admin/config', label: '系统配置', icon: 'settings' },
-      { href: '/admin/key-pool', label: 'Key 池', icon: 'key' },
+      { href: '/admin/billing', label: '财务积分', icon: 'coin' },
+      { href: '/admin/usage-stats', label: '用量统计', icon: 'activity' },
+    ],
+  },
+  {
+    title: '系统',
+    items: [
+      { href: '/admin/system', label: '系统与安全', icon: 'settings' },
       { href: '/admin/content', label: '内容审核', icon: 'shield' },
-      { href: '/admin/storage', label: '存储管理', icon: 'storage' },
       { href: '/admin/knowledge', label: '知识库', icon: 'book' },
     ],
   },
@@ -223,6 +220,40 @@ export function renderAdminShell(options: AdminShellOptions): string {
     .empty-page { max-width:720px; }
     .empty-page p { margin:0; color:var(--muted); line-height:1.7; font-size:13px; }
     .admin-icon { width:1em; height:1em; display:block; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; fill:none; }
+    /* ===== adm-* 统一组件层（所有后台页面共用，页面内禁止再手写同类控件样式） ===== */
+    .adm-toolbar { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin-bottom:16px; }
+    .adm-field { display:grid; gap:6px; min-width:0; }
+    .adm-field > span { color:var(--admin-text-muted); font-size:var(--admin-font-sm); font-weight:700; }
+    .adm-field input, .adm-field select { height:38px; border:1px solid var(--line-strong); border-radius:8px; background:#fff; padding:0 10px; font-size:var(--admin-font-md); font-weight:600; color:var(--admin-text-strong); min-width:0; }
+    .adm-field input:focus, .adm-field select:focus { outline:2px solid rgba(17,156,145,.25); outline-offset:0; border-color:var(--accent); }
+    .adm-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .adm-btn { height:38px; display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:0 14px; border:1px solid var(--line-strong); border-radius:8px; background:#fff; color:var(--admin-text); font-size:var(--admin-font-md); font-weight:700; cursor:pointer; }
+    .adm-btn .admin-icon { width:16px; height:16px; }
+    .adm-btn-primary { border-color:rgba(17,156,145,.5); background:linear-gradient(180deg, var(--accent), var(--accent-dark)); color:#fff; }
+    .adm-btn-primary:hover { background:linear-gradient(180deg, var(--accent), var(--accent-dark)); border-color:rgba(17,156,145,.72); color:#fff; }
+    .adm-btn-danger { color:var(--admin-danger); border-color:#f0b8ae; }
+    .adm-kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:14px; margin:18px 0; }
+    .adm-kpi { border:1px solid var(--line); border-radius:12px; background:#fff; padding:16px 18px; box-shadow:var(--shadow-soft); min-width:0; }
+    .adm-kpi[data-empty="true"] { opacity:.5; }
+    .adm-kpi-label { display:block; color:var(--admin-text-muted); font-size:var(--admin-font-sm); font-weight:700; }
+    .adm-kpi-value { display:block; margin-top:8px; color:var(--admin-text-strong); font-size:var(--admin-font-page); line-height:1.1; font-weight:800; letter-spacing:-.01em; overflow-wrap:anywhere; }
+    .adm-kpi-sub { display:block; margin-top:6px; color:var(--admin-text-muted); font-size:var(--admin-font-sm); }
+    .adm-tabs { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 16px; }
+    .adm-tab { height:36px; display:inline-flex; align-items:center; gap:7px; padding:0 14px; border:1px solid var(--line-strong); border-radius:999px; background:#fff; color:var(--admin-text); font-size:var(--admin-font-md); font-weight:700; cursor:pointer; }
+    .adm-tab[data-active="true"] { background:var(--accent-soft); border-color:rgba(17,156,145,.45); color:var(--admin-success-strong); }
+    .adm-section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 14px; }
+    .adm-section-head h2 { margin:0; }
+    .adm-count { color:var(--admin-text-muted); font-size:var(--admin-font-md); font-weight:700; white-space:nowrap; }
+    .adm-cell-title { display:block; color:var(--admin-text-strong); font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .adm-cell-sub { display:block; margin-top:3px; color:var(--admin-text-muted); font-size:var(--admin-font-xs); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .adm-empty { min-height:110px; display:grid; place-items:center; gap:8px; padding:18px; color:var(--admin-text-subtle); text-align:center; font-size:var(--admin-font-md); font-weight:600; }
+    .adm-pager { display:flex; gap:10px; align-items:center; }
+    .adm-pager button { min-width:74px; }
+    .adm-page-text { min-width:56px; text-align:center; color:var(--admin-text-strong); font-size:var(--admin-font-md); font-weight:800; }
+    .adm-note { min-height:34px; display:inline-flex; align-items:center; gap:8px; padding:6px 12px; border-radius:6px; background:var(--admin-info-soft); color:var(--admin-text); font-size:var(--admin-font-sm); font-weight:600; line-height:1.5; }
+    .adm-note .admin-icon { width:15px; height:15px; color:var(--admin-info); flex:0 0 auto; }
+    .adm-notes { display:flex; flex-wrap:wrap; gap:8px; }
+    .adm-blind-spot { display:block; margin:0 0 14px; padding:10px 14px; border:1px solid var(--admin-warning); border-left-width:4px; border-radius:8px; background:var(--admin-warning-soft); color:var(--admin-text); font-size:var(--admin-font-sm); line-height:1.6; }
     @media (max-width: 900px) {
       .admin-shell { grid-template-columns:1fr; }
       .sidebar { position:relative; height:auto; border-right:0; border-bottom:1px solid var(--line); padding:22px; }
@@ -268,6 +299,36 @@ export function renderAdminShell(options: AdminShellOptions): string {
     </div>
   </div>
   <script>
+    // 共享前端工具：各页面统一用 adminUi.*，禁止页面内再手抄 esc/fmtDate 等。
+    window.adminUi = {
+      esc(value) {
+        return String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+      },
+      fmt(n) { return Number(n || 0).toLocaleString('zh-CN'); },
+      fmtDate(value) {
+        if (!value) return '-';
+        try { return new Date(value).toLocaleString('zh-CN', { hour12:false, timeZone:'Asia/Shanghai' }); } catch { return value; }
+      },
+      fmtMs(ms) {
+        if (ms == null) return '-';
+        const s = Math.round(Number(ms) / 1000);
+        if (s < 60) return s + ' 秒';
+        const m = Math.floor(s / 60); const r = s % 60;
+        if (m < 60) return m + ' 分 ' + r + ' 秒';
+        return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+      },
+      emptyRow(cols, text) {
+        return '<tr><td colspan="' + cols + '"><div class="adm-empty">' + this.esc(text || '暂无数据') + '</div></td></tr>';
+      },
+      setNotice(el, message, kind = '') {
+        if (!el) return;
+        el.textContent = message || '';
+        el.dataset.kind = kind;
+      },
+      idemKey() {
+        return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random());
+      },
+    };
     window.adminMarkRefresh = function adminMarkRefresh() {
       const value = new Date().toISOString();
       document.body.dataset.lastRefresh = value;

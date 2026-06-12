@@ -6,6 +6,7 @@ export const ADMIN_THRESHOLDS = {
   heavyFailureMinSample: 5,
   refundRatioWindowHours: 24,
   refundChargeRatio: 0.3,
+  recentFailedHours: 24,
   keyPoolFailureWindowMinutes: 10,
   keyPoolFailureRate: 0.3,
   keyPoolRecentErrorMinutes: 5,

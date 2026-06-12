@@ -9,15 +9,23 @@ export function renderKnowledgeAdminPage(req: NextRequest, initialTab: 'cards' |
     headHtml: `<style>
       .knowledge-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:14px; }
       .knowledge-toolbar select, .knowledge-toolbar input, .audit-toolbar select, .audit-toolbar input, .knowledge-editor input, .knowledge-editor textarea { padding-left:10px; padding-right:10px; }
-      .knowledge-tabs { display:flex; gap:8px; margin-bottom:14px; border-bottom:1px solid var(--line); }
-      .knowledge-tab { border:0; border-bottom:2px solid transparent; border-radius:0; padding:10px 12px; background:transparent; }
-      .knowledge-tab[data-active="true"] { border-bottom-color:var(--accent); color:var(--accent); }
-      .knowledge-editor { display:grid; grid-template-columns:280px minmax(0,1fr); gap:14px; }
-      .knowledge-list { border:1px solid var(--line); border-radius:8px; background:#fff; overflow:auto; max-height:620px; }
-      .knowledge-item { width:100%; height:auto; border:0; border-bottom:1px solid var(--admin-border-soft); border-radius:0; text-align:left; padding:12px; display:block; }
-      .knowledge-item[data-active="true"] { background:var(--accent-bg); }
-      .knowledge-tags-input { min-width:360px; }
-      .knowledge-editor textarea { width:100%; min-height:260px; padding:10px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:var(--admin-font-sm); line-height:var(--admin-line-body); }
+      .knowledge-editor { display:grid; grid-template-columns:340px minmax(0,1fr); gap:16px; align-items:start; }
+      .knowledge-list { display:grid; gap:10px; overflow:auto; max-height:680px; padding:2px; }
+      .knowledge-item { width:100%; height:auto; border:1px solid var(--line); border-radius:10px; background:#fff; text-align:left; padding:0; display:block; overflow:hidden; cursor:pointer; transition:border-color .15s ease, box-shadow .15s ease; }
+      .knowledge-item:hover { border-color:var(--accent); box-shadow:0 6px 16px rgba(16,27,45,.07); background:#fff; }
+      .knowledge-item[data-active="true"] { border-color:var(--accent); box-shadow:0 0 0 2px rgba(17,156,145,.16); }
+      .ki-head { display:flex; align-items:center; gap:8px; padding:10px 12px 0; }
+      .ki-title { display:block; padding:8px 12px 2px; color:var(--admin-text-strong); font-size:var(--admin-font-nav); font-weight:800; line-height:1.4; overflow-wrap:anywhere; }
+      .ki-summary { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; padding:0 12px; color:var(--admin-text-muted); font-size:var(--admin-font-sm); line-height:1.55; }
+      .ki-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; padding:10px 12px 12px; }
+      .ki-tags { display:flex; gap:5px; flex-wrap:wrap; min-width:0; }
+      .ki-tag { display:inline-flex; align-items:center; height:20px; padding:0 8px; border-radius:999px; background:var(--admin-bg-soft); border:1px solid var(--admin-border-soft); color:var(--admin-text-muted); font-size:var(--admin-font-xs); font-weight:600; white-space:nowrap; }
+      .ki-id { color:var(--admin-text-subtle); font-size:var(--admin-font-xs); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:nowrap; }
+      .knowledge-editor-panel { border:1px solid var(--line); border-radius:10px; background:#fff; padding:16px; }
+      .knowledge-editor-grid { display:grid; grid-template-columns:minmax(0,2fr) repeat(2, minmax(110px, .6fr)); gap:12px; margin-bottom:12px; }
+      .knowledge-editor-grid-full { display:grid; gap:12px; margin-bottom:12px; }
+      .knowledge-tags-input { width:100%; }
+      .knowledge-editor textarea { width:100%; min-height:280px; padding:12px; border-radius:8px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:var(--admin-font-sm); line-height:var(--admin-line-body); }
       .knowledge-empty { padding:14px; }
       .audit-page { display:grid; gap:14px; }
       .dry-run-card { margin-bottom:14px; min-height:0; }
@@ -73,10 +81,10 @@ export function renderKnowledgeAdminPage(req: NextRequest, initialTab: 'cards' |
       @media (max-width: 900px) { .knowledge-editor, .audit-layout, .audit-metrics { grid-template-columns:1fr; } .audit-detail { position:static; max-height:none; } .audit-kv-grid { grid-template-columns:1fr; } }
     </style>`,
     bodyHtml: `<section class="panel">
-      <div class="knowledge-tabs">
-        <a class="knowledge-tab" href="/admin/knowledge" data-knowledge-tab="cards" data-active="${initialTab === 'cards'}">Cards</a>
-        <a class="knowledge-tab" href="/admin/knowledge/audits" data-knowledge-tab="audits" data-active="${initialTab === 'audits'}">Audits</a>
-        <a class="knowledge-tab" href="/admin/knowledge/dry-run" data-knowledge-tab="dry_run" data-active="${initialTab === 'dry_run'}">Dry-run</a>
+      <div class="adm-tabs">
+        <button type="button" class="adm-tab" data-knowledge-tab="cards" data-active="${initialTab === 'cards'}">知识卡</button>
+        <button type="button" class="adm-tab" data-knowledge-tab="audits" data-active="${initialTab === 'audits'}">审计</button>
+        <button type="button" class="adm-tab" data-knowledge-tab="dry_run" data-active="${initialTab === 'dry_run'}">注入预演</button>
       </div>
       <div data-knowledge-panel="cards"${initialTab === 'cards' ? '' : ' hidden'}>
         <div class="knowledge-toolbar">
@@ -87,16 +95,16 @@ export function renderKnowledgeAdminPage(req: NextRequest, initialTab: 'cards' |
         </div>
         <div class="knowledge-editor">
           <div class="knowledge-list" data-knowledge-list="true"></div>
-          <div>
-            <div class="form-row">
-              <input data-card-title="true" placeholder="卡片标题" />
-              <input data-card-type="true" placeholder="card type" value="rule" />
-              <input data-card-priority="true" placeholder="优先级" value="100" />
+          <div class="knowledge-editor-panel">
+            <div class="knowledge-editor-grid">
+              <label class="adm-field"><span>卡片标题</span><input data-card-title="true" placeholder="例如：避免群像同脸" /></label>
+              <label class="adm-field"><span>类型</span><input data-card-type="true" placeholder="rule" value="rule" /></label>
+              <label class="adm-field"><span>优先级</span><input data-card-priority="true" placeholder="100" value="100" /></label>
             </div>
-            <div class="form-row">
-              <input data-card-tags="true" class="knowledge-tags-input" placeholder="标签，逗号分隔" />
+            <div class="knowledge-editor-grid-full">
+              <label class="adm-field"><span>标签（逗号分隔）</span><input data-card-tags="true" class="knowledge-tags-input" placeholder="style, crowd, safety" /></label>
+              <label class="adm-field"><span>卡片内容（JSON）</span><textarea data-card-data="true" spellcheck="false">{}</textarea></label>
             </div>
-            <textarea data-card-data="true" spellcheck="false">{}</textarea>
             <div class="actions">
               <button data-action="save_draft" class="primary">保存草稿</button>
               <button data-action="preview">预览</button>
@@ -205,12 +213,37 @@ export function renderKnowledgeAdminPage(req: NextRequest, initialTab: 'cards' |
         auditStageInput.innerHTML = '<option value="">全部阶段</option>' + state.stages.map((s) => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
         dryStageInput.innerHTML = '<option value="">选择阶段</option>' + state.stages.map((s) => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
       }
+      function lifecycleLabel(value) {
+        return ({ draft:'草稿', published:'已发布', archived:'已归档' })[value] || value || '-';
+      }
+      function cardSummary(card) {
+        const data = card?.data;
+        if (!data) return '';
+        if (typeof data === 'string') return data;
+        const text = data.text || data.rule || data.description || data.content || data.summary || '';
+        if (text && typeof text === 'string') return text;
+        try { return JSON.stringify(data); } catch { return ''; }
+      }
       function renderList() {
         if (!state.cards.length) { list.innerHTML = '<div class="muted knowledge-empty">暂无卡片</div>'; return; }
-        list.innerHTML = state.cards.map((card) => '<button class="knowledge-item" data-id="' + esc(card.id) + '" data-active="' + (state.selected?.id === card.id ? 'true' : 'false') + '">' +
-          '<span class="badge ' + esc(card.lifecycle) + '">' + esc(card.lifecycle) + '</span><span class="badge">v' + Number(card.version || 1) + '</span>' +
-          '<strong>' + esc(card.title) + '</strong><div class="muted">' + esc(card.id) + '</div>' +
-        '</button>').join('');
+        list.innerHTML = state.cards.map((card) => {
+          const tags = (card.tags || []).slice(0, 4).map((tag) => '<span class="ki-tag">' + esc(tag) + '</span>').join('');
+          const summary = cardSummary(card);
+          return '<button class="knowledge-item" data-id="' + esc(card.id) + '" data-active="' + (state.selected?.id === card.id ? 'true' : 'false') + '">' +
+            '<div class="ki-head">' +
+              '<span class="badge ' + esc(card.lifecycle) + '">' + esc(lifecycleLabel(card.lifecycle)) + '</span>' +
+              '<span class="badge">v' + Number(card.version || 1) + '</span>' +
+              (card.cardType ? '<span class="ki-tag">' + esc(card.cardType) + '</span>' : '') +
+              '<span class="ki-tag">优先级 ' + Number(card.priority || 100) + '</span>' +
+            '</div>' +
+            '<strong class="ki-title">' + esc(card.title || '(未命名)') + '</strong>' +
+            (summary ? '<span class="ki-summary">' + esc(summary) + '</span>' : '') +
+            '<div class="ki-foot">' +
+              '<span class="ki-tags">' + (tags || '<span class="ki-tag">无标签</span>') + '</span>' +
+              '<span class="ki-id">' + esc(String(card.id || '').slice(0, 14)) + '</span>' +
+            '</div>' +
+          '</button>';
+        }).join('');
       }
       function fillEditor(card) {
         state.selected = card;
