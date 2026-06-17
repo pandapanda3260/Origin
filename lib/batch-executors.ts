@@ -107,7 +107,7 @@ import {
 } from './video-segment-runtime';
 import { validateCharacterConsistencyForGroup } from './character-consistency-gate';
 import { dataPath } from './runtime-paths';
-import { markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl, checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
+import { buildFirstFrameRecord, markFirstFrameReady, normalizeFirstFrameState, resolveStoryboardFirstFrameUrl, checkTailFramePreflight, formatTailFramePreflightError } from './visual-reference-state';
 import { buildFrameImageGenerationPlan, summarizePlanForAudit, type FrameImageGenerationPlan } from './frame-image-plan';
 import {
   buildFrameConsistencyRetryDecision,
@@ -1907,6 +1907,19 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const firstShotForWrite = shots[freshShotIndices[0]];
     const prevFirstFrame = normalizeFirstFrameState(prev);
     const at = new Date().toISOString();
+    const frameFirst = buildFirstFrameRecord(prev, {
+      url: result.url,
+      prompt: result.submittedPrompt,
+      originalPrompt: basePrompt,
+      mode: 'legacy_pencil',
+      status: 'legacy_sketch_only',
+      source: 'generated',
+      generatedAt: at,
+      sourceHash: null,
+      shotIndices: freshShotIndices,
+      safetyAudit: result.safetyAudit,
+      visualAnchorDescription: result.visualAnchorDescription,
+    });
     storyboards[groupIdx] = {
       ...prev,
       url: result.url,
@@ -1938,6 +1951,10 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       idx: groupIdx,
       shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
       shotIndices: freshShotIndices,
+      frames: {
+        ...(prev.frames || {}),
+        first: frameFirst,
+      },
     };
     // 用户原则: 首帧变化 (含 legacy_pencil 路径) 不再连带删除 videoTasks[groupIdx],
     // 由用户自己决定要不要重做视频。

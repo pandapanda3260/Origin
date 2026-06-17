@@ -94,11 +94,11 @@ record('main.js 注入 applyServerStaleFlags 且从 assets.js 导入 mirror 函�
   assert.match(mainSrc, /applyServerStaleFlags: \(prefixes, serverFlags\) => _applyServerStaleFlagsToProject\(project, prefixes, serverFlags\)/);
 });
 
-record('storyboard.js 版本号 main.js 显式 import 与 workspace.html importmap 一致', () => {
+record('storyboard.js 版本号由 workspace.html importmap 承载，若 main.js 有显式 import 则必须一致', () => {
   const mainVer = (mainSrc.match(/\.\/modules\/storyboard\.js\?v=(\d+)/) || [])[1];
   const mapVer = (workspaceHtml.match(/"\/modules\/storyboard\.js":\s*"\/modules\/storyboard\.js\?v=(\d+)"/) || [])[1];
-  assert.ok(mainVer && mapVer, '找不到版本号');
-  assert.equal(mainVer, mapVer, `双实例风险: main.js 用 v=${mainVer}, importmap 用 v=${mapVer}`);
+  assert.ok(mapVer, 'workspace.html importmap 找不到 storyboard.js 版本号');
+  if (mainVer) assert.equal(mainVer, mapVer, `双实例风险: main.js 用 v=${mainVer}, importmap 用 v=${mapVer}`);
 });
 
 /* ============================================================
@@ -134,16 +134,16 @@ if (sqliteOk) {
   ).run('stale-clear-it', 'stale-clear-it@example.com', 'Tester', 'fake-hash');
   const userId = Number(info.lastInsertRowid);
 
-  const created = projectsDb.createProjectForUser(userId, {
-    title: 'stale-clear-it',
+  const created = projectsDb.createProjectForUser(userId, { title: 'stale-clear-it' });
+  const projectId = created.id;
+  projectsDb.patchProjectForUser(projectId, userId, () => ({
     shots: [{ idx: 1, visual: 'shot-0' }, { idx: 2, visual: 'shot-1' }],
     storyboards: [
       { idx: 0, shotIndices: [0], imageUrl: '/api/images/file/x0', firstFrameUrl: '/api/images/file/x0' },
       { idx: 1, shotIndices: [1], imageUrl: '/api/images/file/x1', firstFrameUrl: '/api/images/file/x1' },
     ],
     _staleFlags: { storyboard_0: true, storyboard_1: true, tail_frame_0: true, assets: true },
-  });
-  const projectId = created.id;
+  }));
 
   record('种子 _staleFlags（下划线键）能写入并读回', () => {
     const p = projectsDb.getProjectByIdForUser(projectId, userId);

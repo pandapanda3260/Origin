@@ -216,7 +216,7 @@ export async function POST(req: NextRequest) {
     const sourceHash = typeof historyItem.sourceHash === 'string' ? historyItem.sourceHash : null;
     const basePrompt = historyBasePrompt(historyItem, currentBasePrompt(prev));
     const submittedPrompt = historySubmittedPrompt(historyItem, prev.firstFramePrompt || prev.frames?.first?.prompt || '');
-    const rawUrl = cleanUrl(historyItem.rawUrl) || historyUrl;
+    const rawUrl = historyUrl;
     const nextStoryboard = {
       ...prev,
       idx: groupIdx,

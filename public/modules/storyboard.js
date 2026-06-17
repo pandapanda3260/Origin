@@ -687,12 +687,9 @@ function _reattachImagesBatch(b) {
         _applyTailFrameFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
         renderStoryboardFrameCard(gIdx, 'tail', 'done', { imgUrl: url });
       } else {
-        var displayUrl = url;
-        if (project.storyboards[gIdx].imageUrl) {
-          displayUrl = project.storyboards[gIdx].rawUrl || project.storyboards[gIdx].imageUrl;
-        } else {
-          _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
-        }
+        var isFirstFramePatch = !!(extra.firstFrameUrl || extra.firstFrameMode || (extra.frames && extra.frames.first));
+        _applyStoryboardImageFields(project.storyboards[gIdx], url, extra, target.shotIndices || null);
+        var displayUrl = isFirstFramePatch ? (_firstFrameImageUrl(project.storyboards[gIdx]) || url) : url;
         updateStoryboardCard(gIdx, "done", displayUrl);
         _scheduleTailChain(originId, gIdx, 'reattach-first-done');
       }
@@ -1172,6 +1169,7 @@ function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndice
   existing.rawUrl = rawUrl;
   if (extra.firstFrameUrl || extra.firstFrameMode) {
     var firstFrameSource = extra.firstFrameSource || "generated";
+    var incomingFirst = (extra.frames && extra.frames.first) || null;
     existing.firstFrameUrl = extra.firstFrameUrl || rawUrl;
     existing.firstFrameMode = extra.firstFrameMode || "multi_ref_v1";
     existing.firstFrameSourceHash = Object.prototype.hasOwnProperty.call(extra, "firstFrameSourceHash")
@@ -1192,6 +1190,21 @@ function _applyStoryboardImageFields(existing, rawUrl, extra, fallbackShotIndice
         return item && item.url && item.url !== existing.firstFrameUrl;
       }) : []).slice(0, 20)
     };
+    var frameFirst = Object.assign({}, incomingFirst || {}, {
+      url: existing.firstFrameUrl,
+      status: (incomingFirst && incomingFirst.status) || extra.firstFrameStatus || "ready",
+      source: (incomingFirst && incomingFirst.source) || firstFrameSource,
+      mode: (incomingFirst && incomingFirst.mode) || existing.firstFrameMode,
+      sourceHash: Object.prototype.hasOwnProperty.call(extra, "firstFrameSourceHash")
+        ? extra.firstFrameSourceHash
+        : (incomingFirst && incomingFirst.sourceHash) || existing.firstFrameSourceHash || null
+    });
+    if (extra.firstFramePrompt && !frameFirst.prompt) frameFirst.prompt = extra.firstFramePrompt;
+    if (extra.firstFramePlanSummary && !frameFirst.planSummary) frameFirst.planSummary = extra.firstFramePlanSummary;
+    if (extra.imageSafetyAudit && !frameFirst.safetyAudit) frameFirst.safetyAudit = extra.imageSafetyAudit;
+    if (Array.isArray(extra.shotIndices)) frameFirst.shotIndices = extra.shotIndices;
+    else if (Array.isArray(fallbackShotIndices)) frameFirst.shotIndices = fallbackShotIndices;
+    existing.frames = Object.assign({}, existing.frames || {}, { first: frameFirst });
     delete existing.firstFrameLastError;
     delete existing.firstFrameFailedAt;
     // 用户原则: 首帧变化不再连带把尾帧标记为 stale, 由用户自己决定要不要重做尾帧。
