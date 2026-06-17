@@ -16,6 +16,24 @@ export type FirstFrameState = {
   history: FirstFrameHistoryItem[];
 };
 
+export type FirstFrameRecordInput = {
+  url: string;
+  prompt?: string;
+  originalPrompt?: string;
+  mode?: string;
+  status?: ReferenceStatus;
+  source?: FirstFrameHistoryItem['source'];
+  generatedAt?: string;
+  sourceHash?: string | null;
+  shotIndices?: number[];
+  planSummary?: any;
+  safetyAudit?: any;
+  visualAnchorDescription?: any;
+  consistencyCheck?: any;
+  consistencyAttempts?: any;
+  consistencyStatus?: string;
+};
+
 function cleanUrl(value: any): string {
   return String(value || '').trim();
 }
@@ -113,6 +131,75 @@ export function markFirstFrameReady(storyboard: any, url: string, rawUrl = url):
     lastError: undefined,
     history,
   };
+}
+
+export function buildFirstFrameRecord(storyboard: any, input: FirstFrameRecordInput): any {
+  const url = cleanUrl(input.url);
+  const previous = storyboard?.frames?.first && typeof storyboard.frames.first === 'object'
+    ? storyboard.frames.first
+    : {};
+  const next: any = {
+    ...previous,
+    url,
+    status: input.status || 'ready',
+    source: input.source || 'generated',
+  };
+  if (input.prompt !== undefined) next.prompt = input.prompt;
+  if (input.originalPrompt !== undefined) next.originalPrompt = input.originalPrompt;
+  if (input.mode !== undefined) next.mode = input.mode;
+  if (input.generatedAt !== undefined) next.generatedAt = input.generatedAt;
+  if (Object.prototype.hasOwnProperty.call(input, 'sourceHash')) next.sourceHash = input.sourceHash;
+  if (Array.isArray(input.shotIndices)) next.shotIndices = input.shotIndices;
+  if (input.planSummary !== undefined) next.planSummary = input.planSummary;
+  if (input.safetyAudit !== undefined) next.safetyAudit = input.safetyAudit;
+  if (input.visualAnchorDescription !== undefined) next.visualAnchorDescription = input.visualAnchorDescription;
+  if (input.consistencyCheck !== undefined) next.consistencyCheck = input.consistencyCheck;
+  if (input.consistencyAttempts !== undefined) next.consistencyAttempts = input.consistencyAttempts;
+  if (input.consistencyStatus !== undefined) next.consistencyStatus = input.consistencyStatus;
+  return next;
+}
+
+export function alignStoryboardFirstFrameUrlsIfDrift(storyboard: any): {
+  storyboard: any;
+  changed: boolean;
+  canonicalUrl?: string;
+} {
+  if (!storyboard || typeof storyboard !== 'object') return { storyboard, changed: false };
+  const framesFirstUrl = cleanUrl(storyboard?.frames?.first?.url);
+  const firstFrameUrl = cleanUrl(storyboard?.firstFrameUrl);
+  const currentUrl = cleanUrl(storyboard?.firstFrame?.currentUrl);
+  const unique = Array.from(new Set([framesFirstUrl, firstFrameUrl, currentUrl].filter(Boolean)));
+  if (unique.length <= 1) {
+    return {
+      storyboard,
+      changed: false,
+      canonicalUrl: currentUrl || firstFrameUrl || framesFirstUrl || undefined,
+    };
+  }
+
+  const canonicalUrl = currentUrl || firstFrameUrl || framesFirstUrl;
+  if (!canonicalUrl) return { storyboard, changed: false };
+  const next: any = {
+    ...storyboard,
+    url: canonicalUrl,
+    imageUrl: canonicalUrl,
+    rawUrl: canonicalUrl,
+    firstFrameUrl: canonicalUrl,
+  };
+  next.firstFrame = {
+    ...(storyboard.firstFrame && typeof storyboard.firstFrame === 'object' ? storyboard.firstFrame : {}),
+    currentUrl: canonicalUrl,
+    rawUrl: canonicalUrl,
+    lastKnownGoodUrl: canonicalUrl,
+  };
+  next.frames = {
+    ...(storyboard.frames && typeof storyboard.frames === 'object' ? storyboard.frames : {}),
+    first: {
+      ...(storyboard.frames?.first && typeof storyboard.frames.first === 'object' ? storyboard.frames.first : {}),
+      url: canonicalUrl,
+    },
+  };
+  return { storyboard: next, changed: true, canonicalUrl };
 }
 
 export function markFirstFrameFailed(storyboard: any, error: any): FirstFrameState {

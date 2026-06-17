@@ -1229,9 +1229,10 @@ var _scriptEditInitialText = "";
       var p = await fetchProjectByIdShared(projId, {
         signal: activationCtl ? activationCtl.signal : undefined,
         force: true,
+        throwOnError: true,
       });
       if (!_isProjectActivationCurrent(token)) return null;
-      if (!p || !p.id) throw new Error("项目数据为空");
+      if (!p || !p.id) throw new Error("项目详情返回异常：缺少项目 ID，请刷新后重试。");
 
       var oldProject = project;
       _resetProjectRuntime(oldProject);

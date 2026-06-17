@@ -5,6 +5,7 @@ import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { attachVideoPromptReadiness } from '@/lib/video-prompt-state';
 import { mutateCharacterLock, syncWorldCharactersIntoConsistency } from '@/lib/character-consistency';
 import { attachAssetLibraryCurrentToProject } from '@/lib/asset-library';
+import { alignStoryboardFirstFrameUrlsIfDrift } from '@/lib/visual-reference-state';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -172,9 +173,32 @@ function applyProjectPutWorldConsistency(current: any, patch: any) {
   return result.changed ? { ...patch, consistency: result.project.consistency } : patch;
 }
 
-function applyProjectPutConsistency(current: any, body: any) {
+function applyProjectPutFirstFrameConsistency(
+  current: any,
+  patch: any,
+  opts?: { expectedVersion?: number },
+) {
+  if (!current || !patch || typeof patch !== 'object') return patch;
+  if (!Object.prototype.hasOwnProperty.call(patch, 'storyboards')) return patch;
+  if (!Array.isArray(patch.storyboards)) return patch;
+  if (typeof opts?.expectedVersion !== 'number') return patch;
+  const currentVersion = Number(current.version);
+  if (!Number.isFinite(currentVersion) || currentVersion !== opts.expectedVersion) return patch;
+
+  let changed = false;
+  const storyboards = patch.storyboards.map((storyboard: any) => {
+    const result = alignStoryboardFirstFrameUrlsIfDrift(storyboard);
+    if (!result.changed) return storyboard;
+    changed = true;
+    return result.storyboard;
+  });
+  return changed ? { ...patch, storyboards } : patch;
+}
+
+function applyProjectPutConsistency(current: any, body: any, opts?: { expectedVersion?: number }) {
   const withCharacterConsistency = applyProjectPutCharacterConsistency(current, body);
-  return applyProjectPutWorldConsistency(current, withCharacterConsistency);
+  const withWorldConsistency = applyProjectPutWorldConsistency(current, withCharacterConsistency);
+  return applyProjectPutFirstFrameConsistency(current, withWorldConsistency, opts);
 }
 
 // `If-Match` 头格式约定：`v<int>`（兼容前端 project.js `_serverSave` 的发送格式）。
@@ -212,7 +236,7 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
   // 老前端 / 老客户端不发 If-Match → expectedVersion=undefined → 走原本的覆盖语义，不破坏现状。
   const expectedVersion = parseIfMatchVersion(req);
   const allowTitleUpdate = isExplicitTitleUpdate(req, body);
-  const patch = removeRouteOnlyFields(applyProjectPutConsistency(current as any, body));
+  const patch = removeRouteOnlyFields(applyProjectPutConsistency(current as any, body, { expectedVersion }));
   let proj: any;
   try {
     proj = updateProjectForUser(

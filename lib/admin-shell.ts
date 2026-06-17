@@ -49,7 +49,10 @@ export async function renderAdminPage(req: NextRequest, options: AdminPageOption
 }
 
 export function redirectToAdminLogin(req: NextRequest): NextResponse {
-  return NextResponse.redirect(new URL('/admin/login', req.url), 302);
+  return new NextResponse(null, {
+    status: 302,
+    headers: { location: '/admin/login' },
+  });
 }
 
 export function htmlResponse(html: string): NextResponse {

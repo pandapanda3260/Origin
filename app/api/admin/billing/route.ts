@@ -49,25 +49,27 @@ export const POST = withAdminAudit(async function mutateBilling(_req: NextReques
   const action = String(body.action || '').trim();
   if (action !== 'manual_adjust') return jsonError('unsupported action', 400);
 
-  const userId = Math.floor(Number(body.userId));
+  const userKey = String(body.userId ?? body.accountId ?? '').trim();
   const amount = Math.floor(Number(body.amount));
   const reason = String(audit.reason || body.reason || '').trim();
   const confirmText = String(body.confirmText || '').trim();
-  if (!Number.isInteger(userId) || userId <= 0) return jsonError('valid userId required', 400);
+  if (!userKey) return jsonError('valid accountId or userId required', 400);
   if (!Number.isInteger(amount) || amount === 0) return jsonError('non-zero integer amount required', 400);
   if (reason.length < 4) return jsonError('reason too short', 400);
 
   const user = getDb()
-    .prepare<{ id: number }, any>(
-      `SELECT u.id, u.username, u.phone, u.display_name AS displayName, c.total_credits AS totalCredits
+    .prepare<{ key: string }, any>(
+      `SELECT u.id, u.account_id AS accountId, u.username, u.phone, u.display_name AS displayName, c.total_credits AS totalCredits
          FROM users u
          LEFT JOIN user_credits c ON c.user_id = u.id
-        WHERE u.id = @id`,
+        WHERE CAST(u.id AS TEXT) = @key
+           OR u.account_id = @key`,
     )
-    .get({ id: userId });
+    .get({ key: userKey });
   if (!user) return jsonError('user not found', 404);
   if (String(user.username || '').startsWith('__shadow__')) return jsonError('shadow user cannot be adjusted manually', 400);
 
+  const userId = Number(user.id);
   const guard = manualAdjustGuard({ adminId: audit.admin.id, amount, confirmText });
   if (guard.blocked) return jsonError(guard.reason, guard.status);
 
@@ -90,7 +92,7 @@ export const POST = withAdminAudit(async function mutateBilling(_req: NextReques
     reason,
     idempotencyKey: audit.idempotencyKey,
   });
-  return jsonOk({ success: true, action, userId, amount, result });
+  return jsonOk({ success: true, action, userId, accountId: user.accountId || '', amount, result });
 	}, 'billing.manual_adjust', {
 	  category: 'billing',
 	  supportDryRun: true,
@@ -133,6 +135,7 @@ function ledgerWhere(filters: LedgerFilters) {
       OR l.ref_id = @q
       OR l.charge_ref_id = @q
       OR CAST(l.user_id AS TEXT) = @q
+      OR u.account_id = @q
       OR u.username LIKE @like
       OR COALESCE(u.phone, '') LIKE @like
       OR COALESCE(u.email, '') LIKE @like
@@ -169,6 +172,7 @@ function ledgerWhere(filters: LedgerFilters) {
 function listCreditUsers(q: string, limit: number) {
   return getDb().prepare<any, any>(
     `SELECT u.id,
+            u.account_id AS accountId,
             u.username,
             u.phone,
             u.display_name AS displayName,
@@ -177,8 +181,14 @@ function listCreditUsers(q: string, limit: number) {
             COALESCE(c.total_credits, 0) AS totalCredits,
 	            COALESCE(c.subscription_credits, 0) AS subscriptionCredits,
 	            COALESCE(c.topup_credits, 0) AS topupCredits,
-	            COALESCE(c.bonus_credits, 0) AS bonusCredits,
+            COALESCE(c.bonus_credits, 0) AS bonusCredits,
               COALESCE(c.overdraft_credits, 0) AS overdraftCredits,
+            COALESCE((
+              SELECT SUM(-l.amount)
+                FROM credit_ledger l
+               WHERE l.user_id = u.id
+                 AND l.amount < 0
+            ), 0) AS consumedCredits,
 	            c.plan_code AS planCode,
             c.updated_at AS creditsUpdatedAt
        FROM users u
@@ -187,6 +197,7 @@ function listCreditUsers(q: string, limit: number) {
         AND (
           @q = ''
           OR CAST(u.id AS TEXT) = @q
+          OR u.account_id = @q
           OR u.username LIKE @like
           OR COALESCE(u.phone, '') LIKE @like
           OR COALESCE(u.email, '') LIKE @like
@@ -201,6 +212,7 @@ function listOrders(q: string, limit: number) {
   return getDb().prepare<any, any>(
     `SELECT o.id,
             o.user_id AS userId,
+            u.account_id AS accountId,
             u.username,
             u.phone,
             o.kind,
@@ -219,6 +231,7 @@ function listOrders(q: string, limit: number) {
          OR o.id = @q
          OR o.provider_ref = @q
          OR CAST(o.user_id AS TEXT) = @q
+         OR u.account_id = @q
          OR u.username LIKE @like
          OR COALESCE(u.phone, '') LIKE @like
       ORDER BY o.created_at DESC
@@ -231,6 +244,7 @@ function listLedger(filters: LedgerFilters, limit: number) {
   return getDb().prepare<any, any>(
     `SELECT l.id,
             l.user_id AS userId,
+            u.account_id AS accountId,
             u.username,
             u.phone,
             u.display_name AS displayName,
@@ -333,6 +347,7 @@ function costSnapshot() {
   ).all();
   const userCost = db.prepare<[], any>(
     `SELECT l.user_id AS userId,
+            u.account_id AS accountId,
             u.username,
             u.phone,
             u.display_name AS displayName,
@@ -399,6 +414,7 @@ function ledgerCsv(rows: any[]) {
     'createdAt',
     'ledgerId',
     'userId',
+    'accountId',
     'username',
     'amount',
     'balanceAfter',

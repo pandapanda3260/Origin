@@ -10,8 +10,8 @@ var _selected = null;
 var _blobUrlCache = new Map();
 var _busy = { image: false, video: false };
 var _notice = { image: null, video: null };
-var _pollTimers = { video: null };
-var _polling = { video: false };
+var _pollTimers = { image: null, video: null };
+var _polling = { image: false, video: false };
 var _previewRenderSeq = 0;
 var _imageForm = { mode: 'text_to_image', ratio: '9:16', count: 1, refs: [], prompt: '' };
 var _videoForm = {
@@ -25,6 +25,8 @@ var _videoForm = {
   prompt: '',
   cameraMotionDescription: '',
 };
+var TOOLBOX_STATUS_POLL_INTERVAL_MS = 6000;
+var TOOLBOX_IMAGE_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 
 export function initToolbox(ctx) {
   _ctx = ctx || {};
@@ -442,7 +444,7 @@ function _clipText(text, maxLen) {
 function _historyDetail(item) {
   if (!item) return '';
   if (item.status === 'failed') return _clipText(_humanizeError(item.errorMessage) || '可调整参数后重试', 42);
-  if (item.status === 'running') return item.toolType === 'video' ? '任务已提交，自动刷新中' : '正在生成，请稍候';
+  if (item.status === 'running') return item.toolType === 'video' ? '任务已提交，自动刷新中' : '正在生成，自动刷新中';
   if (item.result && item.result.deleted) return '原文件不可用';
   if (item.sourceType === 'upload') return _clipText(item.result && item.result.filename || '手动上传素材', 42);
   return _clipText(item.prompt || '无提示词', 42);
@@ -566,32 +568,61 @@ function _syncSelectedFromHistory(tool) {
   if (updated) _selected = updated;
 }
 
-function _stopVideoStatusPolling() {
-  if (!_pollTimers.video) return;
-  window.clearInterval(_pollTimers.video);
-  _pollTimers.video = null;
-  _polling.video = false;
+function _stopStatusPolling(tool) {
+  if (tool !== 'image' && tool !== 'video') return;
+  if (!_pollTimers[tool]) return;
+  window.clearInterval(_pollTimers[tool]);
+  _pollTimers[tool] = null;
+  _polling[tool] = false;
 }
 
-async function _pollVideoHistoryOnce() {
-  if (_polling.video) return;
-  _polling.video = true;
-  try {
-    await _loadHistory('video', false);
-    if (_activeView === 'video') _render();
-    if (!_hasRunning('video')) _stopVideoStatusPolling();
-  } catch (e) {
-    console.warn('[Toolbox] video status polling failed:', e);
-  } finally {
-    _polling.video = false;
+function _stopVideoStatusPolling() {
+  _stopStatusPolling('video');
+}
+
+function _pollCompletionNotice(tool) {
+  if (tool !== 'image' && tool !== 'video') return;
+  if (_activeTool !== tool || !_notice[tool] || _notice[tool].kind !== 'running') return;
+  if (_hasRunning(tool)) return;
+  var item = _selected && _selected.toolType === tool ? _selected : ((_history[tool] || [])[0] || null);
+  if (!item) return;
+  if (item.status === 'failed') {
+    _setToolNotice(tool, 'error', tool === 'image' ? '图片生成失败' : '视频生成失败', _humanizeError(item.errorMessage) || '失败记录已保留在历史');
+  } else if (item.status === 'completed') {
+    _setToolNotice(tool, 'success', tool === 'image' ? '图片生成完成' : '视频生成完成', '结果已显示在预览区');
   }
 }
 
+async function _pollHistoryOnce(tool) {
+  if (tool !== 'image' && tool !== 'video') return;
+  if (_polling[tool]) return;
+  _polling[tool] = true;
+  try {
+    await _loadHistory(tool, false);
+    _pollCompletionNotice(tool);
+    if (_activeView === tool) _render();
+    if (!_hasRunning(tool)) _stopStatusPolling(tool);
+  } catch (e) {
+    console.warn('[Toolbox] ' + tool + ' status polling failed:', e);
+  } finally {
+    _polling[tool] = false;
+  }
+}
+
+function _startStatusPolling(tool) {
+  if (tool !== 'image' && tool !== 'video') return;
+  if (_pollTimers[tool]) return;
+  _pollTimers[tool] = window.setInterval(function () {
+    _pollHistoryOnce(tool);
+  }, TOOLBOX_STATUS_POLL_INTERVAL_MS);
+}
+
+function _startImageStatusPolling() {
+  _startStatusPolling('image');
+}
+
 function _startVideoStatusPolling() {
-  if (_pollTimers.video) return;
-  _pollTimers.video = window.setInterval(function () {
-    _pollVideoHistoryOnce();
-  }, 6000);
+  _startStatusPolling('video');
 }
 
 function _previewHtml(item) {
@@ -766,7 +797,7 @@ export async function refreshToolboxPage() {
     try {
       await _loadHistory(_activeTool, false);
       if (_selected && _selected.toolType !== _activeTool) _selected = null;
-      if (_activeTool === 'video' && _hasRunning('video')) _startVideoStatusPolling();
+      if (_hasRunning(_activeTool)) _startStatusPolling(_activeTool);
     } catch (e) {
       console.warn('[Toolbox] load history failed:', e);
     }
@@ -867,6 +898,7 @@ async function _generateImage() {
       jobs.push(
         _jsonFetch('/api/toolbox/image/generate', {
           method: 'POST',
+          timeoutMs: TOOLBOX_IMAGE_REQUEST_TIMEOUT_MS,
           body: JSON.stringify({ mode: mode, prompt: prompt, params: { ratio: ratio, count: 1 }, inputRefs: refs }),
         })
           .then(function (data) { _ingestImageItem(data && data.items && data.items[0], collected, count); })
@@ -875,18 +907,22 @@ async function _generateImage() {
     }
     await Promise.allSettled(jobs);
     await _loadHistory('image', false);
+    if (_hasRunning('image')) _startImageStatusPolling();
     // 收尾时若当前选中不是已完成图，优先选中一张已完成的结果。
     if (_activeTool === 'image') {
       var firstDone = collected.filter(function (x) { return x && x.status === 'completed'; })[0];
       var firstReturned = collected[0] || null;
-      var nextSelected = firstDone || firstReturned;
+      var firstRunning = (_history.image || []).filter(function (x) { return x && x.status === 'running'; })[0] || null;
+      var nextSelected = firstDone || firstReturned || firstRunning;
       if (nextSelected) {
         _selected = (_history.image || []).find(function (x) { return x.id === nextSelected.id; }) || nextSelected;
         _applySelectedToForm(_selected);
       }
     }
     var summary = _summarizeItems(collected);
-    if (!summary.total && transportErrors.length) {
+    if (!summary.total && transportErrors.length && _hasRunning('image')) {
+      _setToolNotice('image', 'running', '图片任务仍在生成', '请求返回较慢，右侧历史会自动刷新');
+    } else if (!summary.total && transportErrors.length) {
       _setToolNotice('image', 'error', '图片请求失败', _humanizeError(transportErrors[0]) || '请稍后重试');
     } else if (summary.done > 0 && summary.failed > 0) {
       _setToolNotice('image', 'warn', '部分图片已完成', '成功 ' + summary.done + ' 张，失败 ' + summary.failed + ' 张；最新结果已显示');
@@ -894,6 +930,8 @@ async function _generateImage() {
       _setToolNotice('image', 'error', '图片生成失败', '失败记录已保留在右侧历史，可调整后重试');
     } else if (summary.done > 0) {
       _setToolNotice('image', 'success', '图片生成完成', '已完成 ' + summary.done + ' 张，最新结果已显示在预览区');
+    } else if (summary.running > 0) {
+      _setToolNotice('image', 'running', '图片任务仍在生成', '右侧历史会自动刷新，完成后自动显示结果');
     }
     if (collected.length) _toastForImageGeneration({ items: collected });
     if (transportErrors.length) _toast('部分图片请求失败：' + (_humanizeError(transportErrors[0]) || '请稍后重试'), 'warn');
@@ -970,6 +1008,7 @@ async function _enhanceSelected() {
   try {
     var data = await _jsonFetch('/api/toolbox/items/' + encodeURIComponent(_selected.id) + '/enhance', {
       method: 'POST',
+      timeoutMs: isVideoEnhance ? undefined : TOOLBOX_IMAGE_REQUEST_TIMEOUT_MS,
       body: JSON.stringify({}),
     });
     var nextSelected = data.item || _selected;
@@ -977,7 +1016,7 @@ async function _enhanceSelected() {
     await _loadHistory(busyTool, false);
     if (nextSelected) _history[busyTool] = [nextSelected].concat((_history[busyTool] || []).filter(function (item) { return item.id !== nextSelected.id; }));
     if (_activeTool === busyTool && nextSelected) _applySelectedToForm(_selected);
-    if (isVideoEnhance && _hasRunning('video')) _startVideoStatusPolling();
+    if (_hasRunning(busyTool)) _startStatusPolling(busyTool);
     else if (isVideoEnhance) _stopVideoStatusPolling();
     if (nextSelected && nextSelected.status === 'failed') {
       _setToolNotice(busyTool, 'error', '高清重绘失败', _humanizeError(nextSelected.errorMessage) || '失败记录已保留在历史');

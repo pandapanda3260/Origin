@@ -61,11 +61,17 @@ export async function POST(req: NextRequest) {
   resp.cookies.set('admin_token', token, {
     httpOnly: true,
     sameSite: 'strict',
-    secure: process.env.NODE_ENV === 'production',
+    secure: shouldUseSecureAdminCookie(req),
     path: '/',
     maxAge: ADMIN_TOKEN_MAX_AGE_SECONDS,
   });
   return resp;
+}
+
+function shouldUseSecureAdminCookie(req: NextRequest): boolean {
+  const forwardedProto = String(req.headers.get('x-forwarded-proto') || '').split(',')[0]?.trim().toLowerCase();
+  if (forwardedProto) return forwardedProto === 'https';
+  return req.nextUrl.protocol === 'https:';
 }
 
 function getClientIp(req: NextRequest): string {

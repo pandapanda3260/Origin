@@ -55,6 +55,7 @@ function bootstrap(db: Database.Database) {
       username      TEXT UNIQUE NOT NULL,
       email         TEXT UNIQUE,
       phone         TEXT,
+      account_id    TEXT UNIQUE,
       display_name  TEXT NOT NULL,
       password_hash TEXT NOT NULL,
       email_verified INTEGER NOT NULL DEFAULT 0,
@@ -1097,6 +1098,7 @@ function bootstrap(db: Database.Database) {
   migrateVideoPromptSnapshotColumn(db);
   migrateCustomCharacterLifecycleColumns(db);
   migratePhoneIdentityColumns(db);
+  migrateUserAccountIds(db);
   migrateOtpPhoneIdentityTable(db);
 }
 
@@ -1203,6 +1205,57 @@ function migratePhoneIdentityColumns(db: Database.Database) {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_users_phone ON users(phone) WHERE phone IS NOT NULL`);
   } catch (e) {
     console.warn('[db] migratePhoneIdentityColumns failed:', e);
+  }
+}
+
+function migrateUserAccountIds(db: Database.Database) {
+  try {
+    addColumnIfMissing(db, 'users', 'account_id', 'account_id TEXT');
+    db.exec(`
+      WITH
+        base AS (
+          SELECT COALESCE(MAX(CAST(account_id AS INTEGER)), 99999) AS max_account_id
+            FROM users
+           WHERE account_id GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'
+        ),
+        ranked AS (
+          SELECT id,
+                 ROW_NUMBER() OVER (ORDER BY created_at, id) AS rn
+            FROM users
+           WHERE account_id IS NULL
+             AND username NOT GLOB '__shadow__*'
+        )
+      UPDATE users
+         SET account_id = (
+           SELECT printf('%06d', base.max_account_id + ranked.rn)
+             FROM ranked, base
+            WHERE ranked.id = users.id
+         )
+       WHERE id IN (SELECT id FROM ranked);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_users_account_id
+        ON users(account_id)
+        WHERE account_id IS NOT NULL;
+
+      CREATE TRIGGER IF NOT EXISTS trg_users_account_id_after_insert
+      AFTER INSERT ON users
+      WHEN NEW.account_id IS NULL AND NEW.username NOT GLOB '__shadow__*'
+      BEGIN
+        UPDATE users
+           SET account_id = printf(
+             '%06d',
+             COALESCE(
+               (SELECT MAX(CAST(account_id AS INTEGER))
+                  FROM users
+                 WHERE account_id GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
+               99999
+             ) + 1
+           )
+         WHERE id = NEW.id;
+      END;
+    `);
+  } catch (e) {
+    console.warn('[db] migrateUserAccountIds failed:', e);
   }
 }
 
@@ -2271,6 +2324,7 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
           username      TEXT UNIQUE NOT NULL,
           email         TEXT UNIQUE,
           phone         TEXT,
+          account_id    TEXT UNIQUE,
           display_name  TEXT NOT NULL,
           password_hash TEXT NOT NULL,
           email_verified INTEGER NOT NULL DEFAULT 0,
@@ -2280,10 +2334,10 @@ function migrateDropLegacyUserAdminColumn(db: Database.Database) {
           updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         INSERT INTO users_new
-          (id, username, email, phone, display_name, password_hash, email_verified,
+          (id, username, email, phone, account_id, display_name, password_hash, email_verified,
            disabled_at, token_revoked_at, created_at, updated_at)
         SELECT
-          id, username, email, ${hasPhone ? 'phone' : 'NULL AS phone'}, display_name, password_hash, email_verified,
+          id, username, email, ${hasPhone ? 'phone' : 'NULL AS phone'}, ${cols.some((c) => c.name === 'account_id') ? 'account_id' : 'NULL AS account_id'}, display_name, password_hash, email_verified,
           disabled_at, token_revoked_at, created_at, updated_at
         FROM users;
         DROP TABLE users;
@@ -2320,6 +2374,7 @@ export type UserRow = {
   username: string;
   email: string | null;
   phone: string | null;
+  account_id?: string | null;
   display_name: string;
   password_hash: string;
   email_verified: number;
@@ -2356,6 +2411,7 @@ export type ProjectRow = {
 export function userToPublic(u: UserRow) {
   return {
     id: u.id,
+    accountId: u.account_id || '',
     phone: u.phone || '',
     displayName: u.display_name,
     createdAt: u.created_at,

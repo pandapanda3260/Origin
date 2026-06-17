@@ -531,6 +531,30 @@ async function testPropSortUsesMentionsThenTextOrder() {
   );
 }
 
+async function testPropShortNameMatchesCanonicalAsset() {
+  const project = makeProject({ characterCount: 1, propCount: 1, includeScene: true });
+  project.assets.props = [
+    {
+      id: 'prop-lingxi-screen',
+      name: '移动灵犀屏',
+      imageUrl: img('lingxi-screen'),
+      description: 'black narrow-bezel smart display with pale support stand',
+    },
+  ];
+  project.shots[0].visual = '角色1 看向桌上的灵犀屏，屏幕亮起柔和冷光';
+  project.shots[0].description = '';
+  project.shots[0].dialogue = '';
+  project.shots[0].characters = ['角色1'];
+
+  const result = build(project, img('first-frame'));
+  assert(
+    result.manifest.some((ref) => ref.role === 'prop' && ref.assetName === '移动灵犀屏'),
+    'short mention 灵犀屏 should match canonical prop 移动灵犀屏',
+  );
+  const propLine = result.manifest.find((ref) => ref.role === 'prop' && ref.assetName === '移动灵犀屏')?.referenceBrief || '';
+  assert(propLine.includes('同一件单实例道具'), 'prop reference brief should lock single-instance identity');
+}
+
 async function testAssetMissingReason() {
   const project = makeProject({ characterCount: 1, propCount: 0, includeScene: false, missingCharacter: true });
   const result = build(project, img('first-frame'));
@@ -840,6 +864,7 @@ async function run() {
     ['three characters no props keeps third character', testThreeCharactersNoPropsKeepsThirdCharacter],
     ['duplicate character only once', testDuplicateCharacterOnlyOnce],
     ['prop sort uses mentions then text order', testPropSortUsesMentionsThenTextOrder],
+    ['prop short name matches canonical asset', testPropShortNameMatchesCanonicalAsset],
     ['asset missing reason', testAssetMissingReason],
     ['groupShotIndices scopes full shots input', testGroupShotIndicesScopeFullShotsInput],
     ['generate and submit manifest mappings stay aligned', testGenerateAndSubmitManifestMappingsStayAligned],

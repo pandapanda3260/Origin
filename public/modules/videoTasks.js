@@ -688,6 +688,26 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return _reattachVideoTasks(options);
   }
 
+  function _dropSupersededGroupTasks(gIdx) {
+    if (!videoState || !Array.isArray(videoState.tasks)) return;
+    var n = Number(gIdx);
+    if (!Number.isFinite(n)) return;
+    var bWrap = $("batchTaskListWrap");
+    for (var i = videoState.tasks.length - 1; i >= 0; i--) {
+      var t = videoState.tasks[i];
+      if (!t || Number(t._groupIdx) !== n) continue;
+      t._killed = true;
+      cleanupTask(t);
+      videoState.tasks.splice(i, 1);
+    }
+    // Mirror rows are keyed by localId, but stale duplicates from older renders may
+    // only have the group key. Clear that too before rebuilding from server history.
+    try {
+      var mirror = bWrap && bWrap.querySelector('[data-group-idx="' + n + '"]');
+      if (mirror && mirror.parentNode) mirror.parentNode.removeChild(mirror);
+    } catch (_e) {}
+  }
+
   /* 2026-06 · 全局唤醒对账（main.js focus/visibilitychange/online 分发）。
    * 只在"本地没有任何闭包在跟踪任务"时才考虑重建：activeTaskCount()>0 说明
    * 进行中的任务有自己的 SSE+降级轮询（backend_stream.js）盯着，不打断；
@@ -1048,6 +1068,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	              durationSec: t.duration_sec,
 	            });
 	          }
+
+          if (isSucceeded || isFailed) {
+            _dropSupersededGroupTasks(gIdx);
+          }
 
 	          var task = createVideoTaskObj("片段 " + (gIdx + 1), false);
 	          _applyVideoNameMeta(task, t);
@@ -3070,7 +3094,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	  function _findTaskByGroup(gIdx) {
 	    if (!videoState || !Array.isArray(videoState.tasks)) return null;
 	    for (var i = 0; i < videoState.tasks.length; i++) {
-	      if (videoState.tasks[i]._groupIdx === gIdx) return videoState.tasks[i];
+	      var task = videoState.tasks[i];
+	      if (!task || task._killed) continue;
+	      if (task._projectId && project && task._projectId !== project.id) continue;
+	      if (task._groupIdx === gIdx) return task;
 	    }
     return null;
   }

@@ -44,15 +44,15 @@ export async function GET(req: NextRequest) {
 function findUsers(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT u.id, u.username, u.phone, u.email, u.display_name, u.disabled_at, u.created_at,
+      `SELECT u.id, u.account_id, u.username, u.phone, u.email, u.display_name, u.disabled_at, u.created_at,
               COALESCE(c.total_credits, 0) AS total_credits,
               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id) AS project_count,
               (SELECT COUNT(*) FROM billing_orders o WHERE o.user_id = u.id) AS order_count,
               (SELECT COUNT(*) FROM credit_ledger l WHERE l.user_id = u.id) AS ledger_count
-         FROM users u
+        FROM users u
          LEFT JOIN user_credits c ON c.user_id = u.id
         WHERE u.username NOT GLOB '__shadow__*'
-          AND (CAST(u.id AS TEXT) = @q OR u.username = @q OR COALESCE(u.phone, '') = @q OR COALESCE(u.email, '') = @q)
+          AND (CAST(u.id AS TEXT) = @q OR u.account_id = @q OR u.username = @q OR COALESCE(u.phone, '') = @q OR COALESCE(u.email, '') = @q)
         LIMIT 10`,
     )
     .all({ q })
@@ -60,8 +60,10 @@ function findUsers(q: string): SearchItem[] {
       entityType: 'user' as const,
       id: String(row.id),
       title: row.phone || row.display_name || row.username,
-      subtitle: row.display_name || row.email || `user#${row.id}`,
+      subtitle: row.account_id ? `账户ID ${row.account_id}` : row.display_name || row.email || `user#${row.id}`,
       fields: {
+        accountId: row.account_id,
+        userId: row.id,
         phone: row.phone,
         displayName: row.display_name,
         email: row.email,
@@ -78,7 +80,7 @@ function findUsers(q: string): SearchItem[] {
 function findOrders(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT o.*, u.username
+      `SELECT o.*, u.username, u.account_id
          FROM billing_orders o
          JOIN users u ON u.id = o.user_id
         WHERE o.id = @q OR COALESCE(o.provider_ref, '') = @q
@@ -92,6 +94,7 @@ function findOrders(q: string): SearchItem[] {
       subtitle: `${row.status} · ${row.username}`,
       fields: {
         userId: row.user_id,
+        accountId: row.account_id,
         username: row.username,
         provider: row.provider,
         providerRef: row.provider_ref,
@@ -110,7 +113,7 @@ function findOrders(q: string): SearchItem[] {
 function findProjects(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT p.id, p.owner_id, p.title, p.status, p.cover_url, p.created_at, p.updated_at, u.username
+      `SELECT p.id, p.owner_id, p.title, p.status, p.cover_url, p.created_at, p.updated_at, u.username, u.account_id
          FROM projects p
          JOIN users u ON u.id = p.owner_id
         WHERE p.id = @q
@@ -124,6 +127,7 @@ function findProjects(q: string): SearchItem[] {
       subtitle: `${row.status} · ${row.username}`,
       fields: {
         ownerId: row.owner_id,
+        accountId: row.account_id,
         username: row.username,
         status: row.status,
         coverUrl: row.cover_url,
@@ -136,7 +140,7 @@ function findProjects(q: string): SearchItem[] {
 function findBatches(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT b.*, u.username, p.title AS project_title
+      `SELECT b.*, u.username, u.account_id, p.title AS project_title
          FROM batches b
          JOIN users u ON u.id = b.owner_id
          LEFT JOIN projects p ON p.id = b.project_id
@@ -151,6 +155,7 @@ function findBatches(q: string): SearchItem[] {
       subtitle: `${row.status} · ${row.username}`,
       fields: {
         ownerId: row.owner_id,
+        accountId: row.account_id,
         username: row.username,
         projectId: row.project_id,
         projectTitle: row.project_title,
@@ -170,7 +175,7 @@ function findBatches(q: string): SearchItem[] {
 function findVideoTasks(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT vt.*, u.username, p.title AS project_title
+      `SELECT vt.*, u.username, u.account_id, p.title AS project_title
          FROM video_tasks vt
          JOIN users u ON u.id = vt.owner_id
          LEFT JOIN projects p ON p.id = vt.project_id
@@ -185,6 +190,7 @@ function findVideoTasks(q: string): SearchItem[] {
       subtitle: `${row.status} · ${row.username}`,
       fields: {
         ownerId: row.owner_id,
+        accountId: row.account_id,
         username: row.username,
         projectId: row.project_id,
         projectTitle: row.project_title,
@@ -205,7 +211,7 @@ function findVideoTasks(q: string): SearchItem[] {
 function findExports(q: string): SearchItem[] {
   return getDb()
     .prepare<{ q: string }, any>(
-      `SELECT e.*, u.username, p.title AS project_title
+      `SELECT e.*, u.username, u.account_id, p.title AS project_title
          FROM exports e
          JOIN users u ON u.id = e.owner_id
          LEFT JOIN projects p ON p.id = e.project_id
@@ -220,6 +226,7 @@ function findExports(q: string): SearchItem[] {
       subtitle: `${row.status} · ${row.username}`,
       fields: {
         ownerId: row.owner_id,
+        accountId: row.account_id,
         username: row.username,
         projectId: row.project_id,
         projectTitle: row.project_title,

@@ -1089,6 +1089,42 @@ async function testManualStoryboardMaterialsFirst() {
   );
 }
 
+async function testPropShortNameMatchesCanonicalAsset() {
+  const project = makeFixtureProject();
+  project.shots[0].visual = 'Alice turns toward the 灵犀屏 glowing on the table.';
+  project.shots[0].dialogue = '';
+  project.assets.props = [{
+    propId: 'p-lingxi-screen',
+    name: '移动灵犀屏',
+    description: 'black narrow-bezel smart display with pale support stand',
+    imageUrl: '/api/images/file/00000000-0000-0000-0000-0000000000d1',
+  }];
+  const scene = makeFixtureScene();
+  const mod = loadAll({
+    imageGen: makeImageGenStub({
+      [scene.imageUrl]: '/local/scene.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000a1': '/local/alice.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000d1': '/local/lingxi-screen.png',
+    }),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: { ...MODEL_SNAPSHOT_CAP1, multiRefImageCap: 6 },
+  });
+
+  assertEqual(plan.props.map((p) => p.name), ['移动灵犀屏'], 'short mention 灵犀屏 should match canonical prop 移动灵犀屏');
+  assert(
+    plan.referenceManifest.some((r) => r.role === 'prop' && r.assetName === '移动灵犀屏' && r.delivery === 'image'),
+    'matched canonical prop should be submitted as image reference',
+  );
+  assert(plan.finalPrompt.includes('屏幕类道具只能改变屏幕内容/反光/视角'), 'prop lock includes screen-specific continuity rule');
+}
+
 async function testTailFrameUnresolvableSelfFirstFrameShiftsImageNo() {
   const scene = makeFixtureScene();
   const firstFrameUrl = '/api/images/file/00000000-0000-0000-0000-0000000000ff';
@@ -1155,6 +1191,7 @@ async function main() {
     ['plan cap=5 candidates=3 → no phantom imageNo beyond 3', testPlanCapFiveCandidatesThree],
 	    ['first_frame balanced 12-image quality pack with 6/6 role caps', testFirstFrameBalancedTwelveImageQualityPack],
     ['manual storyboard materials before fallback', testManualStoryboardMaterialsFirst],
+    ['prop short name matches canonical asset', testPropShortNameMatchesCanonicalAsset],
     ['tail_frame unresolvable self_first_frame shifts imageNo', testTailFrameUnresolvableSelfFirstFrameShiftsImageNo],
     ['unknown frameType rejected', testTailFrameUnknownTypeRejected],
   ];

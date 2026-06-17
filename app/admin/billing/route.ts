@@ -27,7 +27,7 @@ export async function GET(req: NextRequest) {
     </style>`,
     bodyHtml: `<section class="panel">
 	      <div class="billing-toolbar">
-	        <input data-billing-search="true" placeholder="搜索用户ID / 手机号 / 订单 / ledger / refId" />
+	        <input data-billing-search="true" placeholder="搜索账户ID / 手机号 / 订单 / ledger / refId" />
           <input data-billing-from="true" placeholder="开始时间 ISO / YYYY-MM-DD" />
           <input data-billing-to="true" placeholder="结束时间 ISO / YYYY-MM-DD" />
           <select data-billing-module="true">
@@ -56,7 +56,7 @@ export async function GET(req: NextRequest) {
 	      </div>
       <div class="billing-grid" data-billing-metrics="true"></div>
       <div class="adjust-form">
-        <input data-adjust-user-id="true" class="adjust-user-input" placeholder="用户 ID" />
+        <input data-adjust-user-id="true" class="adjust-user-input" placeholder="账户ID / 用户ID" />
         <input data-adjust-amount="true" class="adjust-amount-input" placeholder="调账积分，正数加、负数扣" />
         <input data-adjust-confirm="true" class="adjust-confirm-input" placeholder="大额输入 CONFIRM" />
         <button data-adjust-submit="true" class="primary">人工调账</button>
@@ -103,7 +103,8 @@ export async function GET(req: NextRequest) {
 	      function fmtDate(value) { if (!value) return '-'; try { return new Date(value).toLocaleString('zh-CN', { hour12:false }); } catch { return value; } }
 	      function yuan(cents) { return (Number(cents || 0) / 100).toFixed(2); }
         function cny(micros) { return (Number(micros || 0) / 1000000).toFixed(6); }
-	      function userLabel(row) { return row?.phone || row?.displayName || row?.username || row?.userId || '-'; }
+	      function userLabel(row) { return row?.phone || row?.displayName || row?.username || row?.accountId || row?.userId || '-'; }
+        function accountLabel(row) { return row?.accountId || row?.userId || row?.id || '-'; }
         function usageText(row) {
           const parts = [];
           if (row.consumptionType) parts.push(row.consumptionType);
@@ -146,20 +147,20 @@ export async function GET(req: NextRequest) {
 	        const data = state.data || {};
         extraWrap.hidden = state.tab !== 'cost';
 	        if (state.tab === 'users') {
-	          head.innerHTML = '<tr><th>ID</th><th>用户</th><th>总积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>透支</th><th>计划</th><th>更新时间</th></tr>';
-	          table.innerHTML = rows(data.users, 9, (u) => '<tr><td>' + u.id + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + Number(u.overdraftCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
+	          head.innerHTML = '<tr><th>账户ID</th><th>用户</th><th>账户总剩余积分</th><th>账户总消耗积分</th><th>订阅</th><th>充值</th><th>赠送</th><th>透支</th><th>计划</th><th>更新时间</th></tr>';
+	          table.innerHTML = rows(data.users, 10, (u) => '<tr><td class="mono">' + esc(accountLabel(u)) + '</td><td><strong>' + esc(userLabel(u)) + '</strong><div class="muted">' + esc(u.displayName || u.username || '') + '</div></td><td>' + Number(u.totalCredits || 0) + '</td><td>' + Number(u.consumedCredits || 0) + '</td><td>' + Number(u.subscriptionCredits || 0) + '</td><td>' + Number(u.topupCredits || 0) + '</td><td>' + Number(u.bonusCredits || 0) + '</td><td>' + Number(u.overdraftCredits || 0) + '</td><td>' + esc(u.planCode || '-') + '</td><td>' + esc(fmtDate(u.creditsUpdatedAt)) + '</td></tr>');
         } else if (state.tab === 'orders') {
           head.innerHTML = '<tr><th>订单</th><th>用户</th><th>类型</th><th>Provider</th><th>金额</th><th>积分</th><th>状态</th><th>时间</th></tr>';
-          table.innerHTML = rows(data.orders, 8, (o) => '<tr><td class="mono">' + esc(o.id) + '</td><td>' + esc(userLabel(o)) + '<div class="muted">' + o.userId + '</div></td><td>' + esc(o.kind + '/' + (o.planCode || '-')) + '</td><td>' + esc(o.provider) + '<div class="muted mono">' + esc(o.providerRef || '') + '</div></td><td>' + esc(o.currency) + ' ' + yuan(o.amountCents) + '</td><td>' + Number(o.creditsAdded || 0) + '</td><td>' + esc(o.status) + '</td><td>' + esc(fmtDate(o.createdAt)) + '</td></tr>');
+          table.innerHTML = rows(data.orders, 8, (o) => '<tr><td class="mono">' + esc(o.id) + '</td><td>' + esc(userLabel(o)) + '<div class="muted">账户ID ' + esc(accountLabel(o)) + '</div></td><td>' + esc(o.kind + '/' + (o.planCode || '-')) + '</td><td>' + esc(o.provider) + '<div class="muted mono">' + esc(o.providerRef || '') + '</div></td><td>' + esc(o.currency) + ' ' + yuan(o.amountCents) + '</td><td>' + Number(o.creditsAdded || 0) + '</td><td>' + esc(o.status) + '</td><td>' + esc(fmtDate(o.createdAt)) + '</td></tr>');
 	        } else if (state.tab === 'ledger') {
 	          head.innerHTML = '<tr><th>Ledger</th><th>用户</th><th>金额</th><th>操作</th><th>消耗</th><th>模型/成本</th><th>Ref</th><th>时间</th></tr>';
-	          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(userLabel(l)) + '<div class="muted">' + l.userId + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.reason || '-') + '<div class="muted">' + esc([l.operationModule,l.operationFeature,l.kind].filter(Boolean).join(' / ')) + (l.adminUsername ? ' · admin ' + esc(l.adminUsername) : '') + '</div></td><td>' + esc(usageText(l)) + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? '¥' + cny(l.costMicros) : '-') + '</div></td><td class="mono">' + esc(l.refId || '-') + '<div class="muted mono">' + esc(l.chargeRefId || '') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
+	          table.innerHTML = rows(data.ledger, 8, (l) => '<tr><td class="mono">' + esc(l.id) + '</td><td>' + esc(userLabel(l)) + '<div class="muted">账户ID ' + esc(accountLabel(l)) + '</div></td><td>' + Number(l.amount || 0) + '<div class="muted">余额 ' + Number(l.balanceAfter || 0) + '</div></td><td>' + esc(l.reason || '-') + '<div class="muted">' + esc([l.operationModule,l.operationFeature,l.kind].filter(Boolean).join(' / ')) + (l.adminUsername ? ' · admin ' + esc(l.adminUsername) : '') + '</div></td><td>' + esc(usageText(l)) + '</td><td>' + esc([l.provider,l.model,l.modelRole].filter(Boolean).join(' / ') || '-') + '<div class="muted">' + (l.costMicros ? '¥' + cny(l.costMicros) : '-') + '</div></td><td class="mono">' + esc(l.refId || '-') + '<div class="muted mono">' + esc(l.chargeRefId || '') + '</div></td><td>' + esc(fmtDate(l.createdAt)) + '</td></tr>');
 	        } else if (state.tab === 'cost') {
 	          const cost = data.cost || {};
             const costRows = []
               .concat((cost.providerCost || []).map((r) => ({ dimension:'provider', name:r.provider, detail:'-', ...r })))
               .concat((cost.modelCost || []).map((r) => ({ dimension:'model', name:[r.provider,r.model,r.modelRole,r.consumptionType].filter(Boolean).join(' / '), detail:usageText(r), ...r })))
-              .concat((cost.userCost || []).map((r) => ({ dimension:'user', name:userLabel(r), detail:'userId ' + r.userId, ...r })));
+              .concat((cost.userCost || []).map((r) => ({ dimension:'user', name:userLabel(r), detail:'账户ID ' + accountLabel(r), ...r })));
             head.innerHTML = '<tr><th>维度</th><th>对象</th><th>实际成本</th><th>消耗积分</th><th>用量</th><th>样本</th></tr>';
 	          table.innerHTML = rows(costRows, 6, (r) => '<tr><td>' + esc(r.dimension) + '</td><td>' + esc(r.name) + '<div class="muted">' + esc(r.detail || '-') + '</div></td><td>¥' + cny(r.costMicros) + '</td><td>' + Number(r.chargedCredits || 0) + '</td><td>' + esc(usageText(r)) + '</td><td>' + Number(r.count || 0) + '</td></tr>');
             extraHead.innerHTML = '<tr><th>价格表：状态</th><th>Provider / Model</th><th>消耗类型</th><th>单位</th><th>人民币单价</th><th>美元单价</th><th>更新时间</th><th>来源</th></tr>';
@@ -181,7 +182,7 @@ export async function GET(req: NextRequest) {
           window.location.href = '/api/admin/billing?' + p.toString();
         }
       async function adjust() {
-        const userId = Number(document.querySelector('[data-adjust-user-id="true"]').value);
+        const userId = document.querySelector('[data-adjust-user-id="true"]').value.trim();
         const amount = Number(document.querySelector('[data-adjust-amount="true"]').value);
         const confirmText = document.querySelector('[data-adjust-confirm="true"]').value.trim();
         const reason = window.prompt('人工调账原因（不可物理撤销，只能反向调账）');
@@ -193,7 +194,7 @@ export async function GET(req: NextRequest) {
         const dry = await fetch('/api/admin/billing', { method:'POST', credentials:'same-origin', headers, body: JSON.stringify(body) });
         const dryData = await dry.json().catch(() => null);
         if (!dry.ok || !dryData?.dryRun) { setNotice((dryData && dryData.detail) || '预检查失败', 'error'); return; }
-        if (!window.confirm('确认对用户 ' + userId + ' 调账 ' + amount + ' 积分？')) { setNotice('已取消'); return; }
+        if (!window.confirm('确认对账户 ' + userId + ' 调账 ' + amount + ' 积分？')) { setNotice('已取消'); return; }
         const commit = await fetch('/api/admin/billing', { method:'POST', credentials:'same-origin', headers, body: JSON.stringify({ action:'manual_adjust', userId, amount, confirmText, reason: reason.trim() }) });
         const commitData = await commit.json().catch(() => null);
         if (!commit.ok) { setNotice((commitData && commitData.detail) || '提交失败', 'error'); return; }

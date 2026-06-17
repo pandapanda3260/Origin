@@ -279,7 +279,7 @@ export function buildReferenceBriefLine(ref: ReferenceManifestItem, refs: Refere
     return `${imageLabel} | scene | ${name} | 用于环境布局、空间结构、材质和氛围；不锁人物外貌。`;
   }
   if (role === 'prop') {
-    return `${imageLabel} | prop | ${name} | 用于外形、材质、尺度和识别符号；不当角色或场景。`;
+    return `${imageLabel} | prop | ${name} | 用于同一件单实例道具的外形、材质、尺度、支架/边框结构和识别符号；允许视角、屏幕内容和光线变化，但不得改成其他设备、相框、盒子或复制成多件；不当角色或场景。`;
   }
 
   const panel = compactBriefText(ref.panelInfo?.panel);
@@ -319,7 +319,7 @@ export function buildReferenceManifestPromptBlock(refs: ReferenceManifestItem[])
     '',
     ...lines,
     '',
-    '写 videoPrompt 时不要重复长篇描述参考图已经锁定的字段；只写动作、情绪、人物调度、镜头运动、节奏、画面事件。引用图片时只使用 Image 1 / Image 2 这类编号。',
+    '写 videoPrompt 时不要重复长篇描述参考图已经锁定的字段；只写动作、情绪、人物调度、镜头运动、节奏、画面事件。引用图片时只使用 Image 1 / Image 2 这类编号。同名道具在所有片段中必须视为同一件规范实体，不能因为镜头变化改成另一种产品。',
   ].join('\n');
 }
 

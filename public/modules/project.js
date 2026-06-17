@@ -256,7 +256,15 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    */
   // 给 fetch 加硬超时：浏览器默认无限等，某些场景下（后端 TCP 接连却不返回、
   // 维护期反代 timeout、扩展拦截）会导致 loadProject 里的 await 永远不 resolve，
-  // 骨架屏随之永远不关。10s 超时后转成 AbortError 抛出，由外层 try/catch 吞掉。
+  // 骨架屏随之永远不关。10s 超时后转成 TimeoutError，外层可选择吞掉或展示精确提示。
+  function _timeoutProjectFetchError(url, timeoutMs) {
+    var err = new Error("请求超时，请检查网络后重试");
+    err.name = "TimeoutError";
+    err.url = url;
+    err.timeoutMs = timeoutMs;
+    return err;
+  }
+
   async function _fetchWithTimeout(url, options, timeoutMs) {
     options = options || {};
     timeoutMs = timeoutMs || 10000;
@@ -264,6 +272,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
     var ctl = (typeof AbortController === "function") ? new AbortController() : null;
     var timer = null;
     var onAbort = null;
+    var timedOut = false;
     if (ctl) {
       if (externalSignal) {
         if (externalSignal.aborted) {
@@ -274,10 +283,16 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
         }
       }
       options = Object.assign({}, options, { signal: ctl.signal });
-      timer = setTimeout(function () { try { ctl.abort(); } catch (_) {} }, timeoutMs);
+      timer = setTimeout(function () {
+        timedOut = true;
+        try { ctl.abort(); } catch (_) {}
+      }, timeoutMs);
     }
     try {
       return await fetch(url, options);
+    } catch (e) {
+      if (timedOut) throw _timeoutProjectFetchError(url, timeoutMs);
+      throw e;
     } finally {
       if (timer) clearTimeout(timer);
       if (externalSignal && onAbort && typeof externalSignal.removeEventListener === "function") {
@@ -287,6 +302,48 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
   }
 
   var _projectFetchInFlight = Object.create(null);
+
+  function _projectFetchError(message, meta) {
+    var err = new Error(message || "项目详情请求失败，请稍后重试");
+    err.name = "ProjectFetchError";
+    meta = meta || {};
+    err.code = meta.code || "";
+    err.status = meta.status || 0;
+    err.projectId = meta.projectId || "";
+    err.timeoutMs = meta.timeoutMs || 0;
+    err.payload = meta.payload || null;
+    return err;
+  }
+
+  function _projectFetchDetail(payload) {
+    if (!payload || typeof payload !== "object") return "";
+    return String(payload.detail || payload.error || payload.message || "").trim();
+  }
+
+  function _projectFetchMessage(meta) {
+    meta = meta || {};
+    var status = Number(meta.status) || 0;
+    var detail = _projectFetchDetail(meta.payload);
+    if (meta.code === "timeout") return "项目详情请求超时，请检查网络后重试。";
+    if (meta.code === "empty_response") return "项目详情返回异常：缺少项目 ID，请刷新后重试。";
+    if (meta.code === "network") return "项目详情网络请求失败，请检查连接后重试。";
+    if (status === 401) return "登录已失效，请重新登录后再打开项目。";
+    if (status === 403) return "没有权限访问该项目，请确认当前登录账号。";
+    if (status === 404) return "项目不存在或已被删除，请刷新任务列表。";
+    if (status >= 500) return "服务器读取项目失败（" + status + "），请稍后重试。";
+    if (status > 0) return "项目详情请求失败（" + status + "）" + (detail ? "：" + detail : "。");
+    return "项目详情请求失败，请稍后重试。";
+  }
+
+  async function _readProjectFetchPayload(resp) {
+    var text = "";
+    try { text = await resp.text(); } catch (_) { text = ""; }
+    if (!text) return {};
+    try { return JSON.parse(text); } catch (_) {
+      if (text.trim().charAt(0) === "<") return { detail: "服务器返回了 HTML 错误页" };
+      return { detail: text.trim().slice(0, 180) };
+    }
+  }
 
   async function fetchProjectByIdShared(projId, options) {
     options = options || {};
@@ -301,18 +358,60 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
           options.timeoutMs || 10000,
         );
         _checkAuth(resp);
-        if (!resp.ok) return null;
+        if (!resp.ok) {
+          var payload = await _readProjectFetchPayload(resp);
+          if (options.throwOnError) {
+            throw _projectFetchError(_projectFetchMessage({ status: resp.status, payload: payload }), {
+              code: "http",
+              status: resp.status,
+              payload: payload,
+              projectId: key,
+            });
+          }
+          return null;
+        }
         var data = await resp.json();
-        return (data && data.id) ? data : null;
+        if (data && data.id) return data;
+        if (options.throwOnError) {
+          throw _projectFetchError(_projectFetchMessage({ code: "empty_response" }), {
+            code: "empty_response",
+            projectId: key,
+          });
+        }
+        return null;
       } catch (e) {
+        if (e && e.name === "ProjectFetchError") {
+          if (options.throwOnError) throw e;
+          return null;
+        }
+        if (e && e.name === "TimeoutError") {
+          if (options.throwOnError) {
+            throw _projectFetchError(_projectFetchMessage({ code: "timeout" }), {
+              code: "timeout",
+              projectId: key,
+              timeoutMs: e.timeoutMs || options.timeoutMs || 10000,
+            });
+          }
+          return null;
+        }
+        // 外部切换项目触发的 AbortError 是正常中断，不要误报成网络/超时。
+        if (e && (e.name === "AbortError" || e.code === 20)) return null;
         if (!(e && (e.name === "AbortError" || e.code === 20))) {
           console.warn("[fetchProjectByIdShared] failed:", e);
+        }
+        if (options.throwOnError) {
+          throw _projectFetchError(_projectFetchMessage({ code: "network" }), {
+            code: "network",
+            projectId: key,
+          });
         }
         return null;
       }
     })();
     _projectFetchInFlight[key] = promise;
-    promise.finally(function () {
+    promise.then(function () {
+      if (_projectFetchInFlight[key] === promise) delete _projectFetchInFlight[key];
+    }, function () {
       if (_projectFetchInFlight[key] === promise) delete _projectFetchInFlight[key];
     });
     return promise;

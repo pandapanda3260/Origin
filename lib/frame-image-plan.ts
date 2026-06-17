@@ -251,6 +251,42 @@ function propName(prop: any): string {
   return clean(prop?.name || prop?.propName);
 }
 
+function propMentionAliases(prop: any): string[] {
+  const raw = [
+    prop?.name,
+    prop?.propName,
+    prop?.title,
+    ...(Array.isArray(prop?.aliases) ? prop.aliases : []),
+  ]
+    .map((value) => clean(value))
+    .filter(Boolean);
+  const aliases = new Set<string>(raw);
+  for (const name of raw) {
+    const short = name.replace(/^(?:移动|智能|电子|家用|现代|小型|桌面|立式|便携|可移动)/, '');
+    if (short !== name && importanceKey(short).length >= 2) aliases.add(short);
+  }
+  return [...aliases];
+}
+
+function propMentionStats(prop: any, text: string): { count: number; firstMentionIndex: number } {
+  const textKey = importanceKey(text);
+  let count = 0;
+  let firstMentionIndex = Number.MAX_SAFE_INTEGER;
+  for (const alias of propMentionAliases(prop)) {
+    const key = importanceKey(alias);
+    if (key.length < 2) continue;
+    let pos = 0;
+    while (true) {
+      const idx = textKey.indexOf(key, pos);
+      if (idx < 0) break;
+      count += 1;
+      firstMentionIndex = Math.min(firstMentionIndex, idx);
+      pos = idx + Math.max(1, key.length);
+    }
+  }
+  return { count, firstMentionIndex };
+}
+
 function isCrowdCharacter(ch: any): boolean {
   return isAnonymousCrowdAsset(ch);
 }
@@ -384,14 +420,13 @@ export function orderCharactersByImportance(
 }
 
 export function orderPropsByFirstOccurrence(usedProps: any[], groupText: string): any[] {
-  const groupTextKey = importanceKey(groupText);
   return usedProps
     .map((prop, index) => {
-      const key = importanceKey(propName(prop));
+      const stats = propMentionStats(prop, groupText);
       return {
         prop,
         index,
-        firstMentionIndex: key && groupTextKey.includes(key) ? groupTextKey.indexOf(key) : Number.MAX_SAFE_INTEGER,
+        firstMentionIndex: stats.firstMentionIndex,
       };
     })
     .sort((a, b) => (a.firstMentionIndex - b.firstMentionIndex) || (a.index - b.index))
@@ -546,8 +581,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
   const matchedProps = orderPropsByFirstOccurrence(availableProps
     .filter((p: any) => {
       if (isStoryboardMaterialForGroup(p, groupIdx, 'prop')) return false;
-      const nm = p?.name || p?.propName;
-      return groupText.includes(nm);
+      return propMentionStats(p, groupText).count > 0;
     }), groupText);
   const usedProps = [...manualProps, ...matchedProps].slice(0, 6);
   const propLockText = usedProps
@@ -1057,41 +1091,41 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   // 3. Reference images (only those actually submitted)
   const imageRefs = plan.referenceManifest.filter((r) => r.delivery === 'image');
   if (imageRefs.length) {
-	    lines.push('');
-	    lines.push('【参考图】');
-	    for (const r of imageRefs) {
-	      const panelText =
-	        r.panel === 'sheet'
-	          ? '角色设定图'
-	          : r.panel === 'headshot'
-	            ? '脸部近景'
-	            : r.panel === 'front'
-	              ? '正面图'
-	              : r.panel === 'side'
-	                ? '侧面图'
-	                : r.panel === 'back'
-	                  ? '背面图'
-	                  : '';
-	      const roleText =
-	        r.role === 'scene'
-	          ? `场景（${r.assetName || '场景'}）- 锁定空间布局、材质、光线方向、时间氛围和主色调。`
-	          : r.role === 'character'
-	            ? `角色（${r.assetName || '角色'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '锁定同一人脸部、服装、体型、物种特征和配饰。'}`
-	            : r.role === 'crowd'
-	              ? `人群/群像（${r.assetName || '人群'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '只锁定人群规模、服装气质和背景层次，不替代主角身份参考。'}`
-	              : r.role === 'prop'
-	                ? `道具（${r.assetName || '道具'}）- 锁定形状、颜色、材质、尺度和可识别细节。`
-	                : r.role === 'prev_tail'
-	                  ? '上一片段尾帧 - 连续性锚点，锁定衔接关系，不复制构图。'
-	                  : r.role === 'self_first_frame'
-	                    ? '本片段首帧 - 身份、服装、地点、光线和关键道具连续性锚点，不是构图复制目标。'
-	                    : String(r.role);
-	      // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
-	      lines.push(`- Image ${r.imageNo} = ${roleText}`);
-	    }
-	    lines.push('- 角色设定图负责统一身份和服装；头像/正面/侧面/背面只补充对应角度细节，不能相互冲突。');
-	    lines.push('- 场景和道具参考必须同等执行：不要为了贴近角色而改掉地点、关键道具、材质、光线或空间关系。');
-	  }
+    lines.push('');
+    lines.push('【参考图】');
+    for (const r of imageRefs) {
+      const panelText =
+        r.panel === 'sheet'
+          ? '角色设定图'
+          : r.panel === 'headshot'
+            ? '脸部近景'
+            : r.panel === 'front'
+              ? '正面图'
+              : r.panel === 'side'
+                ? '侧面图'
+                : r.panel === 'back'
+                  ? '背面图'
+                  : '';
+      const roleText =
+        r.role === 'scene'
+          ? `场景（${r.assetName || '场景'}）- 锁定空间布局、材质、光线方向、时间氛围和主色调。`
+          : r.role === 'character'
+            ? `角色（${r.assetName || '角色'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '锁定同一人脸部、服装、体型、物种特征和配饰。'}`
+            : r.role === 'crowd'
+              ? `人群/群像（${r.assetName || '人群'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '只锁定人群规模、服装气质和背景层次，不替代主角身份参考。'}`
+              : r.role === 'prop'
+                ? `道具（${r.assetName || '道具'}）- 锁定同一件单实例道具的形状、颜色、材质、尺度、支架/边框结构和可识别细节；只允许视角、屏幕内容和光线变化，不得改成其他类型设备。`
+                : r.role === 'prev_tail'
+                  ? '上一片段尾帧 - 连续性锚点，锁定衔接关系，不复制构图。'
+                  : r.role === 'self_first_frame'
+                    ? '本片段首帧 - 身份、服装、地点、光线和关键道具连续性锚点，不是构图复制目标。'
+                    : String(r.role);
+      // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
+      lines.push(`- Image ${r.imageNo} = ${roleText}`);
+    }
+    lines.push('- 角色设定图负责统一身份和服装；头像/正面/侧面/背面只补充对应角度细节，不能相互冲突。');
+    lines.push('- 场景和道具参考必须同等执行：不要为了贴近角色而改掉地点、关键道具、材质、光线或空间关系。');
+  }
 
   // 4. Locks (text)
   if (plan.characterLockText) {
@@ -1107,9 +1141,11 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
   if (plan.propLockText) {
     lines.push('');
     lines.push('【道具锁定】');
+    lines.push('- 每个道具名称都代表同一件规范实体；跨镜头必须保持外形、比例、支架/边框、材质和核心识别结构一致。');
+    lines.push('- 道具参考只用于锁定外观，不得据此新增第二个同名物体；屏幕类道具只能改变屏幕内容/反光/视角，不得变成手机、相框、盒子或另一种产品。');
     lines.push(plan.propLockText);
   }
-	  if (plan.styleLock) {
+  if (plan.styleLock) {
     lines.push('');
     lines.push('【项目风格锁定】');
     lines.push(plan.styleLock);

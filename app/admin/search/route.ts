@@ -30,7 +30,7 @@ export async function GET(req: NextRequest) {
     bodyHtml: `<section class="panel">
       <div class="adm-toolbar">
         <label class="adm-field" style="flex:1; min-width:300px;"><span>检索</span>
-          <input data-admin-search-input="true" placeholder="用户：ID / 手机号 / 昵称（模糊）；单据：orderId / batchId / taskId / projectId / exportId（精确）" />
+          <input data-admin-search-input="true" placeholder="用户：账户ID / 手机号 / 昵称（模糊）；单据：orderId / batchId / taskId / projectId / exportId（精确）" />
         </label>
         <div class="adm-actions">
           <button class="adm-btn adm-btn-primary" data-admin-search-button="true">${adminIcon('search')}检索</button>
@@ -49,7 +49,7 @@ export async function GET(req: NextRequest) {
         <table class="admin-table users-table">
           <thead>
             <tr>
-              <th>ID</th>
+              <th>账户ID</th>
               <th>用户</th>
               <th>手机号</th>
               <th>积分</th>
@@ -83,7 +83,8 @@ export async function GET(req: NextRequest) {
         export: '导出任务'
       };
       const fieldLabels = {
-        userId: '用户 ID',
+        userId: '内部用户 ID',
+        accountId: '账户ID',
         ownerId: '归属用户',
         username: '内部账号',
         phone: '手机号',
@@ -154,7 +155,7 @@ export async function GET(req: NextRequest) {
           const primaryName = u.displayName || u.phone || u.username;
           const accountLine = u.phone || u.username || '';
           return '<tr>' +
-            '<td>' + u.id + '</td>' +
+            '<td class="mono">' + esc(u.accountId || u.id) + '</td>' +
             '<td><strong>' + esc(primaryName) + '</strong><div class="muted">' + esc(accountLine) + '</div></td>' +
             '<td>' + esc(u.phone || '-') + '</td>' +
             '<td>' + Number(u.totalCredits || 0) + '</td>' +

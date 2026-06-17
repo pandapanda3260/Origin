@@ -32,16 +32,38 @@ const LOGIN_HTML = `<!doctype html>
   <main>
     <h1>ORIGIN Admin</h1>
     <p>独立后台入口。普通工作台账号不可登录这里。</p>
-    <form id="loginForm" autocomplete="off">
-      <label>管理员账号<input id="username" autocomplete="off" autocapitalize="none" spellcheck="false" data-lpignore="true" data-1p-ignore="true" required /></label>
-      <label>密码<input id="password" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" required /></label>
+    <form id="loginForm" autocomplete="off" data-form-type="other">
+      <label>管理员账号<input id="adminLoginName" name="admin_login_name_ignored" autocomplete="off" autocapitalize="none" spellcheck="false" data-form-type="other" data-lpignore="true" data-1p-ignore="true" readonly required /></label>
+      <label>密码<input id="adminLoginSecret" name="admin_login_secret_ignored" type="password" autocomplete="new-password" data-form-type="other" data-lpignore="true" data-1p-ignore="true" readonly required /></label>
       <div id="error" class="error"></div>
       <button type="submit">登录后台</button>
     </form>
   </main>
   <script>
+    const usernameInput = document.getElementById('adminLoginName');
+    const passwordInput = document.getElementById('adminLoginSecret');
+    let userInteracted = false;
+    function unlockLoginFields() {
+      userInteracted = true;
+      usernameInput.readOnly = false;
+      passwordInput.readOnly = false;
+    }
+    function clearAutofillValues() {
+      if (userInteracted) return;
+      usernameInput.value = '';
+      passwordInput.value = '';
+    }
+    [usernameInput, passwordInput].forEach(function (input) {
+      input.addEventListener('focus', unlockLoginFields, { once: true });
+      input.addEventListener('pointerdown', unlockLoginFields, { once: true });
+      input.addEventListener('keydown', unlockLoginFields, { once: true });
+    });
+    [0, 80, 300, 900].forEach(function (delay) {
+      window.setTimeout(clearAutofillValues, delay);
+    });
     document.getElementById('loginForm').addEventListener('submit', async function (ev) {
       ev.preventDefault();
+      unlockLoginFields();
       const error = document.getElementById('error');
       error.textContent = '';
       const resp = await fetch('/api/admin/auth/login', {
@@ -49,8 +71,8 @@ const LOGIN_HTML = `<!doctype html>
         headers: { 'content-type': 'application/json' },
         credentials: 'same-origin',
         body: JSON.stringify({
-          username: document.getElementById('username').value,
-          password: document.getElementById('password').value
+          username: usernameInput.value,
+          password: passwordInput.value
         })
       });
       if (!resp.ok) {

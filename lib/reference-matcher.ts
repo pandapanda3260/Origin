@@ -57,6 +57,22 @@ function assetName(asset: any, fallback: string): string {
   return compactText(asset?.name || asset?.role || asset?.propName || asset?.location || fallback);
 }
 
+function assetMentionAliases(asset: any, fallback: string): string[] {
+  const raw = [
+    assetName(asset, fallback),
+    asset?.title,
+    ...(Array.isArray(asset?.aliases) ? asset.aliases : []),
+  ]
+    .map(compactText)
+    .filter(Boolean);
+  const aliases = new Set<string>(raw);
+  for (const name of raw) {
+    const short = name.replace(/^(?:移动|智能|电子|家用|现代|小型|桌面|立式|便携|可移动)/, '');
+    if (short !== name && normalizeReferenceName(short).length >= 2) aliases.add(short);
+  }
+  return [...aliases];
+}
+
 function assetUrl(asset: any): string {
   const reference = resolveAssetReferenceState(asset);
   if (isBlockingReferenceStatus(reference.status)) return '';
@@ -168,6 +184,18 @@ function countOccurrences(haystack: string, needle: string): number {
     pos = idx + Math.max(needle.length, 1);
   }
   return count;
+}
+
+function propMentionStats(normText: string, prop: any, fallback: string): { count: number; firstMentionIndex: number } {
+  let count = 0;
+  let firstMentionIndex = Number.MAX_SAFE_INTEGER;
+  for (const alias of assetMentionAliases(prop, fallback)) {
+    const norm = normalizeReferenceName(alias);
+    if (norm.length < 2) continue;
+    count += countOccurrences(normText, norm);
+    firstMentionIndex = Math.min(firstMentionIndex, firstOccurrenceIndex(normText, norm));
+  }
+  return { count, firstMentionIndex };
 }
 
 function firstOccurrenceIndex(haystack: string, needle: string): number {
@@ -321,8 +349,9 @@ function roleDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem, 'us
     };
   }
   return {
-    useFor: ['锁定道具材质', '颜色', '尺度', '识别特征'],
-    immutable: ['核心形状', '主色', '材质', '用途'],
+    useFor: ['锁定同一件道具外形', '材质', '颜色', '尺度', '识别特征'],
+    immutable: ['核心形状', '主色', '材质', '用途', '支架/边框/结构'],
+    promptHint: '同名道具全片只是一件规范实体；只允许视角、屏幕内容和光线变化，不得改成其他类型设备或复制多件。',
   };
 }
 
@@ -698,11 +727,11 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   props.forEach((prop, idx) => {
     if (isMaterialAssetExcluded(project, 'prop', prop, input.groupIdx, idx)) return;
     const name = assetName(prop, `道具${idx + 1}`);
-    const norm = normalizeReferenceName(name);
-    const mentions = norm ? countOccurrences(normText, norm) : 0;
+    const mentionStats = propMentionStats(normText, prop, name);
+    const mentions = mentionStats.count;
     const manualMatch = isStoryboardMaterialForGroup(prop, input.groupIdx, 'prop');
     if (!manualMatch && !mentions) return;
-    const firstMention = firstOccurrenceIndex(normText, norm);
+    const firstMention = mentionStats.firstMentionIndex;
     const url = assetUrl(prop);
     if (!url) {
       dropped.push({ role: 'prop', assetName: name, reason: 'asset_missing' });

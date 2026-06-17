@@ -10,6 +10,7 @@ export const dynamic = 'force-dynamic';
 
 type AdminUserListRow = {
   id: number;
+  account_id: string | null;
   username: string;
   phone: string | null;
   email: string | null;
@@ -27,6 +28,7 @@ type AdminUserListRow = {
 
 type UserSnapshot = {
   id: number;
+  accountId: string;
   username: string;
   phone: string | null;
   email: string | null;
@@ -60,6 +62,7 @@ export async function GET(req: NextRequest) {
   const searchClause = q
     ? `AND (
 	         CAST(u.id AS TEXT) = @q
+	         OR u.account_id = @q
 	         OR u.username LIKE @like ESCAPE '\\'
 	         OR COALESCE(u.phone, '') LIKE @like ESCAPE '\\'
 	         OR COALESCE(u.email, '') LIKE @like ESCAPE '\\'
@@ -70,6 +73,7 @@ export async function GET(req: NextRequest) {
     .prepare<typeof params, AdminUserListRow>(
       `SELECT
 	         u.id,
+	         u.account_id,
 	         u.username,
 	         u.phone,
 	         u.email,
@@ -140,6 +144,7 @@ function readUserSnapshot(userId: number): UserSnapshot | null {
     .prepare<{ id: number }, AdminUserListRow>(
       `SELECT
 	         u.id,
+	         u.account_id,
 	         u.username,
 	         u.phone,
 	         u.email,
@@ -209,6 +214,7 @@ function planAfter(before: UserSnapshot, action: string, now: string): UserSnaps
 function toSnapshot(row: AdminUserListRow): UserSnapshot {
   return {
 	    id: row.id,
+      accountId: row.account_id || '',
 	    username: row.username,
 	    phone: row.phone,
 	    email: row.email,
