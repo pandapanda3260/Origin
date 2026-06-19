@@ -175,6 +175,24 @@ function providerCompletedResultPayload(provider: ProviderRecoveryKey, result: P
   return { provider, result: result.result, raw: result.raw };
 }
 
+function nonEmptyString(value: unknown) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function completedPayloadRequiresVideoUrl(provider: ProviderRecoveryKey, payload: unknown) {
+  const obj = payload && typeof payload === 'object' ? payload as any : null;
+  return provider === 'volcengine_seedance_video' || obj?.patch?.type === 'video_segment';
+}
+
+function completedPayloadHasVideoUrl(payload: unknown) {
+  const obj = payload && typeof payload === 'object' ? payload as any : null;
+  return Boolean(
+    nonEmptyString(obj?.resultUrl) ||
+    nonEmptyString(obj?.patch?.url) ||
+    nonEmptyString(obj?.extra?.protectedUrl),
+  );
+}
+
 function providerPollErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) return error.message.slice(0, 500);
   if (typeof error === 'string') return error.slice(0, 500);
@@ -307,6 +325,20 @@ export async function pollBatchProviderTask(opts: {
     }
 
     if (result.status === 'completed') {
+      if (
+        completedPayloadRequiresVideoUrl(opts.adapter.provider, result.result) &&
+        !completedPayloadHasVideoUrl(result.result)
+      ) {
+        const reason = 'provider_completed_missing_video_url';
+        const marked = markProviderTaskNeedsReview({
+          taskId: opts.taskId,
+          reason,
+          errorMsg: 'provider returned completed video result without a playable URL',
+          nowMs,
+        });
+        if (!marked) return { status: 'ignored', reason: 'concurrent_modification' };
+        return { status: 'needs_review', reason };
+      }
       getDb()
         .prepare(
           `UPDATE batch_tasks

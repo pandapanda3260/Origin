@@ -15,6 +15,7 @@ import { recoverRunningVideoTasks, startVideoRecoveryLoop } from './video-gen';
 import { startProviderPollingLoop } from './provider-polling-worker';
 import { startVevDemoExportPollingWorker } from './vevdemo-export-worker';
 import { startVideoPromptReaperLoop } from './video-prompt-reaper';
+import { computeExecutorRuntime, envFlagFrom } from './executor-runtime';
 
 installConsoleHook();
 
@@ -23,32 +24,16 @@ function isNextProductionBuild() {
 }
 
 function envFlag(name: string, fallback: boolean) {
-  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
-  if (raw == null || raw === '') return fallback;
-  const normalized = String(raw).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return fallback;
-}
-
-function isWorkerProcess() {
-  return process.env.ORIGIN_PROCESS_ROLE === 'worker' || envFlag('WORKER_ENABLED', false);
-}
-
-function expectsExternalWorker() {
-  return envFlag('EXPECT_WORKER', process.env.NODE_ENV === 'production');
+  return envFlagFrom(process.env, name, fallback);
 }
 
 // 启动时回收上次进程留下的孤儿 batch/export + 退款
 // 用 globalThis 标记避免 HMR 下重复 reap
 const reapKey = '__qd_batches_reaped__';
-const workerProcess = isWorkerProcess();
-const externalWorkerExpected = expectsExternalWorker();
-const localCoordinatorEnabled =
-  !workerProcess &&
-  !externalWorkerExpected &&
-  envFlag('LOCAL_WORKER_IN_WEB', process.env.NODE_ENV !== 'production');
-const recoveryEnabled = workerProcess || envFlag('BATCH_RECOVERY_ENABLED', false) || localCoordinatorEnabled;
+const executorRuntime = computeExecutorRuntime(process.env);
+const workerProcess = executorRuntime.workerProcess;
+const externalWorkerExpected = executorRuntime.externalWorkerExpected;
+const recoveryEnabled = executorRuntime.recoveryEnabled;
 const reapOnStart = envFlag('REAP_ORPHANS_ON_START', !recoveryEnabled && !externalWorkerExpected);
 
 if (!isNextProductionBuild() && reapOnStart && !(globalThis as any)[reapKey]) {

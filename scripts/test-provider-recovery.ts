@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ProviderTaskAdapter, ProviderPollResult } from '../lib/provider-recovery';
+import type { ProviderRecoveryKey, ProviderTaskAdapter, ProviderPollResult } from '../lib/provider-recovery';
 
 const tempDir = mkdtempSync(join(tmpdir(), 'origin-provider-recovery-'));
 process.env.ORIGIN_DATA_DIR = tempDir;
@@ -117,9 +117,9 @@ async function main() {
     });
   }
 
-  function adapterFor(poll: ProviderTaskAdapter['poll']): ProviderTaskAdapter {
+  function adapterFor(poll: ProviderTaskAdapter['poll'], provider: ProviderRecoveryKey = 'volcengine_seedance_video'): ProviderTaskAdapter {
     return {
-      provider: 'volcengine_seedance_video',
+      provider,
       async submit() {
         return { providerTaskId: 'unused' };
       },
@@ -144,18 +144,73 @@ async function main() {
   assert.equal(pendingTask.last_checked_at, '2026-01-01T00:00:00.000Z');
   assert.equal(pendingTask.next_retry_at, '2026-01-01T00:00:10.000Z');
 
-  insertProviderTask('task-poll-completed');
+  insertProviderTask('task-poll-completed', { provider: 'volcengine_seedream_image' });
   const completedOutcome = await pollBatchProviderTask({
     taskId: 'task-poll-completed',
-    adapter: adapterFor(async () => ({ status: 'completed', result: { url: 'https://cdn.example/video.mp4' } })),
+    adapter: adapterFor(
+      async () => ({ status: 'completed', result: { url: 'https://cdn.example/image.png' } }),
+      'volcengine_seedream_image',
+    ),
     nowMs: baseNow,
   });
   assert.equal(completedOutcome.status, 'completed');
   const completedTask = db.prepare("SELECT status, result_json FROM batch_tasks WHERE id = 'task-poll-completed'").get() as any;
   assert.equal(completedTask.status, 'completed');
-  assert.equal(JSON.parse(completedTask.result_json).result.url, 'https://cdn.example/video.mp4');
+  assert.equal(JSON.parse(completedTask.result_json).result.url, 'https://cdn.example/image.png');
   const completedHistory = db.prepare("SELECT to_state FROM task_state_history WHERE task_id = 'task-poll-completed'").get() as any;
   assert.equal(completedHistory.to_state, 'completed');
+
+  insertProviderTask('task-poll-video-completed');
+  const videoCompletedOutcome = await pollBatchProviderTask({
+    taskId: 'task-poll-video-completed',
+    adapter: adapterFor(async () => ({
+      status: 'completed',
+      result: {
+        resultUrl: '/api/videos/file/local-video-ok',
+        patch: {
+          type: 'video_segment',
+          url: '/api/videos/file/local-video-ok',
+          taskId: 'local-video-ok',
+        },
+        extra: {
+          protectedUrl: '/api/videos/file/local-video-ok',
+          mode: 'real',
+        },
+      },
+    })),
+    nowMs: baseNow,
+  });
+  assert.equal(videoCompletedOutcome.status, 'completed');
+  const videoCompletedTask = db.prepare("SELECT status, result_json FROM batch_tasks WHERE id = 'task-poll-video-completed'").get() as any;
+  assert.equal(videoCompletedTask.status, 'completed');
+  assert.equal(JSON.parse(videoCompletedTask.result_json).extra.protectedUrl, '/api/videos/file/local-video-ok');
+
+  insertProviderTask('task-poll-video-completed-empty-url');
+  const emptyVideoCompletedOutcome = await pollBatchProviderTask({
+    taskId: 'task-poll-video-completed-empty-url',
+    adapter: adapterFor(async () => ({
+      status: 'completed',
+      result: {
+        resultUrl: '',
+        patch: {
+          type: 'video_segment',
+          url: '',
+          taskId: 'local-video-empty',
+        },
+        extra: {
+          protectedUrl: '',
+          mode: 'real',
+        },
+      },
+    })),
+    nowMs: baseNow,
+  });
+  assert.equal(emptyVideoCompletedOutcome.status, 'needs_review');
+  const emptyVideoCompletedTask = db
+    .prepare("SELECT status, error_msg FROM batch_tasks WHERE id = 'task-poll-video-completed-empty-url'")
+    .get() as any;
+  assert.equal(emptyVideoCompletedTask.status, 'needs_review');
+  assert.match(emptyVideoCompletedTask.error_msg, /playable URL/);
 
   insertProviderTask('task-poll-retry', { retryCount: 0, maxRetries: 3 });
   const rateLimit = new Error('429 too many requests') as Error & { status: number };

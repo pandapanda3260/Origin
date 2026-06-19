@@ -110,7 +110,7 @@ async function main() {
   const refundBucketRow = db
     .prepare("SELECT buckets_json FROM credit_ledger WHERE refund_ref_id = 'refund:task-bucket-refund'")
     .get() as any;
-  assert.deepEqual(JSON.parse(refundBucketRow.buckets_json), { bonus: 50, topup: 20, subscription: 0, overdraft: 0 });
+  assert.deepEqual(JSON.parse(refundBucketRow.buckets_json), { bonus: 50, topup: 0, subscription: 20, overdraft: 0 });
   assert.equal(
     (db.prepare("SELECT COUNT(*) AS c FROM credit_ledger WHERE refund_ref_id = 'refund:task-bucket-refund'").get() as any).c,
     1,

@@ -14,7 +14,7 @@ function timestampSlug(date = new Date()) {
   return date.toISOString().replace(/[:.]/g, '-');
 }
 
-async function main() {
+export async function backupSqliteDatabase() {
   const dbPath = resolve(process.env.DB_PATH || join(getDataDir(), 'qd.sqlite'));
   if (!existsSync(dbPath)) {
     throw new Error(`SQLite database not found: ${dbPath}`);
@@ -55,17 +55,23 @@ async function main() {
     unlinkSync(old.path);
   }
 
-  console.log(JSON.stringify({
+  return {
     ok: true,
     dbPath,
     backupPath,
     backupDir,
     retained: Math.min(backups.length, retain),
     removed: Math.max(0, backups.length - retain),
-  }));
+  };
 }
 
-main().catch((error) => {
-  console.error('[backup-sqlite] failed:', error?.message || error);
-  process.exit(1);
-});
+async function main() {
+  console.log(JSON.stringify(await backupSqliteDatabase()));
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error('[backup-sqlite] failed:', error?.message || error);
+    process.exit(1);
+  });
+}

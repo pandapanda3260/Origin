@@ -804,6 +804,26 @@ function resolveVideoNamesForRecoveredRow(user: UserRow, row: any) {
   return buildVideoSegmentNamesForRow(row, project);
 }
 
+export function buildRecoveredVideoReusePayload(user: UserRow, row: any, fallbackDurationSec = 0) {
+  const taskId = String(row.id || '');
+  const project = row?.project_id ? getProjectByIdForUser(String(row.project_id), user.id) : null;
+  const videoNames = buildVideoSegmentNamesForRow(row, project);
+  const durationSec = Number(row.duration_sec) || Number(fallbackDurationSec) || 0;
+  const coverImageId = String(row.cover_image_id || '').trim();
+  return {
+    taskId,
+    protectedUrl: `/api/videos/file/${taskId}`,
+    filename: videoNames.filename,
+    displayName: videoNames.displayName,
+    downloadFilename: videoNames.downloadFilename,
+    coverUrl: coverImageId ? `/api/images/file/${coverImageId}` : null,
+    durationSec,
+    realDurationSec: durationSec,
+    videoWarnings: [],
+    mode: 'real' as const,
+  };
+}
+
 /**
  * 主入口：生成 + 落 DB + 返回封装结果。
  *
@@ -2658,6 +2678,16 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
     });
 	  if (!completeInfo.completed) {
 	    console.warn('[video-recover] completion ignored because task is no longer active:', taskId);
+    const freshRow = db
+      .prepare<{ taskId: string }, any>('SELECT * FROM video_tasks WHERE id = @taskId')
+      .get({ taskId });
+    if (
+      freshRow &&
+      String(freshRow.status || '') === 'completed' &&
+      String(freshRow.filename || '').trim()
+    ) {
+      return buildRecoveredVideoReusePayload(user, freshRow, Number(row.duration_sec) || durationSec || 0);
+    }
 	    return {
 	      taskId,
       status: 'cancelled',
@@ -2822,6 +2852,9 @@ export function createSeedanceVideoProviderAdapter(): ProviderTaskAdapter {
 	        const videoUrl = j?.content?.video_url || j?.video_url || '';
 	        if (!videoUrl) return { status: 'failed', reason: 'Seedance 完成但没返回 video_url', raw: j };
 	        const final = await finalizeRecoveredVideoTask(user, videoRow, videoUrl, cfg);
+	        if (!final.protectedUrl) {
+	          return { status: 'failed', reason: 'local_video_completion_unavailable', raw: j };
+	        }
 	        return {
           status: 'completed',
           result: {

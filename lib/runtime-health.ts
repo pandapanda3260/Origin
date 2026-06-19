@@ -2,6 +2,7 @@ import { constants, existsSync, mkdirSync, readFileSync, statSync, statfsSync, a
 import { dirname, join } from 'node:path';
 import { getDb } from './db';
 import { getExternalEnvLoadResult, getExternalEnvValue, loadExternalEnv } from './env';
+import { envFlagFrom, type ExecutorEnv } from './executor-runtime';
 import { describeRuntimeStorage, getDataDir } from './runtime-paths';
 import { isPlaceholderSecret, secretByteLength } from './secret-safety';
 import { getServiceHeartbeat } from './service-heartbeat';
@@ -32,12 +33,7 @@ function readReleaseIdentity() {
 }
 
 function envFlag(name: string, fallback: boolean) {
-  const raw = process.env[name] || process.env[`ORIGIN_${name}`];
-  if (raw == null || raw === '') return fallback;
-  const normalized = String(raw).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
-  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
-  return fallback;
+  return envFlagFrom(process.env, name, fallback);
 }
 
 function envInt(name: string, fallback: number, min: number, max: number) {
@@ -373,49 +369,73 @@ function checkStorageMode(checks: Check[]) {
   });
 }
 
-function checkProductionRuntimeGuards(checks: Check[]) {
-  const production = process.env.NODE_ENV === 'production';
+export function getProductionRuntimeGuardSummary(env: ExecutorEnv = process.env) {
+  const production = env.NODE_ENV === 'production';
+  const role = env.ORIGIN_PROCESS_ROLE || 'web';
+  const violations: string[] = [];
   if (!production) {
+    return {
+      production,
+      role,
+      violations,
+      detail: {
+        role,
+      },
+    };
+  }
+  if (envFlagFrom(env, 'BILLING_DEV_AUTOPAY', false)) {
+    violations.push('BILLING_DEV_AUTOPAY must be off in production');
+  }
+  if (envFlagFrom(env, 'ALLOW_INSECURE_DOWNLOAD', false)) {
+    violations.push('ORIGIN_ALLOW_INSECURE_DOWNLOAD must be off in production');
+  }
+  if (!envFlagFrom(env, 'EXPECT_WORKER', true)) {
+    violations.push('ORIGIN_EXPECT_WORKER must stay on in production');
+  }
+  if (role === 'web') {
+    if (envFlagFrom(env, 'BATCH_INLINE_RUNNER', false)) {
+      violations.push('ORIGIN_BATCH_INLINE_RUNNER must be off for production web');
+    }
+    if (envFlagFrom(env, 'INLINE_ONLINE_EDITOR_DOWNLOAD', false)) {
+      violations.push('ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD must be off for production web');
+    }
+    if (envFlagFrom(env, 'REAP_ORPHANS_ON_START', false)) {
+      violations.push('ORIGIN_REAP_ORPHANS_ON_START must be off for production web');
+    }
+    if (envFlagFrom(env, 'BATCH_RECOVERY_ENABLED', false)) {
+      violations.push('ORIGIN_BATCH_RECOVERY_ENABLED must be worker-only in production');
+    }
+  }
+
+  return {
+    production,
+    role,
+    violations,
+    detail: {
+      role,
+      billingDevAutopay: envFlagFrom(env, 'BILLING_DEV_AUTOPAY', false),
+      allowInsecureDownload: envFlagFrom(env, 'ALLOW_INSECURE_DOWNLOAD', false),
+      expectWorker: envFlagFrom(env, 'EXPECT_WORKER', true),
+      batchInlineRunner: envFlagFrom(env, 'BATCH_INLINE_RUNNER', false),
+      inlineOnlineEditorDownload: envFlagFrom(env, 'INLINE_ONLINE_EDITOR_DOWNLOAD', false),
+      reapOrphansOnStart: envFlagFrom(env, 'REAP_ORPHANS_ON_START', false),
+      batchRecoveryEnabled: envFlagFrom(env, 'BATCH_RECOVERY_ENABLED', false),
+    },
+  };
+}
+
+function checkProductionRuntimeGuards(checks: Check[]) {
+  const summary = getProductionRuntimeGuardSummary(process.env);
+  if (!summary.production) {
     addCheck(checks, { name: 'runtime.productionGuards', status: 'ok', message: 'non-production runtime' });
     return;
   }
 
-  const role = process.env.ORIGIN_PROCESS_ROLE || 'web';
-  const violations: string[] = [];
-  if (envFlag('BILLING_DEV_AUTOPAY', false)) {
-    violations.push('BILLING_DEV_AUTOPAY must be off in production');
-  }
-  if (envFlag('ALLOW_INSECURE_DOWNLOAD', false)) {
-    violations.push('ORIGIN_ALLOW_INSECURE_DOWNLOAD must be off in production');
-  }
-  if (!envFlag('EXPECT_WORKER', true)) {
-    violations.push('ORIGIN_EXPECT_WORKER must stay on in production');
-  }
-  if (role === 'web') {
-    if (envFlag('BATCH_INLINE_RUNNER', false)) {
-      violations.push('ORIGIN_BATCH_INLINE_RUNNER must be off for production web');
-    }
-    if (envFlag('INLINE_ONLINE_EDITOR_DOWNLOAD', false)) {
-      violations.push('ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD must be off for production web');
-    }
-    if (envFlag('REAP_ORPHANS_ON_START', false)) {
-      violations.push('ORIGIN_REAP_ORPHANS_ON_START must be off for production web');
-    }
-  }
-
   addCheck(checks, {
     name: 'runtime.productionGuards',
-    status: violations.length ? 'fail' : 'ok',
-    message: violations.length ? violations.join('; ') : undefined,
-    detail: {
-      role,
-      billingDevAutopay: envFlag('BILLING_DEV_AUTOPAY', false),
-      allowInsecureDownload: envFlag('ALLOW_INSECURE_DOWNLOAD', false),
-      expectWorker: envFlag('EXPECT_WORKER', true),
-      batchInlineRunner: envFlag('BATCH_INLINE_RUNNER', false),
-      inlineOnlineEditorDownload: envFlag('INLINE_ONLINE_EDITOR_DOWNLOAD', false),
-      reapOrphansOnStart: envFlag('REAP_ORPHANS_ON_START', false),
-    },
+    status: summary.violations.length ? 'fail' : 'ok',
+    message: summary.violations.length ? summary.violations.join('; ') : undefined,
+    detail: summary.detail,
   });
 }
 
