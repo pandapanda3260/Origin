@@ -23,6 +23,7 @@ function assert(cond, label) {
 
 const workspace = read('public/workspace.html');
 const mainJs = read('public/main.js');
+const mainScriptVersion = Number(workspace.match(/<script type="module" src="main\.js\?v=(\d+)"><\/script>/)?.[1] || 0);
 const prebootScript = workspace.match(/<script>\s*\(function \(\) \{[\s\S]*?<\/script>/)?.[0]
   ?.replace(/^<script>\s*/, '')
   ?.replace(/\s*<\/script>$/, '');
@@ -90,7 +91,7 @@ assert(
 );
 
 assert(
-  /<script type="module" src="main\.js\?v=357"><\/script>/.test(workspace),
+  mainScriptVersion >= 357,
   'workspace.html must bump main.js cache version after route default change',
 );
 

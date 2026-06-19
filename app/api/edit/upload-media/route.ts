@@ -19,6 +19,8 @@ const MAX_AV_BYTES = 200 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 // 请求体总上限（稍微宽松：给 form 字段留点余量）
 const MAX_REQUEST_BYTES = MAX_AV_BYTES + 1 * 1024 * 1024;
+const CHARACTER_REFERENCE_UPLOAD_SURFACE = 'character_reference';
+const CHARACTER_REFERENCE_REQUEST_BYTES = MAX_IMAGE_BYTES + 1 * 1024 * 1024;
 
 const ALLOWED_MIME_PREFIX = ['video/', 'audio/', 'image/'];
 
@@ -26,33 +28,52 @@ export async function POST(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
 
+  const requestId = (req.headers.get('x-origin-request-id') || '').trim();
+  const surface = (req.headers.get('x-origin-upload-surface') || '').trim();
+  const contentType = req.headers.get('content-type') || '';
   // 先看 content-length，阻止超大请求把整个 body 读进内存
   const contentLength = Number(req.headers.get('content-length') || 0);
-  if (contentLength && contentLength > MAX_REQUEST_BYTES) {
+  const requestLimit = surface === CHARACTER_REFERENCE_UPLOAD_SURFACE ? CHARACTER_REFERENCE_REQUEST_BYTES : MAX_REQUEST_BYTES;
+  if (contentLength && contentLength > requestLimit) {
+    if (surface === CHARACTER_REFERENCE_UPLOAD_SURFACE) {
+      return jsonError(`参考图不能超过 ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)} MB`, 413);
+    }
     return jsonError(`文件过大：请求体 ${Math.round(contentLength / 1024 / 1024)} MB 超过上限 ${Math.round(MAX_REQUEST_BYTES / 1024 / 1024)} MB`, 413);
   }
 
+  const baseLog = { requestId, surface, contentLength, contentType, ownerId: user.id };
+  let form: FormData;
   try {
-    const form = await req.formData();
-    const file = form.get('file') as File | null;
-    const projectId = (form.get('projectId') || '').toString() || null;
-    const purpose = (form.get('purpose') || '').toString().trim();
-    if (!file) return jsonError('没有上传文件', 400);
+    form = await req.formData();
+  } catch (e: any) {
+    const message = e?.message || String(e);
+    console.warn('[upload-media] formData failed', { ...baseLog, message });
+    return jsonError('上传失败：multipart 表单解析失败', 400);
+  }
 
-    const mime = (file as any).type || 'application/octet-stream';
-    if (!ALLOWED_MIME_PREFIX.some((p) => mime.startsWith(p))) {
-      return jsonError('不支持的文件类型：' + mime, 415);
-    }
-    const kind = mime.startsWith('video') ? 'video' : mime.startsWith('audio') ? 'audio' : 'image';
-    if (purpose === 'edit_timeline' && kind !== 'video') {
-      return jsonError('剪辑页目前仅支持上传视频素材', 415);
-    }
-    const perFileLimit = kind === 'image' ? MAX_IMAGE_BYTES : MAX_AV_BYTES;
-    const declaredSize = Number((file as any).size || 0);
-    if (declaredSize && declaredSize > perFileLimit) {
-      return jsonError(`文件过大：${kind} 最大 ${Math.round(perFileLimit / 1024 / 1024)} MB`, 413);
-    }
+  const file = form.get('file') as File | null;
+  const projectId = (form.get('projectId') || '').toString() || null;
+  const purpose = (form.get('purpose') || '').toString().trim();
+  if (!file) return jsonError('没有上传文件', 400);
 
+  const mime = (file as any).type || 'application/octet-stream';
+  if (!ALLOWED_MIME_PREFIX.some((p) => mime.startsWith(p))) {
+    return jsonError('不支持的文件类型：' + mime, 415);
+  }
+  const kind = mime.startsWith('video') ? 'video' : mime.startsWith('audio') ? 'audio' : 'image';
+  if (purpose === 'edit_timeline' && kind !== 'video') {
+    return jsonError('剪辑页目前仅支持上传视频素材', 415);
+  }
+  if ((surface === CHARACTER_REFERENCE_UPLOAD_SURFACE || purpose === CHARACTER_REFERENCE_UPLOAD_SURFACE) && kind !== 'image') {
+    return jsonError('参考图只能上传图片文件（JPG、PNG 等）', 415);
+  }
+  const perFileLimit = kind === 'image' ? MAX_IMAGE_BYTES : MAX_AV_BYTES;
+  const declaredSize = Number((file as any).size || 0);
+  if (declaredSize && declaredSize > perFileLimit) {
+    return jsonError(`文件过大：${kind} 最大 ${Math.round(perFileLimit / 1024 / 1024)} MB`, 413);
+  }
+
+  try {
     const buf = Buffer.from(await file.arrayBuffer());
     if (buf.length > perFileLimit) {
       return jsonError(`文件过大：${kind} 最大 ${Math.round(perFileLimit / 1024 / 1024)} MB`, 413);
@@ -96,6 +117,16 @@ export async function POST(req: NextRequest) {
       sizeBytes: buf.length,
     });
   } catch (e: any) {
+    const message = e?.message || String(e);
+    console.error('[upload-media] persist failed', {
+      ...baseLog,
+      projectId,
+      purpose,
+      kind,
+      mime,
+      declaredSize,
+      message,
+    });
     return jsonError('上传失败：' + (e?.message || String(e)), 400);
   }
 }

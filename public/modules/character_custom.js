@@ -1,4 +1,4 @@
-import { $, apiRequest, apiUpload, escapeHtml, hydrateProtectedImageElements, showConfirm } from '/modules/utils.js';
+import { $, ApiError, apiRequest, apiUpload, escapeHtml, hydrateProtectedImageElements, showConfirm } from '/modules/utils.js';
 import { deriveAssetCardState } from '/modules/assets.js';
 
 var _ctx = {};
@@ -36,6 +36,8 @@ var _form = {
 };
 var CHARACTER_NAME_MAX = 20;
 var CHARACTER_PROMPT_MAX = 300;
+var CHARACTER_REFERENCE_UPLOAD_SURFACE = 'character_reference';
+var CHARACTER_REFERENCE_MAX_BYTES = 20 * 1024 * 1024;
 
 export function initCharacterCustom(ctx) {
   _ctx = ctx || {};
@@ -48,6 +50,32 @@ function _toast(msg, type) {
 function _projectId() {
   var p = _ctx.getProject ? _ctx.getProject() : null;
   return p && p.id ? p.id : '';
+}
+
+function _newUploadRequestId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
+  } catch (_) {}
+  return 'charref-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function _validateCharacterReferenceFile(file) {
+  if (!file) return '没有选择参考图';
+  var mime = file.type || '';
+  if (!mime || mime.indexOf('image/') !== 0) return '参考图只能上传图片文件（JPG、PNG 等）';
+  var size = Number(file.size || 0);
+  if (size && size > CHARACTER_REFERENCE_MAX_BYTES) {
+    return '参考图不能超过 ' + Math.round(CHARACTER_REFERENCE_MAX_BYTES / 1024 / 1024) + ' MB';
+  }
+  return '';
+}
+
+function _characterReferenceUploadErrorMessage(e) {
+  if (e instanceof ApiError) {
+    if (e.status === 413) return e.message || '参考图不能超过 ' + Math.round(CHARACTER_REFERENCE_MAX_BYTES / 1024 / 1024) + ' MB';
+    if (e.status === 415) return e.message || '参考图只能上传图片文件（JPG、PNG 等）';
+  }
+  return e && e.message || '参考图上传失败，请重试';
 }
 
 function _listCacheKey() {
@@ -1201,12 +1229,18 @@ function _updateCharacterFieldCounter(input) {
   counter.textContent = String(input.value || '').length + '/' + max;
 }
 
-async function _uploadReference(file) {
+async function _uploadReference(file, requestId) {
   var fd = new FormData();
   fd.append('file', file);
+  fd.append('purpose', CHARACTER_REFERENCE_UPLOAD_SURFACE);
   var projectId = _projectId();
   if (projectId) fd.append('projectId', projectId);
-  var data = await apiUpload('/api/edit/upload-media', fd);
+  var data = await apiUpload('/api/edit/upload-media', fd, {
+    headers: {
+      'X-Origin-Request-Id': requestId,
+      'X-Origin-Upload-Surface': CHARACTER_REFERENCE_UPLOAD_SURFACE,
+    },
+  });
   if (data.kind !== 'image') throw new Error('参考图只能是图片文件（JPG、PNG 等）');
   var localPreviewUrl = '';
   try { localPreviewUrl = URL.createObjectURL(file); } catch (_) {}
@@ -1687,13 +1721,21 @@ export function _initCharacterCustomEvents() {
     if (ev.target && ev.target.id === 'characterRefInput') {
       var file = ev.target.files && ev.target.files[0];
       if (!file) return;
+      var validationError = _validateCharacterReferenceFile(file);
+      if (validationError) {
+        _toast(validationError, 'error');
+        try { ev.target.value = ''; } catch (_) {}
+        return;
+      }
+      var requestId = _newUploadRequestId();
       _refUploading = true;
       _render();
-      _uploadReference(file).then(function () {
+      _uploadReference(file, requestId).then(function () {
         _render();
         _toast('参考图已上传', 'ok');
       }).catch(function (e) {
-        _toast(e && e.message || '参考图上传失败，请重试', 'error');
+        try { console.warn('[charref-upload]', requestId, e && e.message || e); } catch (_) {}
+        _toast(_characterReferenceUploadErrorMessage(e), 'error');
       }).finally(function () {
         _refUploading = false;
         try { ev.target.value = ''; } catch (_) {}
