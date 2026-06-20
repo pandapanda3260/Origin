@@ -13,6 +13,7 @@ import {
 } from './video-reference-manifest';
 import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 import { buildVideoReferenceManifest } from './reference-matcher';
+import { isPrimarySceneRef } from './scene-views';
 import {
   buildVideoPromptRetryAudit,
   VIDEO_PROMPT_FIRST_TEMPERATURE,
@@ -182,7 +183,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
     storyboardImageUrl: resolvedFirstFrameUrl || null,
   });
   const manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
-  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
+  const sceneItem = manifestInImageOrder.find((ref) => isPrimarySceneRef(ref) && ref.localPath);
   const sceneReferencePath = sceneItem?.localPath;
   const sceneReferenceHint = sceneItem?.promptHint || '';
   const characterReferencePaths = manifestInImageOrder
@@ -247,8 +248,9 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
   const referenceImages: VideoReferenceImage[] = manifestInImageOrder
     .filter((ref) => !!ref.localPath)
     .map((ref) => ({
-      role: ref.role,
-      path: ref.localPath as string,
+	      role: ref.role,
+	      viewRole: ref.viewRole,
+	      path: ref.localPath as string,
       label: ref.label,
       sourceUrl: ref.url,
       assetId: ref.assetId,
@@ -286,7 +288,7 @@ function buildVideoInput(project: any, user: UserRow, groupIdx: number, shotIndi
       chosenSceneName: sceneItem?.assetName || sceneItem?.label || '',
       characterReferenceNames,
       propReferenceNames,
-      referenceImages: referenceImages.map((ref) => ({ role: ref.role, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief })),
+	      referenceImages: referenceImages.map((ref) => ({ role: ref.role, viewRole: ref.viewRole, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief })),
     },
   };
 }
@@ -378,7 +380,7 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
           type: 'image_url',
           image_url: { url: '[base64 reference image omitted from audit view]' },
           role: 'reference_image',
-          auditReference: { role: ref.role, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief },
+	          auditReference: { role: ref.role, viewRole: ref.viewRole, label: ref.label, assetId: ref.assetId, assetName: ref.assetName, sourceUrl: ref.sourceUrl, promptHint: ref.promptHint, panelInfo: ref.panelInfo, referenceBrief: ref.referenceBrief },
         });
       }
     } else if (seedancePrompt.hasAnyRef) {
@@ -400,8 +402,9 @@ function buildProviderAudit(user: UserRow, input: ReturnType<typeof buildVideoIn
       referenceMode: {
         independentMultiImage: seedancePrompt.hasIndependentImageRefs,
         independentReferenceImages: seedancePrompt.independentReferenceImages.map((ref) => ({
-          role: ref.role,
-          label: ref.label,
+	          role: ref.role,
+	          viewRole: ref.viewRole,
+	          label: ref.label,
           assetId: ref.assetId,
           assetName: ref.assetName,
           sourceUrl: ref.sourceUrl,

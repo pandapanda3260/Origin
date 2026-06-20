@@ -1472,6 +1472,7 @@ export async function generateVideo(
               modeReason: input.payloadModeReason || 'no_tail_intent',
               referenceImages: submittedRefs.map(({ ref, image }, idx) => ({
                 role: ref.role,
+                viewRole: ref.viewRole,
                 path: ref.path,
                 label: ref.label,
                 sourceUrl: ref.sourceUrl,

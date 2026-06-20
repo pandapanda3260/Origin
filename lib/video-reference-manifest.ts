@@ -1,4 +1,6 @@
 import type { VideoSubmitMode } from './feature-flags';
+import type { SceneViewRole } from './scene-views';
+import type { PropViewRole } from './prop-views';
 import type { VideoPayloadDecisionReason, VideoPayloadMode } from './video-payload-decision';
 
 export const VIDEO_REFERENCE_IMAGE_BUDGET = 9;
@@ -16,6 +18,8 @@ export type DialoguePolicy =
 export type ReferenceManifestItem = {
   imageNo: number;
   role: VideoReferenceRole;
+  viewRole?: SceneViewRole;
+  propViewRole?: PropViewRole;
   assetId?: string;
   assetName?: string;
   label: string;
@@ -36,6 +40,8 @@ export type ReferenceManifestItem = {
 
 export type DroppedReference = {
   role: Exclude<VideoReferenceRole, 'first_frame'>;
+  viewRole?: SceneViewRole;
+  propViewRole?: PropViewRole;
   assetName?: string;
   reason:
     | 'image_budget_exceeded'
@@ -276,10 +282,18 @@ export function buildReferenceBriefLine(ref: ReferenceManifestItem, refs: Refere
     return `${imageLabel} | target_end | ${name} | 用于结尾落点、姿态和画面收束；过程要自然抵达，禁止硬切。`;
   }
   if (role === 'scene') {
+    if (ref.viewRole === 'topdown') {
+      return `${imageLabel} | scene topdown_layout_anchor | ${name} | 只用于锁定俯视空间布局、入口/家具/大物件相对方位和朝向；不是最终镜头视角，不要求视频变成俯视图。`;
+    }
+    if (ref.viewRole && ref.viewRole !== 'establishing') {
+      return `${imageLabel} | scene ${ref.viewRole} | ${name} | 用于同一场景的对应机位参考，锁定环境布局、空间结构、材质和氛围；不锁人物外貌。`;
+    }
     return `${imageLabel} | scene | ${name} | 用于环境布局、空间结构、材质和氛围；不锁人物外貌。`;
   }
   if (role === 'prop') {
-    return `${imageLabel} | prop | ${name} | 用于同一件单实例道具的外形、材质、尺度、支架/边框结构和识别符号；允许视角、屏幕内容和光线变化，但不得改成其他设备、相框、盒子或复制成多件；不当角色或场景。`;
+    const propView = compactBriefText(ref.propViewRole || ref.panelInfo?.panel);
+    const viewText = propView ? ` ${propView}` : '';
+    return `${imageLabel} | prop | ${name}${viewText} | 用于同一件单实例道具的外形、材质、尺度、支架/边框结构和识别符号；本参考只代表该道具${propView ? `的${propView}视图` : '的身份视图'}，允许屏幕内容和光线变化，但不得改成其他设备、相框、盒子或复制成多件；不当角色或场景。`;
   }
 
   const panel = compactBriefText(ref.panelInfo?.panel);

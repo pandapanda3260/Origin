@@ -272,6 +272,74 @@ function loadFrameImagePlan({
         isBlockingReferenceStatus: (status) => status === 'missing' || status === 'failed' || status === 'legacy_sketch_only',
       };
     }
+    if (id === './scene-views') {
+      const normalizeRole = (role) => ['establishing', 'reverse', 'alt', 'topdown'].includes(role) ? role : null;
+      const viewFor = (scene, role) => Array.isArray(scene?.views)
+        ? scene.views.find((view) => normalizeRole(view?.role) === role)
+        : null;
+      const urlFor = (scene, opts = {}) => {
+        if (!scene) return '';
+        const role = normalizeRole(opts.viewRole);
+        if (role) {
+          const view = viewFor(scene, role);
+          const ref = view?.reference || {};
+          if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+          return ref.currentUrl || ref.lastKnownGoodUrl || view?.imageUrl || view?.rawUrl || (role === 'establishing' ? urlFor(scene) : '');
+        }
+        const ref = scene.reference || {};
+        if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+        return ref.currentUrl || ref.lastKnownGoodUrl || scene.imageUrl || scene.rawUrl || scene.pencilUrl || scene.realPhotoUrl || scene.coverUrl || '';
+      };
+      return {
+        resolveSceneImageUrl: urlFor,
+        pickSceneView: (scene, shot) => {
+          const text = [shot?.angle, shot?.shotType, shot?.camera, shot?.composition, shot?.focus].filter(Boolean).join(' ');
+          const wanted = /反打|背面|reverse|180/.test(text) ? 'reverse' : /侧|特写|detail|close/.test(text) ? 'alt' : 'establishing';
+          const url = urlFor(scene, { viewRole: wanted }) || urlFor(scene, { viewRole: 'establishing' }) || urlFor(scene);
+          return { role: urlFor(scene, { viewRole: wanted }) ? wanted : 'establishing', url, view: viewFor(scene, wanted) || viewFor(scene, 'establishing') || undefined };
+        },
+        pickSceneTopdownAnchor: (scene) => {
+          const url = urlFor(scene, { viewRole: 'topdown' });
+          return url ? { role: 'topdown', url, view: viewFor(scene, 'topdown') || undefined } : null;
+        },
+      };
+    }
+    if (id === './prop-views') {
+      const normalizeRole = (role) => ['front', 'side', 'back', 'top', 'hero'].includes(role) ? role : null;
+      const urlFor = (prop, opts = {}) => {
+        const role = normalizeRole(opts.viewRole);
+        if (role) {
+          const view = prop?.views?.[role];
+          const ref = view?.reference || {};
+          if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+          return ref.currentUrl || ref.lastKnownGoodUrl || view?.imageUrl || view?.rawUrl || '';
+        }
+        const ref = prop?.reference || {};
+        if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+        return ref.currentUrl || ref.lastKnownGoodUrl || prop?.views?.front?.imageUrl || prop?.views?.hero?.imageUrl || prop?.imageUrl || prop?.rawUrl || '';
+      };
+      return {
+        resolvePropImageUrl: urlFor,
+        pickPropView: (prop, shot) => {
+          const text = [shot?.angle, shot?.shotType, shot?.camera, shot?.composition, shot?.description, shot?.visual].filter(Boolean).join(' ');
+          const name = String(prop?.name || prop?.propName || '').toLowerCase();
+          const mentioned = name && text.toLowerCase().includes(name);
+          const wanted = /俯拍|top|overhead|from above/.test(text)
+            ? 'top'
+            : mentioned && /背面|back|rear/.test(text)
+              ? 'back'
+              : mentioned && /侧面|side|profile/.test(text)
+                ? 'side'
+                : 'front';
+          const roles = wanted === 'front' ? ['front', 'hero', 'side', 'back', 'top'] : [wanted, 'front', 'hero', 'side', 'back', 'top'];
+          for (const role of roles) {
+            const url = urlFor(prop, { viewRole: role });
+            if (url) return { role, url, view: prop?.views?.[role] };
+          }
+          return { role: 'front', url: urlFor(prop) };
+        },
+      };
+    }
     return require(id);
   }
   vm.runInNewContext(
@@ -1125,6 +1193,44 @@ async function testPropShortNameMatchesCanonicalAsset() {
   assert(plan.finalPrompt.includes('屏幕类道具只能改变屏幕内容/反光/视角'), 'prop lock includes screen-specific continuity rule');
 }
 
+async function testPropTopViewSelectedForOverheadFrame() {
+  const project = makeFixtureProject();
+  project.shots[0].angle = '俯拍';
+  project.shots[0].visual = '俯拍看到 Alice 将 lantern 放在桌面中央。';
+  project.assets.props = [{
+    propId: 'p-lantern',
+    name: 'lantern',
+    description: 'brass oil lantern with cracked glass',
+    imageUrl: '/api/images/file/00000000-0000-0000-0000-0000000000b1',
+    views: {
+      front: { role: 'front', imageUrl: '/api/images/file/00000000-0000-0000-0000-0000000000b1' },
+      top: { role: 'top', imageUrl: '/api/images/file/00000000-0000-0000-0000-0000000000b2' },
+    },
+  }];
+  const scene = makeFixtureScene();
+  const mod = loadAll({
+    imageGen: makeImageGenStub({
+      [scene.imageUrl]: '/local/scene.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000a1': '/local/alice.png',
+      '/api/images/file/00000000-0000-0000-0000-0000000000b2': '/local/lantern-top.png',
+    }),
+    sceneSelection: makeSceneSelectionStub(scene),
+  });
+  const plan = mod.buildFrameImageGenerationPlan({
+    project,
+    groupIdx: 0,
+    shotIndices: [0],
+    ownerId: 42,
+    frameType: 'first_frame',
+    modelSnapshot: { ...MODEL_SNAPSHOT_CAP1, multiRefImageCap: 6 },
+  });
+  const propRef = plan.referenceManifest.find((r) => r.role === 'prop' && r.assetName === 'lantern');
+  assert(propRef, 'lantern prop reference should be present');
+  assertEqual(propRef.remoteUrl, '/api/images/file/00000000-0000-0000-0000-0000000000b2', 'overhead frame should use top prop view');
+  assertEqual(propRef.propViewRole, 'top', 'propViewRole should record selected top view');
+  assert(plan.finalPrompt.includes('top视图'), 'final prompt should mention selected prop view');
+}
+
 async function testTailFrameUnresolvableSelfFirstFrameShiftsImageNo() {
   const scene = makeFixtureScene();
   const firstFrameUrl = '/api/images/file/00000000-0000-0000-0000-0000000000ff';
@@ -1192,6 +1298,7 @@ async function main() {
 	    ['first_frame balanced 12-image quality pack with 6/6 role caps', testFirstFrameBalancedTwelveImageQualityPack],
     ['manual storyboard materials before fallback', testManualStoryboardMaterialsFirst],
     ['prop short name matches canonical asset', testPropShortNameMatchesCanonicalAsset],
+    ['prop top view selected for overhead frame', testPropTopViewSelectedForOverheadFrame],
     ['tail_frame unresolvable self_first_frame shifts imageNo', testTailFrameUnresolvableSelfFirstFrameShiftsImageNo],
     ['unknown frameType rejected', testTailFrameUnknownTypeRejected],
   ];

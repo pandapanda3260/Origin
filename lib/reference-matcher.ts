@@ -4,6 +4,16 @@ import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-
 import { selectCharacterReferencePanels, type CharacterReferencePanel } from './panel-selection';
 import { pickSceneForShots } from './scene-selection';
 import {
+  pickSceneTopdownAnchor,
+  pickSceneView,
+  resolveSceneImageUrl,
+  type SceneViewRole,
+} from './scene-views';
+import {
+  pickPropView,
+  type PropViewRole,
+} from './prop-views';
+import {
   materialRoleToVideoRole,
   type StoryboardMaterialRole,
 } from './reference-roles';
@@ -19,6 +29,8 @@ import { dataPath } from './runtime-paths';
 
 type Candidate = Omit<ReferenceManifestItem, 'imageNo'> & {
   type: VideoReferenceRole;
+  viewRole?: SceneViewRole;
+  propViewRole?: PropViewRole;
   name: string;
   score: number;
   _order: number;
@@ -79,6 +91,10 @@ function assetUrl(asset: any): string {
   return compactText(reference.currentUrl || reference.lastKnownGoodUrl || asset?.imageUrl || asset?.rawUrl || asset?.realPhotoUrl || asset?.coverUrl);
 }
 
+function sceneAssetUrl(scene: any): string {
+  return resolveSceneImageUrl(scene, { strategy: 'videoManifest', gate: true });
+}
+
 function assetId(asset: any): string | undefined {
   const id = compactText(asset?.id || asset?.assetId || asset?.uuid);
   return id || undefined;
@@ -103,7 +119,7 @@ function materialIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: nu
       for (const prefix of prefixes) keys.push(`${prefix}:${value}`);
     }
   }
-  const url = assetUrl(source);
+  const url = role === 'scene' ? sceneAssetUrl(source) : assetUrl(source);
   if (url) {
     for (const prefix of prefixes) keys.push(`${prefix}:url:${url}`);
   }
@@ -311,6 +327,10 @@ function pushCandidate(list: Candidate[], candidate: Omit<Candidate, '_order'>) 
   const duplicateIdx = list.findIndex((item) => {
     if (item.url === candidate.url) return true;
     if (item.role !== candidate.role) return false;
+    if (item.role === 'scene') {
+      return compactText(item.viewRole || 'establishing') === compactText(candidate.viewRole || 'establishing') &&
+        normalizeReferenceName(item.assetName) === normalizeReferenceName(candidate.assetName);
+    }
     if (normalizeReferenceName(item.assetName) !== normalizeReferenceName(candidate.assetName)) return false;
     if (item.role === 'character') {
       const itemPanel = compactText(item.panelInfo?.panel);
@@ -472,8 +492,19 @@ function slotSelect(candidates: Candidate[], budget: number): { selected: Candid
     return !selectedKeys.has(`${candidate.role}:${candidate.url}`);
   });
 
-  take(sortByDynamicPriority(byRole('scene'))[0]);
+  const primaryScene = sortByDynamicPriority(byRole('scene').filter((item) => item.viewRole !== 'topdown'))[0];
+  take(primaryScene);
   take(sortByDynamicPriority(byRole('character'))[0], true);
+  if (primaryScene) {
+    const primarySceneName = normalizeReferenceName(primaryScene.assetName || primaryScene.label);
+    const primarySceneId = compactText(primaryScene.assetId);
+    const topdownForPrimary = sortByDynamicPriority(byRole('scene').filter((item) => (
+      item.viewRole === 'topdown' &&
+      ((primarySceneId && compactText(item.assetId) === primarySceneId) ||
+        normalizeReferenceName(item.assetName || item.label) === primarySceneName)
+    )))[0];
+    take(topdownForPrimary);
+  }
 
   while (selected.length < budget) {
     const next = sortByDynamicPriority(remaining())[0];
@@ -485,11 +516,13 @@ function slotSelect(candidates: Candidate[], budget: number): { selected: Candid
   for (const c of candidates) {
     if (selected.some((s) => s.url === c.url)) continue;
     if (c.role === 'first_frame') continue;
-    dropped.push({
-      role: c.role,
-      assetName: c.assetName,
-      reason: 'image_budget_exceeded',
-    });
+	    dropped.push({
+	      role: c.role,
+	      viewRole: c.viewRole,
+	      propViewRole: c.propViewRole,
+	      assetName: c.assetName,
+	      reason: 'image_budget_exceeded',
+	    });
   }
   return { selected, dropped };
 }
@@ -498,6 +531,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   const project = input.project || {};
   const assets = input.assets || project.assets || {};
   const shots = shotsFromInput(input);
+  const primaryShot = shots[0];
   const text = shotText(shots);
   const normText = normalizeReferenceName(text);
   const explicitCharNames = firstChars(shots);
@@ -646,7 +680,8 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     );
     const manualMatch = isStoryboardMaterialForGroup(scene, input.groupIdx, 'scene');
     if (!manualMatch && !explicitMatch && !mentions && !isMain) return;
-    const url = assetUrl(scene);
+    const pickedView = pickSceneView(scene, shots[0]);
+    const url = pickedView.url || sceneAssetUrl(scene);
     if (!url) {
       dropped.push({ role: 'scene', assetName: name, reason: 'asset_missing' });
       return;
@@ -662,13 +697,19 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       .filter(Boolean)
       .join(' ')
       .slice(0, 180);
+    const baseScore = manualMatch
+      ? 540 - idx
+      : explicitMatch
+        ? 260 - idx
+        : (mentions ? 85 + mentions * 8 : 45) + (isMain ? 10 : 0) - idx;
     pushCandidate(candidates, {
       type: 'scene',
       role: 'scene',
+      viewRole: pickedView.role,
       assetId: assetId(scene),
       assetName: name,
       name,
-      label: `${name} scene reference`,
+      label: `${name} ${pickedView.role} scene reference`,
       url,
       localPath,
       useFor: defaults.useFor,
@@ -681,28 +722,51 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
         : mentions
           ? 'group visual/location text match'
           : 'fallback main scene',
-      score: manualMatch
-        ? 540 - idx
-        : explicitMatch
-          ? 260 - idx
-          : (mentions ? 85 + mentions * 8 : 45) + (isMain ? 10 : 0) - idx,
+      score: baseScore,
       mentionCount: hitCount || mentions,
       firstMentionIndex: firstOccurrenceIndex(normText, norm),
       relevanceScore: explicitMatch ? 100 : manualMatch ? 100 : isMain ? 45 : 30,
       firstShotOrder: firstShotOrderForEntity(shots, 'scene', name),
     });
+    const topdown = pickSceneTopdownAnchor(scene);
+    if (topdown?.url) {
+      const topdownPath = resolveLocalImagePath(topdown.url, input.ownerId) || undefined;
+      if (topdownPath) {
+        pushCandidate(candidates, {
+          type: 'scene',
+          role: 'scene',
+          viewRole: 'topdown',
+          assetId: assetId(scene),
+          assetName: name,
+          name,
+          label: `${name} topdown layout anchor`,
+          url: topdown.url,
+          localPath: topdownPath,
+          useFor: ['锁定俯视空间布局', '入口/家具/大物件相对位置', '场景朝向'],
+          immutable: ['主要空间关系', '入口/家具/大物件相对方位', '场景布局'],
+          promptHint: '俯视空间锚只用于保持布局、方位和相对位置，不要求最终镜头变成俯视图。',
+          matchReason: 'same scene topdown layout anchor',
+          score: Math.max(1, baseScore - 1),
+          mentionCount: hitCount || mentions,
+          firstMentionIndex: firstOccurrenceIndex(normText, norm),
+          relevanceScore: explicitMatch ? 98 : manualMatch ? 98 : isMain ? 44 : 29,
+          firstShotOrder: firstShotOrderForEntity(shots, 'scene', name),
+        });
+      }
+    }
   });
   if (!candidates.some((c) => c.role === 'scene')) {
-    const fallback = scenes.find((s, idx) => assetUrl(s) && !isMaterialAssetExcluded(project, 'scene', s, input.groupIdx, idx));
+    const fallback = scenes.find((s, idx) => sceneAssetUrl(s) && !isMaterialAssetExcluded(project, 'scene', s, input.groupIdx, idx));
     if (fallback) {
       const name = assetName(fallback, '主场景');
-      const url = assetUrl(fallback);
+      const url = sceneAssetUrl(fallback);
       const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
       if (localPath) {
         const defaults = roleDefaults('scene');
         pushCandidate(candidates, {
           type: 'scene',
           role: 'scene',
+          viewRole: 'establishing',
           assetId: assetId(fallback),
           assetName: name,
           name,
@@ -732,14 +796,15 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     const manualMatch = isStoryboardMaterialForGroup(prop, input.groupIdx, 'prop');
     if (!manualMatch && !mentions) return;
     const firstMention = mentionStats.firstMentionIndex;
-    const url = assetUrl(prop);
+    const pickedView = pickPropView(prop, primaryShot);
+    const url = pickedView.url || assetUrl(prop);
     if (!url) {
-      dropped.push({ role: 'prop', assetName: name, reason: 'asset_missing' });
+      dropped.push({ role: 'prop', propViewRole: pickedView.role, assetName: name, reason: 'asset_missing' });
       return;
     }
     const localPath = resolveLocalImagePath(url, input.ownerId) || undefined;
     if (!localPath) {
-      dropped.push({ role: 'prop', assetName: name, reason: 'asset_missing' });
+      dropped.push({ role: 'prop', propViewRole: pickedView.role, assetName: name, reason: 'asset_missing' });
       return;
     }
     const defaults = roleDefaults('prop');
@@ -751,6 +816,7 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     pushCandidate(candidates, {
       type: 'prop',
       role: 'prop',
+      propViewRole: pickedView.role,
       assetId: assetId(prop),
       assetName: name,
       name,
@@ -760,6 +826,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
       useFor: defaults.useFor,
       immutable: defaults.immutable,
       promptHint: hint || defaults.promptHint,
+      panelInfo: {
+        panel: pickedView.role,
+        intent: 'prop-view',
+      },
       matchReason: manualMatch
         ? 'storyboard material group match'
         : 'group visual/dialogue/keyInfo text match',
@@ -775,8 +845,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   const slotResult = slotSelect(candidates, budget);
   const manifestBase = slotResult.selected.map((ref, idx) => ({
     imageNo: idx + 1,
-    role: ref.role,
-    assetId: ref.assetId,
+	    role: ref.role,
+	    viewRole: ref.viewRole,
+	    propViewRole: ref.propViewRole,
+	    assetId: ref.assetId,
     assetName: ref.assetName,
     label: ref.label,
     url: ref.url,
@@ -799,8 +871,10 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
     droppedReferences: [...dropped, ...slotResult.dropped],
     candidates: candidates.map((ref, idx) => ({
       imageNo: idx + 1,
-      role: ref.role,
-      assetId: ref.assetId,
+	      role: ref.role,
+	      viewRole: ref.viewRole,
+	      propViewRole: ref.propViewRole,
+	      assetId: ref.assetId,
       assetName: ref.assetName,
       label: ref.label,
       url: ref.url,

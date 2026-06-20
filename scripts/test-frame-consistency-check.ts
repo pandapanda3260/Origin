@@ -183,6 +183,7 @@ const refs: FrameReference[] = [
       imageNo: 5,
       role: 'scene',
       assetName: '客厅',
+      viewRole: 'establishing',
       localPath: '/tmp/scene.png',
       remoteUrl: '/api/images/file/scene',
       textFallback: 'scene',
@@ -191,6 +192,17 @@ const refs: FrameReference[] = [
     {
       slot: 6,
       imageNo: 6,
+      role: 'scene',
+      assetName: '客厅',
+      viewRole: 'topdown',
+      localPath: '/tmp/scene-topdown.png',
+      remoteUrl: '/api/images/file/scene-topdown',
+      textFallback: 'topdown',
+      delivery: 'image',
+    },
+    {
+      slot: 7,
+      imageNo: 7,
       role: 'prop',
       assetName: '信封',
       localPath: '/tmp/prop.png',
@@ -199,8 +211,8 @@ const refs: FrameReference[] = [
       delivery: 'image',
     },
     {
-      slot: 7,
-      imageNo: 7,
+      slot: 8,
+      imageNo: 8,
       role: 'crowd',
       assetName: '人群',
       localPath: '/tmp/crowd.png',
@@ -222,6 +234,7 @@ const refs: FrameReference[] = [
     'prop:信封:',
     'crowd:人群:',
   ]);
+  assert.equal(selected.some((ref) => ref.role === 'scene' && ref.viewRole === 'topdown'), false, 'topdown layout anchor is not used as a frame consistency image');
 }
 
 {

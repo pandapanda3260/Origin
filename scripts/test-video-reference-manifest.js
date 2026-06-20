@@ -222,6 +222,74 @@ function makeLoader(pathMap, state) {
         }),
       };
     }
+    if (id === './scene-views') {
+      const normalizeRole = (role) => ['establishing', 'reverse', 'alt', 'topdown'].includes(role) ? role : null;
+      const viewFor = (scene, role) => Array.isArray(scene?.views)
+        ? scene.views.find((view) => normalizeRole(view?.role) === role)
+        : null;
+      const urlFor = (scene, opts = {}) => {
+        if (!scene) return '';
+        const role = normalizeRole(opts.viewRole);
+        if (role) {
+          const view = viewFor(scene, role);
+          const ref = view?.reference || {};
+          if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+          return ref.currentUrl || ref.lastKnownGoodUrl || view?.imageUrl || view?.rawUrl || (role === 'establishing' ? urlFor(scene) : '');
+        }
+        const ref = scene.reference || {};
+        if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+        return ref.currentUrl || ref.lastKnownGoodUrl || scene.imageUrl || scene.rawUrl || scene.realPhotoUrl || scene.coverUrl || '';
+      };
+      return {
+        resolveSceneImageUrl: urlFor,
+        pickSceneView: (scene, shot) => {
+          const text = [shot?.angle, shot?.shotType, shot?.camera, shot?.composition, shot?.focus].filter(Boolean).join(' ');
+          const wanted = /反打|背面|reverse|180/.test(text) ? 'reverse' : /侧|特写|detail|close/.test(text) ? 'alt' : 'establishing';
+          const url = urlFor(scene, { viewRole: wanted }) || urlFor(scene, { viewRole: 'establishing' }) || urlFor(scene);
+          return { role: urlFor(scene, { viewRole: wanted }) ? wanted : 'establishing', url, view: viewFor(scene, wanted) || viewFor(scene, 'establishing') || undefined };
+        },
+        pickSceneTopdownAnchor: (scene) => {
+          const url = urlFor(scene, { viewRole: 'topdown' });
+          return url ? { role: 'topdown', url, view: viewFor(scene, 'topdown') || undefined } : null;
+        },
+      };
+    }
+    if (id === './prop-views') {
+      const normalizeRole = (role) => ['front', 'side', 'back', 'top', 'hero'].includes(role) ? role : null;
+      const urlFor = (prop, opts = {}) => {
+        const role = normalizeRole(opts.viewRole);
+        if (role) {
+          const view = prop?.views?.[role];
+          const ref = view?.reference || {};
+          if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+          return ref.currentUrl || ref.lastKnownGoodUrl || view?.imageUrl || view?.rawUrl || '';
+        }
+        const ref = prop?.reference || {};
+        if (['missing', 'failed', 'legacy_sketch_only'].includes(ref.status)) return '';
+        return ref.currentUrl || ref.lastKnownGoodUrl || prop?.views?.front?.imageUrl || prop?.views?.hero?.imageUrl || prop?.imageUrl || prop?.rawUrl || '';
+      };
+      return {
+        resolvePropImageUrl: urlFor,
+        pickPropView: (prop, shot) => {
+          const text = [shot?.angle, shot?.shotType, shot?.camera, shot?.composition, shot?.description, shot?.visual].filter(Boolean).join(' ');
+          const name = String(prop?.name || prop?.propName || '').toLowerCase();
+          const mentioned = name && text.toLowerCase().includes(name);
+          const wanted = /俯拍|top|overhead|from above/.test(text)
+            ? 'top'
+            : mentioned && /背面|back|rear/.test(text)
+              ? 'back'
+              : mentioned && /侧面|side|profile/.test(text)
+                ? 'side'
+                : 'front';
+          const roles = wanted === 'front' ? ['front', 'hero', 'side', 'back', 'top'] : [wanted, 'front', 'hero', 'side', 'back', 'top'];
+          for (const role of roles) {
+            const url = urlFor(prop, { viewRole: role });
+            if (url) return { role, url, view: prop?.views?.[role] };
+          }
+          return { role: 'front', url: urlFor(prop) };
+        },
+      };
+    }
     if (id === './video-reference-manifest') return videoReferenceManifest;
     if (id === './reference-roles') return referenceRoles;
     return require(id);
@@ -304,14 +372,22 @@ function makeProject({ characterCount = 4, propCount = 2, includeScene = true, m
 
 function urlsForProject(project, firstFrameUrl) {
   const urls = [firstFrameUrl];
-  for (const scene of project.assets.scenes || []) urls.push(scene.imageUrl);
+  for (const scene of project.assets.scenes || []) {
+    urls.push(scene.imageUrl);
+    for (const view of scene.views || []) urls.push(view.imageUrl || view.rawUrl || view.reference?.currentUrl);
+  }
   for (const ch of project.assets.characters || []) {
     if (ch.imageUrl) urls.push(ch.imageUrl);
     if (ch.panels?.sheetUrl) urls.push(ch.panels.sheetUrl);
     if (ch.panels?.headshotUrl) urls.push(ch.panels.headshotUrl);
     if (ch.panels?.frontUrl) urls.push(ch.panels.frontUrl);
   }
-  for (const prop of project.assets.props || []) urls.push(prop.imageUrl);
+  for (const prop of project.assets.props || []) {
+    urls.push(prop.imageUrl);
+    for (const view of Object.values(prop.views || {})) {
+      if (view && typeof view === 'object') urls.push(view.imageUrl || view.rawUrl || view.reference?.currentUrl);
+    }
+  }
   return urls.filter(Boolean);
 }
 
@@ -349,6 +425,23 @@ async function testDynamicPriorityChain() {
     !result.droppedReferences.some((ref) => ref.reason === 'image_budget_exceeded'),
     'no available candidate is dropped when it fits budget 9',
   );
+}
+
+async function testSceneTopdownAnchorSurvivesSelection() {
+  const project = makeProject({ characterCount: 5, propCount: 2, includeScene: true });
+  project.assets.scenes[0] = {
+    ...project.assets.scenes[0],
+    imageUrl: img('scene-establishing'),
+    views: [
+      { role: 'establishing', imageUrl: img('scene-establishing') },
+      { role: 'topdown', imageUrl: img('scene-topdown') },
+    ],
+  };
+  const result = build(project, img('first-frame'));
+  const sceneRefs = result.manifest.filter((ref) => ref.role === 'scene' && ref.assetName === '主场景');
+  assertEqual(sceneRefs.map((ref) => ref.viewRole || 'establishing'), ['establishing', 'topdown'], 'primary scene and topdown anchor both survive scene de-dupe');
+  assert(sceneRefs[0].imageNo < sceneRefs[1].imageNo, 'primary camera scene is ordered before topdown anchor');
+  assert(sceneRefs[1].referenceBrief.includes('topdown_layout_anchor'), 'topdown anchor receives distinct brief text');
 }
 
 async function testCloseUpEntityBoost() {
@@ -411,7 +504,7 @@ async function testCloseUpFocusCharacterGetsSheetHeadshotPair() {
   const entries = result.manifest.map((ref) => `${ref.role}:${ref.assetName}:${ref.panelInfo?.panel || ''}`);
   const sheetIndex = entries.indexOf('character:角色1:sheet');
   const headshotIndex = entries.indexOf('character:角色1:headshot');
-  const propIndex = entries.indexOf('prop:混沌钟:');
+  const propIndex = result.manifest.findIndex((ref) => ref.role === 'prop' && ref.assetName === '混沌钟');
   assert(sheetIndex >= 0, 'close-up focus character sheet is selected');
   assert(headshotIndex >= 0, 'close-up focus character headshot is selected');
   assertEqual(headshotIndex, sheetIndex + 1, 'focus character sheet/headshot stay adjacent');
@@ -553,6 +646,33 @@ async function testPropShortNameMatchesCanonicalAsset() {
   );
   const propLine = result.manifest.find((ref) => ref.role === 'prop' && ref.assetName === '移动灵犀屏')?.referenceBrief || '';
   assert(propLine.includes('同一件单实例道具'), 'prop reference brief should lock single-instance identity');
+}
+
+async function testPropTopViewSelectedForOverheadVideoReference() {
+  const project = makeProject({ characterCount: 1, propCount: 1, includeScene: true });
+  project.assets.props = [{
+    id: 'prop-lantern',
+    name: '灯盏',
+    imageUrl: img('prop-lantern-front'),
+    description: 'bronze lantern with cracked glass',
+    views: {
+      front: { role: 'front', imageUrl: img('prop-lantern-front') },
+      top: { role: 'top', imageUrl: img('prop-lantern-top') },
+    },
+  }];
+  project.shots[0].angle = '俯拍';
+  project.shots[0].visual = '角色1 俯拍检查桌上的灯盏';
+  project.shots[0].description = '';
+  project.shots[0].dialogue = '';
+  project.shots[0].characters = ['角色1'];
+
+  const result = build(project, img('first-frame'));
+  const propRef = result.manifest.find((ref) => ref.role === 'prop' && ref.assetName === '灯盏');
+  assert(propRef, 'lantern prop reference should be selected');
+  assertEqual(propRef.url, img('prop-lantern-top'), 'overhead video reference should use top prop view');
+  assertEqual(propRef.propViewRole, 'top', 'manifest carries propViewRole=top');
+  assertEqual(propRef.panelInfo?.panel, 'top', 'panelInfo carries selected prop view');
+  assert((propRef.referenceBrief || '').includes('top视图'), 'reference brief names selected prop view');
 }
 
 async function testAssetMissingReason() {
@@ -830,6 +950,26 @@ async function testVisibleBindingMergesSameCharacterPanels() {
     },
     {
       imageNo: 3,
+      role: 'scene',
+      viewRole: 'establishing',
+      assetName: '雨夜大厅',
+      label: '雨夜大厅 establishing scene reference',
+      url: img('scene-establishing'),
+      useFor: [],
+      immutable: [],
+    },
+    {
+      imageNo: 4,
+      role: 'scene',
+      viewRole: 'topdown',
+      assetName: '雨夜大厅',
+      label: '雨夜大厅 topdown layout anchor',
+      url: img('scene-topdown'),
+      useFor: [],
+      immutable: [],
+    },
+    {
+      imageNo: 5,
       role: 'character',
       assetName: '萧云',
       label: '萧云 character reference (sheet)',
@@ -839,7 +979,7 @@ async function testVisibleBindingMergesSameCharacterPanels() {
       panelInfo: { panel: 'sheet', intent: 'face' },
     },
     {
-      imageNo: 4,
+      imageNo: 6,
       role: 'character',
       assetName: '萧云',
       label: '萧云 character reference (headshot)',
@@ -849,13 +989,15 @@ async function testVisibleBindingMergesSameCharacterPanels() {
       panelInfo: { panel: 'headshot', intent: 'face' },
     },
   ]);
-  assert(summary.includes('萧云（Image 3 角色设定，Image 4 脸部近景）'), 'visible binding merges sheet/headshot for the same character');
-  assert(!summary.includes('萧云（Image 3 角色设定）；萧云（Image 4 脸部近景）'), 'visible binding does not split same character panels into duplicate roles');
+  assert(summary.includes('萧云（Image 5 角色设定，Image 6 脸部近景）'), 'visible binding merges sheet/headshot for the same character');
+  assert(!summary.includes('萧云（Image 5 角色设定）；萧云（Image 6 脸部近景）'), 'visible binding does not split same character panels into duplicate roles');
+  assert(summary.includes('雨夜大厅（Image 4 俯视空间锚）'), 'visible binding labels topdown scene as layout anchor');
 }
 
 async function run() {
   const tests = [
     ['dynamic priority chain', testDynamicPriorityChain],
+    ['scene topdown anchor survives selection', testSceneTopdownAnchorSurvivesSelection],
     ['close-up entity boost', testCloseUpEntityBoost],
     ['close-up focus character sheet headshot pair', testCloseUpFocusCharacterGetsSheetHeadshotPair],
     ['crowded segment close-up ordering', testCrowdedSegmentCloseUpOrdering],
@@ -865,6 +1007,7 @@ async function run() {
     ['duplicate character only once', testDuplicateCharacterOnlyOnce],
     ['prop sort uses mentions then text order', testPropSortUsesMentionsThenTextOrder],
     ['prop short name matches canonical asset', testPropShortNameMatchesCanonicalAsset],
+    ['prop top view selected for overhead video reference', testPropTopViewSelectedForOverheadVideoReference],
     ['asset missing reason', testAssetMissingReason],
     ['groupShotIndices scopes full shots input', testGroupShotIndicesScopeFullShotsInput],
     ['generate and submit manifest mappings stay aligned', testGenerateAndSubmitManifestMappingsStayAligned],

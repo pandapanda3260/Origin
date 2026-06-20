@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 globalThis.localStorage = {
   getItem() { return ''; },
@@ -16,7 +20,25 @@ globalThis.document = {
   getElementById() { return null; },
 };
 
-const { _applyServerStaleFlagsToProject, _assetStaleBannerTextForProject, deriveAssetCardState, syncAssetsProject } = await import('../public/modules/assets.js');
+function browserModuleImportUrl(entry) {
+  const srcDir = fileURLToPath(new URL('../public/modules/', import.meta.url));
+  const tmpDir = mkdtempSync(join(tmpdir(), 'origin-browser-modules-'));
+  process.on('exit', () => {
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  });
+
+  for (const name of readdirSync(srcDir)) {
+    if (!name.endsWith('.js')) continue;
+    const src = readFileSync(join(srcDir, name), 'utf8')
+      .replace(/(from\s+['"])\/modules\//g, '$1./')
+      .replace(/(import\s*\(\s*['"])\/modules\//g, '$1./');
+    writeFileSync(join(tmpDir, name), src);
+  }
+
+  return pathToFileURL(join(tmpDir, entry)).href;
+}
+
+const { _applyServerStaleFlagsToProject, _assetStaleBannerTextForProject, _markDownstreamStaleFallback, _reindexAssetImageStateAfterDeletes, deriveAssetCardState, syncAssetsProject } = await import(browserModuleImportUrl('assets.js'));
 
 // The asset page no longer auto-syncs style-driven asset stale badges.
 // This helper still backs managed-prefix mirroring for downstream stale families.
@@ -79,6 +101,34 @@ const { _applyServerStaleFlagsToProject, _assetStaleBannerTextForProject, derive
   const changed = _applyServerStaleFlagsToProject(project, 'asset_img_', { asset_img_char_0: true });
   assert.equal(changed, false, 'matching mirror should be a no-op');
   assert.equal(project._staleFlags.asset_img_char_0, true);
+}
+
+{
+  const project = { _staleFlags: {}, assets: { scenes: [{ name: '大厅' }] } };
+  syncAssetsProject(project);
+  _markDownstreamStaleFallback('asset', { type: 'scene', idx: 0 });
+  assert.equal(project._staleFlags.asset_img_scene_0, undefined, 'scene fallback should not use aggregate stale key');
+  assert.equal(project._staleFlags.asset_img_scene_0_establishing, true);
+  assert.equal(project._staleFlags.asset_img_scene_0_reverse, true);
+  assert.equal(project._staleFlags.asset_img_scene_0_alt, true);
+  assert.equal(project._staleFlags.asset_img_scene_0_topdown, true);
+}
+
+{
+  const project = {
+    _staleFlags: {
+      asset_img_scene_0_establishing: true,
+      asset_img_scene_1: true,
+      asset_img_scene_2_topdown: true,
+      asset_img_prop_0: true,
+    },
+  };
+  syncAssetsProject(project);
+  _reindexAssetImageStateAfterDeletes('scene', [0]);
+  assert.equal(project._staleFlags.asset_img_scene_0_establishing, undefined, 'deleted scene view stale key should be removed');
+  assert.equal(project._staleFlags.asset_img_scene_0, true, 'higher aggregate scene stale key should shift down');
+  assert.equal(project._staleFlags.asset_img_scene_1_topdown, true, 'higher per-role scene stale key should shift down');
+  assert.equal(project._staleFlags.asset_img_prop_0, true, 'other asset stale families should be preserved');
 }
 
 {

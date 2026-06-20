@@ -136,10 +136,10 @@ assert(shotsJs.includes('_trackingShotsBatchByProject.delete(_trackKey)'), 'shot
 const wsHtml = readFileSync(path.join(root, 'public/workspace.html'), 'utf8');
 const mainJs = readFileSync(path.join(root, 'public/main.js'), 'utf8');
 for (const mod of ['assets', 'script', 'shots']) {
-  const mainVer = (mainJs.match(new RegExp(`modules/${mod}\\.js\\?v=(\\d+)`)) || [])[1];
+  const mainUsesImportMapKey = new RegExp(`from ['"]/modules/${mod}\\.js['"]`).test(mainJs);
   const mapVer = (wsHtml.match(new RegExp(`"/modules/${mod}\\.js\\?v=(\\d+)"`)) || [])[1];
-  assert(!!mainVer && mainVer === mapVer,
-    `cache: main.js 与 importmap 的 ${mod}.js 版本一致 (main=${mainVer}, map=${mapVer})`);
+  assert(mainUsesImportMapKey && !!mapVer,
+    `cache: main.js 使用 importmap key 且 importmap 提供 ${mod}.js 版本 (mainKey=${mainUsesImportMapKey}, map=${mapVer})`);
 }
 
 if (failed) {

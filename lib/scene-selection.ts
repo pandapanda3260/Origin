@@ -1,4 +1,5 @@
 import { normalizeReferenceName } from './video-reference-manifest';
+import { resolveSceneImageUrl } from './scene-views';
 
 export type SceneSelectionSource = {
   project?: any;
@@ -39,13 +40,7 @@ function sceneName(scene: any, fallback: string): string {
 }
 
 function sceneUrl(scene: any): string {
-  return compactText(
-    scene?.imageUrl ||
-      scene?.rawUrl ||
-      scene?.currentUrl ||
-      scene?.realPhotoUrl ||
-      scene?.coverUrl,
-  );
+  return compactText(resolveSceneImageUrl(scene, { strategy: 'selection', gate: false }));
 }
 
 export function normalizeScenes(input: SceneSelectionSource, opts: { requireImage?: boolean } = {}): NormalizedScene[] {

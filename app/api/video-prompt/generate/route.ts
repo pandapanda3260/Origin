@@ -30,6 +30,7 @@ import {
 } from '@/lib/character-consistency-gate';
 import { buildVideoReferenceManifest } from '@/lib/reference-matcher';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
+import { normalizeSceneViewRole } from '@/lib/scene-views';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -38,7 +39,7 @@ function compactText(value: unknown): string {
   return String(value || '').trim();
 }
 
-function roleDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem, 'useFor' | 'immutable' | 'promptHint'> {
+function roleDefaults(role: VideoReferenceRole, viewRole?: unknown): Pick<ReferenceManifestItem, 'useFor' | 'immutable' | 'promptHint'> {
   if (role === 'first_frame') {
     return {
       useFor: ['锁定第 0 帧开场构图', '光照', '主体位置', '画面比例', '色调基准'],
@@ -47,6 +48,21 @@ function roleDefaults(role: VideoReferenceRole): Pick<ReferenceManifestItem, 'us
     };
   }
   if (role === 'scene') {
+    const sceneViewRole = normalizeSceneViewRole(viewRole);
+    if (sceneViewRole === 'topdown') {
+      return {
+        useFor: ['锁定俯视空间布局', '入口/家具/大物件相对位置', '场景朝向'],
+        immutable: ['主要空间关系', '入口/家具/大物件相对方位', '场景布局'],
+        promptHint: '俯视空间锚只用于保持布局、方位和相对位置，不要求最终镜头变成俯视图。',
+      };
+    }
+    if (sceneViewRole && sceneViewRole !== 'establishing') {
+      return {
+        useFor: ['锁定同一场景对应机位', '空间结构', '材质', '氛围'],
+        immutable: ['场景类型', '主空间关系', '材质和主色调', '对应视角环境特征'],
+        promptHint: '这是同一场景的视角参考；锁定环境和机位下的空间关系，不锁人物外貌。',
+      };
+    }
     return {
       useFor: ['锁定环境布局', '空间结构', '材质', '氛围'],
       immutable: ['场景类型', '道路/地形结构', '主色调', '主要空间关系'],
@@ -499,17 +515,23 @@ function buildReferenceManifestFromRequest(body: any, groupIdx: number): Referen
   if (Array.isArray(body?.referenceManifest) && body.referenceManifest.length) {
     return body.referenceManifest
       .slice(0, VIDEO_REFERENCE_IMAGE_BUDGET)
-      .map((item: any, idx: number) => ({
-        imageNo: idx + 1,
-        role: normalizeRole(item?.role) || 'prop',
-        assetId: compactText(item?.assetId) || undefined,
-        assetName: compactText(item?.assetName) || undefined,
-        label: compactText(item?.label || item?.assetName || `reference image ${idx + 1}`),
-        url: compactText(item?.url),
-        useFor: Array.isArray(item?.useFor) ? item.useFor.map(compactText).filter(Boolean) : roleDefaults(normalizeRole(item?.role) || 'prop').useFor,
-        immutable: Array.isArray(item?.immutable) ? item.immutable.map(compactText).filter(Boolean) : roleDefaults(normalizeRole(item?.role) || 'prop').immutable,
-        promptHint: compactText(item?.promptHint) || roleDefaults(normalizeRole(item?.role) || 'prop').promptHint,
-      }))
+      .map((item: any, idx: number) => {
+        const role = normalizeRole(item?.role) || 'prop';
+        const viewRole = normalizeSceneViewRole(item?.viewRole) || undefined;
+        const defaults = roleDefaults(role, viewRole);
+        return {
+          imageNo: idx + 1,
+          role,
+          viewRole,
+          assetId: compactText(item?.assetId) || undefined,
+          assetName: compactText(item?.assetName) || undefined,
+          label: compactText(item?.label || item?.assetName || `reference image ${idx + 1}`),
+          url: compactText(item?.url),
+          useFor: Array.isArray(item?.useFor) ? item.useFor.map(compactText).filter(Boolean) : defaults.useFor,
+          immutable: Array.isArray(item?.immutable) ? item.immutable.map(compactText).filter(Boolean) : defaults.immutable,
+          promptHint: compactText(item?.promptHint) || defaults.promptHint,
+        };
+      })
       .filter((item: ReferenceManifestItem) => item.url);
   }
 
@@ -519,10 +541,12 @@ function buildReferenceManifestFromRequest(body: any, groupIdx: number): Referen
       .slice(0, VIDEO_REFERENCE_IMAGE_BUDGET)
       .map((ref: any, idx: number) => {
         const role = normalizeRole(ref?.role || ref?.type) || 'prop';
-        const defaults = roleDefaults(role);
+        const viewRole = normalizeSceneViewRole(ref?.viewRole) || undefined;
+        const defaults = roleDefaults(role, viewRole);
         return {
           imageNo: idx + 1,
           role,
+          viewRole,
           assetId: compactText(ref?.assetId) || undefined,
           assetName: compactText(ref?.assetName || ref?.name) || undefined,
           label: compactText(ref?.label || ref?.assetName || ref?.name || `${role} reference`),
@@ -563,10 +587,12 @@ function buildReferenceManifestFromRequest(body: any, groupIdx: number): Referen
     if (!role || role === 'first_frame') continue;
     const url = compactText(ref?.url);
     if (!url || manifest.some((item) => item.url === url)) continue;
-    const defaults = roleDefaults(role);
+    const viewRole = normalizeSceneViewRole(ref?.viewRole) || undefined;
+    const defaults = roleDefaults(role, viewRole);
     manifest.push({
       imageNo: manifest.length + 1,
       role,
+      viewRole,
       assetId: compactText(ref?.assetId) || undefined,
       assetName: compactText(ref?.assetName || ref?.name) || undefined,
       label: compactText(ref?.label || ref?.assetName || ref?.name || `${role} reference`),
@@ -733,6 +759,7 @@ export async function POST(req: NextRequest) {
             referenceImages: referenceManifest.map((item) => ({
               imageNo: item.imageNo,
               role: item.role,
+              viewRole: item.viewRole || null,
               assetId: item.assetId || null,
               label: item.label || null,
             })),

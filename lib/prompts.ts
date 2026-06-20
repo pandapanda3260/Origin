@@ -109,6 +109,14 @@ function referencePanelBindingText(ref: ReferenceManifestItem): string {
   return '';
 }
 
+function referenceImageBindingText(ref: ReferenceManifestItem): string {
+  const imageText = `Image ${Number(ref.imageNo)}`;
+  if (ref.role !== 'scene') return imageText;
+  if (ref.viewRole === 'topdown') return `${imageText} 俯视空间锚`;
+  if (ref.viewRole && ref.viewRole !== 'establishing') return `${imageText} ${ref.viewRole}视角`;
+  return imageText;
+}
+
 function buildCharacterReferenceBindings(refs: ReferenceManifestItem[]): string[] {
   const groups = new Map<string, ReferenceManifestItem[]>();
   refs.forEach((ref) => {
@@ -137,7 +145,7 @@ export function buildReferenceBindingSummary(refs: ReferenceManifestItem[] | und
   if (!items.length) {
     return '本组没有可用 Image N 参考图；可见正文不要编造 Image 编号。';
   }
-  const fmt = (ref: ReferenceManifestItem) => `${referenceBindingName(ref)}（Image ${Number(ref.imageNo)}）`;
+  const fmt = (ref: ReferenceManifestItem) => `${referenceBindingName(ref)}（${referenceImageBindingText(ref)}）`;
   const characterRefs = items.filter((ref) => ref.role === 'character');
   const otherRefs = items.filter((ref) => ref.role !== 'character');
   const characterBindings = buildCharacterReferenceBindings(characterRefs);
@@ -1215,6 +1223,7 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
       "id": "p1",
       "name": "道具名",
       "propType": "手持物/服装/家具/标志物",
+      "dimensionality": "volumetric 或 flat",
       "function": "在剧本里的作用",
       "ownership": "关联角色 id，例如 c1；公共道具填 null",
       "features": "外观/材质/颜色",
@@ -1227,6 +1236,7 @@ const SP_ASSET_PROPS_EXTRACT = `${COMMON_RULES}
 
 【重点】
   · ownership 只能填用户给你的角色 id；不确定或公共道具填 null。
+  · dimensionality 必须二选一：有实体厚度、会从多个角度入镜的物件填 volumetric；画作/照片/相框正面内容/纸张/文件/票据/地图/屏幕内容/招牌/标识牌等平面内容填 flat。设备外壳、武器、杯子、钥匙、家具、盒子默认 volumetric。
   · imagePrompt 必须中文且不能为空；允许保留少量必要专有术语，但不要整段英文。
   · 不要输出任何 JSON 之外的内容。`;
 

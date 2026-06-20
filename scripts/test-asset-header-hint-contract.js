@@ -24,7 +24,7 @@ function section(src, start, end) {
 assert(workspace.includes('class="workflow-title-hint asset-title-hint" id="assetImgHint"'), 'asset progress hint should use the shared title hint class');
 assert(!workspace.includes('assetStylizeBadge'), 'stylize badge DOM must stay removed (asset_stylize layer deleted)');
 assert(/"\/modules\/assets\.js":\s+"\/modules\/assets\.js\?v=\d+"/.test(workspace), 'workspace import map should carry an assets.js cache version');
-assert(/\.\/modules\/assets\.js\?v=\d+/.test(main), 'main import should carry an assets.js cache version');
+assert(main.includes("from '/modules/assets.js'"), 'main import should use the canonical assets.js specifier covered by the workspace import map');
 
 assert(styles.includes('.workflow-title-hint'), 'shared title hint class should be styled');
 // 拍板：标题提示统一灰色，仅保留 is-error 红色异常态。
@@ -56,6 +56,18 @@ assert.equal(directHintWrites.length, 1, 'only _setAssetHeaderHint may write ass
 // 静态三态摘要：随时可从 project.assets 重算，刷新/切项目后不丢。
 // 优先级：活跃批进度 > 部分缺失(warning) > 生成完成 N/N > 待生成… 0/N > 空。
 assert(hintHelpers.includes('function _assetHeaderImageState()'), 'asset image tri-state should be statically computable');
+assert(assets.includes('function _sceneViewDoneCount(item)'), 'scene image summary should count completed views per role');
+assert(assets.includes('function _sceneViewMissingLabels(item, idx)'), 'scene image summary should expose missing view labels');
+assert(assets.includes('_sceneViewOriginalUrl(item, role)'), 'scene image summary must read each view URL instead of item.imageUrl only');
+assert(assets.includes('function _reindexAssetImageStateAfterDeletes(type, deletedIdxs)'), 'asset image state should reindex after asset deletion');
+assert(assets.includes('_assetGenStatus = nextStatus;'), 'asset image reindex should also shift in-memory generation status');
+assert(assets.includes('function _regenerateSceneAllViews(idx)'), 'scene top-level regeneration should have a dedicated four-view flow');
+assert(assets.includes('return _regenerateSceneAllViews(idx);'), 'scene card refresh should force regenerate the full view set');
+assert(assets.includes('sceneViewRole === "establishing"'), 'scene establishing slot refresh should route to full scene view regeneration');
+assert(assets.includes('重新生成整组场景视图'), 'establishing slot tooltip should communicate full view regeneration');
+assert(assets.includes('var skipPromptRebuild = type === "scene" && !!sceneViewRole;'), 'single scene view refresh must not rebuild the shared scene prompt');
+assert(assets.includes('showToast(label + "图上传成功，已保存为主视角"'), 'scene upload should route through establishing-view semantics');
+assert(assets.includes('"views",') && assets.includes('"viewsVersion",') && assets.includes('"viewHistory",'), 'frontend generated-field restore should preserve scene view sets');
 const syncFn = section(assets, 'function _syncAssetHeaderHint(options)', 'function _assetVariant');
 const partialMissingAt = syncFn.indexOf('张已生成，缺少 ');
 const completedAt = syncFn.indexOf('"生成完成 " + img.done');
@@ -64,6 +76,9 @@ assert(partialMissingAt !== -1 && completedAt !== -1 && pendingAt !== -1, 'sync 
 assert(partialMissingAt < completedAt && completedAt < pendingAt, 'summary priority should stay partial-missing > completed > pending');
 const summarizeFn = section(assets, 'function _summarizeAssetImageGeneration(hint, options)', 'async function _runAssetImageTargets');
 assert(summarizeFn.includes('if (hint) _syncAssetHeaderHint();'), 'batch summary should settle through the shared sync helper');
+const reviewExec = section(assets, 'async function _executeAssetRegenerationReview', 'function _showAssetRegenerationReviewDialog');
+assert(reviewExec.includes('_sceneFollowupTargetsAfterStage(targets)'), 'review confirm path should generate scene secondary/topdown views after establishing');
+assert(reviewExec.includes('reloadProjectFromServer'), 'review confirm path should reload before scene follow-up target expansion');
 
 // asset_stylize（风格图转绘）层已整体摘除：不允许任何残留触发点回归。
 assert(!assets.includes('asset_stylize'), 'asset_stylize batch type must stay removed from assets.js');

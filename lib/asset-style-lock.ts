@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { normalizeCastingProfile } from './casting-profile';
+import { SCENE_VIEW_ROLES, normalizeSceneViews } from './scene-views';
 
 export type AssetStyleType = 'char' | 'scene' | 'prop';
 
@@ -300,6 +301,17 @@ function assetHasImage(asset: any): boolean {
   );
 }
 
+function sceneViewHasImage(view: any): boolean {
+  if (!view || typeof view !== 'object') return false;
+  const reference = view.reference || {};
+  return !!(
+    reference.currentUrl ||
+    reference.lastKnownGoodUrl ||
+    view.imageUrl ||
+    view.rawUrl
+  );
+}
+
 export function computeAssetStyleStaleFlags(project: any): Record<string, boolean> {
   const flags: Record<string, boolean> = {};
   const assets = project?.assets || {};
@@ -311,6 +323,18 @@ export function computeAssetStyleStaleFlags(project: any): Record<string, boolea
   for (const group of groups) {
     const current = assetStyleSignature(project?.styleBible || {}, group.type);
     group.items.forEach((item, idx) => {
+      if (group.type === 'scene' && Array.isArray(item?.views) && item.views.length) {
+        const views = normalizeSceneViews(item);
+        let hasViewImage = false;
+        for (const role of SCENE_VIEW_ROLES) {
+          const view = views.find((candidate) => candidate.role === role);
+          if (!sceneViewHasImage(view)) continue;
+          hasViewImage = true;
+          const stored = cleanText(view?.reference?.styleBibleSignature);
+          if (stored !== current) flags[`asset_img_scene_${idx}_${role}`] = true;
+        }
+        if (hasViewImage) return;
+      }
       if (!assetHasImage(item)) return;
       const stored = cleanText(item?.reference?.styleBibleSignature);
       if (stored !== current) flags[`asset_img_${group.type}_${idx}`] = true;

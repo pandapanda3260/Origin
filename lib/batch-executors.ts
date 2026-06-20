@@ -67,6 +67,20 @@ import {
 import { buildAssetAuthoritativeCharacterLock } from './character-lock-authority';
 import { characterAssetModeFor, isAnonymousCrowdAsset } from './crowd-character';
 import { buildVideoReferenceManifest } from './reference-matcher';
+import {
+  applySceneViewWrite,
+  isPrimarySceneRef,
+  normalizeSceneViewRole,
+  resolveSceneImageUrl,
+  type SceneViewRole,
+} from './scene-views';
+import {
+  applyPropViewWrite,
+  normalizePropDimensionality,
+  resolvePropImageUrl,
+  splitPropViews,
+  type SplitPropViewsResult,
+} from './prop-views';
 import { sanitizePromptObject } from './content-sanitize';
 import {
   cleanDialogueCharCount,
@@ -449,11 +463,13 @@ function dedupeDroppedReferences(refs: any[]): DroppedReference[] {
           ].includes(rawReason)
             ? rawReason as DroppedReference['reason']
             : 'image_budget_exceeded');
-    const key = `${role}|${assetName.toLowerCase()}|${reason}`;
+    const viewRole = role === 'scene' ? normalizeSceneViewRole(ref.viewRole) || undefined : undefined;
+    const key = `${role}|${viewRole || ''}|${assetName.toLowerCase()}|${reason}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push({
       role: role as DroppedReference['role'],
+      viewRole,
       assetName: assetName || undefined,
       reason,
     });
@@ -674,6 +690,7 @@ function planReferencesFromAuditRefs(refs: any[]): ReferenceManifestItem[] {
       return {
         imageNo: idx + 1,
         role,
+        viewRole: ref.viewRole,
         assetId: ref.assetId,
         assetName: ref.assetName,
         label: ref.label || `${role} reference`,
@@ -726,6 +743,7 @@ function videoFallbackWarnings(fallbackReason?: string): any[] {
 function compactVideoAuditReferenceImages(refs: any[]): any[] {
   return (Array.isArray(refs) ? refs : []).map((ref) => ({
     role: ref?.role,
+    viewRole: ref?.viewRole,
     path: ref?.path,
     label: ref?.label,
     sourceUrl: ref?.sourceUrl,
@@ -964,10 +982,14 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
    ============================================================ */
 const ASSET_IMG_HISTORY_FIELDS: Record<'char' | 'scene' | 'prop', string[]> = {
   char: ['name','role','identity','appearance','clothing','equipment','temperament','actionTraits','entityType','castingOverride','imagePrompt','description','tags'],
-  scene: ['name','description','location','timeSetting','weather','lighting','atmosphere','elements','imagePrompt'],
-  prop: ['name','propType','features','material','imagePrompt'],
+  scene: ['name','description','location','timeSetting','weather','lighting','atmosphere','elements','imagePrompt','views','viewsVersion','viewHistory'],
+  prop: ['name','propType','features','material','dimensionality','imagePrompt','views','viewsVersion','viewHistory'],
 };
 const MAX_ASSET_IMAGE_HISTORY = 10;
+
+function sceneViewRoleForTarget(target: any): SceneViewRole {
+  return normalizeSceneViewRole(target?.viewRole) || 'establishing';
+}
 
 function _captureAssetImageSnapshot(
   existing: any,
@@ -1023,6 +1045,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   const { item, type, idx, cat } = resolveAssetTarget(proj, ctx.target);
   if (!item) throw new Error(`找不到 ${cat}[${idx}]`);
   const isCrowdCharacterAsset = type === 'char' && isAnonymousCrowdAsset(item);
+  const sceneViewRole: SceneViewRole | undefined = type === 'scene' ? sceneViewRoleForTarget(ctx.target) : undefined;
+  const propDimensionality = type === 'prop' ? normalizePropDimensionality(item?.dimensionality, item) : undefined;
+  const isVolumetricProp = type === 'prop' && propDimensionality === 'volumetric';
 
   ctx.progress({ stage: 'building_prompt' });
   const rawStyleBible = (proj as any).styleBible || {};
@@ -1090,11 +1115,10 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   //   - 真人角色：1536×1024（宽图），三视图横向排开
   //   - 非人角色（拟人海鲜/机甲/动物）：1536×1024 也用三视图（前/侧/背）
   //   - 场景：1536×1024 establishing shot
-  //   - 道具：1024×1024 白底 product shot
+  //   - 立体道具：1536×1024 六视图 sheet（3×2，每格正方）
+  //   - 平面道具：1024×1024 白底 product shot
   const entityType: 'human' | 'non-human' =
     type === 'char' ? inferEntityTypeFromCharacter(item) : 'human';
-
-  const referenceImagePath: string | undefined = undefined;
 
   const styleReferenceMeta = {
     styleBibleSignature: styleLockContext.signature,
@@ -1102,18 +1126,34 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     resolvedBackdropColor: styleLockContext.resolvedBackdropColor,
   };
 
+  let referenceImagePath: string | undefined;
+  if (type === 'scene' && sceneViewRole && sceneViewRole !== 'establishing') {
+    const establishingUrl = resolveSceneImageUrl(item, {
+      strategy: 'videoManifest',
+      gate: true,
+      viewRole: 'establishing',
+    });
+    referenceImagePath = establishingUrl ? (resolveLocalImagePath(establishingUrl, ctx.user.id) || undefined) : undefined;
+    if (!referenceImagePath) {
+      throw new Error(`scene_view_missing_establishing:${cat}[${idx}].views.${sceneViewRole}`);
+    }
+  }
+
   const result = await generateImageWithModerationRecovery(ctx.user, {
     prompt,
-    size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : '1024x1024',
+    size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : isVolumetricProp ? '1536x1024' : '1024x1024',
     style: 'natural',
     kind: type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop',
     entityType: type === 'char' ? entityType : undefined,
+    sceneViewRole,
+    propDimensionality,
     characterAssetMode: type === 'char' ? characterAssetModeFor(item) : undefined,
     projectId: ctx.projectId,
-    assetRef: `${cat}[${idx}]`,
+    assetRef: type === 'scene' && sceneViewRole ? `${cat}[${idx}].views.${sceneViewRole}` : `${cat}[${idx}]`,
     // 角色参考图和场景主环境图细节多，低画质会糊掉脸和场景纹理；
-    // prop 单图保持 low 既快又够用。
-    quality: type === 'prop' ? 'low' : 'medium',
+    // 立体道具六视图 sheet 也需要更高细节；平面道具保留 low 单图。
+    quality: type === 'prop' && !isVolumetricProp ? 'low' : 'medium',
+    storageStyle: type === 'scene' ? 'scene-view' : isVolumetricProp ? 'prop-view-sheet' : undefined,
     referenceImagePath,
     styleLockApplied: type === 'char' && styleLockContext.hasMeaningfulStyle,
     styleBackdropColor: type === 'char' ? styleLockContext.resolvedBackdropColor : undefined,
@@ -1141,11 +1181,50 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       console.warn(`[asset_images] character panel split failed for ${cat}[${idx}]: ${panelResult.error}`);
     }
   }
+  let propViewResult: SplitPropViewsResult | null = null;
+  if (isVolumetricProp) {
+    ctx.progress({ stage: 'splitting_prop_views' });
+    const priorVersion = Number(item?.viewsVersion || item?.views?.version || 0);
+    propViewResult = await splitPropViews({
+      user: ctx.user,
+      projectId: ctx.projectId,
+      assetRef: `${cat}[${idx}]`,
+      sourceImageUrl: result.url,
+      prompt: result.submittedPrompt,
+      version: (Number.isFinite(priorVersion) ? priorVersion : 0) + 1,
+    });
+    if (!propViewResult.ok) {
+      console.warn(`[asset_images] prop view split failed for ${cat}[${idx}]: ${propViewResult.error}`);
+    }
+  }
   const eventReferenceUpdate = type === 'char'
     ? isCrowdCharacterAsset
       ? deriveCrowdReferenceUpdate(item, result, styleReferenceMeta)
       : deriveCharacterReferenceUpdate(item, result, panelResult, entityType, styleReferenceMeta, undefined, findCharacterLock(proj, item)?.referenceLock)
     : null;
+  const eventPropAsset = type === 'prop'
+    ? isVolumetricProp && propViewResult
+      ? applyPropViewWrite(item, {
+          splitResult: propViewResult,
+          sourceImageUrl: result.url,
+          imagePrompt: reusablePrompt,
+          submittedImagePrompt: result.submittedPrompt,
+          imageSafetyAudit: result.safetyAudit,
+          effectiveVisualDescription: result.visualAnchorDescription,
+          styleBibleSignature: styleReferenceMeta.styleBibleSignature,
+          styleLockVersion: styleReferenceMeta.styleLockVersion,
+          resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+        })
+      : {
+          ...item,
+          dimensionality: propDimensionality,
+          imageUrl: result.url,
+          rawUrl: result.url,
+        }
+    : null;
+  const eventPropUrl = eventPropAsset
+    ? resolvePropImageUrl(eventPropAsset, { strategy: 'selection', gate: false })
+    : '';
 
   // 写回项目：把 imageUrl + rawUrl + imagePrompt 落到资产对象
   // 注意：写入 imageUrl + rawUrl 两个字段，因为前端不同卡片读不同字段（兼容历史）
@@ -1167,29 +1246,60 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
         ? deriveCrowdReferenceUpdate(baseAsset, result, styleReferenceMeta)
         : deriveCharacterReferenceUpdate(baseAsset, result, panelResult, entityType, styleReferenceMeta, undefined, assetReferenceLock)
       : null;
-    let nextAsset = charAssetUpdate ? charAssetUpdate.nextAsset : {
-      ...baseAsset,
-      imageUrl: result.url,
-      rawUrl: result.url,
-      reference: {
-        ...assets[cat][idx].reference,
-        currentUrl: result.url,
-        lastKnownGoodUrl: result.url,
-        status: 'ready',
-        updatedAt: new Date().toISOString(),
-        styleBibleSignature: styleLockContext.signature,
-        styleLockVersion: styleLockContext.styleLockVersion,
-        resolvedBackdropColor: styleLockContext.resolvedBackdropColor,
-      },
-      imageGeneratedAt: new Date().toISOString(),
-    };
-    if (type !== 'char') {
+    let nextAsset = charAssetUpdate
+      ? charAssetUpdate.nextAsset
+      : type === 'scene' && sceneViewRole
+        ? applySceneViewWrite(baseAsset, {
+            role: sceneViewRole,
+            imageUrl: result.url,
+            rawUrl: result.url,
+            imagePrompt: reusablePrompt,
+            submittedImagePrompt: result.submittedPrompt,
+            imageSafetyAudit: result.safetyAudit,
+            effectiveVisualDescription: result.visualAnchorDescription,
+            styleBibleSignature: styleReferenceMeta.styleBibleSignature,
+            styleLockVersion: styleReferenceMeta.styleLockVersion,
+            resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+          })
+        : type === 'prop' && isVolumetricProp && propViewResult
+          ? applyPropViewWrite(baseAsset, {
+              splitResult: propViewResult,
+              sourceImageUrl: result.url,
+              imagePrompt: reusablePrompt,
+              submittedImagePrompt: result.submittedPrompt,
+              imageSafetyAudit: result.safetyAudit,
+              effectiveVisualDescription: result.visualAnchorDescription,
+              styleBibleSignature: styleReferenceMeta.styleBibleSignature,
+              styleLockVersion: styleReferenceMeta.styleLockVersion,
+              resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+            })
+        : {
+            ...baseAsset,
+            ...(type === 'prop' ? { dimensionality: propDimensionality } : {}),
+            imageUrl: result.url,
+            rawUrl: result.url,
+            reference: {
+              ...assets[cat][idx].reference,
+              currentUrl: result.url,
+              lastKnownGoodUrl: result.url,
+              status: 'ready',
+              updatedAt: new Date().toISOString(),
+              styleBibleSignature: styleLockContext.signature,
+              styleLockVersion: styleLockContext.styleLockVersion,
+              resolvedBackdropColor: styleLockContext.resolvedBackdropColor,
+            },
+            imageGeneratedAt: new Date().toISOString(),
+          };
+    const propViewSplitFailed = type === 'prop' && isVolumetricProp && propViewResult && !propViewResult.ok;
+    if (type !== 'char' && !propViewSplitFailed) {
       delete (nextAsset as any).imageLastError;
       delete (nextAsset as any).imageFailedAt;
       if (nextAsset.reference) delete (nextAsset.reference as any).lastError;
     }
     // 把旧图 + 旧信息归档进 imageHistory（前端 polling/reload 后也能看到）
-    const archivedAsset = _withArchivedImageHistory(assets[cat][idx], nextAsset, type, 'regen');
+    const archivedAsset = type === 'scene' && sceneViewRole !== 'establishing'
+      ? nextAsset
+      : _withArchivedImageHistory(assets[cat][idx], nextAsset, type, 'regen');
     assets[cat][idx] = archivedAsset;
     // 顶层 characters/environments/props 也同步（前端两种结构都读）
     const topKey = cat === 'characters' ? 'characters' : cat === 'scenes' ? 'environments' : 'props';
@@ -1208,28 +1318,58 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
         ? deriveCrowdReferenceUpdate(baseTop, result, styleReferenceMeta)
         : deriveCharacterReferenceUpdate(baseTop, result, panelResult, entityType, styleReferenceMeta, undefined, topReferenceLock)
       : null;
-    let nextTop = charTopUpdate ? charTopUpdate.nextAsset : {
-      ...baseTop,
-      imageUrl: result.url,
-      rawUrl: result.url,
-      reference: {
-        ...top[idx].reference,
-        currentUrl: result.url,
-        lastKnownGoodUrl: result.url,
-        status: 'ready',
-        updatedAt: new Date().toISOString(),
-        styleBibleSignature: styleLockContext.signature,
-        styleLockVersion: styleLockContext.styleLockVersion,
-        resolvedBackdropColor: styleLockContext.resolvedBackdropColor,
-      },
-    };
-    if (type !== 'char') {
+    let nextTop = charTopUpdate
+      ? charTopUpdate.nextAsset
+      : type === 'scene' && sceneViewRole
+        ? applySceneViewWrite(baseTop, {
+            role: sceneViewRole,
+            imageUrl: result.url,
+            rawUrl: result.url,
+            imagePrompt: reusablePrompt,
+            submittedImagePrompt: result.submittedPrompt,
+            imageSafetyAudit: result.safetyAudit,
+            effectiveVisualDescription: result.visualAnchorDescription,
+            styleBibleSignature: styleReferenceMeta.styleBibleSignature,
+            styleLockVersion: styleReferenceMeta.styleLockVersion,
+            resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+          })
+        : type === 'prop' && isVolumetricProp && propViewResult
+          ? applyPropViewWrite(baseTop, {
+              splitResult: propViewResult,
+              sourceImageUrl: result.url,
+              imagePrompt: reusablePrompt,
+              submittedImagePrompt: result.submittedPrompt,
+              imageSafetyAudit: result.safetyAudit,
+              effectiveVisualDescription: result.visualAnchorDescription,
+              styleBibleSignature: styleReferenceMeta.styleBibleSignature,
+              styleLockVersion: styleReferenceMeta.styleLockVersion,
+              resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+            })
+        : {
+            ...baseTop,
+            ...(type === 'prop' ? { dimensionality: propDimensionality } : {}),
+            imageUrl: result.url,
+            rawUrl: result.url,
+            reference: {
+              ...top[idx].reference,
+              currentUrl: result.url,
+              lastKnownGoodUrl: result.url,
+              status: 'ready',
+              updatedAt: new Date().toISOString(),
+              styleBibleSignature: styleLockContext.signature,
+              styleLockVersion: styleLockContext.styleLockVersion,
+              resolvedBackdropColor: styleLockContext.resolvedBackdropColor,
+            },
+          };
+    if (type !== 'char' && !propViewSplitFailed) {
       delete (nextTop as any).imageLastError;
       delete (nextTop as any).imageFailedAt;
       if (nextTop.reference) delete (nextTop.reference as any).lastError;
     }
     // 顶层也归档一份（保持 assets.* 和 top.* 两路镜像一致）
-    nextTop = _withArchivedImageHistory(top[idx], nextTop, type, 'regen');
+    nextTop = type === 'scene' && sceneViewRole !== 'establishing'
+      ? nextTop
+      : _withArchivedImageHistory(top[idx], nextTop, type, 'regen');
     top[idx] = nextTop;
     const patch: any = { assets, [topKey]: top };
     if (type === 'char' && !isAnonymousCrowdAsset(nextAsset)) {
@@ -1251,28 +1391,35 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   // task_completed 事件 payload：前端 onTaskCompleted 读 extra.rawUrl / extra.pencilUrl
   // 来实时更新卡片 UI（不刷新就能看到图）。之前我们漏发这两个字段，所以图必须
   // 刷新页面才显示——这里补上。
+  const emittedImageUrl = type === 'prop' && isVolumetricProp ? eventPropUrl : result.url;
+  const emittedImagePrompt = reusablePrompt;
   return {
-    resultUrl: result.url,
+    resultUrl: emittedImageUrl || undefined,
     patch: {
       type: 'asset_image',
       cat,
       idx,
-      value: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : result.url,
-      imageUrl: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : result.url,
-      imagePrompt: reusablePrompt,
+      value: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : emittedImageUrl || undefined,
+      imageUrl: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : emittedImageUrl || undefined,
+      imagePrompt: emittedImagePrompt,
     },
     extra: {
       type,
       idx,
-      rawUrl: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : result.url,
-      pencilUrl: type === 'char' && (!eventReferenceUpdate || eventReferenceUpdate.accepted) ? result.url : undefined,
+      viewRole: sceneViewRole,
+      rawUrl: type === 'char' && eventReferenceUpdate && !eventReferenceUpdate.accepted ? undefined : emittedImageUrl || undefined,
+      pencilUrl: type === 'char' && (!eventReferenceUpdate || eventReferenceUpdate.accepted) ? emittedImageUrl || undefined : undefined,
       skippedStylize: type === 'char' && (!eventReferenceUpdate || eventReferenceUpdate.accepted) ? true : undefined,
       mode: result.mode,
       width: result.width,
       height: result.height,
+      sourceSheetUrl: type === 'prop' && isVolumetricProp ? result.url : undefined,
+      dimensionality: type === 'prop' ? propDimensionality : undefined,
       referenceStatus: eventReferenceUpdate?.referenceStatus,
       lastAttemptUrl: eventReferenceUpdate && !eventReferenceUpdate.accepted ? result.url : undefined,
       lastError: eventReferenceUpdate && !eventReferenceUpdate.accepted ? eventReferenceUpdate.lastError : undefined,
+      views: type === 'prop' && isVolumetricProp && propViewResult?.ok ? propViewResult.views : undefined,
+      viewsError: type === 'prop' && isVolumetricProp && propViewResult && !propViewResult.ok ? propViewResult.error : undefined,
       panels: eventReferenceUpdate?.accepted
         ? isCrowdCharacterAsset
           ? eventReferenceUpdate.nextAsset?.panels
@@ -2678,7 +2825,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	    `[video_segments] group ${groupIdx} 计划 ${plannedDurationSec}s，台词 ${dialogueCharSum} 字 → ` +
 	      `请求 ${durationSec}s 视频（原始 ${requestedDurationSec}s，预算 ${tempoBudget.requiredRawSec}s，${dialoguePairs.length} 句台词）`,
 	  );
-	  const sceneItem = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath);
+		  const sceneItem = manifestInImageOrder.find((ref) => isPrimarySceneRef(ref) && ref.localPath);
   sceneReferencePath = sceneItem?.localPath || undefined;
   sceneReferenceLabel = sceneItem?.assetName || sceneItem?.label || sceneReferenceLabel;
   sceneReferenceHint = sceneItem?.promptHint || sceneReferenceHint;
@@ -2703,8 +2850,9 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   for (const ref of manifestInImageOrder) {
     if (!ref.localPath) continue;
     addReferenceImage({
-      role: ref.role,
-      path: ref.localPath,
+	      role: ref.role,
+	      viewRole: ref.viewRole,
+	      path: ref.localPath,
       sourceUrl: ref.url,
       assetId: ref.assetId,
       assetName: ref.assetName,
@@ -3207,6 +3355,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		        .filter((ref) => isPlanReferenceRole(ref.role) && ref.role !== 'first_frame' && ref.path && !sentPaths.has(ref.path))
 		        .map((ref) => ({
 		          role: ref.role as Exclude<VideoReferenceRole, 'first_frame'>,
+		          viewRole: ref.viewRole,
 		          assetName: ref.assetName || ref.label,
 		          reason: 'filtered_constraint' as const,
 		        })),

@@ -38,6 +38,17 @@ import {
 import { isAnonymousCrowdAsset } from './crowd-character';
 import type { CharacterEntityType, PanelName } from './character-panels';
 import { pickSceneForShots } from './scene-selection';
+import {
+  pickSceneTopdownAnchor,
+  pickSceneView,
+  resolveSceneImageUrl,
+  type SceneViewRole,
+} from './scene-views';
+import {
+  pickPropView,
+  resolvePropImageUrl,
+  type PropViewRole,
+} from './prop-views';
 import { resolveShotFieldsForPrompt } from './shot-plan-normalize';
 import { isBlockingReferenceStatus, resolveAssetReferenceState } from './visual-reference-state';
 import {
@@ -77,6 +88,10 @@ export type FrameReference = {
   textFallback: string;
   /** 角色参考子图类型。sheet=完整角色设定图; headshot/front/side/back=切图。 */
   panel?: 'sheet' | PanelName;
+  /** 场景多视图子类型。role 仍保持 scene，避免扩散顶层 role。 */
+  viewRole?: SceneViewRole;
+  /** 道具多视图子类型。与 scene.viewRole 分开，避免消费者误判。 */
+  propViewRole?: PropViewRole;
   entityType?: CharacterEntityType | string;
   /** 给 prompt/校验使用的短用途说明，不作为 UI 文案强制展示。 */
   referencePurpose?: string;
@@ -153,6 +168,8 @@ export type FrameImagePlanSummary = {
 	    role: FrameRefRole;
 	    assetName?: string;
 	    panel?: string;
+	    viewRole?: SceneViewRole;
+	    propViewRole?: PropViewRole;
 	  }>;
   textOnlyReferences: Array<{
     slot: number;
@@ -334,6 +351,14 @@ function assetImageUrl(asset: any): string {
 	  );
 	}
 
+function sceneImageUrl(scene: any, viewRole?: SceneViewRole): string {
+  return resolveSceneImageUrl(scene, { strategy: 'framePlan', gate: true, viewRole });
+}
+
+function propImageUrl(prop: any, viewRole?: PropViewRole): string {
+  return resolvePropImageUrl(prop, { strategy: 'framePlan', gate: true, viewRole });
+}
+
 function assetIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: number): string[] {
   const source = asset || {};
   const fields = role === 'character'
@@ -349,7 +374,7 @@ function assetIdentityKeys(role: StoryboardMaterialRole, asset: any, idx?: numbe
       for (const prefix of prefixes) keys.push(`${prefix}:${value}`);
     }
   }
-  const url = assetImageUrl(source);
+  const url = role === 'scene' ? sceneImageUrl(source) : assetImageUrl(source);
   if (url) {
     for (const prefix of prefixes) keys.push(`${prefix}:url:${url}`);
   }
@@ -549,7 +574,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
     .filter((scene: any, idx: number) =>
       isStoryboardMaterialForGroup(scene, groupIdx, 'scene') &&
       !isMaterialAssetExcluded(project, 'scene', scene, groupIdx, idx) &&
-      !!assetImageUrl(scene),
+      !!sceneImageUrl(scene),
     );
   const chosenScene = (manualScenes[0] || sceneSelection.scene) as any;
   const chosenSceneExcluded = isMaterialAssetExcluded(project, 'scene', chosenScene, groupIdx);
@@ -643,18 +668,40 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       : null;
 
   const sceneCandidate: Candidate | null = chosenScene && !chosenSceneExcluded
-    ? {
-        role: 'scene',
-        assetId: chosenScene.sceneId || chosenScene.id || undefined,
-        assetName: chosenScene.name || chosenScene.location || 'scene',
-        remoteUrl: assetImageUrl(chosenScene) || undefined,
-        textFallback: sceneLockText,
-      }
+    ? (() => {
+        const pickedView = pickSceneView(chosenScene, primaryShot);
+        return {
+          role: 'scene' as const,
+          viewRole: pickedView.role,
+          assetId: chosenScene.sceneId || chosenScene.id || undefined,
+          assetName: chosenScene.name || chosenScene.location || 'scene',
+          remoteUrl: pickedView.url || sceneImageUrl(chosenScene) || undefined,
+          textFallback: sceneLockText,
+          referencePurpose: pickedView.role === 'establishing'
+            ? '主场景视角参考：锁定空间布局、材质、光线和主色调。'
+            : `${pickedView.role} 场景视角参考：锁定同一地点在该机位下的空间、材质、光线和主色调。`,
+        };
+      })()
     : null;
-  const chosenSceneUrl = assetImageUrl(chosenScene);
+  const sceneTopdownCandidate: Candidate | null = chosenScene && !chosenSceneExcluded
+    ? (() => {
+        const anchor = pickSceneTopdownAnchor(chosenScene);
+        if (!anchor?.url) return null;
+        return {
+          role: 'scene' as const,
+          viewRole: 'topdown' as const,
+          assetId: chosenScene.sceneId || chosenScene.id || undefined,
+          assetName: `${chosenScene.name || chosenScene.location || 'scene'} 俯视空间锚`,
+          remoteUrl: anchor.url,
+          textFallback: sceneLockText,
+          referencePurpose: '俯视空间锚：只锁定入口、家具/大物件、主体活动区的相对位置和朝向，不要求画面变成俯视图。',
+        };
+      })()
+    : null;
+  const chosenSceneUrl = sceneImageUrl(chosenScene);
   const supplementalSceneCandidates = manualScenes
     .filter((scene: any) => {
-      const url = assetImageUrl(scene);
+      const url = sceneImageUrl(scene);
       return scene !== chosenScene && url !== chosenSceneUrl;
     })
     .map((scene: any): Candidate => {
@@ -663,7 +710,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         role: 'scene',
         assetId: scene.sceneId || scene.id || nm,
         assetName: nm,
-        remoteUrl: assetImageUrl(scene),
+        remoteUrl: sceneImageUrl(scene),
         textFallback: `${nm}: ${truncate([scene.description, scene.location, scene.lighting, scene.atmosphere, scene.elements, scene.features].filter(Boolean).join(', '), 180)}`,
       };
     });
@@ -758,15 +805,20 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
 
   const propCandidates = usedProps.map((p: any): Candidate => {
     const nm = p.name || p.propName;
+    const pickedView = pickPropView(p, primaryShot);
     return {
       role: 'prop',
       assetId: p.propId || p.id || nm,
       assetName: nm,
-      remoteUrl: assetImageUrl(p) || undefined,
+      propViewRole: pickedView.role,
+      remoteUrl: pickedView.url || propImageUrl(p) || undefined,
       textFallback: `${nm}: ${truncate(
         [p.description, p.features, p.propType].filter(Boolean).join(', '),
         140,
       )}`,
+      referencePurpose: pickedView.role === 'front'
+        ? `${nm}正面/身份参考：锁定同一件道具的轮廓、材质、尺度和识别符号。`
+        : `${nm}${pickedView.role}视图参考：优先匹配本镜头道具角度，同时锁定同一件道具的材质和细节。`,
     };
   });
 
@@ -776,6 +828,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
 	  const contextCandidates: Candidate[] = [];
 	  if (frameType === 'tail_frame') pushIf(contextCandidates, selfFirstFrameCandidate);
 	  pushIf(contextCandidates, sceneCandidate);
+	  pushIf(contextCandidates, sceneTopdownCandidate);
 	  pushIf(contextCandidates, propCandidates[0]);
 	  pushIf(contextCandidates, supplementalSceneCandidates[0]);
 	  pushIf(contextCandidates, propCandidates[1]);
@@ -851,10 +904,12 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
       assetName: cand.assetName,
       localPath: delivery === 'image' ? resolved : undefined,
 	      remoteUrl: cand.remoteUrl,
-	      textFallback: cand.textFallback,
-	      panel: cand.panel,
-	      entityType: cand.entityType,
-	      referencePurpose: cand.referencePurpose,
+      textFallback: cand.textFallback,
+      panel: cand.panel,
+      viewRole: cand.viewRole,
+      propViewRole: cand.propViewRole,
+      entityType: cand.entityType,
+      referencePurpose: cand.referencePurpose,
 	      delivery,
 	      droppedReason,
 	    });
@@ -897,7 +952,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
               .join(', '),
             220,
           ),
-          imageUrl: assetImageUrl(chosenScene),
+          imageUrl: sceneCandidate?.remoteUrl || sceneImageUrl(chosenScene),
         }
       : null,
     props: usedProps.map((p: any) => ({
@@ -906,7 +961,7 @@ export function buildFrameImageGenerationPlan(input: BuildFramePlanInput): Frame
         [p.description, p.features, p.propType].filter(Boolean).join(', '),
         140,
       ),
-      imageUrl: assetImageUrl(p),
+      imageUrl: propImageUrl(p),
     })),
     styleLock,
     driftGuardrails,
@@ -1106,15 +1161,17 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
                 : r.panel === 'back'
                   ? '背面图'
                   : '';
-      const roleText =
-        r.role === 'scene'
-          ? `场景（${r.assetName || '场景'}）- 锁定空间布局、材质、光线方向、时间氛围和主色调。`
+	      const roleText =
+	        r.role === 'scene' && r.viewRole === 'topdown'
+	          ? `场景俯视空间锚（${r.assetName || '场景'}）- 只锁定空间布局、入口/家具/大物件相对位置和朝向；最终画面不要变成俯视图，不要镜像或重排主要空间关系。`
+	          : r.role === 'scene'
+	          ? `场景（${r.assetName || '场景'}）- 锁定空间布局、材质、光线方向、时间氛围和主色调。`
           : r.role === 'character'
             ? `角色（${r.assetName || '角色'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '锁定同一人脸部、服装、体型、物种特征和配饰。'}`
             : r.role === 'crowd'
               ? `人群/群像（${r.assetName || '人群'}${panelText ? `，${panelText}` : ''}）- ${r.referencePurpose || '只锁定人群规模、服装气质和背景层次，不替代主角身份参考。'}`
               : r.role === 'prop'
-                ? `道具（${r.assetName || '道具'}）- 锁定同一件单实例道具的形状、颜色、材质、尺度、支架/边框结构和可识别细节；只允许视角、屏幕内容和光线变化，不得改成其他类型设备。`
+                ? `道具（${r.assetName || '道具'}${r.propViewRole ? `，${r.propViewRole}视图` : ''}）- ${r.referencePurpose || '锁定同一件单实例道具的形状、颜色、材质、尺度、支架/边框结构和可识别细节；只允许视角、屏幕内容和光线变化，不得改成其他类型设备。'}`
                 : r.role === 'prev_tail'
                   ? '上一片段尾帧 - 连续性锚点，锁定衔接关系，不复制构图。'
                   : r.role === 'self_first_frame'
@@ -1123,9 +1180,12 @@ export function renderFramePrompt(plan: FrameImageGenerationPlan): string {
       // imageNo 在 delivery='image' 的 ref 上 1-based 连续, 和 image[] 数组对齐。
       lines.push(`- Image ${r.imageNo} = ${roleText}`);
     }
-    lines.push('- 角色设定图负责统一身份和服装；头像/正面/侧面/背面只补充对应角度细节，不能相互冲突。');
-    lines.push('- 场景和道具参考必须同等执行：不要为了贴近角色而改掉地点、关键道具、材质、光线或空间关系。');
-  }
+	    lines.push('- 角色设定图负责统一身份和服装；头像/正面/侧面/背面只补充对应角度细节，不能相互冲突。');
+	    lines.push('- 场景和道具参考必须同等执行：不要为了贴近角色而改掉地点、关键道具、材质、光线或空间关系。');
+	    if (imageRefs.some((r) => r.role === 'scene' && r.viewRole === 'topdown')) {
+	      lines.push('- 俯视空间锚只用于约束场景布局、朝向和相对位置；最终画面仍按本帧镜头/构图生成，不要输出俯视图或平面图。');
+	    }
+	  }
 
   // 4. Locks (text)
   if (plan.characterLockText) {
@@ -1185,6 +1245,8 @@ export function summarizePlanForAudit(plan: FrameImageGenerationPlan): FrameImag
 	      role: r.role,
 	      assetName: r.assetName,
 	      panel: r.panel,
+	      viewRole: r.viewRole,
+	      propViewRole: r.propViewRole,
 	    })),
     textOnlyReferences: textOnly.map((r) => ({
       slot: r.slot,

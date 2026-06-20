@@ -23,3 +23,6 @@ tsconfig.tsbuildinfo
 tmp/
 _server_snapshot/
 _pull_server_snapshot.sh
+
+# 本地真实密钥副本，严禁提交
+origin.env.local

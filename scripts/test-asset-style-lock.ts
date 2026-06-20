@@ -144,6 +144,31 @@ assert.equal(staleFlags.asset_img_char_1, true, 'legacy image without signature 
 assert.equal(staleFlags.asset_img_char_2, true, 'changed style signature should be style-stale');
 assert.equal(staleFlags.asset_img_char_3, undefined, 'image-less draft should not be style-stale');
 
+const currentSceneSig = buildAssetStyleLock(noirBible, 'scene').signature;
+const sceneViewStaleFlags = computeAssetStyleStaleFlags({
+  styleBible: noirBible,
+  assets: {
+    characters: [],
+    scenes: [
+      {
+        imageUrl: '/scene-main.png',
+        reference: { currentUrl: '/scene-main.png', styleBibleSignature: currentSceneSig },
+        views: [
+          { role: 'establishing', imageUrl: '/scene-main.png', reference: { currentUrl: '/scene-main.png', styleBibleSignature: currentSceneSig } },
+          { role: 'reverse', imageUrl: '/scene-reverse.png', reference: { currentUrl: '/scene-reverse.png', styleBibleSignature: assetStyleSignature(animationBible, 'scene') } },
+          { role: 'topdown', imageUrl: '/scene-top.png', reference: { currentUrl: '/scene-top.png' } },
+        ],
+      },
+    ],
+    props: [],
+  },
+});
+assert.equal(sceneViewStaleFlags.asset_img_scene_0, undefined, 'scene views should not fall back to aggregate style stale');
+assert.equal(sceneViewStaleFlags.asset_img_scene_0_establishing, undefined, 'matching scene establishing view should not be stale');
+assert.equal(sceneViewStaleFlags.asset_img_scene_0_reverse, true, 'changed scene view signature should be stale per role');
+assert.equal(sceneViewStaleFlags.asset_img_scene_0_topdown, true, 'legacy scene view without signature should be stale per role');
+assert.equal(sceneViewStaleFlags.asset_img_scene_0_alt, undefined, 'missing scene view should not emit stale flag');
+
 const sceneLock = buildAssetStyleLock(noirBible, 'scene');
 assertIncludes(sceneLock.prompt, noirBible.cameraStyle);
 assertIncludes(sceneLock.prompt, noirBible.worldRules);

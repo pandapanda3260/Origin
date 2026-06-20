@@ -41,7 +41,11 @@ export function renderAssetCard(type, idx, status, payload) {
   var card = container.querySelector('[data-type="' + type + '"][data-idx="' + idx + '"]');
   if (!card) return { ok: false };
 
-  var loading = card.querySelector(".asset-card-loading");
+  var loadingScope = card;
+  if (payload.viewRole && card.dataset.type === "scene") {
+    loadingScope = card.querySelector('[data-scene-view-role="' + String(payload.viewRole).replace(/"/g, '\\"') + '"]') || card;
+  }
+  var loading = loadingScope.querySelector(".asset-card-loading");
 
   if (status === "loading") {
     if (loading) {
@@ -54,7 +58,7 @@ export function renderAssetCard(type, idx, status, payload) {
 
   if (status === "done" && payload.imgUrl) {
     if (loading) loading.hidden = true;
-    var updated = _updateCardImageInPlace(card, payload.imgUrl, payload.zoomUrl);
+    var updated = _updateCardImageInPlace(card, payload.imgUrl, payload.zoomUrl, payload.viewRole);
     return { ok: true, needFullRerender: !updated };
   }
 
@@ -316,13 +320,21 @@ export function renderVpCard(gIdx, status, payload) {
  * 就地更新卡片内所有 <img src> 和 [data-img]。如果分镜卡片还只有
  * placeholder，先原地替换成 <img>，避免首次出图时整块 grid 重建。
  */
-function _updateCardImageInPlace(card, imgUrl, zoomUrl) {
-  var imgs = card.querySelectorAll("img");
-  var zoomEls = card.querySelectorAll("[data-img]");
+function _updateCardImageInPlace(card, imgUrl, zoomUrl, viewRole) {
+  var scope = card;
+  if (viewRole && card.dataset.type === "scene") {
+    scope = card.querySelector('[data-scene-view-role="' + String(viewRole).replace(/"/g, '\\"') + '"]') || card;
+  }
+  var imgs = scope.querySelectorAll("img");
+  var zoomEls = scope.querySelectorAll("[data-img]");
   zoomUrl = zoomUrl || imgUrl;
+  if (viewRole && card.dataset.type === "scene" && scope) {
+    scope.dataset.action = "zoom-img";
+    scope.dataset.img = zoomUrl;
+  }
 
   if (!imgs.length) {
-    var sbPlaceholder = card.querySelector(".sb-sheet-placeholder");
+    var sbPlaceholder = scope.querySelector(".sb-sheet-placeholder");
     if (sbPlaceholder) {
       var img = document.createElement("img");
       img.className = "w-full h-full object-cover scale-105 group-hover:scale-100 transition-transform duration-1000 ease-out cursor-pointer";
@@ -333,7 +345,7 @@ function _updateCardImageInPlace(card, imgUrl, zoomUrl) {
       sbPlaceholder.replaceWith(img);
       imgs = [img];
     } else {
-      var assetPlaceholder = card.querySelector(".asset-card-placeholder");
+      var assetPlaceholder = scope.querySelector(".asset-card-placeholder");
       if (!assetPlaceholder) return false;
       var assetImg = document.createElement("img");
       assetImg.className = assetPlaceholder.dataset.imgClass || "w-full h-full object-cover";

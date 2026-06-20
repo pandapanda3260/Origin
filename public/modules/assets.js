@@ -66,6 +66,258 @@ var _assetEntranceClearTimer = null;
 var ASSET_CARD_DISPLAY_W = 1024;
 var ASSET_CARD_THUMB_W = 512;
 var ASSET_LIGHTBOX_W = 1600;
+var SCENE_VIEW_ROLES = ["establishing", "reverse", "alt", "topdown"];
+var SCENE_VIEW_LABELS = {
+  establishing: "主视角",
+  reverse: "反打",
+  alt: "侧角",
+  topdown: "俯视布局"
+};
+var PROP_VIEW_SLOTS = ["hero", "front", "back", "side_left", "side_right", "top"];
+var PROP_VIEW_LABELS = {
+  hero: "3/4 主图",
+  front: "正面",
+  back: "背面",
+  side_left: "左侧",
+  side_right: "右侧",
+  side: "侧面",
+  top: "俯视"
+};
+
+function _normalizeSceneViewRole(role) {
+  role = String(role || "").trim();
+  return SCENE_VIEW_ROLES.indexOf(role) >= 0 ? role : "";
+}
+
+function _assetGenStatusKey(type, idx, viewRole) {
+  var role = type === "scene" ? _normalizeSceneViewRole(viewRole) : "";
+  return role ? type + "_" + idx + "_" + role : type + "_" + idx;
+}
+
+function _normalizePropViewRole(role) {
+  role = String(role || "").trim();
+  return (PROP_VIEW_SLOTS.indexOf(role) >= 0 || role === "side") ? role : "";
+}
+
+function _sceneViewStaleKey(idx, role) {
+  role = _normalizeSceneViewRole(role);
+  return role ? "asset_img_scene_" + idx + "_" + role : "asset_img_scene_" + idx;
+}
+
+function _sceneView(item, role) {
+  role = _normalizeSceneViewRole(role) || "establishing";
+  var views = Array.isArray(item && item.views) ? item.views : [];
+  for (var i = 0; i < views.length; i++) {
+    if (_normalizeSceneViewRole(views[i] && views[i].role) === role) return views[i];
+  }
+  return null;
+}
+
+function _sceneViewOriginalUrl(item, role) {
+  if (!item) return "";
+  role = _normalizeSceneViewRole(role) || "establishing";
+  var view = _sceneView(item, role);
+  var ref = view && view.reference && typeof view.reference === "object" ? view.reference : {};
+  if (view) {
+    return _firstAssetUrl(ref.currentUrl, ref.lastKnownGoodUrl, view.imageUrl, view.rawUrl);
+  }
+  if (role === "establishing") {
+    var topRef = item.reference && typeof item.reference === "object" ? item.reference : {};
+    return _firstAssetUrl(topRef.currentUrl, topRef.lastKnownGoodUrl, item.originalUrl, item.rawUrl, item.imageUrl, item.displayUrl);
+  }
+  return "";
+}
+
+function _sceneMissingViewRoles(item) {
+  if (!item || !item.imagePrompt) return [];
+  var missing = [];
+  var hasEstablishing = !!_sceneViewOriginalUrl(item, "establishing");
+  if (!hasEstablishing) return ["establishing"];
+  SCENE_VIEW_ROLES.forEach(function (role) {
+    if (!_sceneViewOriginalUrl(item, role)) missing.push(role);
+  });
+  return missing;
+}
+
+function _sceneViewIsStale(idx, role) {
+  if (!project || !project._staleFlags) return false;
+  return !!(
+    project._staleFlags[_sceneViewStaleKey(idx)] ||
+    project._staleFlags[_sceneViewStaleKey(idx, role)]
+  );
+}
+
+function _sceneViewState(item, idx, role) {
+  role = _normalizeSceneViewRole(role) || "establishing";
+  var url = _sceneViewOriginalUrl(item, role);
+  var establishingUrl = _sceneViewOriginalUrl(item, "establishing");
+  var loading = !!_assetGenStatus[_assetGenStatusKey("scene", idx, role)];
+  var disabled = role !== "establishing" && !establishingUrl;
+  return {
+    role: role,
+    url: url,
+    done: !!url,
+    missing: !url,
+    stale: _sceneViewIsStale(idx, role),
+    loading: loading,
+    disabled: disabled,
+  };
+}
+
+function _propViews(item) {
+  var views = item && item.views && typeof item.views === "object" ? item.views : {};
+  return views || {};
+}
+
+function _propViewBySlot(item, slot) {
+  slot = _normalizePropViewRole(slot);
+  if (!slot) return null;
+  var views = _propViews(item);
+  var slots = views.slots && typeof views.slots === "object" ? views.slots : {};
+  if (slots[slot]) return slots[slot];
+  if (views[slot]) return views[slot];
+  if ((slot === "side_left" || slot === "side_right") && views.side) return views.side;
+  return null;
+}
+
+function _propViewOriginalUrl(item, slot) {
+  var view = _propViewBySlot(item, slot);
+  var ref = view && view.reference && typeof view.reference === "object" ? view.reference : {};
+  return _firstAssetUrl(ref.currentUrl, ref.lastKnownGoodUrl, view && view.imageUrl, view && view.rawUrl);
+}
+
+function _propCanonicalOriginalUrl(item) {
+  if (!item) return "";
+  var ref = item.reference && typeof item.reference === "object" ? item.reference : {};
+  return _firstAssetUrl(
+    _propViewOriginalUrl(item, "front"),
+    _propViewOriginalUrl(item, "hero"),
+    _propViewOriginalUrl(item, "side"),
+    _propViewOriginalUrl(item, "back"),
+    _propViewOriginalUrl(item, "top"),
+    ref.currentUrl,
+    ref.lastKnownGoodUrl,
+    item.originalUrl,
+    item.rawUrl,
+    item.imageUrl,
+    item.displayUrl
+  );
+}
+
+function _propHasViewSlots(item) {
+  if (!item || !item.views || typeof item.views !== "object") return false;
+  if (item.views.slots && typeof item.views.slots === "object" && Object.keys(item.views.slots).length) return true;
+  return PROP_VIEW_SLOTS.some(function (slot) { return !!_propViewOriginalUrl(item, slot); });
+}
+
+function _markAllSceneViewStale(idx) {
+  if (!project || !project._staleFlags || typeof idx !== "number" || idx < 0) return;
+  SCENE_VIEW_ROLES.forEach(function (role) {
+    project._staleFlags[_sceneViewStaleKey(idx, role)] = true;
+  });
+  delete project._staleFlags[_sceneViewStaleKey(idx)];
+}
+
+function _sceneAssetMatchesStaleDetail(detail) {
+  if (!project || !project.assets || !Array.isArray(project.assets.scenes) || !detail) return false;
+  var item = project.assets.scenes[detail.idx];
+  if (!item) return false;
+  var expectedName = (detail.name || "").toString().trim();
+  return !expectedName || (item.name || "").toString().trim() === expectedName;
+}
+
+function _clearSceneViewStaleAfterWrite(flags, item, idx, role) {
+  if (!flags) return;
+  role = _normalizeSceneViewRole(role) || "establishing";
+  var aggregateKey = _sceneViewStaleKey(idx);
+  if (flags[aggregateKey]) {
+    SCENE_VIEW_ROLES.forEach(function (candidate) {
+      if (candidate === role) return;
+      if (_sceneViewOriginalUrl(item, candidate)) flags[_sceneViewStaleKey(idx, candidate)] = true;
+    });
+  }
+  delete flags[aggregateKey];
+  delete flags[_sceneViewStaleKey(idx, role)];
+}
+
+function _shiftIndexAfterDeletes(idx, deletedIdxs) {
+  var shift = 0;
+  for (var i = 0; i < deletedIdxs.length; i++) {
+    var deleted = deletedIdxs[i];
+    if (idx === deleted) return -1;
+    if (deleted < idx) shift++;
+  }
+  return idx - shift;
+}
+
+function _normalizeDeletedIdxs(deletedIdxs) {
+  var seen = {};
+  return (Array.isArray(deletedIdxs) ? deletedIdxs : [deletedIdxs])
+    .map(function (idx) { return parseInt(idx, 10); })
+    .filter(function (idx) {
+      if (isNaN(idx) || idx < 0 || seen[idx]) return false;
+      seen[idx] = true;
+      return true;
+    })
+    .sort(function (a, b) { return a - b; });
+}
+
+function _reindexKeyAfterDeletes(key, prefix, deletedIdxs) {
+  var match = new RegExp("^" + prefix + "_(\\d+)(.*)$").exec(key);
+  if (!match) return key;
+  var nextIdx = _shiftIndexAfterDeletes(parseInt(match[1], 10), deletedIdxs);
+  if (nextIdx < 0) return "";
+  return prefix + "_" + nextIdx + (match[2] || "");
+}
+
+export function _reindexAssetImageStateAfterDeletes(type, deletedIdxs) {
+  deletedIdxs = _normalizeDeletedIdxs(deletedIdxs);
+  if (!deletedIdxs.length) return;
+  var stalePrefix = "asset_img_" + type;
+  if (project && project._staleFlags) {
+    var nextFlags = {};
+    Object.keys(project._staleFlags).forEach(function (key) {
+      var nextKey = _reindexKeyAfterDeletes(key, stalePrefix, deletedIdxs);
+      if (nextKey) nextFlags[nextKey] = project._staleFlags[key];
+    });
+    project._staleFlags = nextFlags;
+  }
+  var nextStatus = {};
+  Object.keys(_assetGenStatus).forEach(function (key) {
+    var nextKey = _reindexKeyAfterDeletes(key, type, deletedIdxs);
+    if (nextKey) nextStatus[nextKey] = _assetGenStatus[key];
+  });
+  _assetGenStatus = nextStatus;
+}
+
+function _deletedIndexList(indexMap) {
+  return Object.keys(indexMap || {}).map(function (idx) { return parseInt(idx, 10); }).filter(function (idx) { return !isNaN(idx); });
+}
+
+function _sceneNeedsViewSet(item) {
+  if (!item) return false;
+  if (item.imagePrompt) return true;
+  return SCENE_VIEW_ROLES.some(function (role) { return !!_sceneViewOriginalUrl(item, role); });
+}
+
+function _sceneViewDoneCount(item) {
+  if (!_sceneNeedsViewSet(item)) return 0;
+  var done = 0;
+  SCENE_VIEW_ROLES.forEach(function (role) {
+    if (_sceneViewOriginalUrl(item, role)) done++;
+  });
+  return done;
+}
+
+function _sceneViewMissingLabels(item, idx) {
+  if (!_sceneNeedsViewSet(item)) return [];
+  var name = (item.name || "").toString().trim() || ("场景" + (idx + 1));
+  var labels = [];
+  SCENE_VIEW_ROLES.forEach(function (role) {
+    if (!_sceneViewOriginalUrl(item, role)) labels.push(name + "·" + (SCENE_VIEW_LABELS[role] || role));
+  });
+  return labels;
+}
 
 function _assetProjectKey(originId) {
   return originId ? String(originId) : "";
@@ -125,6 +377,11 @@ function _assetHeaderImageState() {
     var type = cat === "characters" ? "char" : cat === "scenes" ? "scene" : "prop";
     (project.assets[cat] || []).forEach(function (item, idx) {
       if (!item) return;
+      if (type === "scene") {
+        done += _sceneViewDoneCount(item);
+        missingLabels = missingLabels.concat(_sceneViewMissingLabels(item, idx));
+        return;
+      }
       if (item.imageUrl) { done++; return; }
       if (item.imagePrompt) {
         var label = (item.name || "").toString().trim() || (_assetTypeLabel(type) + (idx + 1));
@@ -204,6 +461,9 @@ var _ASSET_GENERATED_FIELDS = [
   "reference",
   "imageGeneratedAt",
   "skippedStylize",
+  "views",
+  "viewsVersion",
+  "viewHistory",
 ];
 
 function _assetTypeLabel(type) {
@@ -288,6 +548,7 @@ function _hasAssetImage(type, item) {
   var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
   var panels = item.panels && typeof item.panels === "object" ? item.panels : {};
   if (type === "char" && String(reference.status || "").toLowerCase() === "failed") return false;
+  if (type === "prop" && _propCanonicalOriginalUrl(item)) return true;
   return !!_firstAssetUrl(
     item.imageUrl,
     item.rawUrl,
@@ -1559,7 +1820,7 @@ function _showSceneMenu(anchor, idx) {
         _ctx.markDownstreamStale("asset", { type: "scene", idx: idx, name: _delSceneName });
         project.assets.scenes.splice(idx, 1);
         if (Array.isArray(project.environments)) project.environments.splice(idx, 1);
-        if (project._staleFlags) delete project._staleFlags["asset_img_scene_" + idx];
+        _reindexAssetImageStateAfterDeletes("scene", [idx]);
         _saveAssetsProject();
         renderAssets();
         _showAssetActions();
@@ -1591,22 +1852,51 @@ function _showSceneMenu(anchor, idx) {
   }, 0);
 }
 
+function _sceneViewSlotHtml(item, idx, role) {
+  var state = _sceneViewState(item, idx, role);
+  var originalSrc = state.url;
+  var imgSrc = originalSrc ? _assetVariant(originalSrc, ASSET_CARD_THUMB_W) : "";
+  var zoomSrc = originalSrc ? _assetVariant(originalSrc, ASSET_LIGHTBOX_W) : "";
+  var originalCleanSrc = _assetOriginal(originalSrc);
+  var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
+  var imageClass = imgSrc ? ' cursor-pointer' : '';
+  var badge = state.loading ? "" : state.stale && state.done ? "需更新" : state.missing ? (state.disabled ? "待主视角" : "待生成") : "";
+  var badgeHtml = badge
+    ? '<div class="absolute left-1.5 top-1.5 rounded bg-black/45 px-1.5 py-0.5 text-[9px] font-bold text-white/90">' + escapeHtml(badge) + '</div>'
+    : '';
+  var btnDisabled = state.disabled ? ' disabled aria-disabled="true"' : '';
+  var btnClass = state.disabled
+    ? ' opacity-35 cursor-not-allowed'
+    : ' hover:bg-black/45';
+  var btnTitle = state.disabled
+    ? '先生成主视角'
+    : role === "establishing"
+      ? '重新生成整组场景视图'
+      : '重新生成' + (SCENE_VIEW_LABELS[role] || role);
+  var imgHtml = imgSrc
+    ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" data-scene-view-img="' + escapeHtml(role) + '" />'
+    : '<div class="asset-card-placeholder w-full h-full flex items-center justify-center bg-surface-container" data-img-class="w-full h-full object-cover" data-scene-view-placeholder="' + escapeHtml(role) + '"><span class="material-symbols-outlined text-2xl text-on-surface-variant/20">landscape</span></div>';
+  return '<div class="relative min-h-0 overflow-hidden rounded-lg bg-surface-container-high group/slot' + imageClass + '" data-scene-view-role="' + escapeHtml(role) + '"' + imageAttrs + '>' +
+      imgHtml +
+      '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (state.loading ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
+      badgeHtml +
+      '<div class="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-gradient-to-t from-black/60 to-transparent px-2 pb-1.5 pt-5">' +
+        '<span class="truncate text-[10px] font-bold text-white/90">' + escapeHtml(SCENE_VIEW_LABELS[role] || role) + '</span>' +
+        '<button type="button" class="w-6 h-6 rounded-full bg-black/25 text-white/90 flex items-center justify-center' + btnClass + '" data-action="regen-scene-view" data-scene-view-role="' + escapeHtml(role) + '" title="' + escapeHtml(btnTitle) + '"' + btnDisabled + '><span class="material-symbols-outlined text-[15px]">refresh</span></button>' +
+      '</div>' +
+    '</div>';
+}
+
 function _renderSceneCards(container, items) {
   items.forEach(function (item, idx) {
     var card = document.createElement("div");
     card.dataset.type = "scene";
     card.dataset.idx = idx;
 
-    var originalSrc = item.originalUrl || item.rawUrl || item.imageUrl || '';
-    var imgSrc = item.displayUrl || _assetVariant(originalSrc, ASSET_CARD_DISPLAY_W);
-    var zoomSrc = _assetVariant(originalSrc, ASSET_LIGHTBOX_W);
-    var originalCleanSrc = _assetOriginal(originalSrc);
     var isMain = !!item.isMain || idx === 0;
-    var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
-    var imageClass = imgSrc ? ' cursor-pointer' : '';
-    var imgHtml = imgSrc
-      ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" />'
-      : '<div class="w-full h-full flex items-center justify-center bg-surface-container"><span class="material-symbols-outlined text-4xl text-on-surface-variant/15">landscape</span></div>';
+    var sceneViewsHtml = SCENE_VIEW_ROLES.map(function (role) {
+      return _sceneViewSlotHtml(item, idx, role);
+    }).join("");
 
     var metaTags = '';
     if (item.timeSetting) metaTags += '<span class="inline-flex items-center gap-1 text-[11px] font-semibold text-on-surface-variant"><span class="material-symbols-outlined text-xs">schedule</span>' + escapeHtml(item.timeSetting) + '</span>';
@@ -1618,9 +1908,9 @@ function _renderSceneCards(container, items) {
 
     card.className = "asset-card group bg-surface-container-low rounded-xl overflow-hidden p-1 border border-transparent hover:border-outline-variant/20 transition-all duration-500";
     card.innerHTML =
-      '<div class="relative aspect-[16/9] rounded-xl overflow-hidden -mt-1 -ml-1 -mr-1' + imageClass + '"' + imageAttrs + '>' +
-        imgHtml +
-        '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus["scene_" + idx] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
+      '<div class="relative aspect-[16/9] rounded-xl overflow-hidden -mt-1 -ml-1 -mr-1">' +
+        '<div class="grid grid-cols-2 grid-rows-2 gap-1 h-full bg-surface-container-lowest p-1">' + sceneViewsHtml + '</div>' +
+        '<div class="asset-card-loading absolute inset-0 flex items-center justify-center bg-surface/80 z-10"' + (_assetGenStatus[_assetGenStatusKey("scene", idx)] ? '' : ' hidden') + '><div class="tc-spinner"></div></div>' +
         '<div class="absolute inset-x-0 bottom-0 p-3 pl-5 bg-gradient-to-t from-black/65 via-black/20 to-transparent">' +
           '<div class="flex items-center gap-2">' +
             (isMain ? '<span class="bg-primary/90 text-on-primary px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest">主场景</span>' : '') +
@@ -1667,6 +1957,44 @@ function _resolveOwnerName(ownership) {
   return oid;
 }
 
+function _propViewSlotHtml(item, idx, slot) {
+  var originalSrc = _propViewOriginalUrl(item, slot);
+  var imgSrc = originalSrc ? _assetVariant(originalSrc, ASSET_CARD_THUMB_W) : "";
+  var zoomSrc = originalSrc ? _assetVariant(originalSrc, ASSET_LIGHTBOX_W) : "";
+  var originalCleanSrc = _assetOriginal(originalSrc);
+  var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
+  var label = PROP_VIEW_LABELS[slot] || slot;
+  var placeholderIcon = slot === "top" ? "view_in_ar" : "handyman";
+  var imgHtml = imgSrc
+    ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover/slot:scale-105 transition-transform duration-700" data-prop-view-img="' + escapeHtml(slot) + '" />'
+    : '<div class="asset-card-placeholder w-full h-full flex items-center justify-center bg-surface-container" data-img-class="w-full h-full object-cover" data-prop-view-placeholder="' + escapeHtml(slot) + '"><span class="material-symbols-outlined text-xl text-on-surface-variant/20">' + placeholderIcon + '</span></div>';
+  var badgeHtml = imgSrc ? "" : '<div class="absolute left-1.5 top-1.5 rounded bg-black/35 px-1.5 py-0.5 text-[9px] font-bold text-white/85">待生成</div>';
+  return '<div class="relative min-h-0 overflow-hidden rounded-lg bg-surface-container-high group/slot" data-prop-view-slot="' + escapeHtml(slot) + '"' + imageAttrs + '>' +
+      imgHtml +
+      badgeHtml +
+      '<div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2 pb-1.5 pt-5">' +
+        '<span class="truncate text-[10px] font-bold text-white/90">' + escapeHtml(label) + '</span>' +
+      '</div>' +
+    '</div>';
+}
+
+function _propViewGridHtml(item, idx) {
+  if (!_propHasViewSlots(item)) return "";
+  return '<div class="asset-prop-view-grid mt-3 grid grid-cols-3 grid-rows-2 gap-1 rounded-xl bg-surface-container-lowest p-1 aspect-[3/2]">' +
+    PROP_VIEW_SLOTS.map(function (slot) { return _propViewSlotHtml(item, idx, slot); }).join("") +
+    '</div>';
+}
+
+function _propViewsErrorHtml(item) {
+  var msg = item && (item.viewsError || item.imageLastError);
+  if (!msg) return "";
+  return '<div class="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-[10px] font-medium leading-relaxed text-amber-700" data-prop-views-error>' +
+    '<span class="material-symbols-outlined align-[-3px] mr-1 text-[14px]">warning</span>' +
+    '多视图切分未通过，已保留上一版道具图，可重试生成。' +
+    '<span class="block mt-0.5 text-amber-700/75">' + escapeHtml(String(msg).slice(0, 120)) + '</span>' +
+    '</div>';
+}
+
 function _renderPropCards(container, items) {
   items.forEach(function (item, idx) {
     var card = document.createElement("div");
@@ -1674,7 +2002,9 @@ function _renderPropCards(container, items) {
     card.dataset.type = "prop";
     card.dataset.idx = idx;
 
-    var originalSrc = item.originalUrl || item.rawUrl || item.imageUrl || '';
+    var propViewsHtml = _propViewGridHtml(item, idx);
+    var propViewsErrorHtml = _propViewsErrorHtml(item);
+    var originalSrc = _propCanonicalOriginalUrl(item);
     var imgSrc = item.thumbUrl || _assetVariant(originalSrc, ASSET_CARD_THUMB_W);
     var zoomSrc = _assetVariant(originalSrc, ASSET_LIGHTBOX_W);
     var originalCleanSrc = _assetOriginal(originalSrc);
@@ -1729,8 +2059,10 @@ function _renderPropCards(container, items) {
           tagsHtml +
           '<div class="flex flex-wrap items-center gap-1">' + carriesTagHtml + warnHtml + '</div>' +
         '</div>' +
-        thumbHtml +
+        (propViewsHtml ? '' : thumbHtml) +
       '</div>' +
+      propViewsHtml +
+      propViewsErrorHtml +
       '<div class="asset-desc-wrap mt-3" data-action="edit-asset">' +
         '<p class="asset-desc-text text-[11px] text-on-surface-variant/60 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors">' + escapeHtml(propDesc) + '</p>' +
         '<textarea class="asset-desc-edit hidden w-full text-[11px] text-on-surface-variant leading-relaxed bg-surface-container-lowest border border-outline-variant/20 rounded p-2 mt-1 resize-none focus:outline-none focus:ring-1 focus:ring-primary/30" rows="4">' + escapeHtml(propDesc) + '</textarea>' +
@@ -1773,13 +2105,15 @@ function _cleanupStaleGenStatus() {
   Object.keys(_assetGenStatus).forEach(function (key) {
     var parts = key.split("_");
     var t = parts[0]; var i = parseInt(parts[1], 10);
+    var viewRole = parts[2] || "";
     var catName = cats[t];
     if (!catName) return;
     var list = project.assets[catName];
     if (!list || !list[i]) { delete _assetGenStatus[key]; return; }
     var item = list[i];
     if (t === "char" && item.realPhotoUrl) { delete _assetGenStatus[key]; }
-    else if (t !== "char" && item.imageUrl) { delete _assetGenStatus[key]; }
+    else if (t === "scene" && _sceneViewOriginalUrl(item, viewRole || "establishing")) { delete _assetGenStatus[key]; }
+    else if (t !== "char" && t !== "scene" && item.imageUrl) { delete _assetGenStatus[key]; }
   });
   // Phase 3-B-7：`project._generatingAssets` 不再是权威源，也不再由此函数
   // 维护。如果历史项目 JSON 还带着这个字段，交给 `updateAssetCardImage` 的
@@ -1804,16 +2138,17 @@ function _batchTaskTarget(task) {
   if (typeof target.idx !== "number" && task.extra && task.extra.target && typeof task.extra.target.idx === "number") target.idx = task.extra.target.idx;
   if (!target.type && task.target_type) target.type = task.target_type;
   if (typeof target.idx !== "number" && typeof task.target_idx === "number") target.idx = task.target_idx;
+  if (!target.viewRole && task.extra && task.extra.target && task.extra.target.viewRole) target.viewRole = task.extra.target.viewRole;
   return target;
 }
 
-export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
+export function updateAssetCardImage(type, idx, status, imgUrl, loadingText, viewRole) {
   // 业务状态管理依旧留在本模块；DOM 级渲染在 Phase 3-A 搬到 render_hooks.js。
   // Phase 3-B-7：`project._generatingAssets` 不再是权威源——后端
   // `batch_runner._BATCHES` 才是。此函数因此不再把 flag 写进 project.json
   // （减少和权威源打架的状态副本），loading 只在内存 `_assetGenStatus` 维护。
   // 刷新后由 `reattachActiveBatches()` 从后端权威视图重建 loading 态。
-  var key = type + "_" + idx;
+  var key = _assetGenStatusKey(type, idx, viewRole);
   if (status === "loading") {
     _assetGenStatus[key] = "loading";
   } else {
@@ -1827,7 +2162,7 @@ export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
     }
   }
   if (status === "done") {
-    console.log("[updateAssetCardImage] " + type + "#" + idx + " DONE url=" + (imgUrl || "").slice(0, 80));
+    console.log("[updateAssetCardImage] " + type + "#" + idx + (viewRole ? "/" + viewRole : "") + " DONE url=" + (imgUrl || "").slice(0, 80));
   }
   checkAssetsConfirm();
 
@@ -1838,7 +2173,7 @@ export function updateAssetCardImage(type, idx, status, imgUrl, loadingText) {
     renderUrl = _assetVariant(imgUrl, displayWidth);
     zoomUrl = _assetVariant(imgUrl, ASSET_LIGHTBOX_W);
   }
-  var result = renderAssetCard(type, idx, status, { imgUrl: renderUrl, zoomUrl: zoomUrl, loadingText: loadingText });
+  var result = renderAssetCard(type, idx, status, { imgUrl: renderUrl, zoomUrl: zoomUrl, loadingText: loadingText, viewRole: viewRole });
   if (!result.ok) {
     console.warn("[updateAssetCardImage] grid/card not in DOM, will re-render on re-enter");
     if (status === "done" || status === "error") _pendingAssetRerender = true;
@@ -1882,6 +2217,10 @@ function _assetDisplayUrl(type, item) {
     var charOriginal = item.originalUrl || item.imageUrl || item.pencilUrl || item.realPhotoUrl || item.rawUrl || "";
     return item.displayUrl || _assetVariant(charOriginal, ASSET_CARD_DISPLAY_W);
   }
+  if (type === "prop") {
+    var propOriginal = _propCanonicalOriginalUrl(item);
+    return item.displayUrl || _assetVariant(propOriginal, ASSET_CARD_DISPLAY_W);
+  }
   var original = item.originalUrl || item.imageUrl || item.rawUrl || "";
   return item.displayUrl || _assetVariant(original, ASSET_CARD_DISPLAY_W);
 }
@@ -1912,6 +2251,7 @@ function _assetDownloadUrl(type, item, idx) {
     var state = deriveAssetCardState(item, idx);
     return _firstAssetUrl(state.previewOriginalUrl, state.originalUrl, state.previewImageUrl, state.mainImageUrl);
   }
+  if (type === "prop") return _propCanonicalOriginalUrl(item);
   var reference = item.reference && typeof item.reference === "object" ? item.reference : {};
   return _firstAssetUrl(
     item.originalUrl,
@@ -1987,10 +2327,13 @@ function _syncGeneratedAssetCardsFromProject() {
     var parts = key.split("_");
     var type = parts[0];
     var idx = parseInt(parts[1], 10);
+    var viewRole = parts[2] || "";
     if (!type || isNaN(idx)) return;
-    var url = _assetDisplayUrl(type, _assetItemFor(type, idx));
+    var item = _assetItemFor(type, idx);
+    var url = type === "scene" && viewRole ? _sceneViewOriginalUrl(item, viewRole) : _assetDisplayUrl(type, item);
     if (!url) return;
-    updateAssetCardImage(type, idx, "done", url);
+    updateAssetCardImage(type, idx, "done", url, null, viewRole);
+    if (type === "prop" && _propHasViewSlots(item)) _rerenderAssetGrid("prop");
     updated = true;
   });
   return updated;
@@ -2039,28 +2382,7 @@ export async function _rebuildAssetImagePrompt(type, item) {
   }
 }
 
-/**
- * Phase 3-B-8 · 单卡重新生成 = 单元素 `asset_images` batch。
- *
- * 和"一键生成全部资产"完全共用一条 executor 路径：
- *   - char：executor 内部 Step1（真人图）+ Step2（彩铅）一条龙，`apply_patch_and_save`
- *     把 realPhotoUrl + pencilUrl 一次落盘；刷新页面回来就有图
- *   - scene / prop：单 URL 写 imageUrl
- *
- * 不再自管 `_pendingImageTasks` / `registerServerTask` —— 后端 batch_runner
- * 是权威源，前端只挂 SSE 看进度 + 乐观渲染 UI。
- */
-export async function generateSingleAssetImage(type, idx) {
-  if (!project) return;
-  var originId = project.id;
-  var list = type === "char" ? project.assets.characters
-           : type === "scene" ? project.assets.scenes
-           : project.assets.props;
-  var item = list && list[idx];
-  if (!item) return;
-
-  updateAssetCardImage(type, idx, "loading", null, "正在同步最新提示词…");
-
+async function _persistRebuiltAssetImagePrompt(type, idx, item) {
   var rebuiltPrompt = await _rebuildAssetImagePrompt(type, item);
   if (rebuiltPrompt) {
     item.imagePrompt = rebuiltPrompt;
@@ -2081,10 +2403,101 @@ export async function generateSingleAssetImage(type, idx) {
   } else if (_ctx.saveProject) {
     await _saveAssetsProject();
   }
+  return !!item.imagePrompt;
+}
 
-  updateAssetCardImage(type, idx, "loading");
+async function _regenerateSceneAllViews(idx) {
+  if (!project || !project.id || _assetImagesGenerating) return;
+  var item = _assetItemFor("scene", idx);
+  if (!item) return;
+  var hint = $("assetImgHint");
+  _setAssetImagesGeneratingLocked(true);
+  try {
+    updateAssetCardImage("scene", idx, "loading", null, "正在同步最新提示词…", "establishing");
+    var hasPrompt = await _persistRebuiltAssetImagePrompt("scene", idx, item);
+    if (!hasPrompt) {
+      updateAssetCardImage("scene", idx, "error", null, null, "establishing");
+      showToast("场景缺少可生成的提示词", "warn");
+      return;
+    }
+
+    var establishingTarget = { type: "scene", idx: idx, viewRole: "establishing", force: true };
+    if (hint) _setAssetHeaderHint("正在重新生成场景主视角…", "progress");
+    updateAssetCardImage("scene", idx, "loading", null, null, "establishing");
+    await _runAssetImageBatch(project.id, [establishingTarget], hint, 1);
+    if (_ctx.reloadProjectFromServer) {
+      try { await _ctx.reloadProjectFromServer(); } catch (e) { console.warn("[AssetImg] reload before scene full follow-up failed:", e); }
+    }
+    if (!_sceneViewOriginalUrl(_assetItemFor("scene", idx), "establishing")) {
+      _summarizeAssetImageGeneration(hint);
+      return;
+    }
+
+    var followups = ["reverse", "alt", "topdown"].map(function (role) {
+      return { type: "scene", idx: idx, viewRole: role, force: true };
+    });
+    if (hint) _setAssetHeaderHint("正在重新生成场景反打、侧角与俯视布局…", "progress");
+    followups.forEach(function (target) {
+      updateAssetCardImage(target.type, target.idx, "loading", null, null, target.viewRole);
+    });
+    await _runAssetImageBatch(project.id, followups, hint, followups.length);
+    if (_ctx.reloadProjectFromServer) {
+      try { await _ctx.reloadProjectFromServer(); } catch (e2) { console.warn("[AssetImg] reload after scene full regeneration failed:", e2); }
+    }
+    _summarizeAssetImageGeneration(hint);
+  } finally {
+    _setAssetImagesGeneratingLocked(false);
+  }
+}
+
+/**
+ * Phase 3-B-8 · 单卡重新生成 = 单元素 `asset_images` batch。
+ *
+ * 场景卡顶层刷新和主视角槽刷新都是场景级操作：重写一次 prompt，并强制重生四个视图。
+ * 反打/侧角/俯视布局单槽刷新只用当前 prompt 重生该槽，不改其它视图的 prompt 语义。
+ */
+export async function generateSingleAssetImage(type, idx, viewRole) {
+  if (!project) return;
+  if (type === "scene" && !viewRole) {
+    return _regenerateSceneAllViews(idx);
+  }
+  var originId = project.id;
+  var list = type === "char" ? project.assets.characters
+           : type === "scene" ? project.assets.scenes
+           : project.assets.props;
+  var item = list && list[idx];
+  if (!item) return;
+
+  var sceneViewRole = type === "scene" ? _normalizeSceneViewRole(viewRole) : "";
+  if (type === "scene" && viewRole && !sceneViewRole) return;
+  if (type === "scene" && sceneViewRole === "establishing") {
+    return _regenerateSceneAllViews(idx);
+  }
+  var skipPromptRebuild = type === "scene" && !!sceneViewRole;
+  if (skipPromptRebuild) {
+    if (!item.imagePrompt) { showToast("场景缺少可生成的提示词", "warn"); return; }
+    if (sceneViewRole !== "establishing" && !_sceneViewOriginalUrl(item, "establishing")) {
+      showToast("请先生成主视角", "warn");
+      return;
+    }
+  } else {
+    updateAssetCardImage(type, idx, "loading", null, "正在同步最新提示词…", viewRole);
+    var hasPrompt = await _persistRebuiltAssetImagePrompt(type, idx, item);
+    if (!hasPrompt && type !== "char") {
+      updateAssetCardImage(type, idx, "error", null, null, viewRole);
+      showToast(_assetTypeLabel(type) + "缺少可生成的提示词", "warn");
+      return;
+    }
+  }
+
+  var uiViewRole = sceneViewRole || viewRole;
+  updateAssetCardImage(type, idx, "loading", null, null, uiViewRole);
 
   var batchTarget = { type: type, idx: idx };
+  if (type === "scene" && sceneViewRole) {
+    batchTarget.viewRole = sceneViewRole;
+    batchTarget.force = true;
+  }
   var totalTasks = 1;
   var hint = $("assetImgHint");
 
@@ -2097,7 +2510,7 @@ export async function generateSingleAssetImage(type, idx) {
     }).then(function (startResp) {
       if (!startResp || !startResp.batchId) {
         var errMsg = (startResp && startResp.error) || "未能创建批量任务";
-        updateAssetCardImage(type, idx, "error");
+        updateAssetCardImage(type, idx, "error", null, null, uiViewRole);
         showToast("生成失败：" + _diagnoseApiError(errMsg), "error");
         resolve({ done: 0, failed: 1 });
         return;
@@ -2113,13 +2526,13 @@ export async function generateSingleAssetImage(type, idx) {
     }).catch(function (e) {
       console.error("[AssetImg] single /api/batch/start failed:", e);
       if (e instanceof ApiError && e.errorCode === 'INSUFFICIENT_CREDITS') {
-        updateAssetCardImage(type, idx, "error");
+        updateAssetCardImage(type, idx, "error", null, null, uiViewRole);
         showBillingPaywall(e.billing || null);
         resolve({ done: 0, failed: 1 });
         return;
       }
       var errMsg = ((e && e.message) || e).toString();
-      updateAssetCardImage(type, idx, "error");
+      updateAssetCardImage(type, idx, "error", null, null, uiViewRole);
       showToast("生成失败：" + _diagnoseApiError(errMsg), "error");
       resolve({ done: 0, failed: 1 });
     });
@@ -2241,12 +2654,62 @@ function _collectDefaultAssetImageTargets() {
   ["characters", "scenes", "props"].forEach(function (cat) {
     var type = cat === "characters" ? "char" : cat === "scenes" ? "scene" : "prop";
     (project.assets[cat] || []).forEach(function (item, idx) {
+      if (type === "scene") {
+        _sceneMissingViewRoles(item).forEach(function (role) {
+          targets.push({ type: type, idx: idx, viewRole: role });
+        });
+        return;
+      }
       var needsGen = !item.imageUrl && item.imagePrompt;
       if (!needsGen) return;
       targets.push({ type: type, idx: idx });
     });
   });
   return targets;
+}
+
+function _expandAssetImageTargetsForCurrentState(targets) {
+  var out = [];
+  var seen = {};
+  (targets || []).forEach(function (target) {
+    if (!target || !target.type || typeof target.idx !== "number") return;
+    if (target.type !== "scene") {
+      var key = target.type + "_" + target.idx;
+      if (!seen[key]) { seen[key] = true; out.push(target); }
+      return;
+    }
+    var item = _assetItemFor("scene", target.idx);
+    if (!item) return;
+    var requestedRole = _normalizeSceneViewRole(target.viewRole);
+    var roles = requestedRole ? [requestedRole] : _sceneMissingViewRoles(item);
+    roles.forEach(function (role) {
+      if (role !== "establishing" && !_sceneViewOriginalUrl(item, "establishing")) return;
+      if (_sceneViewOriginalUrl(item, role)) return;
+      var key2 = "scene_" + target.idx + "_" + role;
+      if (!seen[key2]) {
+        seen[key2] = true;
+        out.push({ type: "scene", idx: target.idx, viewRole: role });
+      }
+    });
+  });
+  return out;
+}
+
+function _sceneFollowupTargetsAfterStage(originalTargets) {
+  var sceneIdx = {};
+  (originalTargets || []).forEach(function (target) {
+    if (target && target.type === "scene" && typeof target.idx === "number") sceneIdx[target.idx] = true;
+  });
+  var followups = [];
+  Object.keys(sceneIdx).forEach(function (rawIdx) {
+    var idx = parseInt(rawIdx, 10);
+    var item = _assetItemFor("scene", idx);
+    if (!item || !_sceneViewOriginalUrl(item, "establishing")) return;
+    ["reverse", "alt", "topdown"].forEach(function (role) {
+      if (!_sceneViewOriginalUrl(item, role)) followups.push({ type: "scene", idx: idx, viewRole: role });
+    });
+  });
+  return followups;
 }
 
 function _setAssetImagesGeneratingLocked(locked) {
@@ -2258,15 +2721,9 @@ function _setAssetImagesGeneratingLocked(locked) {
 
 function _summarizeAssetImageGeneration(hint, options) {
   var silent = !!(options && options.silent);
-  var done = 0;
-  var still_missing = 0;
-  if (!project || !project.assets) return;
-  ["characters", "scenes", "props"].forEach(function (cat) {
-    (project.assets[cat] || []).forEach(function (item) {
-      if (item.imageUrl) done++;
-      else if (item.imagePrompt) still_missing++;
-    });
-  });
+  var state = _assetHeaderImageState();
+  var done = state.done;
+  var still_missing = state.missingLabels.length;
   // 完成/缺失/待生成摘要统一由 sync 从 project.assets 静态计算
   // （onFinish 前已 reload，扫描结果即本批结果），刷新后口径一致。
   if (hint) _syncAssetHeaderHint();
@@ -2294,10 +2751,22 @@ async function _runAssetImageTargets(targets, hint) {
   _setAssetImagesGeneratingLocked(true);
   try {
     if (hint) _setAssetHeaderHint("正在批量生成参考图…（gpt-image-1 单张约 20-40 秒，请耐心等待）", "progress");
-    targets.forEach(function (t) {
-      updateAssetCardImage(t.type, t.idx, "loading");
+    var stageTargets = _expandAssetImageTargetsForCurrentState(targets);
+    stageTargets.forEach(function (t) {
+      updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
     });
-    await _runAssetImageBatch(project.id, targets, hint, targets.length);
+    await _runAssetImageBatch(project.id, stageTargets, hint, stageTargets.length);
+    if (_ctx.reloadProjectFromServer) {
+      try { await _ctx.reloadProjectFromServer(); } catch (e) { console.warn("[AssetImg] reload before scene follow-up failed:", e); }
+    }
+    var followups = _sceneFollowupTargetsAfterStage(targets);
+    if (followups.length) {
+      if (hint) _setAssetHeaderHint("正在生成场景反打、侧角与俯视锚图…", "progress");
+      followups.forEach(function (t) {
+        updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
+      });
+      await _runAssetImageBatch(project.id, followups, hint, followups.length);
+    }
     _summarizeAssetImageGeneration(hint);
   } finally {
     _setAssetImagesGeneratingLocked(false);
@@ -2453,10 +2922,22 @@ async function _executeAssetRegenerationReview(targets, reuseRows) {
       _showAssetActions();
     }
     if (targets.length) {
-      targets.forEach(function (t) {
-        updateAssetCardImage(t.type, t.idx, "loading");
+      var stageTargets = _expandAssetImageTargetsForCurrentState(targets);
+      stageTargets.forEach(function (t) {
+        updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
       });
-      await _runAssetImageBatch(project.id, targets, hint, targets.length);
+      await _runAssetImageBatch(project.id, stageTargets, hint, stageTargets.length);
+      if (_ctx.reloadProjectFromServer) {
+        try { await _ctx.reloadProjectFromServer(); } catch (e) { console.warn("[AssetReview] reload before scene follow-up failed:", e); }
+      }
+      var followups = _sceneFollowupTargetsAfterStage(targets);
+      if (followups.length) {
+        if (hint) _setAssetHeaderHint("正在生成场景反打、侧角与俯视锚图…", "progress");
+        followups.forEach(function (t) {
+          updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
+        });
+        await _runAssetImageBatch(project.id, followups, hint, followups.length);
+      }
       _summarizeAssetImageGeneration(hint);
     } else {
       if (hint) _setAssetHeaderHint(reused > 0 ? "已沿用历史参考图" : "没有需要生成的资产", reused > 0 ? "success" : "");
@@ -2583,7 +3064,7 @@ function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
         var errMsg = (startResp && startResp.error) || "未能创建批量任务";
         if (hint) _setAssetHeaderHint("批量启动失败：" + errMsg, "error");
         showToast("批量启动失败：" + _diagnoseApiError(errMsg), "error");
-        mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error"); });
+        mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error", null, null, t.viewRole); });
         resolve({ done: 0, failed: mainTargets.length });
         return;
       }
@@ -2605,7 +3086,7 @@ function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
         if (hint) _setAssetHeaderHint("批量启动失败：" + errMsg, "error");
         showToast("批量启动失败：" + _diagnoseApiError(errMsg), "error");
       }
-      mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error"); });
+      mainTargets.forEach(function (t) { updateAssetCardImage(t.type, t.idx, "error", null, null, t.viewRole); });
       resolve({ done: 0, failed: mainTargets.length });
       });
     });
@@ -2839,7 +3320,7 @@ function _attachAssetImageBatch(opts) {
       var seq = data && data.targetSeq;
       var tgt = (data && data.target) || (typeof seq !== "undefined" ? seqToTarget[seq] : null) || {};
       if (tgt.type && typeof tgt.idx === "number") {
-        updateAssetCardImage(tgt.type, tgt.idx, "loading", null, "生成中…");
+        updateAssetCardImage(tgt.type, tgt.idx, "loading", null, "生成中…", tgt.viewRole);
       }
     },
     onTaskCompleted: function (data) {
@@ -2859,6 +3340,7 @@ function _attachAssetImageBatch(opts) {
       if (typeof tgt.idx !== "number" && typeof patch.idx === "number") tgt.idx = patch.idx;
       var type = tgt.type;
       var idx = tgt.idx;
+      var viewRole = extra.viewRole || tgt.viewRole || patch.viewRole || "";
       var eventKey = _assetBatchEventKey(data, tgt);
       var url = extra.rawUrl || patch.value || patch.imageUrl || "";
       console.log("[AssetImg] task_completed seq=" + seq + " type=" + type + " idx=" + idx + " url=" + (url || "<empty>").slice(0, 60) + " hasExtra=" + Object.keys(extra).join(","));
@@ -2887,7 +3369,7 @@ function _attachAssetImageBatch(opts) {
         }, data && data.serverVersion);
         console.warn("[AssetImg] character reference rejected by panel split; keeping downstream URLs unchanged", extra.lastError || extra.panelsError || "");
         if (isFailedCurrent) {
-          updateAssetCardImage(type, idx, "error");
+          updateAssetCardImage(type, idx, "error", null, null, viewRole);
           renderAssets();
         }
         _refreshHint();
@@ -2927,7 +3409,7 @@ function _attachAssetImageBatch(opts) {
         // 再调一次 archiveOldImage 会把"新 URL"也塞进 history（错）。
         // 用 URL 比对识别这种情况就跳过前端归档。
         var alreadySynced = (item.imageUrl === displayUrl) && (item.rawUrl === url);
-        if (!alreadySynced) {
+        if (!alreadySynced && !(type === "scene" && viewRole && viewRole !== "establishing")) {
           _ctx.archiveOldImage(item, type === "char" ? "character" : type);
         }
         if (type === "char") {
@@ -2938,33 +3420,96 @@ function _attachAssetImageBatch(opts) {
             if (item._pencilFailed) delete item._pencilFailed;
           }
         }
-        item.imageUrl = displayUrl;
-        item.rawUrl = url;
-        item.reference = Object.assign({}, item.reference || {}, {
-          currentUrl: displayUrl,
-          lastKnownGoodUrl: displayUrl,
-          status: extra.referenceStatus || "ready",
-          updatedAt: new Date().toISOString(),
-          styleBibleSignature: extra.styleBibleSignature,
-          styleLockVersion: extra.styleLockVersion,
-          resolvedBackdropColor: extra.resolvedBackdropColor
-        });
+        if (type === "prop" && extra.views && typeof extra.views === "object") {
+          item.views = extra.views;
+          item.viewsVersion = extra.views.version || item.viewsVersion;
+          if (extra.dimensionality) item.dimensionality = extra.dimensionality;
+        }
+        if (type === "prop" && extra.viewsError) {
+          item.viewsError = extra.viewsError;
+          item.viewsErrorAt = new Date().toISOString();
+          item.imageLastError = extra.viewsError;
+          item.imageFailedAt = item.viewsErrorAt;
+        }
+        if (type === "scene" && viewRole) {
+          if (!Array.isArray(item.views)) item.views = [];
+          var viewIndex = item.views.findIndex(function (view) { return _normalizeSceneViewRole(view && view.role) === viewRole; });
+          var viewReference = {
+            currentUrl: displayUrl,
+            lastKnownGoodUrl: displayUrl,
+            status: extra.referenceStatus || "ready",
+            updatedAt: new Date().toISOString(),
+            styleBibleSignature: extra.styleBibleSignature,
+            styleLockVersion: extra.styleLockVersion,
+            resolvedBackdropColor: extra.resolvedBackdropColor
+          };
+          var nextView = Object.assign({}, viewIndex >= 0 ? item.views[viewIndex] : {}, {
+            role: viewRole,
+            imageUrl: displayUrl,
+            rawUrl: url,
+            reference: viewReference,
+            generatedAt: new Date().toISOString()
+          });
+          if (viewIndex >= 0) item.views[viewIndex] = nextView;
+          else item.views.push(nextView);
+          if (viewRole === "establishing") {
+            item.imageUrl = displayUrl;
+            item.rawUrl = url;
+            item.reference = Object.assign({}, item.reference || {}, viewReference);
+          }
+        } else {
+          item.imageUrl = displayUrl;
+          item.rawUrl = url;
+          item.reference = Object.assign({}, item.reference || {}, {
+            currentUrl: displayUrl,
+            lastKnownGoodUrl: displayUrl,
+            status: extra.referenceStatus || "ready",
+            updatedAt: new Date().toISOString(),
+            styleBibleSignature: extra.styleBibleSignature,
+            styleLockVersion: extra.styleLockVersion,
+            resolvedBackdropColor: extra.resolvedBackdropColor
+          });
+        }
         if (extra.assetId) item.assetId = extra.assetId;
         if (extra.fetchStatus) item.fetchStatus = extra.fetchStatus;
-        delete item.imageLastError;
-        delete item.imageFailedAt;
-        if (item.reference) {
-          delete item.reference.lastError;
-          delete item.reference.lastAttemptUrl;
-          delete item.reference.lastFailedAt;
+        if (!(type === "prop" && extra.viewsError)) {
+          delete item.imageLastError;
+          delete item.imageFailedAt;
+          delete item.viewsError;
+          delete item.viewsErrorAt;
+          if (item.reference) {
+            delete item.reference.lastError;
+            delete item.reference.lastAttemptUrl;
+            delete item.reference.lastFailedAt;
+          }
         }
         delete item.panelsError;
         delete item.panelsErrorAt;
-        if (proj._staleFlags) delete proj._staleFlags["asset_img_" + type + "_" + idx];
+        if (proj._staleFlags) {
+          if (type === "scene") _clearSceneViewStaleAfterWrite(proj._staleFlags, item, idx, viewRole || "establishing");
+          else delete proj._staleFlags["asset_img_" + type + "_" + idx];
+        }
+        if (type === "prop" && extra.views && Array.isArray(proj.props) && proj.props[idx]) {
+          proj.props[idx] = Object.assign({}, proj.props[idx], {
+            imageUrl: item.imageUrl,
+            rawUrl: item.rawUrl,
+            reference: item.reference,
+            views: item.views,
+            viewsVersion: item.viewsVersion,
+            dimensionality: item.dimensionality,
+            viewsError: item.viewsError,
+            viewsErrorAt: item.viewsErrorAt,
+            imageLastError: item.imageLastError,
+            imageFailedAt: item.imageFailedAt
+          });
+        }
       }, data && data.serverVersion);
 
       console.log("[AssetImg] writeback isCurrent=" + isCurrent + " displayUrl=" + (displayUrl || "").slice(0, 60));
-      if (isCurrent) updateAssetCardImage(type, idx, "done", displayUrl);
+      if (isCurrent) {
+        updateAssetCardImage(type, idx, "done", displayUrl, null, viewRole);
+        if (type === "prop" && (extra.views || extra.viewsError)) renderAssets();
+      }
       _refreshHint();
     },
     onTaskFailed: function (data) {
@@ -2974,11 +3519,12 @@ function _attachAssetImageBatch(opts) {
       _markAssetBatchFailed(_assetBatchEventKey(data, tgt));
       var type = tgt.type;
       var idx = tgt.idx;
+      var viewRole = extra.viewRole || tgt.viewRole || "";
       var err = (data && data.errorMsg) || "生成失败";
       console.error("[AssetImg] task_failed:", type, idx, err);
       if (type && typeof idx === "number") {
         _markAssetImageFailedLocally(originId, type, idx, err, extra, data && data.serverVersion);
-        updateAssetCardImage(type, idx, "error");
+        updateAssetCardImage(type, idx, "error", null, null, viewRole);
       }
       // 积分不足专门处理：弹一次付费墙、把 hint 改成醒目的提示，避免用户
       // 误以为是 bug 反复点"重新生成"。errorCode 由 batches.ts 的 _emit
@@ -3096,17 +3642,17 @@ export async function reattachActiveBatches(originId) {
       var status = String(t.status || "").toLowerCase();
       if (status === "succeeded" || status === "done" || status === "completed") {
         initialDone++;
-      } else if (status === "failed" || status === "error" || status === "cancelled" || status === "needs_review") {
-        initialFailed++;
-        if (target.type && typeof target.idx === "number") {
-          updateAssetCardImage(target.type, target.idx, "error");
-        }
-      } else if (status === "running" || status === "queued" || status === "pending" || status === "polling" || status === "retry_pending" || status === "upstream_pending") {
-        if (target.type && typeof target.idx === "number") {
-          _assetGenStatus[target.type + "_" + target.idx] = "loading";
-          updateAssetCardImage(target.type, target.idx, "loading", null, "生成中…");
-        }
-      }
+	      } else if (status === "failed" || status === "error" || status === "cancelled" || status === "needs_review") {
+	        initialFailed++;
+	        if (target.type && typeof target.idx === "number") {
+	          updateAssetCardImage(target.type, target.idx, "error", null, null, target.viewRole);
+	        }
+	      } else if (status === "running" || status === "queued" || status === "pending" || status === "polling" || status === "retry_pending" || status === "upstream_pending") {
+	        if (target.type && typeof target.idx === "number") {
+	          _assetGenStatus[_assetGenStatusKey(target.type, target.idx, target.viewRole)] = "loading";
+	          updateAssetCardImage(target.type, target.idx, "loading", null, "生成中…", target.viewRole);
+	        }
+	      }
     });
 
     if (_isTerminalBatchStatus(batchStatus)) {
@@ -3307,6 +3853,16 @@ export function handleAssetAction(e) {
 
   if (action === "scene-more") {
     if (type === "scene") _showSceneMenu(btn, idx);
+    return;
+  }
+
+  if (action === "regen-scene-view") {
+    if (type !== "scene") return;
+    if (_assetImagesGenerating) { showToast("正在批量生成中", "warn"); return; }
+    if (btn.disabled) { showToast("请先生成主视角", "warn"); return; }
+    var viewRole = _normalizeSceneViewRole(btn.dataset.sceneViewRole || "");
+    if (!viewRole) return;
+    generateSingleAssetImage("scene", idx, viewRole);
     return;
   }
 
@@ -3623,7 +4179,7 @@ function _showPropMenu(anchor, idx) {
       showConfirm("删除道具", "确定删除道具「" + _delPropName + "」？", function () {
         _ctx.markDownstreamStale("asset", { type: "prop", idx: idx, name: _delPropName });
         project.assets.props.splice(idx, 1);
-        if (project._staleFlags) delete project._staleFlags["asset_img_prop_" + idx];
+        _reindexAssetImageStateAfterDeletes("prop", [idx]);
         _saveAssetsProject();
         renderAssets();
         _showAssetActions();
@@ -3739,13 +4295,7 @@ function _showCharMenu(anchor, type, idx) {
         }
       }
       project.assets.characters.splice(idx, 1);
-      if (project._staleFlags) {
-        delete project._staleFlags["asset_img_char_" + idx];
-        var _maxCharIdx = project.assets.characters.length;
-        for (var _ci = _maxCharIdx; _ci <= _maxCharIdx + 1; _ci++) {
-          delete project._staleFlags["asset_img_char_" + _ci];
-        }
-      }
+      _reindexAssetImageStateAfterDeletes("char", [idx]);
       _saveAssetsProject();
       renderAssets();
       _showAssetActions();
@@ -4107,6 +4657,21 @@ async function _uploadAssetImage(type, idx, file) {
       return;
     }
     var displayUrl = data.signedUrl || uploadedUrl;
+    if (type === "scene") {
+      var reloaded = false;
+      if (_ctx.reloadProjectFromServer) {
+        try { reloaded = await _ctx.reloadProjectFromServer(); } catch (reloadErr) { console.warn("[AssetUpload] scene reload failed:", reloadErr); }
+      }
+      if (reloaded) {
+        renderAssets();
+        _showAssetActions();
+        _syncAssetHeaderHint();
+        showToast(label + "图上传成功，已保存为主视角", "success");
+      } else {
+        showToast(label + "图上传成功，刷新后可见", "success");
+      }
+      return;
+    }
     if (typeof _ctx.archiveOldImage === "function") _ctx.archiveOldImage(item, type);
     item.rawUrl = uploadedUrl;
     item.imageUrl = uploadedUrl;
@@ -6932,10 +7497,14 @@ export function _removeObsoleteAssets(items) {
     if (item.type === "scene") sceneIdxToRemove[item.idx] = true;
   });
   if (Object.keys(propIdxToRemove).length && project.assets.props) {
+    _reindexAssetImageStateAfterDeletes("prop", _deletedIndexList(propIdxToRemove));
     project.assets.props = project.assets.props.filter(function (_, i) { return !propIdxToRemove[i]; });
+    if (Array.isArray(project.props)) project.props = project.props.filter(function (_, i) { return !propIdxToRemove[i]; });
   }
   if (Object.keys(sceneIdxToRemove).length && project.assets.scenes) {
+    _reindexAssetImageStateAfterDeletes("scene", _deletedIndexList(sceneIdxToRemove));
     project.assets.scenes = project.assets.scenes.filter(function (_, i) { return !sceneIdxToRemove[i]; });
+    if (Array.isArray(project.environments)) project.environments = project.environments.filter(function (_, i) { return !sceneIdxToRemove[i]; });
   }
   _saveAssetsProject();
   renderAssets();
@@ -7016,6 +7585,8 @@ export function _markDownstreamStale(scope, detail) {
     project._staleFlags["assets"] = true;
     _setStaleFlagReasonForProject(project, "assets", "script_changed");
   }
+  var localSceneAssetStale = scope === "asset" && detail && detail.type === "scene" && typeof detail.idx === "number";
+  if (localSceneAssetStale && _sceneAssetMatchesStaleDetail(detail)) _markAllSceneViewStale(detail.idx);
   apiPost("/api/orchestration/compute-stale", {
     scope: scope,
     detail: detail,
@@ -7023,6 +7594,7 @@ export function _markDownstreamStale(scope, detail) {
   }).then(function (resp) {
     if (resp.staleFlags) {
       _applyServerStaleFlagsToProject(project, ["asset_img_", "storyboard_", "tail_frame_"], resp.staleFlags);
+      if (localSceneAssetStale && _sceneAssetMatchesStaleDetail(detail)) _markAllSceneViewStale(detail.idx);
       Object.keys(resp.staleFlags).forEach(function (k) {
         // Managed prefixes were mirrored above; other stale families keep their additive semantics.
         if (/^(asset_img_|storyboard_|tail_frame_)/.test(k)) return;
@@ -7039,7 +7611,10 @@ export function _markDownstreamStale(scope, detail) {
 
 export function _markDownstreamStaleFallback(scope, detail) {
   if (scope === "asset") {
-    project._staleFlags["asset_img_" + detail.type + "_" + detail.idx] = true;
+    if (detail && detail.type === "scene") {
+      if (_sceneAssetMatchesStaleDetail(detail)) _markAllSceneViewStale(detail.idx);
+    }
+    else project._staleFlags["asset_img_" + detail.type + "_" + detail.idx] = true;
   } else if (scope === "shot") {
     project._staleFlags["shot_prompt_" + detail.idx] = true;
   } else if (scope === "script") {

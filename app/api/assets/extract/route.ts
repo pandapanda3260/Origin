@@ -31,6 +31,7 @@ import {
 import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { injectWorldTemplateIntoAssets, normalizeAssetMatchKey } from '@/lib/world-asset-injection';
 import { beginAssetExtract, progressAssetExtract, endAssetExtract } from '@/lib/assets-extract-inflight';
+import { normalizePropDimensionality } from '@/lib/prop-views';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -308,6 +309,7 @@ export async function POST(req: NextRequest) {
     }));
     parsed.props = parsed.props.map((p: any) => ({
       ...p,
+      dimensionality: normalizePropDimensionality(p.dimensionality, p),
       imagePrompt: p.imagePrompt || buildPropPrompt(p, styleBible),
     }));
 
@@ -505,6 +507,9 @@ const GENERATED_ASSET_FIELDS = [
   'reference',
   'imageGeneratedAt',
   'skippedStylize',
+  'views',
+  'viewsVersion',
+  'viewHistory',
 ];
 
 function nonEmptyAssetValue(value: any): boolean {
@@ -550,7 +555,7 @@ const IMAGE_RELEVANT_FIELDS: Record<PreserveAssetKind, string[]> = {
                'imagePrompt', 'description', 'tags', 'isCrowd', 'crowdSize'],
   scenes: ['name', 'description', 'location', 'timeSetting', 'weather', 'lighting',
            'atmosphere', 'elements', 'imagePrompt'],
-  props: ['name', 'propType', 'features', 'material', 'imagePrompt'],
+  props: ['name', 'propType', 'features', 'material', 'dimensionality', 'imagePrompt'],
 };
 
 function _stableStringify(value: any): string {

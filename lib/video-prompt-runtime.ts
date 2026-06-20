@@ -7,9 +7,11 @@ import {
   cleanDialogueCharCountFromText,
   type ReferenceManifestItem,
 } from './video-reference-manifest';
+import type { SceneViewRole } from './scene-views';
 
 export type VideoReferenceImage = {
   role: 'first_frame' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
+  viewRole?: SceneViewRole;
   path: string;
   label: string;
   sourceUrl?: string;
@@ -149,7 +151,8 @@ export function buildIndependentReferencePromptBlock(refs: VideoReferenceImage[]
   if (!refs.length) return '';
   const manifestRefs: ReferenceManifestItem[] = refs.map((ref, idx) => ({
     imageNo: idx + 1,
-    role: ref.role === 'storyboard_sketch' || ref.role === 'previous_tail' ? 'first_frame' : ref.role,
+	    role: ref.role === 'storyboard_sketch' || ref.role === 'previous_tail' ? 'first_frame' : ref.role,
+	    viewRole: ref.viewRole,
     assetId: ref.assetId,
     assetName: ref.assetName,
     label: ref.label,
@@ -542,7 +545,8 @@ function buildIndependentStyleBlock(refCount: number): string {
     `  · Image 1 若为 first frame，视频必须从该彩色首帧自然运动起来，开场构图和主体不能突变\n` +
     `  · 若存在 target ending frame，视频最后一帧必须逐步接近它的构图、角色位置、动作状态和光照\n` +
     `  · 角色严格匹配对应 character reference；非人/拟人角色绝对不能画成真人\n` +
-    `  · 场景、道具只参考其指定图片，保持全彩电影级真人画质\n` +
+	    `  · 场景、道具只参考其指定图片，保持全彩电影级真人画质\n` +
+	    `  · 若某张 scene reference 标记为 topdown_layout_anchor，它只锁定空间布局和相对方位，最终视频不得变成俯视图或平面图\n` +
     `  · 画面中严禁出现参考图 UI、网格、黑条、缩略图条、边框、说明文字或字幕\n\n`
   );
 }

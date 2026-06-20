@@ -8,6 +8,7 @@ import {
 import { postJsonWithProxySupport } from './proxy-fetch';
 import { getExternalEnvValue } from './env';
 import type { FrameImageGenerationPlan, FrameReference, FrameType } from './frame-image-plan';
+import { isPrimarySceneRef, isTopdownSceneRef } from './scene-views';
 import type { TokenUsageContext } from './token-usage';
 
 export type FrameConsistencyGrade = 'pass' | 'warn' | 'fail';
@@ -108,7 +109,7 @@ function panelRank(ref: FrameReference): number {
 
 export function selectFrameConsistencyReferences(plan: FrameImageGenerationPlan): FrameReference[] {
   const refs = plan.referenceManifest
-    .filter((ref) => ref.delivery === 'image' && ref.localPath)
+    .filter((ref) => ref.delivery === 'image' && ref.localPath && !isTopdownSceneRef(ref))
     .sort((a, b) => (a.imageNo || 999) - (b.imageNo || 999));
   const selected: FrameReference[] = [];
   const usedKeys = new Set<string>();
@@ -134,7 +135,7 @@ export function selectFrameConsistencyReferences(plan: FrameImageGenerationPlan)
     add(primaryCharacterRefs.find((ref) => ref.panel === 'side' || ref.panel === 'back'));
   }
 
-  add(refs.find((ref) => ref.role === 'scene'));
+  add(refs.find((ref) => isPrimarySceneRef(ref)));
   add(refs.find((ref) => ref.role === 'prop'));
   add(refs.find((ref) => ref.role === 'crowd'));
 

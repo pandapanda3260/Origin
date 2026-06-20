@@ -26,6 +26,7 @@ import {
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { buildVideoReferenceManifest } from '@/lib/reference-matcher';
+import { isPrimarySceneRef } from '@/lib/scene-views';
 import { buildReferenceBriefLine, resolveGenerationDurationSec } from '@/lib/video-reference-manifest';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
 import {
@@ -169,7 +170,7 @@ export async function POST(req: NextRequest) {
     const firstFrameItem = manifestInImageOrder.find((ref) => ref.role === 'first_frame' && ref.localPath);
     referenceImagePath = firstFrameItem?.localPath || (resolveLocalImagePath(firstFrameUrl, user.id) || undefined);
     referenceImageRole = referenceImagePath ? 'first_frame' : undefined;
-    sceneReferencePath = manifestInImageOrder.find((ref) => ref.role === 'scene' && ref.localPath)?.localPath;
+    sceneReferencePath = manifestInImageOrder.find((ref) => isPrimarySceneRef(ref) && ref.localPath)?.localPath;
     characterReferencePaths = manifestInImageOrder
       .filter((ref) => ref.role === 'character' && ref.localPath)
       .map((ref) => ref.localPath as string);
@@ -218,8 +219,9 @@ export async function POST(req: NextRequest) {
 	      ? manifestInImageOrder
 	          .filter((ref) => ref.localPath)
           .map((ref) => ({
-            role: ref.role,
-            path: ref.localPath as string,
+	            role: ref.role,
+	            viewRole: ref.viewRole,
+	            path: ref.localPath as string,
             sourceUrl: ref.url,
             assetId: ref.assetId,
             assetName: ref.assetName,

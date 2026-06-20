@@ -11,6 +11,7 @@ import { mutateCharacterLock } from '@/lib/character-consistency';
 import { getDataDir } from '@/lib/runtime-paths';
 import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
 import { isAnonymousCrowdAsset } from '@/lib/crowd-character';
+import { applySceneViewWrite } from '@/lib/scene-views';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -59,6 +60,7 @@ function buildAssetUploadTarget(form: FormData, assetRef: string): AssetUploadTa
   const topKey = type === 'char' ? 'characters' : type === 'scene' ? 'environments' : 'props';
   const kind = type === 'char' ? 'character' : type === 'scene' ? 'scene' : 'prop';
   const stage = type === 'char' ? 'asset_character' : type === 'scene' ? 'asset_scene' : 'asset_prop';
+  const baseAssetRef = assetRef || `${cat}[${idx >= 0 ? idx : 0}]`;
   return {
     type,
     idx,
@@ -66,11 +68,25 @@ function buildAssetUploadTarget(form: FormData, assetRef: string): AssetUploadTa
     topKey,
     kind,
     stage,
-    assetRef: assetRef || `${cat}[${idx >= 0 ? idx : 0}]`,
+    assetRef: type === 'scene' && !/\.views\./.test(baseAssetRef)
+      ? `${cat}[${idx >= 0 ? idx : 0}].views.establishing`
+      : baseAssetRef,
   };
 }
 
 function withUploadedReference(asset: any, url: string, imageId: string, type: AssetUploadTarget['type']) {
+  if (type === 'scene') {
+    const next = applySceneViewWrite(asset, {
+      role: 'establishing',
+      imageUrl: url,
+      rawUrl: url,
+      assetId: imageId,
+      referenceStatus: 'ready',
+      invalidateOtherViews: true,
+    });
+    delete next._pencilFailed;
+    return next;
+  }
   const next = {
     ...(asset || {}),
     rawUrl: url,

@@ -48,6 +48,7 @@
     "test:tail-frame-delete-no-resurrect": "node scripts/test-tail-frame-delete-no-resurrect.js",
     "test:tail-chain": "node scripts/test-tail-chain-contract.js",
     "test:frame-image-plan": "node scripts/test-frame-image-plan.js",
+    "test:scene-views": "node scripts/test-scene-views.js",
     "test:llm-background-mode": "node scripts/test-llm-background-mode.js",
     "test:first-frame-edit-draft": "tsx scripts/test-first-frame-edit-draft.ts",
     "test:first-frame-rewrite-rate-limit": "tsx scripts/test-first-frame-rewrite-rate-limit.ts",

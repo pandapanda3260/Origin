@@ -29,12 +29,15 @@ export type ImageGenInput = {
   prompt: string;
   size?: '1024x1024' | '1024x1536' | '1536x1024' | '512x512' | '512x768' | '768x512';
   style?: 'natural' | 'vivid' | 'pencil' | 'photographic';
+  storageStyle?: string;
   quality?: 'low' | 'medium' | 'high' | 'auto' | 'standard' | 'hd';
   styleLockApplied?: boolean;
   styleBackdropColor?: string;
   imageAuditMetadata?: Record<string, any>;
   // 用于持久化分类
   kind: 'character' | 'scene' | 'prop' | 'storyboard' | 'other';
+  sceneViewRole?: 'establishing' | 'reverse' | 'alt' | 'topdown';
+  propDimensionality?: 'volumetric' | 'flat';
   // 角色生成时区分人 / 非人（如海鲜拟人、机甲、动物）。
   // 默认 'human'：走"白底+真人摄影+三视图"风格；
   // 'non-human' 时换成"白底+实物写实+保留生物形态"风格，避免把蟹盾画成真人。
@@ -257,7 +260,7 @@ export async function generateImage(user: UserRow, input: ImageGenInput): Promis
     width,
     height,
     finalPrompt.slice(0, 5000),
-    input.style || null,
+    input.storageStyle || input.style || null,
     input.correlationId || null,
   );
 
@@ -894,7 +897,7 @@ function isPngBuffer(buffer: Buffer): boolean {
 function forceStyleSuffix(
   kind: ImageGenInput['kind'],
   entityType: ImageGenInput['entityType'] = 'human',
-  opts: Pick<ImageGenInput, 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode'> = {},
+  opts: Pick<ImageGenInput, 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode' | 'sceneViewRole' | 'propDimensionality'> = {},
 ): string {
   if (kind === 'character') {
     const styleLocked = !!opts.styleLockApplied;
@@ -1013,6 +1016,47 @@ function forceStyleSuffix(
     ].join('\n');
   }
   if (kind === 'scene') {
+    const sceneViewRole = opts.sceneViewRole || 'establishing';
+    if (sceneViewRole === 'reverse') {
+      return [
+        '=== MANDATORY SCENE REVERSE VIEW RULES (must follow) ===',
+        'Style: photorealistic location photography, cinematic but natural production reference quality.',
+        'Layout: ONE single continuous image of ONE location. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+        'Camera: reverse angle / 180-degree counter-view of the same physical location from the establishing scene reference. Keep the same entrances, walls, floor, ceiling, furniture/equipment, materials, lighting family, time of day, and color palette.',
+        'Purpose: this is an alternate camera-angle reference for the same scene, not a new room and not a montage.',
+        'No people / no human figures.',
+        'STRICTLY NOT allowed: changing the location identity, inventing a different room, mirrored layout that contradicts the reference, illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+        'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
+        'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
+      ].join('\n');
+    }
+    if (sceneViewRole === 'alt') {
+      return [
+        '=== MANDATORY SCENE ALTERNATE VIEW RULES (must follow) ===',
+        'Style: photorealistic location photography, cinematic but natural production reference quality.',
+        'Layout: ONE single continuous image of ONE location. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+        'Camera: side-angle / detail-friendly alternate view of the same physical location from the establishing scene reference. Show key spatial anchors, signature materials, major furniture/equipment, entrances/exits, and usable foreground/midground depth.',
+        'Purpose: this is an alternate camera-angle reference for the same scene, useful for close-ups or side angles; keep the same location identity and spatial relationships.',
+        'No people / no human figures.',
+        'STRICTLY NOT allowed: changing the location identity, inventing a different room, mirrored layout that contradicts the reference, illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+        'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
+        'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
+      ].join('\n');
+    }
+    if (sceneViewRole === 'topdown') {
+      return [
+        '=== MANDATORY SCENE TOP-DOWN LAYOUT ANCHOR RULES (must follow) ===',
+        'Style: photorealistic but readable top-down / high overhead location reference, production design layout anchor. Keep materials, color palette, lighting family, and scene identity consistent with the establishing scene reference.',
+        'Layout: ONE single continuous top-down view of ONE location. NO panels, NO split-screen, NO grid, NO collage, NO border, NO inset images.',
+        'Camera: top-down / overhead floor-plan-like view showing the stable spatial layout, entrances/exits, walls, floor zones, key furniture/equipment, large props, and movement areas. Make relative positions and orientation clear.',
+        'Purpose: this image is a spatial layout anchor for later video generation. It is NOT the final camera angle; it only locks the layout and relative placement.',
+        'No people / no human figures.',
+        'CRITICAL: do not mirror or rearrange the establishing scene. Maintain the same physical layout and main object relationships.',
+        'STRICTLY NOT allowed: blueprint line art, schematic-only drawing, map labels, measurement text, illustration, anime, cartoon, 3D render, painting, sketch, concept art.',
+        'Text/signage policy: by default, no readable text, signage, labels, captions, logos, or UI. Only if the user prompt explicitly requests specific visible words/signage, render those exact requested words only; do not invent any extra text.',
+        'STRICTLY NOT allowed: watermark, unsolicited logo, captions, panel labels, frames, UI, grid lines, or multi-panel layout.',
+      ].join('\n');
+    }
     // 场景：单张主环境参考图。
     // 视频阶段已有首帧/尾帧负责镜头级构图；场景资产只负责稳定空间、
     // 色调、光照、材质，不再生成多格 sheet，避免视频模型误读分屏。
@@ -1030,6 +1074,26 @@ function forceStyleSuffix(
     ].join('\n');
   }
   if (kind === 'prop') {
+    if (opts.propDimensionality === 'volumetric') {
+      return [
+        '=== MANDATORY PROP SIX-VIEW REFERENCE SHEET RULES (must follow) ===',
+        'Style: photorealistic product reference photography, sharp focus, high detail, physically plausible material texture.',
+        'Canvas: ONE 3:2 horizontal canvas arranged as a clean 3 columns × 2 rows reference sheet. Each cell is square and isolated by wide pure white negative space; do NOT draw divider lines, borders, labels, captions, arrows, UI, or text.',
+        'Background: PURE WHITE (#FFFFFF) seamless studio backdrop in every cell. Keep generous white margin around the object in every cell. The object must never touch or cross a cell edge.',
+        'Cell layout, fixed order:',
+        '  · Top-left: HERO 3/4 front view, the most recognizable identity view.',
+        '  · Top-center: FRONT view, straight-on orthographic-like product view.',
+        '  · Top-right: BACK view, same object from the rear.',
+        '  · Bottom-left: LEFT SIDE view, strict side profile.',
+        '  · Bottom-center: RIGHT SIDE view, strict opposite side profile.',
+        '  · Bottom-right: TOP view / overhead view.',
+        'CRITICAL: all six cells show the exact SAME SINGLE PROP — same shape, scale, material, color, wear marks, logos/symbols if explicitly requested, and distinctive details. Only the camera angle changes.',
+        'CRITICAL: render exactly one copy of the prop per cell. Do not create a collage, pile, duplicate set, or multiple variants inside any cell.',
+        'Lighting: even soft studio lighting, readable silhouette and material detail, no dramatic shadows that hide shape.',
+        'STRICTLY NOT allowed: illustration, anime, cartoon, 3D render, painting, sketch.',
+        'STRICTLY NOT allowed: any text, watermark, unsolicited logo, labels, panel names, frame, border, grid lines, or UI.',
+      ].join('\n');
+    }
     return [
       '=== MANDATORY STYLE OVERRIDE (must follow) ===',
       'Style: photorealistic product photography, studio shot, sharp focus, high detail.',
@@ -1044,7 +1108,7 @@ function forceStyleSuffix(
 }
 
 export function composeFinalImagePrompt(
-  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType' | 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode'>,
+  input: Pick<ImageGenInput, 'prompt' | 'style' | 'kind' | 'entityType' | 'styleLockApplied' | 'styleBackdropColor' | 'characterAssetMode' | 'propDimensionality'>,
 ): string {
   if (input.style === 'pencil') {
     const PENCIL_PREFIX = [
