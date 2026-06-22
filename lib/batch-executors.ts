@@ -1219,12 +1219,23 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
 
   let referenceImagePath: string | undefined;
   let referenceImagePaths: string[] | undefined;
+  let sceneViewReferenceRoles: string[] = [];
+  let sceneViewReferenceDependency = type === 'scene' && sceneViewRole === 'establishing' ? 'none' : undefined;
   if (type === 'scene' && sceneViewRole && sceneViewRole !== 'establishing') {
     const sceneRefs = sceneViewReferencePathsForRole(item, sceneViewRole, ctx.user.id);
     referenceImagePaths = sceneRefs.length ? sceneRefs : undefined;
     referenceImagePath = sceneRefs[0] || undefined;
     if (!referenceImagePath) {
       throw new Error(`scene_view_missing_establishing:${cat}[${idx}].views.${sceneViewRole}`);
+    }
+    sceneViewReferenceRoles = ['establishing'];
+    if ((sceneViewRole === 'reverse' || sceneViewRole === 'alt') && referenceImagePaths?.[1]) {
+      sceneViewReferenceRoles.push('topdown');
+      sceneViewReferenceDependency = 'topdown_ready';
+    } else if (sceneViewRole === 'reverse' || sceneViewRole === 'alt') {
+      sceneViewReferenceDependency = 'degraded_no_topdown';
+    } else {
+      sceneViewReferenceDependency = 'establishing_only';
     }
   }
 
@@ -1252,6 +1263,8 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor || null,
       styleLockVersion: styleReferenceMeta.styleLockVersion,
       sceneViewReferenceCount: referenceImagePaths?.length || (referenceImagePath ? 1 : 0),
+      sceneViewReferenceRoles,
+      sceneViewReferenceDependency,
     },
     referenceImagePaths,
   };
@@ -1275,6 +1288,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
         user: ctx.user,
         viewRole: sceneViewRole,
         establishingImagePath: referenceImagePath,
+        layoutAnchorImagePath: sceneViewRole === 'reverse' || sceneViewRole === 'alt' ? referenceImagePaths?.[1] : undefined,
         candidateImagePath,
         sceneName: item?.name,
         scenePrompt: reusablePrompt,

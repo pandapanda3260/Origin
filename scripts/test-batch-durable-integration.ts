@@ -34,6 +34,7 @@ async function main() {
     registerExecutor,
     resolveTaskStartTransitionConflict,
   } = await import('../lib/batches');
+  const { writeSystemConfig } = await import('../lib/system-config');
   const {
     finalizeBatchFromTasks,
     taskChargeRef,
@@ -173,6 +174,85 @@ async function main() {
     )
     .get(ok.batchId) as any;
   assert.equal(okCharges.c, 0);
+
+  async function runSceneViewGuardSmoke(opts: {
+    concurrency: number;
+    projectId: string;
+    targets: any[];
+    failTopdown?: boolean;
+  }) {
+    writeSystemConfig('global_image_concurrency_limit', opts.concurrency);
+    const started: string[] = [];
+    registerExecutor('asset_images', async (ctx) => {
+      const role = String(ctx.target?.viewRole || '');
+      started.push(`${ctx.target?.idx}:${role}`);
+      if (role === 'topdown') {
+        await sleep(30);
+        if (opts.failTopdown) throw new Error('planned topdown failure');
+      }
+      return {
+        resultUrl: `/fake/${ctx.target?.idx}-${role || 'asset'}.png`,
+        extra: { idx: ctx.target?.idx, viewRole: role },
+      };
+    });
+    const run = createBatch({
+      user,
+      batchType: 'asset_images',
+      projectId: opts.projectId,
+      targets: opts.targets,
+    });
+    const snap = await waitForBatch(getBatchSnapshot, run.batchId);
+    return { snap, started };
+  }
+
+  const oldSceneTargets = [
+    { type: 'scene', idx: 0, viewRole: 'reverse' },
+    { type: 'scene', idx: 0, viewRole: 'alt' },
+    { type: 'scene', idx: 0, viewRole: 'topdown' },
+  ];
+  const guardedSerial = await runSceneViewGuardSmoke({
+    concurrency: 1,
+    projectId: 'project-scene-view-guard-serial',
+    targets: oldSceneTargets,
+  });
+  assert.equal(guardedSerial.snap.status, 'completed');
+  assert.deepEqual(guardedSerial.started, ['0:topdown', '0:reverse', '0:alt']);
+
+  const guardedTwoWide = await runSceneViewGuardSmoke({
+    concurrency: 2,
+    projectId: 'project-scene-view-guard-two-wide',
+    targets: oldSceneTargets,
+  });
+  assert.equal(guardedTwoWide.snap.status, 'completed');
+  assert.equal(guardedTwoWide.started[0], '0:topdown');
+  assert.deepEqual(new Set(guardedTwoWide.started.slice(1)), new Set(['0:reverse', '0:alt']));
+
+  const guardedMultiScene = await runSceneViewGuardSmoke({
+    concurrency: 2,
+    projectId: 'project-scene-view-guard-multi',
+    targets: [
+      { type: 'scene', idx: 0, viewRole: 'reverse' },
+      { type: 'scene', idx: 1, viewRole: 'reverse' },
+      { type: 'scene', idx: 0, viewRole: 'topdown' },
+      { type: 'scene', idx: 1, viewRole: 'topdown' },
+      { type: 'scene', idx: 0, viewRole: 'alt' },
+      { type: 'scene', idx: 1, viewRole: 'alt' },
+    ],
+  });
+  assert.equal(guardedMultiScene.snap.status, 'completed');
+  assert.deepEqual(new Set(guardedMultiScene.started.slice(0, 2)), new Set(['0:topdown', '1:topdown']));
+
+  const topdownFailed = await runSceneViewGuardSmoke({
+    concurrency: 1,
+    projectId: 'project-scene-view-guard-topdown-failed',
+    targets: oldSceneTargets,
+    failTopdown: true,
+  });
+  assert.equal(topdownFailed.snap.status, 'partial');
+  assert.deepEqual(topdownFailed.started, ['0:topdown', '0:reverse', '0:alt']);
+  assert.equal(topdownFailed.snap.tasks.filter((task: any) => task.status === 'completed').length, 2);
+  assert.equal(topdownFailed.snap.tasks.filter((task: any) => task.status === 'failed').length, 1);
+  writeSystemConfig('global_image_concurrency_limit', 3);
 
   registerExecutor('storyboard_images', async () => {
     throw new Error('planned failure');

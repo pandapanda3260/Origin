@@ -627,6 +627,32 @@ function _concurrencyFor(batchType: string): number {
   return 3;
 }
 
+function blockedAssetSceneViewTaskIds(batchId: string, batchType: string): string[] {
+  if (batchType !== 'asset_images') return [];
+  const rows = getDb()
+    .prepare<{ batchId: string }, { id: string }>(
+      `SELECT angle.id
+         FROM batch_tasks angle
+        WHERE angle.batch_id = @batchId
+          AND angle.task_type = 'asset_images'
+          AND angle.status = 'queued'
+          AND json_extract(angle.target_json, '$.type') = 'scene'
+          AND json_extract(angle.target_json, '$.viewRole') IN ('reverse', 'alt')
+          AND EXISTS (
+            SELECT 1
+              FROM batch_tasks topdown
+             WHERE topdown.batch_id = angle.batch_id
+               AND topdown.task_type = angle.task_type
+               AND topdown.status IN ('queued', 'running')
+               AND json_extract(topdown.target_json, '$.type') = 'scene'
+               AND json_extract(topdown.target_json, '$.viewRole') = 'topdown'
+               AND CAST(json_extract(topdown.target_json, '$.idx') AS TEXT) = CAST(json_extract(angle.target_json, '$.idx') AS TEXT)
+          )`,
+    )
+    .all({ batchId });
+  return rows.map((row) => String(row.id || '')).filter(Boolean);
+}
+
 function _envInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name] || process.env[`ORIGIN_${name}`];
   const n = Number(raw);
@@ -1508,12 +1534,14 @@ export async function runBatch(opts: {
   await new Promise<void>((resolveAll) => {
     const tryNext = () => {
       while (running < concurrency) {
+        const excludeIds = blockedAssetSceneViewTaskIds(opts.batchId, opts.batchType);
         const t = claimNextTask({
           runnerId: BATCH_RUNNER_ID,
           batchId: opts.batchId,
           taskTypes: [opts.batchType],
           statuses: ['queued'],
           leaseMs: BATCH_TASK_LEASE_MS,
+          excludeIds,
         });
         if (!t) break;
         running++;

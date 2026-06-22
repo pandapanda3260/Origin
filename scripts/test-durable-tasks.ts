@@ -70,6 +70,16 @@ async function main() {
   assert.equal(claimed.id, 'task-upstream-stale');
   assert.equal(claimed.status, 'upstream_pending');
 
+  insertTask.run('task-exclude-a', batchId, 6, 'generation', 30, 'queued', null, null, null);
+  insertTask.run('task-exclude-b', batchId, 7, 'generation', 20, 'queued', null, null, null);
+  const claimedWithExclude = claimNextTask({
+    runnerId: 'runner-claim-exclude',
+    nowMs: Date.parse('2026-01-01T00:00:01.500Z'),
+    taskTypes: ['generation'],
+    excludeIds: ['task-exclude-a'],
+  }) as any;
+  assert.equal(claimedWithExclude.id, 'task-exclude-b', 'claimNextTask should skip excluded eligible tasks');
+
   transitionTaskStatus({
     taskId: 'task-run',
     from: 'queued',

@@ -188,10 +188,11 @@ const SYSTEM_CARDS: SystemCardSeed[] = [
     priority: 10,
     tags: ['stage:asset_images', 'scene_view_quality'],
     data: {
-      content: '评估 reverse / alt / topdown 时，只判断候选图是否能作为 establishing 的同一物理空间视图使用，不评价美术好坏。',
+      content: '评估 reverse / alt / topdown 时，只判断候选图是否能作为 establishing 的同一物理空间视图使用；有 topdown 布局锚时必须利用它检查相对位置和朝向，不评价美术好坏。',
       hardRules: [
         '同风格、同色调、同题材不等于同一空间；必须能追踪核心空间锚点。',
         '至少检查中心物、入口/出口、台阶/墙体/地面区域、大型道具、主轴线或朝向中的多个稳定锚点。',
+        '当评分输入包含 topdown 布局锚时，reverse / alt 候选图里的中心物、入口、主轴线、地面区域和大型结构必须能被该俯视布局解释。',
         'reverse 必须像同一空间的反打/回看，不得只是另一个类似广场或房间。',
         'alt 必须像同一空间的侧角/细节机位，不得改掉关键入口、中心物和大结构。',
         'topdown 必须是可读的俯视/高机位布局锚，不是普通概念图、眼平图或装饰性插画。',

@@ -134,17 +134,22 @@ export function claimNextTask(opts: {
   taskTypes?: string[];
   batchId?: string;
   statuses?: DurableTaskStatus[];
+  excludeIds?: string[];
 }) {
   const db = getDb();
   const at = nowIso(opts.nowMs);
   const lease = nowIso((opts.nowMs ?? Date.now()) + (opts.leaseMs ?? DEFAULT_TASK_LEASE_MS));
   const taskTypes = (opts.taskTypes || []).map((s) => String(s).trim()).filter(Boolean);
+  const excludeIds = Array.from(new Set((opts.excludeIds || []).map((s) => String(s).trim()).filter(Boolean)));
   const statuses = (opts.statuses && opts.statuses.length ? opts.statuses : ['queued', 'retry_pending', 'running', 'upstream_pending'])
     .map((status) => parseStatus(status));
   const taskTypeSql = taskTypes.length
     ? `AND task_type IN (${taskTypes.map(() => '?').join(',')})`
     : '';
   const batchSql = opts.batchId ? 'AND batch_id = ?' : '';
+  const excludeSql = excludeIds.length
+    ? `AND id NOT IN (${excludeIds.map(() => '?').join(',')})`
+    : '';
   const sql = `
     UPDATE batch_tasks
        SET runner_id = ?,
@@ -157,6 +162,7 @@ export function claimNextTask(opts: {
         WHERE status IN (${statuses.map(() => '?').join(',')})
           AND (runner_id IS NULL OR runner_id = '' OR lease_expires_at IS NULL OR lease_expires_at < ?)
           AND (next_retry_at IS NULL OR next_retry_at = '' OR next_retry_at <= ?)
+          ${excludeSql}
           ${taskTypeSql}
           ${batchSql}
         ORDER BY priority DESC, created_at ASC
@@ -171,6 +177,7 @@ export function claimNextTask(opts: {
     ...statuses,
     at,
     at,
+    ...excludeIds,
     ...taskTypes,
     ...(opts.batchId ? [opts.batchId] : []),
   ];

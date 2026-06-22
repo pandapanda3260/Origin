@@ -43,6 +43,7 @@ export const SCENE_VIEW_QUALITY_RUBRIC_MODULE = 'scene_view_quality';
 const CHECK_TIMEOUT_MS = 120_000;
 const DEFAULT_SCENE_VIEW_QUALITY_RUBRIC = [
   'Treat the establishing image as the authoritative spatial anchor.',
+  'When a top-down layout anchor is provided, use it as the map for checking relative positions and orientation across the candidate view.',
   'A candidate can pass only if it preserves the same physical location identity and enough stable spatial anchors to support later video reference use.',
   'Same color palette or same fantasy theme is not enough; central objects, entrances/exits, floor zones, large props, stairs/walls, and main orientation must remain mappable.',
   'For reverse views, allow camera-facing elements to change because the camera moved, but reject a new plaza/room that merely shares the same style.',
@@ -246,10 +247,17 @@ export function buildSceneViewQualityPrompt(args: {
   scenePrompt?: string;
   sceneMetadata?: string;
   rubric?: string;
+  hasLayoutAnchor?: boolean;
 }): string {
+  const candidateIndex = args.hasLayoutAnchor ? 3 : 2;
   return [
-    'You are a strict scene multi-view consistency evaluator. Compare Image 1 (establishing anchor) and Image 2 (candidate scene view).',
-    'Only judge whether Image 2 can be used as another view of the SAME physical location as Image 1. Do not reward general beauty, fantasy detail, or similar style if the space is different.',
+    args.hasLayoutAnchor
+      ? 'You are a strict scene multi-view consistency evaluator. Compare Image 1 (establishing anchor), Image 2 (top-down layout anchor), and Image 3 (candidate scene view).'
+      : 'You are a strict scene multi-view consistency evaluator. Compare Image 1 (establishing anchor) and Image 2 (candidate scene view).',
+    `Only judge whether Image ${candidateIndex} can be used as another view of the SAME physical location as Image 1. Do not reward general beauty, fantasy detail, or similar style if the space is different.`,
+    args.hasLayoutAnchor
+      ? 'Use Image 2 as a spatial map: relative positions, main axis, entrances/exits, central objects, stairs/walls, floor zones, and orientation in Image 3 should remain explainable by the top-down layout.'
+      : '',
     '',
     `View role under review: ${args.viewRole}.`,
     viewRoleInstruction(args.viewRole),
@@ -266,7 +274,7 @@ export function buildSceneViewQualityPrompt(args: {
     '- promptComplianceScore: candidate follows the scene metadata and original prompt.',
     '',
     'Hard caps for the overall score:',
-    '- If Image 2 is clearly a different place, score must be at most 45.',
+    `- If Image ${candidateIndex} is clearly a different place, score must be at most 45.`,
     '- If fewer than two stable spatial anchors can be matched, score must be at most 60.',
     '- If topdown is not an overhead/top-down layout anchor, score must be at most 50.',
     '',
@@ -285,7 +293,7 @@ export function buildSceneViewQualityRetryPrompt(basePrompt: string, check: Scen
     '=== SCENE VIEW CONSISTENCY RETRY LOCK ===',
     `The previous ${check.viewRole} view was rejected by visual consistency scoring: ${reasons}.`,
     hint,
-    'This retry must depict the SAME physical location as the establishing reference. Preserve major spatial anchors and relative layout; do not invent a different place with similar style.',
+    'This retry must depict the SAME physical location as the establishing reference. Preserve major spatial anchors and relative layout; when a top-down layout anchor is provided, obey its relative positions and orientation. Do not invent a different place with similar style.',
   ].join('\n');
 }
 
@@ -293,6 +301,7 @@ export async function evaluateSceneViewQuality(args: {
   user: UserRow;
   viewRole: SceneViewQualityRole;
   establishingImagePath?: string | null;
+  layoutAnchorImagePath?: string | null;
   candidateImagePath?: string | null;
   sceneName?: string;
   scenePrompt?: string;
@@ -315,6 +324,7 @@ export async function evaluateSceneViewQuality(args: {
       return skippedSceneViewQualityResult(args.viewRole, `当前文本模型不支持图片识别：${modelCfg.provider}`, modelCfg);
     }
     const establishingPath = String(args.establishingImagePath || '').trim();
+    const rawLayoutAnchorPath = String(args.layoutAnchorImagePath || '').trim();
     const candidatePath = String(args.candidateImagePath || '').trim();
     if (!establishingPath || !existsSync(establishingPath)) {
       return skippedSceneViewQualityResult(args.viewRole, '主视角参考图文件不可解析，跳过场景副视图一致性评分。', modelCfg);
@@ -322,6 +332,7 @@ export async function evaluateSceneViewQuality(args: {
     if (!candidatePath || !existsSync(candidatePath)) {
       return skippedSceneViewQualityResult(args.viewRole, '候选副视图文件不可解析，跳过场景副视图一致性评分。', modelCfg);
     }
+    const layoutAnchorPath = rawLayoutAnchorPath && existsSync(rawLayoutAnchorPath) ? rawLayoutAnchorPath : '';
 
     const rubric = args.rubric === undefined ? loadSceneViewQualityRubric(args.user.id) : args.rubric;
     const prompt = buildSceneViewQualityPrompt({
@@ -330,7 +341,11 @@ export async function evaluateSceneViewQuality(args: {
       scenePrompt: args.scenePrompt,
       sceneMetadata: args.sceneMetadata,
       rubric,
+      hasLayoutAnchor: !!layoutAnchorPath,
     });
+    const imagePaths = layoutAnchorPath
+      ? [establishingPath, layoutAnchorPath, candidatePath]
+      : [establishingPath, candidatePath];
     const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
     const usageOpts = {
       maxTokens: 1400,
@@ -351,7 +366,8 @@ export async function evaluateSceneViewQuality(args: {
           ...(args.tokenContext?.meta || {}),
           viewRole: args.viewRole,
           attempt: args.attempt || 0,
-          referenceCount: 2,
+          referenceCount: imagePaths.length,
+          layoutAnchorUsed: !!layoutAnchorPath,
         },
       },
     };
@@ -361,7 +377,7 @@ export async function evaluateSceneViewQuality(args: {
     const requestTimeoutMs = timeoutMs();
     const postJson = deps.postJsonImpl || postJsonWithProxySupport;
     const observe = deps.observeTextModelCallImpl || observeTextModelCall;
-    const imageUrls = [establishingPath, candidatePath].map(imagePathToDataUrl);
+    const imageUrls = imagePaths.map(imagePathToDataUrl);
     let text = '';
     if (responsesProvider) {
       const body: any = {

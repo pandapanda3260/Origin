@@ -95,6 +95,13 @@ function testRetryPrompt() {
   assert.match(prompt, /central altar/);
 }
 
+function testPromptWithLayoutAnchor() {
+  const prompt = buildSceneViewQualityPrompt({ viewRole: 'reverse', hasLayoutAnchor: true });
+  assert.match(prompt, /Image 1 \(establishing anchor\), Image 2 \(top-down layout anchor\), and Image 3 \(candidate scene view\)/);
+  assert.match(prompt, /Use Image 2 as a spatial map/);
+  assert.match(prompt, /If Image 3 is clearly a different place/);
+}
+
 function testRubricCardFormatting() {
   const rubric = formatSceneViewQualityRubricCards([{
     title: '空间一致性规则',
@@ -174,15 +181,50 @@ async function testEvaluateBudgetThrowFailOpen() {
   }
 }
 
+async function testEvaluateUsesLayoutAnchorImage() {
+  const dir = mkdtempSync(join(tmpdir(), 'scene-view-quality-anchor-'));
+  try {
+    const establishingPath = join(dir, 'establishing.png');
+    const layoutAnchorPath = join(dir, 'topdown.png');
+    const candidatePath = join(dir, 'candidate.png');
+    writeFileSync(establishingPath, 'fake-image');
+    writeFileSync(layoutAnchorPath, 'fake-image');
+    writeFileSync(candidatePath, 'fake-image');
+    let imageCount = 0;
+    const result = await evaluateSceneViewQuality({
+      user: { id: 1, phone: '', display_name: '', username: '' } as any,
+      viewRole: 'reverse',
+      establishingImagePath: establishingPath,
+      layoutAnchorImagePath: layoutAnchorPath,
+      candidateImagePath: candidatePath,
+      rubric: '',
+    }, {
+      resolveTextModelConfigImpl: () => realVisionCfg,
+      observeTextModelCallImpl: (async (_cfg: any, _opts: any, fn: any) => fn()) as any,
+      postJsonImpl: async (_url, _apiKey, body) => {
+        imageCount = body?.input?.[0]?.content?.filter((part: any) => part?.type === 'input_image').length || 0;
+        return { output_text: '{"score":88,"reasons":["same mapped space"]}' };
+      },
+    });
+    assert.equal(result.status, 'checked');
+    assert.equal(result.decision, 'accept');
+    assert.equal(imageCount, 3, 'layout-anchor evaluation should submit establishing + topdown + candidate images');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   testGateBoundary();
   testNormalizeDecision();
   testFailOpenResult();
   testRetryPrompt();
+  testPromptWithLayoutAnchor();
   testRubricCardFormatting();
   await testEvaluateFakeConfigFailOpen();
   await testEvaluateConfigThrowFailOpen();
   await testEvaluateBudgetThrowFailOpen();
+  await testEvaluateUsesLayoutAnchorImage();
   console.log('[test-scene-view-quality] all assertions passed');
 }
 

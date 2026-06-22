@@ -11,6 +11,17 @@ import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
 assertModuleSingleton("assets", import.meta.url);
 
 const _getAuthHeaders = getAuthHeaders;
+const ASSETS_MODULE_VERSION = (() => {
+  try {
+    return new URL(import.meta.url).searchParams.get("v") || "unversioned";
+  } catch (_e) {
+    return "unknown";
+  }
+})();
+
+function _assetBatchClientOptions() {
+  return { clientModuleVersions: { assets: ASSETS_MODULE_VERSION } };
+}
 
 // 进度提示统一时间格式："x分x秒"（<60s 只显 "x秒"）。各模块各持一份，避免动 utils.js 引发全量 cache-bust。
 function _fmtMinSec(sec) {
@@ -1957,31 +1968,45 @@ function _resolveOwnerName(ownership) {
   return oid;
 }
 
-function _propViewSlotHtml(item, idx, slot) {
+function _propViewSlotHtml(item, idx, slot, opts) {
+  opts = opts || {};
+  var lightbox = !!opts.lightbox;
   var originalSrc = _propViewOriginalUrl(item, slot);
   var imgSrc = originalSrc ? _assetVariant(originalSrc, ASSET_CARD_THUMB_W) : "";
   var zoomSrc = originalSrc ? _assetVariant(originalSrc, ASSET_LIGHTBOX_W) : "";
   var originalCleanSrc = _assetOriginal(originalSrc);
-  var imageAttrs = imgSrc ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
-  var label = PROP_VIEW_LABELS[slot] || slot;
+  var imageAttrs = imgSrc && !lightbox ? ' data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) : '';
   var placeholderIcon = slot === "top" ? "view_in_ar" : "handyman";
+  var imgClass = lightbox
+    ? 'w-full h-full object-contain bg-white'
+    : 'w-full h-full object-cover group-hover/slot:scale-105 transition-transform duration-700';
   var imgHtml = imgSrc
-    ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover group-hover/slot:scale-105 transition-transform duration-700" data-prop-view-img="' + escapeHtml(slot) + '" />'
+    ? '<img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="' + imgClass + '" data-prop-view-img="' + escapeHtml(slot) + '" />'
     : '<div class="asset-card-placeholder w-full h-full flex items-center justify-center bg-surface-container" data-img-class="w-full h-full object-cover" data-prop-view-placeholder="' + escapeHtml(slot) + '"><span class="material-symbols-outlined text-xl text-on-surface-variant/20">' + placeholderIcon + '</span></div>';
-  var badgeHtml = imgSrc ? "" : '<div class="absolute left-1.5 top-1.5 rounded bg-black/35 px-1.5 py-0.5 text-[9px] font-bold text-white/85">待生成</div>';
-  return '<div class="relative min-h-0 overflow-hidden rounded-lg bg-surface-container-high group/slot" data-prop-view-slot="' + escapeHtml(slot) + '"' + imageAttrs + '>' +
+  var badgeHtml = imgSrc || lightbox ? "" : '<div class="absolute left-1.5 top-1.5 rounded bg-black/35 px-1.5 py-0.5 text-[9px] font-bold text-white/85">待生成</div>';
+  var labelHtml = lightbox ? "" : '<div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2 pb-1.5 pt-5">' +
+        '<span class="truncate text-[10px] font-bold text-white/90">' + escapeHtml(PROP_VIEW_LABELS[slot] || slot) + '</span>' +
+      '</div>';
+  var slotClass = lightbox
+    ? 'relative min-h-0 overflow-hidden rounded-xl bg-white'
+    : 'relative min-h-0 overflow-hidden rounded-lg bg-surface-container-high group/slot';
+  return '<div class="' + slotClass + '" data-prop-view-slot="' + escapeHtml(slot) + '"' + imageAttrs + '>' +
       imgHtml +
       badgeHtml +
-      '<div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/60 to-transparent px-2 pb-1.5 pt-5">' +
-        '<span class="truncate text-[10px] font-bold text-white/90">' + escapeHtml(label) + '</span>' +
-      '</div>' +
+      labelHtml +
     '</div>';
 }
 
-function _propViewGridHtml(item, idx) {
+function _propViewGridHtml(item, idx, opts) {
   if (!_propHasViewSlots(item)) return "";
-  return '<div class="asset-prop-view-grid mt-3 grid grid-cols-3 grid-rows-2 gap-1 rounded-xl bg-surface-container-lowest p-1 aspect-[3/2]">' +
-    PROP_VIEW_SLOTS.map(function (slot) { return _propViewSlotHtml(item, idx, slot); }).join("") +
+  opts = opts || {};
+  var lightbox = !!opts.lightbox;
+  var gridClass = lightbox
+    ? 'asset-prop-view-grid grid grid-cols-3 grid-rows-2 gap-2 rounded-2xl bg-white/95 p-2 aspect-[3/2]'
+    : 'asset-prop-view-grid mt-3 grid grid-cols-3 grid-rows-2 gap-1 rounded-xl bg-surface-container-lowest p-1 aspect-[3/2]';
+  var styleAttr = lightbox ? ' style="width:min(90vw,960px);max-width:90vw;"' : '';
+  return '<div class="' + gridClass + '"' + styleAttr + '>' +
+    PROP_VIEW_SLOTS.map(function (slot) { return _propViewSlotHtml(item, idx, slot, opts); }).join("") +
     '</div>';
 }
 
@@ -2013,14 +2038,14 @@ function _renderPropCards(container, items) {
     card.dataset.type = "prop";
     card.dataset.idx = idx;
 
-    var propViewsHtml = _propViewGridHtml(item, idx);
     var propViewsErrorHtml = _propViewsErrorHtml(item);
     var originalSrc = _propCanonicalOriginalUrl(item);
     var imgSrc = item.thumbUrl || _assetVariant(originalSrc, ASSET_CARD_THUMB_W);
     var zoomSrc = _assetVariant(originalSrc, ASSET_LIGHTBOX_W);
     var originalCleanSrc = _assetOriginal(originalSrc);
+    var thumbAction = _propHasViewSlots(item) ? "zoom-prop-views" : "zoom-img";
     var thumbHtml = imgSrc
-      ? '<div class="asset-prop-thumb rounded-2xl overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all shrink-0" data-action="zoom-img" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover" /></div>'
+      ? '<div class="asset-prop-thumb rounded-2xl overflow-hidden border border-outline-variant/20 cursor-pointer hover:ring-2 hover:ring-primary/30 transition-all shrink-0" data-action="' + thumbAction + '" data-img="' + escapeHtml(zoomSrc) + '"' + _attrOriginal(originalCleanSrc) + '><img src="' + escapeHtml(imgSrc) + '" loading="lazy" decoding="async" class="w-full h-full object-cover" /></div>'
       : '<div class="asset-prop-thumb rounded-2xl bg-surface-container flex items-center justify-center border border-outline-variant/10 shrink-0"><span class="material-symbols-outlined text-on-surface-variant/20 text-3xl">handyman</span></div>';
 
     var typeLabel = item.propType || '道具';
@@ -2070,9 +2095,8 @@ function _renderPropCards(container, items) {
           tagsHtml +
           '<div class="flex flex-wrap items-center gap-1">' + carriesTagHtml + warnHtml + '</div>' +
         '</div>' +
-        (propViewsHtml ? '' : thumbHtml) +
+        thumbHtml +
       '</div>' +
-      propViewsHtml +
       propViewsErrorHtml +
       '<div class="asset-desc-wrap mt-3" data-action="edit-asset">' +
         '<p class="asset-desc-text text-[11px] text-on-surface-variant/60 leading-relaxed cursor-text hover:text-on-surface-variant transition-colors">' + escapeHtml(propDesc) + '</p>' +
@@ -2533,7 +2557,7 @@ export async function generateSingleAssetImage(type, idx, viewRole) {
       batchType: "asset_images",
       projectId: originId,
       targets: [batchTarget],
-      options: {},
+      options: _assetBatchClientOptions(),
     }).then(function (startResp) {
       if (!startResp || !startResp.batchId) {
         var errMsg = (startResp && startResp.error) || "未能创建批量任务";
@@ -3115,7 +3139,7 @@ function _runAssetImageBatch(originId, mainTargets, hint, totalTasks) {
       batchType: "asset_images",
       projectId: originId,
       targets: mainTargets,
-      options: {},
+      options: _assetBatchClientOptions(),
     }).then(function (startResp) {
       if (!startResp || !startResp.batchId) {
         var errMsg = (startResp && startResp.error) || "未能创建批量任务";
@@ -3913,6 +3937,17 @@ export function handleAssetAction(e) {
   var list = type === "char" ? project.assets.characters : type === "scene" ? project.assets.scenes : project.assets.props;
   var item = list[idx];
   if (!item) return;
+
+  if (action === "zoom-prop-views") {
+    if (type === "prop" && _propHasViewSlots(item)) {
+      _openPropViewsLightbox(item, idx);
+    } else {
+      var propImgUrl = btn.dataset.img;
+      var propOriginalUrl = btn.dataset.originalImg || "";
+      if (propImgUrl) _openLightbox(propImgUrl, "", propOriginalUrl);
+    }
+    return;
+  }
 
   if (action === "ref-agent") {
     var typeLabel = type === "char" ? "角色" : type === "scene" ? "场景" : "道具";
@@ -4939,6 +4974,35 @@ export function _openLightbox(imgUrl, title, originalUrl) {
           '<strong>图片暂不可用</strong>' +
           '<span>原图链接失效或文件不可访问</span>' +
         '</div>' +
+      '</div>' +
+      '<button class="asset-lightbox-close" onclick="this.closest(\'#assetLightbox\').remove()">' +
+        '<span class="material-symbols-outlined">close</span>' +
+      '</button>' +
+    '</div>';
+  overlay.addEventListener("click", function () { overlay.remove(); });
+  document.body.appendChild(overlay);
+  hydrateProtectedImageElements(overlay);
+}
+
+function _openPropViewsLightbox(item, idx) {
+  var existing = document.getElementById("assetLightbox");
+  if (existing) existing.remove();
+
+  var gridHtml = _propViewGridHtml(item, idx, { lightbox: true });
+  if (!gridHtml) {
+    var fallbackUrl = _propCanonicalOriginalUrl(item);
+    if (fallbackUrl) _openLightbox(_assetVariant(fallbackUrl, ASSET_LIGHTBOX_W), "", _assetOriginal(fallbackUrl));
+    return;
+  }
+
+  var overlay = document.createElement("div");
+  overlay.id = "assetLightbox";
+  overlay.className = "asset-lightbox";
+  overlay.style.animation = "fadeIn .2s ease";
+  overlay.innerHTML =
+    '<div class="asset-lightbox-dialog asset-prop-views-lightbox" onclick="event.stopPropagation()">' +
+      '<div class="ffe-image-frame ffe-image-frame--preview asset-lightbox-image-frame" style="background:rgba(255,255,255,.96);">' +
+        gridHtml +
       '</div>' +
       '<button class="asset-lightbox-close" onclick="this.closest(\'#assetLightbox\').remove()">' +
         '<span class="material-symbols-outlined">close</span>' +

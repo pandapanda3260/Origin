@@ -42,6 +42,12 @@ assert(assets.includes('function _endAssetImageBatch(originId)'), 'asset batch f
 assert(assets.includes('function _hasActiveAssetImageBatchForCurrentProject()'), 'current project active state should drive hint priority');
 assert(assets.includes('_beginAssetImageBatch(originId);'), 'main and reattached asset batches should enter active state at attach');
 assert(assets.includes('_endAssetImageBatch(originId);'), 'main and reattached asset batches should leave active state at finish');
+assert(assets.includes('const ASSETS_MODULE_VERSION = (() => {'), 'assets module should derive its import-map version for batch diagnostics');
+assert(assets.includes('return { clientModuleVersions: { assets: ASSETS_MODULE_VERSION } };'), 'asset batch starts should send the assets module version in options');
+const singleAssetBatchStart = section(assets, 'export async function generateSingleAssetImage(type, idx, viewRole)', 'export function _toastErrorWithActions');
+assert(singleAssetBatchStart.includes('options: _assetBatchClientOptions(),'), 'single asset image generation should send client module diagnostics');
+const bulkAssetBatchStart = section(assets, 'function _runAssetImageBatch(originId, mainTargets, hint, totalTasks)', 'function _attachAssetImageBatch');
+assert(bulkAssetBatchStart.includes('options: _assetBatchClientOptions(),'), 'bulk asset image generation should send client module diagnostics');
 
 const hintHelpers = section(assets, 'function _setAssetHeaderHint(text, tone)', 'function _assetVariant');
 assert(hintHelpers.includes('hint.classList.remove("is-progress", "is-warning", "is-error", "is-success")'), 'asset hint helper should clear old tones');
@@ -70,6 +76,10 @@ assert(assets.includes('function _runSceneFollowupTargetsInOrder(originId, follo
 assert(assets.includes('["topdown", "reverse", "alt"]'), 'scene follow-up generation should build topdown before reverse/alt angle views');
 assert(assets.includes('正在生成场景俯视布局锚图'), 'scene follow-up helper should expose the topdown anchor stage');
 assert(assets.includes('正在生成场景反打与侧角视图'), 'scene follow-up helper should expose the angle-view stage after topdown');
+const orderedFollowupFn = section(assets, 'async function _runSceneFollowupTargetsInOrder(originId, followups, hint)', 'function _setAssetImagesGeneratingLocked');
+assert(orderedFollowupFn.includes('var groups = [') && orderedFollowupFn.indexOf('topdownTargets') < orderedFollowupFn.indexOf('angleTargets'), 'ordered scene follow-up should group topdown before angle views');
+assert(orderedFollowupFn.includes('await _runAssetImageBatch(originId, group.targets, hint, group.targets.length);'), 'ordered scene follow-up should await each view group separately');
+assert(orderedFollowupFn.includes('await _ctx.reloadProjectFromServer();'), 'ordered scene follow-up should reload after topdown before reverse/alt expansion can rely on it');
 assert(assets.includes('showToast(label + "图上传成功，已保存为主视角"'), 'scene upload should route through establishing-view semantics');
 assert(assets.includes('"views",') && assets.includes('"viewsVersion",') && assets.includes('"viewHistory",'), 'frontend generated-field restore should preserve scene view sets');
 const syncFn = section(assets, 'function _syncAssetHeaderHint(options)', 'function _assetVariant');
