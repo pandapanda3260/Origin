@@ -995,6 +995,28 @@ function sceneQualityMetadata(asset: any): string {
   return parts.join('\n');
 }
 
+function sceneViewReferencePathsForRole(asset: any, role: SceneViewRole, userId: number): string[] {
+  if (role === 'establishing') return [];
+  const urls: string[] = [];
+  const establishingUrl = resolveSceneImageUrl(asset, {
+    strategy: 'videoManifest',
+    gate: true,
+    viewRole: 'establishing',
+  });
+  if (establishingUrl) urls.push(establishingUrl);
+  if (role === 'reverse' || role === 'alt') {
+    const topdownUrl = resolveSceneImageUrl(asset, {
+      strategy: 'videoManifest',
+      gate: true,
+      viewRole: 'topdown',
+    });
+    if (topdownUrl && topdownUrl !== establishingUrl) urls.push(topdownUrl);
+  }
+  return urls
+    .map((url) => resolveLocalImagePath(url, userId) || '')
+    .filter(Boolean);
+}
+
 function sceneViewQualityAttemptSummary(attempt: number, check: SceneViewQualityCheckResult, imageUrl?: string) {
   return {
     attempt,
@@ -1196,13 +1218,11 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
   };
 
   let referenceImagePath: string | undefined;
+  let referenceImagePaths: string[] | undefined;
   if (type === 'scene' && sceneViewRole && sceneViewRole !== 'establishing') {
-    const establishingUrl = resolveSceneImageUrl(item, {
-      strategy: 'videoManifest',
-      gate: true,
-      viewRole: 'establishing',
-    });
-    referenceImagePath = establishingUrl ? (resolveLocalImagePath(establishingUrl, ctx.user.id) || undefined) : undefined;
+    const sceneRefs = sceneViewReferencePathsForRole(item, sceneViewRole, ctx.user.id);
+    referenceImagePaths = sceneRefs.length ? sceneRefs : undefined;
+    referenceImagePath = sceneRefs[0] || undefined;
     if (!referenceImagePath) {
       throw new Error(`scene_view_missing_establishing:${cat}[${idx}].views.${sceneViewRole}`);
     }
@@ -1231,7 +1251,9 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       styleBibleSignatureType: styleLockContext.signatureType,
       resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor || null,
       styleLockVersion: styleReferenceMeta.styleLockVersion,
+      sceneViewReferenceCount: referenceImagePaths?.length || (referenceImagePath ? 1 : 0),
     },
+    referenceImagePaths,
   };
   let result = await generateImageWithModerationRecovery(ctx.user, imageInput);
   let sceneViewQualityAttempts: Array<ReturnType<typeof sceneViewQualityAttemptSummary>> = [];
