@@ -11,6 +11,7 @@ export type PropDimensionality = 'volumetric' | 'flat';
 export type PropViewRole = 'front' | 'side' | 'back' | 'top' | 'hero';
 export type PropViewSlot = PropViewRole | 'side_left' | 'side_right';
 export type PropImageUrlStrategy = 'selection' | 'framePlan' | 'videoManifest';
+export type PropViewQualityStatus = 'accepted' | 'degraded' | 'rejected';
 
 export type PropViewQuality = {
   nonWhiteRatio: number;
@@ -18,8 +19,10 @@ export type PropViewQuality = {
   bboxCenterX: number;
   bboxCenterY: number;
   edgeTouch: boolean;
+  status: PropViewQualityStatus;
   usable: boolean;
   reason?: string;
+  warnings?: string[];
 };
 
 export type PropView = {
@@ -75,6 +78,13 @@ type PreparedPropView = {
 const DATA_DIR = getDataDir();
 const IMAGES_DIR = join(DATA_DIR, 'images');
 const MAX_PROP_VIEW_HISTORY = 5;
+const PROP_VIEW_TOO_WHITE_RATIO = 0.01;
+const PROP_VIEW_TOO_SMALL_COVERAGE = 0.025;
+const PROP_VIEW_TOO_INK_RATIO = 0.78;
+const PROP_VIEW_TOO_LARGE_COVERAGE = 0.88;
+const PROP_VIEW_NEAR_SOLID_RATIO = 0.92;
+const PROP_VIEW_THIN_RATIO = 0.16;
+const PROP_VIEW_OFF_CENTER_DELTA = 0.33;
 
 export const PROP_VIEW_SCHEMA = 'prop-six-view-sheet-v1' as const;
 export const PROP_VIEW_ROLES: PropViewRole[] = ['front', 'side', 'back', 'top', 'hero'];
@@ -175,6 +185,7 @@ function propViewQuality(data: Uint8ClampedArray, width: number, height: number)
         bboxCenterX: 0.5,
         bboxCenterY: 0.5,
         edgeTouch: false,
+        status: 'rejected',
         usable: false,
         reason: 'empty-view',
       },
@@ -202,14 +213,38 @@ function propViewQuality(data: Uint8ClampedArray, width: number, height: number)
     bounds.right >= width - 1 - edgeMargin ||
     bounds.bottom >= height - 1 - edgeMargin;
 
-  let reason = '';
-  if (nonWhiteRatio < 0.01) reason = 'too-much-white';
-  else if (nonWhiteRatio > 0.78) reason = 'too-much-ink';
-  else if (bboxCoverage < 0.025) reason = 'subject-too-small';
-  else if (bboxCoverage > 0.88) reason = 'subject-too-large';
-  else if (bboxW / width < 0.16 || bboxH / height < 0.16) reason = 'subject-too-thin';
-  else if (edgeTouch) reason = 'subject-touches-cell-edge';
-  else if (Math.abs(bboxCenterX - 0.5) > 0.33 || Math.abs(bboxCenterY - 0.5) > 0.33) reason = 'subject-off-center';
+  let rejectedReason = '';
+  if (nonWhiteRatio < PROP_VIEW_TOO_WHITE_RATIO) rejectedReason = 'too-much-white';
+  else if (bboxCoverage < PROP_VIEW_TOO_SMALL_COVERAGE) rejectedReason = 'subject-too-small';
+  else if (nonWhiteRatio >= PROP_VIEW_NEAR_SOLID_RATIO && bboxCoverage >= PROP_VIEW_NEAR_SOLID_RATIO) {
+    rejectedReason = 'near-solid-no-structure';
+  }
+
+  if (rejectedReason) {
+    return {
+      bounds,
+      quality: {
+        nonWhiteRatio,
+        bboxCoverage,
+        bboxCenterX,
+        bboxCenterY,
+        edgeTouch,
+        status: 'rejected',
+        usable: false,
+        reason: rejectedReason,
+      },
+    };
+  }
+
+  const warnings: string[] = [];
+  if (nonWhiteRatio > PROP_VIEW_TOO_INK_RATIO) warnings.push('too-much-ink');
+  if (bboxCoverage > PROP_VIEW_TOO_LARGE_COVERAGE) warnings.push('subject-too-large');
+  if (bboxW / width < PROP_VIEW_THIN_RATIO || bboxH / height < PROP_VIEW_THIN_RATIO) warnings.push('subject-too-thin');
+  if (edgeTouch) warnings.push('subject-touches-cell-edge');
+  if (Math.abs(bboxCenterX - 0.5) > PROP_VIEW_OFF_CENTER_DELTA || Math.abs(bboxCenterY - 0.5) > PROP_VIEW_OFF_CENTER_DELTA) {
+    warnings.push('subject-off-center');
+  }
+  const status: PropViewQualityStatus = warnings.length ? 'degraded' : 'accepted';
 
   return {
     bounds,
@@ -219,16 +254,26 @@ function propViewQuality(data: Uint8ClampedArray, width: number, height: number)
       bboxCenterX,
       bboxCenterY,
       edgeTouch,
-      usable: !reason,
-      reason: reason || undefined,
+      status,
+      usable: true,
+      warnings: warnings.length ? warnings : undefined,
     },
   };
 }
 
+function qualityStatus(quality: PropViewQuality | undefined): PropViewQualityStatus {
+  if (!quality) return 'rejected';
+  if (quality.status) return quality.status;
+  return quality.usable === false ? 'rejected' : 'accepted';
+}
+
 function qualityScore(quality: PropViewQuality | undefined): number {
   if (!quality) return -Infinity;
+  const status = qualityStatus(quality);
+  if (status === 'rejected') return -Infinity;
   const centerPenalty = Math.abs(quality.bboxCenterX - 0.5) + Math.abs(quality.bboxCenterY - 0.5);
-  return (quality.usable ? 100 : 0) + quality.bboxCoverage * 20 + quality.nonWhiteRatio * 10 - centerPenalty * 8 - (quality.edgeTouch ? 30 : 0);
+  const statusBase = status === 'accepted' ? 200 : 100;
+  return statusBase + quality.bboxCoverage * 20 + quality.nonWhiteRatio * 10 - centerPenalty * 8 - (quality.edgeTouch ? 30 : 0);
 }
 
 function roleFromSlot(slot: PropViewSlot): PropViewRole {
@@ -241,6 +286,10 @@ function selectSideView(slots: Partial<Record<PropViewSlot, PropView>>): PropVie
   const right = slots.side_right;
   if (!left) return right ? { ...right, role: 'side' } : undefined;
   if (!right) return { ...left, role: 'side' };
+  const leftStatus = qualityStatus(left.quality);
+  const rightStatus = qualityStatus(right.quality);
+  if (leftStatus === 'accepted' && rightStatus !== 'accepted') return { ...left, role: 'side' };
+  if (rightStatus === 'accepted' && leftStatus !== 'accepted') return { ...right, role: 'side' };
   return qualityScore(right.quality) > qualityScore(left.quality)
     ? { ...right, role: 'side' }
     : { ...left, role: 'side' };
@@ -255,32 +304,25 @@ async function loadCanvas(): Promise<CanvasApi> {
 }
 
 function makeSquareCrop(canvasApi: CanvasApi, cellCanvas: any, bounds: Bounds): { buffer: Buffer; width: number; height: number } {
-  const sourceW = cellCanvas.width;
-  const sourceH = cellCanvas.height;
   const bboxW = bounds.right - bounds.left + 1;
   const bboxH = bounds.bottom - bounds.top + 1;
-  const pad = Math.round(Math.max(bboxW, bboxH) * 0.12);
-  const cropLeft = Math.max(0, bounds.left - pad);
-  const cropTop = Math.max(0, bounds.top - pad);
-  const cropRight = Math.min(sourceW, bounds.right + 1 + pad);
-  const cropBottom = Math.min(sourceH, bounds.bottom + 1 + pad);
-  const cropW = Math.max(1, cropRight - cropLeft);
-  const cropH = Math.max(1, cropBottom - cropTop);
-  const side = Math.max(cropW, cropH);
+  const contentSide = Math.max(bboxW, bboxH);
+  const margin = Math.max(24, Math.round(contentSide * 0.12));
+  const side = contentSide + margin * 2;
   const out = canvasApi.createCanvas(side, side);
   const outCtx = out.getContext('2d');
   outCtx.fillStyle = '#ffffff';
   outCtx.fillRect(0, 0, side, side);
   outCtx.drawImage(
     cellCanvas,
-    cropLeft,
-    cropTop,
-    cropW,
-    cropH,
-    Math.round((side - cropW) / 2),
-    Math.round((side - cropH) / 2),
-    cropW,
-    cropH,
+    bounds.left,
+    bounds.top,
+    bboxW,
+    bboxH,
+    margin + Math.round((contentSide - bboxW) / 2),
+    margin + Math.round((contentSide - bboxH) / 2),
+    bboxW,
+    bboxH,
   );
   return {
     buffer: out.toBuffer('image/png') as Buffer,
@@ -352,7 +394,7 @@ export async function splitPropViews(opts: {
       const cellData = cellCtx.getImageData(0, 0, cellW, cellH).data as Uint8ClampedArray;
       const { quality, bounds } = propViewQuality(cellData, cellW, cellH);
       views.quality.slots[spec.slot] = quality;
-      if (!quality.usable || !bounds) continue;
+      if (quality.status === 'rejected' || !bounds) continue;
 
       const crop = makeSquareCrop(canvasApi, cellCanvas, bounds);
       prepared.push({

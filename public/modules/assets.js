@@ -1986,13 +1986,24 @@ function _propViewGridHtml(item, idx) {
 }
 
 function _propViewsErrorHtml(item) {
-  var msg = item && (item.viewsError || item.imageLastError);
-  if (!msg) return "";
-  return '<div class="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-[10px] font-medium leading-relaxed text-amber-700" data-prop-views-error>' +
-    '<span class="material-symbols-outlined align-[-3px] mr-1 text-[14px]">warning</span>' +
-    '多视图切分未通过，已保留上一版道具图，可重试生成。' +
-    '<span class="block mt-0.5 text-amber-700/75">' + escapeHtml(String(msg).slice(0, 120)) + '</span>' +
-    '</div>';
+  var splitMsg = item && item.viewsError ? String(item.viewsError) : "";
+  var imageMsg = item && item.imageLastError ? String(item.imageLastError) : "";
+  var html = "";
+  if (splitMsg) {
+    html += '<div class="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-[10px] font-medium leading-relaxed text-amber-700" data-prop-views-error>' +
+      '<span class="material-symbols-outlined align-[-3px] mr-1 text-[14px]">warning</span>' +
+      '新图已生成，但没有切出可用的多视图；系统没有替换当前道具图。' +
+      '<span class="block mt-0.5 text-amber-700/75">' + escapeHtml(splitMsg.slice(0, 120)) + '</span>' +
+      '</div>';
+  }
+  if (imageMsg && imageMsg !== splitMsg) {
+    html += '<div class="mt-2 rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] font-medium leading-relaxed text-red-700" data-prop-image-error>' +
+      '<span class="material-symbols-outlined align-[-3px] mr-1 text-[14px]">error</span>' +
+      '道具图生成失败；系统没有替换当前道具图。' +
+      '<span class="block mt-0.5 text-red-700/75">' + escapeHtml(imageMsg.slice(0, 120)) + '</span>' +
+      '</div>';
+  }
+  return html;
 }
 
 function _renderPropCards(container, items) {
@@ -2636,6 +2647,10 @@ function _markAssetImageFailedLocally(originId, type, idx, err, extra, serverVer
     });
     item.imageLastError = message;
     item.imageFailedAt = failedAt;
+    if (type === "prop") {
+      delete item.viewsError;
+      delete item.viewsErrorAt;
+    }
     if (extra && extra.imageSafetyAudit) item.imageSafetyAudit = extra.imageSafetyAudit;
 
     var top = Array.isArray(proj[topKey]) ? proj[topKey] : null;
@@ -2643,6 +2658,10 @@ function _markAssetImageFailedLocally(originId, type, idx, err, extra, serverVer
       top[idx].reference = item.reference;
       top[idx].imageLastError = item.imageLastError;
       top[idx].imageFailedAt = item.imageFailedAt;
+      if (type === "prop") {
+        delete top[idx].viewsError;
+        delete top[idx].viewsErrorAt;
+      }
       if (item.imageSafetyAudit) top[idx].imageSafetyAudit = item.imageSafetyAudit;
     }
   }, serverVersion);
@@ -2824,6 +2843,10 @@ function _reuseLatestInfoChangedImage(type, idx) {
   _clearAssetImageDerivedFields(item);
   delete item.imageLastError;
   delete item.imageFailedAt;
+  if (type === "prop") {
+    delete item.viewsError;
+    delete item.viewsErrorAt;
+  }
   delete item._pencilFailed;
   delete item.panelsError;
   delete item.panelsErrorAt;
@@ -3426,10 +3449,10 @@ function _attachAssetImageBatch(opts) {
           if (extra.dimensionality) item.dimensionality = extra.dimensionality;
         }
         if (type === "prop" && extra.viewsError) {
+          delete item.imageLastError;
+          delete item.imageFailedAt;
           item.viewsError = extra.viewsError;
           item.viewsErrorAt = new Date().toISOString();
-          item.imageLastError = extra.viewsError;
-          item.imageFailedAt = item.viewsErrorAt;
         }
         if (type === "scene" && viewRole) {
           if (!Array.isArray(item.views)) item.views = [];
@@ -3472,7 +3495,15 @@ function _attachAssetImageBatch(opts) {
         }
         if (extra.assetId) item.assetId = extra.assetId;
         if (extra.fetchStatus) item.fetchStatus = extra.fetchStatus;
-        if (!(type === "prop" && extra.viewsError)) {
+        if (type === "prop" && extra.viewsError) {
+          delete item.imageLastError;
+          delete item.imageFailedAt;
+          if (item.reference) {
+            delete item.reference.lastError;
+            delete item.reference.lastAttemptUrl;
+            delete item.reference.lastFailedAt;
+          }
+        } else {
           delete item.imageLastError;
           delete item.imageFailedAt;
           delete item.viewsError;
@@ -3489,8 +3520,8 @@ function _attachAssetImageBatch(opts) {
           if (type === "scene") _clearSceneViewStaleAfterWrite(proj._staleFlags, item, idx, viewRole || "establishing");
           else delete proj._staleFlags["asset_img_" + type + "_" + idx];
         }
-        if (type === "prop" && extra.views && Array.isArray(proj.props) && proj.props[idx]) {
-          proj.props[idx] = Object.assign({}, proj.props[idx], {
+        if (type === "prop" && (extra.views || extra.viewsError) && Array.isArray(proj.props) && proj.props[idx]) {
+          var nextTopProp = Object.assign({}, proj.props[idx], {
             imageUrl: item.imageUrl,
             rawUrl: item.rawUrl,
             reference: item.reference,
@@ -3502,6 +3533,15 @@ function _attachAssetImageBatch(opts) {
             imageLastError: item.imageLastError,
             imageFailedAt: item.imageFailedAt
           });
+          if (!item.viewsError) {
+            delete nextTopProp.viewsError;
+            delete nextTopProp.viewsErrorAt;
+          }
+          if (!item.imageLastError) {
+            delete nextTopProp.imageLastError;
+            delete nextTopProp.imageFailedAt;
+          }
+          proj.props[idx] = nextTopProp;
         }
       }, data && data.serverVersion);
 
@@ -4685,6 +4725,10 @@ async function _uploadAssetImage(type, idx, file) {
     });
     delete item.imageLastError;
     delete item.imageFailedAt;
+    if (type === "prop") {
+      delete item.viewsError;
+      delete item.viewsErrorAt;
+    }
     if (item.reference) {
       delete item.reference.lastError;
       delete item.reference.lastFailedAt;
@@ -4700,6 +4744,10 @@ async function _uploadAssetImage(type, idx, file) {
       top[idx].reference = Object.assign({}, top[idx].reference || {}, item.reference || {});
       delete top[idx].imageLastError;
       delete top[idx].imageFailedAt;
+      if (type === "prop") {
+        delete top[idx].viewsError;
+        delete top[idx].viewsErrorAt;
+      }
     }
     if (project._staleFlags) delete project._staleFlags["asset_img_" + type + "_" + idx];
     _saveAssetsProject();
