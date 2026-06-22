@@ -25,6 +25,7 @@ const { resolve } = require('node:path');
 // 1. 源码自检
 // ============================================================
 const llmSrc = readFileSync(resolve(__dirname, '..', 'lib', 'llm.ts'), 'utf8');
+const dbSrc = readFileSync(resolve(__dirname, '..', 'lib', 'db.ts'), 'utf8');
 
 assert.match(
   llmSrc,
@@ -67,13 +68,45 @@ assert.match(
   'final output must be extracted via extractResponsesText',
 );
 assert.match(
+  dbSrc,
+  /CREATE TABLE IF NOT EXISTS batch_tasks[\s\S]{0,1200}\bmodel\s+TEXT\b/,
+  'batch_tasks schema must include model TEXT',
+);
+assert.match(
+  dbSrc,
+  /migrateDurableTaskColumns[\s\S]{0,900}['"]model TEXT['"]/,
+  'durable task migration must add batch_tasks.model',
+);
+assert.match(
+  llmSrc,
+  /function recordResponsesBackgroundSubmissionBestEffort\b/,
+  'responses background submit must have a best-effort persistence hook',
+);
+assert.match(
+  llmSrc,
+  /const responseId[\s\S]{0,400}recordResponsesBackgroundSubmissionBestEffort\(cfg, opts, responseId\)/,
+  'responses background submit must persist provider/model/response id after response id is confirmed',
+);
+{
+  const recordStart = llmSrc.indexOf('function recordResponsesBackgroundSubmissionBestEffort');
+  const recordEnd = llmSrc.indexOf('// 用 background 模式跑 Responses API', recordStart);
+  const recordBody = llmSrc.slice(recordStart, recordEnd > 0 ? recordEnd : undefined);
+  assert.match(recordBody, /provider_task_id\s*=\s*@providerTaskId/, 'provider_task_id must be persisted');
+  assert.match(recordBody, /model\s*=\s*@model/, 'model must be persisted');
+  assert.doesNotMatch(
+    recordBody,
+    /upstream_pending|status\s*=/,
+    'P2 persistence hook must not change the task status machine',
+  );
+}
+assert.match(
   llmSrc,
   /export async function chatCompleteJsonViaBackground\b/,
   'chatCompleteJsonViaBackground must be exported',
 );
 assert.match(
   llmSrc,
-  /isResponsesProvider[\s\S]{0,400}chatCompleteJsonWithRetry\(/,
+  /isResponsesConfig\(cfg\)[\s\S]{0,400}chatCompleteJsonWithRetry\(/,
   'chatCompleteJsonViaBackground must fall back to chatCompleteJsonWithRetry for non-Responses providers',
 );
 
@@ -85,6 +118,26 @@ assert.match(
   beSrc,
   /chatCompleteJsonViaBackground[\s\S]{0,2000}['"]shots-generate['"]/,
   'lib/batch-executors.ts shots executor must call chatCompleteJsonViaBackground with taskName="shots-generate"',
+);
+assert.match(
+  llmSrc,
+  /chatCompleteJsonViaBackground[\s\S]{0,3000}selectTextFallbackConfig\(cfg, e, opts\)/,
+  'chatCompleteJsonViaBackground must reuse existing text fallback selection',
+);
+assert.match(
+  llmSrc,
+  /responsesBackgroundComplete\(fallbackCfg, messages, fallbackBudgetedOpts\)/,
+  'chatCompleteJsonViaBackground must run fallback via background responses',
+);
+assert.match(
+  llmSrc,
+  /status:\s*['"]fallback_started['"][\s\S]{0,1600}status:\s*['"]fallback_ok['"][\s\S]{0,2200}status:\s*['"]fallback_failed['"]/,
+  'background fallback must record explicit started/ok/failed observability events',
+);
+assert.match(
+  llmSrc,
+  /background fallback attempt \$\{attempt\}\/\$\{maxAttempts\} failed/,
+  'background fallback failure must emit a summary log before throwing',
 );
 // 限定在 shots executor 函数体范围内 (从 registerExecutor 到下一个空行的 closing) 检查;
 // 注释里出现 chatCompleteJsonWithRetry 字样 (例如 "fallback to chatCompleteJsonWithRetry")

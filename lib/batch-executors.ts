@@ -3752,9 +3752,18 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
   });
   shotsArr = normalizedPlan.shots;
   const planMeta = normalizedPlan.planMeta;
+  const planValidation = normalizedPlan.validation;
 
   if (!shotsArr.length) {
     throw new Error('AI 返回的镜头都没有内容，请稍后重试或换个剧本');
+  }
+  if (planValidation && (!planValidation.ok || planValidation.warnings?.length)) {
+    console.warn('[shots] shot-plan validation signals:', {
+      projectId: ctx.projectId,
+      batchId: ctx.batchId,
+      errors: planValidation.errors,
+      warnings: planValidation.warnings,
+    });
   }
 
   ctx.progress({ stage: 'assembling', percent: 95, hint: '正在保存镜头表…' });
@@ -3818,7 +3827,12 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
   return {
     patch: { type: 'shots', value: shotsArr },
-    extra: { count: shotsArr.length, planMeta, shotPlanStaleReasons: completionStaleReasons },
+    extra: {
+      count: shotsArr.length,
+      planMeta,
+      shotPlanValidation: planValidation,
+      shotPlanStaleReasons: completionStaleReasons,
+    },
   };
 });
 

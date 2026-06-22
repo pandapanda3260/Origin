@@ -10,7 +10,7 @@
  *   - 失败时抛带 friendly message 的 Error，路由层会序列化成前端能展示的中文
  */
 
-import type { UserRow } from './db';
+import { getDb, type UserRow } from './db';
 import {
   resolveSlotModelConfig,
   resolveTextModelConfig,
@@ -408,6 +408,40 @@ async function responsesComplete(
   return stripThinkBlocks(content);
 }
 
+function recordResponsesBackgroundSubmissionBestEffort(
+  cfg: ResolvedModelConfig,
+  opts: LLMOptions,
+  responseId: string,
+) {
+  const taskId = opts.tokenContext?.taskId ? String(opts.tokenContext.taskId) : '';
+  if (!taskId) return;
+
+  try {
+    const now = new Date().toISOString();
+    getDb().prepare(`
+      UPDATE batch_tasks
+      SET provider = @provider,
+          provider_task_id = @providerTaskId,
+          model = @model,
+          last_checked_at = COALESCE(last_checked_at, @now),
+          updated_at = @now
+      WHERE id = @taskId
+        AND (provider_task_id IS NULL OR provider_task_id = @providerTaskId)
+    `).run({
+      taskId,
+      provider: cfg.provider,
+      providerTaskId: responseId,
+      model: cfg.model,
+      now,
+    });
+  } catch (err: any) {
+    console.warn(
+      `[llm.responses.bg] failed to record provider task id for task=${taskId}: ` +
+        String(err?.message || err || '').slice(0, 300),
+    );
+  }
+}
+
 // 用 background 模式跑 Responses API: 适用于长耗时 / 高 reasoning 任务,
 // 避免被中转站(gateway)的同步连接超时(常见 60-300s)掐断。
 // 协议:
@@ -445,6 +479,7 @@ async function responsesBackgroundComplete(
   if (!responseId) {
     throw new Error('LLM background 提交未返回 response id');
   }
+  recordResponsesBackgroundSubmissionBestEffort(cfg, opts, responseId);
 
   console.info(
     `[llm.responses.bg] submitted ${formatResponsesTrace(cfg, opts)} ` +
@@ -521,6 +556,14 @@ async function responsesBackgroundComplete(
       `id=${responseId} polls=${pollCount} status=${status} usage=${formatUsageSummary(usage)}`,
   );
   return stripThinkBlocks(content);
+}
+
+function isResponsesConfig(cfg: ResolvedModelConfig): boolean {
+  return (
+    cfg.provider === 'zerail_responses' ||
+    cfg.provider === 'openai_responses' ||
+    cfg.provider === 'packy_responses'
+  );
 }
 
 async function getJsonWithProxySupport(
@@ -925,7 +968,7 @@ function buildClaudeMessagesBody(
   return body;
 }
 
-function buildResponsesBody(
+export function buildResponsesBody(
   cfg: ResolvedModelConfig,
   messages: ChatMessage[],
   opts: LLMOptions,
@@ -1138,11 +1181,7 @@ export async function chatCompleteJsonViaBackground<T = any>(
   const cfg = resolveTextModelConfig(user, role);
 
   // 非 Responses API provider (Claude / Chat Completions) 没有 background 模式 — 自动回退。
-  const isResponsesProvider =
-    cfg.provider === 'zerail_responses' ||
-    cfg.provider === 'openai_responses' ||
-    cfg.provider === 'packy_responses';
-  if (!isResponsesProvider || cfg.mode === 'fake') {
+  if (!isResponsesConfig(cfg) || cfg.mode === 'fake') {
     return chatCompleteJsonWithRetry(user, messages, opts, parser, taskName);
   }
 
@@ -1178,6 +1217,83 @@ export async function chatCompleteJsonViaBackground<T = any>(
       return parsed;
     } catch (e: any) {
       lastErr = e;
+      const fallbackCfg = selectTextFallbackConfig(cfg, e, opts);
+      if (fallbackCfg && isResponsesConfig(fallbackCfg)) {
+        const fallbackStartedAt = Date.now();
+        const fallbackMessage = String(e?.message || e).slice(0, 240);
+        console.warn(
+          `[llm.fallback.bg] ${taskName} ` +
+            `${cfg.provider}/${cfg.model} -> ${fallbackCfg.provider}/${fallbackCfg.model}: ` +
+            `${fallbackMessage}`,
+        );
+        recordModelCallEvent({
+          cfg: fallbackCfg,
+          slot: fallbackCfg.role || opts.modelRole || 'text',
+          status: 'fallback_started',
+          traceName: taskName,
+          fallbackUsed: true,
+          message: fallbackMessage,
+          meta: {
+            fromProvider: cfg.provider,
+            fromModel: cfg.model,
+            attempt,
+            maxAttempts,
+          },
+        });
+        const finalOpts: LLMOptions = {
+          ...opts,
+          maxTokens: currentMaxTokens,
+          requestTimeoutMs,
+          responseFormat: 'json_object',
+          modelRole: opts.modelRole || 'structured',
+          traceName: taskName,
+          traceAttempt: attempt,
+          traceMaxAttempts: maxAttempts,
+        };
+        const fallbackBudgetedOpts = applyTokenBudget(fallbackCfg, messages, finalOpts, 'complete');
+        try {
+          const raw = await responsesBackgroundComplete(fallbackCfg, messages, fallbackBudgetedOpts);
+          const parsed = parser(raw);
+          recordModelCallEvent({
+            cfg: fallbackCfg,
+            slot: fallbackCfg.role || opts.modelRole || 'text',
+            status: 'fallback_ok',
+            latencyMs: Date.now() - fallbackStartedAt,
+            traceName: taskName,
+            fallbackUsed: true,
+            meta: {
+              fromProvider: cfg.provider,
+              fromModel: cfg.model,
+              attempt,
+              maxAttempts,
+            },
+          });
+          console.info(`[${taskName}] background fallback attempt ${attempt}/${maxAttempts} ok in ${Date.now() - t0}ms (${taskMeta})`);
+          return parsed;
+        } catch (fallbackErr: any) {
+          const fallbackErrMsg = String(fallbackErr?.message || fallbackErr || '').slice(0, 300);
+          recordModelCallEvent({
+            cfg: fallbackCfg,
+            slot: fallbackCfg.role || opts.modelRole || 'text',
+            status: 'fallback_failed',
+            latencyMs: Date.now() - fallbackStartedAt,
+            traceName: taskName,
+            fallbackUsed: true,
+            message: fallbackErrMsg,
+            meta: {
+              fromProvider: cfg.provider,
+              fromModel: cfg.model,
+              attempt,
+              maxAttempts,
+            },
+          });
+          console.warn(
+            `[${taskName}] background fallback attempt ${attempt}/${maxAttempts} failed in ${Date.now() - fallbackStartedAt}ms ` +
+              `${fallbackCfg.provider}/${fallbackCfg.model}: ${fallbackErrMsg}`,
+          );
+          throw fallbackErr;
+        }
+      }
       const decision = classifyJsonRetryError(e);
       const elapsedMs = Date.now() - t0;
       console.warn(
@@ -1285,6 +1401,9 @@ function classifyJsonRetryError(e: any): { retryable: boolean; reason: string } 
   ) {
     return { retryable: true, reason: 'output_incomplete' };
   }
+  if (isBackgroundSubmitTimeoutMessage(message)) {
+    return { retryable: false, reason: 'submit_timeout' };
+  }
   if (message.includes('请求超时') || lower.includes('timeout') || lower.includes('abort')) {
     return { retryable: false, reason: 'timeout' };
   }
@@ -1309,6 +1428,14 @@ function classifyJsonRetryError(e: any): { retryable: boolean; reason: string } 
   }
 
   return { retryable: false, reason: 'non_retryable' };
+}
+
+function isBackgroundSubmitTimeoutMessage(message: string): boolean {
+  return (
+    message.includes('background submit 超时') ||
+    message.includes('submit 超时') ||
+    message.includes('未确认入队')
+  );
 }
 
 /* ============================================================

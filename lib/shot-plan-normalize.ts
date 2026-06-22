@@ -29,6 +29,9 @@ const INTERNAL_KEYS = new Set([
 
 const PACES = ['slow', 'normal', 'fast', 'fast_forward'];
 const EMOTIONS = ['setup', 'rising', 'climax', 'falling', 'resolution', 'transition'];
+const MIN_GENERATED_SHOTS = 6;
+const MAX_GENERATED_SHOTS = 14;
+const MAX_DIALOGUE_CHARS_PER_SHOT = 45;
 
 type NormalizeGeneratedShotOptions = {
   assets?: any;
@@ -37,6 +40,12 @@ type NormalizeGeneratedShotOptions = {
 
 type NormalizeGeneratedShotPlanOptions = NormalizeGeneratedShotOptions & {
   generatedAt?: string;
+};
+
+export type GeneratedShotPlanValidation = {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
 };
 
 function cleanFirst(...values: any[]): string {
@@ -247,14 +256,58 @@ export function buildPlanMeta(shots: any[], styleBible?: any, opts: { generatedA
   };
 }
 
+export function validateGeneratedShotPlan(shots: any[], planMeta?: any): GeneratedShotPlanValidation {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const list = Array.isArray(shots) ? shots : [];
+  if (list.length < MIN_GENERATED_SHOTS || list.length > MAX_GENERATED_SHOTS) {
+    errors.push(`shot_count_out_of_range:${list.length}`);
+  }
+
+  list.forEach((shot, index) => {
+    const label = `shot_${index + 1}`;
+    if (Number(shot?.idx) !== index + 1) errors.push(`${label}:idx_not_contiguous`);
+    if (!cleanShotText(shot?.visual)) errors.push(`${label}:missing_visual`);
+    if (!cleanShotText(shot?.shotType)) errors.push(`${label}:missing_shotType`);
+    if (!cleanShotText(shot?.camera)) errors.push(`${label}:missing_camera`);
+    const duration = Number(shot?.durationSec ?? shot?.duration);
+    if (!Number.isFinite(duration) || duration < 1 || duration > 7) {
+      errors.push(`${label}:duration_out_of_range`);
+    }
+    const dialogue = cleanShotText(shot?.dialogue);
+    if (dialogue && dialogue !== '——' && dialogue.length > MAX_DIALOGUE_CHARS_PER_SHOT) {
+      warnings.push(`${label}:dialogue_over_budget`);
+    }
+  });
+
+  const plannedDurationSec = list.reduce((sum, shot) => sum + (Number(shot?.durationSec ?? shot?.duration) || 0), 0);
+  if (planMeta && typeof planMeta === 'object') {
+    if (Number(planMeta.shotCount) !== list.length) errors.push('plan_meta_shot_count_mismatch');
+    if (Number(planMeta.plannedDurationSec) !== plannedDurationSec) errors.push('plan_meta_duration_mismatch');
+  }
+
+  const fixedCameraCount = list.filter((shot) => cleanShotText(shot?.camera) === '固定镜头').length;
+  if (list.length && fixedCameraCount / list.length < 0.4) {
+    warnings.push('fixed_camera_ratio_below_40_percent');
+  }
+
+  return { ok: errors.length === 0, errors, warnings };
+}
+
 export function normalizeGeneratedShotPlan(rawShots: any[], opts: NormalizeGeneratedShotPlanOptions = {}) {
   const shots = (Array.isArray(rawShots) ? rawShots : [])
     .map((shot, index) => normalizeGeneratedShot(shot, index, opts))
     .filter((shot) => shot.visual || (shot.dialogue && shot.dialogue !== '——'))
     .map((shot, index) => ({ ...shot, idx: index + 1 }));
+  const planMeta = buildPlanMeta(shots, opts.styleBible, { generatedAt: opts.generatedAt });
+  const validation = validateGeneratedShotPlan(shots, planMeta);
   return {
     shots,
-    planMeta: buildPlanMeta(shots, opts.styleBible, { generatedAt: opts.generatedAt }),
+    planMeta: {
+      ...planMeta,
+      validation,
+    },
+    validation,
   };
 }
 
