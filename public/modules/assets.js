@@ -965,7 +965,7 @@ export function refreshAssetsPage() {
     if (content) content.hidden = false;
     var _staleBannerEl = content && content.querySelector(".upstream-stale-banner");
     if (_staleBannerEl) _staleBannerEl.remove();
-    if (_ctx.isStale("assets") && content) {
+    if (typeof _ctx.isStale === "function" && _ctx.isStale("assets") && content) {
       var _sb = document.createElement("div");
       _sb.className = "upstream-stale-banner";
       _sb.innerHTML = '<span class="material-symbols-outlined">warning</span>' + escapeHtml(_assetStaleBannerTextForProject(project));
@@ -7529,21 +7529,76 @@ export async function _detectObsoleteAssets() {
       projectId: project.id,
       project: { assets: project.assets, shots: project.shots },
     });
-    return resp.obsolete || [];
+    return _normalizeObsoleteAssetItems(resp.obsolete);
   } catch (e) {
     console.warn("[DetectObsolete] backend call failed:", e);
     return [];
   }
 }
 
-export function _removeObsoleteAssets(items) {
-  if (!project || !project.assets || !items.length) return;
+function _normalizeObsoleteAssetItems(items) {
+  if (!Array.isArray(items)) return [];
+  var out = [];
+  items.forEach(function (item) {
+    if (!item || typeof item !== "object") return;
+    var type = item.type === "prop" || item.type === "scene" ? item.type : "";
+    var idx = Number(item.idx);
+    var reasons = Array.isArray(item.reasons)
+      ? item.reasons.map(function (reason) { return String(reason || "").trim(); }).filter(Boolean)
+      : [];
+    if (!type || !Number.isFinite(idx) || idx < 0 || Math.floor(idx) !== idx || !reasons.length) return;
+    out.push({
+      type: type,
+      idx: idx,
+      id: item.id == null ? "" : String(item.id || "").trim(),
+      name: item.name == null ? "" : String(item.name || "").trim(),
+      reasons: reasons,
+      reasonCodes: Array.isArray(item.reasonCodes) ? item.reasonCodes.slice() : [],
+    });
+  });
+  return out;
+}
+
+function _obsoleteAssetCurrentItem(item) {
+  if (!project || !project.assets || !item) return null;
+  var list = item.type === "prop" ? project.assets.props : item.type === "scene" ? project.assets.scenes : null;
+  return list && list[item.idx] ? list[item.idx] : null;
+}
+
+function _syntheticObsoleteAssetName(item) {
+  if (!item || (item.type !== "prop" && item.type !== "scene")) return "";
+  return (item.type === "prop" ? "道具 " : "场景 ") + (item.idx + 1);
+}
+
+function _obsoleteAssetMatchesCurrent(item) {
+  var current = _obsoleteAssetCurrentItem(item);
+  if (!current) return false;
+  var expectedId = item.id ? String(item.id).trim() : "";
+  var currentId = current.id == null ? "" : String(current.id || "").trim();
+  if (expectedId && currentId) return expectedId === currentId;
+  var expectedName = item.name ? String(item.name).trim() : "";
+  var currentName = current.name == null ? "" : String(current.name || "").trim();
+  if (!expectedId && !currentId && !currentName && expectedName === _syntheticObsoleteAssetName(item)) return true;
+  return !!expectedName && !!currentName && expectedName === currentName;
+}
+
+export async function _removeObsoleteAssets(items) {
+  var requested = Array.isArray(items) ? items.length : 0;
+  if (!project || !project.assets || !requested) return { removed: 0, skipped: requested };
+  items = _normalizeObsoleteAssetItems(items);
   var propIdxToRemove = {};
   var sceneIdxToRemove = {};
+  var skipped = requested - items.length;
   items.forEach(function (item) {
+    if (!_obsoleteAssetMatchesCurrent(item)) {
+      skipped += 1;
+      return;
+    }
     if (item.type === "prop") propIdxToRemove[item.idx] = true;
     if (item.type === "scene") sceneIdxToRemove[item.idx] = true;
   });
+  var removed = Object.keys(propIdxToRemove).length + Object.keys(sceneIdxToRemove).length;
+  if (!removed) return { removed: 0, skipped: skipped };
   if (Object.keys(propIdxToRemove).length && project.assets.props) {
     _reindexAssetImageStateAfterDeletes("prop", _deletedIndexList(propIdxToRemove));
     project.assets.props = project.assets.props.filter(function (_, i) { return !propIdxToRemove[i]; });
@@ -7554,9 +7609,10 @@ export function _removeObsoleteAssets(items) {
     project.assets.scenes = project.assets.scenes.filter(function (_, i) { return !sceneIdxToRemove[i]; });
     if (Array.isArray(project.environments)) project.environments = project.environments.filter(function (_, i) { return !sceneIdxToRemove[i]; });
   }
-  _saveAssetsProject();
+  await _flushAssetsProjectNow();
   renderAssets();
   _showAssetActions();
+  return { removed: removed, skipped: skipped };
 }
 
 export async function _showCleanObsoleteDialog() {
@@ -7610,7 +7666,7 @@ export async function _showCleanObsoleteDialog() {
   document.body.appendChild(overlay);
 
   overlay.querySelector("#_cleanCancel").addEventListener("click", function () { overlay.remove(); });
-  overlay.querySelector("#_cleanConfirm").addEventListener("click", function () {
+  overlay.querySelector("#_cleanConfirm").addEventListener("click", async function () {
     var toRemove = [];
     overlay.querySelectorAll("[data-clean-idx]").forEach(function (cb) {
       if (cb.checked) {
@@ -7619,8 +7675,9 @@ export async function _showCleanObsoleteDialog() {
       }
     });
     if (toRemove.length) {
-      _removeObsoleteAssets(toRemove);
-      showToast("已清理 " + toRemove.length + " 个过时资产", "ok");
+      var result = await _removeObsoleteAssets(toRemove);
+      if (result.removed) showToast("已清理 " + result.removed + " 个过时资产", "ok");
+      else showToast("未清理任何资产，列表可能已更新", "warn");
     }
     overlay.remove();
   });

@@ -82,6 +82,7 @@
     "test:frontend-api-timeouts": "node scripts/test-frontend-api-timeouts.mjs",
     "test:backend-stream-fallback": "node scripts/test-backend-stream-fallback-contract.mjs",
     "test:asset-extract-inflight": "tsx scripts/test-asset-extract-inflight.ts",
+    "test:obsolete-assets": "node scripts/test-obsolete-assets.js",
     "test:edit-export-signature": "tsx scripts/test-edit-export-signature.ts",
     "test:edit-auto-compose-state": "tsx scripts/test-edit-auto-compose-state.ts",
     "test:edit-preview-aspect": "node scripts/test-edit-preview-aspect-contract.mjs",

@@ -7646,8 +7646,9 @@ var _scriptEditInitialText = "";
           }
         });
         if (toRemove.length) {
-          _removeObsoleteAssets(toRemove);
-          showToast("已清理 " + toRemove.length + " 个过时资产", "ok");
+          var removeResult = await _removeObsoleteAssets(toRemove);
+          if (removeResult.removed) showToast("已清理 " + removeResult.removed + " 个过时资产", "ok");
+          else showToast("未清理任何资产，列表可能已更新", "warn");
         }
       }
 

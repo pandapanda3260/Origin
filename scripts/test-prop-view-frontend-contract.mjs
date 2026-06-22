@@ -24,6 +24,6 @@ assert.match(assets, /if \(type === "prop" && extra\.viewsError\) \{\s*delete it
 assert.match(assets, /if \(type === "prop" && \(extra\.views \|\| extra\.viewsError\) && Array\.isArray\(proj\.props\)/, 'task_completed must sync top-level props for split errors too');
 assert.match(assets, /if \(type === "prop" && \(extra\.views \|\| extra\.viewsError\)\) renderAssets\(\)/, 'prop completion must redraw the whole card after merging views or split errors');
 assert.match(assets, /if \(type === "prop" && _propHasViewSlots\(item\)\) _rerenderAssetGrid\("prop"\)/, 'polling fallback must rerender prop view cards');
-assert.match(workspace, /"\/modules\/assets\.js": "\/modules\/assets\.js\?v=179"/, 'assets.js import map version must be bumped');
+assert.match(workspace, /"\/modules\/assets\.js": "\/modules\/assets\.js\?v=181"/, 'assets.js import map version must be bumped');
 
 console.log('[test-prop-view-frontend-contract] all assertions passed');
