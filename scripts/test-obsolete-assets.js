@@ -167,7 +167,7 @@ function testFrontendAndRouteContracts() {
   assert(main.includes('await _removeObsoleteAssets(toRemove)'), 'cascade cleanup should await removal');
   assert(main.includes('removeResult.removed'), 'cascade cleanup toast should use real removed count');
   assert(!main.includes('showToast("已清理 " + toRemove.length + " 个过时资产"'), 'cascade cleanup must not use checked count');
-  assert(workspace.includes('"/modules/assets.js": "/modules/assets.js?v=182"'), 'assets.js import map should be bumped');
+  assert(workspace.includes('"/modules/assets.js": "/modules/assets.js?v=183"'), 'assets.js import map should be bumped');
   assert(workspace.includes('src="main.js?v=359"'), 'main.js script version should be bumped');
 }
 

@@ -2463,14 +2463,10 @@ async function _regenerateSceneAllViews(idx) {
       return;
     }
 
-    var followups = ["reverse", "alt", "topdown"].map(function (role) {
+    var followups = ["topdown", "reverse", "alt"].map(function (role) {
       return { type: "scene", idx: idx, viewRole: role, force: true };
     });
-    if (hint) _setAssetHeaderHint("正在重新生成场景反打、侧角与俯视布局…", "progress");
-    followups.forEach(function (target) {
-      updateAssetCardImage(target.type, target.idx, "loading", null, null, target.viewRole);
-    });
-    await _runAssetImageBatch(project.id, followups, hint, followups.length);
+    await _runSceneFollowupTargetsInOrder(project.id, followups, hint);
     if (_ctx.reloadProjectFromServer) {
       try { await _ctx.reloadProjectFromServer(); } catch (e2) { console.warn("[AssetImg] reload after scene full regeneration failed:", e2); }
     }
@@ -2744,11 +2740,37 @@ function _sceneFollowupTargetsAfterStage(originalTargets) {
     var idx = parseInt(rawIdx, 10);
     var item = _assetItemFor("scene", idx);
     if (!item || !_sceneViewOriginalUrl(item, "establishing")) return;
-    ["reverse", "alt", "topdown"].forEach(function (role) {
+    ["topdown", "reverse", "alt"].forEach(function (role) {
       if (!_sceneViewOriginalUrl(item, role)) followups.push({ type: "scene", idx: idx, viewRole: role });
     });
   });
   return followups;
+}
+
+async function _runSceneFollowupTargetsInOrder(originId, followups, hint) {
+  followups = Array.isArray(followups) ? followups : [];
+  if (!followups.length) return;
+  var topdownTargets = followups.filter(function (t) { return _normalizeSceneViewRole(t && t.viewRole) === "topdown"; });
+  var angleTargets = followups.filter(function (t) {
+    var role = _normalizeSceneViewRole(t && t.viewRole);
+    return role === "reverse" || role === "alt";
+  });
+  var groups = [
+    { targets: topdownTargets, label: "正在生成场景俯视布局锚图…" },
+    { targets: angleTargets, label: "正在生成场景反打与侧角视图…" }
+  ];
+  for (var i = 0; i < groups.length; i++) {
+    var group = groups[i];
+    if (!group.targets.length) continue;
+    if (hint) _setAssetHeaderHint(group.label, "progress");
+    group.targets.forEach(function (t) {
+      updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
+    });
+    await _runAssetImageBatch(originId, group.targets, hint, group.targets.length);
+    if (_ctx.reloadProjectFromServer) {
+      try { await _ctx.reloadProjectFromServer(); } catch (e) { console.warn("[AssetImg] reload after scene follow-up stage failed:", e); }
+    }
+  }
 }
 
 function _setAssetImagesGeneratingLocked(locked) {
@@ -2800,11 +2822,7 @@ async function _runAssetImageTargets(targets, hint) {
     }
     var followups = _sceneFollowupTargetsAfterStage(targets);
     if (followups.length) {
-      if (hint) _setAssetHeaderHint("正在生成场景反打、侧角与俯视锚图…", "progress");
-      followups.forEach(function (t) {
-        updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
-      });
-      await _runAssetImageBatch(project.id, followups, hint, followups.length);
+      await _runSceneFollowupTargetsInOrder(project.id, followups, hint);
     }
     _summarizeAssetImageGeneration(hint);
   } finally {
@@ -2975,11 +2993,7 @@ async function _executeAssetRegenerationReview(targets, reuseRows) {
       }
       var followups = _sceneFollowupTargetsAfterStage(targets);
       if (followups.length) {
-        if (hint) _setAssetHeaderHint("正在生成场景反打、侧角与俯视锚图…", "progress");
-        followups.forEach(function (t) {
-          updateAssetCardImage(t.type, t.idx, "loading", null, null, t.viewRole);
-        });
-        await _runAssetImageBatch(project.id, followups, hint, followups.length);
+        await _runSceneFollowupTargetsInOrder(project.id, followups, hint);
       }
       _summarizeAssetImageGeneration(hint);
     } else {

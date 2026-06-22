@@ -66,6 +66,10 @@ assert(assets.includes('return _regenerateSceneAllViews(idx);'), 'scene card ref
 assert(assets.includes('sceneViewRole === "establishing"'), 'scene establishing slot refresh should route to full scene view regeneration');
 assert(assets.includes('重新生成整组场景视图'), 'establishing slot tooltip should communicate full view regeneration');
 assert(assets.includes('var skipPromptRebuild = type === "scene" && !!sceneViewRole;'), 'single scene view refresh must not rebuild the shared scene prompt');
+assert(assets.includes('function _runSceneFollowupTargetsInOrder(originId, followups, hint)'), 'scene follow-up views should run through the ordered follow-up helper');
+assert(assets.includes('["topdown", "reverse", "alt"]'), 'scene follow-up generation should build topdown before reverse/alt angle views');
+assert(assets.includes('正在生成场景俯视布局锚图'), 'scene follow-up helper should expose the topdown anchor stage');
+assert(assets.includes('正在生成场景反打与侧角视图'), 'scene follow-up helper should expose the angle-view stage after topdown');
 assert(assets.includes('showToast(label + "图上传成功，已保存为主视角"'), 'scene upload should route through establishing-view semantics');
 assert(assets.includes('"views",') && assets.includes('"viewsVersion",') && assets.includes('"viewHistory",'), 'frontend generated-field restore should preserve scene view sets');
 const syncFn = section(assets, 'function _syncAssetHeaderHint(options)', 'function _assetVariant');
