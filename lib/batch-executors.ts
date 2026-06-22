@@ -128,6 +128,13 @@ import {
   checkFrameVisualConsistency,
   type FrameConsistencyCheckResult,
 } from './frame-consistency-check';
+import {
+  buildSceneViewQualityRetryPrompt,
+  errorSceneViewQualityResult,
+  evaluateSceneViewQuality,
+  shouldEvaluateSceneViewQuality,
+  type SceneViewQualityCheckResult,
+} from './scene-view-quality';
 import { inferTailFrameDependencyForShots } from './tail-frame-dependency';
 import {
   applyFirstFrameDraftToPlan,
@@ -976,13 +983,75 @@ function buildAssetPrompt(asset: any, type: string, _styleBible: any): string {
   ].filter(Boolean).join('\n');
 }
 
+function sceneQualityMetadata(asset: any): string {
+  const parts: string[] = [];
+  if (asset?.location) parts.push(`Location context: ${asset.location}.`);
+  if (asset?.timeSetting) parts.push(`Time of day: ${asset.timeSetting}.`);
+  if (asset?.weather) parts.push(`Weather: ${asset.weather}.`);
+  if (asset?.lighting) parts.push(`Lighting style: ${asset.lighting}.`);
+  if (asset?.atmosphere) parts.push(`Atmosphere / mood: ${asset.atmosphere}.`);
+  if (Array.isArray(asset?.elements) && asset.elements.length) parts.push(`Key elements: ${asset.elements.join(', ')}.`);
+  if (asset?.description) parts.push(`Description: ${asset.description}.`);
+  return parts.join('\n');
+}
+
+function sceneViewQualityAttemptSummary(attempt: number, check: SceneViewQualityCheckResult, imageUrl?: string) {
+  return {
+    attempt,
+    status: check.status,
+    decision: check.decision,
+    score: check.score,
+    threshold: check.threshold,
+    reasons: check.reasons,
+    retryPromptHint: check.retryPromptHint,
+    model: check.model,
+    provider: check.provider,
+    checkedAt: check.checkedAt,
+    imageUrl,
+  };
+}
+
+function sceneViewQualityAuditFromAttempts(
+  viewRole: SceneViewRole,
+  attempts: Array<ReturnType<typeof sceneViewQualityAttemptSummary>>,
+  acceptedImageUrl?: string,
+) {
+  if (!attempts.length) return undefined;
+  const accepted =
+    attempts.find((attempt) => acceptedImageUrl && attempt.imageUrl === acceptedImageUrl) ||
+    attempts[attempts.length - 1];
+  const checkedAttempts = attempts.filter((attempt) => attempt.status === 'checked');
+  const status = checkedAttempts.length
+    ? 'checked'
+    : attempts.some((attempt) => attempt.status === 'error')
+      ? 'error'
+      : 'skipped';
+  const reasons = accepted?.reasons?.length
+    ? accepted.reasons
+    : attempts.flatMap((attempt) => attempt.reasons || []).slice(0, 6);
+  return {
+    schemaVersion: 1,
+    viewRole,
+    status,
+    decision: 'accept',
+    score: typeof accepted?.score === 'number' ? accepted.score : null,
+    threshold: accepted?.threshold,
+    acceptedAttempt: typeof accepted?.attempt === 'number' ? accepted.attempt : attempts.length - 1,
+    acceptedImageUrl: acceptedImageUrl || accepted?.imageUrl || null,
+    attemptCount: attempts.length,
+    attempts,
+    reasons,
+    evaluatedAt: new Date().toISOString(),
+  };
+}
+
 /* ============================================================
    imageHistory archiving helper — keep old image+info snapshots
    on the asset itself so polling/reload from server preserves them.
    ============================================================ */
 const ASSET_IMG_HISTORY_FIELDS: Record<'char' | 'scene' | 'prop', string[]> = {
   char: ['name','role','identity','appearance','clothing','equipment','temperament','actionTraits','entityType','castingOverride','imagePrompt','description','tags'],
-  scene: ['name','description','location','timeSetting','weather','lighting','atmosphere','elements','imagePrompt','views','viewsVersion','viewHistory'],
+  scene: ['name','description','location','timeSetting','weather','lighting','atmosphere','elements','imagePrompt','views','viewsQuality','viewsVersion','viewHistory'],
   prop: ['name','propType','features','material','dimensionality','imagePrompt','views','viewsVersion','viewHistory'],
 };
 const MAX_ASSET_IMAGE_HISTORY = 10;
@@ -1139,7 +1208,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
     }
   }
 
-  const result = await generateImageWithModerationRecovery(ctx.user, {
+  const imageInput: ImageGenInput = {
     prompt,
     size: type === 'char' ? '1536x1024' : type === 'scene' ? '1536x1024' : isVolumetricProp ? '1536x1024' : '1024x1024',
     style: 'natural',
@@ -1163,7 +1232,93 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
       resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor || null,
       styleLockVersion: styleReferenceMeta.styleLockVersion,
     },
-  });
+  };
+  let result = await generateImageWithModerationRecovery(ctx.user, imageInput);
+  let sceneViewQualityAttempts: Array<ReturnType<typeof sceneViewQualityAttemptSummary>> = [];
+  let sceneViewQualityAudit: ReturnType<typeof sceneViewQualityAuditFromAttempts> | undefined;
+
+  if (sceneViewRole && shouldEvaluateSceneViewQuality(type, sceneViewRole)) {
+    const evaluateCandidate = async (
+      candidate: Awaited<ReturnType<typeof generateImageWithModerationRecovery>>,
+      attempt: number,
+    ): Promise<SceneViewQualityCheckResult> => {
+      const candidateImagePath = resolveLocalImagePath(candidate.url, ctx.user.id) || undefined;
+      ctx.progress({
+        stage: 'checking_scene_view_quality',
+        viewRole: sceneViewRole,
+        attempt,
+        hint: '检查场景副视图是否贴合主视角空间布局…',
+      });
+      return evaluateSceneViewQuality({
+        user: ctx.user,
+        viewRole: sceneViewRole,
+        establishingImagePath: referenceImagePath,
+        candidateImagePath,
+        sceneName: item?.name,
+        scenePrompt: reusablePrompt,
+        sceneMetadata: sceneQualityMetadata(item),
+        attempt,
+        tokenContext: {
+          ownerId: ctx.user.id,
+          usernameSnapshot: ctx.user.phone || ctx.user.display_name || ctx.user.username || null,
+          projectId: ctx.projectId,
+          routeName: 'batch.asset_images',
+          moduleKey: 'image',
+          moduleLabel: '图片生成',
+          featureKey: 'scene_view_quality_check',
+          featureLabel: '场景副视图一致性评分',
+          callItemType: 'batch_task',
+          callItemId: ctx.taskId,
+          callItemLabel: `${cat}[${idx}].views.${sceneViewRole}`,
+          batchId: ctx.batchId,
+          taskId: ctx.taskId,
+          operationKey: `batch:${ctx.batchId}:task:${ctx.taskId}:scene-view-quality:${sceneViewRole}:${attempt}`,
+          operationLabel: '场景副视图一致性评分',
+          meta: {
+            type,
+            cat,
+            idx,
+            viewRole: sceneViewRole,
+            attempt,
+          },
+        },
+      });
+    };
+
+    const firstCheck = await evaluateCandidate(result, 0);
+    sceneViewQualityAttempts.push(sceneViewQualityAttemptSummary(0, firstCheck, result.url));
+
+    if (firstCheck.decision === 'retry') {
+      try {
+        ctx.progress({
+          stage: 'calling_image_api',
+          viewRole: sceneViewRole,
+          attempt: 1,
+          hint: '重新生成场景副视图以修正空间一致性…',
+        });
+        const retryPrompt = buildSceneViewQualityRetryPrompt(prompt, firstCheck);
+        const retryResult = await generateImageWithModerationRecovery(ctx.user, {
+          ...imageInput,
+          prompt: retryPrompt,
+        });
+        const retryCheck = await evaluateCandidate(retryResult, 1);
+        sceneViewQualityAttempts.push(sceneViewQualityAttemptSummary(1, retryCheck, retryResult.url));
+        const firstScore = typeof firstCheck.score === 'number' ? firstCheck.score : -1;
+        const retryScore = typeof retryCheck.score === 'number' ? retryCheck.score : Number.POSITIVE_INFINITY;
+        if (retryCheck.status !== 'checked' || retryScore >= firstScore) {
+          result = retryResult;
+        }
+      } catch (retryErr: any) {
+        const retryError = errorSceneViewQualityResult(sceneViewRole, retryErr);
+        sceneViewQualityAttempts.push(sceneViewQualityAttemptSummary(1, retryError));
+        console.warn(
+          `[asset_images] scene view quality retry failed for ${cat}[${idx}].views.${sceneViewRole}; accepting first candidate: ` +
+          String(retryErr?.message || retryErr).slice(0, 300),
+        );
+      }
+    }
+    sceneViewQualityAudit = sceneViewQualityAuditFromAttempts(sceneViewRole, sceneViewQualityAttempts, result.url);
+  }
 
   let panelResult: SplitCharacterPanelsResult | null = null;
   if (type === 'char' && !isCrowdCharacterAsset) {
@@ -1260,6 +1415,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
             styleBibleSignature: styleReferenceMeta.styleBibleSignature,
             styleLockVersion: styleReferenceMeta.styleLockVersion,
             resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+            qualityAudit: sceneViewQualityAudit,
           })
         : type === 'prop' && isVolumetricProp && propViewResult
           ? applyPropViewWrite(baseAsset, {
@@ -1332,6 +1488,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
             styleBibleSignature: styleReferenceMeta.styleBibleSignature,
             styleLockVersion: styleReferenceMeta.styleLockVersion,
             resolvedBackdropColor: styleReferenceMeta.resolvedBackdropColor,
+            qualityAudit: sceneViewQualityAudit,
           })
         : type === 'prop' && isVolumetricProp && propViewResult
           ? applyPropViewWrite(baseTop, {
@@ -1429,6 +1586,7 @@ registerExecutor('asset_images', async (ctx: BatchExecCtx) => {
         ? (eventReferenceUpdate.lastError?.message || eventReferenceUpdate.lastError?.reason)
         : undefined,
       imageSafetyAudit: result.safetyAudit,
+      sceneViewQuality: sceneViewQualityAudit,
       styleBibleSignature: styleLockContext.signature,
       styleLockVersion: styleLockContext.styleLockVersion,
       resolvedBackdropColor: styleLockContext.resolvedBackdropColor,

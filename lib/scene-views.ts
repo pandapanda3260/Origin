@@ -86,6 +86,50 @@ function appendSceneViewHistory(existing: any): any[] {
   ].slice(0, MAX_SCENE_VIEW_HISTORY);
 }
 
+function summarizeSceneViewQuality(view: any): any | null {
+  const audit = view?.qualityAudit;
+  if (!audit || typeof audit !== 'object') return null;
+  return {
+    status: audit.status || 'unknown',
+    decision: audit.decision || 'accept',
+    score: typeof audit.score === 'number' ? audit.score : null,
+    threshold: typeof audit.threshold === 'number' ? audit.threshold : null,
+    attemptCount: Array.isArray(audit.attempts) ? audit.attempts.length : 0,
+    acceptedAttempt: typeof audit.acceptedAttempt === 'number' ? audit.acceptedAttempt : null,
+    checkedAt: audit.evaluatedAt || audit.checkedAt || null,
+    reasons: Array.isArray(audit.reasons) ? audit.reasons.slice(0, 4) : [],
+  };
+}
+
+function deriveSceneViewsQualitySummary(views: any[], updatedAt: string): any | undefined {
+  const byRole: Record<string, any> = {};
+  for (const view of views) {
+    const role = normalizeSceneViewRole(view?.role);
+    if (!role || role === 'establishing') continue;
+    const summary = summarizeSceneViewQuality(view);
+    if (summary) byRole[role] = summary;
+  }
+  const roles = Object.keys(byRole);
+  if (!roles.length) return undefined;
+  const hasUnchecked = roles.some((role) => byRole[role].status !== 'checked');
+  const hasLowScore = roles.some((role) => (
+    typeof byRole[role].score === 'number' &&
+    typeof byRole[role].threshold === 'number' &&
+    byRole[role].score < byRole[role].threshold
+  ));
+  const overallStatus = hasLowScore || hasUnchecked
+    ? 'best_effort'
+    : roles.length < 3
+      ? 'partial'
+      : 'pass';
+  return {
+    version: 1,
+    updatedAt,
+    overallStatus,
+    byRole,
+  };
+}
+
 export function applySceneViewWrite(existing: any, args: {
   role: SceneViewRole;
   imageUrl: string;
@@ -101,6 +145,7 @@ export function applySceneViewWrite(existing: any, args: {
   styleLockVersion?: number;
   resolvedBackdropColor?: string;
   invalidateOtherViews?: boolean;
+  qualityAudit?: any;
 }): any {
   const now = args.generatedAt || new Date().toISOString();
   const priorViews = Array.isArray(existing?.views) ? existing.views : [];
@@ -130,17 +175,22 @@ export function applySceneViewWrite(existing: any, args: {
     generatedAt: now,
   };
   if (args.assetId) currentView.assetId = args.assetId;
+  if (args.qualityAudit !== undefined) currentView.qualityAudit = args.qualityAudit;
 
   const baseForViews = { ...(existing || {}), views: keptViews };
-  const next = {
+  const nextViews = upsertSceneView(baseForViews, args.role, currentView);
+  const viewsQuality = deriveSceneViewsQualitySummary(nextViews, now);
+  const next: any = {
     ...(existing || {}),
     imagePrompt: args.imagePrompt === undefined ? existing?.imagePrompt : args.imagePrompt,
     imageSafetyAudit: args.imageSafetyAudit === undefined ? existing?.imageSafetyAudit : args.imageSafetyAudit,
     effectiveVisualDescription: args.effectiveVisualDescription === undefined ? existing?.effectiveVisualDescription : args.effectiveVisualDescription,
-    views: upsertSceneView(baseForViews, args.role, currentView),
+    views: nextViews,
     viewsVersion: Number(existing?.viewsVersion || 0) + 1,
     viewHistory: appendSceneViewHistory(existing),
   };
+  if (viewsQuality) next.viewsQuality = viewsQuality;
+  else delete next.viewsQuality;
   if (args.role === 'establishing') {
     next.imageUrl = args.imageUrl;
     next.rawUrl = args.rawUrl || args.imageUrl;

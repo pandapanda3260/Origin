@@ -115,6 +115,53 @@ function testViewSelectionAndKeys() {
   assert.equal(uploaded.viewHistory[0].version, 3, 'previous view set is archived before invalidation');
 }
 
+function testSceneViewsQualityAccumulatesByRole() {
+  const base = sceneViews.applySceneViewWrite({
+    name: '广场',
+    imageUrl: 'est',
+    rawUrl: 'est',
+    views: [{ role: 'establishing', imageUrl: 'est' }],
+    viewsVersion: 1,
+  }, {
+    role: 'reverse',
+    imageUrl: 'rev',
+    rawUrl: 'rev',
+    qualityAudit: {
+      schemaVersion: 1,
+      viewRole: 'reverse',
+      status: 'checked',
+      decision: 'accept',
+      score: 82,
+      threshold: 75,
+      attempts: [{ attempt: 0, status: 'checked', decision: 'accept', score: 82, threshold: 75, reasons: [] }],
+      reasons: [],
+      evaluatedAt: '2026-06-22T00:00:00.000Z',
+    },
+  });
+  const next = sceneViews.applySceneViewWrite(base, {
+    role: 'alt',
+    imageUrl: 'alt',
+    rawUrl: 'alt',
+    qualityAudit: {
+      schemaVersion: 1,
+      viewRole: 'alt',
+      status: 'checked',
+      decision: 'accept',
+      score: 68,
+      threshold: 75,
+      attempts: [{ attempt: 0, status: 'checked', decision: 'accept', score: 68, threshold: 75, reasons: ['weak side layout'] }],
+      reasons: ['weak side layout'],
+      evaluatedAt: '2026-06-22T00:01:00.000Z',
+    },
+  });
+  assert.equal(next.views.find((view) => view.role === 'reverse').qualityAudit.score, 82);
+  assert.equal(next.views.find((view) => view.role === 'alt').qualityAudit.score, 68);
+  assert.equal(next.viewsQuality.byRole.reverse.score, 82, 'reverse quality summary must survive later alt write');
+  assert.equal(next.viewsQuality.byRole.alt.score, 68, 'alt quality summary is added by role');
+  assert.equal(next.viewsQuality.overallStatus, 'best_effort', 'low scored role makes scene best_effort internally');
+}
+
 testLegacyUrlStrategies();
 testViewSelectionAndKeys();
+testSceneViewsQualityAccumulatesByRole();
 console.log('[test-scene-views] all assertions passed');

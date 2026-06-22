@@ -181,6 +181,33 @@ const SYSTEM_CARDS: SystemCardSeed[] = [
     sourceRef: { files: ['lib/video-reference-manifest.ts', 'lib/frame-workflow-state.ts'] },
   },
   {
+    id: 'sys-scene-view-quality-rubric',
+    module: 'scene_view_quality',
+    cardType: 'visual_quality_rubric',
+    title: '场景多视图评分只判断同一物理空间',
+    priority: 10,
+    tags: ['stage:asset_images', 'scene_view_quality'],
+    data: {
+      content: '评估 reverse / alt / topdown 时，只判断候选图是否能作为 establishing 的同一物理空间视图使用，不评价美术好坏。',
+      hardRules: [
+        '同风格、同色调、同题材不等于同一空间；必须能追踪核心空间锚点。',
+        '至少检查中心物、入口/出口、台阶/墙体/地面区域、大型道具、主轴线或朝向中的多个稳定锚点。',
+        'reverse 必须像同一空间的反打/回看，不得只是另一个类似广场或房间。',
+        'alt 必须像同一空间的侧角/细节机位，不得改掉关键入口、中心物和大结构。',
+        'topdown 必须是可读的俯视/高机位布局锚，不是普通概念图、眼平图或装饰性插画。',
+      ],
+      scoreFields: [
+        'sceneIdentityScore: 是否还是同一个地点/空间身份。',
+        'spatialLayoutScore: 关键空间锚点和相对位置是否能对应。',
+        'viewRoleScore: 候选图是否满足 reverse / alt / topdown 的角色。',
+        'visualContinuityScore: 材质、光线、天气、色彩、年代感是否一致。',
+        'promptComplianceScore: 是否符合 scene metadata 和原始场景提示词。',
+      ],
+      outputSchema: '{"score":0-100,"sceneIdentityScore":0-100,"spatialLayoutScore":0-100,"viewRoleScore":0-100,"visualContinuityScore":0-100,"promptComplianceScore":0-100,"reasons":["..."],"retryPromptHint":"..."}',
+    },
+    sourceRef: { files: ['lib/scene-view-quality.ts', 'lib/batch-executors.ts'] },
+  },
+  {
     id: 'sys-edit-dialogue-preservation',
     module: 'edit_strategy',
     cardType: 'edit_integrity',

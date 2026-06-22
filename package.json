@@ -57,6 +57,7 @@
     "test:first-frame-editor-ui-contract": "node scripts/test-first-frame-editor-ui-contract.mjs",
     "test:storyboard-index-rail-contract": "node scripts/test-storyboard-index-rail-contract.js",
     "test:frame-consistency-check": "tsx scripts/test-frame-consistency-check.ts",
+    "test:scene-view-quality": "tsx scripts/test-scene-view-quality.ts",
     "test:batch-preflight": "tsx scripts/test-batch-preflight.ts",
     "test:responses-input-role-mapping": "node scripts/test-responses-input-role-mapping.js",
     "test:project-dependency-state": "tsx scripts/test-project-dependency-state.js",
