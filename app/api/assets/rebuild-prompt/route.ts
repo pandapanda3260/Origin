@@ -84,7 +84,9 @@ export async function POST(req: NextRequest) {
       ],
       {
         temperature: 0.5,
-        maxTokens: 400,
+        // 这是短文本重写任务，不需要推理预算；显式压低 reasoning 避免把输出额度耗尽后误报缺 prompt。
+        maxTokens: 1200,
+        reasoningEffort: 'none',
         modelRole: 'structured',
         traceName: 'assets.rebuild-prompt',
         tokenContext: {

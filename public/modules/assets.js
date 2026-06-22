@@ -2350,12 +2350,35 @@ function _syncGeneratedAssetCardsFromProject() {
   return updated;
 }
 
+function _joinPublicDesc(parts) {
+  return parts.map(function (v) { return (v || "").toString().trim(); })
+    .filter(Boolean)
+    .join(" · ")
+    .slice(0, 160);
+}
+
+function _assetPublicDesc(item, cat) {
+  if (!item) return "";
+  if (item.description) return item.description;
+  if (cat === "characters") {
+    return _joinPublicDesc([item.role || item.identity, item.appearance, item.clothing, item.equipment, item.temperament]);
+  }
+  if (cat === "scenes") {
+    return _joinPublicDesc([item.location, item.timeSetting, item.atmosphere, item.weather, item.lighting]);
+  }
+  return _joinPublicDesc([item.propType, item.material, item.features, item.function, item.ownership]);
+}
+
 export async function _rebuildAssetImagePrompt(type, item) {
+  if (item) delete item._imagePromptRebuildError;
   var descParts = [];
   if (type === "char") {
     if (item.appearance) descParts.push(item.appearance);
     if (item.clothing) descParts.push(item.clothing);
     if (item.equipment) descParts.push(item.equipment);
+  } else if (type === "prop") {
+    var propDesc = _assetPublicDesc(item, "props");
+    if (propDesc) descParts.push(propDesc);
   } else {
     if (item.description) descParts.push(item.description);
   }
@@ -2386,9 +2409,11 @@ export async function _rebuildAssetImagePrompt(type, item) {
       payload.carriesCharacter = item.carriesCharacter;
     }
     var resp = await apiPost("/api/assets/rebuild-prompt", payload);
+    if (item) delete item._imagePromptRebuildError;
     return resp.imagePrompt || null;
   } catch (e) {
     console.error("[RebuildPrompt] failed:", e);
+    if (item) item._imagePromptRebuildError = (e && e.message) || String(e || "");
     return null;
   }
 }
@@ -2400,12 +2425,6 @@ async function _persistRebuiltAssetImagePrompt(type, idx, item) {
     var topKey = type === "char" ? "characters" : type === "scene" ? "environments" : "props";
     if (project[topKey] && project[topKey][idx]) {
       project[topKey][idx].imagePrompt = rebuiltPrompt;
-    }
-  } else if (item.imagePrompt) {
-    item.imagePrompt = "";
-    var fallbackTopKey = type === "char" ? "characters" : type === "scene" ? "environments" : "props";
-    if (project[fallbackTopKey] && project[fallbackTopKey][idx]) {
-      project[fallbackTopKey][idx].imagePrompt = "";
     }
   }
 
@@ -2496,7 +2515,8 @@ export async function generateSingleAssetImage(type, idx, viewRole) {
     var hasPrompt = await _persistRebuiltAssetImagePrompt(type, idx, item);
     if (!hasPrompt && type !== "char") {
       updateAssetCardImage(type, idx, "error", null, null, viewRole);
-      showToast(_assetTypeLabel(type) + "缺少可生成的提示词", "warn");
+      var rebuildError = item._imagePromptRebuildError || "";
+      showToast(rebuildError || _assetTypeLabel(type) + "缺少可生成的提示词", "warn");
       return;
     }
   }
@@ -6686,25 +6706,6 @@ async function _deleteWorldTemplate(tplId) {
 export function _collectLibraryAssets(proj) {
   var assets = [];
   if (!proj) return assets;
-
-  function _joinPublicDesc(parts) {
-    return parts.map(function (v) { return (v || "").toString().trim(); })
-      .filter(Boolean)
-      .join(" · ")
-      .slice(0, 160);
-  }
-
-  function _assetPublicDesc(item, cat) {
-    if (!item) return "";
-    if (item.description) return item.description;
-    if (cat === "characters") {
-      return _joinPublicDesc([item.role || item.identity, item.appearance, item.clothing, item.equipment, item.temperament]);
-    }
-    if (cat === "scenes") {
-      return _joinPublicDesc([item.location, item.timeSetting, item.atmosphere, item.weather, item.lighting]);
-    }
-    return _joinPublicDesc([item.propType, item.material, item.features, item.function, item.ownership]);
-  }
 
   function _shotSummaryForStoryboard(sb, idx) {
     var indices = sb && Array.isArray(sb.shotIndices) ? sb.shotIndices : [idx];
