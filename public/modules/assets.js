@@ -1797,6 +1797,8 @@ function _showSceneMenu(anchor, idx) {
     '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-scene-menu="download"><span class="material-symbols-outlined text-lg text-[#1565C0]">download</span>下载图片</button>' +
     '<div class="mx-4 border-t border-black/[0.06]"></div>' +
+    '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-scene-menu="replace-custom-scene"><span class="material-symbols-outlined text-lg text-primary">add_photo_alternate</span>替换场景特征</button>' +
+    '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#1a1a1a] hover:bg-[#f5f5f5] transition-colors" data-scene-menu="history"><span class="material-symbols-outlined text-lg">history</span>历史记录</button>' +
     '<div class="mx-4 border-t border-black/[0.06]"></div>' +
     '<button type="button" class="w-full flex items-center gap-3 px-5 py-3 text-[13px] font-medium text-[#e53935] hover:bg-red-50 transition-colors rounded-b-2xl" data-scene-menu="delete"><span class="material-symbols-outlined text-lg">delete_outline</span>删除场景</button>';
@@ -1814,6 +1816,10 @@ function _showSceneMenu(anchor, idx) {
       _triggerAssetImageUpload("scene", idx);
     } else if (act === "download") {
       _downloadAssetImage("scene", idx);
+    } else if (act === "replace-custom-scene") {
+      _openCustomSceneReplaceDialog(idx).catch(function (e) {
+        showToast("定制场景加载失败：" + ((e && e.message) || e), "error");
+      });
     } else if (act === "history") {
       _openAssetHistoryFor("scene", idx);
       return;
@@ -4229,6 +4235,10 @@ var _customCharReplaceDismissHandler = null;
 var _customCharReplaceKeyHandler = null;
 var _customCharReplaceSelection = "";
 var _customCharReplaceItems = [];
+var _customSceneReplaceDismissHandler = null;
+var _customSceneReplaceKeyHandler = null;
+var _customSceneReplaceSelection = "";
+var _customSceneReplaceItems = [];
 
 /* ── 道具卡右上角菜单 ── */
 var _propMoreMenuDismissHandler = null;
@@ -4667,6 +4677,215 @@ function _replaceAssetCharacterWithCustom(idx, item) {
   if (project.styleBible && _ctx.refreshStylePage) _ctx.refreshStylePage();
   _syncAssetToStyleBible("char", idx);
   showToast("已替换角色特征，角色名称和 ID 已保留", "ok");
+}
+
+function _customSceneCurrentFields(item) {
+  item = item || {};
+  return item.current || item.currentVersion && (item.currentVersion.sceneData || item.currentVersion.fields) || {};
+}
+
+function _customSceneDisplayName(item) {
+  var fields = _customSceneCurrentFields(item);
+  return fields.name || item.title || "未命名场景";
+}
+
+function _customSceneViewUrl(item, role) {
+  var fields = _customSceneCurrentFields(item);
+  return _sceneViewOriginalUrl(fields, role || "establishing");
+}
+
+function _customSceneCardHtml(item, selectedId) {
+  var fields = _customSceneCurrentFields(item);
+  var id = item && item.id || "";
+  var name = _customSceneDisplayName(item);
+  var thumb = _customSceneViewUrl(item, "establishing");
+  var summary = [fields.location, fields.timeSetting, fields.weather, fields.atmosphere]
+    .map(function (value) { return String(value || "").trim(); })
+    .filter(Boolean)
+    .join(" · ");
+  var selected = id && id === selectedId;
+  return '<button type="button" class="custom-char-choice custom-scene-choice' + (selected ? ' is-selected' : '') + '" data-custom-scene-choice="' + escapeHtml(id) + '">' +
+    '<span class="custom-char-choice-thumb">' +
+      (thumb ? '<img src="' + escapeHtml(_assetVariant(thumb, ASSET_CARD_THUMB_W)) + '" alt="' + escapeHtml(name) + '" loading="lazy" decoding="async" />' : '<span class="material-symbols-outlined">landscape</span>') +
+    '</span>' +
+    '<span class="custom-char-choice-copy">' +
+      '<strong>' + escapeHtml(name) + '</strong>' +
+      (summary ? '<small>' + escapeHtml(summary.slice(0, 72)) + '</small>' : '<small>定制场景</small>') +
+    '</span>' +
+  '</button>';
+}
+
+function _renderCustomSceneReplaceDialog(idx, loading, errorText) {
+  var overlay = document.getElementById("customSceneReplaceDialog");
+  if (!overlay) return;
+  var currentName = project && project.assets && project.assets.scenes && project.assets.scenes[idx]
+    ? project.assets.scenes[idx].name || ("场景 " + (idx + 1))
+    : ("场景 " + (idx + 1));
+  var listHtml = "";
+  if (loading) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined toolbox-spin">progress_activity</span><p>正在加载定制场景</p></div>';
+  } else if (errorText) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined">error</span><p>' + escapeHtml(errorText) + '</p></div>';
+  } else if (!_customSceneReplaceItems.length) {
+    listHtml = '<div class="custom-char-picker-empty"><span class="material-symbols-outlined">landscape</span><p>暂无可替换的定制场景</p></div>';
+  } else {
+    listHtml = _customSceneReplaceItems.map(function (item) {
+      return _customSceneCardHtml(item, _customSceneReplaceSelection);
+    }).join("");
+  }
+  overlay.innerHTML =
+    '<div class="custom-char-replace-card custom-scene-replace-card" role="dialog" aria-modal="true" aria-label="替换场景特征" onclick="event.stopPropagation()">' +
+      '<button type="button" class="custom-char-replace-close" data-custom-scene-replace-close title="关闭"><span class="material-symbols-outlined">close</span></button>' +
+      '<div class="custom-char-replace-head">' +
+        '<p>REPLACE SCENE TRAITS</p>' +
+        '<h3>替换场景特征</h3>' +
+        '<small>将「' + escapeHtml(currentName) + '」的图片、字段和四视图替换为一个已确认的定制场景，场景名称和 ID 保持不变。</small>' +
+      '</div>' +
+      '<div class="custom-char-picker-grid custom-scene-picker-grid">' + listHtml + '</div>' +
+      '<div class="custom-char-replace-foot">' +
+        '<button type="button" class="custom-char-replace-cancel" data-custom-scene-replace-close>取消</button>' +
+        '<button type="button" class="custom-char-replace-confirm" data-custom-scene-replace-confirm="' + escapeHtml(String(idx)) + '" ' + (!_customSceneReplaceSelection ? 'disabled' : '') + '>确认替换特征</button>' +
+      '</div>' +
+    '</div>';
+  hydrateProtectedImageElements(overlay);
+  var card = overlay.querySelector(".custom-scene-replace-card");
+  if (card) {
+    card.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      var close = ev.target.closest("[data-custom-scene-replace-close]");
+      if (close) {
+        _dismissCustomSceneReplaceDialog();
+        return;
+      }
+      var choice = ev.target.closest("[data-custom-scene-choice]");
+      if (choice) {
+        _customSceneReplaceSelection = choice.getAttribute("data-custom-scene-choice") || "";
+        _renderCustomSceneReplaceDialog(Number(overlay.getAttribute("data-replace-idx") || 0), false, "");
+        return;
+      }
+      var confirm = ev.target.closest("[data-custom-scene-replace-confirm]");
+      if (confirm) {
+        var idx = Number(confirm.getAttribute("data-custom-scene-replace-confirm"));
+        var selected = _customSceneReplaceItems.find(function (item) { return item && item.id === _customSceneReplaceSelection; });
+        if (!selected) {
+          showToast("请先选择一个定制场景", "warn");
+          return;
+        }
+        _dismissCustomSceneReplaceDialog();
+        _replaceAssetSceneWithCustom(idx, selected);
+      }
+    });
+  }
+}
+
+function _dismissCustomSceneReplaceDialog() {
+  var overlay = document.getElementById("customSceneReplaceDialog");
+  if (overlay) overlay.remove();
+  if (_customSceneReplaceDismissHandler) {
+    document.removeEventListener("click", _customSceneReplaceDismissHandler);
+    _customSceneReplaceDismissHandler = null;
+  }
+  if (_customSceneReplaceKeyHandler) {
+    document.removeEventListener("keydown", _customSceneReplaceKeyHandler);
+    _customSceneReplaceKeyHandler = null;
+  }
+}
+
+async function _openCustomSceneReplaceDialog(idx) {
+  if (!project || !project.assets || !project.assets.scenes || !project.assets.scenes[idx]) return;
+  _dismissCustomSceneReplaceDialog();
+  _customSceneReplaceSelection = "";
+  _customSceneReplaceItems = [];
+
+  var overlay = document.createElement("div");
+  overlay.id = "customSceneReplaceDialog";
+  overlay.className = "custom-char-replace-overlay custom-scene-replace-overlay";
+  overlay.setAttribute("data-replace-idx", String(idx));
+  document.body.appendChild(overlay);
+  _renderCustomSceneReplaceDialog(idx, true, "");
+
+  overlay.addEventListener("click", function () { _dismissCustomSceneReplaceDialog(); });
+  _customSceneReplaceDismissHandler = function (ev) {
+    if (!overlay.contains(ev.target)) _dismissCustomSceneReplaceDialog();
+  };
+  _customSceneReplaceKeyHandler = function (ev) {
+    if (ev.key === "Escape") _dismissCustomSceneReplaceDialog();
+  };
+  setTimeout(function () {
+    document.addEventListener("click", _customSceneReplaceDismissHandler);
+    document.addEventListener("keydown", _customSceneReplaceKeyHandler);
+  }, 0);
+
+  try {
+    var url = "/api/scene-custom/history?limit=100";
+    var data = await apiGet(url, { timeoutMs: 15000 });
+    _customSceneReplaceItems = (data.items || []).filter(function (item) {
+      return !!_customSceneViewUrl(item, "establishing");
+    });
+    if (!_customSceneReplaceSelection && _customSceneReplaceItems.length) {
+      _customSceneReplaceSelection = _customSceneReplaceItems[0].id || "";
+    }
+    _renderCustomSceneReplaceDialog(idx, false, "");
+  } catch (e) {
+    _renderCustomSceneReplaceDialog(idx, false, (e && e.message) || "定制场景加载失败");
+  }
+}
+
+function _customSceneToAssetScene(item, previous) {
+  var fields = _deepClonePlain(_customSceneCurrentFields(item));
+  previous = previous || {};
+  var preservedName = previous.name || previous.canonicalName || fields.name || item.title || "未命名场景";
+  var preservedId = previous.id || previous.sceneId || fields.id || item.id || "";
+  var preservedSceneId = previous.sceneId || previous.id || preservedId || fields.sceneId || fields.id || item.id || "";
+  var next = {
+    ...fields,
+    id: preservedId,
+    sceneId: preservedSceneId,
+    name: preservedName,
+    canonicalName: previous.canonicalName || preservedName,
+    customSceneId: item.id || "",
+    customSceneVersionId: item.currentVersion && item.currentVersion.id || item.currentVersionId || "",
+    _fromCustomScene: true,
+  };
+  if (previous.isMain) next.isMain = true;
+  if (previous.assetId) next.assetId = previous.assetId;
+  if (previous.materialId) next.materialId = previous.materialId;
+  if (previous.sourceAssetId) next.sourceAssetId = previous.sourceAssetId;
+  delete next.imageLastError;
+  delete next.imageFailedAt;
+  delete next.viewsError;
+  delete next.viewsErrorAt;
+  if (next.reference) {
+    delete next.reference.lastError;
+    delete next.reference.lastAttemptUrl;
+    delete next.reference.lastFailedAt;
+  }
+  return next;
+}
+
+function _clearAllSceneViewStaleFlags(idx) {
+  if (!project || !project._staleFlags) return;
+  delete project._staleFlags[_sceneViewStaleKey(idx)];
+  SCENE_VIEW_ROLES.forEach(function (role) {
+    delete project._staleFlags[_sceneViewStaleKey(idx, role)];
+  });
+}
+
+function _replaceAssetSceneWithCustom(idx, item) {
+  if (!project || !project.assets || !project.assets.scenes || !project.assets.scenes[idx]) return;
+  var previous = project.assets.scenes[idx] || {};
+  var oldDesc = _getAssetDescText("scene", idx);
+  var next = _customSceneToAssetScene(item, previous);
+  project.assets.scenes[idx] = next;
+  if (Array.isArray(project.environments)) {
+    project.environments[idx] = _deepClonePlain(next);
+  }
+  _clearAllSceneViewStaleFlags(idx);
+  _saveAssetsProject();
+  renderAssets();
+  _showAssetActions();
+  _autoSyncUpstream("scene", idx, oldDesc);
+  showToast("已替换场景特征，场景名称和 ID 已保留", "ok");
 }
 
 var _charUploadStreams = {};

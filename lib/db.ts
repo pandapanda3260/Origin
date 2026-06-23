@@ -493,6 +493,51 @@ function bootstrap(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_custom_character_versions_character_time
       ON custom_character_versions(character_id, version_no DESC);
 
+    -- 场景定制：独立于项目资产页的自定义场景与版本历史。
+    CREATE TABLE IF NOT EXISTS custom_scenes (
+      id                 TEXT PRIMARY KEY,
+      owner_id           INTEGER NOT NULL,
+      project_id         TEXT,
+      current_version_id TEXT,
+      title              TEXT NOT NULL DEFAULT '未命名场景',
+      lifecycle_status   TEXT NOT NULL DEFAULT 'confirmed',
+      confirmed_at       TEXT,
+      created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_custom_scenes_owner_project_time
+      ON custom_scenes(owner_id, project_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_custom_scenes_owner_lifecycle_project_time
+      ON custom_scenes(owner_id, lifecycle_status, project_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS custom_scene_versions (
+      id                TEXT PRIMARY KEY,
+      scene_id          TEXT NOT NULL,
+      owner_id          INTEGER NOT NULL,
+      project_id        TEXT,
+      version_no        INTEGER NOT NULL,
+      generation_status TEXT NOT NULL DEFAULT 'completed',
+      source_type       TEXT NOT NULL DEFAULT 'prompt',
+      prompt            TEXT NOT NULL DEFAULT '',
+      params_json       TEXT NOT NULL DEFAULT '{}',
+      input_refs_json   TEXT NOT NULL DEFAULT '[]',
+      scene_data_json   TEXT NOT NULL DEFAULT '{}',
+      result_image_id   TEXT,
+      source_hash       TEXT,
+      error_message     TEXT,
+      created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      FOREIGN KEY (scene_id) REFERENCES custom_scenes(id) ON DELETE CASCADE,
+      FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_custom_scene_versions_number
+      ON custom_scene_versions(scene_id, version_no);
+    CREATE INDEX IF NOT EXISTS idx_custom_scene_versions_owner_time
+      ON custom_scene_versions(owner_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_custom_scene_versions_scene_time
+      ON custom_scene_versions(scene_id, version_no DESC);
+
     -- 素材库 v1：长期资产索引。真实文件型素材才进入 assets；
     -- 生成中、失败槽位、部分成功记录进入 generation_batches / generation_failures。
     CREATE TABLE IF NOT EXISTS asset_version_groups (
@@ -1098,6 +1143,7 @@ function bootstrap(db: Database.Database) {
   migrateProjectsVersionColumn(db);
   migrateVideoPromptSnapshotColumn(db);
   migrateCustomCharacterLifecycleColumns(db);
+  migrateCustomSceneTables(db);
   migratePhoneIdentityColumns(db);
   migrateUserAccountIds(db);
   migrateOtpPhoneIdentityTable(db);
@@ -1130,6 +1176,58 @@ function migrateCustomCharacterLifecycleColumns(db: Database.Database) {
       ON custom_characters(owner_id, lifecycle_status, project_id, updated_at DESC)`);
   } catch (e) {
     console.warn('[db] migrateCustomCharacterLifecycleColumns failed:', e);
+  }
+}
+
+function migrateCustomSceneTables(db: Database.Database) {
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS custom_scenes (
+        id                 TEXT PRIMARY KEY,
+        owner_id           INTEGER NOT NULL,
+        project_id         TEXT,
+        current_version_id TEXT,
+        title              TEXT NOT NULL DEFAULT '未命名场景',
+        lifecycle_status   TEXT NOT NULL DEFAULT 'confirmed',
+        confirmed_at       TEXT,
+        created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_custom_scenes_owner_project_time
+        ON custom_scenes(owner_id, project_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_custom_scenes_owner_lifecycle_project_time
+        ON custom_scenes(owner_id, lifecycle_status, project_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS custom_scene_versions (
+        id                TEXT PRIMARY KEY,
+        scene_id          TEXT NOT NULL,
+        owner_id          INTEGER NOT NULL,
+        project_id        TEXT,
+        version_no        INTEGER NOT NULL,
+        generation_status TEXT NOT NULL DEFAULT 'completed',
+        source_type       TEXT NOT NULL DEFAULT 'prompt',
+        prompt            TEXT NOT NULL DEFAULT '',
+        params_json       TEXT NOT NULL DEFAULT '{}',
+        input_refs_json   TEXT NOT NULL DEFAULT '[]',
+        scene_data_json   TEXT NOT NULL DEFAULT '{}',
+        result_image_id   TEXT,
+        source_hash       TEXT,
+        error_message     TEXT,
+        created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        FOREIGN KEY (scene_id) REFERENCES custom_scenes(id) ON DELETE CASCADE,
+        FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_custom_scene_versions_number
+        ON custom_scene_versions(scene_id, version_no);
+      CREATE INDEX IF NOT EXISTS idx_custom_scene_versions_owner_time
+        ON custom_scene_versions(owner_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_custom_scene_versions_scene_time
+        ON custom_scene_versions(scene_id, version_no DESC);
+    `);
+  } catch (e) {
+    console.warn('[db] migrateCustomSceneTables failed:', e);
   }
 }
 

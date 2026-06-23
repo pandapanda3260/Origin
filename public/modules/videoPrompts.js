@@ -22,6 +22,7 @@ let _vpParseTimers = {};
 let _vpAttachedBatchesByKey = Object.create(null);
 let _vpTerminalHandledByKey = Object.create(null);
 let _vpReattachRefreshTimer = null;
+let _vpVideoResultUnsubscribe = null;
 
 const _HL_CLASS = {
   motion: 'font-bold border-b border-primary/30',
@@ -30,7 +31,21 @@ const _HL_CLASS = {
 };
 
 export function initVideoPrompts(ctx) {
+  if (_vpVideoResultUnsubscribe) {
+    try { _vpVideoResultUnsubscribe(); } catch (_e) {}
+    _vpVideoResultUnsubscribe = null;
+  }
   _ctx = ctx || {};
+  if (_ctx.subscribeVideoResultChanges) {
+    _vpVideoResultUnsubscribe = _ctx.subscribeVideoResultChanges(function (evt) {
+      if (!_isVideoResultSurfaceActive()) return;
+      var groupIdx = evt && typeof evt.groupIdx === "number" ? evt.groupIdx : null;
+      if (groupIdx == null || groupIdx === _vpSelectedGroup) {
+        renderVideoResultCard(_vpSelectedGroup);
+      }
+      try { _renderVpStoryboardFrames(); } catch (_e) {}
+    });
+  }
   _syncRefs();
 }
 
@@ -43,6 +58,34 @@ function _syncRefs() {
   project = _ctx.getProject ? _ctx.getProject() : project;
   settings = _ctx.getSettings ? _ctx.getSettings() : settings;
 }
+
+function _getVideoResultStateForGroup(gIdx) {
+  if (_ctx.getVideoResultState) {
+    try {
+      var state = _ctx.getVideoResultState(gIdx);
+      if (state) return state;
+    } catch (e) {
+      console.warn("[VideoResult] get state failed:", e);
+    }
+  }
+  var sb = project && project.storyboards && project.storyboards[gIdx];
+  return {
+    groupIdx: gIdx,
+    status: "not_generated",
+    statusLabel: "未生成",
+    statusIcon: "radio_button_unchecked",
+    videoUrl: "",
+    protectedUrl: "",
+    canPlay: false,
+    canRegenerate: _isVideoPromptReady(sb),
+    canDownload: false,
+    canDelete: false,
+    canImport: false,
+    imported: false,
+    progress: 0,
+  };
+}
+
 function _invalidateVideoForGroup(gIdx, sb) {
   var now = new Date().toISOString();
   if (sb) {
@@ -259,20 +302,16 @@ function _updateVideoPromptConfirmButton(groups) {
   var area = $("videoPromptsConfirmTopArea");
   var btn = $("btnConfirmVideoPromptsTop");
   if (!area || !btn) return;
-  var allDone = _areAllVideoPromptsReady(groups || getStoryboardGroups());
   area.hidden = false;
-  btn.disabled = !allDone;
+  btn.disabled = false;
   // 用 innerHTML 整段重写，保留前置语义 icon + 末尾箭头；如果只 setText 会把 workspace.html
   // 里的 <span class="material-symbols-outlined"> 子节点冲掉，导致 icon 一刷新就丢。
   btn.innerHTML =
-    '<span class="material-symbols-outlined text-base">auto_awesome</span>' +
-    '<span>确认提示词，进入下一步</span>' +
+    '<span class="material-symbols-outlined text-base">content_cut</span>' +
+    '<span>进入剪辑</span>' +
     '<span class="material-symbols-outlined text-base">arrow_forward</span>';
-  btn.classList.toggle("opacity-50", !allDone);
-  btn.classList.toggle("cursor-not-allowed", !allDone);
-  btn.classList.toggle("shadow-none", !allDone);
-  btn.classList.toggle("hover:opacity-90", allDone);
-  btn.classList.toggle("hover:opacity-50", !allDone);
+  btn.classList.remove("opacity-50", "cursor-not-allowed", "shadow-none", "hover:opacity-50");
+  btn.classList.add("hover:opacity-90");
 }
 
 function saveProject() { if (_ctx.saveProject) return _ctx.saveProject(); }
@@ -705,7 +744,10 @@ async function _handleVideoPromptPreflightBlocked(payload, runOpts, hint, btn) {
 }
 
 export function getVpSelectedGroup() { return _vpSelectedGroup; }
-export function setVpSelectedGroup(idx) { _vpSelectedGroup = idx; }
+export function setVpSelectedGroup(idx) {
+  _vpSelectedGroup = idx;
+  renderVideoResultCard(_vpSelectedGroup);
+}
 
 /* ================================================================
    VP Cache
@@ -1242,7 +1284,7 @@ function _renderVpStoryboardFrames() {
 
     frame.innerHTML =
       '<div class="vp-frame-shot-number">' + escapeHtml('片段 ' + (gIdx + 1)) + '</div>' +
-      '<div class="aspect-[21/9] rounded-xl overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.05)] bg-surface-container-lowest transition-transform duration-500 group-hover:scale-[1.02]' +
+      '<div class="aspect-[16/9] rounded-xl overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.05)] bg-surface-container-lowest transition-transform duration-500 group-hover:scale-[1.02]' +
         (isActive ? ' ring-2 ring-primary/30' : '') + '">' +
         imgHtml +
       '</div>' +
@@ -1261,11 +1303,94 @@ function _renderVpStoryboardFrames() {
       _vpSelectedGroup = gIdx;
       _renderVpStoryboardFrames();
       renderVideoPromptList({ force: true });
+      renderVideoResultCard(gIdx);
     });
 
     container.appendChild(frame);
   });
   hydrateProtectedImageElements(container);
+}
+
+function _videoResultTone(status) {
+  if (status === "ready") return "is-ready";
+  if (status === "generating") return "is-running";
+  if (status === "failed") return "is-failed";
+  if (status === "outdated") return "is-outdated";
+  return "is-empty";
+}
+
+function _disabledAttr(enabled) {
+  return enabled ? "" : " disabled";
+}
+
+function _isVideoResultSurfaceActive() {
+  var page = $("pagePrompts");
+  if (page && page.hidden) return false;
+  var root = $("videoResultCard");
+  return !!(root && root.isConnected);
+}
+
+export function renderVideoResultCard(gIdx) {
+  _syncRefs();
+  var root = $("videoResultCard");
+  if (!root) return;
+  var groups = getStoryboardGroups();
+  if (!groups.length) {
+    root.innerHTML = "";
+    return;
+  }
+  var idx = Number.isInteger(gIdx) ? gIdx : _vpSelectedGroup;
+  if (idx < 0 || idx >= groups.length) idx = 0;
+  var state = _getVideoResultStateForGroup(idx);
+  var tone = _videoResultTone(state.status);
+  var rawVideoUrl = state.videoUrl || state.protectedUrl || "";
+  var previewHtml = rawVideoUrl && state.canPlay
+    ? '<video class="video-result-video" data-raw-src="' + escapeHtml(rawVideoUrl) + '" playsinline preload="metadata"></video>'
+    : '<div class="video-result-empty">' +
+        '<span class="material-symbols-outlined">' + escapeHtml(state.statusIcon || "movie") + '</span>' +
+        '<span>' + escapeHtml(state.statusLabel || "未生成") + '</span>' +
+      '</div>';
+  var progressHtml = state.status === "generating"
+    ? '<div class="video-result-progress"><i style="width:' + Math.max(4, Math.min(100, Number(state.progress || 0))) + '%"></i></div>'
+    : '';
+  root.innerHTML =
+    '<div class="video-result-card-inner ' + tone + '" data-video-result-group="' + idx + '">' +
+      '<div class="video-result-head">' +
+        '<div class="video-result-title">' +
+          '<span>当前视频</span>' +
+          '<em>' + escapeHtml(String(idx + 1).padStart(2, "0")) + '</em>' +
+        '</div>' +
+        '<span class="video-result-status-icon ' + tone + '" title="' + escapeHtml(state.statusLabel || "") + '">' +
+          '<span class="material-symbols-outlined">' + escapeHtml(state.statusIcon || "radio_button_unchecked") + '</span>' +
+        '</span>' +
+      '</div>' +
+      '<div class="video-result-preview-frame">' + previewHtml + '</div>' +
+      progressHtml +
+      '<div class="video-result-actions">' +
+        '<button type="button" class="video-result-action" data-video-result-action="play"' + _disabledAttr(state.canPlay) + '>' +
+          '<span class="material-symbols-outlined">play_arrow</span><span>播放</span>' +
+        '</button>' +
+        '<button type="button" class="video-result-action" data-video-result-action="regenerate"' + _disabledAttr(state.canRegenerate) + ' data-write-action>' +
+          '<span class="material-symbols-outlined">auto_awesome</span><span>重新生成</span>' +
+        '</button>' +
+        '<button type="button" class="video-result-icon-action" data-video-result-action="history" title="历史" aria-label="历史">' +
+          '<span class="material-symbols-outlined">history</span>' +
+        '</button>' +
+        '<div class="video-result-more-wrap">' +
+          '<button type="button" class="video-result-icon-action" data-video-result-action="toggle-menu" aria-haspopup="menu" aria-expanded="false" title="更多" aria-label="更多">' +
+            '<span class="material-symbols-outlined">more_vert</span>' +
+          '</button>' +
+          '<div class="video-result-more-menu" role="menu" hidden>' +
+            '<button type="button" role="menuitem" data-video-result-action="download"' + _disabledAttr(state.canDownload) + '>下载</button>' +
+            '<button type="button" role="menuitem" data-video-result-action="import"' + _disabledAttr(state.canImport && !state.imported) + ' data-write-action>' + (state.imported ? '已导入' : '导入剪辑') + '</button>' +
+            '<button type="button" role="menuitem" class="is-danger" data-video-result-action="delete"' + _disabledAttr(state.canDelete) + ' data-write-action>删除</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  if (_ctx.hydrateVideoResultPlayback) {
+    try { _ctx.hydrateVideoResultPlayback(root); } catch (_e) {}
+  }
 }
 
 export function renderVideoPromptList(opts) {
@@ -1284,6 +1409,7 @@ export function renderVideoPromptList(opts) {
   var active = document.activeElement;
   if (!(opts && opts.force) && active && active.id === "vpPromptTextarea" && parseInt(active.dataset.gidx || "-1", 10) === gIdx) {
     updateVideoPromptChrome(gIdx);
+    renderVideoResultCard(gIdx);
     return;
   }
 
@@ -1376,6 +1502,7 @@ export function renderVideoPromptList(opts) {
   }
   list.appendChild(card);
   updateVideoPromptChrome(gIdx);
+  renderVideoResultCard(gIdx);
 }
 
 export function updateVpCard(gIdx, status, promptText, errMsg) {
@@ -2326,6 +2453,44 @@ export async function confirmVideoPrompts() {
     saveProject();
   }
   switchPage("batch");
+}
+
+export async function prepareVideoPromptsForVideoGeneration(groupIdxs) {
+  _syncRefs();
+  if (!project || !Array.isArray(project.storyboards)) {
+    showToast("请先打开项目", "warn");
+    return false;
+  }
+  var committed = await _vpCommitAllDrafts();
+  if (!committed) return false;
+  _syncRefs();
+  var groups = getStoryboardGroups();
+  var targets = Array.isArray(groupIdxs) && groupIdxs.length
+    ? groupIdxs.map(function (idx) { return parseInt(idx, 10); }).filter(function (idx) { return Number.isInteger(idx) && idx >= 0 && idx < groups.length; })
+    : groups.map(function (_, idx) { return idx; });
+  if (!targets.length) {
+    showToast("没有可生成视频的分镜", "warn");
+    return false;
+  }
+  var missing = targets.filter(function (idx) { return !_isVideoPromptReady(project.storyboards[idx]); });
+  if (missing.length) {
+    if (targets.length === 1) showToast("当前视频提示词未就绪，请先生成或确认提示词", "warn");
+    else showToast("还有 " + missing.length + " 条视频提示词未就绪", "warn");
+    return false;
+  }
+  var allReady = groups.length > 0 && groups.every(function (_, idx) {
+    return _isVideoPromptReady(project.storyboards[idx]);
+  });
+  if (allReady) {
+    project.videoPromptsApproved = true;
+    project.currentStep = Math.max(project.currentStep || 0, 6);
+    if (_ctx.flushServerSave) {
+      await _ctx.flushServerSave();
+    } else {
+      saveProject();
+    }
+  }
+  return true;
 }
 
 function _formatRefineViolations(resp) {

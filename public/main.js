@@ -23,12 +23,15 @@ import { initEpisodes, syncEpisodesProject,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
   _renderEpisodeTabs, _openNewEpisodeDialog } from '/modules/episodes.js';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
-  refreshBatchPage, startBatchGeneration, _initBatchPlayerEvents, handleVideoTaskAction,
+  refreshBatchPage, startBatchGeneration, generateAllVideos, generateVideoForGroup,
+  getVideoResultState, subscribeVideoResultChanges, openVideoHistoryForGroup,
+  downloadVideoForGroup, deleteVideoForGroup, importVideoForGroup,
+  _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
   confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
-  refreshPromptsPage, renderVideoPromptList, updateVpCard, checkVideoPromptsConfirm,
-  generateGroupVideoPrompt, generateAllVideoPrompts, confirmVideoPrompts,
+  refreshPromptsPage, renderVideoPromptList, renderVideoResultCard, updateVpCard, checkVideoPromptsConfirm,
+  generateGroupVideoPrompt, generateAllVideoPrompts, prepareVideoPromptsForVideoGeneration,
   refineVideoPrompt, handleVideoPromptAction,
   getVpSelectedGroup, setVpSelectedGroup, flushVideoPromptAutoSave,
   reattachVideoPromptBatches } from '/modules/videoPrompts.js';
@@ -67,6 +70,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
   _openLightbox } from '/modules/assets.js';
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from '/modules/toolbox.js';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from '/modules/character_custom.js';
+import { initSceneCustom, refreshSceneCustomPage, _initSceneCustomEvents } from '/modules/scene_custom.js';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from '/modules/billing.js';
 import { mountPixelCard } from '/modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
@@ -151,7 +155,7 @@ var _scriptEditInitialText = "";
   };
   // 注意：billing 不再是独立 page，而是顶层 modal（#billingModal），所以不放进 PAGES。
   // 顶部任务列表卡片走 data-goto="overview"，会员升级按钮走 switchPage("billing")。
-  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "toolbox", "profile", "settings", "onlineEditor"];
+  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "toolbox", "profile", "settings", "onlineEditor"];
   // 下线但暂不删除的工作台旧页面。保留 DOM/模块，统一阻止导航、hash 直达和历史恢复。
   var DISABLED_WORKSPACE_PAGES = ["profile", "settings"];
   var SIDEBAR_PIPELINE_PAGES = ["script", "style", "assets", "shots", "prompts", "batch", "edit"];
@@ -1405,6 +1409,9 @@ var _scriptEditInitialText = "";
     if (activePage === "characterCustom") {
       try { refreshCharacterCustomPage({ force: true }); } catch (e) { console.error("[RefreshAll] characterCustom:", e); }
     }
+    if (activePage === "sceneCustom") {
+      try { refreshSceneCustomPage({ force: true }); } catch (e) { console.error("[RefreshAll] sceneCustom:", e); }
+    }
     try { refreshToolboxPage(); } catch (e) { console.error("[RefreshAll] toolbox:", e); }
     try { _renderEpisodeTabs(); } catch (e) {}
     try { renderProjectList(); } catch (e) {}
@@ -1950,6 +1957,7 @@ var _scriptEditInitialText = "";
       }
       if (page === "library") refreshLibraryPage();
       if (page === "characterCustom") refreshCharacterCustomPage();
+      if (page === "sceneCustom") refreshSceneCustomPage();
       if (page === "toolbox") refreshToolboxPage();
     } catch (e) {
       console.error("[SwitchPage] refresh failed:", page, e);
@@ -2863,6 +2871,30 @@ var _scriptEditInitialText = "";
       videoEl.src = signed;
     });
   }
+
+  function _hydrateVideoResultPlayback(root) {
+    var scope = root || document;
+    if (!scope || !scope.querySelectorAll) return;
+    scope.querySelectorAll(".video-result-video[data-raw-src]").forEach(function (videoEl) {
+      var rawUrl = String(videoEl.dataset.rawSrc || "").trim();
+      if (!rawUrl) return;
+      if (videoEl.dataset.videoResultRawSrc === rawUrl && videoEl.src) return;
+      videoEl.dataset.videoResultRawSrc = rawUrl;
+      _ovApplyPreviewVideoSrc(videoEl, rawUrl);
+    });
+  }
+
+  async function _ensureVideoResultPlayable(videoEl) {
+    if (!videoEl) return false;
+    if (videoEl.src) return true;
+    var rawUrl = String(videoEl.dataset.rawSrc || videoEl.dataset.ovRawSrc || "").trim();
+    if (!rawUrl) return false;
+    var signed = await _ovResolvePlayableVideoUrl(rawUrl);
+    if (!signed || !videoEl.isConnected) return false;
+    videoEl.src = signed;
+    return true;
+  }
+
   // 预览封面（poster）也是无签名图片地址（/api/images/file/{id}），<video poster> 一样
   // 带不了 Bearer → 黑底/裂图。走和列表缩略图同一套 fetchAssetSignedUrl 换签名图，
   // 异步塞 poster。外链/已带有效签名的直接用（inline poster 已设，这里不覆盖）。
@@ -8032,6 +8064,12 @@ var _scriptEditInitialText = "";
       getProject: () => project,
       openLightbox: (url, title, originalUrl) => _openLightbox(url, title, originalUrl),
     });
+    initSceneCustom({
+      getAuthToken: () => getAuthToken(),
+      showToast: (msg, type) => showToast(msg, type || "info"),
+      getProject: () => project,
+      openLightbox: (url, title, originalUrl) => _openLightbox(url, title, originalUrl),
+    });
     syncTasksProject(project);
         syncVideoTasksProject(project);
     syncEpisodesProject(project);
@@ -8049,8 +8087,11 @@ var _scriptEditInitialText = "";
 	      switchPage: (p) => switchPage(p),
 	      formatCreatorProfileForApi: () => formatCreatorProfileForApi(),
 	      sleep: (ms) => sleep(ms),
-	      diagnoseApiError: (msg) => _diagnoseApiError(msg),
-	      invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
+      diagnoseApiError: (msg) => _diagnoseApiError(msg),
+      invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
+      getVideoResultState: (gIdx) => getVideoResultState(gIdx),
+      subscribeVideoResultChanges: (handler) => subscribeVideoResultChanges(handler),
+      hydrateVideoResultPlayback: (root) => _hydrateVideoResultPlayback(root),
 	      applyProjectFromServer: (p) => {
 	        if (!p || !p.id || (project && p.id !== project.id)) return false;
 	        project = p;
@@ -8448,10 +8489,86 @@ var _scriptEditInitialText = "";
 
     /* Video prompts page (Phase 3) */
     _bindClick("btnGenAllVideoPrompts", generateAllVideoPrompts);
+    _bindClick("btnGenerateAllVideos", async function () {
+      var ok = await prepareVideoPromptsForVideoGeneration();
+      if (ok) await generateAllVideos();
+    });
     var confirmVpTopBtn = $("btnConfirmVideoPromptsTop");
-    if (confirmVpTopBtn) confirmVpTopBtn.addEventListener("click", confirmVideoPrompts);
+    if (confirmVpTopBtn) confirmVpTopBtn.addEventListener("click", confirmSegmentsAndEnterEdit);
     var vpList = $("videoPromptList");
     if (vpList) vpList.addEventListener("click", handleVideoPromptAction);
+    var videoResultRoot = $("videoResultCard");
+    if (videoResultRoot && !videoResultRoot._videoResultBound) {
+      videoResultRoot._videoResultBound = true;
+      videoResultRoot.addEventListener("click", async function (e) {
+        var btn = e.target.closest("[data-video-result-action]");
+        if (!btn || btn.disabled) return;
+        var card = btn.closest("[data-video-result-group]");
+        if (!card) return;
+        var gIdx = parseInt(card.dataset.videoResultGroup, 10);
+        if (isNaN(gIdx)) gIdx = getVpSelectedGroup();
+        var action = btn.dataset.videoResultAction;
+        if (action === "toggle-menu") {
+          e.preventDefault();
+          e.stopPropagation();
+          var wrap = btn.closest(".video-result-more-wrap");
+          var menu = wrap && wrap.querySelector(".video-result-more-menu");
+          var willOpen = menu && menu.hidden;
+          videoResultRoot.querySelectorAll(".video-result-more-menu").forEach(function (m) { if (m !== menu) m.hidden = true; });
+          videoResultRoot.querySelectorAll("[data-video-result-action='toggle-menu']").forEach(function (b) { if (b !== btn) b.setAttribute("aria-expanded", "false"); });
+          if (menu) menu.hidden = !willOpen;
+          btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+          return;
+        }
+        var menuHost = btn.closest(".video-result-more-wrap");
+        if (menuHost) {
+          var openMenu = menuHost.querySelector(".video-result-more-menu");
+          if (openMenu) openMenu.hidden = true;
+          var menuBtn = menuHost.querySelector("[data-video-result-action='toggle-menu']");
+          if (menuBtn) menuBtn.setAttribute("aria-expanded", "false");
+        }
+        if (action === "play") {
+          var video = card.querySelector("video");
+          if (!video) return;
+          if (video.paused) {
+            var playable = await _ensureVideoResultPlayable(video);
+            if (!playable) { showToast("视频预览加载失败，请刷新后重试", "warn"); return; }
+            video.play().catch(function () {});
+          }
+          else video.pause();
+          return;
+        }
+        if (action === "regenerate") {
+          var ready = await prepareVideoPromptsForVideoGeneration([gIdx]);
+          if (ready) await generateVideoForGroup(gIdx);
+          renderVideoResultCard(gIdx);
+          return;
+        }
+        if (action === "history") {
+          await openVideoHistoryForGroup(gIdx);
+          return;
+        }
+        if (action === "download") {
+          await downloadVideoForGroup(gIdx, btn);
+          return;
+        }
+        if (action === "import") {
+          importVideoForGroup(gIdx);
+          renderVideoResultCard(gIdx);
+          return;
+        }
+        if (action === "delete") {
+          var deleted = await deleteVideoForGroup(gIdx, btn);
+          if (deleted) renderVideoResultCard(gIdx);
+        }
+      });
+      document.addEventListener("click", function (e) {
+        if (!videoResultRoot.contains(e.target)) {
+          videoResultRoot.querySelectorAll(".video-result-more-menu").forEach(function (m) { m.hidden = true; });
+          videoResultRoot.querySelectorAll("[data-video-result-action='toggle-menu']").forEach(function (b) { b.setAttribute("aria-expanded", "false"); });
+        }
+      });
+    }
 
     // @ / 重新生成 / 复制 这三个按钮已移到左侧每张镜头卡片右下角，事件由
     // videoPrompts.js _renderVpStoryboardFrames 在 frame 创建时直接绑（带 ev.stopPropagation
@@ -8488,6 +8605,7 @@ var _scriptEditInitialText = "";
     /* Toolbox page */
     _initToolboxEvents();
     _initCharacterCustomEvents();
+    _initSceneCustomEvents();
 
     /* Batch video task events */
     var batchTW = $("batchTaskListWrap");

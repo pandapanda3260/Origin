@@ -48,6 +48,21 @@ var _videoGenerationEstimate = {
   fetchedAt: 0,
   loading: false,
 };
+var _videoResultSubscribers = new Set();
+
+function subscribeVideoResultChanges(handler) {
+  if (typeof handler !== "function") return function () {};
+  _videoResultSubscribers.add(handler);
+  return function () { _videoResultSubscribers.delete(handler); };
+}
+
+function _notifyVideoResultChanged(groupIdx, reason) {
+  var n = _normalizeGroupIdx(groupIdx);
+  var evt = { groupIdx: n, reason: reason || "update" };
+  Array.from(_videoResultSubscribers).forEach(function (handler) {
+    try { handler(evt); } catch (e) { console.warn("[VideoResult] subscriber failed:", e); }
+  });
+}
 
 function isVideoSegmentBatchType(batchType) {
   return batchType === "video_segments" || batchType === "videos";
@@ -439,12 +454,246 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     delete vt.invalidatedAt;
     delete vt.invalidatedReason;
     project.videoTasks[gIdx] = vt;
+    _notifyVideoResultChanged(gIdx, "current");
   }
 
   function _canBulkImportGroup(gIdx) {
     if (!_hasCurrentVideoForGroup(gIdx)) return false;
     var sb = project && project.storyboards && project.storyboards[gIdx];
     if (sb && typeof sb.readyForEdit === "boolean") return sb.readyForEdit === true;
+    return true;
+  }
+
+  function _videoWarningsForGroup(gIdx) {
+    var vt = Array.isArray(project && project.videoTasks) ? project.videoTasks[gIdx] : null;
+    if (vt && Array.isArray(vt.warnings)) return vt.warnings.filter(function (w) { return !_isObsoleteVideoWarning(w); });
+    var sb = Array.isArray(project && project.storyboards) ? project.storyboards[gIdx] : null;
+    if (sb && Array.isArray(sb.videoWarnings)) return sb.videoWarnings.filter(function (w) { return !_isObsoleteVideoWarning(w); });
+    return [];
+  }
+
+  function _resolveTaskForVideoGroup(gIdx) {
+    var n = _normalizeGroupIdx(gIdx);
+    if (n == null) return null;
+    var task = _findTaskByGroup(n);
+    if (task && (task.videoUrl || task.blobUrl || !isTerminal(task))) return task;
+    var sb = project && project.storyboards && project.storyboards[n];
+    if (!sb || !sb.videoUrl) return task || null;
+    var nameMeta = _nameMetaFrom({
+      filename: sb.videoFilename,
+      displayName: sb.videoDisplayName,
+      downloadFilename: sb.videoDownloadFilename,
+    });
+    return {
+      _groupIdx: n,
+      videoUrl: sb.videoUrl,
+      protectedUrl: sb._originVideoUrl || sb.videoUrl,
+      filename: nameMeta.filename,
+      displayName: nameMeta.displayName,
+      downloadFilename: nameMeta.downloadFilename,
+      durationSec: sb.videoDurationSec,
+      status: "done",
+      statusCn: "已完成",
+    };
+  }
+
+  function getVideoResultState(gIdx) {
+    _syncVideoRefs();
+    var n = _normalizeGroupIdx(gIdx);
+    var empty = {
+      groupIdx: n,
+      status: "not_generated",
+      statusLabel: "未生成",
+      statusIcon: "radio_button_unchecked",
+      videoUrl: "",
+      protectedUrl: "",
+      canPlay: false,
+      canRegenerate: false,
+      canDownload: false,
+      canDelete: false,
+      canImport: false,
+      imported: false,
+      progress: 0,
+      task: null,
+    };
+    if (n == null || !project || !Array.isArray(project.storyboards)) return empty;
+    var sb = project.storyboards[n] || {};
+    var vt = Array.isArray(project.videoTasks) ? project.videoTasks[n] : null;
+    var task = _findTaskByGroup(n);
+    var resolved = _resolveTaskForVideoGroup(n);
+    var videoUrl = (resolved && (resolved.blobUrl || resolved.videoUrl)) || sb.videoUrl || "";
+    var protectedUrl = (resolved && resolved.protectedUrl) || sb._originVideoUrl || videoUrl;
+    var imported = false;
+    try { imported = isGroupImported(n); } catch (_e) {}
+    var readiness = _videoPromptReadinessForGroup(n);
+    var state = Object.assign({}, empty, {
+      videoUrl: videoUrl,
+      protectedUrl: protectedUrl,
+      imported: imported,
+      canRegenerate: !!readiness.canStart,
+      task: task || resolved || null,
+      taskId: task && (task.serverTaskId || task.localId),
+      displayName: (resolved && resolved.displayName) || sb.videoDisplayName || "",
+      filename: (resolved && resolved.filename) || sb.videoFilename || "",
+      downloadFilename: (resolved && resolved.downloadFilename) || sb.videoDownloadFilename || "",
+      warnings: _videoWarningsForGroup(n),
+    });
+    if (task && !isTerminal(task)) {
+      state.status = "generating";
+      state.statusLabel = task.statusCn || "生成中";
+      state.statusIcon = "motion_photos_auto";
+      state.progress = _batchTaskProgress(task);
+      return state;
+    }
+    if (task && (task.status === "failed" || task.status === "timeout")) {
+      state.status = "failed";
+      state.statusLabel = task.statusCn || "失败";
+      state.statusIcon = "error";
+      state.canPlay = !!videoUrl;
+      state.canDownload = !!videoUrl;
+      state.canDelete = !!videoUrl;
+      return state;
+    }
+    if (videoUrl && (sb.videoIsCurrent === false || (vt && vt.isCurrent === false))) {
+      state.status = "outdated";
+      state.statusLabel = "已过期";
+      state.statusIcon = "history_toggle_off";
+      state.canPlay = true;
+      state.canDownload = true;
+      state.canDelete = true;
+      return state;
+    }
+    if (videoUrl) {
+      state.status = "ready";
+      state.statusLabel = "已生成";
+      state.statusIcon = "check_circle";
+      state.canPlay = true;
+      state.canDownload = true;
+      state.canDelete = true;
+      state.canImport = _canBulkImportGroup(n);
+      state.progress = 100;
+      return state;
+    }
+    return state;
+  }
+
+  async function generateAllVideos() {
+    return startBatchGeneration();
+  }
+
+  async function generateVideoForGroup(gIdx) {
+    return regenSingleClip(gIdx);
+  }
+
+  async function openVideoHistoryForGroup(gIdx) {
+    return _openVideoHistoryModal(gIdx);
+  }
+
+  async function downloadVideoForGroup(gIdx, btn) {
+    _syncVideoRefs();
+    var task = _resolveTaskForVideoGroup(gIdx);
+    return downloadVideoTask(task, btn);
+  }
+
+  function importVideoForGroup(gIdx) {
+    _syncVideoRefs();
+    var n = _normalizeGroupIdx(gIdx);
+    if (n == null) { showToast("当前视频没有关联分镜，无法导入", "warn"); return false; }
+    if (!_canBulkImportGroup(n)) {
+      showToast("当前视频未生成、已过期或尚未就绪，无法导入剪辑", "warn");
+      return false;
+    }
+    var alreadyImported = false;
+    try { alreadyImported = isGroupImported(n); } catch (_e) {}
+    if (alreadyImported) {
+      showToast("该视频已在剪辑工作台", "info");
+      return true;
+    }
+    var didImport = false;
+    try { didImport = importGroupToTimeline(n); } catch (_err) { didImport = false; }
+    if (didImport) {
+      showToast("已导入剪辑工作台", "ok");
+      var task = _findTaskByGroup(n);
+      if (task) updateTaskCard(task);
+      _notifyVideoResultChanged(n, "import");
+      try { updateBadge(); } catch (_e) {}
+      return true;
+    }
+    showToast("导入失败，视频可能还在加载中，请稍后再试", "warn");
+    return false;
+  }
+
+  async function deleteVideoForGroup(gIdx, btn) {
+    _syncVideoRefs();
+    var n = _normalizeGroupIdx(gIdx);
+    if (n == null) return false;
+    if (typeof window !== "undefined" && !window.confirm("确定要删除该已生成的视频片段吗？此操作不可撤销。")) return false;
+    if (!project || !project.id) {
+      showToast("请先打开项目", "warn");
+      return false;
+    }
+    if (btn) btn.disabled = true;
+    try {
+      var delResp = await apiPost("/api/tasks/video-by-project", {
+        projectId: project.id,
+        groupIdx: n,
+      }, "DELETE");
+      if (delResp && delResp.serverVersion != null) {
+        project.version = Number(delResp.serverVersion) || project.version;
+      }
+      if (delResp && delResp.edl) {
+        if (!project.editData) project.editData = {};
+        project.editData.edl = delResp.edl;
+      }
+      if (delResp && delResp.readiness) {
+        if (!project.editData) project.editData = {};
+        project.editData.readiness = delResp.readiness;
+      }
+    } catch (delErr) {
+      if (btn) btn.disabled = false;
+      showToast("删除失败: " + _diagnoseApiError(((delErr && delErr.message) || delErr).toString()), "error");
+      return false;
+    }
+    try {
+      if (project && project.storyboards && project.storyboards[n]) {
+        var sbDel = project.storyboards[n];
+        sbDel.importedToEdit = false;
+        delete sbDel.videoUrl;
+        delete sbDel._originVideoUrl;
+        delete sbDel.videoTaskId;
+        delete sbDel.videoCoverUrl;
+        delete sbDel.videoStatus;
+        delete sbDel.videoMode;
+        delete sbDel.videoTaskFinishedAt;
+        delete sbDel.videoDurationSec;
+        delete sbDel.videoFilename;
+        delete sbDel.videoDisplayName;
+        delete sbDel.videoDownloadFilename;
+        delete sbDel.readyForEdit;
+        delete sbDel.videoWarnings;
+        delete sbDel.videoIsCurrent;
+        delete sbDel.videoAssetId;
+      }
+      if (project && Array.isArray(project.videoTasks) && project.videoTasks[n]) {
+        project.videoTasks[n] = null;
+      }
+    } catch (_e) {}
+    try {
+      for (var dk = videoState.tasks.length - 1; dk >= 0; dk--) {
+        var dt = videoState.tasks[dk];
+        if (dt && Number(dt._groupIdx) === n) {
+          dt._killed = true;
+          if (dt._sseHandle) { try { dt._sseHandle.close(); } catch (_e) {} dt._sseHandle = null; }
+          if (dt.blobUrl) { try { URL.revokeObjectURL(dt.blobUrl); } catch (_e) {} dt.blobUrl = ""; }
+          if (dt.cardEl && dt.cardEl.parentNode) dt.cardEl.parentNode.removeChild(dt.cardEl);
+          videoState.tasks.splice(dk, 1);
+        }
+      }
+    } catch (_e) {}
+    try { syncTaskListVisibility(); } catch (_e) {}
+    try { updateBadge(); } catch (_e) {}
+    _notifyVideoResultChanged(n, "delete");
+    showToast("已删除该视频片段", "ok");
     return true;
   }
 
@@ -579,6 +828,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
     _mergeVideoWarnings(task, data, true);
     updateTaskCard(task);
+    if (task._groupIdx != null) _notifyVideoResultChanged(task._groupIdx, "progress");
   }
 
 	  function _normalizeGroupIdx(gIdx) {
@@ -1763,83 +2013,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         if (act === "mirror-delete") {
           var delGIdx = parseInt(actionBtn.dataset.groupIdx, 10);
           if (isNaN(delGIdx)) return;
-          if (!window.confirm("确定要删除该已生成的视频片段吗？此操作不可撤销。")) return;
-          if (!project || !project.id) {
-            showToast("请先打开项目", "warn");
-            return;
+          var deleted = await deleteVideoForGroup(delGIdx, actionBtn);
+          if (deleted) {
+            try {
+              var oldMirror = bWrap.querySelector('[data-group-idx="' + delGIdx + '"]');
+              if (oldMirror && oldMirror.parentNode) oldMirror.parentNode.removeChild(oldMirror);
+            } catch (_e) {}
+            try { renderBatchClipList(); } catch (_e) {}
           }
-          actionBtn.disabled = true;
-          try {
-            var delResp = await apiPost("/api/tasks/video-by-project", {
-              projectId: project.id,
-              groupIdx: delGIdx,
-            }, "DELETE");
-            if (delResp && delResp.serverVersion != null) {
-              project.version = Number(delResp.serverVersion) || project.version;
-            }
-            if (delResp && delResp.edl) {
-              if (!project.editData) project.editData = {};
-              project.editData.edl = delResp.edl;
-            }
-            if (delResp && delResp.readiness) {
-              if (!project.editData) project.editData = {};
-              project.editData.readiness = delResp.readiness;
-            }
-          } catch (delErr) {
-            actionBtn.disabled = false;
-            showToast("删除失败: " + _diagnoseApiError(((delErr && delErr.message) || delErr).toString()), "error");
-            return;
-          }
-          // 1) 清掉本地 storyboard/videoTasks 镜像；后端已原子落盘。
-          try {
-            if (project && project.storyboards && project.storyboards[delGIdx]) {
-              var sbDel = project.storyboards[delGIdx];
-              sbDel.importedToEdit = false;
-              delete sbDel.videoUrl;
-              delete sbDel._originVideoUrl;
-              delete sbDel.videoTaskId;
-              delete sbDel.videoCoverUrl;
-              delete sbDel.videoStatus;
-              delete sbDel.videoMode;
-	              delete sbDel.videoTaskFinishedAt;
-	              delete sbDel.videoDurationSec;
-	              delete sbDel.videoFilename;
-	              delete sbDel.videoDisplayName;
-	              delete sbDel.videoDownloadFilename;
-	              delete sbDel.readyForEdit;
-              delete sbDel.videoWarnings;
-              delete sbDel.videoIsCurrent;
-              // 必须连带清掉 videoAssetId，否则 hydrateProjectAssetUrls 会用
-              // 它重签出新的 videoUrl，导致「删除 → 全部生成」立刻显示已完成。
-              delete sbDel.videoAssetId;
-            }
-            if (project && Array.isArray(project.videoTasks) && project.videoTasks[delGIdx]) {
-              project.videoTasks[delGIdx] = null;
-            }
-          } catch (_e) {}
-          // 2) 干掉关联任务（清掉镜像卡 + 主任务卡）
-          try {
-            for (var dk = videoState.tasks.length - 1; dk >= 0; dk--) {
-              var dt = videoState.tasks[dk];
-              if (dt && Number(dt._groupIdx) === delGIdx) {
-                dt._killed = true;
-                if (dt._sseHandle) { try { dt._sseHandle.close(); } catch (_e) {} dt._sseHandle = null; }
-                if (dt.blobUrl) { try { URL.revokeObjectURL(dt.blobUrl); } catch (_e) {} dt.blobUrl = ""; }
-                if (dt.cardEl && dt.cardEl.parentNode) dt.cardEl.parentNode.removeChild(dt.cardEl);
-                videoState.tasks.splice(dk, 1);
-              }
-            }
-          } catch (_e) {}
-          // 3) 干掉对应的镜像行
-          try {
-            var oldMirror = bWrap.querySelector('[data-group-idx="' + delGIdx + '"]');
-            if (oldMirror && oldMirror.parentNode) oldMirror.parentNode.removeChild(oldMirror);
-          } catch (_e) {}
-          // 4) 刷新本页镜像；不再走 saveProject，避免旧版本整包 PUT 把删除覆盖回来。
-          try { renderBatchClipList(); } catch (_e) {}
-          try { syncTaskListVisibility(); } catch (_e) {}
-          try { updateBadge(); } catch (_e) {}
-          showToast("已删除该视频片段", "ok");
           return;
         }
         if (tid && act === "retry") {
@@ -3675,6 +3856,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (activeTaskCount() >= MAX_CONCURRENT) { showToast("最多同时运行 " + MAX_CONCURRENT + " 个任务", "warn"); return; }
     if (!_lockVideoGroup(gIdx)) { showToast(_inFlightMessage([gIdx]), "warn"); return; }
     var handedOffLock = false;
+    _notifyVideoResultChanged(gIdx, "generate-start");
 
     try {
       showToast("正在检查相邻镜头衔接，通过后自动开始生成…", "info");
@@ -3820,6 +4002,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       }
       insertTaskCardToWraps(createTaskCard(task));
       updateTaskCard(task);
+      _notifyVideoResultChanged(gIdx, "generate-start");
     });
     syncTaskListVisibility(); updateBadge();
     renderBatchClipList();
@@ -3999,6 +4182,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       t.statusCn = _videoFailureStatusText(data, data.reason || data.errorMsg || "failed");
       updateTaskCard(t); updateBadge();
       renderBatchClipList();
+      _notifyVideoResultChanged(t._groupIdx, "failed");
       _unlockVideoGroup(t._groupIdx);
     }
 
@@ -4250,6 +4434,14 @@ export {
   reconcileVideoTasksOnWake,
   refreshBatchPage,
   startBatchGeneration,
+  generateAllVideos,
+  generateVideoForGroup,
+  getVideoResultState,
+  subscribeVideoResultChanges,
+  openVideoHistoryForGroup,
+  downloadVideoForGroup,
+  deleteVideoForGroup,
+  importVideoForGroup,
   importAllGeneratedSegments,
   confirmSegmentsAndEnterEdit,
   _initBatchPlayerEvents,

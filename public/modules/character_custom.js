@@ -445,7 +445,10 @@ function _listHtml() {
     : '<div class="toolbox-preview-empty character-list-empty"><span class="material-symbols-outlined">person_add</span><p>暂无自定义角色</p></div>';
   return '' +
     '<header class="toolbox-hero character-custom-head">' +
-      '<div><p class="toolbox-kicker">CHARACTER CUSTOM</p><h1>角色定制</h1></div>' +
+      '<div class="toolbox-head-left">' +
+        '<button type="button" class="toolbox-back" data-toolbox-back data-goto="toolbox" title="返回工具箱"><span class="material-symbols-outlined">arrow_back</span></button>' +
+        '<div><p class="toolbox-kicker">CHARACTER CUSTOM</p><h1>角色定制</h1></div>' +
+      '</div>' +
       '<button type="button" class="character-new-btn" data-character-new><span class="material-symbols-outlined">add</span>新建角色</button>' +
     '</header>' +
     '<div class="character-card-grid">' + cards + '</div>';
@@ -1047,6 +1050,10 @@ function _clearGenerationFit() {
     root.style.removeProperty('--character-generation-fit-left');
     root.style.removeProperty('--character-generation-fit-top');
     root.style.removeProperty('--character-gen-panel-min');
+    root.style.removeProperty('--character-generation-back-size');
+    root.style.removeProperty('--character-generation-back-icon-size');
+    root.style.removeProperty('--character-generation-back-border-width');
+    root.style.removeProperty('--character-generation-head-gap');
     root.removeAttribute('data-character-generation-fit-scale');
   }
   if (page) page.removeAttribute('data-character-generation-scale');
@@ -1094,6 +1101,10 @@ function _fitGenerationEditor() {
   root.style.setProperty('--character-generation-scale', scale.toFixed(4));
   root.style.setProperty('--character-generation-fit-left', left.toFixed(2) + 'px');
   root.style.setProperty('--character-generation-fit-top', top.toFixed(2) + 'px');
+  root.style.setProperty('--character-generation-back-size', (42 / scale).toFixed(2) + 'px');
+  root.style.setProperty('--character-generation-back-icon-size', (24 / scale).toFixed(2) + 'px');
+  root.style.setProperty('--character-generation-back-border-width', (1 / scale).toFixed(2) + 'px');
+  root.style.setProperty('--character-generation-head-gap', (18 / scale).toFixed(2) + 'px');
   root.setAttribute('data-character-generation-fit-scale', scale < 0.999 ? 'scaled' : 'none');
   page.setAttribute('data-character-generation-scale', scale.toFixed(4));
 }

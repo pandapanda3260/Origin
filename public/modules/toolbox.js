@@ -214,6 +214,8 @@ function _homeHtml() {
   var tools = [
     { tool: 'image', icon: 'image', title: '图片生成', sub: '文生图 / 图生图', enabled: true },
     { tool: 'video', icon: 'movie', title: '视频生成', sub: '图生视频 / 首尾帧视频', enabled: true },
+    { tool: 'characterCustom', icon: 'frame_person', title: '角色定制', sub: '角色形象 / 版本库', enabled: true, goto: 'characterCustom' },
+    { tool: 'sceneCustom', icon: 'add_photo_alternate', title: '场景定制', sub: '场景主视图 / 四视图', enabled: true, goto: 'sceneCustom' },
     { tool: 'prompt', icon: 'auto_fix_high', title: '提示词优化', sub: '提示词改写', enabled: false },
     { tool: 'breakdown', icon: 'video_settings', title: '视频拆解', sub: '成片解析', enabled: false },
     { tool: 'audio', icon: 'graphic_eq', title: '音频生成', sub: '旁白 / 音效', enabled: false },
@@ -227,8 +229,11 @@ function _homeHtml() {
     '</header>' +
     '<section class="toolbox-home-grid">' +
       tools.map(function (t) {
+        var actionAttr = t.enabled
+          ? (t.goto ? 'data-goto="' + escapeHtml(t.goto) + '"' : 'data-toolbox-open="' + t.tool + '"')
+          : 'disabled';
         return '<button type="button" class="toolbox-entry ' + (t.enabled ? '' : 'is-disabled') + '" ' +
-          (t.enabled ? 'data-toolbox-open="' + t.tool + '"' : 'disabled') + '>' +
+          actionAttr + '>' +
           '<span class="material-symbols-outlined">' + t.icon + '</span>' +
           '<strong>' + escapeHtml(t.title) + '</strong>' +
           '<small>' + escapeHtml(t.sub) + '</small>' +

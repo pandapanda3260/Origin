@@ -50,6 +50,7 @@
     "test:frame-image-plan": "node scripts/test-frame-image-plan.js",
     "test:scene-views": "node scripts/test-scene-views.js",
     "test:llm-background-mode": "node scripts/test-llm-background-mode.js",
+    "test:custom-scene": "node scripts/test-custom-scene-contracts.js",
     "test:first-frame-edit-draft": "tsx scripts/test-first-frame-edit-draft.ts",
     "test:first-frame-rewrite-rate-limit": "tsx scripts/test-first-frame-rewrite-rate-limit.ts",
     "test:first-frame-rewrite-patch": "tsx scripts/test-first-frame-rewrite-patch.ts",

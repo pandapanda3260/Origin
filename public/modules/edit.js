@@ -986,13 +986,13 @@ function _teardownProjectScopedEditUi() {
     // 动态引导文案，根据后端 readiness 下发的 readyCount / totalCount 区分场景：
     //   - readyCount=0, totalCount=0  新项目，还没生成过视频
     //   - readyCount=0, totalCount>0  所有视频都还没做好
-    //   - readyCount>=1               有视频已就绪，等用户去点「导入剪辑工作台」
+    //   - readyCount>=1               有视频已就绪，等用户从视频页导入剪辑
     // 规则判定一律由后端算，前端只选文案；不存在"前端自己推断还差几条"。
     var el = $("editGuardHint");
     if (!el) return;
     if (!readiness) {
       el.innerHTML =
-        '在「片段生成」页任意一条生成成功的视频卡片上，点「导入剪辑工作台」即可。';
+        '在「视频」页生成可用视频后，通过当前视频菜单导入剪辑。';
       return;
     }
     var ready = readiness.readyCount | 0;
@@ -1000,16 +1000,16 @@ function _teardownProjectScopedEditUi() {
     if (ready >= 1) {
       el.innerHTML =
         '你已经有 <span class="text-on-background font-semibold">' + ready + '</span> 条视频就绪。' +
-        '<br/>回「片段生成」页，在想用的视频卡片上点「导入剪辑工作台」即可开剪。';
+        '<br/>回「视频」页，在当前视频菜单中导入想剪的视频即可开剪。';
     } else if (total >= 1) {
       el.innerHTML =
         '所有视频还在生成中。<br/>' +
-        '任意一条视频生成成功后，就可以在卡片上点「导入剪辑工作台」开始剪辑，<br/>' +
+        '任意一条视频生成成功后，就可以从「视频」页的当前视频菜单导入剪辑，<br/>' +
         '不必等全部生成完。';
     } else {
       el.innerHTML =
         '还没有可用的视频片段。<br/>' +
-        '先去「片段生成」页生成至少一条视频，之后在卡片上点「导入剪辑工作台」。';
+        '先去「视频」页生成至少一条视频，之后通过当前视频菜单导入剪辑。';
     }
   }
 

@@ -11,7 +11,7 @@
     <title>Origin</title>
     <script>
       (function () {
-        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "toolbox", "profile", "settings", "onlineEditor"];
+        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "toolbox", "profile", "settings", "onlineEditor"];
         var disabledPages = ["profile", "settings"];
         var hashKey = "workspacePage";
         function normalize(page) {
@@ -51,6 +51,7 @@
       html[data-workspace-boot-page="edit"]:not([data-workspace-boot-ready]) #pageEdit,
       html[data-workspace-boot-page="library"]:not([data-workspace-boot-ready]) #pageLibrary,
       html[data-workspace-boot-page="characterCustom"]:not([data-workspace-boot-ready]) #pageCharacterCustom,
+      html[data-workspace-boot-page="sceneCustom"]:not([data-workspace-boot-ready]) #pageSceneCustom,
       html[data-workspace-boot-page="toolbox"]:not([data-workspace-boot-ready]) #pageToolbox,
       html[data-workspace-boot-page="profile"]:not([data-workspace-boot-ready]) #pageProfile,
       html[data-workspace-boot-page="settings"]:not([data-workspace-boot-ready]) #pageSettings,
@@ -60,7 +61,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=248" />
+    <link rel="stylesheet" href="styles.css?v=252" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -214,12 +215,12 @@
               <span class="material-symbols-outlined">movie_filter</span>
               <span>镜头</span>
             </button>
-            <button type="button" id="navPrompts" data-page="prompts" title="视频提示词"
+            <button type="button" id="navPrompts" data-page="prompts" title="视频创作"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-              <span class="material-symbols-outlined">psychology</span>
-              <span>提示词</span>
+              <span class="material-symbols-outlined">movie_creation</span>
+              <span>视频</span>
             </button>
-            <button type="button" id="navBatch" data-page="batch" title="片段"
+            <button type="button" id="navBatch" data-page="batch" title="片段" hidden data-retired-surface="batch"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
               <span class="material-symbols-outlined">layers</span>
               <span>片段</span>
@@ -253,11 +254,6 @@
             class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
             <span class="material-symbols-outlined">construction</span>
             <span>工具箱</span>
-          </button>
-          <button type="button" id="navCharacterCustom" data-page="characterCustom" title="角色定制"
-            class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-            <span class="material-symbols-outlined">frame_person</span>
-            <span>角色定制</span>
           </button>
           <button type="button" id="navProfile" data-page="profile" title="创作偏好" hidden data-retired-surface="creator-profile"
             class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
@@ -1032,8 +1028,8 @@
         <div class="prompts-page-shell flex overflow-hidden relative">
           <section id="promptsNeedImages" class="workflow-guard-surface" hidden>
             <div class="max-w-md shrink-0">
-              <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">提示词生成</h2>
-              <p class="text-on-surface-variant text-base leading-relaxed mb-2">基于分镜图生成并确认视频提示词</p>
+              <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">视频创作</h2>
+              <p class="text-on-surface-variant text-base leading-relaxed mb-2">优化提示词并生成视频</p>
             </div>
             <div class="workflow-empty-state workflow-empty-state--page-center">
               <div class="workflow-empty-state__icon">
@@ -1050,55 +1046,58 @@
           <!-- Left: Prompt Generation Panel -->
           <section id="promptsNarrativePanel" class="w-[420px] p-12 overflow-hidden flex flex-col gap-10 bg-transparent border-r border-outline-variant/10 shrink-0">
             <div class="max-w-md shrink-0">
-              <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">提示词生成</h2>
-              <p class="text-on-surface-variant text-base leading-relaxed mb-2">基于分镜图生成并确认视频提示词</p>
+              <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">视频创作</h2>
+              <p class="text-on-surface-variant text-base leading-relaxed mb-2">优化提示词并生成视频</p>
               <span class="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-bold inline-block mt-3" id="vpVersionTag" hidden></span>
             </div>
 
             <div id="vpStoryboardFrames" class="flex-1 min-h-0 overflow-y-auto elegant-scroll pr-2 space-y-5"></div>
           </section>
 
-          <!-- Right: Prompt Engineering Lab -->
-          <section id="promptsLabPanel" class="flex-1 p-12 bg-transparent flex flex-col relative overflow-hidden">
+          <!-- Right: Video Creation Lab -->
+          <section id="promptsLabPanel" class="flex-1 p-10 bg-transparent flex flex-col relative overflow-hidden">
             <div id="promptsReady" class="flex-1 min-h-0 flex flex-col" hidden>
-	              <!-- Header: actions -->
-		              <div class="flex justify-end items-center gap-4 mb-4">
-		                <div class="flex gap-2 items-center">
-	                  <button type="button" id="btnGenAllVideoPrompts" class="shrink-0 whitespace-nowrap px-5 py-2.5 rounded-full bg-primary text-on-primary text-xs font-bold flex items-center gap-2 hover:opacity-90 transition-all" data-write-action>
-	                    <span class="material-symbols-outlined text-sm" style="font-variation-settings: 'FILL' 1;">bolt</span>
-	                    <span id="btnGenAllVideoPromptsLabel">生成全部提示词</span>
-	                  </button>
-	                  <!-- 原顶栏的 @ / 重新生成 / 复制 三个按钮已挪到左侧每张镜头卡片右下角，
-	                       使得操作可以直接针对具体镜头，不必先选中再操作。
-	                       渲染入口：public/modules/videoPrompts.js -> _renderVpStoryboardFrames。
-	                       事件绑定：main.js 里原来对应的 vpBtn{RefAgent,RegenSingle,Copy} 监听器一并移除。 -->
-	                  <section id="videoPromptsConfirmTopArea" class="shrink-0" hidden>
-	                    <button type="button" id="btnConfirmVideoPromptsTop" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all inline-flex items-center gap-2" data-write-action>
-	                      <span class="material-symbols-outlined text-base">auto_awesome</span>
-	                      <span>确认提示词，进入下一步</span>
-	                      <span class="material-symbols-outlined text-base">arrow_forward</span>
-	                    </button>
-	                  </section>
-	                </div>
-              </div>
-              <p class="text-xs text-on-surface-variant mb-4" id="videoPromptsHint"></p>
-
-              <div id="vpDiagnostic" class="diag-container mb-6"></div>
-
-              <!-- Main Prompt Block -->
-              <div id="videoPromptList" class="flex-grow flex flex-col min-h-0 overflow-hidden"></div>
-
-              <!-- Bottom: AI Refine Input -->
-              <!-- mt-4 给上面提示词正文区域和这个输入框留 16px 呼吸距离，避免视觉上贴死。 -->
-              <div class="vp-refine-command-wrap">
-                <div class="script-command-box vp-refine-command-box">
-                  <input type="text" id="vpRefineInput" name="video_prompt_refine_instruction" class="script-command-input" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" data-form-type="other" data-lpignore="true" data-1p-ignore="true" />
-                  <button type="button" id="vpBtnRefine" class="script-send-btn" title="发送" data-write-action>
-                    <span class="material-symbols-outlined">north</span>
+              <div class="video-creation-toolbar">
+                <div class="video-creation-toolbar-copy">
+                  <span>视频完成</span>
+                  <p id="videoPromptsHint"></p>
+                </div>
+                <div class="video-creation-toolbar-actions">
+                  <button type="button" id="btnGenAllVideoPrompts" class="video-creation-top-action" data-write-action>
+                    <span class="material-symbols-outlined" style="font-variation-settings: 'FILL' 1;">bolt</span>
+                    <span id="btnGenAllVideoPromptsLabel">生成全部提示词</span>
                   </button>
+                  <button type="button" id="btnGenerateAllVideos" class="video-creation-top-action video-creation-top-action--dark" data-write-action>
+                    <span class="material-symbols-outlined">movie</span>
+                    <span>生成全部视频</span>
+                  </button>
+                  <section id="videoPromptsConfirmTopArea" class="shrink-0" hidden>
+                    <button type="button" id="btnConfirmVideoPromptsTop" class="video-creation-enter-edit" data-write-action>
+                      <span class="material-symbols-outlined text-base">content_cut</span>
+                      <span>进入剪辑</span>
+                      <span class="material-symbols-outlined text-base">arrow_forward</span>
+                    </button>
+                  </section>
                 </div>
               </div>
 
+              <div id="vpDiagnostic" class="diag-container mb-5"></div>
+
+              <div class="video-creation-workspace">
+                <div class="video-creation-prompt-column">
+                  <div id="videoPromptList" class="video-creation-prompt-list flex flex-col min-h-0 overflow-hidden"></div>
+
+                  <div class="vp-refine-command-wrap video-creation-refine">
+                    <div class="script-command-box vp-refine-command-box">
+                      <input type="text" id="vpRefineInput" name="video_prompt_refine_instruction" class="script-command-input" placeholder="输入指令让 AI 修改提示词（如「把镜头运动改得更激烈」）" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" aria-autocomplete="none" data-form-type="other" data-lpignore="true" data-1p-ignore="true" />
+                      <button type="button" id="vpBtnRefine" class="script-send-btn" title="发送" data-write-action>
+                        <span class="material-symbols-outlined">north</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <aside id="videoResultCard" class="video-result-card" aria-label="当前视频预览"></aside>
+              </div>
             </div>
           </section>
         </div>
@@ -1323,10 +1322,10 @@
                 </div>
                 <h3 class="workflow-empty-state__title">暂时还没有任何片段在剪辑工作台。</h3>
                 <p id="editGuardHint" class="workflow-empty-state__text">
-                  在「片段生成」页任意一条生成成功的视频卡片上，点「导入剪辑工作台」即可。
+                  在「视频」页生成可用视频后，通过当前视频菜单导入剪辑。
                 </p>
                 <div class="workflow-empty-state__actions">
-                  <button type="button" data-goto="batch" class="workflow-empty-state__button">前往片段生成</button>
+                  <button type="button" data-goto="prompts" class="workflow-empty-state__button">前往视频创作</button>
                 </div>
               </div>
             </div>
@@ -1601,6 +1600,11 @@
         <div id="characterCustomRoot" class="toolbox-shell"></div>
       </div>
 
+      <!-- ══════ 场景定制 ══════ -->
+      <div class="page-scroll p-10 overflow-y-auto" id="pageSceneCustom" hidden>
+        <div id="sceneCustomRoot" class="toolbox-shell"></div>
+      </div>
+
       <!-- ══════ 创作偏好 ══════ -->
       <div class="page-scroll !p-0 !overflow-hidden" id="pageProfile" hidden>
         <div class="flex h-screen">
@@ -1834,12 +1838,13 @@
     <script type="importmap">
     {
             "imports": {
-                    "/modules/assets.js": "/modules/assets.js?v=184",
+                    "/modules/assets.js": "/modules/assets.js?v=185",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
                     "/modules/billing.js": "/modules/billing.js?v=118",
-                    "/modules/character_custom.js": "/modules/character_custom.js?v=218",
+                    "/modules/character_custom.js": "/modules/character_custom.js?v=222",
+                    "/modules/scene_custom.js": "/modules/scene_custom.js?v=100",
                     "/modules/diagnostic.js": "/modules/diagnostic.js?v=301",
-                    "/modules/edit.js": "/modules/edit.js?v=307",
+                    "/modules/edit.js": "/modules/edit.js?v=308",
                     "/modules/episode_fields.js": "/modules/episode_fields.js?v=103",
                     "/modules/episodes.js": "/modules/episodes.js?v=113",
                     "/modules/error_hub.js": "/modules/error_hub.js?v=300",
@@ -1863,17 +1868,17 @@
                     "/modules/storyboard.js": "/modules/storyboard.js?v=159",
                     "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
                     "/modules/tasks.js": "/modules/tasks.js?v=301",
-                    "/modules/toolbox.js": "/modules/toolbox.js?v=203",
+                    "/modules/toolbox.js": "/modules/toolbox.js?v=205",
                     "/modules/utils.js": "/modules/utils.js?v=300",
-                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=115",
-                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=307",
+                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=117",
+                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=308",
                     "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
             }
     }
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=359"></script>
+    <script type="module" src="main.js?v=362"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

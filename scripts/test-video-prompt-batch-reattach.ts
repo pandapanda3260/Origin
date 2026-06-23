@@ -40,7 +40,7 @@ function section(src: string, start: string, end?: string) {
 }
 
 record('videoPrompts imports shared active-batch API', () => {
-  const importBlock = section(videoPrompts, "import { $", "from './utils.js';");
+  const importBlock = section(videoPrompts, "import { $", "from '/modules/utils.js';");
   assert(importBlock.includes('getActiveBatchesShared'));
 });
 
@@ -81,8 +81,10 @@ record('terminal reattach is silent and does not subscribe', () => {
   assert(attachBlock.includes("var silent = source === 'reattach';"));
   assert(attachBlock.includes('if (!silent) {'));
   assert(attachBlock.includes('if (!silent) setTimeout(function () { _checkAndSuggest("videoPrompts"); }, 1000);'));
-  assert(attachBlock.includes('if (!terminalAtAttach) {\n      _videoPromptsGenerating = false;\n      if (btn) btn.disabled = false;\n    }'));
-  assert(attachBlock.includes('if (!terminalAtAttach && hint) {'));
+  assert(attachBlock.includes('if (!terminalAtAttach) {'));
+  assert(attachBlock.includes('_videoPromptsGenerating = false;'));
+  assert(attachBlock.includes('if (btn) btn.disabled = false;'));
+  assert(attachBlock.includes('_syncVideoPromptsHeaderHint();'));
   assert(attachBlock.includes('if (!terminalAtAttach) _updateVideoPromptBulkButtonLabel(groups);'));
   assert(attachBlock.includes('if (terminalAtAttach && attachKey && reloadOk) _vpTerminalHandledByKey[attachKey] = true;'));
   assert(attachBlock.includes('if (terminalAtAttach) {'));
@@ -105,8 +107,7 @@ record('refresh and main init both call the shared reattach path', () => {
   const refreshBlock = section(videoPrompts, 'export function refreshPromptsPage()', '// 片段条展示导演计划时长');
   assert(refreshBlock.includes('_scheduleVideoPromptBatchReattach("refresh");'));
   assert(main.includes('reattachVideoPromptBatches'));
-  const initBlock = section(main, 'try { _restoreAssetGenStatus(); }', '// Phase 3-B-10');
-  assert(initBlock.includes('reattachVideoPromptBatches("init")'));
+  assert(main.includes('reattachVideoPromptBatches("init")'));
 });
 
 record('workspace import map cache-busts videoPrompts module', () => {
