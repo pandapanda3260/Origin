@@ -3,12 +3,17 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { buildSignedImageUrl, buildSignedVideoUrl } from '@/lib/signed-asset-url';
-import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
+import { getProjectByIdForUser } from '@/lib/projects-db';
 import { storyboardShotIndices } from '@/lib/frame-workflow-state';
-import { syncEditProjectClips } from '@/lib/asset-library';
 import { getVevDemoMaterialBinding } from '@/lib/vevdemo-material-bindings';
 import { getVevDemoProjectBinding } from '@/lib/vevdemo-project-bindings';
 import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
+import {
+  deleteCurrentVideoForGroup,
+  setCurrentVideoForGroup,
+  type VideoCurrentOutcome,
+} from '@/lib/video-creation/current-video';
+import { getVideoCreationHistoryForGroup } from '@/lib/video-creation/history';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -157,46 +162,9 @@ function toProjectVideoLibraryItem(req: NextRequest, row: any, userId: number, p
   };
 }
 
-function computeReadiness(project: any) {
-  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
-  const videoTasks = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
-  let readyCount = 0;
-  for (let i = 0; i < storyboards.length; i += 1) {
-    const sb = storyboards[i];
-    const vt = videoTasks[i];
-    if (sb && typeof sb.videoUrl === 'string' && sb.videoUrl.trim() && sb.videoIsCurrent !== false && vt?.isCurrent !== false) {
-      readyCount += 1;
-    }
-  }
-  return {
-    totalCount: storyboards.length,
-    readyCount,
-    canEnterEdit: readyCount >= 1,
-  };
-}
-
-function clearStoryboardVideoFields(sb: any) {
-  if (!sb || typeof sb !== 'object') return sb;
-  const next = { ...sb, importedToEdit: false };
-  delete next.videoUrl;
-  delete next._originVideoUrl;
-  delete next.videoTaskId;
-  delete next.videoCoverUrl;
-  delete next.videoStatus;
-  delete next.videoMode;
-  delete next.videoTaskFinishedAt;
-  delete next.videoDurationSec;
-  delete next.videoFilename;
-  delete next.videoDisplayName;
-  delete next.videoDownloadFilename;
-  delete next.readyForEdit;
-  delete next.videoWarnings;
-  delete next.videoIsCurrent;
-  // ⚠️ 关键：videoAssetId 也要清掉。前端 hydrateProjectAssetUrls 会用
-  // videoAssetId 重签出新的 videoUrl 塞回 storyboard，于是「删除 → 全部生成 →
-  // 该片段立刻显示已完成」的鬼影 bug 就出现了。
-  delete next.videoAssetId;
-  return next;
+function videoCurrentOutcomeResponse(outcome: VideoCurrentOutcome) {
+  if (outcome.status === 200) return jsonOk(outcome.body);
+  return Response.json(outcome.body, { status: outcome.status });
 }
 
 /**
@@ -253,70 +221,14 @@ export async function GET(req: NextRequest) {
   const historyGroupRaw = url.searchParams.get('groupIdx');
   if (historyGroupRaw != null && historyGroupRaw !== '') {
     const gi = Number(historyGroupRaw);
-    if (!Number.isInteger(gi) || gi < 0) return jsonError('非法 groupIdx', 400);
-
-    const storyboardsH = Array.isArray(project?.storyboards) ? project.storyboards : [];
-    const sbH = storyboardsH[gi];
-    let slotValid = false;
-    if (sbH) {
-      try {
-        storyboardShotIndices(project, gi, sbH, { mode: 'single-shot-strict' });
-        slotValid = true;
-      } catch {
-        slotValid = false;
-      }
-    }
-    if (!slotValid) return jsonOk({ history: [], total: 0 });
-
-    const histRows = db
-      .prepare<{ uid: number; pid: string; gi: number }, any>(
-        `SELECT id, group_idx, status, duration_sec, filename, cover_image_id, prompt, created_at
-         FROM video_tasks
-         WHERE owner_id = @uid AND project_id = @pid AND group_idx = @gi
-         ORDER BY created_at DESC`,
-      )
-      .all({ uid: user.id, pid: projectId, gi });
-
-    const videoTasksH = Array.isArray(project?.videoTasks) ? project.videoTasks : [];
-    const vtH = videoTasksH[gi];
-    const currentIds = [sbH?.videoTaskId, vtH?.taskId, vtH?.serverTaskId, vtH?.id]
-      .map((v: any) => String(v || '').trim())
-      .filter(Boolean);
-    const currentUrls = [sbH?.videoUrl, sbH?._originVideoUrl, vtH?.url, vtH?.protectedUrl].map(
-      (v: any) => String(v || ''),
-    );
-
-    const history = histRows
-      .filter(
-        (r: any) =>
-          (r.status === 'succeeded' || r.status === 'done' || r.status === 'completed') && r.filename,
-      )
-	      .map((r: any) => {
-	        const taskId = String(r.id);
-	        const names = buildVideoSegmentNamesForRow(r, project);
-	        const isCurrent =
-          currentIds.includes(taskId) ||
-          currentUrls.some((u: string) => stringContainsTaskId(u, taskId));
-        return {
-	          task_id: r.id,
-	          target_idx: gi,
-	          title: names.displayName,
-	          name: names.displayName,
-	          displayName: names.displayName,
-	          filename: names.filename,
-	          downloadFilename: names.downloadFilename,
-	          status: r.status,
-          duration_sec: r.duration_sec,
-          url: buildSignedVideoUrl(r.id, user.id).url,
-          protected_url: `/api/videos/file/${r.id}`,
-          cover_url: buildSignedCoverDisplayUrl(req, r.cover_image_id, user.id),
-          prompt: r.prompt || '',
-          created_at: r.created_at,
-          is_current: isCurrent,
-        };
-      });
-
-    return jsonOk({ history, total: history.length });
+    const result = getVideoCreationHistoryForGroup({
+      req,
+      projectId,
+      ownerId: user.id,
+      groupIdx: gi,
+    });
+    if (result.status === 200) return jsonOk(result.body);
+    return Response.json(result.body, { status: result.status });
   }
 
   const rows = db
@@ -402,135 +314,12 @@ export async function POST(req: NextRequest) {
   const projectId = String(body?.projectId || '').trim();
   const groupIdx = Number(body?.groupIdx);
   const taskId = String(body?.taskId || '').trim();
-	  if (!projectId) return jsonError('缺 projectId', 400);
-	  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
-	  if (!taskId) return jsonError('缺 taskId', 400);
-	  const project = getProjectByIdForUser(projectId, user.id) as any;
-	  if (!project) return jsonError('项目不存在', 404);
-
-	  const db = getDb();
-  const row = db
-    .prepare<{ id: string; uid: number; pid: string }, any>(
-      `SELECT id, group_idx, status, duration_sec, filename, cover_image_id
-       FROM video_tasks WHERE id = @id AND owner_id = @uid AND project_id = @pid`,
-    )
-    .get({ id: taskId, uid: user.id, pid: projectId });
-  if (!row) return jsonError('历史视频不存在', 404);
-  if (Number(row.group_idx) !== groupIdx) return jsonError('groupIdx 与任务不匹配', 400);
-  const succeeded = row.status === 'succeeded' || row.status === 'done' || row.status === 'completed';
-  if (!succeeded || !row.filename) return jsonError('该历史视频不可用', 400);
-
-  const protectedUrl = `/api/videos/file/${row.id}`;
-  const signedUrl = buildSignedVideoUrl(row.id, user.id).url;
-	  const coverUrl = row.cover_image_id ? `/api/images/file/${row.cover_image_id}` : '';
-	  const durationSec = Number(row.duration_sec) || 0;
-	  const names = buildVideoSegmentNamesForRow(row, project);
-
-  const patched = patchProjectForUser(projectId, user.id, (fresh: any) => {
-    const storyboards = Array.isArray(fresh?.storyboards) ? [...fresh.storyboards] : [];
-    if (groupIdx >= storyboards.length || !storyboards[groupIdx]) return null;
-
-    const sb = { ...storyboards[groupIdx] };
-	    sb.videoUrl = signedUrl;
-	    sb._originVideoUrl = protectedUrl;
-	    sb.videoTaskId = row.id;
-	    sb.videoFilename = names.filename;
-	    sb.videoDisplayName = names.displayName;
-	    sb.videoDownloadFilename = names.downloadFilename;
-    if (coverUrl) sb.videoCoverUrl = coverUrl;
-    if (durationSec > 0) sb.videoDurationSec = durationSec;
-    sb.videoStatus = 'done';
-    sb.videoIsCurrent = true;
-    delete sb.videoInvalidatedAt;
-    delete sb.videoInvalidatedReason;
-    delete sb.readyForEdit;
-    // videoAssetId 可能指向旧资源；清掉以免 hydrateProjectAssetUrls 用旧的重签覆盖。
-    delete sb.videoAssetId;
-    storyboards[groupIdx] = sb;
-
-    const videoTasks = Array.isArray(fresh?.videoTasks) ? [...fresh.videoTasks] : [];
-    const prevVt =
-      videoTasks[groupIdx] && typeof videoTasks[groupIdx] === 'object' ? videoTasks[groupIdx] : {};
-    const vt: any = { ...prevVt };
-    vt.groupIdx = groupIdx;
-    vt.taskId = row.id;
-	    vt.url = protectedUrl;
-	    vt.protectedUrl = protectedUrl;
-	    vt.filename = names.filename;
-	    vt.displayName = names.displayName;
-	    vt.downloadFilename = names.downloadFilename;
-    if (durationSec > 0) vt.durationSec = durationSec;
-    vt.status = 'completed';
-    vt.isCurrent = true;
-    delete vt.outdated;
-    delete vt.invalidatedAt;
-    delete vt.invalidatedReason;
-    videoTasks[groupIdx] = vt;
-
-    // 同步剪辑时间线：该片段若已在 timeline，把它的 videoUrl 换成新视频。
-    const editData =
-      fresh?.editData && typeof fresh.editData === 'object' ? { ...fresh.editData } : {};
-    const edl = editData.edl && typeof editData.edl === 'object' ? { ...editData.edl } : null;
-    if (edl && Array.isArray(edl.timeline)) {
-      let touched = false;
-      edl.timeline = edl.timeline.map((entry: any) => {
-        if (entry && Number(entry.groupIdx) === groupIdx) {
-          touched = true;
-	          return {
-	            ...entry,
-	            videoUrl: signedUrl,
-	            protectedUrl,
-	            _originVideoUrl: protectedUrl,
-	            filename: names.filename,
-	            displayName: names.displayName,
-	            downloadFilename: names.downloadFilename,
-	            _mediaName: names.displayName,
-	          };
-        }
-        return entry;
-      });
-      if (touched) edl.version = (Number(edl.version) || 0) + 1;
-      editData.edl = edl;
-    }
-
-    return {
-      storyboards,
-      videoTasks,
-      editData: {
-        ...editData,
-        readiness: computeReadiness({ ...fresh, storyboards, videoTasks }),
-      },
-    };
-  });
-
-  if (!patched) return jsonError('项目不存在或片段不存在', 404);
-
-  const edl = patched?.editData?.edl;
-  try {
-    syncEditProjectClips({
-      ownerId: user.id,
-      projectId,
-      timeline: Array.isArray(edl?.timeline) ? edl.timeline : [],
-    });
-  } catch (clipError) {
-    console.warn('[video-by-project] set-current clip sync skipped:', clipError);
-  }
-
-  return jsonOk({
-    ok: true,
+  return videoCurrentOutcomeResponse(setCurrentVideoForGroup({
+    projectId,
+    ownerId: user.id,
     groupIdx,
-    taskId: row.id,
-    url: signedUrl,
-	    protectedUrl,
-	    filename: names.filename,
-	    displayName: names.displayName,
-	    downloadFilename: names.downloadFilename,
-	    coverUrl,
-    durationSec,
-    readiness: computeReadiness(patched),
-    edl: edl || null,
-    serverVersion: Number(patched.version) || undefined,
-  });
+    taskId,
+  }));
 }
 
 export async function DELETE(req: NextRequest) {
@@ -541,58 +330,9 @@ export async function DELETE(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const projectId = String(body?.projectId || url.searchParams.get('projectId') || '').trim();
   const groupIdx = Number(body?.groupIdx ?? url.searchParams.get('groupIdx'));
-  if (!projectId) return jsonError('缺 projectId', 400);
-  if (!Number.isInteger(groupIdx) || groupIdx < 0) return jsonError('非法 groupIdx', 400);
-
-  const patched = patchProjectForUser(projectId, user.id, (fresh: any) => {
-    const storyboards = Array.isArray(fresh?.storyboards) ? [...fresh.storyboards] : [];
-    if (groupIdx >= storyboards.length || !storyboards[groupIdx]) return null;
-
-    storyboards[groupIdx] = clearStoryboardVideoFields(storyboards[groupIdx]);
-
-    const videoTasks = Array.isArray(fresh?.videoTasks) ? [...fresh.videoTasks] : [];
-    if (groupIdx < videoTasks.length) videoTasks[groupIdx] = null;
-
-    const editData = fresh?.editData && typeof fresh.editData === 'object'
-      ? { ...fresh.editData }
-      : {};
-    const edl = editData.edl && typeof editData.edl === 'object'
-      ? { ...editData.edl }
-      : null;
-    if (edl && Array.isArray(edl.timeline)) {
-      edl.timeline = edl.timeline.filter((entry: any) => !(entry && Number(entry.groupIdx) === groupIdx));
-      edl.version = (Number(edl.version) || 0) + 1;
-      editData.edl = edl;
-    }
-
-    return {
-      storyboards,
-      videoTasks,
-      editData: {
-        ...editData,
-        readiness: computeReadiness({ ...fresh, storyboards, videoTasks }),
-      },
-    };
-  });
-
-  if (!patched) return jsonError('项目不存在或片段不存在', 404);
-
-  const edl = patched?.editData?.edl;
-  try {
-    syncEditProjectClips({
-      ownerId: user.id,
-      projectId,
-      timeline: Array.isArray(edl?.timeline) ? edl.timeline : [],
-    });
-  } catch (clipError) {
-    console.warn('[video-by-project] edit clip sync skipped:', clipError);
-  }
-
-  return jsonOk({
-    ok: true,
+  return videoCurrentOutcomeResponse(deleteCurrentVideoForGroup({
+    projectId,
+    ownerId: user.id,
     groupIdx,
-    readiness: computeReadiness(patched),
-    edl: edl || null,
-    serverVersion: Number(patched.version) || undefined,
-  });
+  }));
 }

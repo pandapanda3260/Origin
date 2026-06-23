@@ -209,7 +209,7 @@ async function structureVisionScene(
   sourceType: CustomSceneSourceType,
   tokenContext: TokenUsageContext | null,
 ) {
-  const cfg = resolveTextModelConfig(user, 'structured');
+  const cfg = resolveTextModelConfig(user, 'visionExtract');
   if (cfg.mode === 'fake') throw new Error('当前结构化文本模型未配置，无法识别参考图场景');
   if (cfg.provider !== 'openai_responses' && cfg.provider !== 'packy_responses' && cfg.provider !== 'zerail_responses' && cfg.provider !== 'openai_chat') {
     throw new Error(`当前文本模型不支持图片识别：${cfg.provider}`);
@@ -234,9 +234,9 @@ async function structureVisionScene(
       120_000,
   );
   const usageOpts = {
-    maxTokens: 8192,
+    maxTokens: 1600,
     traceName: 'custom-scene-vision',
-    modelRole: 'structured' as const,
+    modelRole: 'visionExtract' as const,
     tokenContext: {
       ownerId: user.id,
       usernameSnapshot: user.phone || user.display_name || user.username || null,
@@ -255,7 +255,7 @@ async function structureVisionScene(
     usageOpts,
     'complete',
   );
-  const maxOutputTokens = budgeted.maxTokens ?? 8192;
+  const maxOutputTokens = budgeted.maxTokens ?? 1600;
   let text = '';
   if (cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses' || cfg.provider === 'zerail_responses') {
     const body: any = {

@@ -22,9 +22,6 @@ let _ctx = {};
 function _safeWriteBack(id, fn, serverVersion) {
   return _ctx.safeWriteBack ? _ctx.safeWriteBack(id, fn, serverVersion) : false;
 }
-function importGroupToTimeline(groupIdx) {
-  return _ctx.importGroupToTimeline ? _ctx.importGroupToTimeline(groupIdx) : false;
-}
 function removeGroupFromTimeline(groupIdx) {
   return _ctx.removeGroupFromTimeline ? _ctx.removeGroupFromTimeline(groupIdx) : false;
 }
@@ -384,7 +381,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	  async function _postVideoBatchStartWithPreflightHandling(requestBody) {
 	    var body = JSON.parse(JSON.stringify(requestBody || {}));
 	    try {
-	      return { resp: await apiPost("/api/batch/start", body) };
+	      return { resp: await apiPost("/api/video-creation/videos/start", body) };
 	    } catch (e) {
 	      var payload = _getVideoSegmentPreflightPayload(e);
 	      if (!payload) throw e;
@@ -408,6 +405,77 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    if (vt && vt.isCurrent === false) return false;
 	    return true;
 	  }
+
+  function _videoCreationTaskFromSegment(segment) {
+    var video = segment && segment.video ? segment.video : null;
+    var gIdx = Number(segment && segment.groupIdx);
+    if (!video || !Number.isInteger(gIdx) || gIdx < 0) return null;
+    var status = String(video.status || "").toLowerCase();
+    var taskId = String(video.taskId || "").trim();
+    var protectedUrl = String(video.protectedUrl || video.videoUrl || "").trim();
+    var playbackUrl = String(video.playbackUrl || "").trim();
+    var hasVideo = !!(protectedUrl || playbackUrl);
+    if (!hasVideo && !taskId && status !== "failed" && status !== "generating") return null;
+    return {
+      task_id: taskId,
+      target_idx: gIdx,
+      title: video.displayName || ("片段 " + (gIdx + 1)),
+      name: video.displayName || ("片段 " + (gIdx + 1)),
+      displayName: video.displayName || "",
+      filename: video.filename || "",
+      downloadFilename: video.downloadFilename || "",
+      status: status === "ready" ? "completed" : (status || "completed"),
+      progress: status === "ready" ? 100 : 0,
+      duration_sec: video.durationSec || 0,
+      result_url: playbackUrl || protectedUrl,
+      protected_url: protectedUrl,
+      cover_url: video.coverUrl || "",
+      error_msg: video.errorMsg || "",
+      updated_at: video.updatedAt || "",
+      imported: video.imported === true,
+    };
+  }
+
+  function _applyVideoCreationStateSnapshot(snapshot, options) {
+    options = options || {};
+    var coveredGroups = options.coveredGroups || {};
+    var tasks = [];
+    if (!snapshot || !project || !Array.isArray(project.storyboards)) return { tasks: tasks, applied: 0 };
+    if (snapshot.projectId && project.id && String(snapshot.projectId) !== String(project.id)) {
+      return { tasks: tasks, applied: 0 };
+    }
+    if (snapshot.serverVersion != null) project.version = Number(snapshot.serverVersion) || project.version;
+    if (snapshot.readiness) {
+      if (!project.editData) project.editData = {};
+      project.editData.readiness = snapshot.readiness;
+    }
+    var segments = Array.isArray(snapshot.segments) ? snapshot.segments : [];
+    var applied = 0;
+    segments.forEach(function (segment) {
+      var item = _videoCreationTaskFromSegment(segment);
+      if (!item) return;
+      var gIdx = item.target_idx;
+      if (coveredGroups[gIdx]) return;
+      if (!project.storyboards[gIdx]) project.storyboards[gIdx] = {};
+      var sb = project.storyboards[gIdx];
+      if (typeof item.imported === "boolean") sb.importedToEdit = item.imported;
+      var video = segment.video || {};
+      var status = String(video.status || "").toLowerCase();
+      if (status === "ready" && item.result_url) {
+        _markGroupVideoCurrent(gIdx, item.result_url, {
+          protectedUrl: item.protected_url,
+          taskId: item.task_id,
+          filename: item.filename,
+          displayName: item.displayName || item.title || item.name,
+          downloadFilename: item.downloadFilename,
+          durationSec: item.duration_sec,
+        });
+        applied++;
+      }
+      tasks.push(item);
+    });
+    return { tasks: tasks, applied: applied };
+  }
 
   function _markGroupVideoCurrent(gIdx, url, opts) {
     opts = opts || {};
@@ -595,33 +663,42 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return downloadVideoTask(task, btn);
   }
 
-  function importVideoForGroup(gIdx) {
-    _syncVideoRefs();
-    var n = _normalizeGroupIdx(gIdx);
-    if (n == null) { showToast("当前视频没有关联分镜，无法导入", "warn"); return false; }
-    if (!_canBulkImportGroup(n)) {
-      showToast("当前视频未生成、已过期或尚未就绪，无法导入剪辑", "warn");
-      return false;
-    }
-    var alreadyImported = false;
-    try { alreadyImported = isGroupImported(n); } catch (_e) {}
-    if (alreadyImported) {
-      showToast("该视频已在剪辑工作台", "info");
-      return true;
-    }
-    var didImport = false;
-    try { didImport = importGroupToTimeline(n); } catch (_err) { didImport = false; }
-    if (didImport) {
-      showToast("已导入剪辑工作台", "ok");
-      var task = _findTaskByGroup(n);
-      if (task) updateTaskCard(task);
-      _notifyVideoResultChanged(n, "import");
-      try { updateBadge(); } catch (_e) {}
-      return true;
-    }
-    showToast("导入失败，视频可能还在加载中，请稍后再试", "warn");
-    return false;
-  }
+  async function importVideoForGroup(gIdx, options) {
+    options = options || {};
+	    _syncVideoRefs();
+	    var n = _normalizeGroupIdx(gIdx);
+	    if (n == null) { if (!options.silent) showToast("当前视频没有关联分镜，无法导入", "warn"); return false; }
+	    if (!_canBulkImportGroup(n)) {
+	      if (!options.silent) showToast("当前视频未生成、已过期或尚未就绪，无法导入剪辑", "warn");
+	      return false;
+	    }
+	    var alreadyImported = false;
+	    try { alreadyImported = isGroupImported(n); } catch (_e) {}
+	    if (alreadyImported) {
+	      if (!options.silent) showToast("该视频已在剪辑工作台", "info");
+	      return true;
+	    }
+	    try {
+	      var resp = await apiPost("/api/video-creation/videos/import", {
+	        projectId: project.id,
+	        groupIdx: n,
+	      });
+	      if (resp && resp.serverVersion != null) project.version = Number(resp.serverVersion) || project.version;
+	      if (!project.editData) project.editData = {};
+	      if (resp && resp.edl) project.editData.edl = resp.edl;
+	      if (resp && resp.readiness) project.editData.readiness = resp.readiness;
+	      if (project.storyboards[n]) project.storyboards[n].importedToEdit = true;
+	      if (!options.silent) showToast("已导入剪辑工作台", "ok");
+	      var task = _findTaskByGroup(n);
+	      if (task) updateTaskCard(task);
+	      _notifyVideoResultChanged(n, "import");
+	      try { updateBadge(); } catch (_e) {}
+	      return true;
+	    } catch (err) {
+	      if (!options.silent) showToast("导入失败: " + _diagnoseApiError(((err && err.message) || err).toString()), "warn");
+	      return false;
+	    }
+	  }
 
   async function deleteVideoForGroup(gIdx, btn) {
     _syncVideoRefs();
@@ -634,10 +711,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
     if (btn) btn.disabled = true;
     try {
-      var delResp = await apiPost("/api/tasks/video-by-project", {
-        projectId: project.id,
-        groupIdx: n,
-      }, "DELETE");
+	      var delResp = await apiPost("/api/video-creation/videos/current", {
+	        projectId: project.id,
+	        groupIdx: n,
+	      }, "DELETE");
       if (delResp && delResp.serverVersion != null) {
         project.version = Number(delResp.serverVersion) || project.version;
       }
@@ -724,12 +801,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       var isImported = false;
       try { isImported = isGroupImported(i); } catch (_e) { isImported = false; }
       if (isImported) { already++; continue; }
-      try {
-        if (importGroupToTimeline(i)) imported++;
-        else failed++;
-      } catch (_err) {
-        failed++;
-      }
+	      try {
+	        if (await importVideoForGroup(i, { silent: true })) imported++;
+	        else failed++;
+	      } catch (_err) {
+	        failed++;
+	      }
     }
     renderBatchClipList();
     updateBadge();
@@ -908,7 +985,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
    *
    * 恢复策略：
    *   1. /api/batch/active → 活跃批次（进行中），按 target_idx 去重建卡 + 挂 SSE
-   *   2. /api/tasks/video-by-project → 已完成历史（去重），补充 batch 没覆盖的分镜
+   *   2. /api/video-creation/state → 权威视频快照（去重），补充 batch 没覆盖的分镜
    *   两步之间按 groupIdx 互斥：步骤 1 已有的分镜，步骤 2 不再建卡 */
   function _videoRestoreGuard(options) {
     options = options || {};
@@ -1290,13 +1367,14 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       console.warn("[VideoReattach] batch/active failed:", e);
     }
 
-    // Step 2: completed history — 补充已完成但不在活跃 batch 中的历史任务
+    // Step 2: authoritative video-creation state — 补充已完成但不在活跃 batch 中的片段
     try {
-      var histResp = await apiGet("/api/tasks/video-by-project?projectId=" + encodeURIComponent(restoreProjectId));
+      var stateResp = await apiGet("/api/video-creation/state?projectId=" + encodeURIComponent(restoreProjectId));
       if (!guard()) return false;
-      var histTasks = (histResp && histResp.tasks) || [];
+      var stateMerge = _applyVideoCreationStateSnapshot(stateResp, { coveredGroups: coveredGroups });
+      var histTasks = (stateMerge && stateMerge.tasks) || [];
       if (histTasks.length) {
-        console.log("[VideoReattach] Found " + histTasks.length + " history tasks");
+        console.log("[VideoReattach] Found " + histTasks.length + " video creation state tasks");
         histTasks.forEach(function (t) {
           if (!guard()) return;
           var gIdx = t.target_idx != null ? t.target_idx : 0;
@@ -1364,7 +1442,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
         });
       }
     } catch (e) {
-      console.warn("[VideoReattach] video-by-project failed:", e);
+      console.warn("[VideoReattach] video-creation state failed:", e);
     }
 
     syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();
@@ -2037,12 +2115,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           if (alreadyIn) {
             try { removeGroupFromTimeline(mGIdx); } catch (_e) {}
             showToast("已从剪辑工作台移出", "info");
-          } else {
-            var imported = false;
-            try { imported = importGroupToTimeline(mGIdx); } catch (_e) {}
-            if (imported) {
-              showToast("已导入剪辑工作台", "ok");
-            } else {
+	          } else {
+	            var imported = false;
+	            try { imported = await importVideoForGroup(mGIdx, { silent: true }); } catch (_e) {}
+	            if (imported) {
+	              showToast("已导入剪辑工作台", "ok");
+	            } else {
               showToast("导入失败，视频可能还在加载中，请稍后再试", "warn");
             }
           }
@@ -2262,10 +2340,10 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     // 后半段是"业务资格"—— 业务资格严格只读后端 hydrate 下发的
     // `storyboards[idx].readyForEdit`（规则来源 services/edit_timeline_gate.py，
     // `is_storyboard_ready_for_edit`）。前端不再自己拼 `videoUrl && gIdx != null`
-    // 之类的业务判定，避免和后端 /api/edit/timeline import-group 的准入规则撕裂。
+	    // 之类的业务判定，避免和后端 video-creation import 的准入规则撕裂。
     //
     // 兜底：readyForEdit 字段完全缺失（老项目 / 该项目这次会话没触发过 GET）时
-    // 视为"后端还没表态"，按钮默认放行——后端 /api/edit/timeline 的
+	    // 视为"后端还没表态"，按钮默认放行——后端 video-creation import 的
     // assert_can_import_group 仍是最终防线，点下去后端拒绝会 toast。
     var gIdx = task._groupIdx;
     var uiDone = task.status === "done" && (task.previewOk || task.videoUrl) && gIdx != null;
@@ -2554,8 +2632,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       if (!project || !project.id) { showToast("请先打开项目", "warn"); return; }
       if (btnEl) { btnEl.disabled = true; btnEl.textContent = "替换中…"; }
       try {
-        var resp = await apiPost("/api/tasks/video-by-project", {
-          action: "set-current", projectId: project.id, groupIdx: gIdx, taskId: item.task_id,
+        var resp = await apiPost("/api/video-creation/videos/current", {
+          projectId: project.id, groupIdx: gIdx, taskId: item.task_id,
         });
         var newUrl = (resp && resp.url) || item.url;
         var newProtected = (resp && resp.protectedUrl) || item.protected_url;
@@ -2616,7 +2694,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
     // 拉取该片段历史
     try {
-      var resp = await apiGet("/api/tasks/video-by-project?projectId=" + encodeURIComponent(project.id) + "&groupIdx=" + gIdx);
+      var resp = await apiGet("/api/video-creation/videos/history?projectId=" + encodeURIComponent(project.id) + "&groupIdx=" + gIdx);
       state.items = (resp && resp.history) || [];
     } catch (e) {
       listEl.innerHTML = '<div class="vh-empty">加载失败</div>';
@@ -3872,8 +3950,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
   }
 
-  /* Phase 2 · 2.6.3：片段生成全权由后端 batch_runner 调度。
-   * 前端只发一次 POST /api/batch/start，并订阅 /api/batch/<batchId>/stream
+	  /* Phase 2 · 2.6.3：片段生成全权由 video-creation 领域服务创建 batch。
+	   * 前端只发一次 POST /api/video-creation/videos/start，并订阅 /api/batch/<batchId>/stream
    * 来获取每个分镜的生命周期事件。再也不用前端 plan-batch / 轮询。 */
   var _batchHandle = null;
 
@@ -4315,7 +4393,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
   }
 
   /* Task action delegation */
-  function handleVideoTaskAction(e) {
+	  async function handleVideoTaskAction(e) {
     _syncVideoRefs();
     var btn = e.target.closest("[data-action]"); if (!btn) return;
     var cardEl = btn.closest(".task-card"); if (!cardEl) return;
@@ -4336,11 +4414,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       if (alreadyImported) {
         try { removeGroupFromTimeline(task._groupIdx); } catch (_e) {}
         showToast("已从剪辑工作台移出", "info");
-      } else {
-        var didImport = false;
-        try { didImport = importGroupToTimeline(task._groupIdx); } catch (_e) {}
-        if (didImport) {
-          showToast("已导入剪辑工作台", "ok");
+	      } else {
+	        var didImport = false;
+	        try { didImport = await importVideoForGroup(task._groupIdx, { silent: true }); } catch (_e) {}
+	        if (didImport) {
+	          showToast("已导入剪辑工作台", "ok");
         } else {
           showToast("导入失败，视频可能还在加载中，请稍后再试", "warn");
         }

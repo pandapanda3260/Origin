@@ -68,6 +68,8 @@ export function resolveLLMConfig(
 // 这种带"思考过程"的模型经常误伤（思考期间 0 字节流回，被 AbortController 砍掉），
 // 给到 3 分钟兜底就够覆盖常见慢模型；如果中转站真挂了也不会无限等。
 const LLM_REQUEST_TIMEOUT_MS = 180_000;
+const LLM_TEXT_NETWORK_RETRY_DEFAULT_ATTEMPTS = 2;
+const LLM_TEXT_NETWORK_RETRY_DEFAULT_DELAY_MS = 1_000;
 
 type TaskOutputPolicy = {
   baseMaxTokens: number;
@@ -173,23 +175,42 @@ export async function chatComplete(
   try {
     return await chatCompleteOnce(cfg, messages, budgetedOpts);
   } catch (e: any) {
-    const fallbackCfg = selectTextFallbackConfig(cfg, e, opts);
+    let error = e;
+    const networkRetry = shouldRetryTextNetworkError(error, opts);
+    if (networkRetry.retryable) {
+      const delayMs = resolveTextNetworkRetryDelayMs();
+      console.warn(
+        `[llm.retry.network] ${opts.traceName || 'chatComplete'} retrying transient text network error ` +
+          `attempt=2/${networkRetry.maxAttempts} delayMs=${delayMs} ` +
+          `provider=${cfg.provider} model=${opts.modelOverride || cfg.model}: ` +
+          `${String(error?.message || error).slice(0, 240)}`,
+      );
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      try {
+        const retryOpts = markNetworkRetryAttempt(budgetedOpts, networkRetry.maxAttempts);
+        return await chatCompleteOnce(cfg, messages, retryOpts);
+      } catch (retryError: any) {
+        error = retryError;
+      }
+    }
+
+    const fallbackCfg = selectTextFallbackConfig(cfg, error, opts);
     if (fallbackCfg) {
       console.warn(
         `[llm.fallback] ${opts.traceName || 'chatComplete'} ` +
-        `${cfg.provider}/${cfg.model} -> ${fallbackCfg.provider}/${fallbackCfg.model}: ${String(e?.message || e).slice(0, 240)}`,
+        `${cfg.provider}/${cfg.model} -> ${fallbackCfg.provider}/${fallbackCfg.model}: ${String(error?.message || error).slice(0, 240)}`,
       );
       const fallbackOpts = applyTokenBudget(fallbackCfg, messages, initialOpts, 'complete');
       return chatCompleteOnce(fallbackCfg, messages, fallbackOpts);
     }
 
     const policy = resolveTaskOutputPolicy(opts.traceName);
-    const decision = classifyJsonRetryError(e);
+    const decision = classifyJsonRetryError(error);
     const canRetryOutputIncomplete =
       opts.responseFormat !== 'json_object' &&
       !!policy?.allowOutputIncompleteRetry &&
       decision.reason === 'output_incomplete';
-    if (!canRetryOutputIncomplete) throw e;
+    if (!canRetryOutputIncomplete) throw error;
 
     const nextTraceAttempt = Math.max((opts.traceAttempt || 1) + 1, 2);
     const retryMaxTokens = resolveRetryMaxTokens(opts.traceName || '', budgetedOpts.maxTokens ?? opts.maxTokens ?? 4096);
@@ -205,6 +226,33 @@ export async function chatComplete(
     const retryBudgetedOpts = applyTokenBudget(cfg, messages, retryOpts, 'complete');
     return chatCompleteOnce(cfg, messages, retryBudgetedOpts);
   }
+}
+
+function markNetworkRetryAttempt(opts: LLMOptions, maxAttempts: number): LLMOptions {
+  const nextAttempt = Math.max((opts.traceAttempt || 1) + 1, 2);
+  return {
+    ...opts,
+    traceAttempt: nextAttempt,
+    traceMaxAttempts: Math.max(maxAttempts, opts.traceMaxAttempts || 0, nextAttempt),
+  };
+}
+
+function shouldRetryTextNetworkError(error: any, opts: LLMOptions): { retryable: boolean; maxAttempts: number } {
+  const maxAttempts = resolveTextNetworkRetryMaxAttempts();
+  if (maxAttempts <= 1) return { retryable: false, maxAttempts };
+  if ((opts.traceAttempt || 1) > 1) return { retryable: false, maxAttempts };
+  if (opts.traceMaxAttempts && opts.traceMaxAttempts > 1) return { retryable: false, maxAttempts };
+  return { retryable: isTransientTextNetworkError(error), maxAttempts };
+}
+
+function resolveTextNetworkRetryMaxAttempts(): number {
+  const configured = positiveEnvInt('LLM_TEXT_NETWORK_RETRY_ATTEMPTS') ?? LLM_TEXT_NETWORK_RETRY_DEFAULT_ATTEMPTS;
+  return Math.max(1, Math.min(3, configured));
+}
+
+function resolveTextNetworkRetryDelayMs(): number {
+  const configured = nonNegativeEnvInt('LLM_TEXT_NETWORK_RETRY_DELAY_MS') ?? LLM_TEXT_NETWORK_RETRY_DEFAULT_DELAY_MS;
+  return Math.max(0, Math.min(10_000, configured));
 }
 
 async function chatCompleteOnce(
@@ -251,6 +299,41 @@ function isTextFallbackEligible(error: any): boolean {
     'socket hang up',
     'retry_deadline_exceeded',
   ].some((needle) => message.includes(needle));
+}
+
+function isTransientTextNetworkError(error: any): boolean {
+  const message = errorWithCausesText(error);
+  const lower = message.toLowerCase();
+  if (!lower) return false;
+  if (isBackgroundSubmitTimeoutMessage(message)) return false;
+  if (message.includes('请求超时') || lower.includes('abort')) return false;
+  if (/^llm\s+\d{3}\b/i.test(String(error?.message || error || ''))) return false;
+  return [
+    'fetch failed',
+    'etimedout',
+    'econnreset',
+    'eai_again',
+    'socket hang up',
+    'network socket disconnected',
+    'tls connection',
+    'read timeout',
+  ].some((needle) => lower.includes(needle));
+}
+
+function errorWithCausesText(error: any): string {
+  const parts: string[] = [];
+  let current = error;
+  const seen = new Set<any>();
+  for (let depth = 0; current && depth < 5 && !seen.has(current); depth += 1) {
+    seen.add(current);
+    for (const key of ['name', 'code', 'errno', 'syscall', 'message']) {
+      const value = current?.[key];
+      if (value != null) parts.push(String(value));
+    }
+    current = current?.cause;
+  }
+  if (!parts.length) parts.push(String(error || ''));
+  return parts.join(' ');
 }
 
 export async function observeTextModelCall<T>(
@@ -564,6 +647,24 @@ function isResponsesConfig(cfg: ResolvedModelConfig): boolean {
     cfg.provider === 'openai_responses' ||
     cfg.provider === 'packy_responses'
   );
+}
+
+function shouldUseShotsGenerateSyncFallback(taskName: string, cfg: ResolvedModelConfig): boolean {
+  return taskName === 'shots-generate' && cfg.provider === 'zerail_responses';
+}
+
+function shotsGenerateSyncFallbackOptions(opts: LLMOptions): LLMOptions {
+  const fallbackMaxTokens = positiveEnvInt('SHOTS_GENERATE_SYNC_FALLBACK_MAX_TOKENS') || 8_000;
+  const fallbackTimeoutMs = positiveEnvInt('SHOTS_GENERATE_SYNC_FALLBACK_TIMEOUT_MS') || 180_000;
+  return {
+    ...opts,
+    maxTokens: Math.max(Number(opts.maxTokens || 0), fallbackMaxTokens),
+    requestTimeoutMs: Math.max(Number(opts.requestTimeoutMs || 0), fallbackTimeoutMs),
+    reasoningEffort: null,
+    responseFormat: 'json_object',
+    modelRole: opts.modelRole || 'structured',
+    traceName: 'shots-generate-sync-fallback',
+  };
 }
 
 async function getJsonWithProxySupport(
@@ -939,6 +1040,14 @@ function positiveEnvInt(name: string): number | undefined {
   return Math.round(n);
 }
 
+function nonNegativeEnvInt(name: string): number | undefined {
+  const raw = String(getExternalEnvValue(name) ?? process.env[name] ?? '').trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return Math.round(n);
+}
+
 async function postJsonWithTimeout(
   url: string,
   apiKey: string,
@@ -1183,6 +1292,14 @@ export async function chatCompleteJsonViaBackground<T = any>(
   // 非 Responses API provider (Claude / Chat Completions) 没有 background 模式 — 自动回退。
   if (!isResponsesConfig(cfg) || cfg.mode === 'fake') {
     return chatCompleteJsonWithRetry(user, messages, opts, parser, taskName);
+  }
+  if (shouldUseShotsGenerateSyncFallback(taskName, cfg)) {
+    const fallbackOpts = shotsGenerateSyncFallbackOptions(opts);
+    console.warn(
+      `[${taskName}] using sync fallback for ${cfg.provider}/${cfg.model}: ` +
+        `background submit is not honored reliably for large shot-plan payloads`,
+    );
+    return chatCompleteJsonWithRetry(user, messages, fallbackOpts, parser, fallbackOpts.traceName || taskName);
   }
 
   const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts || 3));

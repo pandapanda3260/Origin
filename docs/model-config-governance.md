@@ -46,6 +46,7 @@ Origin needs to swap models, gateways, and quality/speed tiers frequently. If se
 | `styleBible` | Style bible extraction | `STYLE_BIBLE_*`, then `TEXT_*` |
 | `projectClassifier` | Early project classification/evaluation, including default style selection and world-model checks | `PROJECT_CLASSIFIER_*`, then task fallback |
 | `profileDerive` | Creator profile derivation | `PROFILE_DERIVE_*`, then `TEXT_*` |
+| `visionExtract` | Reference-image visual extraction into structured character/scene asset fields | `VISION_EXTRACT_*`, then `TEXT_*` |
 | `image` | Image generation/editing | `IMAGE_*` |
 | `video` | Video generation | `VIDEO_*` |
 
@@ -61,6 +62,9 @@ STYLE_BIBLE_REASONING_EFFORT="xhigh"
 
 PROFILE_DERIVE_MODEL="gpt-5.5"
 PROFILE_DERIVE_REASONING_EFFORT="xhigh"
+
+VISION_EXTRACT_MODEL="gpt-5.5"
+VISION_EXTRACT_REASONING_EFFORT="none"
 
 PROJECT_CLASSIFIER_PROVIDER="volcengine_chat"
 PROJECT_CLASSIFIER_API_BASE="https://ark.cn-beijing.volces.com/api/v3"
@@ -83,6 +87,11 @@ TEXT_REASONING_EFFORT="xhigh"
 TEXT_CONTEXT_WINDOW="400000"
 TEXT_MAX_OUTPUT_TOKENS="32768"
 ```
+
+`visionExtract` is intentionally separate from `structured`: it is for
+reference-image recognition before custom character/scene field extraction. When
+`VISION_EXTRACT_REASONING_EFFORT` is not configured, it defaults to `none` and
+does not inherit `TEXT_REASONING_EFFORT`.
 
 ### Image Provider Primary/Fallback
 
@@ -142,6 +151,11 @@ LLM_JSON_REQUEST_TIMEOUT_MS="900000"
 
 # Optional task-specific timeout override, generated from traceName.
 SHOTS_GENERATE_REQUEST_TIMEOUT_MS="900000"
+
+# Optional transient network retry for synchronous text LLM calls.
+# Attempts includes the initial call; set to 1 to disable.
+LLM_TEXT_NETWORK_RETRY_ATTEMPTS="2"
+LLM_TEXT_NETWORK_RETRY_DELAY_MS="1000"
 ```
 
 ## Allowed Exceptions

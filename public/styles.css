@@ -4347,9 +4347,16 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell {
 body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   min-height: 0;
 }
+#promptsNarrativePanel {
+  /* 列宽自适应：原 Tailwind 固定宽 420px → clamp 顶值≈-30%，随窗口平滑收放。
+     与右栏 .video-creation-workspace 的 clamp(220px,18vw,300px) 同款约定。 */
+  width: clamp(248px, 22vw, 296px);
+  /* 内边距整合：原 Tailwind p-12(四边48) 移入此处；右 48→14 收窄右间距，左 28 视觉平衡。 */
+  padding: 44px 14px 44px 28px;
+}
 #vpStoryboardFrames {
-  padding-left: 8px;
-  padding-right: 12px;
+  padding-left: 4px;
+  padding-right: 6px; /* 原 12px；与栏右内边距合计 20px（原 ~60px，约 -67%）；保留 ≥4px 给选中态 ring-2 余量 */
   overflow-x: hidden;
 }
 .vp-refine-command-wrap {
@@ -4666,6 +4673,14 @@ body.is-prompts-workbench-page #pagePrompts .prompts-page-shell > section {
   opacity: 0.38;
   cursor: not-allowed;
   transform: none;
+}
+
+/* 键盘焦点环：补齐与仓库同款 :focus-visible（原先这组按钮只有 :hover，键盘不可见焦点，违反 WCAG 2.4.7）。 */
+.video-result-action:focus-visible,
+.video-result-icon-action:focus-visible,
+.video-result-more-menu button:focus-visible {
+  outline: 2px solid rgba(11, 19, 32, 0.2);
+  outline-offset: 2px;
 }
 
 .video-result-action .material-symbols-outlined,
@@ -20156,3 +20171,340 @@ main.main-area { margin-left: var(--sidebar-width); }
   overflow-x: hidden;
 }
 #episodeTabsWrap::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ════════════════════════════════════════════════════════════════
+   道具定制（prop_custom.js 自包含页面）
+   ════════════════════════════════════════════════════════════════ */
+.prop-custom-page,
+.prop-custom-editor,
+.prop-custom-preview-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.prop-custom-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 0 14px;
+}
+
+.prop-custom-section-title h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--md-sys-color-on-surface, #111827);
+}
+
+.prop-custom-section-title span,
+.prop-custom-muted {
+  color: var(--md-sys-color-on-surface-variant, #64748b);
+  font-size: 12px;
+}
+
+.prop-custom-grid,
+.prop-custom-draft-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.prop-custom-draft-grid {
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.prop-custom-card,
+.prop-custom-draft-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 220px;
+  padding: 18px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 12px 34px rgba(15, 23, 42, 0.05);
+}
+
+.prop-custom-card-main {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 14px;
+  min-width: 0;
+}
+
+.prop-custom-thumb {
+  position: relative;
+  display: block;
+  width: 118px;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 14px;
+  background: #f8fafc;
+  cursor: pointer;
+}
+
+.prop-custom-thumb img,
+.prop-custom-preview-frame > img,
+.prop-custom-view-slot img,
+.prop-custom-lightbox img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.prop-custom-thumb--empty,
+.prop-custom-empty-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(100, 116, 139, 0.48);
+}
+
+.prop-custom-view-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.72);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.prop-custom-card-copy {
+  min-width: 0;
+}
+
+.prop-custom-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--md-sys-color-primary, #0f766e);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.prop-custom-card h3,
+.prop-custom-draft-card h3 {
+  margin: 6px 0 4px;
+  color: var(--md-sys-color-on-surface, #111827);
+  font-size: 17px;
+  font-weight: 720;
+}
+
+.prop-custom-card-function,
+.prop-custom-card-desc,
+.prop-custom-draft-card p {
+  margin: 0;
+  color: var(--md-sys-color-on-surface-variant, #64748b);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.prop-custom-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.prop-custom-tags span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(15, 118, 110, 0.08);
+  color: #0f766e;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.prop-custom-card-actions,
+.prop-custom-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.prop-custom-card-actions button,
+.prop-custom-editor-actions button,
+.prop-custom-version-row {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 10px;
+  background: #fff;
+  color: #0f172a;
+  font-size: 12px;
+  font-weight: 650;
+  padding: 8px 11px;
+}
+
+.prop-custom-icon-btn {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 !important;
+}
+
+.prop-custom-error {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.prop-custom-error small {
+  grid-column: 2;
+  opacity: 0.8;
+}
+
+.prop-custom-error--split {
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  background: rgba(245, 158, 11, 0.09);
+  color: #92400e;
+}
+
+.prop-custom-error--image {
+  border: 1px solid rgba(239, 68, 68, 0.22);
+  background: rgba(239, 68, 68, 0.09);
+  color: #991b1b;
+}
+
+.prop-custom-editor-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.prop-custom-editor-form,
+.prop-custom-editor-preview,
+.prop-custom-preview-frame {
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.prop-custom-editor-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+}
+
+.prop-custom-editor-form label,
+.character-generation-form-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--md-sys-color-on-surface-variant, #64748b);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.prop-custom-editor-form input,
+.prop-custom-editor-form textarea,
+.prop-custom-editor-form select,
+.character-generation-form-card input,
+.character-generation-form-card textarea,
+.character-generation-form-card select {
+  width: 100%;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.88);
+  color: #0f172a;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 10px 11px;
+}
+
+.prop-custom-form-row {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.prop-custom-preview-frame {
+  min-height: 360px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.prop-custom-view-grid {
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: 6px;
+  padding: 8px;
+  background: rgba(248, 250, 252, 0.95);
+}
+
+.prop-custom-view-grid.is-lightbox {
+  width: min(90vw, 960px);
+  max-width: 90vw;
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.prop-custom-view-slot {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.prop-custom-view-slot small {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.68);
+  color: #fff;
+  font-size: 10px;
+}
+
+.prop-custom-version-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 8px;
+}
+
+.prop-custom-version-row.is-selected {
+  border-color: rgba(15, 118, 110, 0.4);
+  background: rgba(15, 118, 110, 0.08);
+}
+
+@media (max-width: 900px) {
+  .prop-custom-grid,
+  .prop-custom-draft-grid,
+  .prop-custom-editor-grid,
+  .prop-custom-card-main,
+  .prop-custom-form-row {
+    grid-template-columns: 1fr;
+  }
+
+  .prop-custom-thumb {
+    width: 100%;
+    max-width: 220px;
+  }
+}

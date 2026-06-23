@@ -291,7 +291,7 @@ async function structureVisionCharacter(
   sourceType: CustomCharacterSourceType,
   tokenContext: TokenUsageContext | null,
 ) {
-  const cfg = resolveTextModelConfig(user, 'structured');
+  const cfg = resolveTextModelConfig(user, 'visionExtract');
   if (cfg.mode === 'fake') throw new Error('当前结构化文本模型未配置，无法识别参考图角色');
   if (cfg.provider !== 'openai_responses' && cfg.provider !== 'packy_responses' && cfg.provider !== 'zerail_responses' && cfg.provider !== 'openai_chat') {
     throw new Error(`当前文本模型不支持图片识别：${cfg.provider}`);
@@ -315,12 +315,10 @@ async function structureVisionCharacter(
       process.env.ORIGIN_IMAGE_CAPTION_TIMEOUT_MS ||
       120_000,
   );
-  // 走统一预算层决定输出 token 上限：推理模型会按 reasoning reserve 预留思考额度，
-  // 避免“思考占满固定额度 → 正文为空 → JSON 解析失败”这类偶发失败（原来这里硬编码 1400）。
   const usageOpts = {
-    maxTokens: 8192,
+    maxTokens: 1600,
     traceName: 'custom-character-vision',
-    modelRole: 'structured' as const,
+    modelRole: 'visionExtract' as const,
     tokenContext: {
       ownerId: user.id,
       usernameSnapshot: user.phone || user.display_name || user.username || null,
@@ -339,7 +337,7 @@ async function structureVisionCharacter(
     usageOpts,
     'complete',
   );
-  const maxOutputTokens = budgeted.maxTokens ?? 8192;
+  const maxOutputTokens = budgeted.maxTokens ?? 1600;
   let text = '';
   if (cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses' || cfg.provider === 'zerail_responses') {
     const body: any = {

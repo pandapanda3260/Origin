@@ -150,11 +150,20 @@ function assertSourceContains(relPath, pattern, message) {
   return source;
 }
 
+function tableBlocks(source, tableName) {
+  return Array.from(source.matchAll(new RegExp(`CREATE TABLE IF NOT EXISTS ${tableName} \\([\\s\\S]*?\\n\\s*\\);`, 'g')))
+    .map((match) => match[0]);
+}
+
 function testStaticContracts() {
   const dbSource = assertSourceContains('lib/db.ts', 'custom_scenes', 'db schema includes custom_scenes');
   assert.match(dbSource, /custom_scenes[\s\S]*lifecycle_status\s+TEXT NOT NULL DEFAULT 'confirmed'/, 'parent scene table owns lifecycle_status');
   assert.match(dbSource, /custom_scene_versions[\s\S]*generation_status\s+TEXT NOT NULL DEFAULT 'completed'/, 'version scene table owns generation_status');
-  assert.doesNotMatch(dbSource, /custom_scene_versions[\s\S]{0,700}lifecycle_status/, 'version scene table must not own lifecycle_status');
+  const sceneVersionBlocks = tableBlocks(dbSource, 'custom_scene_versions');
+  assert.equal(sceneVersionBlocks.length >= 1, true, 'db schema declares custom_scene_versions');
+  sceneVersionBlocks.forEach((block) => {
+    assert.doesNotMatch(block, /lifecycle_status/, 'version scene table must not own lifecycle_status');
+  });
 
   const promptSource = assertSourceContains('lib/custom-scene-prompt.ts', "return 'image';", 'source_type supports pure image input');
   assert.match(promptSource, /sourceType === 'image_prompt'[\s\S]*用户未填写补充提示词/, 'image_prompt and image-only inputs use distinct vision extraction instructions');

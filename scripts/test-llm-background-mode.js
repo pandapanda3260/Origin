@@ -106,6 +106,11 @@ assert.match(
 );
 assert.match(
   llmSrc,
+  /shouldUseShotsGenerateSyncFallback\(taskName, cfg\)[\s\S]{0,700}chatCompleteJsonWithRetry\(user, messages, fallbackOpts, parser, fallbackOpts\.traceName \|\| taskName\)/,
+  'shots-generate on zerail_responses must use sync fallback instead of unreliable background submit',
+);
+assert.match(
+  llmSrc,
   /isResponsesConfig\(cfg\)[\s\S]{0,400}chatCompleteJsonWithRetry\(/,
   'chatCompleteJsonViaBackground must fall back to chatCompleteJsonWithRetry for non-Responses providers',
 );

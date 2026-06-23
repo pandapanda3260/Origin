@@ -8,7 +8,7 @@ import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
 import { appStore } from '/modules/store.js';
 import { installGlobalHandlers as _installErrorHub } from '/modules/error_hub.js';
 import { initEdit, syncEditProject, refreshEditPage, _initEditEvents,
-  importGroupToTimeline, removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
+  removeGroupFromTimeline, isGroupImported } from '/modules/edit.js';
 import { initSettings, loadSettings, saveModelSlots, getSlotConfig,
   refreshSettingsFormFromState, wireSettingsPageOnce } from '/modules/settings.js';
 import { initTasks, syncTasksProject, _startMaintenanceBannerPoll } from '/modules/tasks.js';
@@ -71,6 +71,7 @@ import { initAssets, syncAssetsProject, refreshAssetsPage, extractAssets,
 import { initToolbox, refreshToolboxPage, _initToolboxEvents } from '/modules/toolbox.js';
 import { initCharacterCustom, refreshCharacterCustomPage, _initCharacterCustomEvents } from '/modules/character_custom.js';
 import { initSceneCustom, refreshSceneCustomPage, _initSceneCustomEvents } from '/modules/scene_custom.js';
+import { initPropCustom, refreshPropCustomPage, _initPropCustomEvents } from '/modules/prop_custom.js';
 import { initBilling, loadBillingSummary, renderBillingPage, showBillingPaywall, handleBillingReturnFromUrl, refreshBillingBadge } from '/modules/billing.js';
 import { mountPixelCard } from '/modules/pixel_card.js';
 import { createSwLoading } from '/modules/loading.js';
@@ -155,7 +156,7 @@ var _scriptEditInitialText = "";
   };
   // 注意：billing 不再是独立 page，而是顶层 modal（#billingModal），所以不放进 PAGES。
   // 顶部任务列表卡片走 data-goto="overview"，会员升级按钮走 switchPage("billing")。
-  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "toolbox", "profile", "settings", "onlineEditor"];
+  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
   // 下线但暂不删除的工作台旧页面。保留 DOM/模块，统一阻止导航、hash 直达和历史恢复。
   var DISABLED_WORKSPACE_PAGES = ["profile", "settings"];
   var SIDEBAR_PIPELINE_PAGES = ["script", "style", "assets", "shots", "prompts", "batch", "edit"];
@@ -1412,6 +1413,9 @@ var _scriptEditInitialText = "";
     if (activePage === "sceneCustom") {
       try { refreshSceneCustomPage({ force: true }); } catch (e) { console.error("[RefreshAll] sceneCustom:", e); }
     }
+    if (activePage === "propCustom") {
+      try { refreshPropCustomPage({ force: true }); } catch (e) { console.error("[RefreshAll] propCustom:", e); }
+    }
     try { refreshToolboxPage(); } catch (e) { console.error("[RefreshAll] toolbox:", e); }
     try { _renderEpisodeTabs(); } catch (e) {}
     try { renderProjectList(); } catch (e) {}
@@ -1958,6 +1962,7 @@ var _scriptEditInitialText = "";
       if (page === "library") refreshLibraryPage();
       if (page === "characterCustom") refreshCharacterCustomPage();
       if (page === "sceneCustom") refreshSceneCustomPage();
+      if (page === "propCustom") refreshPropCustomPage();
       if (page === "toolbox") refreshToolboxPage();
     } catch (e) {
       console.error("[SwitchPage] refresh failed:", page, e);
@@ -2882,6 +2887,31 @@ var _scriptEditInitialText = "";
       videoEl.dataset.videoResultRawSrc = rawUrl;
       _ovApplyPreviewVideoSrc(videoEl, rawUrl);
     });
+    // 播放交互态：复用总览同款加载遮罩绑定（驱动 [data-ov-preview-loading]）+ 同步动作栏播放按钮状态。
+    scope.querySelectorAll(".video-result-preview-frame").forEach(function (frame) {
+      var videoEl = frame.querySelector(".video-result-video");
+      if (!videoEl || videoEl.dataset.vrUxBound === "1") return;
+      videoEl.dataset.vrUxBound = "1";
+      _ovBindPreviewVideoUx(videoEl, frame);
+      _bindVideoResultPlayButton(videoEl, frame.closest("[data-video-result-group]"));
+    });
+  }
+
+  // 动作栏「播放」按钮跟随 video 真实状态：playing→暂停态，pause/ended→播放态（含 aria-pressed）。
+  function _bindVideoResultPlayButton(video, card) {
+    if (!video || !card) return;
+    var btn = card.querySelector("[data-video-result-action='play']");
+    if (!btn) return;
+    var icon = btn.querySelector("[data-vr-play-icon]");
+    var label = btn.querySelector("[data-vr-play-label]");
+    function setPlaying(on) {
+      if (icon) icon.textContent = on ? "pause" : "play_arrow";
+      if (label) label.textContent = on ? "暂停" : "播放";
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    video.addEventListener("play", function () { setPlaying(true); });
+    video.addEventListener("pause", function () { setPlaying(false); });
+    video.addEventListener("ended", function () { setPlaying(false); });
   }
 
   async function _ensureVideoResultPlayable(videoEl) {
@@ -7953,8 +7983,7 @@ var _scriptEditInitialText = "";
       updateAssetCardImage: (type, idx, status, imgUrl, loadingText) => updateAssetCardImage(type, idx, status, imgUrl, loadingText),
       updateStoryboardCard: (gIdx, status, imgUrl, errMsg) => updateStoryboardCard(gIdx, status, imgUrl, errMsg),
       getStoryboardGroups: () => getStoryboardGroups(),
-      importGroupToTimeline,
-      removeGroupFromTimeline,
+	      removeGroupFromTimeline,
       isGroupImported,
 	      vpFetchAndCache: (sb) => vpFetchAndCache(sb),
 	      vpGetCache: (sb) => vpGetCache(sb),
@@ -8065,6 +8094,12 @@ var _scriptEditInitialText = "";
       openLightbox: (url, title, originalUrl) => _openLightbox(url, title, originalUrl),
     });
     initSceneCustom({
+      getAuthToken: () => getAuthToken(),
+      showToast: (msg, type) => showToast(msg, type || "info"),
+      getProject: () => project,
+      openLightbox: (url, title, originalUrl) => _openLightbox(url, title, originalUrl),
+    });
+    initPropCustom({
       getAuthToken: () => getAuthToken(),
       showToast: (msg, type) => showToast(msg, type || "info"),
       getProject: () => project,
@@ -8531,9 +8566,16 @@ var _scriptEditInitialText = "";
           var video = card.querySelector("video");
           if (!video) return;
           if (video.paused) {
+            var vrFrame = card.querySelector(".video-result-preview-frame");
+            var vrLoading = vrFrame && vrFrame.querySelector("[data-ov-preview-loading]");
+            if (vrLoading) vrLoading.hidden = false; // 点下立刻转圈，playing 事件会收掉
             var playable = await _ensureVideoResultPlayable(video);
-            if (!playable) { showToast("视频预览加载失败，请刷新后重试", "warn"); return; }
-            video.play().catch(function () {});
+            if (!playable) {
+              if (vrLoading) vrLoading.hidden = true;
+              showToast("视频预览加载失败，请刷新后重试", "warn");
+              return;
+            }
+            video.play().catch(function () { if (vrLoading) vrLoading.hidden = true; });
           }
           else video.pause();
           return;
@@ -8552,11 +8594,11 @@ var _scriptEditInitialText = "";
           await downloadVideoForGroup(gIdx, btn);
           return;
         }
-        if (action === "import") {
-          importVideoForGroup(gIdx);
-          renderVideoResultCard(gIdx);
-          return;
-        }
+	        if (action === "import") {
+	          var imported = await importVideoForGroup(gIdx);
+	          if (imported) renderVideoResultCard(gIdx);
+	          return;
+	        }
         if (action === "delete") {
           var deleted = await deleteVideoForGroup(gIdx, btn);
           if (deleted) renderVideoResultCard(gIdx);
@@ -8606,6 +8648,7 @@ var _scriptEditInitialText = "";
     _initToolboxEvents();
     _initCharacterCustomEvents();
     _initSceneCustomEvents();
+    _initPropCustomEvents();
 
     /* Batch video task events */
     var batchTW = $("batchTaskListWrap");

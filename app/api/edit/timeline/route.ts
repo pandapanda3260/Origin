@@ -3,9 +3,10 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, updateProjectForUser } from '@/lib/projects-db';
 import { syncEditProjectClips } from '@/lib/asset-library';
-import { resolveGroupImportDurationSec, resolveTrustedActualDurationSec } from '@/lib/edit-duration-runtime';
-import { buildVideoSegmentNamesForRow } from '@/lib/video-segment-names';
+import { resolveTrustedActualDurationSec } from '@/lib/edit-duration-runtime';
 import { buildEdlResult, collectEdlGenerationContext } from '@/lib/edit-edl';
+import { computeEditReadiness } from '@/lib/video-creation/edit-readiness';
+import { applyImportGroupToEdit } from '@/lib/video-creation/import-to-edit';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -41,49 +42,6 @@ function ensureEdl(proj: any): Edl {
   if (!edl.bgm || typeof edl.bgm !== 'object') edl.bgm = null;
   if (typeof edl.version !== 'number') edl.version = 0;
   return edl;
-}
-
-function sumGroupDuration(proj: any, groupIdx: number): number {
-  // 新导入可以用计划/镜头累加兜底；已存在 EDL 的自愈不能用估计值覆盖。
-  return resolveGroupImportDurationSec(proj, groupIdx);
-}
-
-function computeReadiness(proj: any) {
-  const sbs: any[] = Array.isArray(proj?.storyboards) ? proj.storyboards : [];
-  const videoTasks: any[] = Array.isArray(proj?.videoTasks) ? proj.videoTasks : [];
-  const totalCount = sbs.length;
-  let readyCount = 0;
-  for (let i = 0; i < sbs.length; i++) {
-    const sb = sbs[i];
-    const vt = videoTasks[i];
-    if (sb && typeof sb.videoUrl === 'string' && sb.videoUrl.trim() && sb.videoIsCurrent !== false && vt?.isCurrent !== false) readyCount++;
-  }
-  return {
-    totalCount,
-    readyCount,
-    canEnterEdit: readyCount >= 1,
-  };
-}
-
-function resolveSegmentNames(proj: any, groupIdx: number) {
-  const sb = Array.isArray(proj?.storyboards) ? proj.storyboards[groupIdx] || {} : {};
-  const vt = Array.isArray(proj?.videoTasks) ? proj.videoTasks[groupIdx] || {} : {};
-  const taskId = sb.videoTaskId || vt.taskId || vt.serverTaskId || vt.id || '';
-  if (taskId) {
-    return buildVideoSegmentNamesForRow({
-      id: taskId,
-      project_id: proj?.id,
-      group_idx: groupIdx,
-      filename: sb.videoFilename || vt.filename,
-    }, proj);
-  }
-  const displayName = String(sb.videoDisplayName || vt.displayName || `片段${groupIdx + 1}`).trim();
-  const downloadFilename = String(sb.videoDownloadFilename || vt.downloadFilename || `${displayName}.mp4`).trim();
-  return {
-    displayName,
-    filename: String(sb.videoFilename || vt.filename || downloadFilename).trim(),
-    downloadFilename,
-  };
 }
 
 function buildDeterministicTimelineFromClips(clips: any[]) {
@@ -189,37 +147,7 @@ function applyOp(proj: any, body: any): { edl: Edl; storyboards: any[] | null; e
   switch (op) {
     case 'import-group': {
       const idx = Number(body?.groupIdx);
-      if (!Number.isInteger(idx) || idx < 0 || idx >= sbs.length) {
-        return { edl, storyboards: null, error: '非法 groupIdx' };
-      }
-	      const sb = sbs[idx] || {};
-	      const vt = Array.isArray(proj?.videoTasks) ? proj.videoTasks[idx] : null;
-	      if (!sb.videoUrl || sb.videoIsCurrent === false || vt?.isCurrent === false) {
-	        return { edl, storyboards: null, error: '该片段还没有视频，无法导入' };
-      }
-      sbs[idx] = { ...sb, importedToEdit: true };
-      sbsTouched = true;
-      const exists = edl.timeline.some((e: any) => e && e.groupIdx === idx);
-	      if (!exists) {
-	        const dur = sumGroupDuration(proj, idx);
-	        const names = resolveSegmentNames(proj, idx);
-	        edl.timeline.push({
-	          groupIdx: idx,
-	          videoUrl: sb.videoUrl,
-	          protectedUrl: sb._originVideoUrl || vt?.protectedUrl || sb.videoUrl,
-	          _originVideoUrl: sb._originVideoUrl || vt?.protectedUrl || sb.videoUrl,
-	          filename: names.filename,
-	          displayName: names.displayName,
-	          downloadFilename: names.downloadFilename,
-	          _mediaName: names.displayName,
-	          inPoint: 0,
-          outPoint: dur,
-          duration: dur,
-          transitionIn: { type: 'cut', duration: 0 },
-        });
-        edl.timeline.sort((a: any, b: any) => (a.groupIdx || 0) - (b.groupIdx || 0));
-      }
-      break;
+      return applyImportGroupToEdit(proj, idx);
     }
     case 'remove-group': {
       const idx = Number(body?.groupIdx);
@@ -389,7 +317,7 @@ export async function GET(req: NextRequest) {
   const proj = getProjectByIdForUser(projectId, user.id) as any;
   if (!proj) return jsonError('项目不存在', 404);
   const edl = ensureEdl(proj);
-  return jsonOk({ edl, readiness: computeReadiness(proj), serverVersion: edl.version || 0 });
+  return jsonOk({ edl, readiness: computeEditReadiness(proj), serverVersion: edl.version || 0 });
 }
 
 export async function POST(req: NextRequest) {
@@ -409,7 +337,7 @@ export async function POST(req: NextRequest) {
         ok: true,
         changed: false,
         edl: ensured.edl,
-        readiness: computeReadiness(proj),
+        readiness: computeEditReadiness(proj),
         serverVersion: ensured.edl.version || 0,
       });
     }
@@ -428,7 +356,7 @@ export async function POST(req: NextRequest) {
       ok: true,
       changed: true,
       edl: ensured.edl,
-      readiness: computeReadiness(finalProj),
+      readiness: computeEditReadiness(finalProj),
       serverVersion: ensured.edl.version || 0,
       projectVersion: Number(fresh?.version) || undefined,
       storyboards: ensured.storyboards || undefined,
@@ -454,7 +382,7 @@ export async function POST(req: NextRequest) {
   return jsonOk({
     ok: true,
     edl,
-    readiness: computeReadiness(finalProj),
+    readiness: computeEditReadiness(finalProj),
     serverVersion: edl.version || 0,
   });
 }

@@ -10,11 +10,12 @@ export type TextModelRole =
   | 'structured'
   | 'styleBible'
   | 'projectClassifier'
-	  | 'styleClassifier'
-	  | 'profileDerive'
-	  | 'continuity'
-	  | 'frameConsistencyCheck'
-	  | 'legacy';
+  | 'styleClassifier'
+  | 'profileDerive'
+  | 'continuity'
+  | 'frameConsistencyCheck'
+  | 'visionExtract'
+  | 'legacy';
 export type ProviderKind =
   | 'openai_chat'
   | 'openai_responses'
@@ -153,7 +154,7 @@ export function resolveTextModelConfig(
     });
   }
 
-	  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive' || role === 'continuity' || role === 'frameConsistencyCheck') {
+  if (role === 'structured' || role === 'styleBible' || role === 'profileDerive' || role === 'continuity' || role === 'frameConsistencyCheck' || role === 'visionExtract') {
     const prefix = roleEnvPrefix(role);
     const key = prefixedEnv(prefix, 'API_KEY') || env('TEXT_API_KEY') || env('OPENAI_API_KEY');
     if (key) {
@@ -167,7 +168,7 @@ export function resolveTextModelConfig(
         endpoint: prefixedEnv(prefix, 'API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses',
         role,
         source: 'env',
-	        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' || role === 'frameConsistencyCheck' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
+        reasoningEffort: prefixedEnv(prefix, 'REASONING_EFFORT') || (role === 'continuity' || role === 'frameConsistencyCheck' || role === 'visionExtract' ? 'none' : env('TEXT_REASONING_EFFORT') || undefined),
       });
       return attachTextFallbackConfigs(cfg, role);
     }
@@ -255,11 +256,12 @@ export function getModelRoutingStatus(user: UserRow | null) {
     structured: redactConfig(resolveTextModelConfig(user, 'structured')),
     styleBible: redactConfig(resolveTextModelConfig(user, 'styleBible')),
     projectClassifier: redactConfig(resolveTextModelConfig(user, 'projectClassifier')),
-	    styleClassifier: redactConfig(resolveTextModelConfig(user, 'styleClassifier')),
-	    profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
-	    continuity: redactConfig(resolveTextModelConfig(user, 'continuity')),
-	    frameConsistencyCheck: redactConfig(resolveTextModelConfig(user, 'frameConsistencyCheck')),
-	    image: redactConfig(resolveSlotModelConfig(user, 'image')),
+    styleClassifier: redactConfig(resolveTextModelConfig(user, 'styleClassifier')),
+    profileDerive: redactConfig(resolveTextModelConfig(user, 'profileDerive')),
+    continuity: redactConfig(resolveTextModelConfig(user, 'continuity')),
+    frameConsistencyCheck: redactConfig(resolveTextModelConfig(user, 'frameConsistencyCheck')),
+    visionExtract: redactConfig(resolveTextModelConfig(user, 'visionExtract')),
+    image: redactConfig(resolveSlotModelConfig(user, 'image')),
     video: redactConfig(resolveSlotModelConfig(user, 'video')),
     env: {
       ...loadExternalEnv(),
@@ -585,11 +587,12 @@ function capacityEnvNames(input: RealModelInput, suffix: 'CONTEXT_WINDOW' | 'MAX
 
   if (role === 'styleBible') names.push(`STYLE_BIBLE_${suffix}`);
   else if (role === 'projectClassifier') names.push(`PROJECT_CLASSIFIER_${suffix}`, `STYLE_CLASSIFIER_${suffix}`);
-	  else if (role === 'styleClassifier') names.push(`STYLE_CLASSIFIER_${suffix}`, `PROJECT_CLASSIFIER_${suffix}`);
-	  else if (role === 'profileDerive') names.push(`PROFILE_DERIVE_${suffix}`);
-	  else if (role === 'continuity') names.push(`CONTINUITY_${suffix}`);
-	  else if (role === 'frameConsistencyCheck') names.push(`FRAME_CONSISTENCY_CHECK_${suffix}`);
-	  else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
+  else if (role === 'styleClassifier') names.push(`STYLE_CLASSIFIER_${suffix}`, `PROJECT_CLASSIFIER_${suffix}`);
+  else if (role === 'profileDerive') names.push(`PROFILE_DERIVE_${suffix}`);
+  else if (role === 'continuity') names.push(`CONTINUITY_${suffix}`);
+  else if (role === 'frameConsistencyCheck') names.push(`FRAME_CONSISTENCY_CHECK_${suffix}`);
+  else if (role === 'visionExtract') names.push(`VISION_EXTRACT_${suffix}`);
+  else if (role === 'structured') names.push(`STRUCTURED_${suffix}`);
   else if (role === 'brain') names.push(`BRAIN_${suffix}`, `CLAUDE_${suffix}`);
 
   if (provider === 'zerail_messages' || provider === 'code80_messages' || provider === 'packy_messages') names.push(`CLAUDE_${suffix}`);
@@ -641,12 +644,13 @@ function secretEnv(name: string): string {
 function roleEnvPrefix(role: TextModelRole): string {
   if (role === 'styleBible') return 'STYLE_BIBLE';
   if (role === 'projectClassifier') return 'PROJECT_CLASSIFIER';
-	  if (role === 'styleClassifier') return 'STYLE_CLASSIFIER';
-	  if (role === 'profileDerive') return 'PROFILE_DERIVE';
-	  if (role === 'continuity') return 'CONTINUITY';
-	  if (role === 'frameConsistencyCheck') return 'FRAME_CONSISTENCY_CHECK';
-	  return '';
-	}
+  if (role === 'styleClassifier') return 'STYLE_CLASSIFIER';
+  if (role === 'profileDerive') return 'PROFILE_DERIVE';
+  if (role === 'continuity') return 'CONTINUITY';
+  if (role === 'frameConsistencyCheck') return 'FRAME_CONSISTENCY_CHECK';
+  if (role === 'visionExtract') return 'VISION_EXTRACT';
+  return '';
+}
 
 function prefixedEnv(prefix: string, suffix: string): string {
   return prefix ? env(`${prefix}_${suffix}`) : '';

@@ -1345,7 +1345,8 @@ export function renderVideoResultCard(gIdx) {
   var tone = _videoResultTone(state.status);
   var rawVideoUrl = state.videoUrl || state.protectedUrl || "";
   var previewHtml = rawVideoUrl && state.canPlay
-    ? '<video class="video-result-video" data-raw-src="' + escapeHtml(rawVideoUrl) + '" playsinline preload="metadata"></video>'
+    ? '<video class="video-result-video" data-raw-src="' + escapeHtml(rawVideoUrl) + '" playsinline preload="metadata"></video>' +
+      '<div class="vtd-preview-loading" data-ov-preview-loading hidden><span class="vtd-preview-spinner"></span><span>正在加载视频…</span></div>'
     : '<div class="video-result-empty">' +
         '<span class="material-symbols-outlined">' + escapeHtml(state.statusIcon || "movie") + '</span>' +
         '<span>' + escapeHtml(state.statusLabel || "未生成") + '</span>' +
@@ -1367,8 +1368,8 @@ export function renderVideoResultCard(gIdx) {
       '<div class="video-result-preview-frame">' + previewHtml + '</div>' +
       progressHtml +
       '<div class="video-result-actions">' +
-        '<button type="button" class="video-result-action" data-video-result-action="play"' + _disabledAttr(state.canPlay) + '>' +
-          '<span class="material-symbols-outlined">play_arrow</span><span>播放</span>' +
+        '<button type="button" class="video-result-action" data-video-result-action="play" aria-pressed="false"' + _disabledAttr(state.canPlay) + '>' +
+          '<span class="material-symbols-outlined" data-vr-play-icon>play_arrow</span><span data-vr-play-label>播放</span>' +
         '</button>' +
         '<button type="button" class="video-result-action" data-video-result-action="regenerate"' + _disabledAttr(state.canRegenerate) + ' data-write-action>' +
           '<span class="material-symbols-outlined">auto_awesome</span><span>重新生成</span>' +
@@ -2382,15 +2383,14 @@ export async function generateAllVideoPrompts(opts) {
 
   var startResp;
   try {
-    startResp = await apiPost('/api/batch/start', {
-      batchType: 'video_prompts',
+    startResp = await apiPost('/api/video-creation/prompts/start', {
       projectId: originId,
       targets: targets,
       options: { creatorProfile: formatCreatorProfileForApi() },
     });
     showConsistencyAggregateWarning(startResp);
   } catch (e) {
-    console.error('[generateAllVideoPrompts] /api/batch/start failed:', e);
+    console.error('[generateAllVideoPrompts] /api/video-creation/prompts/start failed:', e);
     var preflightPayload = _getVideoPromptPreflightPayload(e);
     if (preflightPayload) {
       if (hint) hint.textContent = _videoPromptPreflightHint(preflightPayload);

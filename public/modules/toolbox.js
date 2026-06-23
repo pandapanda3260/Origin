@@ -216,6 +216,7 @@ function _homeHtml() {
     { tool: 'video', icon: 'movie', title: '视频生成', sub: '图生视频 / 首尾帧视频', enabled: true },
     { tool: 'characterCustom', icon: 'frame_person', title: '角色定制', sub: '角色形象 / 版本库', enabled: true, goto: 'characterCustom' },
     { tool: 'sceneCustom', icon: 'add_photo_alternate', title: '场景定制', sub: '场景主视图 / 四视图', enabled: true, goto: 'sceneCustom' },
+    { tool: 'propCustom', icon: 'handyman', title: '道具定制', sub: '单图 / 六视图', enabled: true, goto: 'propCustom' },
     { tool: 'prompt', icon: 'auto_fix_high', title: '提示词优化', sub: '提示词改写', enabled: false },
     { tool: 'breakdown', icon: 'video_settings', title: '视频拆解', sub: '成片解析', enabled: false },
     { tool: 'audio', icon: 'graphic_eq', title: '音频生成', sub: '旁白 / 音效', enabled: false },

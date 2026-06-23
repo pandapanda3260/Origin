@@ -11,7 +11,7 @@
     <title>Origin</title>
     <script>
       (function () {
-        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "toolbox", "profile", "settings", "onlineEditor"];
+        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
         var disabledPages = ["profile", "settings"];
         var hashKey = "workspacePage";
         function normalize(page) {
@@ -52,6 +52,7 @@
       html[data-workspace-boot-page="library"]:not([data-workspace-boot-ready]) #pageLibrary,
       html[data-workspace-boot-page="characterCustom"]:not([data-workspace-boot-ready]) #pageCharacterCustom,
       html[data-workspace-boot-page="sceneCustom"]:not([data-workspace-boot-ready]) #pageSceneCustom,
+      html[data-workspace-boot-page="propCustom"]:not([data-workspace-boot-ready]) #pagePropCustom,
       html[data-workspace-boot-page="toolbox"]:not([data-workspace-boot-ready]) #pageToolbox,
       html[data-workspace-boot-page="profile"]:not([data-workspace-boot-ready]) #pageProfile,
       html[data-workspace-boot-page="settings"]:not([data-workspace-boot-ready]) #pageSettings,
@@ -61,7 +62,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=252" />
+    <link rel="stylesheet" href="styles.css?v=254" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -1044,14 +1045,14 @@
           </section>
 
           <!-- Left: Prompt Generation Panel -->
-          <section id="promptsNarrativePanel" class="w-[420px] p-12 overflow-hidden flex flex-col gap-10 bg-transparent border-r border-outline-variant/10 shrink-0">
+          <section id="promptsNarrativePanel" class="overflow-hidden flex flex-col gap-10 bg-transparent border-r border-outline-variant/10 shrink-0">
             <div class="max-w-md shrink-0">
               <h2 class="text-4xl font-extralight text-on-background tracking-tighter mb-1">视频创作</h2>
               <p class="text-on-surface-variant text-base leading-relaxed mb-2">优化提示词并生成视频</p>
               <span class="text-[10px] bg-primary/10 text-primary px-2 py-0.5 rounded-full font-bold inline-block mt-3" id="vpVersionTag" hidden></span>
             </div>
 
-            <div id="vpStoryboardFrames" class="flex-1 min-h-0 overflow-y-auto elegant-scroll pr-2 space-y-5"></div>
+            <div id="vpStoryboardFrames" class="flex-1 min-h-0 overflow-y-auto elegant-scroll space-y-5"></div>
           </section>
 
           <!-- Right: Video Creation Lab -->
@@ -1605,6 +1606,11 @@
         <div id="sceneCustomRoot" class="toolbox-shell"></div>
       </div>
 
+      <!-- ══════ 道具定制 ══════ -->
+      <div class="page-scroll p-10 overflow-y-auto" id="pagePropCustom" hidden>
+        <div id="propCustomRoot" class="toolbox-shell"></div>
+      </div>
+
       <!-- ══════ 创作偏好 ══════ -->
       <div class="page-scroll !p-0 !overflow-hidden" id="pageProfile" hidden>
         <div class="flex h-screen">
@@ -1843,6 +1849,7 @@
                     "/modules/billing.js": "/modules/billing.js?v=118",
                     "/modules/character_custom.js": "/modules/character_custom.js?v=222",
                     "/modules/scene_custom.js": "/modules/scene_custom.js?v=100",
+                    "/modules/prop_custom.js": "/modules/prop_custom.js?v=101",
                     "/modules/diagnostic.js": "/modules/diagnostic.js?v=301",
                     "/modules/edit.js": "/modules/edit.js?v=308",
                     "/modules/episode_fields.js": "/modules/episode_fields.js?v=103",
@@ -1868,17 +1875,17 @@
                     "/modules/storyboard.js": "/modules/storyboard.js?v=159",
                     "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
                     "/modules/tasks.js": "/modules/tasks.js?v=301",
-                    "/modules/toolbox.js": "/modules/toolbox.js?v=205",
+                    "/modules/toolbox.js": "/modules/toolbox.js?v=206",
                     "/modules/utils.js": "/modules/utils.js?v=300",
-                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=117",
-                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=308",
+                    "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=119",
+                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=309",
                     "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
             }
     }
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=300"></script>
-    <script type="module" src="main.js?v=362"></script>
+    <script type="module" src="main.js?v=364"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");
