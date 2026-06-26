@@ -23,6 +23,8 @@ const editTimelineRouteSource = readFileSync(new URL('../app/api/edit/timeline/r
 const importToEditSource = readFileSync(new URL('../lib/video-creation/import-to-edit.ts', import.meta.url), 'utf8');
 const videoTasksFrontendSource = readFileSync(new URL('../public/modules/videoTasks.js', import.meta.url), 'utf8');
 const videoPromptsFrontendSource = readFileSync(new URL('../public/modules/videoPrompts.js', import.meta.url), 'utf8');
+const editFrontendSource = readFileSync(new URL('../public/modules/edit.js', import.meta.url), 'utf8');
+const utilsFrontendSource = readFileSync(new URL('../public/modules/utils.js', import.meta.url), 'utf8');
 const workspaceSource = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
 
 function sectionBetween(source, start, end, label) {
@@ -206,6 +208,24 @@ assert.doesNotMatch(
 );
 
 assert.match(
+  editFrontendSource,
+  /if \(_protectedVideoUrlFrom\(url\)\) return fetchVideoSignedUrl\(url\);/,
+  'edit media preview videos must resolve /api/videos/file/* through signed video URLs before setting <video src>',
+);
+
+assert.match(
+  editFrontendSource,
+  /var _PROTECTED_VIDEO_RE = \/\\\/api\\\/videos\\\/file\\\/\(\[\^\/\?#\]\+\)\//,
+  'edit protected video URL parser must accept non-UUID task ids',
+);
+
+assert.match(
+  utilsFrontendSource,
+  /const _INTERNAL_VIDEO_RE = \/\\\/api\\\/videos\\\/file\\\/\(\[\^\/\?#\]\+\)\//,
+  'shared signed-video URL helper must accept non-UUID task ids',
+);
+
+assert.match(
   workspaceSource,
   /"\/modules\/videoTasks\.js":\s*"\/modules\/videoTasks\.js\?v=309"/,
   'workspace import map must cache-bust updated videoTasks module',
@@ -213,7 +233,7 @@ assert.match(
 
 assert.match(
   workspaceSource,
-  /"\/modules\/videoPrompts\.js":\s*"\/modules\/videoPrompts\.js\?v=119"/,
+  /"\/modules\/videoPrompts\.js":\s*"\/modules\/videoPrompts\.js\?v=121"/,
   'workspace import map must cache-bust updated videoPrompts module',
 );
 

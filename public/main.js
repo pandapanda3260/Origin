@@ -8553,6 +8553,10 @@ var _scriptEditInitialText = "";
           videoResultRoot.querySelectorAll("[data-video-result-action='toggle-menu']").forEach(function (b) { if (b !== btn) b.setAttribute("aria-expanded", "false"); });
           if (menu) menu.hidden = !willOpen;
           btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+          if (willOpen && menu) {
+            var firstItem = menu.querySelector("button:not([disabled])");
+            if (firstItem) firstItem.focus();
+          }
           return;
         }
         var menuHost = btn.closest(".video-result-more-wrap");
@@ -8608,6 +8612,30 @@ var _scriptEditInitialText = "";
         if (!videoResultRoot.contains(e.target)) {
           videoResultRoot.querySelectorAll(".video-result-more-menu").forEach(function (m) { m.hidden = true; });
           videoResultRoot.querySelectorAll("[data-video-result-action='toggle-menu']").forEach(function (b) { b.setAttribute("aria-expanded", "false"); });
+        }
+      });
+      // 更多菜单键盘可用（disclosure）：Esc 关闭并回焦触发钮；↑↓ 在可用项间循环移动。
+      videoResultRoot.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+          var openMenu = null;
+          videoResultRoot.querySelectorAll(".video-result-more-menu").forEach(function (m) { if (!m.hidden) openMenu = m; });
+          if (!openMenu) return;
+          e.preventDefault();
+          openMenu.hidden = true;
+          var host = openMenu.closest(".video-result-more-wrap");
+          var tBtn = host && host.querySelector("[data-video-result-action='toggle-menu']");
+          if (tBtn) { tBtn.setAttribute("aria-expanded", "false"); tBtn.focus(); }
+          return;
+        }
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          var inMenu = e.target.closest(".video-result-more-menu");
+          if (!inMenu) return;
+          e.preventDefault();
+          var items = Array.prototype.slice.call(inMenu.querySelectorAll("button:not([disabled])"));
+          if (!items.length) return;
+          var i = items.indexOf(e.target);
+          var next = e.key === "ArrowDown" ? (i + 1) % items.length : (i - 1 + items.length) % items.length;
+          items[next].focus();
         }
       });
     }

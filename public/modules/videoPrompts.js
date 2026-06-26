@@ -1368,23 +1368,23 @@ export function renderVideoResultCard(gIdx) {
       '<div class="video-result-preview-frame">' + previewHtml + '</div>' +
       progressHtml +
       '<div class="video-result-actions">' +
-        '<button type="button" class="video-result-action" data-video-result-action="play" aria-pressed="false"' + _disabledAttr(state.canPlay) + '>' +
+        '<button type="button" class="video-result-action" data-video-result-action="play" aria-pressed="false"' + _disabledAttr(state.canPlay) + (state.canPlay ? '' : ' title="暂无可播放的视频"') + '>' +
           '<span class="material-symbols-outlined" data-vr-play-icon>play_arrow</span><span data-vr-play-label>播放</span>' +
         '</button>' +
-        '<button type="button" class="video-result-action" data-video-result-action="regenerate"' + _disabledAttr(state.canRegenerate) + ' data-write-action>' +
+        '<button type="button" class="video-result-action" data-video-result-action="regenerate"' + _disabledAttr(state.canRegenerate) + (state.canRegenerate ? '' : ' title="暂不可生成视频（请先完成上一步）"') + ' data-write-action>' +
           '<span class="material-symbols-outlined">auto_awesome</span><span>重新生成</span>' +
         '</button>' +
         '<button type="button" class="video-result-icon-action" data-video-result-action="history" title="历史" aria-label="历史">' +
           '<span class="material-symbols-outlined">history</span>' +
         '</button>' +
         '<div class="video-result-more-wrap">' +
-          '<button type="button" class="video-result-icon-action" data-video-result-action="toggle-menu" aria-haspopup="menu" aria-expanded="false" title="更多" aria-label="更多">' +
+          '<button type="button" class="video-result-icon-action" data-video-result-action="toggle-menu" aria-haspopup="true" aria-expanded="false" title="更多" aria-label="更多">' +
             '<span class="material-symbols-outlined">more_vert</span>' +
           '</button>' +
-          '<div class="video-result-more-menu" role="menu" hidden>' +
-            '<button type="button" role="menuitem" data-video-result-action="download"' + _disabledAttr(state.canDownload) + '>下载</button>' +
-            '<button type="button" role="menuitem" data-video-result-action="import"' + _disabledAttr(state.canImport && !state.imported) + ' data-write-action>' + (state.imported ? '已导入' : '导入剪辑') + '</button>' +
-            '<button type="button" role="menuitem" class="is-danger" data-video-result-action="delete"' + _disabledAttr(state.canDelete) + ' data-write-action>删除</button>' +
+          '<div class="video-result-more-menu" hidden>' +
+            '<button type="button" data-video-result-action="download"' + _disabledAttr(state.canDownload) + (state.canDownload ? '' : ' title="暂无可下载的视频"') + '>下载</button>' +
+            '<button type="button" data-video-result-action="import"' + _disabledAttr(state.canImport && !state.imported) + ' data-write-action>' + (state.imported ? '已导入' : '导入剪辑') + '</button>' +
+            '<button type="button" class="is-danger" data-video-result-action="delete"' + _disabledAttr(state.canDelete) + (state.canDelete ? '' : ' title="暂无可删除的视频"') + ' data-write-action>删除</button>' +
           '</div>' +
         '</div>' +
       '</div>' +

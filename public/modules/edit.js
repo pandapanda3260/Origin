@@ -543,7 +543,7 @@ function _teardownProjectScopedEditUi() {
   var _editPreviewFrameResizeBound = false;
   var _editPreviewFrameRaf = 0;
 
-  var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([0-9a-fA-F-]{36})/;
+  var _PROTECTED_VIDEO_RE = /\/api\/videos\/file\/([^/?#]+)/;
   var _PROTECTED_UPLOAD_RE = /\/api\/edit\/media\/([0-9a-fA-F-]{36})/;
 
   function _protectedVideoUrlFrom(url) {
@@ -4621,7 +4621,9 @@ function _teardownProjectScopedEditUi() {
 
   function _resolveMediaPreviewUrl(url) {
     url = String(url || "").trim();
-    if (!url || !_isProtectedEditMediaUrl(url)) return Promise.resolve(url);
+    if (!url) return Promise.resolve("");
+    if (_protectedVideoUrlFrom(url)) return fetchVideoSignedUrl(url);
+    if (!_isProtectedEditMediaUrl(url)) return Promise.resolve(url);
     if (_mediaPreviewBlobCache[url]) return Promise.resolve(_mediaPreviewBlobCache[url]);
     if (_mediaPreviewBlobPending[url]) return _mediaPreviewBlobPending[url];
 
