@@ -37,6 +37,22 @@ function loadVideoGen() {
     if (id === './image-gen') return { generateImage: async () => ({}) };
     if (id === './signed-asset-url') return { buildSignedVideoUrl: () => ({ url: '/video' }) };
     if (id === './projects-db') return { patchProjectForUser: () => null };
+    if (id === './group-slot-write-guard') {
+      return {
+        buildExpectedShotBinding: () => null,
+        readExpectedShotBinding: () => null,
+        writeGroupSlot: (args) => {
+          const fresh = args && args.fresh ? args.fresh : {};
+          const storyboards = Array.isArray(fresh.storyboards) ? fresh.storyboards : [];
+          const groupIdx = Number(args && args.groupIdx) || 0;
+          const storyboard = storyboards[groupIdx] || {};
+          const shotIndices = Array.isArray(storyboard.shotIndices) ? storyboard.shotIndices : [0];
+          const firstShot = Array.isArray(fresh.shots) ? fresh.shots[shotIndices[0]] : null;
+          if (typeof args.mutator === 'function') args.mutator({ storyboard, shotIndices, firstShot });
+          return { status: 'applied' };
+        },
+      };
+    }
     if (id === './asset-library') return {};
     if (id === './env') return { getExternalEnvValue: () => undefined };
     if (id === './panel-selection') return {};

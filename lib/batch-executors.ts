@@ -9,6 +9,7 @@
 
 import { registerExecutor, aliasExecutor, type BatchExecCtx } from './batches';
 import { recordBatchTaskProviderSubmission } from './provider-recovery';
+import { readExpectedShotBinding, writeGroupSlot } from './group-slot-write-guard';
 import { resolveLocalImagePath, type ImageGenInput } from './image-gen';
 import { generateImageWithModerationRecovery } from './safe-image-gen';
 import {
@@ -1823,9 +1824,22 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       if (!Object.keys(slotPatch).length) return {};
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
       const prev = storyboards[groupIdx] || {};
-      const nextSlot = { ...prev, ...slotPatch };
-      if (slotPatch.firstFrameEditDraft === undefined) delete nextSlot.firstFrameEditDraft;
-      storyboards[groupIdx] = nextSlot;
+      const writeResult = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
+        explicitShotIndices: promptState.shotIndices,
+        expectedBinding: readExpectedShotBinding(ctx.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: () => {
+          const nextSlot = { ...prev, ...slotPatch };
+          if (slotPatch.firstFrameEditDraft === undefined) delete nextSlot.firstFrameEditDraft;
+          storyboards[groupIdx] = nextSlot;
+        },
+      });
+      if (writeResult.status !== 'applied') {
+        throw new Error(`shot_binding_mismatch:${writeResult.reason}`);
+      }
       return { storyboards };
     });
     const finalPlan = generationState.finalPlan;
@@ -1908,71 +1922,75 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
-      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-        mode: 'single-shot-strict',
+      const writeResult = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
         explicitShotIndices: generationShotIndices,
-      });
-      const firstShotForWrite = shots[freshShotIndices[0]];
-      const firstFramePlanSummaryForWrite = {
-        ...planSummary,
-        shotIndices: freshShotIndices,
-      };
-      const frameFirstForWrite = {
-        ...frameFirst,
-        planSummary: firstFramePlanSummaryForWrite,
-        shotIndices: freshShotIndices,
-      };
-      const {
-        videoUrl: _oldVideoUrl,
-        videoTaskId: _oldVideoTaskId,
-        videoDurationSec: _oldVideoDurationSec,
-        videoCoverUrl: _oldVideoCoverUrl,
-        videoStatus: _oldVideoStatus,
-        videoMode: _oldVideoMode,
-        videoTaskFinishedAt: _oldVideoTaskFinishedAt,
-        ...prevWithoutVideo
-      } = prev;
-      const nextStoryboard = {
-        ...prevWithoutVideo,
-        url: result.url,
-        imageUrl: result.url,
-        rawUrl: result.url,
-        firstFrameUrl: result.url,
-        firstFrame: {
-	          ...markFirstFrameReady(prev, result.url, result.url),
-	          safetyAudit: result.safetyAudit,
-	          visualAnchorDescription: result.visualAnchorDescription,
-	          consistencyCheck,
-	          consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
-	        },
-        firstFramePrompt: result.submittedPrompt,
-        firstFrameMode: 'structured_v1',
-        firstFrameSourceHash,
-        firstFrameLastError: undefined,
-        firstFrameFailedAt: undefined,
-        debugSketchUrl: prev.debugSketchUrl || prev.pencilUrl,
-        imagePrompt: result.submittedPrompt,
-        originalFirstFramePrompt: committedBasePrompt,
-	        firstFrameSafetyAudit: result.safetyAudit,
-	        firstFrameConsistencyCheck: consistencyCheck,
-	        firstFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
-	        effectiveVisualDescription: result.visualAnchorDescription,
-        idx: groupIdx,
-        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-        shotIndices: freshShotIndices,
-        firstFramePlanSummary: firstFramePlanSummaryForWrite,
-        frames: {
-          ...(prev.frames || {}),
-          first: {
-            ...frameFirstForWrite,
-            originalPrompt: committedBasePrompt,
-          },
+        expectedBinding: readExpectedShotBinding(ctx.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+          const firstFramePlanSummaryForWrite = {
+            ...planSummary,
+            shotIndices: freshShotIndices,
+          };
+          const frameFirstForWrite = {
+            ...frameFirst,
+            planSummary: firstFramePlanSummaryForWrite,
+            shotIndices: freshShotIndices,
+          };
+          const {
+            videoUrl: _oldVideoUrl,
+            videoTaskId: _oldVideoTaskId,
+            videoDurationSec: _oldVideoDurationSec,
+            videoCoverUrl: _oldVideoCoverUrl,
+            videoStatus: _oldVideoStatus,
+            videoMode: _oldVideoMode,
+            videoTaskFinishedAt: _oldVideoTaskFinishedAt,
+            ...prevWithoutVideo
+          } = prev;
+          const nextStoryboard = {
+            ...prevWithoutVideo,
+            url: result.url,
+            imageUrl: result.url,
+            rawUrl: result.url,
+            firstFrameUrl: result.url,
+            firstFrame: {
+	              ...markFirstFrameReady(prev, result.url, result.url),
+	              safetyAudit: result.safetyAudit,
+	              visualAnchorDescription: result.visualAnchorDescription,
+	              consistencyCheck,
+	              consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	            },
+            firstFramePrompt: result.submittedPrompt,
+            firstFrameMode: 'structured_v1',
+            firstFrameSourceHash,
+            firstFrameLastError: undefined,
+            firstFrameFailedAt: undefined,
+            debugSketchUrl: prev.debugSketchUrl || prev.pencilUrl,
+            imagePrompt: result.submittedPrompt,
+            originalFirstFramePrompt: committedBasePrompt,
+	            firstFrameSafetyAudit: result.safetyAudit,
+	            firstFrameConsistencyCheck: consistencyCheck,
+	            firstFrameConsistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	            effectiveVisualDescription: result.visualAnchorDescription,
+            idx: groupIdx,
+            shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+            shotIndices: freshShotIndices,
+            firstFramePlanSummary: firstFramePlanSummaryForWrite,
+            frames: {
+              ...(prev.frames || {}),
+              first: {
+                ...frameFirstForWrite,
+                originalPrompt: committedBasePrompt,
+              },
+            },
+          };
+          storyboards[groupIdx] = nextStoryboard;
         },
-      };
-      storyboards[groupIdx] = nextStoryboard;
+      });
+      if (writeResult.status !== 'applied') return null;
       // 用户原则: 首帧变了, 尾帧 / 已生成视频任务都保留, 用户自己决定要不要重做。
       // 不再自动 stale 尾帧, 也不再删除 videoTasks[groupIdx]。
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-writeback');
@@ -2154,65 +2172,69 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-    if (groupIdx >= shots.length) return null;
     const prev = storyboards[groupIdx] || {};
-    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-      mode: 'single-shot-strict',
-      explicitShotIndices: shotIndices,
-    });
-    const firstShotForWrite = shots[freshShotIndices[0]];
     const prevFirstFrame = normalizeFirstFrameState(prev);
     const at = new Date().toISOString();
-    const frameFirst = buildFirstFrameRecord(prev, {
-      url: result.url,
-      prompt: result.submittedPrompt,
-      originalPrompt: basePrompt,
-      mode: 'legacy_pencil',
-      status: 'legacy_sketch_only',
-      source: 'generated',
-      generatedAt: at,
-      sourceHash: null,
-      shotIndices: freshShotIndices,
-      safetyAudit: result.safetyAudit,
-      visualAnchorDescription: result.visualAnchorDescription,
+    const writeResult = writeGroupSlot({
+      fresh,
+      groupIdx,
+      storyboard: prev,
+      explicitShotIndices: shotIndices,
+      expectedBinding: readExpectedShotBinding(ctx.target),
+      mismatchPolicy: 'abortPatch',
+      mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+        const frameFirst = buildFirstFrameRecord(prev, {
+          url: result.url,
+          prompt: result.submittedPrompt,
+          originalPrompt: basePrompt,
+          mode: 'legacy_pencil',
+          status: 'legacy_sketch_only',
+          source: 'generated',
+          generatedAt: at,
+          sourceHash: null,
+          shotIndices: freshShotIndices,
+          safetyAudit: result.safetyAudit,
+          visualAnchorDescription: result.visualAnchorDescription,
+        });
+        storyboards[groupIdx] = {
+          ...prev,
+          url: result.url,
+          imageUrl: result.url,
+          rawUrl: result.url,
+          pencilUrl: result.url,
+          firstFrameUrl: result.url,
+          firstFrameMode: 'legacy_pencil',
+          firstFrame: {
+            currentUrl: result.url,
+            rawUrl: result.url,
+            status: 'legacy_sketch_only',
+            source: 'generated',
+            lastKnownGoodUrl: result.url,
+            lastError: undefined,
+            history: [
+              { url: result.url, at, source: 'generated' as const },
+              ...prevFirstFrame.history.filter((item) => item.url !== result.url),
+            ].slice(0, 20),
+            safetyAudit: result.safetyAudit,
+            visualAnchorDescription: result.visualAnchorDescription,
+          },
+          imagePrompt: result.submittedPrompt,
+          originalImagePrompt: basePrompt,
+          imageSafetyAudit: result.safetyAudit,
+          effectiveVisualDescription: result.visualAnchorDescription,
+          firstFrameLastError: undefined,
+          firstFrameFailedAt: undefined,
+          idx: groupIdx,
+          shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+          shotIndices: freshShotIndices,
+          frames: {
+            ...(prev.frames || {}),
+            first: frameFirst,
+          },
+        };
+      },
     });
-    storyboards[groupIdx] = {
-      ...prev,
-      url: result.url,
-      imageUrl: result.url,
-      rawUrl: result.url,
-      pencilUrl: result.url,
-      firstFrameUrl: result.url,
-      firstFrameMode: 'legacy_pencil',
-      firstFrame: {
-        currentUrl: result.url,
-        rawUrl: result.url,
-        status: 'legacy_sketch_only',
-        source: 'generated',
-        lastKnownGoodUrl: result.url,
-        lastError: undefined,
-        history: [
-          { url: result.url, at, source: 'generated' as const },
-          ...prevFirstFrame.history.filter((item) => item.url !== result.url),
-        ].slice(0, 20),
-        safetyAudit: result.safetyAudit,
-        visualAnchorDescription: result.visualAnchorDescription,
-      },
-      imagePrompt: result.submittedPrompt,
-      originalImagePrompt: basePrompt,
-      imageSafetyAudit: result.safetyAudit,
-      effectiveVisualDescription: result.visualAnchorDescription,
-      firstFrameLastError: undefined,
-      firstFrameFailedAt: undefined,
-      idx: groupIdx,
-      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-      shotIndices: freshShotIndices,
-      frames: {
-        ...(prev.frames || {}),
-        first: frameFirst,
-      },
-    };
+    if (writeResult.status !== 'applied') return null;
     // 用户原则: 首帧变化 (含 legacy_pencil 路径) 不再连带删除 videoTasks[groupIdx],
     // 由用户自己决定要不要重做视频。
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'legacy-storyboard-image-writeback');
@@ -2380,11 +2402,24 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
     tailFrameSourceHashForInput = promptState.sourceHash;
     if (!Object.keys(slotPatch).length) return {};
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    while (storyboards.length <= groupIdx) storyboards.push({});
     const prev = storyboards[groupIdx] || {};
-    const nextSlot = { ...prev, ...slotPatch };
-    if (slotPatch.tailFrameEditDraft === undefined) delete nextSlot.tailFrameEditDraft;
-    storyboards[groupIdx] = nextSlot;
+    const writeResult = writeGroupSlot({
+      fresh,
+      groupIdx,
+      storyboard: prev,
+      explicitShotIndices: promptState.shotIndices,
+      expectedBinding: readExpectedShotBinding(ctx.target),
+      mismatchPolicy: 'abortPatch',
+      mutator: () => {
+        while (storyboards.length <= groupIdx) storyboards.push({});
+        const nextSlot = { ...prev, ...slotPatch };
+        if (slotPatch.tailFrameEditDraft === undefined) delete nextSlot.tailFrameEditDraft;
+        storyboards[groupIdx] = nextSlot;
+      },
+    });
+    if (writeResult.status !== 'applied') {
+      throw new Error(`shot_binding_mismatch:${writeResult.reason}`);
+    }
     return { storyboards };
   });
   const plan = generationState.finalPlan;
@@ -2466,30 +2501,32 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
   patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-    while (sbs.length <= groupIdx) sbs.push({});
     const prev = sbs[groupIdx] || {};
-    const freshShots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-      mode: 'single-shot-strict',
+    const writeResult = writeGroupSlot({
+      fresh,
+      groupIdx,
+      storyboard: prev,
       explicitShotIndices: generationShotIndices,
-    });
-    const firstShotForWrite = freshShots[freshShotIndices[0]];
-    const tailFramePlanSummaryForWrite = {
-      ...planSummary,
-      shotIndices: freshShotIndices,
-    };
-    const frameTailForWrite = {
-      ...frameTail,
-      planSummary: tailFramePlanSummaryForWrite,
-      shotIndices: freshShotIndices,
-    };
-    sbs[groupIdx] = {
-      ...prev,
-      idx: groupIdx,
-      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-      shotIndices: freshShotIndices,
-      tailFrameHistory: nextTailFrameHistory(prev.tailFrameHistory, previousTailFrameHistoryItem, {
-        excludeUrls: [result.url],
+      expectedBinding: readExpectedShotBinding(ctx.target),
+      mismatchPolicy: 'abortPatch',
+      mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+        while (sbs.length <= groupIdx) sbs.push({});
+        const tailFramePlanSummaryForWrite = {
+          ...planSummary,
+          shotIndices: freshShotIndices,
+        };
+        const frameTailForWrite = {
+          ...frameTail,
+          planSummary: tailFramePlanSummaryForWrite,
+          shotIndices: freshShotIndices,
+        };
+        sbs[groupIdx] = {
+          ...prev,
+          idx: groupIdx,
+          shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+          shotIndices: freshShotIndices,
+          tailFrameHistory: nextTailFrameHistory(prev.tailFrameHistory, previousTailFrameHistoryItem, {
+            excludeUrls: [result.url],
       }),
       tailFrameUrl: result.url,
       tailFramePrompt: result.submittedPrompt,
@@ -2506,7 +2543,10 @@ registerExecutor('tail_frame_images', async (ctx: BatchExecCtx) => {
       tailFrameSourceHash,
       tailFrameReferenceStatus: 'ready',
       frames: { ...(prev.frames || {}), tail: frameTailForWrite },
-    };
+        };
+      },
+    });
+    if (writeResult.status !== 'applied') return null;
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards: sbs }, 'tail-frame-image-writeback');
     // 与首帧写盘点同理：尾帧已按当前输入重新生成并写入新 sourceHash，
     // 权威数据侧同步清掉本组的 tail_frame stale 标记，避免孤儿标记。
@@ -2841,15 +2881,26 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       if (!fresh) return null;
       const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
       if (!sbs[groupIdx]) return null;
-      const frames = { ...(sbs[groupIdx].frames || {}) };
-      frames.tail = {
-        ...(frames.tail || {}),
-        caption: refreshedTailCaption,
-      };
-      sbs[groupIdx] = {
-        ...sbs[groupIdx],
-        frames,
-      };
+      const prev = sbs[groupIdx];
+      const writeResult = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
+        expectedBinding: readExpectedShotBinding(ctx.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: () => {
+          const frames = { ...(prev.frames || {}) };
+          frames.tail = {
+            ...(frames.tail || {}),
+            caption: refreshedTailCaption,
+          };
+          sbs[groupIdx] = {
+            ...prev,
+            frames,
+          };
+        },
+      });
+      if (writeResult.status !== 'applied') return null;
       return { storyboards: sbs };
     });
   }
@@ -3180,38 +3231,42 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
 	      if (!fresh) return null;
 	      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-	      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-	      if (groupIdx >= shots.length) return null;
 	      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
 	      const sb = storyboards[groupIdx] || {};
-		      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
-		        mode: 'single-shot-strict',
-		        explicitShotIndices: groupShotIndices,
-		      });
-		      const firstShotForWrite = shots[freshShotIndices[0]];
-		      videoTasks[groupIdx] = {
-		        ...(videoTasks[groupIdx] || {}),
-		        groupIdx,
-		        shotIndices: freshShotIndices,
-		        status: 'failed',
-	        errorCode: 'video_duration_budget_blocked',
-	        errorMsg: TAIL_RUSHED_WARNING_MESSAGE,
-	        durationSec,
-	        plannedDurationSec,
-	        tempoBudget,
-	        prompt,
-	        warnings: blockedWarnings,
-	        videoPlan,
-	        isCurrent: false,
-	      };
-	      storyboards[groupIdx] = {
-		        ...sb,
-		        idx: groupIdx,
-		        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-		        shotIndices: freshShotIndices,
-	        videoWarnings: blockedWarnings,
-	        videoIsCurrent: false,
-	      };
+	      const writeResult = writeGroupSlot({
+	        fresh,
+	        groupIdx,
+	        storyboard: sb,
+	        explicitShotIndices: groupShotIndices,
+	        expectedBinding: readExpectedShotBinding(ctx.target),
+	        mismatchPolicy: 'abortPatch',
+	        mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+	          videoTasks[groupIdx] = {
+	            ...(videoTasks[groupIdx] || {}),
+	            groupIdx,
+	            shotIndices: freshShotIndices,
+	            status: 'failed',
+	            errorCode: 'video_duration_budget_blocked',
+	            errorMsg: TAIL_RUSHED_WARNING_MESSAGE,
+	            durationSec,
+	            plannedDurationSec,
+	            tempoBudget,
+	            prompt,
+	            warnings: blockedWarnings,
+	            videoPlan,
+	            isCurrent: false,
+	          };
+	          storyboards[groupIdx] = {
+	            ...sb,
+	            idx: groupIdx,
+	            shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+	            shotIndices: freshShotIndices,
+	            videoWarnings: blockedWarnings,
+	            videoIsCurrent: false,
+	          };
+	        },
+	      });
+	      if (writeResult.status !== 'applied') return null;
 	      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-segment-budget-blocked');
 	      return { videoTasks, storyboards };
 	    });
@@ -3229,37 +3284,42 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-    if (groupIdx >= shots.length) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
-    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], {
-      mode: 'single-shot-strict',
+    const writeResult = writeGroupSlot({
+      fresh,
+      groupIdx,
+      storyboard: storyboards[groupIdx],
       explicitShotIndices: groupShotIndices,
+      expectedBinding: readExpectedShotBinding(ctx.target),
+      mismatchPolicy: 'abortPatch',
+      mutator: ({ shotIndices: freshShotIndices }) => {
+        videoTasks[groupIdx] = {
+          ...(videoTasks[groupIdx] || {}),
+          groupIdx,
+          shotIndices: freshShotIndices,
+          status: 'submitting',
+          prompt,
+          durationSec,
+          plannedDurationSec,
+          tempoBudget,
+          warnings: videoWarnings,
+          videoPlan,
+          consistency: {
+            ...((videoTasks[groupIdx] || {}).consistency || {}),
+            videoSegment: {
+              ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
+              characterLockBlockHash,
+              characterUsages: segmentGate.characterUsages,
+              score: segmentGate.score,
+              level: segmentGate.level,
+              warnings: segmentGate.warnings,
+            },
+          },
+          isCurrent: true,
+        };
+      },
     });
-	    videoTasks[groupIdx] = {
-	      ...(videoTasks[groupIdx] || {}),
-	      groupIdx,
-	      shotIndices: freshShotIndices,
-	      status: 'submitting',
-		      prompt,
-			      durationSec,
-			      plannedDurationSec,
-			      tempoBudget,
-			      warnings: videoWarnings,
-	      videoPlan,
-	      consistency: {
-	        ...((videoTasks[groupIdx] || {}).consistency || {}),
-	        videoSegment: {
-	          ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
-	          characterLockBlockHash,
-	          characterUsages: segmentGate.characterUsages,
-	          score: segmentGate.score,
-	          level: segmentGate.level,
-	          warnings: segmentGate.warnings,
-	        },
-	      },
-	      isCurrent: true,
-	    };
+    if (writeResult.status !== 'applied') return null;
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, videoTasks }, 'video-segment-submit-writeback');
     return { videoTasks };
   });
@@ -3383,36 +3443,41 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 		    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
 		      if (!fresh) return null;
 		      const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-		      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-		      if (groupIdx >= shots.length) return null;
 			      const storyboards = Array.isArray((fresh as any).storyboards) ? (fresh as any).storyboards : [];
-			      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, storyboards[groupIdx], {
-			        mode: 'single-shot-strict',
-			        explicitShotIndices: groupShotIndices,
-			      });
-			      videoTasks[groupIdx] = {
-			        ...(videoTasks[groupIdx] || {}),
+			      const writeResult = writeGroupSlot({
+			        fresh,
 			        groupIdx,
-			        shotIndices: freshShotIndices,
-			        taskId: vgErr?.taskId || videoTasks[groupIdx]?.taskId,
-			        status: 'failed',
-			        errorMsg: errMsg.slice(0, 500),
-				        durationSec,
-				        plannedDurationSec,
-				        tempoBudget,
-				        prompt,
-			        warnings: mergedVideoWarnings,
-		        videoPlan,
-		        videoAudit: failureAudit
-		          ? {
-		              payloadMode: failureAudit.payloadMode,
-		              modeReason: failureAudit.modeReason,
-		              capabilityVerifiedAt: failureAudit.capabilityVerifiedAt,
-		              referenceImages: compactVideoAuditReferenceImages(failureAudit.referenceImages || []),
-		            }
-		          : undefined,
-		        isCurrent: true,
-		      };
+			        storyboard: storyboards[groupIdx],
+			        explicitShotIndices: groupShotIndices,
+			        expectedBinding: readExpectedShotBinding(ctx.target),
+			        mismatchPolicy: 'abortPatch',
+			        mutator: ({ shotIndices: freshShotIndices }) => {
+			          videoTasks[groupIdx] = {
+			            ...(videoTasks[groupIdx] || {}),
+			            groupIdx,
+			            shotIndices: freshShotIndices,
+			            taskId: vgErr?.taskId || videoTasks[groupIdx]?.taskId,
+			            status: 'failed',
+			            errorMsg: errMsg.slice(0, 500),
+			            durationSec,
+			            plannedDurationSec,
+			            tempoBudget,
+			            prompt,
+			            warnings: mergedVideoWarnings,
+			            videoPlan,
+			            videoAudit: failureAudit
+			              ? {
+			                  payloadMode: failureAudit.payloadMode,
+			                  modeReason: failureAudit.modeReason,
+			                  capabilityVerifiedAt: failureAudit.capabilityVerifiedAt,
+			                  referenceImages: compactVideoAuditReferenceImages(failureAudit.referenceImages || []),
+			                }
+			              : undefined,
+			            isCurrent: true,
+			          };
+			        },
+			      });
+			      if (writeResult.status !== 'applied') return null;
 		      maybeAssertStoryboardsAlignedWithShots({ ...fresh, videoTasks }, 'video-segment-failure-writeback');
 		      return { videoTasks };
 		    });
@@ -3494,75 +3559,79 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 	  patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
     if (!fresh) return null;
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-    if (groupIdx >= shots.length) return null;
     const sbs = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     const sb = sbs[groupIdx];
-	    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
-	      mode: 'single-shot-strict',
-	      explicitShotIndices: groupShotIndices,
-	    });
-	    const firstShotForWrite = shots[freshShotIndices[0]];
-			    videoTasks[groupIdx] = {
-			      groupIdx,
-			      shotIndices: freshShotIndices,
-				      taskId: result.taskId,
-			      status: 'completed',
-			      url: result.protectedUrl,
-			      filename: result.filename,
-			      displayName: result.displayName,
-			      downloadFilename: result.downloadFilename,
-			      coverUrl: result.coverUrl,
-					      durationSec: result.durationSec,
-					      plannedDurationSec,
-					      tempoBudget,
-					      prompt,
-					      warnings: mergedVideoWarnings,
-			      videoPlan,
-		      videoAudit: result.videoAudit
-		        ? {
-		            payloadMode: result.videoAudit.payloadMode,
-		            modeReason: result.videoAudit.modeReason,
-			            capabilityVerifiedAt: result.videoAudit.capabilityVerifiedAt,
-			            submittedLastFrameContentHash: result.videoAudit.submittedLastFrameContentHash,
-			            returnedLastFrameUrl: result.videoAudit.returnedLastFrameUrl,
-			            returnedLastFrameContentHash: result.videoAudit.returnedLastFrameContentHash,
-			            referenceImages: compactVideoAuditReferenceImages(result.videoAudit.referenceImages || []),
-			          }
-			        : undefined,
-		      consistency: {
-		        ...((videoTasks[groupIdx] || {}).consistency || {}),
-		        videoSegment: {
-		          ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
-		          characterLockBlockHash,
-		          characterUsages: segmentGate.characterUsages,
-		          score: segmentGate.score,
-		          level: segmentGate.level,
-		          warnings: segmentGate.warnings,
-		        },
-		      },
-		      isCurrent: true,
-			    };
-    // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
-	    // videoDurationSec 是真实生成文件时长；plannedDurationSec 是镜头表计划时长。
-	    // 剪辑工作台优先用真实文件时长，避免生成结果比计划略长时出现时间线错位。
-	    sbs[groupIdx] = {
-		      ...sb,
-		      idx: groupIdx,
-		      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-		      shotIndices: freshShotIndices,
-		      videoUrl: result.protectedUrl,
-		      videoTaskId: result.taskId,
-		      videoFilename: result.filename,
-		      videoDisplayName: result.displayName,
-		      videoDownloadFilename: result.downloadFilename,
-			      videoDurationSec: result.durationSec,
-		      plannedDurationSec,
-		      videoWarnings: mergedVideoWarnings,
-	      videoIsCurrent: true,
-	      videoInvalidatedAt: undefined,
-	      videoInvalidatedReason: undefined,
-	    };
+    const writeResult = writeGroupSlot({
+      fresh,
+      groupIdx,
+      storyboard: sb,
+      explicitShotIndices: groupShotIndices,
+      expectedBinding: readExpectedShotBinding(ctx.target),
+      mismatchPolicy: 'abortPatch',
+      mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+        videoTasks[groupIdx] = {
+          groupIdx,
+          shotIndices: freshShotIndices,
+          taskId: result.taskId,
+          status: 'completed',
+          url: result.protectedUrl,
+          filename: result.filename,
+          displayName: result.displayName,
+          downloadFilename: result.downloadFilename,
+          coverUrl: result.coverUrl,
+          durationSec: result.durationSec,
+          plannedDurationSec,
+          tempoBudget,
+          prompt,
+          warnings: mergedVideoWarnings,
+          videoPlan,
+          videoAudit: result.videoAudit
+            ? {
+                payloadMode: result.videoAudit.payloadMode,
+                modeReason: result.videoAudit.modeReason,
+                capabilityVerifiedAt: result.videoAudit.capabilityVerifiedAt,
+                submittedLastFrameContentHash: result.videoAudit.submittedLastFrameContentHash,
+                returnedLastFrameUrl: result.videoAudit.returnedLastFrameUrl,
+                returnedLastFrameContentHash: result.videoAudit.returnedLastFrameContentHash,
+                referenceImages: compactVideoAuditReferenceImages(result.videoAudit.referenceImages || []),
+              }
+            : undefined,
+          consistency: {
+            ...((videoTasks[groupIdx] || {}).consistency || {}),
+            videoSegment: {
+              ...(((videoTasks[groupIdx] || {}).consistency || {}).videoSegment || {}),
+              characterLockBlockHash,
+              characterUsages: segmentGate.characterUsages,
+              score: segmentGate.score,
+              level: segmentGate.level,
+              warnings: segmentGate.warnings,
+            },
+          },
+          isCurrent: true,
+        };
+        // 同时挂到 storyboards[groupIdx].videoUrl，方便编辑页直接读
+        // videoDurationSec 是真实生成文件时长；plannedDurationSec 是镜头表计划时长。
+        // 剪辑工作台优先用真实文件时长，避免生成结果比计划略长时出现时间线错位。
+        sbs[groupIdx] = {
+          ...sb,
+          idx: groupIdx,
+          shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+          shotIndices: freshShotIndices,
+          videoUrl: result.protectedUrl,
+          videoTaskId: result.taskId,
+          videoFilename: result.filename,
+          videoDisplayName: result.displayName,
+          videoDownloadFilename: result.downloadFilename,
+          videoDurationSec: result.durationSec,
+          plannedDurationSec,
+          videoWarnings: mergedVideoWarnings,
+          videoIsCurrent: true,
+          videoInvalidatedAt: undefined,
+          videoInvalidatedReason: undefined,
+        };
+      },
+    });
+    if (writeResult.status !== 'applied') return null;
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards: sbs, videoTasks }, 'video-segment-complete-writeback');
     return { videoTasks, storyboards: sbs };
   });
@@ -3825,25 +3894,34 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	      startDecision = 'run_taken_by_other';
 	      return null;
 	    }
-		    const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-		      mode: 'single-shot-strict',
-		      explicitShotIndices: shotIndices,
-		    });
-		    const firstShotForWrite = shots[freshShotIndices[0]];
-		    storyboards[groupIdx] = {
-		      ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
-		      idx: groupIdx,
-		      shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-		      shotIndices: freshShotIndices,
-	      videoPromptStatus: 'generating',
-	      videoPromptRunId: promptRunId,
-	      videoPromptStartedAt: promptStartedAt,
-	      videoPromptLastError: undefined,
-	      videoPromptFailedAt: undefined,
-	    };
 	    const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-	    if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-	      videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', promptStartedAt);
+	    const writeResult = writeGroupSlot({
+	      fresh,
+	      groupIdx,
+	      storyboard: prev,
+	      explicitShotIndices: shotIndices,
+	      expectedBinding: readExpectedShotBinding(ctx.target),
+	      mismatchPolicy: 'abortPatch',
+	      mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+	        storyboards[groupIdx] = {
+	          ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', promptStartedAt),
+	          idx: groupIdx,
+	          shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+	          shotIndices: freshShotIndices,
+	          videoPromptStatus: 'generating',
+	          videoPromptRunId: promptRunId,
+	          videoPromptStartedAt: promptStartedAt,
+	          videoPromptLastError: undefined,
+	          videoPromptFailedAt: undefined,
+	        };
+	        if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+	          videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', promptStartedAt);
+	        }
+	      },
+	    });
+	    if (writeResult.status !== 'applied') {
+	      startDecision = writeResult.reason;
+	      return null;
 	    }
 	    maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-batch-generating');
 	    return { storyboards, videoTasks };
@@ -3871,6 +3949,12 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	    ) as Error & { failureStage?: string; errorCode?: string };
 	    error.failureStage = 'persist';
 	    error.errorCode = 'VIDEO_PROMPT_RUN_TAKEN_BY_OTHER';
+	    throw error;
+	  }
+	  if (startDecision !== 'allow') {
+	    const error = new Error(`视频提示词任务写入身份校验失败：${startDecision}`) as Error & { failureStage?: string; errorCode?: string };
+	    error.failureStage = 'persist';
+	    error.errorCode = 'VIDEO_PROMPT_SHOT_BINDING_MISMATCH';
 	    throw error;
 	  }
 
@@ -4030,6 +4114,7 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
     referenceManifest,
     droppedReferences,
     shotIndices,
+    expectedBinding: readExpectedShotBinding(ctx.target),
     consistency: {
       characterUsages: promptGate.characterUsages,
       score: promptGate.score,

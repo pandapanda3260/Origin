@@ -16,6 +16,9 @@ function eq(name: string, got: unknown, want: unknown): void {
   }
 }
 const S = (...durs: number[]) => durs.map((d) => ({ duration: d }));
+function segmentSums(segs: number[][], durs: number[]): number[] {
+  return segs.map((group) => group.reduce((acc, idx) => acc + durs[idx], 0));
+}
 
 // 默认 MIN=4 / MAX=15
 eq('all-solo（全部 ≥MIN 各自成段）', planSegments(S(4, 5, 7)), [[0], [1], [2]]);
@@ -42,6 +45,21 @@ eq('max-cap（7+7=14 ≤15，不再加）', planSegments(S(3, 7, 7)), [[0, 1], [
 // MIN=5 情形（若标准模型下限是 5）
 eq('min5-merges-4s（4<5 要并）', planSegments(S(4, 4), { minDurationSec: 5 }), [[0, 1]]);
 eq('min5-5s-solo（5≥5 单独）', planSegments(S(5, 5), { minDurationSec: 5 }), [[0], [1]]);
+
+// 未来 Seedance 2.5 的 20-25s 目标窗：现在只验证参数化能力，不改变默认生产行为。
+{
+  const durs = [7, 7, 7, 7, 7, 7];
+  const segs = planSegments(S(...durs), { targetMinSec: 20, targetMaxSec: 25, hardMaxSec: 25 });
+  eq('target20-25-greedy-window（逼近目标窗）', segs, [[0, 1, 2], [3, 4, 5]]);
+  eq('target20-25-sums', segmentSums(segs, durs), [21, 21]);
+}
+
+{
+  const durs = [7, 7, 7, 7, 7];
+  const segs = planSegments(S(...durs), { targetMinSec: 20, targetMaxSec: 25, hardMaxSec: 25 });
+  eq('target20-25-tail-hardmax（末段过短但不能并成 35s）', segs, [[0, 1, 2], [3, 4]]);
+  eq('target20-25-tail-sums', segmentSums(segs, durs), [21, 14]);
+}
 
 if (failed) {
   console.error(`\nFAILED: ${failed} 个用例不通过`);

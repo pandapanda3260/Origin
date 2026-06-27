@@ -9,15 +9,26 @@
     <meta http-equiv="Expires" content="0" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Origin</title>
+    <link rel="icon" href="/originrise-logo.png" />
     <script>
       (function () {
         var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
         var disabledPages = ["profile", "settings"];
         var hashKey = "workspacePage";
+        function boardEnabled() {
+          try {
+            var value = window.localStorage.getItem("originBoard");
+            if (value === "1") return true;
+            if (value === "0") return false;
+          } catch (_) {}
+          var host = String(window.location && window.location.hostname || "");
+          return host === "localhost" || host === "127.0.0.1" || host === "::1";
+        }
         function normalize(page) {
           page = String(page || "");
           if (page === "online-editor") page = "onlineEditor";
           if (page === "images") page = "shots";
+          if (page === "prompts" && boardEnabled()) page = "shots";
           if (disabledPages.indexOf(page) !== -1) return "";
           if (pages.indexOf(page) === -1) return "";
           return page;
@@ -35,6 +46,7 @@
         if (!hasWorkspacePageHash) page = "overview";
         page = normalize(page) || "overview";
         document.documentElement.setAttribute("data-workspace-boot-page", page || "overview");
+        if (boardEnabled() && page === "shots") document.documentElement.setAttribute("data-board-boot", "1");
       })();
     </script>
     <style>
@@ -59,10 +71,16 @@
       html[data-workspace-boot-page="onlineEditor"]:not([data-workspace-boot-ready]) #pageOnlineEditor {
         display: block !important;
       }
+      html[data-board-boot="1"][data-workspace-boot-page="shots"]:not([data-workspace-boot-ready]) #pageShots .shots-dashboard-shell {
+        display: none !important;
+      }
+      html[data-board-boot="1"][data-workspace-boot-page="shots"]:not([data-workspace-boot-ready]) #pageShots #boardRoot[hidden] {
+        display: block !important;
+      }
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=254" />
+    <link rel="stylesheet" href="styles.css?v=256" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -882,6 +900,7 @@
             <span class="sw-load-text">加载中…</span>
           </div>
         </div>
+        <div id="boardRoot" hidden></div>
         <div class="shots-dashboard-shell">
           <header class="shots-dashboard-header">
             <div class="script-title-block">
@@ -895,6 +914,10 @@
                 <button type="button" id="btnGenShots" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap flex items-center gap-2" data-write-action>
                   <span class="shots-step-number">I</span>
                   <span>AI 镜头设计</span>
+                </button>
+                <button type="button" id="btnOpenShotPlanDialog" class="px-8 py-4 bg-surface-container text-on-surface rounded-full font-bold text-sm tracking-wide border border-outline-variant/30 hover:bg-surface-container-high transition-all whitespace-nowrap flex items-center gap-2" data-action="open-shot-plan-dialog" data-write-action>
+                  <span class="material-symbols-outlined text-base">edit_note</span>
+                  <span>修改镜头计划</span>
                 </button>
                 <div class="flex items-center gap-3" id="imagesActionBar" hidden>
                   <button type="button" id="btnGenAllImages" class="px-10 py-4 bg-primary text-on-primary rounded-full font-bold text-sm tracking-wide shadow-lg shadow-primary/10 hover:opacity-90 transition-all whitespace-nowrap flex items-center gap-2" data-write-action>
@@ -1847,6 +1870,9 @@
                     "/modules/assets.js": "/modules/assets.js?v=185",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
                     "/modules/billing.js": "/modules/billing.js?v=118",
+                    "/modules/board.js": "/modules/board.js?v=3",
+                    "/modules/board_state.js": "/modules/board_state.js?v=1",
+                    "/modules/board_viewport.js": "/modules/board_viewport.js?v=1",
                     "/modules/character_custom.js": "/modules/character_custom.js?v=222",
                     "/modules/scene_custom.js": "/modules/scene_custom.js?v=100",
                     "/modules/prop_custom.js": "/modules/prop_custom.js?v=101",
@@ -1864,19 +1890,20 @@
                     "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
                     "/modules/project.js": "/modules/project.js?v=111",
                     "/modules/render_hooks.js": "/modules/render_hooks.js?v=302",
-                    "/modules/script.js": "/modules/script.js?v=120",
+                    "/modules/script.js": "/modules/script.js?v=121",
                     "/modules/script_consult_state.js": "/modules/script_consult_state.js?v=300",
                     "/modules/script_timeline.js": "/modules/script_timeline.js?v=2",
                     "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
                     "/modules/settings.js": "/modules/settings.js?v=301",
                     "/modules/shotSchema.js": "/modules/shotSchema.js?v=300",
-                    "/modules/shots.js": "/modules/shots.js?v=115",
+                    "/modules/shotPlanDialog.js": "/modules/shotPlanDialog.js?v=2",
+                    "/modules/shots.js": "/modules/shots.js?v=116",
                     "/modules/store.js": "/modules/store.js?v=301",
                     "/modules/storyboard.js": "/modules/storyboard.js?v=159",
                     "/modules/subtitle_format.js": "/modules/subtitle_format.js?v=300",
                     "/modules/tasks.js": "/modules/tasks.js?v=301",
                     "/modules/toolbox.js": "/modules/toolbox.js?v=206",
-                    "/modules/utils.js": "/modules/utils.js?v=301",
+                    "/modules/utils.js": "/modules/utils.js?v=302",
                     "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=121",
                     "/modules/videoTasks.js": "/modules/videoTasks.js?v=309",
                     "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
@@ -1884,8 +1911,8 @@
     }
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
-    <script type="module" src="modules/utils.js?v=301"></script>
-    <script type="module" src="main.js?v=365"></script>
+    <script type="module" src="modules/utils.js?v=302"></script>
+    <script type="module" src="main.js?v=368"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

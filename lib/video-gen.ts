@@ -20,6 +20,7 @@ import { resolveLLMConfig } from './llm';
 import { recordModelCallEvent } from './model-routing';
 import { getDb } from './db';
 import type { UserRow } from './db';
+import { buildExpectedShotBinding, readExpectedShotBinding, writeGroupSlot } from './group-slot-write-guard';
 import { makeBlackVideo, extractCover, probeMediaStreamDurations } from './ffmpeg';
 import { generateImage } from './image-gen';
 import { buildSignedVideoUrl } from './signed-asset-url';
@@ -804,6 +805,13 @@ function resolveVideoNamesForRecoveredRow(user: UserRow, row: any) {
   return buildVideoSegmentNamesForRow(row, project);
 }
 
+function buildVideoTaskShotBindingJson(user: UserRow, input: VideoGenInput): string {
+  if (!input.projectId || !Number.isInteger(input.groupIdx)) return '{}';
+  const project = getProjectByIdForUser(input.projectId, user.id);
+  const binding = buildExpectedShotBinding(project as any, Number(input.groupIdx), { groupIdx: input.groupIdx });
+  return binding ? JSON.stringify(binding) : '{}';
+}
+
 export function buildRecoveredVideoReusePayload(user: UserRow, row: any, fallbackDurationSec = 0) {
   const taskId = String(row.id || '');
   const project = row?.project_id ? getProjectByIdForUser(String(row.project_id), user.id) : null;
@@ -883,15 +891,16 @@ export async function generateVideo(
         videoTaskId: taskId,
 	      }))
 	    : '{}';
+  const shotBindingJson = buildVideoTaskShotBindingJson(user, input);
   const billingContextJson = JSON.stringify(input.billingContext || {});
 
 	  // 入库登记
 	  const db = getDb();
 	  db.prepare(
 	    `INSERT INTO video_tasks
-        (id, owner_id, project_id, group_idx, prompt, video_prompt_snapshot_json,
+        (id, owner_id, project_id, group_idx, prompt, video_prompt_snapshot_json, shot_binding_json,
          provider, status, progress, filename, duration_sec, billing_session_id, billing_context_json)
-	     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)`,
+	     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', 0, ?, ?, ?, ?)`,
 	  ).run(
 	    taskId,
 	    user.id,
@@ -899,6 +908,7 @@ export async function generateVideo(
     input.groupIdx ?? null,
     input.prompt.slice(0, 4000),
 	    videoPromptSnapshotJson,
+    shotBindingJson,
 	    cfg.mode === 'fake' ? 'fake' : (cfg.model || 'openai'),
 	    filename,
 	    dur,
@@ -2705,16 +2715,18 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
     patchProjectForUser(String(row.project_id), user.id, (fresh) => {
       if (!fresh) return null;
       const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) return null;
 		      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
 		      const sb = storyboards[groupIdx];
 		      const previousTask = videoTasks[groupIdx] || {};
-		      const shotIndices = storyboardShotIndices(fresh, groupIdx, sb, {
-		        mode: 'single-shot-strict',
-		        explicitShotIndices: previousTask.shotIndices,
-		      });
-		      const firstShotForWrite = shots[shotIndices[0]];
+      const expectedBinding = readExpectedShotBinding({ expectedShotBinding: safeParseVideoTaskJson(row.shot_binding_json) });
+      const writeResult = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: sb,
+        explicitShotIndices: previousTask.shotIndices,
+        expectedBinding,
+        mismatchPolicy: 'abortPatch',
+        mutator: ({ shotIndices, firstShot }) => {
 		      const warnings = mergeVideoWarningsLocal(previousTask.warnings || [], tempoProbe.videoWarnings);
 	      const previousPlan = previousTask.videoPlan && typeof previousTask.videoPlan === 'object'
 	        ? previousTask.videoPlan
@@ -2752,10 +2764,10 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 	        prompt: row.prompt || '',
 	      };
 
-      storyboards[groupIdx] = {
+	      storyboards[groupIdx] = {
 	        ...sb,
 	        idx: groupIdx,
-	        shotIdx: firstShotForWrite?.idx ?? shotIndices[0] + 1,
+	        shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
 		        shotIndices,
 		        videoUrl: protectedUrl,
 		        videoTaskId: taskId,
@@ -2765,6 +2777,9 @@ async function finalizeRecoveredVideoTask(user: UserRow, row: any, videoUrl: str
 		        videoDurationSec: durationSec || sb.videoDurationSec,
 	        videoWarnings: warnings,
 	      };
+        },
+      });
+      if (writeResult.status !== 'applied') return null;
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-task-recovery');
       return { videoTasks, storyboards };
     });

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { pickSceneForShots } from './scene-selection';
 import { normalizeTailFrameSignals } from './shot-tail-frame-signals';
 import {
@@ -36,6 +37,7 @@ const MAX_DIALOGUE_CHARS_PER_SHOT = 45;
 type NormalizeGeneratedShotOptions = {
   assets?: any;
   styleBible?: any;
+  generatedAt?: string;
 };
 
 type NormalizeGeneratedShotPlanOptions = NormalizeGeneratedShotOptions & {
@@ -75,6 +77,24 @@ function stripInternalFields(input: any): Record<string, any> {
     if (!INTERNAL_KEYS.has(key)) out[key] = input[key];
   }
   return out;
+}
+
+function normalizeShotUid(value: any): string {
+  return cleanShotText(value).slice(0, 80);
+}
+
+function resolveShotUid(source: any, index: number, opts: NormalizeGeneratedShotOptions, seed: Record<string, any>): string {
+  const existing = normalizeShotUid(source?.shotUid ?? source?.shot_uid);
+  if (existing) return existing;
+  const hash = createHash('sha256')
+    .update(JSON.stringify({
+      generatedAt: cleanShotText(opts.generatedAt),
+      index,
+      ...seed,
+    }))
+    .digest('hex')
+    .slice(0, 16);
+  return `shot_${hash}`;
 }
 
 function normalizeCharacters(value: any): string[] {
@@ -193,6 +213,16 @@ export function normalizeGeneratedShot(raw: any, index: number, opts: NormalizeG
 
   return {
     ...stripInternalFields(source),
+    shotUid: resolveShotUid(source, index, opts, {
+      visual,
+      dialogue,
+      duration,
+      pace,
+      sceneId,
+      shotType: fields.shotType,
+      angle: fields.angle,
+      camera: fields.camera,
+    }),
     idx: typeof source.idx === 'number' && source.idx > 0 ? source.idx : index + 1,
     sceneId,
     sceneName,

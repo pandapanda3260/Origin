@@ -77,14 +77,14 @@ function providerTagsFor(provider?: string | null): string[] {
 function listCardsForStage(ownerId: number, stage: KnowledgeStage, provider?: string | null): KnowledgeCard[] {
   const rule = STAGE_CARD_RULES[stage];
   const cards: KnowledgeCard[] = [];
-  for (const module of rule.modules) {
-    if (module === 'provider_runtime') {
+  for (const knowledgeModule of rule.modules) {
+    if (knowledgeModule === 'provider_runtime') {
       const tags = providerTagsFor(provider);
       for (const tag of tags) {
-        cards.push(...listCardsByModuleAndTag(ownerId, module, tag, { limit: rule.maxCards }));
+        cards.push(...listCardsByModuleAndTag(ownerId, knowledgeModule, tag, { limit: rule.maxCards }));
       }
     } else {
-      cards.push(...listSystemAndUserCards(ownerId, module, { limit: rule.maxCards }));
+      cards.push(...listSystemAndUserCards(ownerId, knowledgeModule, { limit: rule.maxCards }));
     }
   }
   const byId = new Map<string, KnowledgeCard>();

@@ -46,6 +46,8 @@ import { initStoryboard, syncStoryboardProject, getStoryboardGroups,
   generateStoryboardTailFrame,
   generateAllImages, confirmImages, handleImageAction, scrollToCard, getSbCurrentIdx,
   reattachStoryboardBatches, registerStoryboardBatchReconciler, refreshStoryboardMaterialPanels } from '/modules/storyboard.js';
+import { initBoard, syncBoardProject, refreshBoardPage } from '/modules/board.js';
+import { initShotPlanDialog } from '/modules/shotPlanDialog.js';
 import { initScript, syncScriptProject, refreshScriptPage,
   chatClearWelcome, chatAddMsg, chatShowDots, chatRemoveDots, typewriter, chatAutoResize,
   handleScriptInput, generateScript, reviseScript,
@@ -247,10 +249,21 @@ var _scriptEditInitialText = "";
   var CLIENT_FEATURES = {};
   var _clientConfigPollTimer = null;
 
+  function isBoardEnabled() {
+    try {
+      var value = window.localStorage.getItem("originBoard");
+      if (value === "1") return true;
+      if (value === "0") return false;
+    } catch (_) {}
+    var host = String(window.location && window.location.hostname || "");
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  }
+
   function _normalizeWorkspacePage(page) {
     page = String(page || "");
     if (page === "online-editor") page = "onlineEditor";
     if (page === "images") page = "shots";
+    if (page === "prompts" && isBoardEnabled()) page = "shots";
     if (DISABLED_WORKSPACE_PAGES.indexOf(page) !== -1) return "";
     if (PAGES.indexOf(page) === -1) return "";
     return page;
@@ -1196,6 +1209,7 @@ var _scriptEditInitialText = "";
     syncVideoPromptsProject(nextProject);
     syncShotsProject(nextProject);
     syncStoryboardProject(nextProject);
+    syncBoardProject(nextProject);
     syncScriptProject(nextProject);
     syncAssetsProject(nextProject);
     syncEpisodesProject(nextProject);
@@ -1384,6 +1398,7 @@ var _scriptEditInitialText = "";
           syncVideoPromptsProject(null);
           syncShotsProject(null);
           syncStoryboardProject(null);
+          syncBoardProject(null);
           syncScriptProject(null);
           syncAssetsProject(null);
           syncOnlineEditorProject(null);
@@ -1397,13 +1412,22 @@ var _scriptEditInitialText = "";
     }
   }
 
+  function _refreshShotsSurface() {
+    if (isBoardEnabled()) {
+      syncBoardProject(project);
+      refreshBoardPage();
+      return;
+    }
+    refreshShotsPage();
+    refreshImagesPage();
+  }
+
   function refreshAllPages() {
     try { refreshOverview(); } catch (e) { console.error("[RefreshAll] overview:", e); }
     try { refreshScriptPage(); } catch (e) { console.error("[RefreshAll] script:", e); }
     try { refreshStylePage(); } catch (e) { console.error("[RefreshAll] style:", e); }
     try { refreshAssetsPage(); } catch (e) { console.error("[RefreshAll] assets:", e); }
-    try { refreshShotsPage(); } catch (e) { console.error("[RefreshAll] shots:", e); }
-    try { refreshImagesPage(); } catch (e) { console.error("[RefreshAll] images:", e); }
+    try { _refreshShotsSurface(); } catch (e) { console.error("[RefreshAll] shots:", e); }
     try { refreshPromptsPage(); } catch (e) { console.error("[RefreshAll] prompts:", e); }
     try { refreshBatchPage(); } catch (e) { console.error("[RefreshAll] batch:", e); }
     try { refreshEditPage(); } catch (e) { console.error("[RefreshAll] edit:", e); }
@@ -1521,6 +1545,13 @@ var _scriptEditInitialText = "";
       if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
     } catch (_) {}
     return "cr_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+  }
+
+  function _newShotUid() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") return "shot_" + window.crypto.randomUUID();
+    } catch (_) {}
+    return "shot_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
   }
 
   /**
@@ -1949,8 +1980,7 @@ var _scriptEditInitialText = "";
       if (page === "style") refreshStylePage();
       if (page === "assets") refreshAssetsPage();
       if (page === "shots") {
-        refreshShotsPage();
-        refreshImagesPage();
+        _refreshShotsSurface();
       }
       if (page === "prompts") refreshPromptsPage();
       if (page === "batch") refreshBatchPage();
@@ -2061,7 +2091,8 @@ var _scriptEditInitialText = "";
   function _syncFixedWorkbenchRoute(page) {
     var isOnlineEditor = page === "onlineEditor";
     var isPrompts = page === "prompts";
-    var locked = page === "script" || page === "style" || page === "edit" || isPrompts || isOnlineEditor;
+    var isBoardRoute = isBoardEnabled() && page === "shots";
+    var locked = page === "script" || page === "style" || page === "edit" || isPrompts || isOnlineEditor || isBoardRoute;
     [document.documentElement, document.body].forEach(function (node) {
       if (!node) return;
       node.classList.toggle("is-fixed-workbench-page", locked);
@@ -2070,7 +2101,23 @@ var _scriptEditInitialText = "";
       node.classList.toggle("is-prompts-workbench-page", isPrompts);
       node.classList.toggle("is-edit-workbench-page", page === "edit");
       node.classList.toggle("is-online-editor-page", isOnlineEditor);
+      node.classList.toggle("is-board-workbench-page", isBoardRoute);
     });
+    var boardRoot = $("boardRoot");
+    if (boardRoot) boardRoot.hidden = !isBoardRoute;
+    _syncBoardNavigationState();
+  }
+
+  function _syncBoardNavigationState() {
+    var enabled = isBoardEnabled();
+    var navShots = $("navShots");
+    var navPrompts = $("navPrompts");
+    if (navShots) {
+      navShots.title = enabled ? "画板" : "镜头设计";
+      var label = navShots.querySelector("span:not(.material-symbols-outlined)");
+      if (label) label.textContent = enabled ? "画板" : "镜头";
+    }
+    if (navPrompts) navPrompts.hidden = !!enabled;
   }
 
   function switchPage(page, options) {
@@ -4212,6 +4259,7 @@ var _scriptEditInitialText = "";
           syncVideoPromptsProject(null);
           syncShotsProject(null);
           syncStoryboardProject(null);
+          syncBoardProject(null);
           syncScriptProject(null);
           syncAssetsProject(null);
           syncOnlineEditorProject(null);
@@ -7457,7 +7505,8 @@ var _scriptEditInitialText = "";
       if (project.shots) {
         var insertIdx = (action.afterShotIdx != null ? action.afterShotIdx + 1 : project.shots.length);
         var newShot = action.shot || {};
-        newShot.id = "shot_" + (project.shots.length + 1);
+        newShot.shotUid = newShot.shotUid || _newShotUid();
+        newShot.id = newShot.id || newShot.shotUid;
         newShot.order = insertIdx + 1;
         newShot.imagePrompt = "";
         newShot.imagePromptGenerated = false;
@@ -7467,7 +7516,6 @@ var _scriptEditInitialText = "";
         project.shots.splice(insertIdx, 0, newShot);
         for (var _ri = 0; _ri < project.shots.length; _ri++) {
           project.shots[_ri].order = _ri + 1;
-          project.shots[_ri].id = "shot_" + (_ri + 1);
         }
         _syncSingleShotSlotsAfterInsert(insertIdx);
         saveProject();
@@ -7481,7 +7529,6 @@ var _scriptEditInitialText = "";
         project.shots.splice(_di, 1);
         for (var _dri = 0; _dri < project.shots.length; _dri++) {
           project.shots[_dri].order = _dri + 1;
-          project.shots[_dri].id = "shot_" + (_dri + 1);
         }
         _syncSingleShotSlotsAfterDelete(_di);
         saveProject();
@@ -8005,6 +8052,7 @@ var _scriptEditInitialText = "";
 	          syncVideoPromptsProject(project);
 	          syncShotsProject(project);
 	          syncStoryboardProject(project);
+	          syncBoardProject(project);
 	          syncScriptProject(project);
 	          syncAssetsProject(project);
 	          syncEpisodesProject(project);
@@ -8136,6 +8184,7 @@ var _scriptEditInitialText = "";
 	        syncVideoPromptsProject(project);
 	        syncShotsProject(project);
 	        syncStoryboardProject(project);
+	        syncBoardProject(project);
 	        syncScriptProject(project);
 	        syncAssetsProject(project);
 	        syncEpisodesProject(project);
@@ -8153,6 +8202,7 @@ var _scriptEditInitialText = "";
 	          syncVideoPromptsProject(project);
 	          syncShotsProject(project);
 	          syncStoryboardProject(project);
+	          syncBoardProject(project);
 	          syncScriptProject(project);
 	          syncAssetsProject(project);
 	          syncEpisodesProject(project);
@@ -8208,6 +8258,21 @@ var _scriptEditInitialText = "";
       acceptShotPlanForStoryboard: () => acceptShotPlanForStoryboard(),
     });
     syncStoryboardProject(project);
+    syncBoardProject(project);
+    initBoard({
+      getProject: () => project,
+      getStoryboardGroups: () => getStoryboardGroups(),
+      hydrateProtectedImageElements: (root) => hydrateProtectedImageElements(root),
+      showToast: (msg, type) => showToast(msg, type),
+      uPrefix: _uPrefix,
+    });
+    initShotPlanDialog({
+      getProject: () => project,
+      saveProject: () => saveProject(),
+      renderShotList: () => renderShotList(),
+      refreshBoardPage: () => refreshBoardPage(),
+      markDownstreamStale: (scope, detail) => _markDownstreamStale(scope, detail),
+    });
     initScript({
       getProject: () => project,
       saveProject: () => saveProject(),
@@ -8239,6 +8304,7 @@ var _scriptEditInitialText = "";
           syncVideoPromptsProject(project);
           syncShotsProject(project);
           syncStoryboardProject(project);
+          syncBoardProject(project);
           syncScriptProject(project);
           syncAssetsProject(project);
           syncEpisodesProject(project);
@@ -8299,6 +8365,7 @@ var _scriptEditInitialText = "";
           syncVideoPromptsProject(project);
           syncShotsProject(project);
           syncStoryboardProject(project);
+          syncBoardProject(project);
           syncScriptProject(project);
           syncAssetsProject(project);
           return true;

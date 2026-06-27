@@ -92,7 +92,27 @@ const jsonResp = (body, status = 200) => ({
 const countFetch = (frag) => fetchLog.filter((u) => u.includes(frag) && !u.includes('/stream')).length;
 
 // ── 被测模块 ─────────────────────────────────────────────────────────────
-const { subscribeBatch, subscribeTask } = await import('../public/modules/backend_stream.js');
+async function importBackendStreamModule() {
+  const source = readFileSync(new URL('../public/modules/backend_stream.js', import.meta.url), 'utf8');
+  const patched = source.replace(
+    "import { getAuthToken, apiGet } from '/modules/utils.js';",
+    `const getAuthToken = () => 'test-token';
+const apiGet = async (path) => {
+  const resp = await fetch(path);
+  let data = {};
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok) {
+    const err = new Error((data && (data.detail || data.error)) || 'request failed');
+    err.status = resp.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+};`,
+  );
+  return import('data:text/javascript;base64,' + Buffer.from(patched).toString('base64'));
+}
+const { subscribeBatch, subscribeTask } = await importBackendStreamModule();
 
 let passed = 0;
 function ok(name) { passed++; console.log('  ✓ ' + name); }

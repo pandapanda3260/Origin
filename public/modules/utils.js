@@ -1090,6 +1090,10 @@ async function _resolveProtectedImageBlobUrl(url) {
   return task;
 }
 
+export function resolveProtectedImageBlobUrl(url) {
+  return _resolveProtectedImageBlobUrl(url);
+}
+
 export function markImageMissing(node) {
   if (!node) return;
   var frame = node.closest && node.closest('.ffe-image-frame');

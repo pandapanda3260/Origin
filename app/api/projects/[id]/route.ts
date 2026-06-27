@@ -6,6 +6,7 @@ import { attachVideoPromptReadiness } from '@/lib/video-prompt-state';
 import { mutateCharacterLock, syncWorldCharactersIntoConsistency } from '@/lib/character-consistency';
 import { attachAssetLibraryCurrentToProject } from '@/lib/asset-library';
 import { alignStoryboardFirstFrameUrlsIfDrift } from '@/lib/visual-reference-state';
+import { findShotStructureLock, hasShotStructureChange } from '@/lib/shot-structure-lock';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -237,6 +238,33 @@ export async function PUT(req: NextRequest, { params }: { params: { id: string }
   const expectedVersion = parseIfMatchVersion(req);
   const allowTitleUpdate = isExplicitTitleUpdate(req, body);
   const patch = removeRouteOnlyFields(applyProjectPutConsistency(current as any, body, { expectedVersion }));
+  if (typeof expectedVersion === 'number') {
+    const serverVersion = Number((current as any).version) || 1;
+    if (serverVersion !== expectedVersion) {
+      return NextResponse.json(
+        {
+          error: 'stale_version',
+          serverVersion,
+          clientVersion: expectedVersion,
+        },
+        { status: 409 },
+      );
+    }
+  }
+  if (hasShotStructureChange(current as any, patch)) {
+    const active = findShotStructureLock({ ownerId: user.id, projectId: params.id });
+    if (active) {
+      return NextResponse.json(
+        {
+          error: 'shot_structure_locked',
+          reason: 'shot_structure_locked',
+          batchType: active.batchType,
+          batchId: active.batchId,
+        },
+        { status: 423 },
+      );
+    }
+  }
   let proj: any;
   try {
     proj = updateProjectForUser(

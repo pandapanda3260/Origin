@@ -1106,17 +1106,19 @@ function _applyStyleBibleResponse(proj, resp) {
   } else {
     proj.styleOptions = proj.styleOptions || {};
   }
-  if (resp && Object.prototype.hasOwnProperty.call(resp, "styleBibleGenerationContext")) {
+  if (Object.prototype.hasOwnProperty.call(resp || {}, "styleBibleGenerationContext")) {
     proj.styleBibleGenerationContext = resp.styleBibleGenerationContext || null;
   }
-  if (resp && resp.styleTemplateSnapshot) {
-    proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
-    var styleTplId = _styleTemplateIdFromSnapshot(resp.styleTemplateSnapshot) ||
-      (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.styleTemplateId) ||
-      resp.selectedStyleTemplateId;
-    if (styleTplId) proj.selectedStyleTemplateId = styleTplId;
-  } else if (resp && resp.selectedStyleTemplateId) {
-    proj.selectedStyleTemplateId = resp.selectedStyleTemplateId;
+  if (resp) {
+    if (resp.styleTemplateSnapshot) {
+      proj.styleTemplateSnapshot = resp.styleTemplateSnapshot;
+      var styleTplId = _styleTemplateIdFromSnapshot(resp.styleTemplateSnapshot) ||
+        (resp.styleBibleGenerationContext && resp.styleBibleGenerationContext.styleTemplateId) ||
+        resp.selectedStyleTemplateId;
+      if (styleTplId) proj.selectedStyleTemplateId = styleTplId;
+    } else if (resp.selectedStyleTemplateId) {
+      proj.selectedStyleTemplateId = resp.selectedStyleTemplateId;
+    }
   }
   if (resp && resp.worldTemplateSnapshot) {
     proj.worldTemplateSnapshot = resp.worldTemplateSnapshot;

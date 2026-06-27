@@ -41,7 +41,7 @@ assert(/shots:\s*\{\s*selector:\s*"\.shot-workbench-card\[data-shot-idx\]"/.test
 assert(/batch:\s*\{\s*selector:\s*"#batchTaskListWrap\s*>\s*\[data-group-idx\]"/.test(guard), "注册片段页锚点 scope");
 
 console.log("[2] main.js 接线");
-assert(/import\s*\{\s*initScrollAnchorGuard\s*\}\s*from\s*'\.\/modules\/scroll_anchor_guard\.js\?v=\d+'/.test(main), "main.js 带版本号导入守卫");
+assert(/import\s*\{\s*initScrollAnchorGuard\s*\}\s*from\s*'\/modules\/scroll_anchor_guard\.js'/.test(main), "main.js 通过 import-map specifier 导入守卫");
 assert(/initScrollAnchorGuard\(\{\s*\n?\s*getContext:/.test(main), "main.js 初始化守卫并传 getContext");
 assert(/getContext:\s*\(\)\s*=>\s*activePage\s*\+\s*"\|"\s*\+\s*\(project\s*&&\s*project\.id/.test(main), "context 同时含页面与项目 id（切页/切项目锚点作废）");
 

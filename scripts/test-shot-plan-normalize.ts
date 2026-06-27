@@ -8,6 +8,7 @@ import {
 } from '../lib/shot-plan-normalize';
 
 const legacyAngleShot = normalizeGeneratedShot({ shotType: '俯拍', visual: '主角走进走廊' }, 0);
+assert.match(legacyAngleShot.shotUid, /^shot_[a-f0-9]{16}$/);
 assert.equal(legacyAngleShot.shotType, '中景');
 assert.equal(legacyAngleShot.framing, '中景');
 assert.equal(legacyAngleShot.angle, '俯拍');
@@ -23,6 +24,9 @@ assert.equal(legacyAngleWithFraming.angle, '俯拍');
 const viewpointShot = normalizeGeneratedShot({ shotType: '过肩镜头', visual: '两人对话' }, 2);
 assert.equal(viewpointShot.shotType, '中景');
 assert.equal(viewpointShot.angle, '过肩');
+
+const preservedShotUid = normalizeGeneratedShot({ shotUid: 'stable-shot-uid', visual: '保留身份' }, 0);
+assert.equal(preservedShotUid.shotUid, 'stable-shot-uid');
 
 const promptFields = resolveShotFieldsForPrompt({ shotType: '主观镜头', camera: '推', lens: '长焦135+' });
 assert.equal(promptFields.shotType, '中景');
@@ -57,6 +61,9 @@ const normalizedB = normalizeGeneratedShotPlan([
 
 assert.deepEqual(normalizedA, normalizedB);
 assert.equal(normalizedA.shots.length, 2);
+assert.match(normalizedA.shots[0].shotUid, /^shot_[a-f0-9]{16}$/);
+assert.match(normalizedA.shots[1].shotUid, /^shot_[a-f0-9]{16}$/);
+assert.notEqual(normalizedA.shots[0].shotUid, normalizedA.shots[1].shotUid);
 assert.equal(normalizedA.shots[0].shotType, '大全景');
 assert.equal(normalizedA.shots[0].camera, '固定镜头');
 assert.equal(normalizedA.shots[0].durationSec, 7);

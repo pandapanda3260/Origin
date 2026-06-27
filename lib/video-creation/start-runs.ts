@@ -26,6 +26,7 @@ import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { logVideoPromptTrace } from '@/lib/video-prompt-observability';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { getVideoSubmitMode } from '@/lib/feature-flags';
+import { readExpectedShotBinding, writeGroupSlot } from '@/lib/group-slot-write-guard';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import {
   assertVideoCanStart,
@@ -116,7 +117,6 @@ function markVideoPromptBatchTargetsStarted(opts: {
     if (!fresh) return null;
     const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
     const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-    const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
     normalizedTargets.forEach(({ target, groupIdx }) => {
       const prev = storyboards[groupIdx] || {};
       previousByGroup.set(groupIdx, {
@@ -127,25 +127,30 @@ function markVideoPromptBatchTargetsStarted(opts: {
       const explicitShotIndices = Array.isArray(target?.shotIndices)
         ? target.shotIndices.filter((idx: any) => Number.isInteger(idx) && idx >= 0)
         : undefined;
-      const freshShotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-        mode: 'single-shot-strict',
+      writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
         explicitShotIndices,
+        expectedBinding: readExpectedShotBinding(target),
+        mismatchPolicy: 'skip',
+        mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+          storyboards[groupIdx] = {
+            ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', startedAt),
+            idx: groupIdx,
+            shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+            shotIndices: freshShotIndices,
+            videoPromptStatus: 'generating',
+            videoPromptRunId: opts.batchId,
+            videoPromptStartedAt: startedAt,
+            videoPromptLastError: undefined,
+            videoPromptFailedAt: undefined,
+          };
+          if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+            videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', startedAt);
+          }
+        },
       });
-      const firstShotForWrite = shots[freshShotIndices[0]];
-      storyboards[groupIdx] = {
-        ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', startedAt),
-        idx: groupIdx,
-        shotIdx: firstShotForWrite?.idx ?? freshShotIndices[0] + 1,
-        shotIndices: freshShotIndices,
-        videoPromptStatus: 'generating',
-        videoPromptRunId: opts.batchId,
-        videoPromptStartedAt: startedAt,
-        videoPromptLastError: undefined,
-        videoPromptFailedAt: undefined,
-      };
-      if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-        videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_regeneration', startedAt);
-      }
     });
     maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-batch-prestart');
     return { storyboards, videoTasks };

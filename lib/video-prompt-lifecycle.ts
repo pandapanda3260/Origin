@@ -9,6 +9,7 @@ import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prom
 import { resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 import type { DroppedReference, ReferenceManifestItem } from './video-reference-manifest';
 import { normalizePlanMetaForHash, resolveShotFieldsForPrompt } from './shot-plan-normalize';
+import { type ExpectedShotBinding, writeGroupSlot } from './group-slot-write-guard';
 
 export const VIDEO_PROMPT_SOURCE_HASH_VERSION = 'video_prompt_source_hash_v1';
 export const VIDEO_PROMPT_DRAFT_SCHEMA_VERSION = 'video_prompt_edit_draft_v1';
@@ -62,6 +63,7 @@ export type ApplyVideoPromptWriteArgs = {
   narrationsUsed?: any[];
   consistency?: any;
   shotIndices?: number[];
+  expectedBinding?: ExpectedShotBinding | null;
   updatedAt?: string;
 };
 
@@ -71,7 +73,7 @@ export type ApplyVideoPromptWriteResult = {
   runId: string;
   sourceHash: string | null;
   shotIndices?: number[];
-  skippedReason?: 'project_missing' | 'slot_missing' | 'run_taken_by_other' | 'empty_prompt' | 'write_not_applied';
+  skippedReason?: 'project_missing' | 'slot_missing' | 'run_taken_by_other' | 'empty_prompt' | 'write_not_applied' | 'shot_binding_mismatch';
   storedRunId?: string | null;
   storedStatus?: string | null;
 };
@@ -486,11 +488,31 @@ export function applyVideoPromptWrite(args: ApplyVideoPromptWriteArgs): ApplyVid
       ? computeVideoPromptSourceHash({ project: fresh, groupIdx: args.groupIdx, ownerId: args.userId })
       : (args.sourceHash || null);
 
-    const freshShotIndices = safeShotIndices(fresh, args.groupIdx, args.shotIndices);
+    const bindingWrite = args.expectedBinding
+      ? writeGroupSlot({
+        fresh,
+        groupIdx: args.groupIdx,
+        storyboard: prev,
+        explicitShotIndices: args.shotIndices,
+        expectedBinding: args.expectedBinding,
+        mismatchPolicy: 'abortPatch',
+        mutator: () => undefined,
+      })
+      : null;
+    if (bindingWrite && bindingWrite.status !== 'applied') {
+      skippedReason = bindingWrite.reason === 'shot_binding_mismatch' ? 'shot_binding_mismatch' : 'slot_missing';
+      return null;
+    }
+    const freshShotIndices = bindingWrite?.status === 'applied'
+      ? bindingWrite.shotIndices
+      : safeShotIndices(fresh, args.groupIdx, args.shotIndices);
+    const firstShot = bindingWrite?.status === 'applied'
+      ? bindingWrite.firstShot
+      : (Array.isArray((fresh as any).shots) ? (fresh as any).shots[freshShotIndices[0]] : null);
     const next = {
       ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', now),
       idx: args.groupIdx,
-      shotIdx: args.groupIdx + 1,
+      shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
       shotIndices: freshShotIndices,
       videoPrompt: prompt,
       videoPromptSourceHash: sourceHash,

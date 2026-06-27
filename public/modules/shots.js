@@ -299,6 +299,35 @@ function _singleShotSlot(idx, src) {
   return slot;
 }
 
+function _segmentSlot(groupIdx, shotIndices, src) {
+  var indices = Array.isArray(shotIndices) ? shotIndices.slice() : [];
+  var primary = indices.length ? indices[0] : groupIdx;
+  var slot = Object.assign({}, src || {});
+  slot.idx = groupIdx;
+  slot.shotIdx = primary + 1;
+  slot.shotIndices = indices;
+  if (slot.frames && typeof slot.frames === "object") {
+    slot.frames = Object.assign({}, slot.frames);
+    if (slot.frames.first && typeof slot.frames.first === "object") {
+      slot.frames.first = Object.assign({}, slot.frames.first, { shotIndices: indices.slice() });
+    }
+    if (slot.frames.tail && typeof slot.frames.tail === "object") {
+      slot.frames.tail = Object.assign({}, slot.frames.tail, { shotIndices: indices.slice() });
+    }
+  }
+  return slot;
+}
+
+function _validShotIndices(raw, shotCount) {
+  if (!Array.isArray(raw)) return [];
+  var out = [];
+  raw.forEach(function (value) {
+    var idx = Number(value);
+    if (Number.isInteger(idx) && idx >= 0 && idx < shotCount && out.indexOf(idx) < 0) out.push(idx);
+  });
+  return out;
+}
+
 function _makeSingleShotStoryboards(shots) {
   return (Array.isArray(shots) ? shots : []).map(function (_, idx) { return _singleShotSlot(idx, null); });
 }
@@ -422,30 +451,134 @@ function _remapEditDataAfterShotInsert(insertIdx) {
   if (touched) project.editData.version = (Number(project.editData.version) || 0) + 1;
 }
 
+function _remapEditDataGroups(groupIdxRemap, droppedGroupIdxs, reason) {
+  if (!project || !project.editData || typeof project.editData !== "object") return;
+  var touched = false;
+  var timelineArchive = null;
+  var dropped = droppedGroupIdxs || {};
+  var edl = project.editData.edl;
+  if (edl && Array.isArray(edl.timeline)) {
+    var nextTimeline = [];
+    var droppedTimeline = 0;
+    edl.timeline.forEach(function (entry) {
+      var oldGroupIdx = Number(entry && entry.groupIdx);
+      if (!Number.isInteger(oldGroupIdx)) {
+        nextTimeline.push(entry);
+        return;
+      }
+      if (dropped[oldGroupIdx]) {
+        droppedTimeline++;
+        return;
+      }
+      var nextGroupIdx = groupIdxRemap.has(oldGroupIdx) ? groupIdxRemap.get(oldGroupIdx) : oldGroupIdx;
+      nextTimeline.push(Object.assign({}, entry, { groupIdx: nextGroupIdx }));
+      if (nextGroupIdx !== oldGroupIdx) touched = true;
+    });
+    if (droppedTimeline || nextTimeline.length !== edl.timeline.length || touched) {
+      timelineArchive = timelineArchive || {};
+      timelineArchive.edl = edl;
+      timelineArchive.droppedTimelineCount = droppedTimeline;
+      project.editData.edl = Object.assign({}, edl, {
+        timeline: nextTimeline,
+        version: (Number(edl.version) || 0) + 1,
+      });
+      touched = true;
+    }
+  }
+  var tags = project.editData.segmentTags;
+  if (tags && Array.isArray(tags.segments)) {
+    var nextSegments = [];
+    var droppedTags = 0;
+    var tagTouched = false;
+    tags.segments.forEach(function (seg) {
+      var oldGroupIdx = Number(seg && seg.groupIdx);
+      if (!Number.isInteger(oldGroupIdx)) {
+        nextSegments.push(seg);
+        return;
+      }
+      if (dropped[oldGroupIdx]) {
+        droppedTags++;
+        return;
+      }
+      var nextGroupIdx = groupIdxRemap.has(oldGroupIdx) ? groupIdxRemap.get(oldGroupIdx) : oldGroupIdx;
+      nextSegments.push(Object.assign({}, seg, { groupIdx: nextGroupIdx }));
+      if (nextGroupIdx !== oldGroupIdx) tagTouched = true;
+    });
+    if (droppedTags || tagTouched || nextSegments.length !== tags.segments.length) {
+      timelineArchive = timelineArchive || {};
+      timelineArchive.segmentTags = tags;
+      timelineArchive.droppedSegmentTagCount = droppedTags;
+      project.editData.segmentTags = Object.assign({}, tags, { segments: nextSegments });
+      touched = true;
+    }
+  }
+  if (touched) {
+    project.editData.version = (Number(project.editData.version) || 0) + 1;
+    if (timelineArchive) {
+      if (!Array.isArray(project.legacyTimelineArchive)) project.legacyTimelineArchive = [];
+      project.legacyTimelineArchive.push(Object.assign({}, timelineArchive, {
+        archivedAt: new Date().toISOString(),
+        archiveReason: reason || "shot_structure_change",
+      }));
+    }
+  }
+}
+
 export function _syncSingleShotSlotsAfterDelete(deletedIdx) {
   _syncRefs();
   if (!project) return;
   var oldStoryboards = Array.isArray(project.storyboards) ? project.storyboards : [];
   var oldVideoTasks = Array.isArray(project.videoTasks) ? project.videoTasks : [];
-  _archiveStoryboardSlot(deletedIdx, oldStoryboards[deletedIdx], oldVideoTasks[deletedIdx], "shot_deleted");
-
   var nextStoryboards = [];
   var nextVideoTasks = [];
   var shotCount = Array.isArray(project.shots) ? project.shots.length : 0;
-  for (var idx = 0; idx < shotCount; idx++) {
-    var oldIdx = idx < deletedIdx ? idx : idx + 1;
-    nextStoryboards[idx] = _singleShotSlot(idx, oldStoryboards[oldIdx]);
-    if (_hasMeaningfulValue(oldVideoTasks[oldIdx])) {
-      nextVideoTasks[idx] = Object.assign({}, oldVideoTasks[oldIdx], { groupIdx: idx });
+  if (!oldStoryboards.length) {
+    for (var fallbackIdx = 0; fallbackIdx < shotCount; fallbackIdx++) {
+      nextStoryboards[fallbackIdx] = _segmentSlot(fallbackIdx, [fallbackIdx], null);
     }
+    project.storyboards = nextStoryboards;
+    project.videoTasks = nextVideoTasks;
+    project.frameWorkflowSchemaVersion = 3;
+    _remapEditDataAfterShotDelete(deletedIdx);
+    return;
   }
-  for (var extraIdx = shotCount + 1; extraIdx < Math.max(oldStoryboards.length, oldVideoTasks.length); extraIdx++) {
-    _archiveStoryboardSlot(extraIdx, oldStoryboards[extraIdx], oldVideoTasks[extraIdx], "shot_deleted:orphan_after_shift");
-  }
+  var groupIdxRemap = new Map();
+  var droppedGroupIdxs = {};
+  oldStoryboards.forEach(function (sb, oldGroupIdx) {
+    var oldIndices = _validShotIndices(sb && sb.shotIndices, shotCount + 1);
+    var touchedDeleted = oldIndices.indexOf(deletedIdx) >= 0;
+    var nextIndices = [];
+    oldIndices.forEach(function (oldShotIdx) {
+      if (oldShotIdx === deletedIdx) return;
+      nextIndices.push(oldShotIdx > deletedIdx ? oldShotIdx - 1 : oldShotIdx);
+    });
+    if (touchedDeleted) {
+      _archiveStoryboardSlot(oldGroupIdx, sb, oldVideoTasks[oldGroupIdx], "shot_deleted");
+    }
+    if (!nextIndices.length) {
+      droppedGroupIdxs[oldGroupIdx] = true;
+      if (!touchedDeleted) _archiveStoryboardSlot(oldGroupIdx, sb, oldVideoTasks[oldGroupIdx], "shot_deleted:empty_after_shift");
+      return;
+    }
+    var newGroupIdx = nextStoryboards.length;
+    groupIdxRemap.set(oldGroupIdx, newGroupIdx);
+    nextStoryboards[newGroupIdx] = _segmentSlot(newGroupIdx, nextIndices, sb);
+    if (_hasMeaningfulValue(oldVideoTasks[oldGroupIdx])) {
+      nextVideoTasks[newGroupIdx] = Object.assign({}, oldVideoTasks[oldGroupIdx], {
+        groupIdx: newGroupIdx,
+        shotIndices: nextIndices.slice(),
+      });
+    }
+  });
+  oldVideoTasks.forEach(function (task, oldGroupIdx) {
+    if (oldGroupIdx < oldStoryboards.length || !_hasMeaningfulValue(task)) return;
+    droppedGroupIdxs[oldGroupIdx] = true;
+    _archiveStoryboardSlot(oldGroupIdx, null, task, "shot_deleted:orphan_after_shift");
+  });
   project.storyboards = nextStoryboards;
   project.videoTasks = nextVideoTasks;
   project.frameWorkflowSchemaVersion = 3;
-  _remapEditDataAfterShotDelete(deletedIdx);
+  _remapEditDataGroups(groupIdxRemap, droppedGroupIdxs, "shot_deleted");
 }
 
 export function _syncSingleShotSlotsAfterInsert(insertIdx) {
@@ -456,21 +589,114 @@ export function _syncSingleShotSlotsAfterInsert(insertIdx) {
   var shotCount = Array.isArray(project.shots) ? project.shots.length : 0;
   var nextStoryboards = [];
   var nextVideoTasks = [];
-  for (var idx = 0; idx < shotCount; idx++) {
-    if (idx === insertIdx) {
-      nextStoryboards[idx] = _singleShotSlot(idx, null);
-      continue;
+  if (!oldStoryboards.length) {
+    for (var fallbackIdx = 0; fallbackIdx < shotCount; fallbackIdx++) {
+      nextStoryboards[fallbackIdx] = _segmentSlot(fallbackIdx, [fallbackIdx], null);
     }
-    var oldIdx = idx < insertIdx ? idx : idx - 1;
-    nextStoryboards[idx] = _singleShotSlot(idx, oldStoryboards[oldIdx]);
-    if (_hasMeaningfulValue(oldVideoTasks[oldIdx])) {
-      nextVideoTasks[idx] = Object.assign({}, oldVideoTasks[oldIdx], { groupIdx: idx });
+    project.storyboards = nextStoryboards;
+    project.videoTasks = nextVideoTasks;
+    project.frameWorkflowSchemaVersion = 3;
+    _remapEditDataAfterShotInsert(insertIdx);
+    return;
+  }
+  var inserted = false;
+  var groupIdxRemap = new Map();
+  oldStoryboards.forEach(function (sb, oldGroupIdx) {
+    var oldIndices = _validShotIndices(sb && sb.shotIndices, Math.max(0, shotCount - 1));
+    var shifted = oldIndices.map(function (oldShotIdx) {
+      return oldShotIdx >= insertIdx ? oldShotIdx + 1 : oldShotIdx;
+    });
+    if (!inserted && (!shifted.length || shifted[0] >= insertIdx)) {
+      var insertedGroupIdx = nextStoryboards.length;
+      nextStoryboards[insertedGroupIdx] = _segmentSlot(insertedGroupIdx, [insertIdx], null);
+      inserted = true;
     }
+    if (!shifted.length) return;
+    var newGroupIdx = nextStoryboards.length;
+    groupIdxRemap.set(oldGroupIdx, newGroupIdx);
+    nextStoryboards[newGroupIdx] = _segmentSlot(newGroupIdx, shifted, sb);
+    if (_hasMeaningfulValue(oldVideoTasks[oldGroupIdx])) {
+      nextVideoTasks[newGroupIdx] = Object.assign({}, oldVideoTasks[oldGroupIdx], {
+        groupIdx: newGroupIdx,
+        shotIndices: shifted.slice(),
+      });
+    }
+  });
+  if (!inserted) {
+    var tailGroupIdx = nextStoryboards.length;
+    nextStoryboards[tailGroupIdx] = _segmentSlot(tailGroupIdx, [insertIdx], null);
   }
   project.storyboards = nextStoryboards;
   project.videoTasks = nextVideoTasks;
   project.frameWorkflowSchemaVersion = 3;
-  _remapEditDataAfterShotInsert(insertIdx);
+  _remapEditDataGroups(groupIdxRemap, {}, "shot_inserted");
+}
+
+function _groupIndexForShot(storyboards, shotIdx, shotCount) {
+  for (var groupIdx = 0; groupIdx < storyboards.length; groupIdx++) {
+    var indices = _validShotIndices(storyboards[groupIdx] && storyboards[groupIdx].shotIndices, shotCount);
+    if (indices.indexOf(shotIdx) >= 0) return groupIdx;
+  }
+  return -1;
+}
+
+export function _swapAdjacentShotSlots(shotIdx, direction) {
+  _syncRefs();
+  if (!project || !Array.isArray(project.shots)) return { ok: false, reason: "no_project" };
+  var fromIdx = Number(shotIdx);
+  var dir = Number(direction) < 0 ? -1 : 1;
+  var toIdx = fromIdx + dir;
+  var shotCount = project.shots.length;
+  if (!Number.isInteger(fromIdx) || fromIdx < 0 || toIdx < 0 || toIdx >= shotCount) {
+    return { ok: false, reason: "out_of_range" };
+  }
+  var storyboards = Array.isArray(project.storyboards) ? project.storyboards : [];
+  var videoTasks = Array.isArray(project.videoTasks) ? project.videoTasks : [];
+  var fromGroup = _groupIndexForShot(storyboards, fromIdx, shotCount);
+  var toGroup = _groupIndexForShot(storyboards, toIdx, shotCount);
+  if (fromGroup < 0 || toGroup < 0) return { ok: false, reason: "missing_group" };
+  var fromIndices = _validShotIndices(storyboards[fromGroup] && storyboards[fromGroup].shotIndices, shotCount);
+  var toIndices = _validShotIndices(storyboards[toGroup] && storyboards[toGroup].shotIndices, shotCount);
+  if (fromGroup !== toGroup && (fromIndices.length !== 1 || toIndices.length !== 1 || Math.abs(fromGroup - toGroup) !== 1)) {
+    return { ok: false, reason: "segment_boundary" };
+  }
+
+  var tmpShot = project.shots[fromIdx];
+  project.shots[fromIdx] = project.shots[toIdx];
+  project.shots[toIdx] = tmpShot;
+  for (var i = 0; i < project.shots.length; i++) {
+    project.shots[i].order = i + 1;
+  }
+
+  if (fromGroup !== toGroup) {
+    var nextStoryboards = storyboards.slice();
+    var nextVideoTasks = videoTasks.slice();
+    var fromSb = storyboards[fromGroup];
+    var toSb = storyboards[toGroup];
+    var fromTask = videoTasks[fromGroup];
+    var toTask = videoTasks[toGroup];
+    nextStoryboards[fromGroup] = _segmentSlot(fromGroup, [fromIdx], toSb);
+    nextStoryboards[toGroup] = _segmentSlot(toGroup, [toIdx], fromSb);
+    if (_hasMeaningfulValue(toTask)) {
+      nextVideoTasks[fromGroup] = Object.assign({}, toTask, { groupIdx: fromGroup, shotIdx: fromIdx + 1, shotIndices: [fromIdx] });
+    } else {
+      delete nextVideoTasks[fromGroup];
+    }
+    if (_hasMeaningfulValue(fromTask)) {
+      nextVideoTasks[toGroup] = Object.assign({}, fromTask, { groupIdx: toGroup, shotIdx: toIdx + 1, shotIndices: [toIdx] });
+    } else {
+      delete nextVideoTasks[toGroup];
+    }
+    project.storyboards = nextStoryboards;
+    project.videoTasks = nextVideoTasks;
+    var remap = new Map();
+    remap.set(fromGroup, toGroup);
+    remap.set(toGroup, fromGroup);
+    _remapEditDataGroups(remap, {}, "shot_swapped");
+  }
+
+  project.frameWorkflowSchemaVersion = 3;
+  return { ok: true };
 }
 
 /* ================================================================
@@ -1596,7 +1822,7 @@ export function handleShotAction(e) {
 	  if (action === "delete-shot") {
 	    if (!project || !project.shots) return;
 	    project.shots.splice(idx, 1);
-	    project.shots.forEach(function (s, i) { s.order = i + 1; s.id = "shot_" + (i + 1); });
+	    project.shots.forEach(function (s, i) { s.order = i + 1; });
 	    _syncSingleShotSlotsAfterDelete(idx);
 	    showToast("已删除镜头，后续分镜板已按镜头顺序对齐", "warn");
 	    if (project._staleFlags) {

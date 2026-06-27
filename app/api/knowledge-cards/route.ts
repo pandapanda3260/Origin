@@ -25,8 +25,8 @@ const USER_CARD_MODULES = new Set([
 ]);
 
 function normalizeModule(value: unknown): string {
-  const module = String(value || '').trim();
-  return USER_CARD_MODULES.has(module) ? module : '';
+  const knowledgeModule = String(value || '').trim();
+  return USER_CARD_MODULES.has(knowledgeModule) ? knowledgeModule : '';
 }
 
 function parseBool(value: unknown): boolean {
@@ -44,14 +44,14 @@ export async function GET(req: NextRequest) {
   const user = await getCurrentUser(req);
   if (!user) return jsonError('unauthorized', 401);
   const url = new URL(req.url);
-  const module = normalizeModule(url.searchParams.get('module'));
-  if (!module) return jsonError('module not allowed', 400);
+  const knowledgeModule = normalizeModule(url.searchParams.get('module'));
+  if (!knowledgeModule) return jsonError('module not allowed', 400);
   const limit = clampLimit(url.searchParams.get('limit'));
   const includeArchived = parseBool(url.searchParams.get('includeArchived'));
-  const cards = listSystemAndUserCards(user.id, module, { limit });
+  const cards = listSystemAndUserCards(user.id, knowledgeModule, { limit });
   if (includeArchived) {
     const byId = new Map(cards.map((card) => [card.id, card]));
-    for (const card of listArchivedUserCards(user.id, module, { limit })) byId.set(card.id, card);
+    for (const card of listArchivedUserCards(user.id, knowledgeModule, { limit })) byId.set(card.id, card);
     return jsonOk({ cards: Array.from(byId.values()) });
   }
   return jsonOk({ cards });

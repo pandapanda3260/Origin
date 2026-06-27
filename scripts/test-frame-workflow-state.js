@@ -279,6 +279,41 @@ async function testFirstFrameSourceHashIncludesWorld() {
   assert(hashA && hashB && hashA !== hashB, 'first frame source hash changes when world snapshot changes');
 }
 
+async function testManualSegmentationValidGroupsArePreserved() {
+  const mod = loadFrameWorkflowState();
+  const project = {
+    frameWorkflowSchemaVersion: 3,
+    segmentationMode: 'manual',
+    shots: makeShots(3),
+    storyboards: [
+      { idx: 0, shotIdx: 1, shotIndices: [0], imageUrl: '/api/images/file/a' },
+      { idx: 1, shotIdx: 2, shotIndices: [1, 2], imageUrl: '/api/images/file/b' },
+    ],
+  };
+  assertEqual(mod.buildFrameWorkflowNormalizationPatch(project, 1), null, 'valid manual grouping is not repaired');
+}
+
+async function testManualSegmentationRepairDoesNotFallBackToAutoPlan() {
+  const mod = loadFrameWorkflowState();
+  const project = {
+    frameWorkflowSchemaVersion: 3,
+    segmentationMode: 'manual',
+    shots: makeShots(3).map((shot) => ({ ...shot, durationSec: 1, duration: 1 })),
+    storyboards: [
+      { idx: 0, shotIdx: 1, shotIndices: [0, 2], imageUrl: '/api/images/file/a' },
+    ],
+  };
+  const patch = mod.buildFrameWorkflowNormalizationPatch(project, 1);
+  assert(patch, 'invalid manual grouping should be repaired');
+  assertEqual(
+    patch.storyboards.map((sb) => sb.shotIndices),
+    [[0], [1], [2]],
+    'manual repair fills gaps as solo groups instead of using planSegments auto grouping',
+  );
+  assertEqual(patch.segmentationMode, undefined, 'manual repair does not silently flip segmentationMode');
+  mod.assertStoryboardsAlignedWithShots({ ...project, ...patch }, 'manual-repair');
+}
+
 async function main() {
   const tests = [
     ['migration archives multi-shot and moves single-shot task', testMigrationArchivesMultiShotAndMovesSingleShotTask],
@@ -289,6 +324,8 @@ async function main() {
     ['strict resolver rejects wrong slot', testStrictShotResolverRejectsWrongSlot],
     ['single-shot slot factory and invariant', testSingleShotSlotFactoryAndInvariant],
     ['first frame source hash includes world', testFirstFrameSourceHashIncludesWorld],
+    ['manual segmentation valid groups are preserved', testManualSegmentationValidGroupsArePreserved],
+    ['manual segmentation repair does not fall back to auto plan', testManualSegmentationRepairDoesNotFallBackToAutoPlan],
   ];
   let pass = 0;
   for (const [name, fn] of tests) {

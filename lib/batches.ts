@@ -38,6 +38,12 @@ import {
   getGlobalImageConcurrencyLimit,
   getGlobalVideoConcurrencyLimit,
 } from './system-config';
+import {
+  attachExpectedShotBindingsToTargets,
+  readExpectedShotBinding,
+  shouldAttachExpectedShotBinding,
+  writeGroupSlot,
+} from './group-slot-write-guard';
 
 export type BatchEventName =
   | 'snapshot'
@@ -173,29 +179,34 @@ function _clearFailedStoryboardImageState(opts: {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-        mode: 'single-shot-strict',
-        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
-      });
       const error = {
         message: firstFrameLastError,
         failedAt: new Date().toISOString(),
         batchType: opts.batchType,
         imageSafetyAudit: opts.imageSafetyAudit,
       };
-      storyboards[groupIdx] = {
-        ...prev,
-        idx: groupIdx,
-        shotIdx: groupIdx + 1,
-        shotIndices,
-        firstFrame: markFirstFrameFailed(prev, error),
-        firstFrameLastError,
-        firstFrameFailedAt: error.failedAt,
-        firstFrameSafetyAudit: opts.imageSafetyAudit || prev.firstFrameSafetyAudit,
-      };
+      const result = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+        expectedBinding: readExpectedShotBinding(opts.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: ({ shotIndices }) => {
+          storyboards[groupIdx] = {
+            ...prev,
+            idx: groupIdx,
+            shotIdx: shotIndices[0] + 1,
+            shotIndices,
+            firstFrame: markFirstFrameFailed(prev, error),
+            firstFrameLastError,
+            firstFrameFailedAt: error.failedAt,
+            firstFrameSafetyAudit: opts.imageSafetyAudit || prev.firstFrameSafetyAudit,
+          };
+        },
+      });
+      if (result.status !== 'applied') return null;
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-failure-cleanup');
       return { storyboards };
     });
@@ -239,17 +250,11 @@ function _clearFailedTailFrameImageState(opts: {
     patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return null;
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) return null;
       const prev = storyboards[groupIdx] || {};
       // 用户已显式删除该尾帧 (delete-tail 把 tailFrameIntent 置 'none' 并已落盘):
       // 迟到的失败不回写, 否则会把已删除的尾帧"复活"成生成失败。
       // 与前端 storyboard.js _clearFailedTailFrameLocally 的同名 gate 对齐。
       if (String((prev as any).tailFrameIntent || '') === 'none') return null;
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-        mode: 'single-shot-strict',
-        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
-      });
       const failedAt = new Date().toISOString();
       const errorRec = {
         message: tailFrameLastError,
@@ -260,30 +265,41 @@ function _clearFailedTailFrameImageState(opts: {
         recoveryHint,
         imageSafetyAudit: opts.imageSafetyAudit,
       };
-      // 复用 markTailFrameFailed 的 degraded/failed 判定: 有旧图 → degraded + 保留
-      // lastKnownGoodUrl; 无旧图 → failed。前后端语义对齐, 前端 _clearFailedTailFrameLocally
-      // 和这里写出同一个结果, 刷新拿回 server snapshot 也不会变化。
-      const prevTail = (prev.frames && typeof prev.frames === 'object' ? prev.frames.tail : null) || null;
-      const nextTailState = markTailFrameFailed(prev, errorRec);
-      const nextTail = {
-        ...(prevTail || {}),
-        url: nextTailState.currentUrl,
-        lastKnownGoodUrl: nextTailState.lastKnownGoodUrl,
-        status: nextTailState.status,
-        source: nextTailState.source,
-        lastError: nextTailState.lastError,
-        shotIndices,
-      };
-      emittedTail = nextTail;
-      storyboards[groupIdx] = {
-        ...prev,
-        idx: groupIdx,
-        shotIdx: groupIdx + 1,
-        shotIndices,
-        tailFrameLastError,
-        tailFrameFailedAt: failedAt,
-        frames: { ...(prev.frames || {}), tail: nextTail },
-      };
+      const result = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+        expectedBinding: readExpectedShotBinding(opts.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: ({ shotIndices }) => {
+          // 复用 markTailFrameFailed 的 degraded/failed 判定: 有旧图 → degraded + 保留
+          // lastKnownGoodUrl; 无旧图 → failed。前后端语义对齐, 前端 _clearFailedTailFrameLocally
+          // 和这里写出同一个结果, 刷新拿回 server snapshot 也不会变化。
+          const prevTail = (prev.frames && typeof prev.frames === 'object' ? prev.frames.tail : null) || null;
+          const nextTailState = markTailFrameFailed(prev, errorRec);
+          const nextTail = {
+            ...(prevTail || {}),
+            url: nextTailState.currentUrl,
+            lastKnownGoodUrl: nextTailState.lastKnownGoodUrl,
+            status: nextTailState.status,
+            source: nextTailState.source,
+            lastError: nextTailState.lastError,
+            shotIndices,
+          };
+          emittedTail = nextTail;
+          storyboards[groupIdx] = {
+            ...prev,
+            idx: groupIdx,
+            shotIdx: shotIndices[0] + 1,
+            shotIndices,
+            tailFrameLastError,
+            tailFrameFailedAt: failedAt,
+            frames: { ...(prev.frames || {}), tail: nextTail },
+          };
+        },
+      });
+      if (result.status !== 'applied') return null;
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'tail-frame-failure-cleanup');
       return { storyboards };
     });
@@ -422,23 +438,7 @@ function _markFailedVideoPromptState(opts: {
     const patchedProject = patchProjectForUser(opts.projectId, opts.user.id, (fresh) => {
       if (!fresh) return {};
       const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) {
-        decision = {
-          groupIdx,
-          videoPromptRunId: opts.batchId,
-          failureApplied: false,
-          skippedReason: 'slot_missing',
-          storedRunId: null,
-          storedStatus: null,
-        };
-        return {};
-      }
       const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, {
-        mode: 'single-shot-strict',
-        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
-      });
       if (prev.videoPromptRunId && prev.videoPromptRunId !== opts.batchId) {
         console.warn(
           `[batch] ignored stale video_prompt failure project=${opts.projectId} group=${groupIdx} ` +
@@ -454,20 +454,41 @@ function _markFailedVideoPromptState(opts: {
         };
         return {};
       }
-      storyboards[groupIdx] = {
-        ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
-        idx: groupIdx,
-        shotIdx: groupIdx + 1,
-        shotIndices,
-        videoPromptStatus: 'failed',
-        videoPromptRunId: opts.batchId,
-        videoPromptFailedAt: now,
-        videoPromptLastError,
-      };
-
       const videoTasks = Array.isArray((fresh as any).videoTasks) ? [...(fresh as any).videoTasks] : [];
-      if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
-        videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
+      const result = writeGroupSlot({
+        fresh,
+        groupIdx,
+        storyboard: prev,
+        explicitShotIndices: _targetShotIndices(opts.target, groupIdx),
+        expectedBinding: readExpectedShotBinding(opts.target),
+        mismatchPolicy: 'abortPatch',
+        mutator: ({ shotIndices }) => {
+          storyboards[groupIdx] = {
+            ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
+            idx: groupIdx,
+            shotIdx: shotIndices[0] + 1,
+            shotIndices,
+            videoPromptStatus: 'failed',
+            videoPromptRunId: opts.batchId,
+            videoPromptFailedAt: now,
+            videoPromptLastError,
+          };
+
+          if (videoTasks.length > groupIdx && videoTasks[groupIdx]) {
+            videoTasks[groupIdx] = markVideoTaskOutdated(videoTasks[groupIdx], 'video_prompt_failed', now);
+          }
+        },
+      });
+      if (result.status !== 'applied') {
+        decision = {
+          groupIdx,
+          videoPromptRunId: opts.batchId,
+          failureApplied: false,
+          skippedReason: result.reason === 'shot_binding_mismatch' ? 'shot_binding_mismatch' : 'slot_missing',
+          storedRunId: null,
+          storedStatus: null,
+        };
+        return {};
       }
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards, videoTasks }, 'video-prompt-failure-cleanup');
       decision = {
@@ -755,8 +776,16 @@ export function createBatch(opts: {
   beforeStart?: (batchId: string) => void;
 }): { batchId: string; total: number; reused?: boolean; duplicateGroupIdxs?: number[] } {
   const db = getDb();
-  const total = opts.targets.length;
   assertCanStartPaidOperation(opts.user.id);
+  const rawTargets = Array.isArray(opts.targets) ? opts.targets : [];
+  const bindingProject = shouldAttachExpectedShotBinding(opts.batchType)
+    ? getProjectByIdForUser(opts.projectId, opts.user.id)
+    : null;
+  const targets = bindingProject
+    ? attachExpectedShotBindingsToTargets(bindingProject as any, opts.batchType, rawTargets)
+    : rawTargets;
+  const batchOpts = { ...opts, targets };
+  const total = targets.length;
   const batchId = randomUUID();
   const optsJson = JSON.stringify(opts.options || {});
   const leaseAt = _nowIso();
@@ -766,7 +795,7 @@ export function createBatch(opts: {
 
   db.exec('BEGIN IMMEDIATE');
   try {
-    const active = _findActiveGroupBatchOverlap(db, opts);
+    const active = _findActiveGroupBatchOverlap(db, batchOpts);
     if (active) {
       if (active.canReuse) {
         result = {
@@ -800,9 +829,9 @@ export function createBatch(opts: {
       `INSERT INTO batch_tasks (id, batch_id, seq, task_type, target_json, status)
        VALUES (?, ?, ?, ?, ?, 'queued')`,
     );
-    for (let i = 0; i < opts.targets.length; i++) {
+    for (let i = 0; i < targets.length; i++) {
       const tid = randomUUID();
-      insertTask.run(tid, batchId, i, opts.batchType, JSON.stringify(opts.targets[i]));
+      insertTask.run(tid, batchId, i, opts.batchType, JSON.stringify(targets[i]));
     }
     shouldStartRunner = inlineRunner;
     result = { batchId, total };

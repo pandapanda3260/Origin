@@ -358,6 +358,7 @@ function bootstrap(db: Database.Database) {
 	      provider      TEXT NOT NULL DEFAULT 'openai',  -- openai | seedance | keling | fake
 	      provider_task TEXT,                      -- 远端任务 id（用于轮询）
 	      video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}',
+	      shot_binding_json TEXT NOT NULL DEFAULT '{}',
 	      billing_session_id TEXT,
 	      billing_context_json TEXT NOT NULL DEFAULT '{}',
 	      status        TEXT NOT NULL DEFAULT 'queued',  -- queued | running | completed | failed
@@ -1209,6 +1210,7 @@ function migrateProjectsVersionColumn(db: Database.Database) {
 function migrateVideoPromptSnapshotColumn(db: Database.Database) {
   try {
     addColumnIfMissing(db, 'video_tasks', 'video_prompt_snapshot_json', "video_prompt_snapshot_json TEXT NOT NULL DEFAULT '{}'");
+    addColumnIfMissing(db, 'video_tasks', 'shot_binding_json', "shot_binding_json TEXT NOT NULL DEFAULT '{}'");
   } catch (e) {
     console.warn('[db] migrateVideoPromptSnapshotColumn failed:', e);
   }

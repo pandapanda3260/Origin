@@ -74,13 +74,13 @@ export async function GET(req: NextRequest) {
   if (view === 'dry_run') {
     return dryRunKnowledgeContext(url);
   }
-  const module = normalizeModule(url.searchParams.get('module')) || 'style_bible';
+  const knowledgeModule = normalizeModule(url.searchParams.get('module')) || 'style_bible';
   return jsonOk({
     modules: MODULES,
     stages: STAGES,
-    cards: listKnowledgeCards(module),
+    cards: listKnowledgeCards(knowledgeModule),
     projects: listPreviewProjects(),
-    selectedModule: module,
+    selectedModule: knowledgeModule,
     generatedAt: new Date().toISOString(),
   });
 }
@@ -412,8 +412,8 @@ function listPreviewProjects() {
 
 function handleSaveDraft(audit: any) {
   const body = audit.body || {};
-  const module = normalizeModule(body.module);
-  if (!module) return jsonError('module not allowed in P1 knowledge admin', 400);
+  const knowledgeModule = normalizeModule(body.module);
+  if (!knowledgeModule) return jsonError('module not allowed in P1 knowledge admin', 400);
   const title = String(body.title || '').trim().slice(0, 160);
   if (!title) return jsonError('title required', 400);
   const cardType = String(body.cardType || 'rule').trim().slice(0, 80) || 'rule';
@@ -428,7 +428,7 @@ function handleSaveDraft(audit: any) {
     id,
     scope: 'system',
     ownerId: null,
-    module,
+    module: knowledgeModule,
     cardType,
     title,
     status: 'active',
@@ -438,7 +438,7 @@ function handleSaveDraft(audit: any) {
     data,
     sourceRef: { adminDraft: true },
     schemaVersion: 1,
-    version: existing?.version || nextVersionFor(module, title),
+    version: existing?.version || nextVersionFor(knowledgeModule, title),
   };
   audit.setAuditTarget({ type: 'knowledge_card', ids: [id] });
   audit.setAuditDiff({ before, after });
@@ -462,7 +462,7 @@ function handleSaveDraft(audit: any) {
      WHERE knowledge_cards.lifecycle = 'draft'`,
   ).run({
     id,
-    module,
+    module: knowledgeModule,
     cardType,
     title,
     priority,
@@ -481,8 +481,8 @@ async function handlePreview(audit: any, req: NextRequest) {
   const card = readCard(cardId);
   if (!card) return jsonError('card not found', 404);
   if (card.lifecycle !== 'draft') return jsonError('preview requires a draft card', 409);
-  const module = normalizeModule(card.module);
-  if (!module) return jsonError('module not allowed in P1 knowledge admin', 400);
+  const knowledgeModule = normalizeModule(card.module);
+  if (!knowledgeModule) return jsonError('module not allowed in P1 knowledge admin', 400);
   const project = readProject(projectId);
   if (!project) return jsonError('project not found', 404);
 
@@ -497,7 +497,7 @@ async function handlePreview(audit: any, req: NextRequest) {
     }));
   }
 
-  const prompt = buildPreviewPrompt({ card, project, module });
+  const prompt = buildPreviewPrompt({ card, project, module: knowledgeModule });
   let output = '';
   let mode = 'model';
   if (body.runModel === false) {
@@ -791,8 +791,8 @@ function decodeCardRow(row: any) {
 }
 
 function normalizeModule(value: unknown): AdminKnowledgeModule | '' {
-  const module = String(value || '').trim();
-  return MODULES.some((item) => item.key === module) ? module as AdminKnowledgeModule : '';
+  const knowledgeModule = String(value || '').trim();
+  return MODULES.some((item) => item.key === knowledgeModule) ? knowledgeModule as AdminKnowledgeModule : '';
 }
 
 function moduleStage(module: AdminKnowledgeModule) {

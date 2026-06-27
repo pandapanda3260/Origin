@@ -167,8 +167,10 @@ function testFrontendAndRouteContracts() {
   assert(main.includes('await _removeObsoleteAssets(toRemove)'), 'cascade cleanup should await removal');
   assert(main.includes('removeResult.removed'), 'cascade cleanup toast should use real removed count');
   assert(!main.includes('showToast("已清理 " + toRemove.length + " 个过时资产"'), 'cascade cleanup must not use checked count');
-  assert(workspace.includes('"/modules/assets.js": "/modules/assets.js?v=184"'), 'assets.js import map should be bumped');
-  assert(workspace.includes('src="main.js?v=359"'), 'main.js script version should be bumped');
+  const assetsVersion = Number((workspace.match(/"\/modules\/assets\.js": "\/modules\/assets\.js\?v=(\d+)"/) || [])[1]);
+  const mainVersion = Number((workspace.match(/src="main\.js\?v=(\d+)"/) || [])[1]);
+  assert(assetsVersion >= 184, 'assets.js import map should be bumped');
+  assert(mainVersion >= 359, 'main.js script version should be bumped');
 }
 
 testSceneReferenceUsesAssetIdAndNameOnly();

@@ -87,7 +87,7 @@ function isDevAlignmentAssertEnabled(): boolean {
   return process.env.NODE_ENV !== 'production';
 }
 
-function assertGroupsCoverAllShotsOnce(storyboards: any[], shots: any[], context: string): void {
+export function assertGroupsCoverAllShotsOnce(storyboards: any[], shots: any[], context: string): void {
   const n = shots.length;
   const seen: boolean[] = new Array(n).fill(false);
   let expectedNext = 0;
@@ -699,11 +699,51 @@ function sanitizeStoryboardForTargetShotIndices(sb: any, target: number[], shots
 
 function projectFrameAlignmentOk(project: any): boolean {
   try {
+    if (isManualSegmentation(project)) {
+      assertGroupsCoverAllShotsOnce(
+        Array.isArray(project?.storyboards) ? project.storyboards : [],
+        Array.isArray(project?.shots) ? project.shots : [],
+        'frame-workflow-normalization-check',
+      );
+      return true;
+    }
     assertStoryboardsAlignedWithShots(project, 'frame-workflow-normalization-check');
     return true;
   } catch {
     return false;
   }
+}
+
+function isManualSegmentation(project: any): boolean {
+  return String(project?.segmentationMode || '').trim() === 'manual';
+}
+
+function makeManualRepairStoryboardSlots(project: any): any[] {
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const groups: number[][] = [];
+  let cursor = 0;
+  for (const sb of storyboards) {
+    const raw = normalizedShotIndices(sb?.shotIndices, shots.length).filter((idx) => idx >= cursor);
+    if (!raw.length) continue;
+    const start = raw[0];
+    while (cursor < start) {
+      groups.push([cursor]);
+      cursor += 1;
+    }
+    const group: number[] = [];
+    for (const idx of raw) {
+      if (idx !== cursor) break;
+      group.push(idx);
+      cursor += 1;
+    }
+    if (group.length) groups.push(group);
+  }
+  while (cursor < shots.length) {
+    groups.push([cursor]);
+    cursor += 1;
+  }
+  return groups.map((shotIndices, groupIdx) => makeStoryboardSlotForGroup(groupIdx, shotIndices));
 }
 
 function buildFrameWorkflowAlignmentRepairPatch(project: any, userId: number, reason = 'alignment_repair'): any | null {
@@ -717,7 +757,9 @@ function buildFrameWorkflowAlignmentRepairPatch(project: any, userId: number, re
   const archive = Array.isArray(project.legacyStoryboardArchive)
     ? [...project.legacyStoryboardArchive]
     : [];
-  const expectedSlots = makeSingleShotStoryboardSlots(shots);
+  const expectedSlots = isManualSegmentation(project)
+    ? makeManualRepairStoryboardSlots(project)
+    : makeSingleShotStoryboardSlots(shots);
   const usedStoryboards = new Set<number>();
   const groupIdxRemap = new Map<number, number>();
   const repairedStoryboards: any[] = [];

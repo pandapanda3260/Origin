@@ -67,6 +67,9 @@ run_isolated npm run check:admin-governance
 run_isolated npm run test:image-provider-routing
 run_isolated npm run test:image-svg-fallback
 run_isolated npm run test:frame-workflow-state
+run_isolated npm run test:shot-structure-lock
+run_isolated npm run test:group-slot-write-guard
+run_isolated npm run test:segment-planning
 run_isolated npm run test:frame-image-plan
 run_isolated npm run test:llm-background-mode
 run_isolated npm run test:first-frame-edit-draft

@@ -12,6 +12,12 @@ export interface SegmentPlanOptions {
   minDurationSec?: number;
   /** Seedance 时长上限，默认 15。合并时不得超过。 */
   maxDurationSec?: number;
+  /** 目标段长下限；未传时沿用 minDurationSec。 */
+  targetMinSec?: number;
+  /** 目标段长上限；未传时沿用 maxDurationSec。 */
+  targetMaxSec?: number;
+  /** 物理硬上限；尾段并回也不得超过。 */
+  hardMaxSec?: number;
 }
 
 export const SEGMENT_MIN_DURATION_SEC = 4;
@@ -26,19 +32,23 @@ export function shotDurationSec(shot: SegmentPlanShotLike | undefined | null): n
 
 /**
  * 按镜头顺序、前向贪心，把镜头合并成"段"。
- * - 镜头 >= MIN → 单独成段（solo）
- * - 镜头 < MIN → 往后依次并入下一镜头，累计 >= MIN 即停（并入时不超过 MAX）
- * - 末段仍 < MIN → 整体并回上一段（1–7s 区间下数学保证 prev+last ≤ MAX）
+ * - 镜头 >= targetMin → 单独成段（solo）
+ * - 镜头 < targetMin → 往后依次并入下一镜头，累计 >= targetMin 即停（并入时不超过 hardMax）
+ * - 末段仍 < targetMin → 仅在不超过 hardMax 时整体并回上一段
  * 返回：每个元素是一段的 shot 下标运行段；保证升序、连续、覆盖全部下标、无重叠。
  *
- * 退化：整片仅一个 < MIN 的孤镜头 → 返回单段，交由生成时 padding，不在此特判。
+ * 退化：整片仅一个 < targetMin 的孤镜头 → 返回单段，交由生成时 padding，不在此特判。
  */
 export function planSegments(
   shots: ReadonlyArray<SegmentPlanShotLike> | null | undefined,
   options: SegmentPlanOptions = {},
 ): number[][] {
-  const MIN = Math.max(1, Math.floor(options.minDurationSec ?? SEGMENT_MIN_DURATION_SEC));
-  const MAX = Math.max(MIN, Math.floor(options.maxDurationSec ?? SEGMENT_MAX_DURATION_SEC));
+  const TARGET_MIN = Math.max(1, Math.floor(options.targetMinSec ?? options.minDurationSec ?? SEGMENT_MIN_DURATION_SEC));
+  const targetMaxInput = Math.floor(options.targetMaxSec ?? options.maxDurationSec ?? SEGMENT_MAX_DURATION_SEC);
+  const TARGET_MAX = Math.max(TARGET_MIN, targetMaxInput);
+  const hardMaxInput = Math.floor(options.hardMaxSec ?? TARGET_MAX);
+  const HARD_MAX = Math.max(TARGET_MIN, hardMaxInput);
+  const MAX = Math.min(TARGET_MAX, HARD_MAX);
   const list = Array.isArray(shots) ? shots : [];
   const n = list.length;
   const segments: number[][] = [];
@@ -46,7 +56,7 @@ export function planSegments(
   let i = 0;
   while (i < n) {
     const di = shotDurationSec(list[i]);
-    if (di >= MIN) {
+    if (di >= TARGET_MIN) {
       segments.push([i]);
       i += 1;
       continue;
@@ -54,9 +64,9 @@ export function planSegments(
     const group: number[] = [i];
     let sum = di;
     let j = i + 1;
-    while (sum < MIN && j < n) {
+    while (sum < TARGET_MIN && j < n) {
       const dj = shotDurationSec(list[j]);
-      if (sum + dj > MAX) break; // 护栏：1–7s 区间下不会触发
+      if (sum + dj > MAX) break;
       group.push(j);
       sum += dj;
       j += 1;
@@ -65,14 +75,17 @@ export function planSegments(
     i = j;
   }
 
-  // 收尾兜底：末段仍 < MIN → 并回上一段。
+  // 收尾兜底：末段仍 < targetMin → 不超过 hardMax 才并回上一段。
   if (segments.length >= 2) {
     const last = segments[segments.length - 1];
     const lastSum = last.reduce((acc, idx) => acc + shotDurationSec(list[idx]), 0);
-    if (lastSum < MIN) {
+    if (lastSum < TARGET_MIN) {
       const prev = segments[segments.length - 2];
-      segments[segments.length - 2] = prev.concat(last);
-      segments.pop();
+      const prevSum = prev.reduce((acc, idx) => acc + shotDurationSec(list[idx]), 0);
+      if (prevSum + lastSum <= HARD_MAX) {
+        segments[segments.length - 2] = prev.concat(last);
+        segments.pop();
+      }
     }
   }
 

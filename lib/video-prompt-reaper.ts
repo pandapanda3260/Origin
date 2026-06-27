@@ -3,6 +3,7 @@ import { patchProjectForUser } from './projects-db';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from './frame-workflow-state';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from './video-prompt-state';
 import { logVideoPromptTrace, summarizePromptForTrace } from './video-prompt-observability';
+import { type ExpectedShotBinding, readExpectedShotBinding, writeGroupSlot } from './group-slot-write-guard';
 
 type ReapAction = {
   projectId: string;
@@ -17,6 +18,7 @@ type ReapAction = {
   droppedReferences?: any[];
   completedAt?: string;
   shotIndices?: number[];
+  expectedBinding?: ExpectedShotBinding | null;
 };
 
 function envInt(name: string, fallback: number, min: number, max: number) {
@@ -77,6 +79,10 @@ function taskShotIndices(task: any): number[] | undefined {
         .filter((idx: number) => Number.isInteger(idx) && idx >= 0)
     : [];
   return normalized.length ? normalized : undefined;
+}
+
+function taskExpectedShotBinding(task: any): ExpectedShotBinding | null {
+  return readExpectedShotBinding(parseJson(task?.target_json));
 }
 
 function promptFromResult(result: any): string {
@@ -161,6 +167,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
   const result = parseJson(row.result_json);
   const prompt = promptFromResult(result);
   const shotIndices = taskShotIndices(row);
+  const expectedBinding = taskExpectedShotBinding(row);
   if (taskStatus === 'completed') {
     if (prompt) {
       return {
@@ -175,6 +182,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
         droppedReferences: taskDroppedReferences(result),
         completedAt: String(row.updated_at || row.batch_updated_at || ''),
         shotIndices,
+        expectedBinding,
       };
     }
     return {
@@ -186,6 +194,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
       reason: 'completed_task_missing_prompt',
       errorMessage: '系统检测到生成任务完成但缺少提示词，请重新生成',
       shotIndices,
+      expectedBinding,
     };
   }
 
@@ -199,6 +208,7 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
       reason: `batch_task_${taskStatus}`,
       errorMessage: String(row.error_msg || row.error_message || '系统检测到生成任务未完成，请重新生成').slice(0, 500),
       shotIndices,
+      expectedBinding,
     };
   }
 
@@ -212,6 +222,8 @@ function findBatchAction(db: ReturnType<typeof getDb>, opts: {
       action: 'failed',
       reason: `batch_${batchStatus}_without_prompt`,
       errorMessage: '系统检测到生成任务没有可用结果，请重新生成',
+      shotIndices,
+      expectedBinding,
     };
   }
   return null;
@@ -270,16 +282,37 @@ function applyProjectActions(projectId: string, ownerId: number, actions: ReapAc
         skipped += 1;
         continue;
       }
-      const shotIndices = storyboardShotIndices(fresh as any, action.groupIdx, prev, {
-        mode: 'single-shot-strict',
-        explicitShotIndices: action.shotIndices,
-      });
+      let shotIndices: number[];
+      let firstShot: any = null;
+      if (action.expectedBinding) {
+        const writeResult = writeGroupSlot({
+          fresh,
+          groupIdx: action.groupIdx,
+          storyboard: prev,
+          explicitShotIndices: action.shotIndices,
+          expectedBinding: action.expectedBinding,
+          mismatchPolicy: 'skip',
+          mutator: () => undefined,
+        });
+        if (writeResult.status !== 'applied') {
+          skipped += 1;
+          continue;
+        }
+        shotIndices = writeResult.shotIndices;
+        firstShot = writeResult.firstShot;
+      } else {
+        shotIndices = storyboardShotIndices(fresh as any, action.groupIdx, prev, {
+          mode: 'single-shot-strict',
+          explicitShotIndices: action.shotIndices,
+        });
+        firstShot = Array.isArray((fresh as any).shots) ? (fresh as any).shots[shotIndices[0]] : null;
+      }
       if (action.action === 'ready' && action.prompt) {
         const promptUpdatedAt = action.completedAt || now;
         storyboards[action.groupIdx] = {
           ...markStoryboardVideoOutdated(prev, 'video_prompt_regeneration', now),
           idx: action.groupIdx,
-          shotIdx: action.groupIdx + 1,
+          shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
           shotIndices,
           videoPrompt: action.prompt,
           videoPromptStatus: 'ready',
@@ -295,7 +328,7 @@ function applyProjectActions(projectId: string, ownerId: number, actions: ReapAc
         storyboards[action.groupIdx] = {
           ...markStoryboardVideoOutdated(prev, 'video_prompt_failed', now),
           idx: action.groupIdx,
-          shotIdx: action.groupIdx + 1,
+          shotIdx: firstShot?.idx ?? shotIndices[0] + 1,
           shotIndices,
           videoPromptStatus: 'failed',
           videoPromptRunId: action.runId,
