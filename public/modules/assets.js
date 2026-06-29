@@ -1,4 +1,20 @@
 import { $, escapeHtml, showToast, showConfirm, showPrompt, apiPost, apiGet, apiPostStream, consumeStreamStepTags, ApiError, getAuthHeaders, hydrateProtectedImageElements, imageVariantUrl, getActiveBatchesShared, friendlyGatewayTransientError } from '/modules/utils.js';
+import {
+  canUseCharacterFallback as _canUseCharacterFallbackBase,
+  characterFallbackImageUrl as _characterFallbackImageUrlBase,
+  characterOwnImageUrl as _characterOwnImageUrlBase,
+  deriveAssetCardState as _deriveAssetCardStateBase,
+  normalizeCharacterEntityType as _normalizeCharacterEntityTypeBase,
+  normalizePropViewRole as _normalizePropViewRoleBase,
+  normalizeSceneViewRole as _normalizeSceneViewRoleBase,
+  panelSchemaEntityType as _panelSchemaEntityTypeBase,
+  propViewBySlot as _propViewBySlotBase,
+  propViewOriginalUrl as _propViewOriginalUrlBase,
+  propViews as _propViewsBase,
+  resolvePropImageUrl as _resolvePropImageUrlBase,
+  resolveSceneImageUrl as _resolveSceneImageUrlBase,
+  sceneView as _sceneViewBase,
+} from '/modules/asset_display_state.js';
 import { loadProjectData } from '/modules/project.js';
 import { subscribeBatch, subscribeTask } from '/modules/backend_stream.js';
 import { renderAssetCard } from '/modules/render_hooks.js';
@@ -96,8 +112,7 @@ var PROP_VIEW_LABELS = {
 };
 
 function _normalizeSceneViewRole(role) {
-  role = String(role || "").trim();
-  return SCENE_VIEW_ROLES.indexOf(role) >= 0 ? role : "";
+  return _normalizeSceneViewRoleBase(role);
 }
 
 function _assetGenStatusKey(type, idx, viewRole) {
@@ -106,8 +121,7 @@ function _assetGenStatusKey(type, idx, viewRole) {
 }
 
 function _normalizePropViewRole(role) {
-  role = String(role || "").trim();
-  return (PROP_VIEW_SLOTS.indexOf(role) >= 0 || role === "side") ? role : "";
+  return _normalizePropViewRoleBase(role);
 }
 
 function _sceneViewStaleKey(idx, role) {
@@ -116,27 +130,11 @@ function _sceneViewStaleKey(idx, role) {
 }
 
 function _sceneView(item, role) {
-  role = _normalizeSceneViewRole(role) || "establishing";
-  var views = Array.isArray(item && item.views) ? item.views : [];
-  for (var i = 0; i < views.length; i++) {
-    if (_normalizeSceneViewRole(views[i] && views[i].role) === role) return views[i];
-  }
-  return null;
+  return _sceneViewBase(item, role);
 }
 
 function _sceneViewOriginalUrl(item, role) {
-  if (!item) return "";
-  role = _normalizeSceneViewRole(role) || "establishing";
-  var view = _sceneView(item, role);
-  var ref = view && view.reference && typeof view.reference === "object" ? view.reference : {};
-  if (view) {
-    return _firstAssetUrl(ref.currentUrl, ref.lastKnownGoodUrl, view.imageUrl, view.rawUrl);
-  }
-  if (role === "establishing") {
-    var topRef = item.reference && typeof item.reference === "object" ? item.reference : {};
-    return _firstAssetUrl(topRef.currentUrl, topRef.lastKnownGoodUrl, item.originalUrl, item.rawUrl, item.imageUrl, item.displayUrl);
-  }
-  return "";
+  return _resolveSceneImageUrlBase(item, role);
 }
 
 function _sceneMissingViewRoles(item) {
@@ -176,43 +174,19 @@ function _sceneViewState(item, idx, role) {
 }
 
 function _propViews(item) {
-  var views = item && item.views && typeof item.views === "object" ? item.views : {};
-  return views || {};
+  return _propViewsBase(item);
 }
 
 function _propViewBySlot(item, slot) {
-  slot = _normalizePropViewRole(slot);
-  if (!slot) return null;
-  var views = _propViews(item);
-  var slots = views.slots && typeof views.slots === "object" ? views.slots : {};
-  if (slots[slot]) return slots[slot];
-  if (views[slot]) return views[slot];
-  if ((slot === "side_left" || slot === "side_right") && views.side) return views.side;
-  return null;
+  return _propViewBySlotBase(item, slot);
 }
 
 function _propViewOriginalUrl(item, slot) {
-  var view = _propViewBySlot(item, slot);
-  var ref = view && view.reference && typeof view.reference === "object" ? view.reference : {};
-  return _firstAssetUrl(ref.currentUrl, ref.lastKnownGoodUrl, view && view.imageUrl, view && view.rawUrl);
+  return _propViewOriginalUrlBase(item, slot);
 }
 
 function _propCanonicalOriginalUrl(item) {
-  if (!item) return "";
-  var ref = item.reference && typeof item.reference === "object" ? item.reference : {};
-  return _firstAssetUrl(
-    _propViewOriginalUrl(item, "front"),
-    _propViewOriginalUrl(item, "hero"),
-    _propViewOriginalUrl(item, "side"),
-    _propViewOriginalUrl(item, "back"),
-    _propViewOriginalUrl(item, "top"),
-    ref.currentUrl,
-    ref.lastKnownGoodUrl,
-    item.originalUrl,
-    item.rawUrl,
-    item.imageUrl,
-    item.displayUrl
-  );
+  return _resolvePropImageUrlBase(item);
 }
 
 function _propHasViewSlots(item) {
@@ -743,114 +717,23 @@ function _shouldShowAssetRegenerationReview() {
 }
 
 function _normalizeCharacterEntityType(value) {
-  var text = String(value || "").trim().toLowerCase();
-  if (!text) return "";
-  if (text === "non-human" || text === "nonhuman" || text.indexOf("非人") >= 0) return "non-human";
-  if (text === "human" || text.indexOf("人物") >= 0 || text.indexOf("人类") >= 0) return "human";
-  return text;
+  return _normalizeCharacterEntityTypeBase(value);
 }
 
 function _panelSchemaEntityType(panels) {
-  var schema = String((panels && panels.schema) || "").trim().toLowerCase();
-  if (!schema) return "";
-  if (schema.indexOf("non-human") >= 0 || schema.indexOf("nonhuman") >= 0) return "non-human";
-  if (schema.indexOf("human-character") >= 0) return "human";
-  return "";
-}
-
-function _characterIdentityKeys(item) {
-  item = item || {};
-  return [item.characterId, item.id, item.name].filter(Boolean).map(function (value) {
-    return String(value).trim().toLowerCase().replace(/[“”"']/g, "").replace(/\s+/g, "");
-  }).filter(Boolean);
-}
-
-function _hasSharedCharacterKey(left, right) {
-  var leftKeys = _characterIdentityKeys(left);
-  var rightKeys = _characterIdentityKeys(right);
-  if (!leftKeys.length || !rightKeys.length) return false;
-  return leftKeys.some(function (key) { return rightKeys.indexOf(key) >= 0; });
+  return _panelSchemaEntityTypeBase(panels);
 }
 
 function _canUseCharacterFallback(current, fallback, options) {
-  if (!fallback || typeof fallback !== "object") return false;
-  options = options || {};
-  var currentEntity = _normalizeCharacterEntityType(current && current.entityType);
-  var fallbackEntity = _normalizeCharacterEntityType(fallback.entityType);
-  var fallbackSchemaEntity = _panelSchemaEntityType(fallback.panels);
-
-  if (currentEntity && fallbackEntity && currentEntity !== fallbackEntity) return false;
-  if (currentEntity && fallbackSchemaEntity && currentEntity !== fallbackSchemaEntity) return false;
-  if (currentEntity === "non-human" && !fallbackEntity && !fallbackSchemaEntity) {
-    // 非人角色没有显式实体/切片 schema 证据时，不从 legacy mirror 或 consistency lock 里猜旧图。
-    return false;
-  }
-  if (fallbackSchemaEntity === "human" && currentEntity === "non-human") return false;
-  if (fallbackSchemaEntity === "non-human" && currentEntity === "human") return false;
-
-  if (options.requireIdentityMatch && !_hasSharedCharacterKey(current, fallback)) return false;
-  return true;
+  return _canUseCharacterFallbackBase(current, fallback, options || {});
 }
 
 function _characterFallbackImageUrl(item, idx) {
-  item = item || {};
-  var reference = (item.reference && typeof item.reference === "object") ? item.reference : {};
-  var ownReferenceUrl = _firstAssetUrl(reference.lastKnownGoodUrl, reference.currentUrl);
-  if (ownReferenceUrl && _canUseCharacterFallback(item, item, { requireIdentityMatch: false })) return ownReferenceUrl;
-
-  var topChar = project && Array.isArray(project.characters) && typeof idx === "number"
-    ? project.characters[idx]
-    : null;
-  var topReference = topChar && typeof topChar.reference === "object" ? topChar.reference : {};
-  var topPanels = topChar && typeof topChar.panels === "object" ? topChar.panels : {};
-  var topUrl = topChar ? _firstAssetUrl(
-    topChar.originalUrl,
-    topChar.realPhotoUrl,
-    topChar.rawUrl,
-    topChar.imageUrl,
-    topChar.pencilUrl,
-    topReference.lastKnownGoodUrl,
-    topReference.currentUrl,
-    topPanels.sheetUrl,
-  ) : "";
-  if (topUrl && _canUseCharacterFallback(item, topChar, { requireIdentityMatch: false })) return topUrl;
-
-  var keys = [item.characterId, item.id, item.name].filter(Boolean).map(function (v) { return String(v); });
-  var locks = project && project.consistency && Array.isArray(project.consistency.characters)
-    ? project.consistency.characters
-    : [];
-  for (var lockIdx = 0; lockIdx < locks.length; lockIdx++) {
-    var lock = locks[lockIdx] || {};
-    var matches = keys.indexOf(String(lock.characterId || "")) >= 0
-      || keys.indexOf(String(lock.canonicalName || "")) >= 0;
-    if (!matches && !keys.length && typeof idx === "number") matches = lockIdx === idx;
-    if (!matches) continue;
-    var referenceLock = lock.referenceLock || {};
-    var lockFallback = {
-      characterId: lock.characterId || lock.sourceAssetId,
-      id: lock.sourceAssetId || lock.characterId,
-      name: lock.canonicalName,
-      entityType: lock.identityLock && lock.identityLock.entityType,
-    };
-    if (!_canUseCharacterFallback(item, lockFallback, { requireIdentityMatch: true })) continue;
-    var lockUrl = _firstAssetUrl(
-      referenceLock.sheetUrl,
-      referenceLock.headshotUrl,
-      referenceLock.frontUrl,
-      referenceLock.sideUrl,
-      referenceLock.backUrl,
-    );
-    if (lockUrl) return lockUrl;
-  }
-
-  return "";
+  return _characterFallbackImageUrlBase(project, item, idx);
 }
 
 function _characterOwnImageUrl(item) {
-  item = item || {};
-  var ownUrl = _firstAssetUrl(item.originalUrl, item.realPhotoUrl, item.rawUrl, item.imageUrl);
-  if (!ownUrl) return "";
-  return _canUseCharacterFallback(item, item, { requireIdentityMatch: false }) ? ownUrl : "";
+  return _characterOwnImageUrlBase(item);
 }
 
 function _getVideoTasksForLibrary() {
@@ -1415,40 +1298,7 @@ function _characterReferenceFailureMessage(_lastError) {
 }
 
 export function deriveAssetCardState(item, idx) {
-  item = item || {};
-  var reference = (item.reference && typeof item.reference === "object") ? item.reference : {};
-  var mainOriginalUrl = _characterOwnImageUrl(item) || _characterFallbackImageUrl(item, idx) || "";
-  var mainImageUrl = item.displayUrl || _assetVariant(mainOriginalUrl, ASSET_CARD_DISPLAY_W);
-  var thumbnailUrl = item.thumbUrl || _assetVariant(mainOriginalUrl, ASSET_CARD_THUMB_W);
-  var zoomUrl = _assetVariant(item.originalUrl || mainOriginalUrl, ASSET_LIGHTBOX_W);
-  var failed = reference.status === "failed";
-  var degraded = reference.status === "degraded" && !!mainImageUrl;
-  var failedAttemptUrl = failed ? (reference.lastAttemptUrl || "") : "";
-  var failedReason = reference.lastError && reference.lastError.reason ? String(reference.lastError.reason) : "";
-  var canPreviewFailedAttempt = failed && failedAttemptUrl && failedReason === "character_panel_split_failed";
-  var failedAttemptDisplayUrl = _assetVariant(failedAttemptUrl, ASSET_CARD_DISPLAY_W);
-  var failedAttemptThumbUrl = _assetVariant(failedAttemptUrl, ASSET_CARD_THUMB_W);
-  var failedAttemptZoomUrl = _assetVariant(failedAttemptUrl, ASSET_LIGHTBOX_W);
-  var failedAttemptOriginalUrl = _assetOriginal(failedAttemptUrl);
-  return {
-    status: failed ? "failed" : (degraded ? "degraded" : (mainImageUrl ? "ready" : "missing")),
-    originalUrl: _assetOriginal(mainOriginalUrl),
-    mainImageUrl: mainImageUrl,
-    thumbnailUrl: thumbnailUrl,
-    zoomUrl: zoomUrl,
-    previewMode: canPreviewFailedAttempt ? "failed_attempt" : (mainImageUrl ? "accepted" : "missing"),
-    previewImageUrl: canPreviewFailedAttempt ? failedAttemptDisplayUrl : mainImageUrl,
-    previewThumbUrl: canPreviewFailedAttempt ? failedAttemptThumbUrl : thumbnailUrl,
-    previewZoomUrl: canPreviewFailedAttempt ? failedAttemptZoomUrl : zoomUrl,
-    previewOriginalUrl: canPreviewFailedAttempt ? failedAttemptOriginalUrl : _assetOriginal(mainOriginalUrl),
-    failedAttemptUrl: failedAttemptUrl,
-    failedAttemptThumbUrl: failedAttemptThumbUrl,
-    failedAttemptZoomUrl: failedAttemptZoomUrl,
-    statusLabel: failed ? "生成失败" : (degraded ? "可用（比例兜底）" : (mainImageUrl ? "已完成" : "待生成")),
-    statusMessage: failed
-      ? _characterReferenceFailureMessage(reference.lastError)
-      : (degraded ? "生成完成，采用比例兜底切片，可用于后续镜头/视频引用" : ""),
-  };
+  return _deriveAssetCardStateBase(item, idx, { project: project, imageVariantUrl: imageVariantUrl });
 }
 
 function _renderCharCards(container, items) {

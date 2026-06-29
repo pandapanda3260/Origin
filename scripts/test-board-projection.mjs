@@ -7,8 +7,11 @@ function dataModuleUrl(source) {
 
 const frameSrc = readFileSync(new URL('../public/modules/frameRecommendations.js', import.meta.url), 'utf8');
 const frameUrl = dataModuleUrl(frameSrc);
+const assetDisplaySrc = readFileSync(new URL('../public/modules/asset_display_state.js', import.meta.url), 'utf8');
+const assetDisplayUrl = dataModuleUrl(assetDisplaySrc);
 let stateSrc = readFileSync(new URL('../public/modules/board_state.js', import.meta.url), 'utf8');
 stateSrc = stateSrc.replace("from '/modules/frameRecommendations.js';", `from ${JSON.stringify(frameUrl)};`);
+stateSrc = stateSrc.replaceAll("from '/modules/asset_display_state.js';", `from ${JSON.stringify(assetDisplayUrl)};`);
 const boardState = await import(dataModuleUrl(stateSrc));
 
 {

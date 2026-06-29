@@ -8,7 +8,7 @@
     "build": "next build",
     "typecheck": "tsc --noEmit",
     "verify:release:local": "bash scripts/release-local-checks.sh",
-    "verify:frontend": "npm run test:cache-busting && node scripts/test-board-viewport.mjs && node scripts/test-board-svg-origin-contract.mjs && node scripts/test-board-projection.mjs && node scripts/test-board-readonly-contract.mjs && node scripts/test-board-sync-contract.mjs && node scripts/test-board-routing-contract.mjs && npm run test:edit-preview-aspect && node scripts/test-workspace-route-default.mjs && node scripts/test-video-batch-import-contract.mjs && node scripts/test-shot-plan-dialog-contract.mjs && node scripts/test-shot-segment-sync-contract.mjs",
+    "verify:frontend": "npm run test:cache-busting && node scripts/test-asset-display-state-contract.mjs && node scripts/test-board-viewport.mjs && node scripts/test-board-svg-origin-contract.mjs && node scripts/test-board-projection.mjs && node scripts/test-board-readonly-contract.mjs && node scripts/test-board-sync-contract.mjs && node scripts/test-board-routing-contract.mjs && npm run test:edit-preview-aspect && node scripts/test-workspace-route-default.mjs && node scripts/test-video-batch-import-contract.mjs && node scripts/test-shot-plan-dialog-contract.mjs && node scripts/test-shot-segment-sync-contract.mjs",
     "check:admin-governance": "node scripts/check-admin-governance.js",
     "check:model-fetch": "node scripts/check-direct-model-fetch.js",
     "check:usage-price-coverage": "tsx scripts/check-usage-price-coverage.ts",

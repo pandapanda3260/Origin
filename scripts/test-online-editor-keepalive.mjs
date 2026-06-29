@@ -37,15 +37,19 @@ assert(
 );
 
 // ── A2. 跨项目必杀：收口接线 ─────────────────────────────────────
-const syncModulesBlock = mainJs.match(/function _syncProjectModules\(nextProject\)\s*\{[\s\S]*?\n  \}/);
+const syncModulesBlock = mainJs.match(/function _syncProjectModules\(nextProject, options\)\s*\{[\s\S]*?\n  \}/);
 assert(syncModulesBlock, 'main.js 应存在 _syncProjectModules 收口');
 assert(
-  syncModulesBlock && syncModulesBlock[0].includes('syncOnlineEditorProject(nextProject)'),
-  '_syncProjectModules 收口必须调用 syncOnlineEditorProject(nextProject)（跨项目杀 iframe 的唯一权威入口）',
+  syncModulesBlock && syncModulesBlock[0].includes('if (options.onlineEditor !== false) syncOnlineEditorProject(nextProject);'),
+  '_syncProjectModules 收口必须默认调用 syncOnlineEditorProject(nextProject)，且允许 reload/apply 显式跳过以保活 iframe',
 );
 assert(
-  (mainJs.match(/syncOnlineEditorProject\(null\)/g) || []).length >= 2,
-  'main.js 两个"删光项目"分支都应调用 syncOnlineEditorProject(null)',
+  (mainJs.match(/_syncProjectModules\(null\)/g) || []).length >= 2,
+  'main.js 两个"删光项目"分支都应走 _syncProjectModules(null)，由收口统一清理 online editor',
+);
+assert(
+  (mainJs.match(/_syncProjectModules\(project, \{ onlineEditor: false \}\);/g) || []).length >= 5,
+  '同项目 reload/apply 回拉必须显式跳过 onlineEditor 同步，避免误杀保活 iframe',
 );
 
 // ── A3. 守卫钩子语义：同项目不杀 / 跨项目杀 ──────────────────────

@@ -1202,7 +1202,8 @@ var _scriptEditInitialText = "";
     if (document.body) document.body.classList.remove("is-activating");
   }
 
-  function _syncProjectModules(nextProject) {
+  function _syncProjectModules(nextProject, options) {
+    options = options || {};
     syncEditProject(nextProject);
     syncTasksProject(nextProject);
     syncVideoTasksProject(nextProject);
@@ -1213,7 +1214,7 @@ var _scriptEditInitialText = "";
     syncScriptProject(nextProject);
     syncAssetsProject(nextProject);
     syncEpisodesProject(nextProject);
-    syncOnlineEditorProject(nextProject);
+    if (options.onlineEditor !== false) syncOnlineEditorProject(nextProject);
   }
 
   async function _activateProjectContext(projId, options) {
@@ -1392,16 +1393,7 @@ var _scriptEditInitialText = "";
           switchToProject(list[0].id);
         } else {
           project = null;
-          syncEditProject(null);
-          syncTasksProject(null);
-          syncVideoTasksProject(null);
-          syncVideoPromptsProject(null);
-          syncShotsProject(null);
-          syncStoryboardProject(null);
-          syncBoardProject(null);
-          syncScriptProject(null);
-          syncAssetsProject(null);
-          syncOnlineEditorProject(null);
+          _syncProjectModules(null);
           localStorage.removeItem(STORAGE_PROJECT);
           refreshOverview();
         }
@@ -4253,16 +4245,7 @@ var _scriptEditInitialText = "";
           await switchToProject(list[0].id);
         } else {
           project = null;
-          syncEditProject(null);
-          syncTasksProject(null);
-          syncVideoTasksProject(null);
-          syncVideoPromptsProject(null);
-          syncShotsProject(null);
-          syncStoryboardProject(null);
-          syncBoardProject(null);
-          syncScriptProject(null);
-          syncAssetsProject(null);
-          syncOnlineEditorProject(null);
+          _syncProjectModules(null);
           localStorage.removeItem(STORAGE_PROJECT);
           refreshOverview();
         }
@@ -8046,16 +8029,7 @@ var _scriptEditInitialText = "";
 	          var p = await loadProjectData(project.id);
 	          if (!p || !p.id || p.id !== project.id) return false;
 	          project = p;
-	          syncEditProject(project);
-	          syncTasksProject(project);
-	          syncVideoTasksProject(project);
-	          syncVideoPromptsProject(project);
-	          syncShotsProject(project);
-	          syncStoryboardProject(project);
-	          syncBoardProject(project);
-	          syncScriptProject(project);
-	          syncAssetsProject(project);
-	          syncEpisodesProject(project);
+	          _syncProjectModules(project, { onlineEditor: false });
 	          return true;
 	        } catch (e) {
 	          console.warn("[reloadProjectFromServer] failed:", e);
@@ -8178,16 +8152,7 @@ var _scriptEditInitialText = "";
 	      applyProjectFromServer: (p) => {
 	        if (!p || !p.id || (project && p.id !== project.id)) return false;
 	        project = p;
-	        syncEditProject(project);
-	        syncTasksProject(project);
-	        syncVideoTasksProject(project);
-	        syncVideoPromptsProject(project);
-	        syncShotsProject(project);
-	        syncStoryboardProject(project);
-	        syncBoardProject(project);
-	        syncScriptProject(project);
-	        syncAssetsProject(project);
-	        syncEpisodesProject(project);
+	        _syncProjectModules(project, { onlineEditor: false });
 	        return true;
 	      },
 	      reloadProjectFromServer: async () => {
@@ -8196,16 +8161,7 @@ var _scriptEditInitialText = "";
 	          var p = await loadProjectData(project.id);
 	          if (!p || !p.id || p.id !== project.id) return false;
 	          project = p;
-	          syncEditProject(project);
-	          syncTasksProject(project);
-	          syncVideoTasksProject(project);
-	          syncVideoPromptsProject(project);
-	          syncShotsProject(project);
-	          syncStoryboardProject(project);
-	          syncBoardProject(project);
-	          syncScriptProject(project);
-	          syncAssetsProject(project);
-	          syncEpisodesProject(project);
+	          _syncProjectModules(project, { onlineEditor: false });
 	          return true;
 	        } catch (e) {
 	          console.warn("[reloadProjectFromServer] failed:", e);
@@ -8298,16 +8254,7 @@ var _scriptEditInitialText = "";
           var p = await loadProjectData(project.id);
           if (!p || !p.id || p.id !== project.id) return false;
           project = p;
-          syncEditProject(project);
-          syncTasksProject(project);
-          syncVideoTasksProject(project);
-          syncVideoPromptsProject(project);
-          syncShotsProject(project);
-          syncStoryboardProject(project);
-          syncBoardProject(project);
-          syncScriptProject(project);
-          syncAssetsProject(project);
-          syncEpisodesProject(project);
+          _syncProjectModules(project, { onlineEditor: false });
           return true;
         } catch (e) {
           console.warn("[reloadProjectFromServer] failed:", e);
@@ -8359,15 +8306,7 @@ var _scriptEditInitialText = "";
           var p = await loadProjectData(project.id);
           if (!p || !p.id || p.id !== project.id) return false;
           project = p;
-          syncEditProject(project);
-          syncTasksProject(project);
-          syncVideoTasksProject(project);
-          syncVideoPromptsProject(project);
-          syncShotsProject(project);
-          syncStoryboardProject(project);
-          syncBoardProject(project);
-          syncScriptProject(project);
-          syncAssetsProject(project);
+          _syncProjectModules(project, { onlineEditor: false });
           return true;
         } catch (e) {
           console.warn("[reloadProjectFromServer] failed:", e);

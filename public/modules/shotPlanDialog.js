@@ -48,9 +48,18 @@ const MORE_FIELDS = [
 let _ctx = {};
 let _overlay = null;
 let _expanded = new Set();
+let _selectedShotIdx = 0;
+let _draftsByShot = new Map();
 let _bound = false;
 let _lockState = { locked: false, reason: '' };
 let _lockSeq = 0;
+let _returnFocusEl = null;
+
+const DETAIL_TEXT_FIELDS = [
+  { field: 'visual', label: '画面描述' },
+  { field: 'dialogue', label: '对白/旁白' },
+  { field: 'audio', label: '音效' },
+];
 
 export function initShotPlanDialog(ctx) {
   _ctx = ctx || {};
@@ -58,15 +67,26 @@ export function initShotPlanDialog(ctx) {
   _bound = true;
   document.addEventListener('click', onGlobalClick);
   document.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape' && _overlay && !_overlay.hidden) closeShotPlanDialog();
+    if (!_overlay || _overlay.hidden) return;
+    if (event.key === 'Escape') {
+      closeShotPlanDialog();
+    } else if (event.key === 'Tab') {
+      trapDialogFocus(event);
+    }
   });
 }
 
-export function openShotPlanDialog() {
+export function openShotPlanDialog(triggerEl) {
   ensureOverlay();
+  const project = currentProject();
+  const shots = Array.isArray(project && project.shots) ? project.shots : [];
+  _selectedShotIdx = Math.min(Math.max(0, _selectedShotIdx || 0), Math.max(0, shots.length - 1));
+  _draftsByShot = new Map();
+  _returnFocusEl = triggerEl && typeof triggerEl.focus === 'function' ? triggerEl : document.activeElement;
   _overlay.hidden = false;
   document.body.classList.add('spd-open');
   render();
+  focusInitialControl();
   refreshStructureLock();
 }
 
@@ -74,6 +94,10 @@ export function closeShotPlanDialog() {
   if (!_overlay) return;
   _overlay.hidden = true;
   document.body.classList.remove('spd-open');
+  _draftsByShot = new Map();
+  const target = _returnFocusEl && document.contains(_returnFocusEl) ? _returnFocusEl : null;
+  _returnFocusEl = null;
+  if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
 }
 
 function currentProject() {
@@ -102,7 +126,7 @@ function onGlobalClick(event) {
   const btn = event.target && event.target.closest ? event.target.closest('[data-action="open-shot-plan-dialog"]') : null;
   if (!btn) return;
   event.preventDefault();
-  openShotPlanDialog();
+  openShotPlanDialog(btn);
 }
 
 function ensureOverlay() {
@@ -110,11 +134,60 @@ function ensureOverlay() {
   _overlay = document.createElement('div');
   _overlay.className = 'spd-overlay';
   _overlay.hidden = true;
-  _overlay.innerHTML = '<div class="spd-modal" role="dialog" aria-modal="true" aria-labelledby="spdTitle"><div class="spd-body" data-spd-body></div></div>';
+  _overlay.innerHTML = '<div class="spd-modal" role="dialog" aria-modal="true" aria-labelledby="spdTitle" tabindex="-1"><div class="spd-body" data-spd-body></div></div>';
   document.body.appendChild(_overlay);
   _overlay.addEventListener('click', onOverlayClick);
   _overlay.addEventListener('change', onOverlayChange);
-  _overlay.addEventListener('focusout', onOverlayFocusOut);
+  _overlay.addEventListener('input', onOverlayInput);
+}
+
+function focusInitialControl() {
+  if (!_overlay || _overlay.hidden) return;
+  const selected = _overlay.querySelector('[data-spd-action="select-shot"].is-active');
+  const closeBtn = _overlay.querySelector('[data-spd-close]');
+  const modal = _overlay.querySelector('.spd-modal');
+  const target = selected || closeBtn || modal;
+  if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+}
+
+function getDialogFocusableElements() {
+  if (!_overlay || _overlay.hidden) return [];
+  const selector = [
+    'a[href]',
+    'button:not([disabled])',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(',');
+  return Array.from(_overlay.querySelectorAll(selector)).filter(function (el) {
+    if (!el || el.hidden) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    return !style || (style.display !== 'none' && style.visibility !== 'hidden');
+  });
+}
+
+function trapDialogFocus(event) {
+  const focusables = getDialogFocusableElements();
+  if (!focusables.length) {
+    event.preventDefault();
+    focusInitialControl();
+    return;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (!active || !_overlay.contains(active)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus({ preventScroll: true });
+  } else if (event.shiftKey && active === first) {
+    event.preventDefault();
+    last.focus({ preventScroll: true });
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus({ preventScroll: true });
+  }
 }
 
 async function refreshStructureLock() {
@@ -144,6 +217,7 @@ async function refreshStructureLock() {
     _lockState = local;
   }
   render();
+  if (_overlay && !_overlay.hidden && !_overlay.contains(document.activeElement)) focusInitialControl();
 }
 
 function structureLockFromProject(project) {
@@ -166,7 +240,11 @@ function onOverlayClick(event) {
   if (action === 'toggle-more') {
     if (_expanded.has(idx)) _expanded.delete(idx);
     else _expanded.add(idx);
-    render();
+    refreshShotPlanPanels();
+  } else if (action === 'select-shot') {
+    selectShot(idx);
+  } else if (action === 'apply-current') {
+    applyDraftToShot(idx);
   } else if (action === 'merge-next') {
     regroup('merge-next', idx);
   } else if (action === 'split-out') {
@@ -185,31 +263,127 @@ function onOverlayClick(event) {
 function onOverlayChange(event) {
   const select = event.target && event.target.closest ? event.target.closest('[data-spd-field]') : null;
   if (!select || select.tagName !== 'SELECT') return;
-  applyField(select);
+  updateDraftField(select);
 }
 
-function onOverlayFocusOut(event) {
+function onOverlayInput(event) {
   const field = event.target && event.target.closest ? event.target.closest('[data-spd-field]') : null;
   if (!field || field.tagName !== 'TEXTAREA') return;
-  applyField(field);
+  updateDraftField(field);
 }
 
-function applyField(fieldEl) {
+function updateDraftField(fieldEl) {
   const row = fieldEl.closest('[data-shot-idx]');
   const idx = Number(row && row.getAttribute('data-shot-idx'));
   const field = fieldEl.getAttribute('data-spd-field');
+  if (!Number.isInteger(idx) || !field) return;
+  const draft = ensureDraft(idx);
+  if (!draft) return;
+  draft.fields[field] = fieldEl.value;
+  syncDraftIndicators(idx);
+}
+
+function applyDraftToShot(idx) {
   const project = currentProject();
   const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
-  if (!shot || !field) return;
-  const before = _shotFieldCurrent(shot, field);
-  const value = fieldEl.value;
-  if (String(before) === String(value)) return;
-  _applyShotFieldValue(shot, field, value);
+  const draft = _draftsByShot.get(idx);
+  if (!shot || !draft) return;
+  let changed = false;
+  Object.keys(draft.fields).forEach(function (field) {
+    const before = _shotFieldCurrent(shot, field);
+    const value = draft.fields[field];
+    if (String(before) === String(value)) return;
+    _applyShotFieldValue(shot, field, value);
+    changed = true;
+  });
+  if (!changed) {
+    syncDraftIndicators(idx);
+    return;
+  }
   markShotStale(idx);
   saveProject();
   renderShotList();
   refreshBoardPage();
-  render();
+  _draftsByShot.set(idx, makeDraftFromShot(shot));
+  refreshShotPlanPanels();
+}
+
+function editableFieldNames() {
+  return HIGH_FIELDS.concat(MORE_FIELDS).map(function (spec) { return spec.field; })
+    .concat(DETAIL_TEXT_FIELDS.map(function (spec) { return spec.field; }));
+}
+
+function makeDraftFromShot(shot) {
+  const fields = {};
+  editableFieldNames().forEach(function (field) {
+    fields[field] = _shotFieldCurrent(shot, field);
+  });
+  return { fields };
+}
+
+function ensureDraft(idx) {
+  if (_draftsByShot.has(idx)) return _draftsByShot.get(idx);
+  const project = currentProject();
+  const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
+  if (!shot) return null;
+  const draft = makeDraftFromShot(shot);
+  _draftsByShot.set(idx, draft);
+  return draft;
+}
+
+function draftValue(shot, idx, field) {
+  const draft = ensureDraft(idx);
+  if (draft && Object.prototype.hasOwnProperty.call(draft.fields, field)) return draft.fields[field];
+  return _shotFieldCurrent(shot, field);
+}
+
+function isDraftDirty(idx) {
+  const project = currentProject();
+  const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
+  const draft = _draftsByShot.get(idx);
+  if (!shot || !draft) return false;
+  return Object.keys(draft.fields).some(function (field) {
+    return String(_shotFieldCurrent(shot, field)) !== String(draft.fields[field]);
+  });
+}
+
+function selectShot(idx) {
+  const project = currentProject();
+  const shots = Array.isArray(project && project.shots) ? project.shots : [];
+  if (!Number.isInteger(idx) || idx < 0 || idx >= shots.length) return;
+  _selectedShotIdx = idx;
+  ensureDraft(idx);
+  refreshShotPlanPanels();
+}
+
+function syncDraftIndicators(idx) {
+  if (!_overlay) return;
+  const dirty = isDraftDirty(idx);
+  const applyBtn = _overlay.querySelector('[data-spd-action="apply-current"][data-shot-idx="' + idx + '"]');
+  if (applyBtn) {
+    applyBtn.disabled = !dirty;
+    applyBtn.setAttribute('aria-disabled', dirty ? 'false' : 'true');
+  }
+  const listBtn = _overlay.querySelector('[data-spd-action="select-shot"][data-shot-idx="' + idx + '"]');
+  if (listBtn) listBtn.classList.toggle('is-dirty', dirty);
+  const dirtyState = _overlay.querySelector('[data-spd-dirty-state][data-shot-idx="' + idx + '"]');
+  if (dirtyState) dirtyState.textContent = dirty ? '有未应用修改' : '当前镜头未修改';
+}
+
+function refreshShotPlanPanels() {
+  if (!_overlay || _overlay.hidden) return;
+  const project = currentProject();
+  const shots = Array.isArray(project && project.shots) ? project.shots : [];
+  const groups = readGroups(project || {});
+  if (!shots.length) {
+    render();
+    return;
+  }
+  _selectedShotIdx = Math.min(Math.max(0, _selectedShotIdx || 0), shots.length - 1);
+  const list = _overlay.querySelector('[data-spd-list]');
+  const detail = _overlay.querySelector('[data-spd-detail]');
+  if (list) list.innerHTML = renderShotListItems(project, shots, groups);
+  if (detail) detail.innerHTML = renderShotDetail(project, shots[_selectedShotIdx], _selectedShotIdx, groups);
 }
 
 function readGroups(project) {
@@ -370,8 +544,8 @@ function applyGroupsToProject(project, groups) {
   });
 }
 
-function fieldSelect(spec, shot) {
-  const current = _shotFieldCurrent(shot, spec.field);
+function fieldSelect(spec, shot, idx) {
+  const current = draftValue(shot, idx, spec.field);
   let options = '';
   if (spec.type === 'duration') options = _buildDurationOptions(current);
   else if (spec.type === 'pace') options = _buildPaceOptions(current);
@@ -379,8 +553,8 @@ function fieldSelect(spec, shot) {
   return '<label class="spd-chip"><span>' + escapeHtml(spec.label) + '</span><select data-spd-field="' + escapeHtml(spec.field) + '">' + options + '</select></label>';
 }
 
-function textareaField(label, field, shot) {
-  return '<label class="spd-textfield"><span>' + escapeHtml(label) + '</span><textarea rows="2" data-spd-field="' + escapeHtml(field) + '">' + escapeHtml(_shotFieldCurrent(shot, field)) + '</textarea></label>';
+function textareaField(label, field, shot, idx) {
+  return '<label class="spd-textfield"><span>' + escapeHtml(label) + '</span><textarea rows="3" data-spd-field="' + escapeHtml(field) + '">' + escapeHtml(draftValue(shot, idx, field)) + '</textarea></label>';
 }
 
 function groupActions(groups, shotIdx, locked) {
@@ -401,7 +575,26 @@ function groupActions(groups, shotIdx, locked) {
   '</div>';
 }
 
-function renderShotRow(project, shot, idx, groups) {
+function renderShotListItem(project, shot, idx, groups) {
+  const groupIdx = findGroup(groups, idx);
+  const group = groups[groupIdx] || [idx];
+  const active = idx === _selectedShotIdx;
+  const dirty = isDraftDirty(idx);
+  const visual = String(_shotFieldCurrent(shot, 'visual') || '').trim();
+  return '<button type="button" class="spd-shot-list-item' + (active ? ' is-active' : '') + (dirty ? ' is-dirty' : '') + '" data-spd-action="select-shot" data-shot-idx="' + idx + '" aria-selected="' + (active ? 'true' : 'false') + '">' +
+    '<strong>' + String(idx + 1).padStart(2, '0') + '</strong>' +
+    '<span>镜头 ' + escapeHtml(idx + 1) + '</span>' +
+    '<small>片段 ' + escapeHtml(groupIdx + 1) + ' · ' + escapeHtml(group.map(function (n) { return n + 1; }).join(' / ')) + '</small>' +
+    '<em>' + escapeHtml(visual || '暂无画面描述') + '</em>' +
+  '</button>';
+}
+
+function renderShotListItems(project, shots, groups) {
+  return shots.map(function (shot, idx) { return renderShotListItem(project, shot, idx, groups); }).join('');
+}
+
+function renderShotDetail(project, shot, idx, groups) {
+  ensureDraft(idx);
   const groupIdx = findGroup(groups, idx);
   const group = groups[groupIdx] || [idx];
   const expanded = _expanded.has(idx);
@@ -409,22 +602,22 @@ function renderShotRow(project, shot, idx, groups) {
   const storyboard = groupIdx >= 0 ? storyboards[groupIdx] : null;
   const videoPrompt = String((storyboard && storyboard.videoPrompt) || '').trim();
   const locked = !!_lockState.locked;
-  return '<article class="spd-row" data-shot-idx="' + idx + '">' +
+  const dirty = isDraftDirty(idx);
+  return '<article class="spd-row spd-row--detail" data-shot-idx="' + idx + '">' +
     '<div class="spd-row-main">' +
       '<div class="spd-shot-no"><strong>' + String(idx + 1).padStart(2, '0') + '</strong><span>镜头</span></div>' +
       '<div class="spd-group-cell"><span class="spd-group-pill">片段 ' + escapeHtml(groupIdx + 1) + '</span><small>' + escapeHtml(group.map(function (n) { return n + 1; }).join(' / ')) + '</small></div>' +
       '<div class="spd-field-stack">' +
-        '<div class="spd-chip-row">' + HIGH_FIELDS.map(function (spec) { return fieldSelect(spec, shot); }).join('') + '</div>' +
-        (expanded ? '<div class="spd-chip-row spd-chip-row--more">' + MORE_FIELDS.map(function (spec) { return fieldSelect(spec, shot); }).join('') + '</div>' : '') +
+        '<div class="spd-chip-row">' + HIGH_FIELDS.map(function (spec) { return fieldSelect(spec, shot, idx); }).join('') + '</div>' +
+        (expanded ? '<div class="spd-chip-row spd-chip-row--more">' + MORE_FIELDS.map(function (spec) { return fieldSelect(spec, shot, idx); }).join('') + '</div>' : '') +
       '</div>' +
       '<button type="button" class="spd-more-btn" data-spd-action="toggle-more">' + (expanded ? '收起参数' : '更多参数') + '</button>' +
     '</div>' +
     '<div class="spd-row-detail">' +
-      textareaField('画面描述', 'visual', shot) +
-      textareaField('对白/旁白', 'dialogue', shot) +
-      textareaField('音效', 'audio', shot) +
+      DETAIL_TEXT_FIELDS.map(function (spec) { return textareaField(spec.label, spec.field, shot, idx); }).join('') +
       '<label class="spd-textfield spd-textfield--readonly"><span>最终提示词</span><textarea rows="2" readonly>' + escapeHtml(videoPrompt || '未生成') + '</textarea></label>' +
       groupActions(groups, idx, locked) +
+      '<div class="spd-detail-footer"><span data-spd-dirty-state data-shot-idx="' + idx + '">' + (dirty ? '有未应用修改' : '当前镜头未修改') + '</span><button type="button" class="spd-apply-btn" data-spd-action="apply-current" data-shot-idx="' + idx + '"' + (dirty ? '' : ' disabled aria-disabled="true"') + '>应用本镜头</button></div>' +
     '</div>' +
   '</article>';
 }
@@ -436,6 +629,10 @@ function render() {
   if (!body) return;
   const shots = Array.isArray(project && project.shots) ? project.shots : [];
   const groups = readGroups(project || {});
+  if (shots.length) {
+    _selectedShotIdx = Math.min(Math.max(0, _selectedShotIdx || 0), shots.length - 1);
+    ensureDraft(_selectedShotIdx);
+  }
   const lockHtml = _lockState.locked
     ? '<div class="spd-lock"><span class="material-symbols-outlined">lock</span>' + escapeHtml(_lockState.reason || '生成中暂不能修改镜头结构') + '</div>'
     : '';
@@ -446,7 +643,7 @@ function render() {
     '</header>' +
     '<div class="spd-progress"><span>1/3 完成后可批量生视频</span><strong>→ 下一步：准备资产</strong></div>' +
     lockHtml +
-    '<section class="spd-list">' +
-      (shots.length ? shots.map(function (shot, idx) { return renderShotRow(project, shot, idx, groups); }).join('') : '<div class="spd-empty">暂无镜头计划</div>') +
-    '</section>';
+    (shots.length
+      ? '<section class="spd-workbench"><aside class="spd-shot-list" data-spd-list>' + renderShotListItems(project, shots, groups) + '</aside><section class="spd-detail-panel" data-spd-detail>' + renderShotDetail(project, shots[_selectedShotIdx], _selectedShotIdx, groups) + '</section></section>'
+      : '<section class="spd-list"><div class="spd-empty">暂无镜头计划</div></section>');
 }

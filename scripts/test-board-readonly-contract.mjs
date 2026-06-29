@@ -64,5 +64,14 @@ assert.match(boardSrc, /function unobserveBoardImages\(root\)/, 'board image obs
 assert.match(functionBody(boardSrc, 'removeStaleNodes'), /unobserveBoardImages\(_nodeEls\.get\(id\)\)/, 'stale nodes unobserve board images before DOM removal');
 assert.match(functionBody(boardSrc, 'renderSegmentNode'), /const badgeText = placeholderCount \? '封面占位 ' \+ placeholderCount \+ '\/' \+ shotRows\.length : '首帧 0\/' \+ shotRows\.length;/, 'segment header badge must not present reused covers as per-shot first frames');
 assert.match(functionBody(boardSrc, 'renderSegmentNode'), /const frameLabel = isPlaceholder \? '片段封面占位'/, 'segment rows label reused covers as placeholders');
+assert.match(boardSrc, /data-board-minimap/, 'board renders a native minimap surface');
+assert.match(boardSrc, /function updateMiniMap\(vm\)/, 'board updates minimap from the current view model');
+assert.match(boardSrc, /function updateMiniMapViewport\(\)/, 'board keeps the minimap viewport rectangle in sync with camera changes');
+assert.match(boardSrc, /function onMiniMapPointerDown\(event\)/, 'board minimap supports click-to-center navigation');
+assert.match(boardSrc, /function clampMiniMapViewRect\(rect, metrics\)/, 'board minimap clamps the visible viewport rectangle');
+assert.match(functionBody(boardSrc, 'onMiniMapPointerDown'), /clampValue\(metrics\.bounds\.x \+ \(px - metrics\.ox\) \/ metrics\.scale/, 'minimap click target clamps to board bounds');
+assert.match(boardSrc, /data-board-help/, 'board renders an inline help panel');
+assert.match(boardSrc, /function toggleBoardHelp\(force\)/, 'board help is toggled in-place');
+assert.doesNotMatch(functionBody(boardSrc, 'onToolClick'), /showToast/, 'board help must not be a placeholder toast');
 
 console.log('✓ board readonly contract passed');

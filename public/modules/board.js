@@ -17,15 +17,23 @@ let _edgesEl = null;
 let _surfaceEl = null;
 let _toolsEl = null;
 let _scaleLabelEl = null;
+let _miniMapEl = null;
+let _miniMapSvgEl = null;
+let _helpEl = null;
 let _viewport = null;
 let _nodeEls = new Map();
 let _selectedId = '';
 let _lastProjectId = '';
 let _cameraReadyProjectId = '';
 let _handMode = false;
+let _helpOpen = false;
+let _lastViewModel = null;
 const EMPTY_IMAGE_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 const BOARD_IMAGE_VIEWPORT_MARGIN = 640;
 const BOARD_IMAGE_CONCURRENCY = 6;
+const MINIMAP_W = 180;
+const MINIMAP_H = 132;
+const MINIMAP_PAD = 10;
 let _boardImageObserver = null;
 let _boardImageQueue = [];
 let _boardImageActive = 0;
@@ -238,6 +246,9 @@ function ensureRoot() {
     '      <div class="board-nodes" data-board-nodes></div>',
     '    </div>',
     '  </div>',
+    '  <div class="board-minimap" data-board-minimap data-board-control aria-label="画板小地图">',
+    '    <svg class="board-minimap-svg" data-board-minimap-svg viewBox="0 0 ' + MINIMAP_W + ' ' + MINIMAP_H + '" aria-hidden="true"></svg>',
+    '  </div>',
     '  <div class="board-tools" data-board-control>',
     '    <button type="button" class="board-tool" data-board-tool="undo" disabled title="下一阶段接入"><span class="material-symbols-outlined">undo</span></button>',
     '    <button type="button" class="board-tool" data-board-tool="redo" disabled title="下一阶段接入"><span class="material-symbols-outlined">redo</span></button>',
@@ -248,8 +259,18 @@ function ensureRoot() {
     '    <button type="button" class="board-tool" data-board-tool="zoom-in" title="放大"><span class="material-symbols-outlined">add</span></button>',
     '    <button type="button" class="board-tool" data-board-tool="zoom-selected" title="缩放到选中"><span class="material-symbols-outlined">center_focus_strong</span></button>',
     '    <button type="button" class="board-tool" data-board-tool="reset" title="100%"><span class="material-symbols-outlined">zoom_in_map</span></button>',
-    '    <button type="button" class="board-tool" data-board-tool="help" title="帮助"><span class="material-symbols-outlined">help</span></button>',
+    '    <button type="button" class="board-tool" data-board-tool="help" title="帮助" aria-expanded="false" aria-controls="boardHelpPanel"><span class="material-symbols-outlined">help</span></button>',
     '  </div>',
+    '  <section class="board-help-panel" id="boardHelpPanel" data-board-help data-board-control hidden aria-label="画板帮助">',
+    '    <header><h2>画板操作</h2><button type="button" class="board-help-close" data-board-help-close aria-label="关闭帮助"><span class="material-symbols-outlined">close</span></button></header>',
+    '    <dl>',
+    '      <div><dt>移动</dt><dd>双指拖动，或按住空格拖动画板</dd></div>',
+    '      <div><dt>缩放</dt><dd>触控板捏合，或 Ctrl/⌘ + 滚轮</dd></div>',
+    '      <div><dt>全览</dt><dd>Shift + 1</dd></div>',
+    '      <div><dt>选中节点</dt><dd>点击节点后按 Shift + 2 聚焦</dd></div>',
+    '      <div><dt>重置</dt><dd>按 0 回到 100%</dd></div>',
+    '    </dl>',
+    '  </section>',
     '</div>',
   ].join('');
 
@@ -260,6 +281,9 @@ function ensureRoot() {
   _surfaceEl = _root.querySelector('.board-surface');
   _toolsEl = _root.querySelector('.board-tools');
   _scaleLabelEl = _root.querySelector('[data-board-scale]');
+  _miniMapEl = _root.querySelector('[data-board-minimap]');
+  _miniMapSvgEl = _root.querySelector('[data-board-minimap-svg]');
+  _helpEl = _root.querySelector('[data-board-help]');
 
   _viewport = createViewport(_viewportRoot, {
     worldEl: _worldEl,
@@ -269,6 +293,7 @@ function ensureRoot() {
       const projectId = projectIdOf(currentProject());
       saveCamera(projectId, transform);
       scheduleBoardImageHydration();
+      updateMiniMapViewport();
     },
     onEscape() {
       _selectedId = '';
@@ -277,12 +302,144 @@ function ensureRoot() {
 
   _viewportRoot.addEventListener('click', onViewportClick);
   _toolsEl.addEventListener('click', onToolClick);
+  _root.addEventListener('click', onRootClick);
+  if (_miniMapEl) _miniMapEl.addEventListener('pointerdown', onMiniMapPointerDown);
   return true;
 }
 
 function currentProject() {
   if (_project) return _project;
   return typeof _ctx.getProject === 'function' ? _ctx.getProject() : null;
+}
+
+function minimapMetrics(bounds) {
+  const box = bounds || {};
+  const w = Math.max(1, Number(box.w) || 1);
+  const h = Math.max(1, Number(box.h) || 1);
+  const usableW = MINIMAP_W - MINIMAP_PAD * 2;
+  const usableH = MINIMAP_H - MINIMAP_PAD * 2;
+  const scale = Math.min(usableW / w, usableH / h);
+  const drawnW = w * scale;
+  const drawnH = h * scale;
+  return {
+    bounds: { x: Number(box.x) || 0, y: Number(box.y) || 0, w, h },
+    scale,
+    ox: (MINIMAP_W - drawnW) / 2,
+    oy: (MINIMAP_H - drawnH) / 2,
+  };
+}
+
+function mapWorldRect(rect, metrics) {
+  return {
+    x: metrics.ox + (Number(rect.x) - metrics.bounds.x) * metrics.scale,
+    y: metrics.oy + (Number(rect.y) - metrics.bounds.y) * metrics.scale,
+    w: Math.max(1, Number(rect.w) * metrics.scale),
+    h: Math.max(1, Number(rect.h) * metrics.scale),
+  };
+}
+
+function clampValue(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function clampMiniMapViewRect(rect, metrics) {
+  const maxW = metrics.bounds.w * metrics.scale;
+  const maxH = metrics.bounds.h * metrics.scale;
+  const w = Math.min(maxW, Math.max(6, rect.w));
+  const h = Math.min(maxH, Math.max(6, rect.h));
+  return {
+    x: maxW <= w ? metrics.ox : clampValue(rect.x, metrics.ox, metrics.ox + maxW - w),
+    y: maxH <= h ? metrics.oy : clampValue(rect.y, metrics.oy, metrics.oy + maxH - h),
+    w,
+    h,
+  };
+}
+
+function currentViewportWorldRect() {
+  if (!_viewport || !_viewportRoot) return null;
+  const transform = _viewport.getTransform();
+  const rect = _viewportRoot.getBoundingClientRect ? _viewportRoot.getBoundingClientRect() : null;
+  const vw = Math.max(1, Number((rect && rect.width) || _viewportRoot.clientWidth) || 1);
+  const vh = Math.max(1, Number((rect && rect.height) || _viewportRoot.clientHeight) || 1);
+  const k = Math.max(0.01, Number(transform.k) || 1);
+  return {
+    x: -Number(transform.x || 0) / k,
+    y: -Number(transform.y || 0) / k,
+    w: vw / k,
+    h: vh / k,
+  };
+}
+
+function nodeMiniMapClass(kind) {
+  const safe = String(kind || 'node').replace(/[^a-z0-9_-]/gi, '');
+  return 'board-minimap-node board-minimap-node--' + (safe || 'node');
+}
+
+function updateMiniMap(vm) {
+  _lastViewModel = vm || null;
+  if (!_miniMapSvgEl || !vm || !Array.isArray(vm.nodes)) {
+    if (_miniMapSvgEl) _miniMapSvgEl.innerHTML = '';
+    return;
+  }
+  const metrics = minimapMetrics(vm.bounds);
+  const nodes = vm.nodes.map((node) => {
+    const r = mapWorldRect(node, metrics);
+    return '<rect class="' + nodeMiniMapClass(node.kind) + '" x="' + r.x.toFixed(2) + '" y="' + r.y.toFixed(2) + '" width="' + r.w.toFixed(2) + '" height="' + r.h.toFixed(2) + '" rx="3"></rect>';
+  }).join('');
+  _miniMapSvgEl.innerHTML =
+    '<rect class="board-minimap-bg" x="0.5" y="0.5" width="' + (MINIMAP_W - 1) + '" height="' + (MINIMAP_H - 1) + '" rx="8"></rect>' +
+    nodes +
+    '<rect class="board-minimap-view" data-board-minimap-view x="0" y="0" width="1" height="1" rx="3"></rect>';
+  updateMiniMapViewport();
+}
+
+function updateMiniMapViewport() {
+  if (!_miniMapSvgEl || !_lastViewModel) return;
+  const viewEl = _miniMapSvgEl.querySelector('[data-board-minimap-view]');
+  const worldView = currentViewportWorldRect();
+  if (!viewEl || !worldView) return;
+  const metrics = minimapMetrics(_lastViewModel.bounds);
+  const r = clampMiniMapViewRect(mapWorldRect(worldView, metrics), metrics);
+  viewEl.setAttribute('x', r.x.toFixed(2));
+  viewEl.setAttribute('y', r.y.toFixed(2));
+  viewEl.setAttribute('width', r.w.toFixed(2));
+  viewEl.setAttribute('height', r.h.toFixed(2));
+}
+
+function onMiniMapPointerDown(event) {
+  if (!_viewport || !_viewportRoot || !_miniMapSvgEl || !_lastViewModel) return;
+  const rect = _miniMapSvgEl.getBoundingClientRect ? _miniMapSvgEl.getBoundingClientRect() : null;
+  if (!rect || !rect.width || !rect.height) return;
+  const metrics = minimapMetrics(_lastViewModel.bounds);
+  const px = (Number(event.clientX) - rect.left) * (MINIMAP_W / rect.width);
+  const py = (Number(event.clientY) - rect.top) * (MINIMAP_H / rect.height);
+  const worldX = clampValue(metrics.bounds.x + (px - metrics.ox) / metrics.scale, metrics.bounds.x, metrics.bounds.x + metrics.bounds.w);
+  const worldY = clampValue(metrics.bounds.y + (py - metrics.oy) / metrics.scale, metrics.bounds.y, metrics.bounds.y + metrics.bounds.h);
+  const rootRect = _viewportRoot && _viewportRoot.getBoundingClientRect ? _viewportRoot.getBoundingClientRect() : null;
+  const vw = Math.max(1, Number((rootRect && rootRect.width) || _viewportRoot.clientWidth) || 1);
+  const vh = Math.max(1, Number((rootRect && rootRect.height) || _viewportRoot.clientHeight) || 1);
+  const transform = _viewport.getTransform();
+  _viewport.setTransform({
+    k: transform.k,
+    x: vw / 2 - worldX * transform.k,
+    y: vh / 2 - worldY * transform.k,
+  });
+  event.preventDefault();
+}
+
+function toggleBoardHelp(force) {
+  _helpOpen = typeof force === 'boolean' ? force : !_helpOpen;
+  if (_helpEl) _helpEl.hidden = !_helpOpen;
+  const helpBtn = _toolsEl && _toolsEl.querySelector('[data-board-tool="help"]');
+  if (helpBtn) {
+    helpBtn.classList.toggle('is-active', _helpOpen);
+    helpBtn.setAttribute('aria-expanded', _helpOpen ? 'true' : 'false');
+  }
+}
+
+function onRootClick(event) {
+  const close = event.target && event.target.closest ? event.target.closest('[data-board-help-close]') : null;
+  if (close) toggleBoardHelp(false);
 }
 
 function setSurfaceBounds(bounds) {
@@ -466,8 +623,8 @@ function onToolClick(event) {
     _handMode = !_handMode;
     _viewport.setHandMode(_handMode);
     btn.classList.toggle('is-active', _handMode);
-  } else if (tool === 'help' && typeof _ctx.showToast === 'function') {
-    _ctx.showToast('下一阶段接入画板帮助', 'info');
+  } else if (tool === 'help') {
+    toggleBoardHelp();
   }
 }
 
@@ -494,6 +651,7 @@ export function refreshBoardPage() {
     _nodesEl.innerHTML = '<div class="board-no-project"><h2>画板</h2><p>暂无项目</p></div>';
     _nodeEls.clear();
     _viewport.setEdges([]);
+    updateMiniMap(null);
     return;
   }
   const groups = typeof _ctx.getStoryboardGroups === 'function' ? _ctx.getStoryboardGroups() : [];
@@ -503,6 +661,7 @@ export function refreshBoardPage() {
   vm.nodes.forEach(ensureNodeElement);
   _viewport.setEdges(vm.edges);
   _viewport.setSelected(_selectedId);
+  updateMiniMap(vm);
   applyCamera(projectIdOf(project));
   _viewport.refreshCulling();
   hydrate();
