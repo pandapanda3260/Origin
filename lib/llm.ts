@@ -1580,13 +1580,40 @@ export async function chatStream(
   }
   const budgetedOpts = applyTokenBudget(cfg, messages, opts, 'stream');
 
+  let emittedChunk = false;
+  const trackedOnChunk = (text: string) => {
+    if (text) emittedChunk = true;
+    onChunk(text);
+  };
+
+  try {
+    return await chatStreamOnce(cfg, messages, budgetedOpts, trackedOnChunk);
+  } catch (error: any) {
+    const fallbackCfg = !emittedChunk ? selectTextFallbackConfig(cfg, error, opts) : null;
+    if (!fallbackCfg) throw error;
+
+    console.warn(
+      `[llm.fallback.stream] ${opts.traceName || 'chatStream'} ` +
+      `${cfg.provider}/${cfg.model} -> ${fallbackCfg.provider}/${fallbackCfg.model}: ${String(error?.message || error).slice(0, 240)}`,
+    );
+    const fallbackOpts = applyTokenBudget(fallbackCfg, messages, opts, 'stream');
+    return chatStreamOnce(fallbackCfg, messages, fallbackOpts, onChunk);
+  }
+}
+
+function chatStreamOnce(
+  cfg: ResolvedModelConfig,
+  messages: ChatMessage[],
+  opts: LLMOptions,
+  onChunk: (text: string) => void,
+): Promise<string> {
   if (cfg.provider === 'zerail_messages' || cfg.provider === 'code80_messages' || cfg.provider === 'packy_messages') {
-    return observeTextModelCall(cfg, budgetedOpts, () => claudeMessagesStream(cfg, messages, budgetedOpts, onChunk));
+    return observeTextModelCall(cfg, opts, () => claudeMessagesStream(cfg, messages, opts, onChunk));
   }
   if (cfg.provider === 'zerail_responses' || cfg.provider === 'openai_responses' || cfg.provider === 'packy_responses') {
-    return observeTextModelCall(cfg, budgetedOpts, () => responsesStream(cfg, messages, budgetedOpts, onChunk));
+    return observeTextModelCall(cfg, opts, () => responsesStream(cfg, messages, opts, onChunk));
   }
-  return observeTextModelCall(cfg, budgetedOpts, () => openAIChatStream(cfg, messages, budgetedOpts, onChunk));
+  return observeTextModelCall(cfg, opts, () => openAIChatStream(cfg, messages, opts, onChunk));
 }
 
 function withDefaultTokenContext(user: UserRow | null, opts: LLMOptions): LLMOptions {

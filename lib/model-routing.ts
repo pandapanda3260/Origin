@@ -109,7 +109,7 @@ export function resolveTextModelConfig(
   if (role === 'brain') {
     const key = env('CLAUDE_API_KEY') || env('TEXT_API_KEY');
     if (key) {
-      return real({
+      const cfg = real({
         baseUrl: env('CLAUDE_API_BASE') || env('TEXT_API_BASE') || 'https://gateway.zerail.com/v1',
         apiKey: key,
         model: env('CLAUDE_MODEL') || env('MODEL_PRIMARY_BRAIN') || 'claude-opus-4-8',
@@ -119,6 +119,7 @@ export function resolveTextModelConfig(
         source: 'env',
         tier: env('CLAUDE_TIER') || env('MODEL_PRIMARY_BRAIN_TIER') || undefined,
       });
+      return attachTextFallbackConfigs(cfg, role);
     }
   }
 
@@ -463,9 +464,75 @@ function inferResponsesProvider(provider: string, baseUrl: string): ProviderKind
 }
 
 function attachTextFallbackConfigs(cfg: ResolvedModelConfig, role: TextModelRole): ResolvedModelConfig {
-  if (role === 'brain') return cfg;
-  const fallbackConfigs = resolveCode80TextFallbackConfigs(cfg, role);
-  return fallbackConfigs.length ? { ...cfg, fallbackConfigs } : cfg;
+  const fallbackConfigs = [
+    ...(role === 'brain' ? resolveBrainTextFallbackConfigs(cfg) : []),
+    ...resolveCode80TextFallbackConfigs(cfg, role),
+  ];
+  const deduped = dedupeFallbackConfigs(fallbackConfigs);
+  return deduped.length ? { ...cfg, fallbackConfigs: deduped } : cfg;
+}
+
+function dedupeFallbackConfigs(configs: ResolvedModelConfig[]): ResolvedModelConfig[] {
+  const seen = new Set<string>();
+  const out: ResolvedModelConfig[] = [];
+  for (const cfg of configs) {
+    const key = [
+      cfg.provider,
+      normalizeBaseUrl(cfg.baseUrl),
+      normalizeEndpoint(cfg.endpoint || ''),
+      cfg.model,
+    ].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cfg);
+  }
+  return out;
+}
+
+function resolveBrainTextFallbackConfigs(primary: ResolvedModelConfig): ResolvedModelConfig[] {
+  if (env('BRAIN_FALLBACK_ENABLED').toLowerCase() === 'false') return [];
+
+  const apiKey =
+    env('BRAIN_FALLBACK_API_KEY') ||
+    env('TEXT_API_KEY') ||
+    env('OPENAI_API_KEY');
+  if (!apiKey) return [];
+
+  const baseUrl =
+    env('BRAIN_FALLBACK_API_BASE') ||
+    env('TEXT_API_BASE') ||
+    env('OPENAI_BASE_URL') ||
+    primary.baseUrl;
+  const endpoint = env('BRAIN_FALLBACK_API_ENDPOINT') || env('TEXT_API_ENDPOINT') || '/responses';
+  const provider = inferResponsesProvider(env('BRAIN_FALLBACK_PROVIDER') || env('TEXT_PROVIDER'), baseUrl);
+  const model =
+    env('BRAIN_FALLBACK_MODEL') ||
+    env('TEXT_MODEL') ||
+    env('OPENAI_MODEL') ||
+    env('MODEL_STRUCTURED_WORKER') ||
+    'gpt-5.5';
+
+  const sameAsPrimary =
+    primary.provider === provider &&
+    normalizeBaseUrl(primary.baseUrl) === normalizeBaseUrl(baseUrl) &&
+    normalizeEndpoint(primary.endpoint || '') === normalizeEndpoint(endpoint) &&
+    primary.model === model;
+  if (sameAsPrimary) return [];
+
+  return [
+    real({
+      baseUrl,
+      apiKey,
+      model,
+      provider,
+      endpoint,
+      role: 'brain',
+      source: 'env',
+      reasoningEffort: env('BRAIN_FALLBACK_REASONING_EFFORT') || env('TEXT_REASONING_EFFORT') || undefined,
+      disableResponseStorage: envBool('BRAIN_FALLBACK_DISABLE_RESPONSE_STORAGE') ?? envBool('TEXT_DISABLE_RESPONSE_STORAGE'),
+      fallbackOf: `${primary.provider}:${primary.model}`,
+    }),
+  ];
 }
 
 function attachImageFallbackConfigs(cfg: ResolvedModelConfig): ResolvedModelConfig {
