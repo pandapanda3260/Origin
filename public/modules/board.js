@@ -24,6 +24,12 @@ let _lastProjectId = '';
 let _cameraReadyProjectId = '';
 let _handMode = false;
 const EMPTY_IMAGE_SRC = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+const BOARD_IMAGE_VIEWPORT_MARGIN = 640;
+const BOARD_IMAGE_CONCURRENCY = 6;
+let _boardImageObserver = null;
+let _boardImageQueue = [];
+let _boardImageActive = 0;
+let _boardImageHydrateRaf = 0;
 
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -40,20 +46,121 @@ function assetImg(url, alt) {
   return '<img class="board-thumb" src="' + EMPTY_IMAGE_SRC + '" data-board-src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt || '') + '" loading="lazy" decoding="async">';
 }
 
-function hydrateBoardImages(root) {
-  if (!root || !root.querySelectorAll) return;
-  root.querySelectorAll('img[data-board-src]').forEach((img) => {
-    const source = String(img.getAttribute('data-board-src') || '').trim();
-    if (!source || img.getAttribute('data-board-resolved-source') === source) return;
-    img.setAttribute('data-board-resolved-source', source);
-    resolveProtectedImageBlobUrl(source).then((resolved) => {
+function requestBoardFrame(callback) {
+  if (typeof requestAnimationFrame === 'function') return requestAnimationFrame(callback);
+  return setTimeout(callback, 0);
+}
+
+function currentLodLevel() {
+  if (_viewport && typeof _viewport.getLodLevel === 'function') return _viewport.getLodLevel();
+  return 'detail';
+}
+
+function isBoardImageHidden(img) {
+  return !!(img && img.closest && img.closest('[hidden]'));
+}
+
+function isImageNearViewport(img) {
+  if (!_viewportRoot || !img || !img.getBoundingClientRect || !_viewportRoot.getBoundingClientRect) return false;
+  if (isBoardImageHidden(img)) return false;
+  const viewportRect = _viewportRoot.getBoundingClientRect();
+  const imageRect = img.getBoundingClientRect();
+  if (!imageRect || (imageRect.width <= 0 && imageRect.height <= 0)) return false;
+  const margin = BOARD_IMAGE_VIEWPORT_MARGIN;
+  return imageRect.right >= viewportRect.left - margin &&
+    imageRect.left <= viewportRect.right + margin &&
+    imageRect.bottom >= viewportRect.top - margin &&
+    imageRect.top <= viewportRect.bottom + margin;
+}
+
+function shouldLoadThumb(img) {
+  return currentLodLevel() !== 'overview' && isImageNearViewport(img);
+}
+
+function pumpBoardImageQueue() {
+  while (_boardImageActive < BOARD_IMAGE_CONCURRENCY && _boardImageQueue.length) {
+    const img = _boardImageQueue.shift();
+    const source = String(img && img.getAttribute && img.getAttribute('data-board-src') || '').trim();
+    if (!source || img.getAttribute('data-board-resolved-source') === source || !shouldLoadThumb(img)) {
+      if (img && img.getAttribute && img.getAttribute('data-board-pending-source') === source) {
+        img.removeAttribute('data-board-pending-source');
+      }
+      continue;
+    }
+    _boardImageActive += 1;
+    Promise.resolve().then(() => resolveProtectedImageBlobUrl(source)).then((resolved) => {
       if (img.getAttribute('data-board-src') !== source) return;
       img.src = resolved || EMPTY_IMAGE_SRC;
+      img.setAttribute('data-board-resolved-source', source);
       img.classList.remove('is-image-missing');
     }).catch(() => {
       if (img.getAttribute('data-board-src') !== source) return;
+      img.setAttribute('data-board-resolved-source', source);
       img.classList.add('is-image-missing');
+    }).finally(() => {
+      if (img.getAttribute('data-board-pending-source') === source) {
+        img.removeAttribute('data-board-pending-source');
+      }
+      _boardImageActive = Math.max(0, _boardImageActive - 1);
+      pumpBoardImageQueue();
     });
+  }
+}
+
+function queueBoardImage(img) {
+  const source = String(img && img.getAttribute && img.getAttribute('data-board-src') || '').trim();
+  if (!source || img.getAttribute('data-board-resolved-source') === source) return;
+  if (img.getAttribute('data-board-pending-source') === source) return;
+  if (!shouldLoadThumb(img)) return;
+  img.setAttribute('data-board-pending-source', source);
+  _boardImageQueue.push(img);
+  pumpBoardImageQueue();
+}
+
+function ensureBoardImageObserver() {
+  if (_boardImageObserver || !_viewportRoot || typeof IntersectionObserver === 'undefined') return _boardImageObserver;
+  _boardImageObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      const img = entry.target;
+      img.dataset.boardVisible = entry.isIntersecting ? '1' : '0';
+      if (entry.isIntersecting) queueBoardImage(img);
+    });
+  }, {
+    root: _viewportRoot,
+    rootMargin: BOARD_IMAGE_VIEWPORT_MARGIN + 'px',
+    threshold: 0,
+  });
+  return _boardImageObserver;
+}
+
+function hydrateBoardImages(root) {
+  if (!root || !root.querySelectorAll) return;
+  const observer = ensureBoardImageObserver();
+  root.querySelectorAll('img[data-board-src]').forEach((img) => {
+    if (observer && img.getAttribute('data-board-observed') !== '1') {
+      img.setAttribute('data-board-observed', '1');
+      observer.observe(img);
+    }
+    if (!observer || img.dataset.boardVisible === '1' || isImageNearViewport(img)) queueBoardImage(img);
+  });
+}
+
+function unobserveBoardImages(root) {
+  if (!root || !root.querySelectorAll) return;
+  if (_boardImageObserver) {
+    root.querySelectorAll('img[data-board-src]').forEach((img) => {
+      _boardImageObserver.unobserve(img);
+      img.removeAttribute('data-board-observed');
+    });
+  }
+  if (root.contains) _boardImageQueue = _boardImageQueue.filter((img) => !root.contains(img));
+}
+
+function scheduleBoardImageHydration() {
+  if (!_root || _boardImageHydrateRaf) return;
+  _boardImageHydrateRaf = requestBoardFrame(() => {
+    _boardImageHydrateRaf = 0;
+    hydrateBoardImages(_root);
   });
 }
 
@@ -161,6 +268,7 @@ function ensureRoot() {
       if (_scaleLabelEl) _scaleLabelEl.textContent = Math.round(transform.k * 100) + '%';
       const projectId = projectIdOf(currentProject());
       saveCamera(projectId, transform);
+      scheduleBoardImageHydration();
     },
     onEscape() {
       _selectedId = '';
@@ -179,15 +287,18 @@ function currentProject() {
 
 function setSurfaceBounds(bounds) {
   if (!_surfaceEl || !_edgesEl) return;
-  const w = Math.max(1600, Math.ceil((bounds && bounds.w) || 0) + 800);
-  const h = Math.max(1000, Math.ceil((bounds && bounds.h) || 0) + 800);
-  _surfaceEl.style.left = '-400px';
-  _surfaceEl.style.top = '-400px';
+  const pad = 400;
+  const w = Math.max(1600, Math.ceil((bounds && bounds.w) || 0) + pad * 2);
+  const h = Math.max(1000, Math.ceil((bounds && bounds.h) || 0) + pad * 2);
+  _surfaceEl.style.left = -pad + 'px';
+  _surfaceEl.style.top = -pad + 'px';
   _surfaceEl.style.width = w + 'px';
   _surfaceEl.style.height = h + 'px';
+  _edgesEl.style.left = -pad + 'px';
+  _edgesEl.style.top = -pad + 'px';
   _edgesEl.setAttribute('width', String(w));
   _edgesEl.setAttribute('height', String(h));
-  _edgesEl.setAttribute('viewBox', '-400 -400 ' + w + ' ' + h);
+  _edgesEl.setAttribute('viewBox', `${-pad} ${-pad} ${w} ${h}`);
 }
 
 function referenceSection(label, items) {
@@ -236,21 +347,24 @@ function renderShotPlanNode(data) {
 }
 
 function renderSegmentNode(data) {
-  const rows = (data && data.shotRows ? data.shotRows : []).map((row) => {
+  const shotRows = data && data.shotRows ? data.shotRows : [];
+  const placeholderCount = shotRows.filter((row) => row.candidates && row.candidates[0] && row.candidates[0].kind === 'segment-cover-placeholder').length;
+  const badgeText = placeholderCount ? '封面占位 ' + placeholderCount + '/' + shotRows.length : '首帧 0/' + shotRows.length;
+  const rows = shotRows.map((row) => {
     const candidate = row.candidates && row.candidates[0];
+    const isPlaceholder = candidate && candidate.kind === 'segment-cover-placeholder';
+    const frameLabel = isPlaceholder ? '片段封面占位' : '镜头' + (row.shotIdx + 1) + '首帧图';
     return '<div class="board-shot-row">' +
       '<div class="board-shot-label">镜头 ' + escapeHtml(row.shotIdx + 1) + '</div>' +
       '<div class="board-frame-card">' +
-      assetImg(candidate && candidate.url, '镜头' + (row.shotIdx + 1) + '首帧') +
-      '<span>镜头' + escapeHtml(row.shotIdx + 1) + '首帧图</span>' +
+      assetImg(candidate && candidate.url, isPlaceholder ? '片段封面占位' : '镜头' + (row.shotIdx + 1) + '首帧') +
+      '<span>' + escapeHtml(frameLabel) + '</span>' +
       '</div>' +
       (candidate ? '' : '<div class="board-frame-actions">' + disabledButton('生成图片', 'auto_awesome') + disabledButton('上传图片', 'upload') + '</div>') +
     '</div>';
   }).join('');
   return '<div class="board-node-card board-node-card--segment">' +
-    '<div class="board-node-head"><h2>片段 ' + escapeHtml((data && data.gIdx) + 1) + '</h2><span>首帧 ' +
-    escapeHtml((data && data.shotRows ? data.shotRows.filter((row) => row.coverUrl).length : 0) + '/' + (data && data.shotRows ? data.shotRows.length : 0)) +
-    '</span></div>' +
+    '<div class="board-node-head"><h2>片段 ' + escapeHtml((data && data.gIdx) + 1) + '</h2><span>' + escapeHtml(badgeText) + '</span></div>' +
     '<div class="board-shot-rows">' + (rows || '<p class="board-muted">暂无镜头</p>') + '</div>' +
     disabledButton('一键全生成', 'auto_awesome') +
   '</div>';
@@ -310,6 +424,7 @@ function removeStaleNodes(nextIds) {
   const keep = new Set(nextIds);
   Array.from(_nodeEls.keys()).forEach((id) => {
     if (keep.has(id)) return;
+    unobserveBoardImages(_nodeEls.get(id));
     _viewport.removeNode(id);
     _nodeEls.delete(id);
   });
@@ -318,16 +433,16 @@ function removeStaleNodes(nextIds) {
 function applyCamera(projectId) {
   if (!_viewport || _cameraReadyProjectId === projectId) return;
   const saved = loadCamera(projectId);
-  if (saved) _viewport.setTransform(saved, { immediate: true });
-  else _viewport.fit();
-  _cameraReadyProjectId = projectId;
+  if (saved) {
+    _viewport.setTransform(saved, { immediate: true });
+    _cameraReadyProjectId = projectId;
+  } else if (_viewport.fit()) {
+    _cameraReadyProjectId = projectId;
+  }
 }
 
 function hydrate() {
-  hydrateBoardImages(_root);
-  if (typeof _ctx.hydrateProtectedImageElements === 'function') {
-    _ctx.hydrateProtectedImageElements(_root);
-  }
+  scheduleBoardImageHydration();
 }
 
 function onViewportClick(event) {
@@ -375,6 +490,7 @@ export function refreshBoardPage() {
   if (!ensureRoot()) return;
   const project = currentProject();
   if (!project) {
+    unobserveBoardImages(_nodesEl);
     _nodesEl.innerHTML = '<div class="board-no-project"><h2>画板</h2><p>暂无项目</p></div>';
     _nodeEls.clear();
     _viewport.setEdges([]);

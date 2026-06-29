@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 
 const main = readFileSync(new URL('../public/main.js', import.meta.url), 'utf8');
 const workspace = readFileSync(new URL('../public/workspace.html', import.meta.url), 'utf8');
+const styles = readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
 
 function functionBody(source, name) {
   const marker = `function ${name}`;
@@ -82,5 +83,7 @@ assert.match(workspace, /if \(page === "images"\) page = "shots";\s*if \(page ==
 assert.match(workspace, /data-board-boot/, 'workspace preboot marks board boot');
 assert.match(workspace, /id="boardRoot" hidden/, 'workspace contains hidden boardRoot');
 assert.match(workspace, /main\.js\?v=368/, 'workspace bumps main.js after runtime flag change');
+assert.match(workspace, /styles\.css\?v=258/, 'workspace bumps styles.css after board route chrome change');
+assert.match(styles, /is-board-workbench-page[\s\S]*\.agent-fab[\s\S]*\.agent-panel[\s\S]*display:\s*none !important;/, 'board route hides global agent chrome');
 
 console.log('✓ board routing contract passed');

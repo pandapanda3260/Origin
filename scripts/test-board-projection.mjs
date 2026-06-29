@@ -154,6 +154,14 @@ const boardState = await import(dataModuleUrl(stateSrc));
   assert.equal(vm.shotPlan.shotCount, 2, 'shot plan counts shots');
   assert.equal(vm.segments.length, 1, 'one segment is projected');
   assert.equal(vm.segments[0].shotRows.length, 2, 'segment contains two shot rows');
+  assert.ok(
+    vm.segments[0].shotRows.every((row) => row.candidates[0]?.kind === 'segment-cover-placeholder'),
+    'segment first-frame candidates are explicitly marked as cover placeholders before per-shot model exists',
+  );
+  assert.ok(
+    vm.segments[0].shotRows.every((row) => row.candidates[0]?.label === '片段封面占位'),
+    'segment placeholder candidates carry the UI label',
+  );
   assert.deepEqual(
     vm.edges.map((edge) => `${edge.from}->${edge.to}`),
     ['reference->shot-plan', 'shot-plan->segment:0', 'segment:0->video:0'],

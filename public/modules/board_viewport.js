@@ -1,6 +1,9 @@
 const K_MIN = 0.05;
 const K_MAX = 2.5;
 const DEFAULT_BUFFER = 640;
+const MIN_USABLE_VIEWPORT_SIZE = 32;
+export const LOD_OVERVIEW_ENTER = 0.4;
+export const LOD_OVERVIEW_EXIT = 0.45;
 
 function finiteNumber(value, fallback) {
   const n = Number(value);
@@ -19,6 +22,12 @@ export function normalizeTransform(transform) {
     x: finiteNumber(source.x, 0),
     y: finiteNumber(source.y, 0),
   };
+}
+
+export function lodLevelForScale(scale, current = 'detail') {
+  const k = clampScale(scale);
+  if (current === 'overview') return k > LOD_OVERVIEW_EXIT ? 'detail' : 'overview';
+  return k < LOD_OVERVIEW_ENTER ? 'overview' : 'detail';
 }
 
 export function worldToScreenPoint(point, transform) {
@@ -104,13 +113,25 @@ export function fitTransformToRect(rect, viewport, options = {}) {
   };
 }
 
-function viewportSize(rootEl) {
-  if (!rootEl) return { w: 1, h: 1 };
+function measuredViewportSize(rootEl) {
+  if (!rootEl) return { w: 0, h: 0 };
   const rect = rootEl.getBoundingClientRect ? rootEl.getBoundingClientRect() : null;
   return {
-    w: Math.max(1, finiteNumber((rect && rect.width) || rootEl.clientWidth, 1)),
-    h: Math.max(1, finiteNumber((rect && rect.height) || rootEl.clientHeight, 1)),
+    w: finiteNumber((rect && rect.width) || rootEl.clientWidth, 0),
+    h: finiteNumber((rect && rect.height) || rootEl.clientHeight, 0),
   };
+}
+
+function viewportSize(rootEl) {
+  const size = measuredViewportSize(rootEl);
+  return {
+    w: Math.max(1, size.w),
+    h: Math.max(1, size.h),
+  };
+}
+
+function isUsableViewportSize(size) {
+  return !!size && size.w >= MIN_USABLE_VIEWPORT_SIZE && size.h >= MIN_USABLE_VIEWPORT_SIZE;
 }
 
 function relativePoint(rootEl, event) {
@@ -127,7 +148,7 @@ function isEditableTarget(target) {
   return tag === 'input' || tag === 'textarea' || tag === 'select' || target.isContentEditable;
 }
 
-function edgePath(source, target) {
+export function edgePath(source, target) {
   const x0 = source.x + source.w;
   const y0 = source.y + source.h / 2;
   const x1 = target.x;
@@ -149,9 +170,15 @@ export function createViewport(rootEl, options = {}) {
   if (!edgesSvgEl) throw new Error('createViewport requires edgesSvgEl');
 
   const nodes = new Map();
-  const edgeRecords = [];
+  const edgeRecords = new Map();
   let transform = normalizeTransform(options.initialTransform);
+  let lodLevel = lodLevelForScale(transform.k);
   let rafId = 0;
+  let resizeRafId = 0;
+  const initialMeasuredSize = measuredViewportSize(rootEl);
+  let hasUsableViewportSize = isUsableViewportSize(initialMeasuredSize);
+  let lastViewportSize = hasUsableViewportSize ? viewportSize(rootEl) : { w: 1, h: 1 };
+  let resizeObserver = null;
   let destroyed = false;
   let selectedId = '';
   let panning = null;
@@ -164,8 +191,15 @@ export function createViewport(rootEl, options = {}) {
 
   function emitChange() {
     if (typeof options.onViewportChange === 'function') {
-      options.onViewportChange({ ...transform });
+      options.onViewportChange({ ...transform, lodLevel });
     }
+  }
+
+  function syncLodClass() {
+    lodLevel = lodLevelForScale(transform.k, lodLevel);
+    rootEl.dataset.boardLod = lodLevel;
+    rootEl.classList.toggle('is-lod-overview', lodLevel === 'overview');
+    rootEl.classList.toggle('is-lod-detail', lodLevel === 'detail');
   }
 
   function applyNow() {
@@ -173,6 +207,7 @@ export function createViewport(rootEl, options = {}) {
     if (destroyed) return;
     worldEl.style.transform = `translate(${transform.x}px, ${transform.y}px) scale(${transform.k})`;
     rootEl.style.setProperty('--board-scale', String(transform.k));
+    syncLodClass();
     refreshCulling();
     emitChange();
   }
@@ -188,6 +223,40 @@ export function createViewport(rootEl, options = {}) {
     else scheduleApply();
   }
 
+  function preserveViewportCenterOnResize() {
+    resizeRafId = 0;
+    if (destroyed) return;
+    const measuredSize = measuredViewportSize(rootEl);
+    if (!isUsableViewportSize(measuredSize)) {
+      refreshCulling();
+      return;
+    }
+    const nextSize = viewportSize(rootEl);
+    if (!hasUsableViewportSize) {
+      hasUsableViewportSize = true;
+      lastViewportSize = nextSize;
+      refreshCulling();
+      return;
+    }
+    if (Math.abs(nextSize.w - lastViewportSize.w) < 1 && Math.abs(nextSize.h - lastViewportSize.h) < 1) {
+      lastViewportSize = nextSize;
+      refreshCulling();
+      return;
+    }
+    const worldCenter = screenToWorldPoint({ x: lastViewportSize.w / 2, y: lastViewportSize.h / 2 }, transform);
+    lastViewportSize = nextSize;
+    setTransform({
+      k: transform.k,
+      x: nextSize.w / 2 - worldCenter.x * transform.k,
+      y: nextSize.h / 2 - worldCenter.y * transform.k,
+    });
+  }
+
+  function scheduleResize() {
+    if (destroyed || resizeRafId) return;
+    resizeRafId = requestAnimationFrame(preserveViewportCenterOnResize);
+  }
+
   function getNodeRects(filterIds) {
     const ids = filterIds && filterIds.length ? new Set(filterIds) : null;
     const rects = [];
@@ -199,8 +268,16 @@ export function createViewport(rootEl, options = {}) {
 
   function fit(ids) {
     const rects = getNodeRects(Array.isArray(ids) ? ids : null);
-    if (!rects.length) return;
-    setTransform(fitTransformToRect(unionRects(rects), viewportSize(rootEl)));
+    if (!rects.length) return false;
+    const measuredSize = measuredViewportSize(rootEl);
+    if (!isUsableViewportSize(measuredSize)) {
+      refreshCulling();
+      return false;
+    }
+    lastViewportSize = viewportSize(rootEl);
+    hasUsableViewportSize = true;
+    setTransform(fitTransformToRect(unionRects(rects), lastViewportSize));
+    return true;
   }
 
   function zoomTo(scale, screenPoint) {
@@ -265,20 +342,34 @@ export function createViewport(rootEl, options = {}) {
   }
 
   function setEdges(edges) {
-    edgeRecords.length = 0;
-    edgesSvgEl.replaceChildren();
+    const nextKeys = new Set();
     (Array.isArray(edges) ? edges : []).forEach((edge) => {
       const from = nodes.get(String(edge && edge.from));
       const to = nodes.get(String(edge && edge.to));
       if (!from || !to) return;
       const pathInfo = edgePath(from, to);
-      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      path.setAttribute('d', pathInfo.d);
-      path.setAttribute('fill', 'none');
-      path.setAttribute('vector-effect', 'non-scaling-stroke');
-      path.dataset.boardEdge = `${edge.from || ''}->${edge.to || ''}`;
-      edgesSvgEl.appendChild(path);
-      edgeRecords.push({ path, bbox: pathInfo.bbox });
+      const key = `${edge.from || ''}->${edge.to || ''}`;
+      nextKeys.add(key);
+      let record = edgeRecords.get(key);
+      if (!record) {
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('vector-effect', 'non-scaling-stroke');
+        path.dataset.boardEdge = key;
+        edgesSvgEl.appendChild(path);
+        record = { path, bbox: pathInfo.bbox, d: '' };
+        edgeRecords.set(key, record);
+      }
+      if (record.d !== pathInfo.d) {
+        record.path.setAttribute('d', pathInfo.d);
+        record.d = pathInfo.d;
+      }
+      record.bbox = pathInfo.bbox;
+    });
+    edgeRecords.forEach((record, key) => {
+      if (nextKeys.has(key)) return;
+      if (record.path && record.path.remove) record.path.remove();
+      edgeRecords.delete(key);
     });
     refreshCulling();
   }
@@ -389,6 +480,10 @@ export function createViewport(rootEl, options = {}) {
   rootEl.addEventListener('wheel', onWheel, { passive: false });
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('keyup', onKeyUp);
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(scheduleResize);
+    resizeObserver.observe(rootEl);
+  }
 
   applyNow();
 
@@ -399,6 +494,7 @@ export function createViewport(rootEl, options = {}) {
     zoomTo,
     zoomBy,
     zoomToSelection,
+    getLodLevel: () => lodLevel,
     screenToWorld: (x, y) => screenToWorldPoint({ x, y }, transform),
     worldToScreen: (x, y) => worldToScreenPoint({ x, y }, transform),
     mountNode,
@@ -414,6 +510,8 @@ export function createViewport(rootEl, options = {}) {
     destroy() {
       destroyed = true;
       if (rafId) cancelAnimationFrame(rafId);
+      if (resizeRafId) cancelAnimationFrame(resizeRafId);
+      if (resizeObserver) resizeObserver.disconnect();
       rootEl.removeEventListener('pointerdown', onPointerDown);
       rootEl.removeEventListener('pointermove', onPointerMove);
       rootEl.removeEventListener('pointerup', finishPan);

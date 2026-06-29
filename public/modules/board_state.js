@@ -291,7 +291,7 @@ function buildSegments(project, opts) {
     const shotRows = group.shotIndices.map((shotIdx) => ({
       shotIdx,
       shotUid: shotUidOf(project, shotIdx),
-      candidates: coverUrl ? [{ id: `first:${group.gIdx}:${shotIdx}`, url: coverUrl, kind: 'first-frame' }] : [],
+      candidates: coverUrl ? [{ id: `first:${group.gIdx}:${shotIdx}`, url: coverUrl, kind: 'segment-cover-placeholder', label: '片段封面占位' }] : [],
       coverUrl,
     }));
     return {

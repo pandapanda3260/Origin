@@ -1043,6 +1043,13 @@ body.is-online-editor-page .agent-panel {
   display: none !important;
 }
 
+html.is-board-workbench-page .agent-fab,
+html.is-board-workbench-page .agent-panel,
+body.is-board-workbench-page .agent-fab,
+body.is-board-workbench-page .agent-panel {
+  display: none !important;
+}
+
 #pageOnlineEditor:not([hidden]) > .flex,
 #pageOnlineEditor:not([hidden]) > .oe-app-shell {
   height: 100%;
@@ -20635,6 +20642,50 @@ html.is-board-workbench-page #pageShots #boardRoot {
   overflow: hidden;
 }
 
+.board-viewport.is-lod-overview .board-node-card {
+  border-width: 2px;
+  background: rgba(255,255,255,0.92);
+  box-shadow: 0 16px 44px rgba(11,19,32,0.09);
+}
+
+.board-viewport.is-lod-overview .board-node-card--reference {
+  background: rgba(255,255,255,0.72);
+}
+
+.board-viewport.is-lod-overview .board-node-card--plan {
+  background: var(--accent);
+}
+
+.board-viewport.is-lod-overview .board-node-card--reference,
+.board-viewport.is-lod-overview .board-node-card--plan,
+.board-viewport.is-lod-overview .board-node-card--segment,
+.board-viewport.is-lod-overview .board-node-card--video {
+  padding: 24px;
+}
+
+.board-viewport.is-lod-overview .board-node-head {
+  min-height: 72px;
+  margin-bottom: 0;
+}
+
+.board-viewport.is-lod-overview .board-node-head h2 {
+  font-size: 34px;
+  line-height: 1.05;
+}
+
+.board-viewport.is-lod-overview .board-node-head span {
+  font-size: 20px;
+  padding: 8px 16px;
+}
+
+.board-viewport.is-lod-overview .board-ref-section,
+.board-viewport.is-lod-overview .board-plan-steps,
+.board-viewport.is-lod-overview .board-shot-rows,
+.board-viewport.is-lod-overview .board-video-cover,
+.board-viewport.is-lod-overview .board-node-card > .board-btn {
+  display: none !important;
+}
+
 .board-node-card--reference {
   padding: 18px;
   border-radius: 28px;
@@ -20787,6 +20838,10 @@ html.is-board-workbench-page #pageShots #boardRoot {
   gap: 6px;
   font-size: 10px;
   color: var(--text-dim);
+}
+
+.board-frame-card span {
+  white-space: nowrap;
 }
 
 .board-frame-actions {
