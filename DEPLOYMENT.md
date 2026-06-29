@@ -5,7 +5,7 @@ and optional VevDemo API/frontend services behind host Nginx and HTTPS.
 
 Placeholders in this document:
 
-- Domain: `example.com`
+- Domain: `origin.tj.cn`
 - App directory: `/var/www/myapp`
 - Secret values: `CHANGE_ME`
 
@@ -85,12 +85,16 @@ In Docker Compose these paths refer to the container. The host bind mount is
 Required public VevDemo values for the example Nginx layout:
 
 ```bash
-VEVDEMO_EDITOR_URL=https://example.com/vevdemo/
-VEVDEMO_API_URL=https://example.com/vevdemo-api
-VEVDEMO_EDITOR_PROJECT_URL=https://example.com/vevdemo/
-VITE_VEVDEMO_API_BASE=https://example.com/vevdemo-api
-VEVDEMO_BASE_PATH=/vevdemo/
+ORIGIN_PUBLIC_BASE_URL=https://origin.tj.cn
+ADMIN_ALLOWED_ORIGINS=https://origin.tj.cn,https://www.origin.tj.cn
+VEVDEMO_EDITOR_URL=https://origin.tj.cn/vevdemo/
+VEVDEMO_API_URL=https://origin.tj.cn/vevdemo-api
+VEVDEMO_EDITOR_PROJECT_URL=https://origin.tj.cn/vevdemo/
+VITE_VEVDEMO_API_BASE=https://origin.tj.cn/vevdemo-api
 ```
+
+`VEVDEMO_BASE_PATH` is owned by `docker-compose.yml` and `Dockerfile`; do not
+add it to the production `.env`.
 
 ## 3. Data Directory
 
@@ -145,11 +149,11 @@ Issue the initial certificate before enabling the HTTPS config:
 
 ```bash
 sudo systemctl stop nginx
-sudo certbot certonly --standalone -d example.com
+sudo certbot certonly --standalone -d origin.tj.cn -d www.origin.tj.cn
 sudo systemctl start nginx
 ```
 
-Install the Nginx config:
+For a fresh server only, install the example Nginx config:
 
 ```bash
 cd /var/www/myapp
@@ -158,6 +162,11 @@ sudo ln -sf /etc/nginx/sites-available/origin /etc/nginx/sites-enabled/origin
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+For an existing server, do not copy `nginx.conf.example` over the live config.
+Inspect `/etc/nginx/sites-available/origin.conf` first and only hand-edit the
+specific server names or proxy locations needed; overwriting it can remove
+Certbot-managed TLS directives.
 
 Renewal is handled by the certbot system timer:
 

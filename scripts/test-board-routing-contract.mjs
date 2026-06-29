@@ -82,9 +82,13 @@ assert.match(prebootFlag, /host === "localhost"[\s\S]*host === "127\.0\.0\.1"[\s
 assert.match(workspace, /if \(page === "images"\) page = "shots";\s*if \(page === "prompts" && boardEnabled\(\)\) page = "shots";/, 'preboot keeps images->shots unconditional and gates prompts->shots');
 assert.match(workspace, /data-board-boot/, 'workspace preboot marks board boot');
 assert.match(workspace, /id="boardRoot" hidden/, 'workspace contains hidden boardRoot');
-assert.match(workspace, /main\.js\?v=369/, 'workspace bumps main.js after runtime flag change');
-assert.match(workspace, /styles\.css\?v=261/, 'workspace bumps styles.css after board route chrome change');
-assert.match(styles, /is-board-workbench-page[\s\S]*\.agent-fab[\s\S]*\.agent-panel[\s\S]*display:\s*none !important;/, 'board route hides global agent chrome');
+assert.match(workspace, /main\.js\?v=372/, 'workspace bumps main.js after runtime flag change');
+assert.match(workspace, /styles\.css\?v=263/, 'workspace bumps styles.css after board route chrome change');
+assert.match(styles, /body\.is-online-editor-page #sidebar,\s*body\.is-online-editor-page #announceBanner,\s*body\.is-online-editor-page #maintenanceBanner\s*\{\s*display:\s*none !important;\s*\}/, 'online editor keeps sidebar and banners hidden');
+assert.doesNotMatch(styles, /is-online-editor-page[^{}]*\.agent-fab/, 'online editor route must not hide agent fab in CSS');
+assert.doesNotMatch(styles, /is-online-editor-page[^{}]*\.agent-panel/, 'online editor route must not hide agent panel in CSS');
+assert.doesNotMatch(styles, /is-board-workbench-page[^{}]*\.agent-fab/, 'board route must not hide agent fab in CSS');
+assert.doesNotMatch(styles, /is-board-workbench-page[^{}]*\.agent-panel/, 'board route must not hide agent panel in CSS');
 assert.match(styles, /\.board-minimap\s*\{[\s\S]*position:\s*absolute;[\s\S]*left:\s*24px;[\s\S]*bottom:\s*24px;/, 'board minimap is positioned as a canvas navigator');
 assert.match(styles, /\.board-minimap-view\s*\{[\s\S]*stroke:\s*#0B1320;/, 'board minimap viewport rectangle is visible');
 assert.match(styles, /\.board-help-panel\s*\{[\s\S]*position:\s*absolute;[\s\S]*bottom:\s*84px;/, 'board help panel is an inline board overlay');

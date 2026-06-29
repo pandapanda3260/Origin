@@ -26,8 +26,42 @@ function cleanUrl(value: any): string {
   return String(value || '').trim();
 }
 
+function cleanText(value: any): string {
+  return String(value ?? '').trim();
+}
+
 function strictArrayEqual(a: number[], b: number[]): boolean {
   return a.length === b.length && a.every((v, idx) => v === b[idx]);
+}
+
+function shotUidFor(project: any, shotIdx: number): string {
+  const shot = Array.isArray(project?.shots) ? project.shots[shotIdx] : null;
+  return cleanText(shot?.shotUid ?? shot?.shot_uid);
+}
+
+function primaryFirstShotIndices(shotIndices: number[], primaryShotIdx: number): number[] {
+  return [primaryShotIdx, ...shotIndices.filter((idx) => idx !== primaryShotIdx)];
+}
+
+function candidateTime(candidate: any): number {
+  const created = Date.parse(cleanText(candidate?.createdAt));
+  if (!Number.isNaN(created)) return created;
+  const generated = Date.parse(cleanText(candidate?.generatedAt));
+  if (!Number.isNaN(generated)) return generated;
+  return 0;
+}
+
+function selectedShotFrameCandidate(state: any): any | null {
+  const candidates = Array.isArray(state?.candidates)
+    ? state.candidates.filter((candidate: any) => candidate && cleanUrl(candidate.url))
+    : [];
+  if (!candidates.length) return null;
+  const selectedId = cleanText(state?.selectedCandidateId);
+  if (selectedId) {
+    const selected = candidates.find((candidate: any) => cleanText(candidate?.id) === selectedId);
+    if (selected) return selected;
+  }
+  return [...candidates].sort((a, b) => candidateTime(b) - candidateTime(a))[0] || null;
 }
 
 function validShotIndex(value: any, shotsLength: number): number | null {
@@ -237,6 +271,17 @@ export function computeFirstFrameSourceHashForShotIndices(project: any, shotIndi
     styleBible: project?.styleBible || {},
     worldHash: computeWorldHash(project),
   });
+}
+
+export function computeFirstFrameSourceHashForShot(project: any, groupIdx: number, shotUid: string): string | null {
+  const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
+  const sb = storyboards[groupIdx] || {};
+  const shotIndices = storyboardShotIndices(project, groupIdx, sb);
+  const targetShotUid = cleanText(shotUid);
+  if (!targetShotUid) return null;
+  const primaryShotIdx = shotIndices.find((idx) => shotUidFor(project, idx) === targetShotUid);
+  if (!Number.isInteger(primaryShotIdx)) return null;
+  return computeFirstFrameSourceHashForShotIndices(project, primaryFirstShotIndices(shotIndices, primaryShotIdx as number));
 }
 
 export function computeTailFrameSourceHashForShotIndices(project: any, userId: number, storyboard: any, shotIndices: number[]): string | null {
@@ -926,12 +971,30 @@ export function computeFrameWorkflowStaleFlags(project: any, userId: number): Re
   const storyboards = Array.isArray(project?.storyboards) ? project.storyboards : [];
   for (let groupIdx = 0; groupIdx < storyboards.length; groupIdx += 1) {
     const sb = storyboards[groupIdx] || {};
+    const shotIndices = storyboardShotIndices(project, groupIdx, sb);
+    const shotFrames = sb.shotFrames && typeof sb.shotFrames === 'object' ? sb.shotFrames : null;
+    let hasShotFrameCandidate = false;
+    if (shotFrames) {
+      for (const shotIdx of shotIndices) {
+        const shotUid = shotUidFor(project, shotIdx);
+        if (!shotUid) continue;
+        const selected = selectedShotFrameCandidate(shotFrames[shotUid]);
+        if (!selected) continue;
+        hasShotFrameCandidate = true;
+        const storedHash = typeof selected.sourceHash === 'string' ? selected.sourceHash : null;
+        const currentHash = computeFirstFrameSourceHashForShot(project, groupIdx, shotUid);
+        if (!storedHash || (currentHash && storedHash !== currentHash)) {
+          flags[`storyboard_${groupIdx}`] = true;
+          break;
+        }
+      }
+    }
     const hasFirst =
       cleanUrl(sb.frames?.first?.url) ||
       cleanUrl(sb.firstFrameUrl) ||
       cleanUrl(sb.imageUrl) ||
       cleanUrl(sb.url);
-    if (hasFirst) {
+    if (!hasShotFrameCandidate && hasFirst) {
       const currentFirstHash = computeFirstFrameSourceHash(project, userId, groupIdx);
       const storedFirstHash = typeof sb.firstFrameSourceHash === 'string'
         ? sb.firstFrameSourceHash

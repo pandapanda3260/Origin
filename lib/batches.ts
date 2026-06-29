@@ -119,6 +119,26 @@ function _targetGroupIdx(target: BatchTaskTarget): number | null {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
 }
 
+function _targetShotUid(target: BatchTaskTarget): string {
+  return String(target?.shotUid ?? target?.shot_uid ?? '').trim();
+}
+
+function _storyboardImageTargetsOverlap(
+  a: { groupIdx: number; shotUid: string },
+  b: { groupIdx: number; shotUid: string },
+): boolean {
+  if (a.groupIdx !== b.groupIdx) return false;
+  if (!a.shotUid || !b.shotUid) return true;
+  return a.shotUid === b.shotUid;
+}
+
+function _storyboardImageTargetsExactlyMatch(
+  a: { groupIdx: number; shotUid: string },
+  b: { groupIdx: number; shotUid: string },
+): boolean {
+  return a.groupIdx === b.groupIdx && a.shotUid === b.shotUid;
+}
+
 function _targetShotIndices(target: BatchTaskTarget, groupIdx: number): number[] {
   const raw = Array.isArray(target?.shotIndices) ? target.shotIndices : [];
   const normalized = raw
@@ -580,6 +600,9 @@ function _findActiveGroupBatchOverlap(db: any, opts: {
 } {
   const label = _activeGroupBatchLabel(opts.batchType);
   if (!label) return null;
+  if (opts.batchType === 'storyboard_images') {
+    return _findActiveStoryboardImageBatchOverlap(db, opts, label);
+  }
   const requested = Array.from(
     new Set(opts.targets.map(_targetGroupIdx).filter((n): n is number => n != null)),
   );
@@ -619,6 +642,79 @@ function _findActiveGroupBatchOverlap(db: any, opts: {
     overlapGroupIdxs,
     batchIds,
     canReuse: allRequestedCovered && batchIds.length === 1,
+    label,
+	  };
+	}
+
+function _findActiveStoryboardImageBatchOverlap(db: any, opts: {
+  user: UserRow;
+  batchType: string;
+  projectId: string;
+  targets: BatchTaskTarget[];
+}, label: string): null | {
+  batchId: string;
+  total: number;
+  overlapGroupIdxs: number[];
+  batchIds: string[];
+  canReuse: boolean;
+  label: string;
+} {
+  const requested = opts.targets
+    .map((target) => {
+      const groupIdx = _targetGroupIdx(target);
+      if (groupIdx == null) return null;
+      return { groupIdx, shotUid: _targetShotUid(target) };
+    })
+    .filter((item): item is { groupIdx: number; shotUid: string } => !!item);
+  if (!requested.length) return null;
+
+  const requestedGroups = Array.from(new Set(requested.map((item) => item.groupIdx)));
+  const placeholders = requestedGroups.map(() => '?').join(',');
+  const groupExpr =
+    "COALESCE(json_extract(bt.target_json,'$.groupIdx'), json_extract(bt.target_json,'$.storyboardIdx'), json_extract(bt.target_json,'$.idx'))";
+  const shotUidExpr =
+    "COALESCE(json_extract(bt.target_json,'$.shotUid'), json_extract(bt.target_json,'$.shot_uid'))";
+  const rows = db
+    .prepare(
+      `SELECT b.id AS batchId, b.total AS total, CAST(${groupExpr} AS INTEGER) AS groupIdx, CAST(${shotUidExpr} AS TEXT) AS shotUid
+       FROM batches b
+       JOIN batch_tasks bt ON bt.batch_id = b.id
+       WHERE b.owner_id = ?
+         AND b.project_id = ?
+         AND b.batch_type = ?
+         AND b.status IN ('queued', 'running')
+         AND bt.status IN ('queued', 'running', 'retry_pending', 'upstream_pending')
+         AND CAST(${groupExpr} AS INTEGER) IN (${placeholders})
+       ORDER BY b.created_at DESC, bt.seq ASC`,
+    )
+    .all(opts.user.id, opts.projectId, opts.batchType, ...requestedGroups) as Array<{
+      batchId: string;
+      total: number;
+      groupIdx: number;
+      shotUid: string | null;
+    }>;
+
+  const overlappingRows = rows.filter((row) => {
+    const active = { groupIdx: Number(row.groupIdx), shotUid: String(row.shotUid || '').trim() };
+    return requested.some((req) => _storyboardImageTargetsOverlap(req, active));
+  });
+  if (!overlappingRows.length) return null;
+
+  const overlapGroupIdxs = Array.from(
+    new Set(overlappingRows.map((row) => Number(row.groupIdx)).filter((n) => Number.isFinite(n))),
+  ).sort((a, b) => a - b);
+  const batchIds = Array.from(new Set(overlappingRows.map((row) => String(row.batchId))));
+  const exactCoverage = requested.every((req) => overlappingRows.some((row) => _storyboardImageTargetsExactlyMatch(req, {
+    groupIdx: Number(row.groupIdx),
+    shotUid: String(row.shotUid || '').trim(),
+  })));
+
+  return {
+    batchId: String(overlappingRows[0].batchId),
+    total: Number(overlappingRows[0].total) || requested.length,
+    overlapGroupIdxs,
+    batchIds,
+    canReuse: exactCoverage && batchIds.length === 1,
     label,
   };
 }

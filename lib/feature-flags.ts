@@ -76,6 +76,17 @@ export function isMultiShotSegmentEnabled(): boolean {
 }
 
 /**
+ * 分镜首帧候选模型：
+ * - on: storyboard_images 从 group target 展开为 per-shot target, 写入 shotFrames[shotUid].candidates。
+ * - off: 保持旧的一段一张段首首帧行为。
+ *
+ * 默认关闭，确保旧页和旧生成链路零行为变化。
+ */
+export function isPerShotFirstFrameEnabled(): boolean {
+  return readBoolEnv('ORIGIN_PER_SHOT_FIRST_FRAME', false);
+}
+
+/**
  * 尾帧 caption fallback：
  * 仅作为未来兼容不支持 last_frame 图片输入的 provider 的显式实验开关。
  * 默认关闭，避免视频生成前因为 legacy env 设置而隐式触发额外 vision/caption 调用。

@@ -1175,16 +1175,7 @@ body.is-online-editor-page #pageOnlineEditor:not([hidden]) {
 
 body.is-online-editor-page #sidebar,
 body.is-online-editor-page #announceBanner,
-body.is-online-editor-page #maintenanceBanner,
-body.is-online-editor-page .agent-fab,
-body.is-online-editor-page .agent-panel {
-  display: none !important;
-}
-
-html.is-board-workbench-page .agent-fab,
-html.is-board-workbench-page .agent-panel,
-body.is-board-workbench-page .agent-fab,
-body.is-board-workbench-page .agent-panel {
+body.is-online-editor-page #maintenanceBanner {
   display: none !important;
 }
 
@@ -10236,11 +10227,11 @@ body.is-style-workbench-page #pageStyle #stylePromptReferencePanel .style-bible-
   box-shadow: 0 20px 60px rgba(31,38,135,0.08), 0 0 0 1px rgba(255,255,255,0.3) inset;
   z-index: 9997;
   overflow: hidden;
-  transform-origin: bottom right;
+  transform-origin: var(--agent-panel-origin, bottom right);
   animation: agentPanelIn 0.35s ease-out;
 }
 @keyframes agentPanelIn {
-  from { opacity: 0; transform: scale(0.92) translateY(16px); }
+  from { opacity: 0; transform: scale(0.92) translateY(var(--agent-panel-enter-y, 16px)); }
   to { opacity: 1; transform: scale(1) translateY(0); }
 }
 .agent-panel-header {
@@ -20959,10 +20950,10 @@ html.is-board-workbench-page #pageShots #boardRoot {
 
 .board-shot-row {
   display: grid;
-  grid-template-columns: 64px 160px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(180px, 1fr) 144px;
   align-items: center;
   gap: 12px;
-  min-height: 96px;
+  min-height: 108px;
 }
 
 .board-shot-label {
@@ -20980,6 +20971,96 @@ html.is-board-workbench-page #pageShots #boardRoot {
 
 .board-frame-card span {
   white-space: nowrap;
+}
+
+.board-candidate-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.board-candidate-card {
+  width: 116px;
+  flex: 0 0 116px;
+  display: grid;
+  gap: 5px;
+}
+
+.board-candidate-card.is-dragging {
+  opacity: 0.58;
+}
+
+.board-candidate-thumb {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.board-candidate-thumb:disabled {
+  cursor: default;
+}
+
+.board-candidate-card.is-selected .board-candidate-thumb {
+  border-color: var(--accent);
+}
+
+.board-candidate-card.is-placeholder .board-candidate-thumb {
+  opacity: 0.72;
+}
+
+.board-candidate-check {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  font-size: 18px !important;
+  color: #fff;
+  filter: drop-shadow(0 1px 3px rgba(0,0,0,0.35));
+}
+
+.board-candidate-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.board-candidate-meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.board-icon-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255,255,255,0.72);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.board-icon-btn .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.board-icon-btn:hover {
+  color: #9f403d;
+  border-color: rgba(159,64,61,0.28);
 }
 
 .board-frame-actions {

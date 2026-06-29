@@ -38,7 +38,16 @@ function resetProject(projectId: string) {
   db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
 }
 
+function ensureTestUser() {
+  getDb().prepare(
+    `INSERT INTO users (id, username, display_name, password_hash)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(id) DO NOTHING`,
+  ).run(1, 'style-bible-run-test-user', 'Style Bible Run Test User', 'x');
+}
+
 function insertProject(projectId: string, runId: string) {
+  ensureTestUser();
   getDb().prepare(
     'INSERT INTO projects (id, owner_id, title, data_json) VALUES (?, ?, ?, ?)',
   ).run(projectId, 1, projectId, projectData(runId));

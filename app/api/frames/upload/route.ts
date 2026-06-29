@@ -11,10 +11,17 @@ import { getDataDir } from '@/lib/runtime-paths';
 import { createAssetRecord, hashFile, localAssetUri } from '@/lib/asset-library';
 import {
   computeFirstFrameSourceHash,
+  computeFirstFrameSourceHashForShot,
   computeTailFrameSourceHash,
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
 } from '@/lib/frame-workflow-state';
+import { isPerShotFirstFrameEnabled } from '@/lib/feature-flags';
+import {
+  appendShotFrameCandidate,
+  canonicalShotUid,
+  mirrorSelectedFirstFrameToLegacyFields,
+} from '@/lib/shot-frame-candidates';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -39,6 +46,10 @@ function parseIntOrNull(raw: unknown): number | null {
   const n = Number(v);
   if (!Number.isInteger(n) || n < 0) return null;
   return n;
+}
+
+function cleanText(raw: unknown): string {
+  return String(raw ?? '').trim();
 }
 
 function guessExt(mime: string) {
@@ -72,13 +83,17 @@ export async function POST(req: NextRequest) {
     const form = await req.formData();
     const file = form.get('file') as File | null;
     const projectId = (form.get('projectId') || '').toString();
-    const frameType = parseFrameKind(form.get('frameType'));
-    const groupIdx = parseIntOrNull(form.get('groupIdx'));
+	    const frameType = parseFrameKind(form.get('frameType'));
+	    const groupIdx = parseIntOrNull(form.get('groupIdx'));
+	    const shotUid = cleanText(form.get('shotUid'));
 
     if (!file) return jsonError('没有上传文件', 400);
     if (!frameType) return jsonError("frameType 必须是 'first_frame' 或 'tail_frame'", 400);
-    if (!projectId) return jsonError('缺少 projectId', 400);
-    if (groupIdx == null) return jsonError('缺少 groupIdx (非负整数)', 400);
+	    if (!projectId) return jsonError('缺少 projectId', 400);
+	    if (groupIdx == null) return jsonError('缺少 groupIdx (非负整数)', 400);
+	    if (frameType === 'first_frame' && isPerShotFirstFrameEnabled() && !shotUid) {
+	      return jsonError('缺少 shotUid', 400);
+	    }
 
     const mime = (file as any).type || 'image/jpeg';
     if (!ALLOWED_MIME_PREFIX.some((p) => mime.startsWith(p))) {
@@ -129,109 +144,167 @@ export async function POST(req: NextRequest) {
 
     const url = `/api/images/file/${id}`;
     const signed = buildSignedImageUrl(id, user.id);
-    const generatedAt = new Date().toISOString();
-    let uploadedTailFrameSourceHash: string | null = null;
-    let uploadedFirstFrameSourceHash: string | null = null;
+	    const generatedAt = new Date().toISOString();
+	    let uploadedTailFrameSourceHash: string | null = null;
+	    let uploadedFirstFrameSourceHash: string | null = null;
+	    let uploadedCandidateId: string | null = null;
 
-    const updated = patchProjectForUser(projectId, user.id, (fresh) => {
-      if (!fresh) return null;
-      const storyboards = Array.isArray((fresh as any).storyboards)
-        ? [...(fresh as any).storyboards]
-        : [];
-      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
-      if (groupIdx >= shots.length) {
-        throw new Error(`槽位 ${groupIdx + 1} 没有对应镜头`);
-      }
-      const prev = storyboards[groupIdx] || {};
-      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
-      const prevFrames =
-        prev.frames && typeof prev.frames === 'object' ? prev.frames : {};
-      const tailFrameSourceHash = isTail ? computeTailFrameSourceHash(fresh, user.id, groupIdx) : null;
-      const firstFrameSourceHash = !isTail ? computeFirstFrameSourceHash(fresh, user.id, groupIdx) : null;
-      if (isTail) uploadedTailFrameSourceHash = tailFrameSourceHash;
-      else uploadedFirstFrameSourceHash = firstFrameSourceHash;
-      const nextStoryboard = isTail
-        ? {
-          ...prev,
-          idx: groupIdx,
-          shotIdx: groupIdx + 1,
-          shotIndices,
-          tailFrameUrl: url,
-          tailFrameMode: 'uploaded',
-          tailFrameLastError: undefined,
-          tailFrameFailedAt: undefined,
-          tailFrameIntent: 'requested',
-          tailFrameIntentUpdatedAt: generatedAt,
-          tailFrameSourceHash,
-          tailFrameReferenceStatus: 'ready',
-          frames: {
-            ...prevFrames,
-            tail: {
-              url,
-              status: 'ready',
-              source: 'uploaded',
-              mode: 'uploaded',
-              generatedAt,
-              sourceHash: tailFrameSourceHash,
-              referenceStatus: 'ready',
-              shotIndices,
-            },
-          },
-        }
-        : {
-          ...prev,
-          idx: groupIdx,
-          shotIdx: groupIdx + 1,
-          shotIndices,
-          url,
-          imageUrl: url,
-          rawUrl: url,
-          firstFrameUrl: url,
-          firstFrameMode: 'uploaded',
-          firstFrameSourceHash,
-          firstFrameLastError: undefined,
-          firstFrameFailedAt: undefined,
-          firstFrame: {
-            currentUrl: url,
-            rawUrl: url,
-            status: 'ready',
-            source: 'uploaded',
-            lastKnownGoodUrl: url,
-            history: [{
-              url,
-              at: generatedAt,
-              source: 'uploaded',
-            }].concat(Array.isArray(prev.firstFrame?.history)
-              ? prev.firstFrame.history.filter((item: any) => item && item.url && item.url !== url)
-              : []).slice(0, 20),
-          },
-          frames: {
-            ...prevFrames,
-            first: {
-              url,
-              status: 'ready',
-              source: 'uploaded',
-              mode: 'uploaded',
-              generatedAt,
-              sourceHash: firstFrameSourceHash,
-              shotIndices,
-            },
-          },
-        };
-      // 用户原则: 首帧变化不连带 stale 尾帧, 用户自决重做。
-      storyboards[groupIdx] = nextStoryboard;
-      maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'frame-upload');
+	    const updated = patchProjectForUser(projectId, user.id, (fresh) => {
+	      if (!fresh) return null;
+	      let storyboards = Array.isArray((fresh as any).storyboards)
+	        ? [...(fresh as any).storyboards]
+	        : [];
+	      let videoTasksPatch: any[] | undefined;
+	      const shots = Array.isArray((fresh as any).shots) ? (fresh as any).shots : [];
+	      if (groupIdx >= shots.length) {
+	        throw new Error(`槽位 ${groupIdx + 1} 没有对应镜头`);
+	      }
+	      const prev = storyboards[groupIdx] || {};
+	      const shotIndices = storyboardShotIndices(fresh, groupIdx, prev, { mode: 'single-shot-strict' });
+	      const prevFrames =
+	        prev.frames && typeof prev.frames === 'object' ? prev.frames : {};
+	      const tailFrameSourceHash = isTail ? computeTailFrameSourceHash(fresh, user.id, groupIdx) : null;
+	      const perShotFirstUpload = !isTail && isPerShotFirstFrameEnabled();
+	      let targetShotUid = '';
+	      let targetShotIdx: number | null = null;
+	      if (perShotFirstUpload) {
+	        targetShotUid = shotUid;
+	        for (const idx of shotIndices) {
+	          if (canonicalShotUid(shots[idx]) === targetShotUid) {
+	            targetShotIdx = idx;
+	            break;
+	          }
+	        }
+	        if (!targetShotUid) throw new Error('missing_shot_uid');
+	        if (targetShotIdx == null) throw new Error('shot_uid_not_in_group');
+	      }
+	      const firstFrameSourceHash = !isTail
+	        ? (perShotFirstUpload
+	            ? computeFirstFrameSourceHashForShot(fresh, groupIdx, targetShotUid)
+	            : computeFirstFrameSourceHash(fresh, user.id, groupIdx))
+	        : null;
+	      if (isTail) uploadedTailFrameSourceHash = tailFrameSourceHash;
+	      else uploadedFirstFrameSourceHash = firstFrameSourceHash;
+		      let nextStoryboard: any;
+		      if (perShotFirstUpload) {
+		        uploadedCandidateId = `upload:${id}`;
+		        const shotFrames = (prev.shotFrames && typeof prev.shotFrames === 'object') ? { ...prev.shotFrames } : {};
+		        shotFrames[targetShotUid] = appendShotFrameCandidate(shotFrames[targetShotUid], {
+		          id: uploadedCandidateId,
+	          url,
+	          source: 'upload',
+	          mode: 'uploaded',
+	          status: 'ready',
+	          createdAt: generatedAt,
+	          generatedAt,
+	          sourceHash: firstFrameSourceHash,
+	          assetId: id,
+	        });
+	        nextStoryboard = {
+	          ...prev,
+	          idx: groupIdx,
+	          shotIdx: (shotIndices[0] ?? groupIdx) + 1,
+		          shotIndices,
+		          shotFrames,
+		        };
+		      } else {
+		        nextStoryboard = isTail
+		          ? {
+	            ...prev,
+	            idx: groupIdx,
+	            shotIdx: groupIdx + 1,
+	            shotIndices,
+	            tailFrameUrl: url,
+	            tailFrameMode: 'uploaded',
+	            tailFrameLastError: undefined,
+	            tailFrameFailedAt: undefined,
+	            tailFrameIntent: 'requested',
+	            tailFrameIntentUpdatedAt: generatedAt,
+	            tailFrameSourceHash,
+	            tailFrameReferenceStatus: 'ready',
+	            frames: {
+	              ...prevFrames,
+	              tail: {
+	                url,
+	                status: 'ready',
+	                source: 'uploaded',
+	                mode: 'uploaded',
+	                generatedAt,
+	                sourceHash: tailFrameSourceHash,
+	                referenceStatus: 'ready',
+	                shotIndices,
+	              },
+	            },
+	          }
+	          : {
+	            ...prev,
+	            idx: groupIdx,
+	            shotIdx: groupIdx + 1,
+	            shotIndices,
+	            url,
+	            imageUrl: url,
+	            rawUrl: url,
+	            firstFrameUrl: url,
+	            firstFrameMode: 'uploaded',
+	            firstFrameSourceHash,
+	            firstFrameLastError: undefined,
+	            firstFrameFailedAt: undefined,
+	            firstFrame: {
+	              currentUrl: url,
+	              rawUrl: url,
+	              status: 'ready',
+	              source: 'uploaded',
+	              lastKnownGoodUrl: url,
+	              history: [{
+	                url,
+	                at: generatedAt,
+	                source: 'uploaded',
+	              }].concat(Array.isArray(prev.firstFrame?.history)
+	                ? prev.firstFrame.history.filter((item: any) => item && item.url && item.url !== url)
+	                : []).slice(0, 20),
+	            },
+	            frames: {
+	              ...prevFrames,
+	              first: {
+	                url,
+	                status: 'ready',
+	                source: 'uploaded',
+	                mode: 'uploaded',
+	                generatedAt,
+	                sourceHash: firstFrameSourceHash,
+	                shotIndices,
+	              },
+		            },
+		          };
+		      }
+	      // 用户原则: 首帧变化不连带 stale 尾帧, 用户自决重做。
+	      storyboards[groupIdx] = nextStoryboard;
+	      if (perShotFirstUpload) {
+	        const mirrored = mirrorSelectedFirstFrameToLegacyFields(
+	          { ...fresh, storyboards },
+	          groupIdx,
+	          { shotUid: targetShotUid, now: generatedAt },
+	        );
+	        storyboards = Array.isArray(mirrored.project?.storyboards) ? mirrored.project.storyboards : storyboards;
+	        if (Array.isArray(mirrored.project?.videoTasks)) videoTasksPatch = mirrored.project.videoTasks;
+	      }
+	      maybeAssertStoryboardsAlignedWithShots(
+	        { ...fresh, storyboards, ...(videoTasksPatch ? { videoTasks: videoTasksPatch } : {}) },
+	        'frame-upload',
+	      );
       // 上传即用当前上游输入重算并写入了新 sourceHash，权威数据侧同步清掉本槽位的
       // stale 标记——与 batch executor 写盘点同一原则，防"图新标记旧"的孤儿标记。
-      const staleKey = isTail ? `tail_frame_${groupIdx}` : `storyboard_${groupIdx}`;
-      const prevStaleFlags = (fresh as any)._staleFlags;
-      if (prevStaleFlags && typeof prevStaleFlags === 'object' && prevStaleFlags[staleKey]) {
-        const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };
-        delete nextStaleFlags[staleKey];
-        return { storyboards, _staleFlags: nextStaleFlags };
-      }
-      return { storyboards };
-    });
+	      const staleKey = isTail ? `tail_frame_${groupIdx}` : `storyboard_${groupIdx}`;
+	      const prevStaleFlags = (fresh as any)._staleFlags;
+	      const basePatch: Record<string, any> = { storyboards };
+	      if (videoTasksPatch) basePatch.videoTasks = videoTasksPatch;
+	      if (prevStaleFlags && typeof prevStaleFlags === 'object' && prevStaleFlags[staleKey]) {
+	        const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };
+	        delete nextStaleFlags[staleKey];
+	        return { ...basePatch, _staleFlags: nextStaleFlags };
+	      }
+	      return basePatch;
+	    });
 
     return jsonOk({
       ok: true,
@@ -240,9 +313,11 @@ export async function POST(req: NextRequest) {
       signedUrl: signed.url,
       signedTtl: signed.ttl,
       signedExpiresAt: signed.expiresAt,
-      frameType,
-      groupIdx,
-      tailFrameIntent: isTail ? 'requested' : undefined,
+	      frameType,
+	      groupIdx,
+	      shotUid: !isTail && isPerShotFirstFrameEnabled() ? shotUid : undefined,
+	      candidateId: uploadedCandidateId || undefined,
+	      tailFrameIntent: isTail ? 'requested' : undefined,
       tailFrameIntentUpdatedAt: isTail ? generatedAt : undefined,
       tailFrameSourceHash: isTail ? uploadedTailFrameSourceHash : undefined,
       tailFrameReferenceStatus: isTail ? 'ready' : undefined,

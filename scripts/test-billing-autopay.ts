@@ -26,13 +26,14 @@ import {
   settleExpiredSubscription,
 } from '../lib/credits';
 import { fulfillPaidOrder } from '../lib/billing-fulfill';
+import { toBillingOrderPayload } from '../lib/billing-order-payload';
 
 function setNodeEnv(value: string) {
   (process.env as Record<string, string | undefined>)['NODE_ENV'] = value;
 }
 
 // —— 新定价数值锁（2026-06-10 拍板）——
-assert.equal(getPlan('plus')?.price_cents, 10);
+assert.equal(getPlan('plus')?.price_cents, 159900);
 assert.equal(getPlan('plus')?.monthly_credits, 80000);
 assert.equal(getPlan('pro')?.price_cents, 799900);
 assert.equal(getPlan('pro')?.monthly_credits, 400000);
@@ -40,7 +41,7 @@ assert.equal(getPlan('free')?.monthly_credits, 100);
 assert.deepEqual(
   TOPUP_PACKS.map((p) => [p.code, p.credits, p.price_cents]),
   [
-    ['topup_basic', 40000, 10],
+    ['topup_basic', 40000, 100000],
     ['topup_advanced', 120000, 300000],
     ['topup_enterprise', 2000000, 4000000],
   ],
@@ -73,6 +74,10 @@ cleanup();
 db.prepare(`INSERT INTO users (id, username, display_name, password_hash) VALUES (?, ?, ?, ?)`)
   .run(uid, 'billing-autopay-user', 'billing-autopay-user', 'x');
 
+function orderRow(orderId: string) {
+  return db.prepare('SELECT * FROM billing_orders WHERE id = ? AND user_id = ?').get(orderId, uid) as any;
+}
+
 // 开户：free / 100 订阅积分
 let bal = getBalance(uid);
 assert.equal(bal.planCode, 'free');
@@ -80,10 +85,13 @@ assert.equal(bal.subscriptionCredits, 100);
 
 function insertOrder(kind: 'topup' | 'subscription', code: string, credits: number): string {
   const id = randomUUID();
+  const title = kind === 'subscription'
+    ? `订阅 ${getPlan(code)?.title || code}`
+    : `购买 ${getTopupPack(code)?.title || code}`;
   db.prepare(
     `INSERT INTO billing_orders (id, user_id, kind, plan_code, provider, amount_cents, credits_added, status, meta_json)
-     VALUES (?, ?, ?, ?, 'wechat', 0, ?, 'pending', '{}')`,
-  ).run(id, uid, kind, code, credits);
+     VALUES (?, ?, ?, ?, 'wechat', 0, ?, 'pending', ?)`,
+  ).run(id, uid, kind, code, credits, JSON.stringify({ title }));
   return id;
 }
 
@@ -110,6 +118,22 @@ assert.equal(bal.subscriptionCredits, 80000); // 覆盖重置（开户 100 不�
 assert.equal(bal.topupCredits, 40000); // topup 桶不动
 assert.ok(Date.parse(String(bal.periodEnd)) > Date.now());
 assert.equal(bal.cancelAtPeriodEnd, false);
+
+const topupPayload = toBillingOrderPayload(orderRow(topupOrder), uid);
+assert.equal(topupPayload.id, topupOrder);
+assert.equal(topupPayload.kind, 'topup');
+assert.equal(topupPayload.status, 'applied');
+assert.equal(topupPayload.title, '购买 基础积分包');
+assert.equal(topupPayload.creditsAdded, 40000);
+assert.equal(topupPayload.periodEnd, null);
+
+const subscriptionPayload = toBillingOrderPayload(orderRow(subOrder), uid);
+assert.equal(subscriptionPayload.id, subOrder);
+assert.equal(subscriptionPayload.kind, 'subscription');
+assert.equal(subscriptionPayload.status, 'applied');
+assert.equal(subscriptionPayload.title, '订阅 Plus');
+assert.equal(subscriptionPayload.creditsAdded, 80000);
+assert.equal(subscriptionPayload.periodEnd, bal.periodEnd);
 
 // —— 扣减优先级反转：subscription > bonus > topup ——
 chargeCredits({ userId: uid, amount: 1000, kind: 'video', reason: 'test charge' });

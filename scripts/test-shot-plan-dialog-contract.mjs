@@ -64,13 +64,13 @@ assert(main.includes("renderShotList: () => renderShotList()"), 'dialog must ref
 
 assert(html.includes('id="btnOpenShotPlanDialog"'), 'legacy shots top actions must expose dialog entry');
 assert(html.includes('"/modules/shotPlanDialog.js": "/modules/shotPlanDialog.js?v=5"'), 'import map must cache-bust shotPlanDialog');
-assert(html.includes('<script type="module" src="main.js?v=369"></script>'), 'main script cache version must be bumped');
+assert(html.includes('<script type="module" src="main.js?v=372"></script>'), 'main script cache version must be bumped');
 assert(html.includes('"/modules/asset_display_state.js": "/modules/asset_display_state.js?v=1"'), 'asset_display_state import-map cache version must be present');
-assert(html.includes('"/modules/board.js": "/modules/board.js?v=7"'), 'board import-map cache version must be bumped');
-assert(html.includes('"/modules/board_state.js": "/modules/board_state.js?v=3"'), 'board_state import-map cache version must be bumped');
+assert(html.includes('"/modules/board.js": "/modules/board.js?v=8"'), 'board import-map cache version must be bumped');
+assert(html.includes('"/modules/board_state.js": "/modules/board_state.js?v=4"'), 'board_state import-map cache version must be bumped');
 assert(html.includes('"/modules/board_viewport.js": "/modules/board_viewport.js?v=3"'), 'board_viewport import-map cache version must be bumped');
 assert(html.includes('"/modules/shots.js": "/modules/shots.js?v=116"'), 'shots import-map cache version must be bumped');
-assert(html.includes('styles.css?v=261'), 'styles cache version must be bumped');
+assert(html.includes('styles.css?v=263'), 'styles cache version must be bumped');
 
 assert(css.includes('.spd-overlay'), 'dialog CSS must be present');
 assert(css.includes('.spd-workbench'), 'dialog split workbench CSS must be present');

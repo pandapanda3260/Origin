@@ -19,6 +19,7 @@ let _checkoutBusy = false;
 let _redeemBusy = false;
 let _subActionBusy = false;
 let _wechatPayDialog = null;
+let _paymentSuccessDialog = null;
 // 每次 renderBillingPage() 重新渲染前，先销毁上一轮挂在 .plan-card 上的 holo
 // 效果，避免重复绑定 pointer 事件 / 泄漏 rAF。
 let _holoDestroys = [];
@@ -388,8 +389,18 @@ export async function startCheckout(orderType, code, paymentMethod) {
   // 不跳转支付页，直接刷新余额/套餐/流水（loadBillingSummary 内部会重渲整页+刷新角标）。
   if (order && order.status === 'applied') {
     _pendingOrderNo = '';
+    var appliedOrder = null;
+    try {
+      if (order.orderId) appliedOrder = await pollOrder(order.orderId);
+    } catch (e) {
+      console.warn('[billing] reload applied order failed:', e);
+    }
     await loadBillingSummary();
-    showToast((order.message ? String(order.message) : '支付成功，已到账。'), 'ok');
+    if (appliedOrder && appliedOrder.status === 'applied') {
+      showPaymentSuccessDialog(appliedOrder);
+    } else {
+      showToast((order.message ? String(order.message) : '支付成功，已到账。'), 'ok');
+    }
     return order;
   }
   if (order && order.provider === 'wechat' && (order.qrCode || order.codeUrl || (order.providerPayload && order.providerPayload.code_url))) {
@@ -497,7 +508,7 @@ function showWechatPayDialog(order) {
         _pendingOrderNo = '';
         closeWechatPayDialog();
         await loadBillingSummary();
-        showToast('支付成功，账务已刷新。', 'ok');
+        showPaymentSuccessDialog(current);
         return;
       }
       if (st === 'failed' || st === 'cancelled') {
@@ -544,6 +555,87 @@ function closeWechatPayDialog() {
     try { _wechatPayDialog.close(); } catch (_e) {}
   }
   _wechatPayDialog = null;
+}
+
+function _formatSuccessCredits(value) {
+  var n = Number(value || 0);
+  return Number.isFinite(n) ? n.toLocaleString('zh-CN') : '0';
+}
+
+function _successSubscriptionLabel(order) {
+  var title = String((order && order.title) || '').trim();
+  if (title.indexOf('订阅 ') === 0) title = title.replace(/^订阅\s+/, '').trim();
+  if (!title) title = '会员';
+  return /会员$/.test(title) ? title : title + '会员';
+}
+
+function _paymentSuccessViewModel(order) {
+  order = order || {};
+  var kind = String(order.kind || '');
+  var isSubscription = kind === 'subscription';
+  var credits = _formatSuccessCredits(order.creditsAdded);
+  var periodEnd = isSubscription && order.periodEnd ? _fmtDate(order.periodEnd) : '';
+  return {
+    title: '您已支付成功',
+    subtitle: isSubscription ? '恭喜成功订阅 ' + _successSubscriptionLabel(order) : '积分包购买成功',
+    pill: isSubscription ? '升级积分 ' + credits + ' 已发放' : '积分 ' + credits + ' 已到账',
+    periodEnd: periodEnd ? '会员有效期至 ' + periodEnd : '',
+    orderId: String(order.id || ''),
+  };
+}
+
+function showPaymentSuccessDialog(order) {
+  closePaymentSuccessDialog();
+  var vm = _paymentSuccessViewModel(order);
+  var overlay = document.createElement('div');
+  overlay.className = 'billing-payment-success-dialog';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-labelledby', 'billingPaymentSuccessTitle');
+  overlay.innerHTML =
+    '<section class="billing-payment-success-panel" role="document">' +
+      '<button type="button" class="billing-payment-success-close material-symbols-outlined" aria-label="关闭">close</button>' +
+      '<div class="billing-payment-success-icon" aria-hidden="true">' +
+        '<span class="material-symbols-outlined">check_circle</span>' +
+      '</div>' +
+      '<h2 id="billingPaymentSuccessTitle" class="billing-payment-success-title">' + escapeHtml(vm.title) + '</h2>' +
+      '<div class="billing-payment-success-sub">' + escapeHtml(vm.subtitle) + '</div>' +
+      '<div class="billing-payment-success-pill">' + escapeHtml(vm.pill) + '</div>' +
+      '<div class="billing-payment-success-meta">' +
+        (vm.periodEnd ? '<div>' + escapeHtml(vm.periodEnd) + '</div>' : '') +
+        (vm.orderId ? '<div>订单编号：' + escapeHtml(vm.orderId) + '</div>' : '') +
+      '</div>' +
+      '<button type="button" class="billing-payment-success-primary">知道了</button>' +
+    '</section>';
+  var onKeyDown = function (ev) {
+    if (ev && ev.key === 'Escape') closePaymentSuccessDialog();
+  };
+  var closeBtn = overlay.querySelector('.billing-payment-success-close');
+  var primaryBtn = overlay.querySelector('.billing-payment-success-primary');
+  if (closeBtn) closeBtn.addEventListener('click', closePaymentSuccessDialog);
+  if (primaryBtn) primaryBtn.addEventListener('click', closePaymentSuccessDialog);
+  overlay.addEventListener('click', function (ev) {
+    if (ev.target === overlay) closePaymentSuccessDialog();
+  });
+  document.addEventListener('keydown', onKeyDown);
+  document.body.appendChild(overlay);
+  _paymentSuccessDialog = {
+    el: overlay,
+    close: function () {
+      document.removeEventListener('keydown', onKeyDown);
+      if (overlay.parentElement) overlay.remove();
+    },
+  };
+  setTimeout(function () {
+    try { if (primaryBtn) primaryBtn.focus(); } catch (_e) {}
+  }, 0);
+}
+
+function closePaymentSuccessDialog() {
+  if (_paymentSuccessDialog && _paymentSuccessDialog.close) {
+    try { _paymentSuccessDialog.close(); } catch (_e) {}
+  }
+  _paymentSuccessDialog = null;
 }
 
 // 兑换码兑换：后端 /api/billing/redeem 已实现（成功返回 { ok, creditsAdded, message }，
@@ -604,7 +696,11 @@ export async function handleBillingReturnFromUrl() {
       var polled = await waitForOrderApplied(orderNo, 12000);
       await loadBillingSummary();
       _pendingOrderNo = '';
-      showToast(polled && polled.status === 'applied' ? '支付成功，账务已刷新。' : '支付已返回，请稍候账务状态刷新。', polled && polled.status === 'applied' ? 'ok' : 'warn');
+      if (polled && polled.status === 'applied') {
+        showPaymentSuccessDialog(polled);
+      } else {
+        showToast('支付已返回，请稍候账务状态刷新。', 'warn');
+      }
       if (_ctx.switchPage) _ctx.switchPage('billing');
       return;
     }

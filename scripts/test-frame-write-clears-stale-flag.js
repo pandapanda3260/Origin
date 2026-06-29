@@ -58,10 +58,10 @@ const workspaceHtml = readFileSync(join(ROOT, 'public/workspace.html'), 'utf8');
 record('首帧 executor 写盘点清 storyboard_${groupIdx} 并随 storyboards 一起返回 _staleFlags patch', () => {
   const anchor = executorsSrc.indexOf("'storyboard-image-writeback'");
   assert.ok(anchor > 0, '找不到 storyboard-image-writeback 锚点');
-  const seg = executorsSrc.slice(anchor, anchor + 1200);
-  assert.match(seg, /delete nextStaleFlags\[`storyboard_\$\{groupIdx\}`\]/);
-  assert.match(seg, /return \{ storyboards, _staleFlags: nextStaleFlags \}/);
-});
+	  const seg = executorsSrc.slice(anchor, anchor + 1200);
+	  assert.match(seg, /delete nextStaleFlags\[`storyboard_\$\{groupIdx\}`\]/);
+	  assert.match(seg, /return \{ (storyboards|\.\.\.basePatch), _staleFlags: nextStaleFlags \}/);
+	});
 
 record('尾帧 executor 写盘点清 tail_frame_${groupIdx}', () => {
   const anchor = executorsSrc.indexOf("'tail-frame-image-writeback'");
@@ -72,10 +72,10 @@ record('尾帧 executor 写盘点清 tail_frame_${groupIdx}', () => {
 });
 
 record('frames/upload 上传写盘点按 isTail 清对应 flag', () => {
-  assert.match(uploadSrc, /const staleKey = isTail \? `tail_frame_\$\{groupIdx\}` : `storyboard_\$\{groupIdx\}`/);
-  assert.match(uploadSrc, /delete nextStaleFlags\[staleKey\]/);
-  assert.match(uploadSrc, /return \{ storyboards, _staleFlags: nextStaleFlags \}/);
-});
+	  assert.match(uploadSrc, /const staleKey = isTail \? `tail_frame_\$\{groupIdx\}` : `storyboard_\$\{groupIdx\}`/);
+	  assert.match(uploadSrc, /delete nextStaleFlags\[staleKey\]/);
+	  assert.match(uploadSrc, /return \{ (storyboards|\.\.\.basePatch), _staleFlags: nextStaleFlags \}/);
+	});
 
 record('confirmImages 拦截前调 compute-stale 权威重算并 mirror storyboard_ 前缀', () => {
   const anchor = storyboardSrc.indexOf('export async function confirmImages');

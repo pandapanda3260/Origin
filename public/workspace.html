@@ -80,7 +80,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=261" />
+    <link rel="stylesheet" href="styles.css?v=263" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -1809,7 +1809,7 @@
     </main>
 
     <!-- ===== Agent FAB (右下角悬浮按钮) ===== -->
-    <button type="button" id="navAgent" class="agent-fab" title="AI 视频助手（可拖动）" aria-label="AI 视频助手（可拖动）">
+    <button type="button" id="navAgent" class="agent-fab" title="AI 视频助手（可拖动）" aria-label="AI 视频助手（可拖动）" hidden>
       <span class="material-symbols-outlined agent-fab-icon" style="font-variation-settings:'FILL' 0">auto_awesome</span>
       <span class="agent-fab-pulse"></span>
     </button>
@@ -1830,6 +1830,9 @@
           </div>
         </div>
         <div class="flex items-center gap-1">
+          <button type="button" id="agentDockResetBtn" class="w-9 h-9 rounded-full hover:bg-on-background/5 flex items-center justify-center transition-colors" title="停靠到右下角">
+            <span class="material-symbols-outlined text-base text-on-background/40">south_east</span>
+          </button>
           <button type="button" id="agentClearBtn" class="w-9 h-9 rounded-full hover:bg-on-background/5 flex items-center justify-center transition-colors" title="清空对话">
             <span class="material-symbols-outlined text-base text-on-background/40">delete_sweep</span>
           </button>
@@ -1871,8 +1874,8 @@
                     "/modules/assets.js": "/modules/assets.js?v=186",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
                     "/modules/billing.js": "/modules/billing.js?v=119",
-                    "/modules/board.js": "/modules/board.js?v=7",
-                    "/modules/board_state.js": "/modules/board_state.js?v=3",
+                    "/modules/board.js": "/modules/board.js?v=8",
+                    "/modules/board_state.js": "/modules/board_state.js?v=4",
                     "/modules/board_viewport.js": "/modules/board_viewport.js?v=3",
                     "/modules/character_custom.js": "/modules/character_custom.js?v=222",
                     "/modules/scene_custom.js": "/modules/scene_custom.js?v=100",
@@ -1913,7 +1916,7 @@
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=302"></script>
-    <script type="module" src="main.js?v=369"></script>
+    <script type="module" src="main.js?v=372"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

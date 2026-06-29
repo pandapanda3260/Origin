@@ -5,7 +5,19 @@ import { resolveProtectedImageBlobUrl } from '/modules/utils.js';
 
 assertModuleSingleton('board', import.meta.url);
 
-export const BOARD_CTX_KEYS = ['getProject', 'getStoryboardGroups', 'hydrateProtectedImageElements', 'showToast', 'uPrefix'];
+export const BOARD_CTX_KEYS = [
+  'getProject',
+  'getStoryboardGroups',
+  'hydrateProtectedImageElements',
+  'showToast',
+  'uPrefix',
+  'selectShotFrameCandidate',
+  'deleteShotFrameCandidate',
+  'reorderShotFrameCandidates',
+  'generateShotFrameCandidate',
+  'generateStoryboardSheet',
+  'uploadShotFrameCandidate',
+];
 
 let _ctx = {};
 let _project = null;
@@ -38,6 +50,8 @@ let _boardImageObserver = null;
 let _boardImageQueue = [];
 let _boardImageActive = 0;
 let _boardImageHydrateRaf = 0;
+let _boardActionBusy = false;
+let _dragCandidate = null;
 
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -184,6 +198,17 @@ function actionButton(label, icon, action) {
     '<span>' + escapeHtml(label) + '</span></button>';
 }
 
+function boardIconButton(action, icon, title, attrs) {
+  return '<button type="button" class="board-icon-btn" data-board-control data-board-action="' + escapeHtml(action) + '" ' + (attrs || '') + ' title="' + escapeHtml(title || '') + '" aria-label="' + escapeHtml(title || '') + '">' +
+    '<span class="material-symbols-outlined">' + escapeHtml(icon) + '</span></button>';
+}
+
+function boardActionAttrs(groupIdx, shotUid, candidateId) {
+  let attrs = 'data-group-idx="' + escapeHtml(groupIdx) + '" data-shot-uid="' + escapeHtml(shotUid || '') + '"';
+  if (candidateId) attrs += ' data-candidate-id="' + escapeHtml(candidateId) + '"';
+  return attrs;
+}
+
 function projectIdOf(project) {
   return String(project && project.id ? project.id : 'draft');
 }
@@ -300,12 +325,16 @@ function ensureRoot() {
     },
   });
 
-  _viewportRoot.addEventListener('click', onViewportClick);
-  _toolsEl.addEventListener('click', onToolClick);
-  _root.addEventListener('click', onRootClick);
-  if (_miniMapEl) _miniMapEl.addEventListener('pointerdown', onMiniMapPointerDown);
-  return true;
-}
+	  _viewportRoot.addEventListener('click', onViewportClick);
+	  _toolsEl.addEventListener('click', onToolClick);
+	  _root.addEventListener('click', onRootClick);
+	  _root.addEventListener('dragstart', onCandidateDragStart);
+	  _root.addEventListener('dragover', onCandidateDragOver);
+	  _root.addEventListener('drop', onCandidateDrop);
+	  _root.addEventListener('dragend', onCandidateDragEnd);
+	  if (_miniMapEl) _miniMapEl.addEventListener('pointerdown', onMiniMapPointerDown);
+	  return true;
+	}
 
 function currentProject() {
   if (_project) return _project;
@@ -434,13 +463,189 @@ function toggleBoardHelp(force) {
   if (helpBtn) {
     helpBtn.classList.toggle('is-active', _helpOpen);
     helpBtn.setAttribute('aria-expanded', _helpOpen ? 'true' : 'false');
+	  }
+	}
+
+function boardActionPayload(el) {
+  return {
+    groupIdx: Number(el && el.dataset ? el.dataset.groupIdx : NaN),
+    shotUid: String(el && el.dataset ? el.dataset.shotUid || '' : '').trim(),
+    candidateId: String(el && el.dataset ? el.dataset.candidateId || '' : '').trim(),
+  };
+}
+
+function pickBoardImageFile() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.style.position = 'fixed';
+    input.style.left = '-9999px';
+    input.addEventListener('change', () => {
+      const file = input.files && input.files[0] ? input.files[0] : null;
+      try { input.remove(); } catch (_) {}
+      resolve(file);
+    }, { once: true });
+    document.body.appendChild(input);
+    input.click();
+    setTimeout(() => { try { input.remove(); } catch (_) {} }, 30000);
+  });
+}
+
+async function runBoardAction(action, payload) {
+  const project = currentProject();
+  if (!project || !project.id) throw new Error('no_project');
+  if (action === 'candidate-select') {
+    if (!_ctx.selectShotFrameCandidate) throw new Error('select_not_available');
+    await _ctx.selectShotFrameCandidate(payload);
+  } else if (action === 'candidate-delete') {
+    if (!_ctx.deleteShotFrameCandidate) throw new Error('delete_not_available');
+    await _ctx.deleteShotFrameCandidate(payload);
+  } else if (action === 'candidate-generate') {
+    if (!_ctx.generateShotFrameCandidate) throw new Error('generate_not_available');
+    await _ctx.generateShotFrameCandidate(payload);
+  } else if (action === 'candidate-upload') {
+    if (!_ctx.uploadShotFrameCandidate) throw new Error('upload_not_available');
+    const file = await pickBoardImageFile();
+    if (!file) return;
+    await _ctx.uploadShotFrameCandidate({ ...payload, file });
+  } else if (action === 'segment-generate-all') {
+    if (!_ctx.generateStoryboardSheet) throw new Error('segment_generate_not_available');
+    await _ctx.generateStoryboardSheet(payload.groupIdx);
   }
 }
 
-function onRootClick(event) {
-  const close = event.target && event.target.closest ? event.target.closest('[data-board-help-close]') : null;
-  if (close) toggleBoardHelp(false);
+async function handleBoardAction(actionEl) {
+  const action = String(actionEl && actionEl.dataset ? actionEl.dataset.boardAction || '' : '').trim();
+  if (!action || _boardActionBusy) return;
+  const payload = boardActionPayload(actionEl);
+  if (!Number.isInteger(payload.groupIdx) || payload.groupIdx < 0) return;
+  if (action !== 'segment-generate-all' && !payload.shotUid) {
+    if (_ctx.showToast) _ctx.showToast('该镜头缺少 shotUid，不能写入候选', 'error');
+    return;
+  }
+  if ((action === 'candidate-select' || action === 'candidate-delete') && !payload.candidateId) return;
+  _boardActionBusy = true;
+  actionEl.disabled = true;
+  try {
+    await runBoardAction(action, payload);
+    if (action === 'candidate-generate' || action === 'segment-generate-all') {
+      if (_ctx.showToast) _ctx.showToast('已开始生成首帧候选', 'success');
+    } else if (action === 'candidate-upload') {
+      if (_ctx.showToast) _ctx.showToast('已上传首帧候选', 'success');
+    } else {
+      if (_ctx.showToast) _ctx.showToast('候选已更新', 'success');
+    }
+    refreshBoardPage();
+  } catch (err) {
+    const msg = ((err && err.message) || err || '操作失败').toString().slice(0, 160);
+    if (_ctx.showToast) _ctx.showToast(msg, 'error');
+  } finally {
+    _boardActionBusy = false;
+    actionEl.disabled = false;
+  }
 }
+
+function candidateCardFromEvent(event) {
+  return event && event.target && event.target.closest ? event.target.closest('.board-candidate-card[data-candidate-id]') : null;
+}
+
+function candidatePayloadFromCard(card) {
+  return {
+    groupIdx: Number(card && card.dataset ? card.dataset.groupIdx : NaN),
+    shotUid: String(card && card.dataset ? card.dataset.shotUid || '' : '').trim(),
+    candidateId: String(card && card.dataset ? card.dataset.candidateId || '' : '').trim(),
+  };
+}
+
+function sameCandidateScope(a, b) {
+  return a && b && Number(a.groupIdx) === Number(b.groupIdx) && a.shotUid && a.shotUid === b.shotUid;
+}
+
+function onCandidateDragStart(event) {
+  const card = candidateCardFromEvent(event);
+  if (!card || card.getAttribute('draggable') !== 'true') return;
+  const payload = candidatePayloadFromCard(card);
+  if (!payload.shotUid || !payload.candidateId) return;
+  _dragCandidate = payload;
+  card.classList.add('is-dragging');
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', payload.candidateId);
+  }
+}
+
+function onCandidateDragOver(event) {
+  if (!_dragCandidate) return;
+  const card = candidateCardFromEvent(event);
+  const strip = event.target && event.target.closest ? event.target.closest('.board-candidate-strip') : null;
+  if (!card && !strip) return;
+  const targetPayload = card ? candidatePayloadFromCard(card) : _dragCandidate;
+  if (!sameCandidateScope(_dragCandidate, targetPayload)) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+async function onCandidateDrop(event) {
+  if (!_dragCandidate || !_ctx.reorderShotFrameCandidates) return;
+  const card = candidateCardFromEvent(event);
+  const strip = event.target && event.target.closest ? event.target.closest('.board-candidate-strip') : null;
+  if (!strip) return;
+  const targetPayload = card ? candidatePayloadFromCard(card) : _dragCandidate;
+  if (!sameCandidateScope(_dragCandidate, targetPayload)) return;
+  event.preventDefault();
+  const cards = Array.from(strip.querySelectorAll('.board-candidate-card[data-candidate-id]'))
+    .filter((item) => item.getAttribute('draggable') === 'true');
+  let orderedIds = cards.map((item) => String(item.dataset.candidateId || '').trim()).filter(Boolean);
+  orderedIds = orderedIds.filter((id) => id !== _dragCandidate.candidateId);
+  if (card && card.dataset.candidateId && card.dataset.candidateId !== _dragCandidate.candidateId) {
+    const rect = card.getBoundingClientRect ? card.getBoundingClientRect() : null;
+    const after = rect ? event.clientX > rect.left + rect.width / 2 : false;
+    const targetId = String(card.dataset.candidateId || '').trim();
+    const targetIndex = orderedIds.indexOf(targetId);
+    const insertAt = targetIndex < 0 ? orderedIds.length : targetIndex + (after ? 1 : 0);
+    orderedIds.splice(insertAt, 0, _dragCandidate.candidateId);
+  } else {
+    orderedIds.push(_dragCandidate.candidateId);
+  }
+  const original = cards.map((item) => String(item.dataset.candidateId || '').trim()).filter(Boolean);
+  if (orderedIds.length !== original.length || orderedIds.every((id, idx) => id === original[idx])) return;
+  _boardActionBusy = true;
+  try {
+    await _ctx.reorderShotFrameCandidates({
+      groupIdx: _dragCandidate.groupIdx,
+      shotUid: _dragCandidate.shotUid,
+      orderedIds,
+    });
+    if (_ctx.showToast) _ctx.showToast('候选顺序已更新', 'success');
+    refreshBoardPage();
+  } catch (err) {
+    const msg = ((err && err.message) || err || '候选排序失败').toString().slice(0, 160);
+    if (_ctx.showToast) _ctx.showToast(msg, 'error');
+  } finally {
+    _boardActionBusy = false;
+    onCandidateDragEnd();
+  }
+}
+
+function onCandidateDragEnd() {
+  if (_root && _root.querySelectorAll) {
+    _root.querySelectorAll('.board-candidate-card.is-dragging').forEach((card) => card.classList.remove('is-dragging'));
+  }
+  _dragCandidate = null;
+}
+
+function onRootClick(event) {
+  const actionEl = event.target && event.target.closest ? event.target.closest('[data-board-action]') : null;
+  if (actionEl) {
+    event.preventDefault();
+    event.stopPropagation();
+    handleBoardAction(actionEl);
+    return;
+  }
+	  const close = event.target && event.target.closest ? event.target.closest('[data-board-help-close]') : null;
+	  if (close) toggleBoardHelp(false);
+	}
 
 function setSurfaceBounds(bounds) {
   if (!_surfaceEl || !_edgesEl) return;
@@ -500,32 +705,59 @@ function renderShotPlanNode(data) {
     stepRow(steps.composePrompt, '合成提示词') +
     '</ul>' +
     actionButton('打开脚本节点', 'open_in_new', 'open-shot-plan-dialog') +
+	  '</div>';
+	}
+
+function renderCandidateCard(groupIdx, row, candidate, idx) {
+  const selected = !!(candidate && candidate.selected);
+  const placeholder = candidate && candidate.kind === 'segment-cover-placeholder';
+  const candidateId = candidate && candidate.id ? candidate.id : '';
+  const attrs = boardActionAttrs(groupIdx, row.shotUid, candidateId);
+  return '<div class="board-candidate-card ' + (selected ? 'is-selected ' : '') + (placeholder ? 'is-placeholder' : '') + '" ' + attrs + ' ' + (placeholder || !row.shotUid || candidate.readOnly ? '' : 'draggable="true"') + '>' +
+    '<button type="button" class="board-candidate-thumb" data-board-control data-board-action="candidate-select" ' + attrs + ' ' + (placeholder || !row.shotUid ? 'disabled aria-disabled="true"' : '') + '>' +
+    assetImg(candidate && candidate.url, '镜头' + (row.shotIdx + 1) + '候选' + (idx + 1)) +
+    (selected ? '<span class="board-candidate-check material-symbols-outlined">check_circle</span>' : '') +
+    '</button>' +
+    '<div class="board-candidate-meta">' +
+    '<span>' + escapeHtml(candidate && candidate.label ? candidate.label : ('候选 ' + (idx + 1))) + '</span>' +
+    (placeholder || !row.shotUid || candidate.readOnly ? '' : boardIconButton('candidate-delete', 'delete', '删除候选', attrs)) +
+    '</div>' +
+  '</div>';
+}
+
+function renderRowActions(groupIdx, row, hasCandidates) {
+  if (!row.shotUid) return '<div class="board-frame-actions"><span class="board-muted">缺 shotUid</span></div>';
+  const attrs = boardActionAttrs(groupIdx, row.shotUid);
+  const generateLabel = hasCandidates ? '重新生成' : '生成图片';
+  return '<div class="board-frame-actions">' +
+    '<button type="button" class="board-btn" data-board-control data-board-action="candidate-generate" ' + attrs + '><span class="material-symbols-outlined">auto_awesome</span><span>' + escapeHtml(generateLabel) + '</span></button>' +
+    '<button type="button" class="board-btn" data-board-control data-board-action="candidate-upload" ' + attrs + '><span class="material-symbols-outlined">upload</span><span>上传图片</span></button>' +
   '</div>';
 }
 
 function renderSegmentNode(data) {
-  const shotRows = data && data.shotRows ? data.shotRows : [];
-  const placeholderCount = shotRows.filter((row) => row.candidates && row.candidates[0] && row.candidates[0].kind === 'segment-cover-placeholder').length;
-  const badgeText = placeholderCount ? '封面占位 ' + placeholderCount + '/' + shotRows.length : '首帧 0/' + shotRows.length;
-  const rows = shotRows.map((row) => {
-    const candidate = row.candidates && row.candidates[0];
-    const isPlaceholder = candidate && candidate.kind === 'segment-cover-placeholder';
-    const frameLabel = isPlaceholder ? '片段封面占位' : '镜头' + (row.shotIdx + 1) + '首帧图';
-    return '<div class="board-shot-row">' +
-      '<div class="board-shot-label">镜头 ' + escapeHtml(row.shotIdx + 1) + '</div>' +
-      '<div class="board-frame-card">' +
-      assetImg(candidate && candidate.url, isPlaceholder ? '片段封面占位' : '镜头' + (row.shotIdx + 1) + '首帧') +
-      '<span>' + escapeHtml(frameLabel) + '</span>' +
-      '</div>' +
-      (candidate ? '' : '<div class="board-frame-actions">' + disabledButton('生成图片', 'auto_awesome') + disabledButton('上传图片', 'upload') + '</div>') +
-    '</div>';
-  }).join('');
-  return '<div class="board-node-card board-node-card--segment">' +
-    '<div class="board-node-head"><h2>片段 ' + escapeHtml((data && data.gIdx) + 1) + '</h2><span>' + escapeHtml(badgeText) + '</span></div>' +
-    '<div class="board-shot-rows">' + (rows || '<p class="board-muted">暂无镜头</p>') + '</div>' +
-    disabledButton('一键全生成', 'auto_awesome') +
-  '</div>';
-}
+	  const shotRows = data && data.shotRows ? data.shotRows : [];
+	  const placeholderCount = shotRows.filter((row) => row.candidates && row.candidates[0] && row.candidates[0].kind === 'segment-cover-placeholder').length;
+	  const readyCount = shotRows.filter((row) => (row.candidates || []).some((candidate) => candidate && candidate.kind !== 'segment-cover-placeholder')).length;
+	  const badgeText = readyCount ? '首帧 ' + readyCount + '/' + shotRows.length : (placeholderCount ? '封面占位 ' + placeholderCount + '/' + shotRows.length : '首帧 0/' + shotRows.length);
+	  const allReady = shotRows.length > 0 && readyCount === shotRows.length;
+	  const rows = shotRows.map((row) => {
+	    const candidates = row.candidates || [];
+	    const realCandidateCount = candidates.filter((candidate) => candidate && candidate.kind !== 'segment-cover-placeholder').length;
+	    return '<div class="board-shot-row">' +
+	      '<div class="board-shot-label">镜头 ' + escapeHtml(row.shotIdx + 1) + '</div>' +
+	      '<div class="board-candidate-strip">' +
+	      (candidates.length ? candidates.map((candidate, idx) => renderCandidateCard(data.gIdx, row, candidate, idx)).join('') : '<div class="board-frame-card">' + assetImg('', '') + '<span>待生成</span></div>') +
+	      '</div>' +
+	      renderRowActions(data.gIdx, row, realCandidateCount > 0) +
+	    '</div>';
+	  }).join('');
+	  return '<div class="board-node-card board-node-card--segment">' +
+	    '<div class="board-node-head"><h2>片段 ' + escapeHtml((data && data.gIdx) + 1) + '</h2><span>' + escapeHtml(badgeText) + '</span></div>' +
+	    '<div class="board-shot-rows">' + (rows || '<p class="board-muted">暂无镜头</p>') + '</div>' +
+	    (allReady ? '' : '<button type="button" class="board-btn" data-board-control data-board-action="segment-generate-all" data-group-idx="' + escapeHtml((data && data.gIdx) || 0) + '"><span class="material-symbols-outlined">auto_awesome</span><span>一键全生成</span></button>') +
+	  '</div>';
+	}
 
 function statusLabel(status) {
   const map = {

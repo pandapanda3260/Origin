@@ -25,12 +25,13 @@ import { chatComplete, chatCompleteJsonViaBackground, chatCompleteJsonWithRetry,
 import { buildShotsMessages, buildVideoPromptMessages } from './prompts';
 import { getProjectByIdForUser, patchProjectForUser } from './projects-db';
 import {
-  isFirstLastFrameVideoModeEnabled,
-  isIndependentMultiImageModeEnabled,
-  isMultiRefVideoModeEnabled,
-  isTailFrameCaptionFallbackEnabled,
-  getVideoSubmitMode,
-} from './feature-flags';
+	  isFirstLastFrameVideoModeEnabled,
+	  isIndependentMultiImageModeEnabled,
+	  isMultiRefVideoModeEnabled,
+	  isPerShotFirstFrameEnabled,
+	  isTailFrameCaptionFallbackEnabled,
+	  getVideoSubmitMode,
+	} from './feature-flags';
 import {
   computeFirstLastFeatureEnabled,
   deriveVideoSubmitInputMode,
@@ -166,14 +167,19 @@ import {
   maybeAssertStoryboardsAlignedWithShots,
   storyboardShotIndices,
 } from './frame-workflow-state';
-import { buildKnowledgeContextForStage } from './knowledge/compile-context';
-import { recordKnowledgeContextBestEffort } from './knowledge/context-db';
-import type { KnowledgeStage } from './knowledge/types';
-import {
-  describeArtifactStatus,
-  type ArtifactUsageDecision,
-  type TargetArtifact,
-} from './sentinel';
+	import { buildKnowledgeContextForStage } from './knowledge/compile-context';
+	import { recordKnowledgeContextBestEffort } from './knowledge/context-db';
+	import type { KnowledgeStage } from './knowledge/types';
+	import {
+	  appendShotFrameCandidate,
+	  canonicalShotUid,
+	  mirrorSelectedFirstFrameToLegacyFields,
+	} from './shot-frame-candidates';
+	import {
+	  describeArtifactStatus,
+	  type ArtifactUsageDecision,
+	  type TargetArtifact,
+	} from './sentinel';
 import { applyBlockerFilter } from './batch-preflight';
 import { resolveVideoAspectRatio } from './aspect-ratio';
 
@@ -490,6 +496,27 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function cleanTargetText(value: any): string {
+  return String(value ?? '').trim();
+}
+
+function findTargetShotIndexForPerShot(shots: any[], shotIndices: number[], target: any): { shotUid: string; shotIdx: number } | null {
+  const shotUid = cleanTargetText(target?.shotUid ?? target?.shot_uid);
+  if (!shotUid) return null;
+  const targetShotIdx = Number(target?.shotIdx);
+  if (Number.isInteger(targetShotIdx) && shotIndices.includes(targetShotIdx) && canonicalShotUid(shots[targetShotIdx]) === shotUid) {
+    return { shotUid, shotIdx: targetShotIdx };
+  }
+  for (const shotIdx of shotIndices) {
+    if (canonicalShotUid(shots[shotIdx]) === shotUid) return { shotUid, shotIdx };
+  }
+  return null;
+}
+
+function primaryFirstShotIndices(shotIndices: number[], primaryShotIdx: number): number[] {
+  return [primaryShotIdx, ...shotIndices.filter((idx) => idx !== primaryShotIdx)];
 }
 
 function errorWithFailureStage(message: string, failureStage: VideoPromptFailureStage): Error & { failureStage: VideoPromptFailureStage } {
@@ -1745,17 +1772,29 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
   const shots = (proj as any).shots || [];
   const storyboards = Array.isArray((proj as any).storyboards) ? (proj as any).storyboards : [];
   const sb = storyboards[groupIdx] || {};
-  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
-    mode: 'single-shot-strict',
-    explicitShotIndices: ctx.target.shotIndices,
-  });
-  assertArtifactUsable(proj as any, ctx, 'storyboard_image_generation', { groupIdx, shotIndices });
+	  const shotIndices = storyboardShotIndices(proj as any, groupIdx, sb, {
+	    mode: 'single-shot-strict',
+	    explicitShotIndices: ctx.target.shotIndices,
+	  });
+	  assertArtifactUsable(proj as any, ctx, 'storyboard_image_generation', { groupIdx, shotIndices });
 
-  const groupShots = shotIndices.map((i) => shots[i]);
+	  const perShotTarget = isPerShotFirstFrameEnabled()
+	    ? findTargetShotIndexForPerShot(shots, shotIndices, ctx.target)
+	    : null;
+	  if (isPerShotFirstFrameEnabled() && cleanTargetText(ctx.target?.shotUid ?? ctx.target?.shot_uid) && !perShotTarget) {
+	    throw new Error('shot_uid_not_in_group');
+	  }
+	  if (perShotTarget && !isMultiRefVideoModeEnabled()) {
+	    throw new Error('per_shot_first_frame_requires_structured_mode');
+	  }
+	  const planShotIndices = perShotTarget
+	    ? primaryFirstShotIndices(shotIndices, perShotTarget.shotIdx)
+	    : shotIndices;
+	  const groupShots = planShotIndices.map((i) => shots[i]);
 
-  ctx.progress({ stage: 'building_prompt' });
+	  ctx.progress({ stage: 'building_prompt' });
 
-  if (isMultiRefVideoModeEnabled()) {
+	  if (isMultiRefVideoModeEnabled()) {
     // P0: 用结构化的 FrameImageGenerationPlan 统一组织首帧输入。
     //   - prompt / 参考图清单 / 资产锁 / 模型能力快照都通过 plan 产出;
     //   - P3a: multiRefImageCap 从 provider capabilities.image.multiRefImage 读;
@@ -1763,18 +1802,65 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     const imgCfg = resolveLLMConfig(ctx.user, 'image');
     const capMulti = Math.max(1, Math.floor(imgCfg.capabilities?.image?.multiRefImage ?? 1));
     const generationState: { finalPlan: FrameImageGenerationPlan | null } = { finalPlan: null };
-    let appliedEditDraft = false;
-    let appliedDraftForFingerprint: any = null;
-    let committedBasePrompt = '';
-    let generationShotIndices = shotIndices;
-    let firstFrameSourceHashForInput = computeFirstFrameSourceHashForShotIndices(proj, shotIndices);
-    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
-      if (!fresh) return null;
-      const promptState = reconcileFirstFramePromptStateInPatch({
-        project: fresh,
-        user: ctx.user,
-        groupIdx,
-        explicitShotIndices: shotIndices,
+	    let appliedEditDraft = false;
+	    let appliedDraftForFingerprint: any = null;
+	    let committedBasePrompt = '';
+	    let generationShotIndices = planShotIndices;
+	    let firstFrameSourceHashForInput = computeFirstFrameSourceHashForShotIndices(proj, planShotIndices);
+	    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+	      if (!fresh) return null;
+	      if (perShotTarget) {
+	        const modelSnapshot = {
+	          provider: imgCfg.provider,
+	          model: imgCfg.model,
+	          baseUrl: imgCfg.baseUrl,
+	          quality: imgCfg.imageQuality || 'medium',
+	          multiRefImageCap: capMulti,
+	        };
+	        let nextPlan = buildFrameImageGenerationPlan({
+	          project: fresh,
+	          groupIdx,
+	          shotIndices: planShotIndices,
+	          ownerId: ctx.user.id,
+	          frameType: 'first_frame',
+	          modelSnapshot,
+	        });
+	        const { draft } = currentFirstFrameEditDraft(fresh, groupIdx);
+	        if (ctx.options?.applyEditDraft === true && draft) {
+	          try {
+	            validateAndNormalizeFirstFrameDraft({
+	              project: fresh,
+	              groupIdx,
+	              userId: ctx.user.id,
+	              input: draft,
+	              plan: nextPlan,
+	            });
+	          } catch (err) {
+	            if (err instanceof FirstFrameDraftValidationException) {
+	              throw new Error(err.errors.map((item) => item.message).join('; ') || '首帧草稿校验失败');
+	            }
+	            throw err;
+	          }
+	          nextPlan = applyFirstFrameDraftToPlan({
+	            project: fresh,
+	            userId: ctx.user.id,
+	            plan: nextPlan,
+	            draft,
+	          });
+	          appliedEditDraft = true;
+	          appliedDraftForFingerprint = draft;
+	        }
+	        generationState.finalPlan = nextPlan;
+	        committedBasePrompt = nextPlan.finalPrompt;
+	        generationShotIndices = planShotIndices;
+	        firstFrameSourceHashForInput = computeFirstFrameSourceHashForShotIndices(fresh, planShotIndices);
+	        return {};
+	      }
+	      const promptState = reconcileFirstFramePromptStateInPatch({
+	        project: fresh,
+	        user: ctx.user,
+	        groupIdx,
+	        explicitShotIndices: shotIndices,
       });
       const { draft } = currentFirstFrameEditDraft(fresh, groupIdx);
       let nextPlan = {
@@ -1902,9 +1988,9 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
     // 并行输出, 方便 P2 尾帧以同一形状落到 frames.tail。旧字段保留做兼容。
     const generatedAt = nowIso();
     const firstFrameSourceHash = firstFrameSourceHashForInput;
-    const frameFirst = {
-      url: result.url,
-      prompt: result.submittedPrompt,
+	    const frameFirst = {
+	      url: result.url,
+	      prompt: result.submittedPrompt,
       originalPrompt: basePrompt,
       mode: 'structured_v1' as const,
       status: 'ready' as const,
@@ -1916,33 +2002,73 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
 	      consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
 	      generatedAt,
       shotIndices: generationShotIndices,
-      sourceHash: firstFrameSourceHash,
-    };
+	      sourceHash: firstFrameSourceHash,
+	    };
+	    const perShotCandidateId = perShotTarget ? `gen:${ctx.taskId}:${perShotTarget.shotUid}` : null;
 
-    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
-      if (!fresh) return null;
-      const storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
-      const prev = storyboards[groupIdx] || {};
-      const writeResult = writeGroupSlot({
-        fresh,
-        groupIdx,
-        storyboard: prev,
-        explicitShotIndices: generationShotIndices,
-        expectedBinding: readExpectedShotBinding(ctx.target),
-        mismatchPolicy: 'abortPatch',
-        mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
-          const firstFramePlanSummaryForWrite = {
-            ...planSummary,
-            shotIndices: freshShotIndices,
-          };
-          const frameFirstForWrite = {
-            ...frameFirst,
-            planSummary: firstFramePlanSummaryForWrite,
-            shotIndices: freshShotIndices,
-          };
-          const {
-            videoUrl: _oldVideoUrl,
-            videoTaskId: _oldVideoTaskId,
+	    patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
+	      if (!fresh) return null;
+	      let storyboards = Array.isArray((fresh as any).storyboards) ? [...(fresh as any).storyboards] : [];
+	      let videoTasksPatch: any[] | undefined;
+	      const prev = storyboards[groupIdx] || {};
+	      const writeResult = writeGroupSlot({
+	        fresh,
+	        groupIdx,
+	        storyboard: prev,
+	        explicitShotIndices: perShotTarget ? shotIndices : generationShotIndices,
+	        expectedBinding: readExpectedShotBinding(ctx.target),
+	        mismatchPolicy: 'abortPatch',
+	        mutator: ({ shotIndices: freshShotIndices, firstShot }) => {
+	          const firstFramePlanSummaryForWrite = {
+	            ...planSummary,
+	            shotIndices: generationShotIndices,
+	          };
+	          const frameFirstForWrite = {
+	            ...frameFirst,
+	            planSummary: firstFramePlanSummaryForWrite,
+	            shotIndices: generationShotIndices,
+	          };
+	          if (perShotTarget) {
+	            const shotFrames = (prev.shotFrames && typeof prev.shotFrames === 'object') ? { ...prev.shotFrames } : {};
+	            const candidate = {
+	              id: perShotCandidateId,
+	              url: result.url,
+	              source: appliedEditDraft ? 'edit' as const : 'gen' as const,
+	              mode: 'structured_v1' as const,
+	              status: 'ready' as const,
+	              createdAt: generatedAt,
+	              generatedAt,
+	              prompt: result.submittedPrompt,
+	              originalPrompt: committedBasePrompt,
+	              sourceHash: firstFrameSourceHash,
+	              taskId: ctx.taskId,
+	              planSummary: firstFramePlanSummaryForWrite,
+	              safetyAudit: result.safetyAudit,
+	              visualAnchorDescription: result.visualAnchorDescription,
+	              consistencyCheck,
+	              consistencyAttempts,
+	              consistencyStatus: consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade,
+	            };
+	            shotFrames[perShotTarget.shotUid] = appendShotFrameCandidate(shotFrames[perShotTarget.shotUid], candidate);
+	            storyboards[groupIdx] = {
+	              ...prev,
+	              idx: groupIdx,
+	              shotIdx: firstShot?.idx ?? freshShotIndices[0] + 1,
+	              shotIndices: freshShotIndices,
+	              shotFrames,
+	            };
+	            const mirrored = mirrorSelectedFirstFrameToLegacyFields(
+	              { ...fresh, storyboards },
+	              groupIdx,
+	              { shotUid: perShotTarget.shotUid, now: generatedAt },
+	            );
+	            storyboards = Array.isArray(mirrored.project?.storyboards) ? mirrored.project.storyboards : storyboards;
+	            if (Array.isArray(mirrored.project?.videoTasks)) videoTasksPatch = mirrored.project.videoTasks;
+	            return;
+	          }
+	          const {
+	            videoUrl: _oldVideoUrl,
+	            videoTaskId: _oldVideoTaskId,
             videoDurationSec: _oldVideoDurationSec,
             videoCoverUrl: _oldVideoCoverUrl,
             videoStatus: _oldVideoStatus,
@@ -1994,36 +2120,104 @@ registerExecutor('storyboard_images', async (ctx: BatchExecCtx) => {
       // 用户原则: 首帧变了, 尾帧 / 已生成视频任务都保留, 用户自己决定要不要重做。
       // 不再自动 stale 尾帧, 也不再删除 videoTasks[groupIdx]。
       maybeAssertStoryboardsAlignedWithShots({ ...fresh, storyboards }, 'storyboard-image-writeback');
-      // 首帧已按当前上游输入重新生成并写入新 sourceHash，权威数据侧同步清掉本组的
-      // storyboard stale 标记。此前清除只存在于前端"亲历 task_completed"的回调里，
-      // 页面刷新/重连窗口内完成的任务会留下孤儿标记，导致"确认分镜图"被残留标记误拦。
-      const prevStaleFlags = (fresh as any)._staleFlags;
-      if (prevStaleFlags && typeof prevStaleFlags === 'object' && prevStaleFlags[`storyboard_${groupIdx}`]) {
-        const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };
-        delete nextStaleFlags[`storyboard_${groupIdx}`];
-        return { storyboards, _staleFlags: nextStaleFlags };
-      }
-      return { storyboards };
-    });
+	      // 首帧已按当前上游输入重新生成并写入新 sourceHash，权威数据侧同步清掉本组的
+	      // storyboard stale 标记。此前清除只存在于前端"亲历 task_completed"的回调里，
+	      // 页面刷新/重连窗口内完成的任务会留下孤儿标记，导致"确认分镜图"被残留标记误拦。
+	      const prevStaleFlags = (fresh as any)._staleFlags;
+	      const basePatch: Record<string, any> = { storyboards };
+	      if (videoTasksPatch) basePatch.videoTasks = videoTasksPatch;
+	      if (prevStaleFlags && typeof prevStaleFlags === 'object' && prevStaleFlags[`storyboard_${groupIdx}`]) {
+	        const nextStaleFlags: Record<string, any> = { ...prevStaleFlags };
+	        delete nextStaleFlags[`storyboard_${groupIdx}`];
+	        return { ...basePatch, _staleFlags: nextStaleFlags };
+	      }
+	      return basePatch;
+	    });
 
-    recordBatchKnowledgeAudit({
-      ctx,
-      project: proj,
-      stage: 'first_frame_image',
-      provider: imgCfg.provider,
+	    recordBatchKnowledgeAudit({
+	      ctx,
+	      project: proj,
+	      stage: 'first_frame_image',
+	      provider: imgCfg.provider,
       stageTarget: {
         groupIdx,
         shotIndices,
         mode: 'structured_v1',
         referenceCount: finalPlan.referenceManifest.length,
         imageReferenceCount: imageRefs.length,
-        planSummary,
-      },
-    });
+	        planSummary,
+	      },
+	    });
 
-    return {
-      resultUrl: result.url,
-      patch: {
+	    if (perShotTarget) {
+	      const isLeadingShot = shotIndices[0] === perShotTarget.shotIdx;
+	      const perShotPatch: Record<string, any> = {
+	        type: 'storyboard_image',
+	        idx: groupIdx,
+	        groupIdx,
+	        shotUid: perShotTarget.shotUid,
+	        shotIdx: perShotTarget.shotIdx,
+	        candidateId: perShotCandidateId,
+	        url: result.url,
+	        imageUrl: result.url,
+	        rawUrl: result.url,
+	        shotIndices,
+	        candidate: {
+	          id: perShotCandidateId,
+	          url: result.url,
+	          source: appliedEditDraft ? 'edit' : 'gen',
+	          mode: 'structured_v1',
+	          status: 'ready',
+	          createdAt: generatedAt,
+	          generatedAt,
+	          prompt: result.submittedPrompt,
+	          originalPrompt: basePrompt,
+	          sourceHash: firstFrameSourceHash,
+	          taskId: ctx.taskId,
+	        },
+	      };
+	      const perShotExtra: Record<string, any> = {
+	        mode: result.mode,
+	        groupIdx,
+	        shotUid: perShotTarget.shotUid,
+	        shotIdx: perShotTarget.shotIdx,
+	        candidateId: perShotCandidateId,
+	        url: result.url,
+	        rawUrl: result.url,
+	        imageUrl: result.url,
+	        shotIndices,
+	        imagePrompt: result.submittedPrompt,
+	        originalImagePrompt: basePrompt,
+	        imageSafetyAudit: result.safetyAudit,
+	        firstFramePlanSummary: planSummary,
+	        perShotFirstFrame: true,
+	      };
+	      if (isLeadingShot) {
+	        perShotPatch.firstFrameUrl = result.url;
+	        perShotPatch.firstFrameMode = 'structured_v1';
+	        perShotPatch.firstFrameSourceHash = firstFrameSourceHash;
+	        perShotPatch.imagePrompt = result.submittedPrompt;
+	        perShotPatch.firstFrameSafetyAudit = result.safetyAudit;
+	        perShotPatch.firstFrameConsistencyCheck = consistencyCheck;
+	        perShotPatch.firstFrameConsistencyStatus = consistencyCheck.grade === 'fail' ? 'needs_review' : consistencyCheck.grade;
+	        perShotPatch.firstFramePlanSummary = planSummary;
+	        perShotPatch.frames = { first: frameFirst };
+	        perShotExtra.firstFrameUrl = result.url;
+	        perShotExtra.firstFrameMode = 'structured_v1';
+	        perShotExtra.firstFrameSourceHash = firstFrameSourceHash;
+	        perShotExtra.frames = { first: frameFirst };
+	        perShotExtra.invalidateVideo = true;
+	      }
+	      return {
+	        resultUrl: result.url,
+	        patch: perShotPatch,
+	        extra: perShotExtra,
+	      };
+	    }
+
+	    return {
+	      resultUrl: result.url,
+	      patch: {
         type: 'storyboard_image',
         idx: groupIdx,
         url: result.url,

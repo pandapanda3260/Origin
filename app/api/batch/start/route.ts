@@ -5,6 +5,7 @@ import { ActiveVideoBatchConflictError, createBatch, findActiveBatchForType } fr
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import {
   isMultiShotSegmentEnabled,
+  isPerShotFirstFrameEnabled,
 } from '@/lib/feature-flags';
 import { InsufficientCreditsError } from '@/lib/credits';
 import {
@@ -21,6 +22,7 @@ import {
   sentinelMessage,
 } from '@/lib/batch-preflight';
 import '@/lib/init-executors'; // 副作用：注册所有 executor
+import { expandStoryboardImageTargetsForPerShot } from '@/lib/shot-frame-candidates';
 import {
   startVideoPromptRun,
   startVideoSegmentRun,
@@ -82,6 +84,21 @@ export async function POST(req: NextRequest) {
   }
 
   if (!targets.length) return jsonError('targets 不能为空', 400);
+
+  if (batchType === 'storyboard_images' && isPerShotFirstFrameEnabled()) {
+    const projForFirstFrames = getProjectByIdForUser(projectId, user.id);
+    if (!projForFirstFrames) return jsonError('项目不存在', 404);
+    try {
+      targets = expandStoryboardImageTargetsForPerShot(projForFirstFrames as any, targets);
+      batchOptions = {
+        ...(batchOptions || {}),
+        perShotFirstFrame: true,
+      };
+    } catch (err: any) {
+      return jsonError(err?.message || '首帧 target 展开失败', Number(err?.status) || 400);
+    }
+    if (!targets.length) return jsonError('targets 不能为空', 400);
+  }
 
   if (batchType === 'video_prompts') {
     return videoCreationStartResponse(startVideoPromptRun({

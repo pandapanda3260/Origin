@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getDb } from '@/lib/db';
 import { fulfillPaidOrder } from '@/lib/billing-fulfill';
+import { toBillingOrderPayload } from '@/lib/billing-order-payload';
 import { getWechatPayConfig, queryWechatPaymentByOutTradeNo, WechatPayConfigError, WechatPayGatewayError } from '@/lib/wechat-pay';
 
 export const runtime = 'nodejs';
@@ -17,7 +18,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     .get({ id: params.id, uid: user.id });
   if (!row) return jsonError('订单不存在', 404);
   const reconciled = await reconcileWechatOrderIfPaid(row);
-  return jsonOk(toOrderPayload(reconciled || row));
+  return jsonOk(toBillingOrderPayload(reconciled || row, user.id));
 }
 
 async function reconcileWechatOrderIfPaid(row: any) {
@@ -64,21 +65,6 @@ async function reconcileWechatOrderIfPaid(row: any) {
     console.warn('[wechat-pay] order query reconcile failed:', e?.message || e);
     return row;
   }
-}
-
-function toOrderPayload(row: any) {
-  return {
-    id: row.id,
-    kind: row.kind,
-    planCode: row.plan_code,
-    provider: row.provider,
-    amountCents: row.amount_cents,
-    currency: row.currency,
-    creditsAdded: row.credits_added,
-    status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
 }
 
 function mergeMetaJson(raw: string, patch: Record<string, any>) {

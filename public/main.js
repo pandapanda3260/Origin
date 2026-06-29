@@ -2,7 +2,7 @@
  * ORIGINRISE · AI 可视化分镜工作台 — v2.7-web
  */
 import { $, escapeHtml, showToast, showConfirm, formatTime, setLoading,
-  consumeStreamStepTags, apiPost, apiGet, apiPostStream,
+  consumeStreamStepTags, apiPost, apiGet, apiPostStream, apiUpload,
   getAuthToken, getAuthHeaders, checkAuth, ensureSession, getCachedAuthUser, getSessionUser, fetchAssetSignedUrl,
   hydrateProtectedImageElements } from '/modules/utils.js';
 import { appStore } from '/modules/store.js';
@@ -2098,6 +2098,7 @@ var _scriptEditInitialText = "";
     var boardRoot = $("boardRoot");
     if (boardRoot) boardRoot.hidden = !isBoardRoute;
     _syncBoardNavigationState();
+    syncAgentFabPlacement("route", page);
   }
 
   function _syncBoardNavigationState() {
@@ -6932,16 +6933,103 @@ var _scriptEditInitialText = "";
   var _agentRefs = [];
   var _agentBusy = false;
   var _agentFabSuppressClick = false;
-  var AGENT_FAB_POS_KEY = _uPrefix + "sw_agent_fab_pos_v2";
+  var AGENT_FAB_POS_KEY = _uPrefix + "sw_agent_fab_pos_v3";
+  var AGENT_FAB_DEFAULT_DOCK = "bottom-end";
+  var AGENT_FAB_DOCKS = ["top-start", "top-end", "bottom-start", "bottom-end"];
+  var _agentFabResizeBound = false;
+
+  function _agentFabElements() {
+    return {
+      fab: $("navAgent"),
+      panel: $("agentPanel"),
+    };
+  }
+
+  function _agentClamp(value, min, max) {
+    if (max < min) return min;
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function _agentSafeRect() {
+    var margin = 24;
+    var viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    var left = margin;
+    var top = margin;
+    var sidebar = $("sidebar");
+    if (sidebar && !sidebar.hidden) {
+      var sidebarStyle = null;
+      try { sidebarStyle = getComputedStyle(sidebar); } catch (_) {}
+      if (!sidebarStyle || (sidebarStyle.display !== "none" && sidebarStyle.visibility !== "hidden")) {
+        var sidebarRect = sidebar.getBoundingClientRect();
+        if (sidebarRect && sidebarRect.width > 0) left = Math.max(left, sidebarRect.right + margin);
+      }
+    }
+    try {
+      var cssTop = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--top-announcement-height"));
+      if (Number.isFinite(cssTop) && cssTop > 0) top = Math.max(top, cssTop + margin);
+    } catch (_) {}
+    ["announceBanner", "maintenanceBanner"].forEach(function (id) {
+      var banner = $(id);
+      if (!banner || banner.hidden) return;
+      var style = null;
+      try { style = getComputedStyle(banner); } catch (_) {}
+      if (style && style.display === "none") return;
+      var rect = banner.getBoundingClientRect();
+      if (rect && rect.height > 0) top = Math.max(top, rect.bottom + margin);
+    });
+    return {
+      left: left,
+      top: top,
+      right: Math.max(left, viewportWidth - margin),
+      bottom: Math.max(top, viewportHeight - margin),
+    };
+  }
+
+  function _normalizeAgentFabDock(dock) {
+    return AGENT_FAB_DOCKS.indexOf(dock) >= 0 ? dock : AGENT_FAB_DEFAULT_DOCK;
+  }
+
+  function _readAgentFabDock() {
+    try {
+      var raw = localStorage.getItem(AGENT_FAB_POS_KEY);
+      if (!raw) return AGENT_FAB_DEFAULT_DOCK;
+      try {
+        var parsed = JSON.parse(raw);
+        if (typeof parsed === "string") return _normalizeAgentFabDock(parsed);
+        return _normalizeAgentFabDock(parsed && parsed.dock);
+      } catch (_) {
+        return _normalizeAgentFabDock(raw);
+      }
+    } catch (_) {
+      return AGENT_FAB_DEFAULT_DOCK;
+    }
+  }
+
+  function _saveAgentFabDock(dock) {
+    var next = _normalizeAgentFabDock(dock);
+    try { localStorage.setItem(AGENT_FAB_POS_KEY, JSON.stringify({ dock: next })); } catch (_) {}
+    return next;
+  }
+
+  function _agentFabRoutePolicy(page) {
+    var current = page || activePage || "overview";
+    var isOnlineEditor = current === "onlineEditor";
+    var isBoardRoute = isBoardEnabled() && current === "shots";
+    return {
+      visible: !isOnlineEditor && !isBoardRoute,
+      dock: _readAgentFabDock(),
+    };
+  }
 
   function _agentFabBounds(fab) {
-    var margin = 12;
+    var safe = _agentSafeRect();
     var size = fab && fab.offsetWidth ? fab.offsetWidth : 52;
     return {
-      minX: margin,
-      minY: margin,
-      maxX: Math.max(margin, window.innerWidth - size - margin),
-      maxY: Math.max(margin, window.innerHeight - size - margin),
+      minX: safe.left,
+      minY: safe.top,
+      maxX: Math.max(safe.left, safe.right - size),
+      maxY: Math.max(safe.top, safe.bottom - size),
     };
   }
 
@@ -6962,32 +7050,138 @@ var _scriptEditInitialText = "";
     fab.style.bottom = "auto";
   }
 
-  function _readAgentFabPos() {
-    try {
-      var raw = localStorage.getItem(AGENT_FAB_POS_KEY);
-      if (!raw) return null;
-      var pos = JSON.parse(raw);
-      if (!pos || typeof pos.x !== "number" || typeof pos.y !== "number") return null;
-      return pos;
-    } catch (_) {
-      return null;
-    }
+  function _agentFabDockPos(fab, dock) {
+    var safe = _agentSafeRect();
+    var size = fab && fab.offsetWidth ? fab.offsetWidth : 52;
+    var normalized = _normalizeAgentFabDock(dock);
+    return {
+      x: normalized.indexOf("end") > -1 ? Math.max(safe.left, safe.right - size) : safe.left,
+      y: normalized.indexOf("bottom") === 0 ? Math.max(safe.top, safe.bottom - size) : safe.top,
+    };
   }
 
-  function _saveAgentFabPos(fab) {
+  function _applyAgentFabDock(fab, dock) {
     if (!fab) return;
+    var normalized = _normalizeAgentFabDock(dock);
+    _applyAgentFabPos(fab, _agentFabDockPos(fab, normalized));
+    fab.dataset.dock = normalized;
+  }
+
+  function _nearestAgentFabDock(fab) {
+    if (!fab) return AGENT_FAB_DEFAULT_DOCK;
     var rect = fab.getBoundingClientRect();
-    var pos = _clampAgentFabPos(fab, { x: rect.left, y: rect.top });
-    _applyAgentFabPos(fab, pos);
-    try { localStorage.setItem(AGENT_FAB_POS_KEY, JSON.stringify(pos)); } catch (_) {}
+    var centerX = rect.left + rect.width / 2;
+    var centerY = rect.top + rect.height / 2;
+    var bestDock = AGENT_FAB_DEFAULT_DOCK;
+    var bestDistance = Infinity;
+    AGENT_FAB_DOCKS.forEach(function (dock) {
+      var pos = _agentFabDockPos(fab, dock);
+      var size = fab.offsetWidth || 52;
+      var dx = centerX - (pos.x + size / 2);
+      var dy = centerY - (pos.y + size / 2);
+      var distance = dx * dx + dy * dy;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestDock = dock;
+      }
+    });
+    return bestDock;
+  }
+
+  function _measureAgentPanel(panel, safe) {
+    var restoreHidden = panel.hidden;
+    var restoreVisibility = panel.style.visibility;
+    var maxPanelWidth = Math.max(180, safe.right - safe.left);
+    var viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    var maxPanelHeight = Math.min(Math.max(240, safe.bottom - safe.top), Math.max(240, Math.floor(viewportHeight * 0.7)));
+    panel.style.maxWidth = maxPanelWidth + "px";
+    panel.style.maxHeight = maxPanelHeight + "px";
+    if (restoreHidden) {
+      panel.style.visibility = "hidden";
+      panel.hidden = false;
+    }
+    var size = {
+      width: Math.min(panel.offsetWidth || 420, maxPanelWidth),
+      height: Math.min(panel.offsetHeight || 420, maxPanelHeight),
+    };
+    if (restoreHidden) {
+      panel.hidden = true;
+      panel.style.visibility = restoreVisibility;
+    }
+    return size;
+  }
+
+  function _syncAgentPanelPlacement(fab, panel, dock) {
+    if (!fab || !panel) return;
+    var safe = _agentSafeRect();
+    var gap = 14;
+    var fabRect = fab.getBoundingClientRect();
+    var panelSize = _measureAgentPanel(panel, safe);
+    var width = panelSize.width;
+    var height = panelSize.height;
+    var normalized = _normalizeAgentFabDock(dock || fab.dataset.dock);
+    var preferAbove = normalized.indexOf("bottom") === 0;
+    var fitsAbove = fabRect.top - gap - height >= safe.top;
+    var fitsBelow = fabRect.bottom + gap + height <= safe.bottom;
+    if (preferAbove && !fitsAbove && fitsBelow) preferAbove = false;
+    if (!preferAbove && !fitsBelow && fitsAbove) preferAbove = true;
+    var left = normalized.indexOf("end") > -1 ? fabRect.right - width : fabRect.left;
+    var top = preferAbove ? fabRect.top - gap - height : fabRect.bottom + gap;
+    left = _agentClamp(left, safe.left, safe.right - width);
+    top = _agentClamp(top, safe.top, safe.bottom - height);
+    var originX = fabRect.left + fabRect.width / 2 < left + width / 2 ? "left" : "right";
+    var originY = preferAbove ? "bottom" : "top";
+    panel.style.left = Math.round(left) + "px";
+    panel.style.top = Math.round(top) + "px";
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+    panel.style.setProperty("--agent-panel-origin", originY + " " + originX);
+    panel.style.setProperty("--agent-panel-enter-y", preferAbove ? "16px" : "-16px");
+  }
+
+  function _wireAgentFabResize() {
+    if (_agentFabResizeBound) return;
+    _agentFabResizeBound = true;
+    window.addEventListener("resize", function () {
+      syncAgentFabPlacement("resize");
+    });
+  }
+
+  function syncAgentFabPlacement(reason, page) {
+    var elements = _agentFabElements();
+    var fab = elements.fab;
+    var panel = elements.panel;
+    if (!fab && !panel) return;
+    var policy = _agentFabRoutePolicy(page);
+    if (!policy.visible) {
+      _agentOpen = false;
+      if (panel) panel.hidden = true;
+      if (fab) {
+        fab.hidden = true;
+        fab.classList.remove("is-open");
+      }
+      return;
+    }
+    var dock = _normalizeAgentFabDock(policy.dock);
+    if (fab) {
+      _applyAgentFabDock(fab, dock);
+      fab.hidden = false;
+      fab.classList.toggle("is-open", !!_agentOpen);
+    }
+    if (panel) {
+      if (_agentOpen && fab) {
+        _syncAgentPanelPlacement(fab, panel, dock);
+        panel.hidden = false;
+      } else {
+        panel.hidden = true;
+      }
+    }
   }
 
   function _wireAgentFabDrag(fab) {
     if (!fab || fab.dataset.dragBound === "1") return;
     fab.dataset.dragBound = "1";
-
-    var saved = _readAgentFabPos();
-    if (saved) _applyAgentFabPos(fab, saved);
+    _wireAgentFabResize();
 
     var drag = null;
 
@@ -6996,7 +7190,8 @@ var _scriptEditInitialText = "";
       try { fab.releasePointerCapture(drag.pointerId); } catch (_) {}
       fab.classList.remove("is-dragging");
       if (drag.moved) {
-        _saveAgentFabPos(fab);
+        _saveAgentFabDock(_nearestAgentFabDock(fab));
+        syncAgentFabPlacement("drag-end");
         _agentFabSuppressClick = true;
         setTimeout(function () { _agentFabSuppressClick = false; }, 180);
         if (e) {
@@ -7029,19 +7224,12 @@ var _scriptEditInitialText = "";
       if (!drag.moved && Math.hypot(dx, dy) < 4) return;
       drag.moved = true;
       _applyAgentFabPos(fab, { x: drag.left + dx, y: drag.top + dy });
+      if (_agentOpen) _syncAgentPanelPlacement(fab, $("agentPanel"), fab.dataset.dock);
       e.preventDefault();
     });
 
     fab.addEventListener("pointerup", finishDrag);
     fab.addEventListener("pointercancel", finishDrag);
-
-    window.addEventListener("resize", function () {
-      var current = _readAgentFabPos();
-      if (current) {
-        _applyAgentFabPos(fab, current);
-        _saveAgentFabPos(fab);
-      }
-    });
   }
 
   function toggleAgentPanel(forceState) {
@@ -7050,11 +7238,7 @@ var _scriptEditInitialText = "";
     if (!panel) return;
     if (forceState !== undefined) _agentOpen = forceState;
     else _agentOpen = !_agentOpen;
-    panel.hidden = !_agentOpen;
-    if (fab) {
-      if (_agentOpen) fab.classList.add("is-open");
-      else fab.classList.remove("is-open");
-    }
+    syncAgentFabPlacement(_agentOpen ? "panel-open" : "panel-close");
     if (_agentOpen) {
       var ta = $("agentInput");
       if (ta) setTimeout(function () { ta.focus(); }, 100);
@@ -7809,6 +7993,12 @@ var _scriptEditInitialText = "";
     var closeBtn = $("agentCloseBtn");
     if (closeBtn) closeBtn.addEventListener("click", function () { toggleAgentPanel(false); });
 
+    var dockResetBtn = $("agentDockResetBtn");
+    if (dockResetBtn) dockResetBtn.addEventListener("click", function () {
+      _saveAgentFabDock(AGENT_FAB_DEFAULT_DOCK);
+      syncAgentFabPlacement("dock-reset");
+    });
+
     var clearBtn = $("agentClearBtn");
     if (clearBtn) clearBtn.addEventListener("click", function () {
       _agentHistory = [];
@@ -8212,16 +8402,95 @@ var _scriptEditInitialText = "";
       sleep: (ms) => sleep(ms),
       invalidateVideoForGroup: (gIdx) => _invalidateVideoForGroup(gIdx),
       acceptShotPlanForStoryboard: () => acceptShotPlanForStoryboard(),
-    });
-    syncStoryboardProject(project);
-    syncBoardProject(project);
-    initBoard({
-      getProject: () => project,
-      getStoryboardGroups: () => getStoryboardGroups(),
-      hydrateProtectedImageElements: (root) => hydrateProtectedImageElements(root),
-      showToast: (msg, type) => showToast(msg, type),
-      uPrefix: _uPrefix,
-    });
+	    });
+	    syncStoryboardProject(project);
+	    syncBoardProject(project);
+	    async function _reloadProjectFromServerForBoard() {
+	      if (!project || !project.id) return false;
+	      try {
+	        var p = await loadProjectData(project.id);
+	        if (!p || !p.id || p.id !== project.id) return false;
+	        project = p;
+	        _syncProjectModules(project, { onlineEditor: false });
+	        return true;
+	      } catch (e) {
+	        console.warn("[reloadProjectFromServerForBoard] failed:", e);
+	        return false;
+	      }
+	    }
+	    initBoard({
+	      getProject: () => project,
+	      getStoryboardGroups: () => getStoryboardGroups(),
+	      hydrateProtectedImageElements: (root) => hydrateProtectedImageElements(root),
+	      showToast: (msg, type) => showToast(msg, type),
+	      selectShotFrameCandidate: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var resp = await apiPost('/api/frames/candidate', {
+	          action: 'select',
+	          projectId: project.id,
+	          groupIdx: payload.groupIdx,
+	          shotUid: payload.shotUid,
+	          candidateId: payload.candidateId,
+	        });
+	        await _reloadProjectFromServerForBoard();
+	        return resp;
+	      },
+	      deleteShotFrameCandidate: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var resp = await apiPost('/api/frames/candidate', {
+	          action: 'delete',
+	          projectId: project.id,
+	          groupIdx: payload.groupIdx,
+	          shotUid: payload.shotUid,
+	          candidateId: payload.candidateId,
+	        });
+	        await _reloadProjectFromServerForBoard();
+	        return resp;
+	      },
+	      reorderShotFrameCandidates: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var resp = await apiPost('/api/frames/candidate', {
+	          action: 'reorder',
+	          projectId: project.id,
+	          groupIdx: payload.groupIdx,
+	          shotUid: payload.shotUid,
+	          orderedIds: payload.orderedIds || [],
+	        });
+	        await _reloadProjectFromServerForBoard();
+	        return resp;
+	      },
+	      generateShotFrameCandidate: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var groups = getStoryboardGroups();
+	        var group = (groups || []).find(function (item) { return Number(item && (item.gIdx ?? item.groupIdx)) === Number(payload.groupIdx); }) || {};
+	        return await apiPost('/api/batch/start', {
+	          batchType: 'storyboard_images',
+	          projectId: project.id,
+	          targets: [{
+	            groupIdx: payload.groupIdx,
+	            idx: payload.groupIdx,
+	            shotUid: payload.shotUid,
+	            shotIndices: group.shotIndices || [],
+	          }],
+	        });
+	      },
+	      generateStoryboardSheet: async (gIdx) => {
+	        return await generateStoryboardSheet(gIdx, { skipPreflight: true });
+	      },
+	      uploadShotFrameCandidate: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var form = new FormData();
+	        form.append('file', payload.file);
+	        form.append('projectId', String(project.id || ''));
+	        form.append('groupIdx', String(payload.groupIdx));
+	        form.append('shotUid', String(payload.shotUid || ''));
+	        form.append('frameType', 'first_frame');
+	        var resp = await apiUpload('/api/frames/upload', form);
+	        await _reloadProjectFromServerForBoard();
+	        return resp;
+	      },
+	      uPrefix: _uPrefix,
+	    });
     initShotPlanDialog({
       getProject: () => project,
       saveProject: () => saveProject(),

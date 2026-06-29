@@ -76,6 +76,7 @@ function assertEqual(actual, expected, message) {
 function makeShots(count) {
   return Array.from({ length: count }, (_, idx) => ({
     id: `shot_${idx + 1}`,
+    shotUid: `s${idx + 1}`,
     idx: idx + 1,
     visual: `shot ${idx + 1}`,
   }));
@@ -279,6 +280,95 @@ async function testFirstFrameSourceHashIncludesWorld() {
   assert(hashA && hashB && hashA !== hashB, 'first frame source hash changes when world snapshot changes');
 }
 
+async function testPerShotFirstFrameHashUsesPrimaryShotAndContext() {
+  const mod = loadFrameWorkflowState();
+  const base = {
+    shots: makeShots(2),
+    storyboards: [{ idx: 0, shotIdx: 1, shotIndices: [0, 1] }],
+    styleBible: { visualStyle: 'realistic' },
+  };
+  const hashA = mod.computeFirstFrameSourceHashForShot(base, 0, 's1');
+  const hashB = mod.computeFirstFrameSourceHashForShot(base, 0, 's2');
+  assert(hashA && hashB && hashA !== hashB, 'per-shot first frame hash changes with primary shot ordering');
+
+  const onlySecondCandidate = {
+    ...base,
+    storyboards: [{
+      idx: 0,
+      shotIdx: 1,
+      shotIndices: [0, 1],
+      shotFrames: {
+        s2: {
+          candidates: [{ id: 'c2', url: '/api/images/file/c2', sourceHash: hashB, createdAt: '2026-06-01T00:00:00.000Z' }],
+          selectedCandidateId: 'c2',
+        },
+      },
+    }],
+  };
+  assertEqual(mod.computeFrameWorkflowStaleFlags(onlySecondCandidate, 1), {}, 'matching per-shot candidate hash is current');
+  const contextChanged = {
+    ...onlySecondCandidate,
+    shots: [
+      { ...onlySecondCandidate.shots[0], visual: 'shot 1 changed' },
+      onlySecondCandidate.shots[1],
+    ],
+  };
+  assertEqual(
+    mod.computeFrameWorkflowStaleFlags(contextChanged, 1),
+    { storyboard_0: true },
+    'changing sibling context marks merged-segment per-shot candidate stale',
+  );
+}
+
+async function testPerShotFirstFrameStaleIsSoloPrecise() {
+  const mod = loadFrameWorkflowState();
+  const base = {
+    shots: makeShots(2),
+    storyboards: [
+      { idx: 0, shotIdx: 1, shotIndices: [0] },
+      { idx: 1, shotIdx: 2, shotIndices: [1] },
+    ],
+    styleBible: { visualStyle: 'realistic' },
+  };
+  const hashA = mod.computeFirstFrameSourceHashForShot(base, 0, 's1');
+  const hashB = mod.computeFirstFrameSourceHashForShot(base, 1, 's2');
+  const withCandidates = {
+    ...base,
+    storyboards: [
+      {
+        ...base.storyboards[0],
+        shotFrames: {
+          s1: {
+            candidates: [{ id: 'c1', url: '/api/images/file/c1', sourceHash: hashA, createdAt: '2026-06-01T00:00:00.000Z' }],
+            selectedCandidateId: 'c1',
+          },
+        },
+      },
+      {
+        ...base.storyboards[1],
+        shotFrames: {
+          s2: {
+            candidates: [{ id: 'c2', url: '/api/images/file/c2', sourceHash: hashB, createdAt: '2026-06-01T00:00:00.000Z' }],
+            selectedCandidateId: 'c2',
+          },
+        },
+      },
+    ],
+  };
+  const changedFirstShot = {
+    ...withCandidates,
+    shots: [
+      { ...withCandidates.shots[0], visual: 'shot 1 changed' },
+      withCandidates.shots[1],
+    ],
+  };
+  assertEqual(
+    mod.computeFrameWorkflowStaleFlags(changedFirstShot, 1),
+    { storyboard_0: true },
+    'solo per-shot stale does not mark unrelated solo groups',
+  );
+}
+
 async function testManualSegmentationValidGroupsArePreserved() {
   const mod = loadFrameWorkflowState();
   const project = {
@@ -324,6 +414,8 @@ async function main() {
     ['strict resolver rejects wrong slot', testStrictShotResolverRejectsWrongSlot],
     ['single-shot slot factory and invariant', testSingleShotSlotFactoryAndInvariant],
     ['first frame source hash includes world', testFirstFrameSourceHashIncludesWorld],
+    ['per-shot first frame hash uses primary shot and context', testPerShotFirstFrameHashUsesPrimaryShotAndContext],
+    ['per-shot first frame stale is solo precise', testPerShotFirstFrameStaleIsSoloPrecise],
     ['manual segmentation valid groups are preserved', testManualSegmentationValidGroupsArePreserved],
     ['manual segmentation repair does not fall back to auto plan', testManualSegmentationRepairDoesNotFallBackToAutoPlan],
   ];

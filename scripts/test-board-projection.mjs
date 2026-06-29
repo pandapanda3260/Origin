@@ -157,13 +157,19 @@ const boardState = await import(dataModuleUrl(stateSrc));
   assert.equal(vm.shotPlan.shotCount, 2, 'shot plan counts shots');
   assert.equal(vm.segments.length, 1, 'one segment is projected');
   assert.equal(vm.segments[0].shotRows.length, 2, 'segment contains two shot rows');
-  assert.ok(
-    vm.segments[0].shotRows.every((row) => row.candidates[0]?.kind === 'segment-cover-placeholder'),
-    'segment first-frame candidates are explicitly marked as cover placeholders before per-shot model exists',
+  assert.equal(
+    vm.segments[0].shotRows[0].candidates[0]?.kind,
+    'segment-cover-placeholder',
+    'legacy segment cover is projected only onto the leading shot row',
+  );
+  assert.equal(
+    vm.segments[0].shotRows[1].candidates.length,
+    0,
+    'legacy segment cover is not promoted into sibling per-shot candidates',
   );
   assert.ok(
-    vm.segments[0].shotRows.every((row) => row.candidates[0]?.label === '片段封面占位'),
-    'segment placeholder candidates carry the UI label',
+    vm.segments[0].shotRows.every((row) => row.readOnlyReason === 'missing_shot_uid'),
+    'rows without canonical shotUid are read-only',
   );
   assert.deepEqual(
     vm.edges.map((edge) => `${edge.from}->${edge.to}`),
@@ -172,6 +178,42 @@ const boardState = await import(dataModuleUrl(stateSrc));
   );
   assert.ok(vm.nodes.find((node) => node.id === 'reference'), 'reference node exists');
   assert.ok(vm.nodes.find((node) => node.id === 'video:0'), 'video node exists');
+}
+
+{
+  const project = {
+    shots: [
+      { id: 'wrong-id-a', uid: 'wrong-uid-a', shotUid: 'shot-a' },
+      { id: 'wrong-id-b', shot_uid: 'shot-b' },
+    ],
+    storyboards: [{
+      shotIndices: [0, 1],
+      firstFrameUrl: '/api/images/file/legacy-cover',
+      shotFrames: {
+        'shot-a': {
+          selectedCandidateId: 'a2',
+          candidates: [
+            { id: 'a1', url: '/api/images/file/a1', source: 'gen', mode: 'structured_v1', status: 'ready', metadataTier: 'compact' },
+            { id: 'a2', url: '/api/images/file/a2', source: 'upload', mode: 'uploaded', status: 'ready', metadataTier: 'full' },
+          ],
+        },
+        'shot-b': {
+          selectedCandidateId: 'b1',
+          candidates: [
+            { id: 'b1', url: '/api/images/file/b1', source: 'edit', mode: 'multi_ref_v1', status: 'ready' },
+          ],
+        },
+      },
+    }],
+  };
+  const vm = boardState.buildBoardViewModel(project, { groups: [{ gIdx: 0, shotIndices: [0, 1] }] });
+  assert.equal(vm.segments[0].shotRows[0].shotUid, 'shot-a', 'board shotUid uses canonical shotUid before id/uid');
+  assert.equal(vm.segments[0].shotRows[1].shotUid, 'shot-b', 'board shotUid accepts shot_uid');
+  assert.equal(vm.segments[0].shotRows[0].candidates.length, 2, 'shotFrames candidates are projected for the matching shotUid');
+  assert.equal(vm.segments[0].shotRows[0].selectedCandidateId, 'a2', 'selectedCandidateId is preserved on the row');
+  assert.equal(vm.segments[0].shotRows[0].candidates[1].selected, true, 'selected candidate is marked explicitly');
+  assert.equal(vm.segments[0].shotRows[0].candidates[0].kind, undefined, 'real shotFrames candidates are not cover placeholders');
+  assert.equal(vm.segments[0].shotRows[1].candidates[0].url, '/api/images/file/b1', 'second shot reads its own shotFrames bucket');
 }
 
 console.log('✓ board projection contract passed');

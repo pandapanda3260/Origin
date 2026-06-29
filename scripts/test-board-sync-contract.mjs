@@ -55,7 +55,7 @@ assert.ok(
 const onlineEditorSkippedReloads = (src.match(/_syncProjectModules\(project, \{ onlineEditor: false \}\);/g) || []).length;
 assert.equal(
   onlineEditorSkippedReloads,
-  5,
+  6,
   'known server reload/apply paths must reuse _syncProjectModules while preserving online-editor keepalive',
 );
 

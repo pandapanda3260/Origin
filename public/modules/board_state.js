@@ -55,7 +55,48 @@ export function resolveVideoStatus(project, groupIdx) {
 
 function shotUidOf(project, shotIdx) {
   const shot = arr(asObject(project).shots)[shotIdx] || {};
-  return text(shot.uid || shot.id || shot.shotUid || shot.shotId) || `shot-${shotIdx + 1}`;
+  return text(shot.shotUid ?? shot.shot_uid);
+}
+
+function boardCandidateFromShotFrame(candidate, selectedCandidateId, idx) {
+  const item = asObject(candidate);
+  const id = text(item.id) || `candidate-${idx + 1}`;
+  const url = text(item.url);
+  if (!url) return null;
+  return {
+    id,
+    url,
+    source: text(item.source),
+    mode: text(item.mode),
+    status: text(item.status) || 'ready',
+    label: text(item.label) || `候选 ${idx + 1}`,
+    selected: id === selectedCandidateId,
+    metadataTier: text(item.metadataTier),
+  };
+}
+
+function shotFrameCandidatesForRow(sb, group, rowIdx, shotIdx, shotUid, coverUrl) {
+  const shotFrames = asObject(sb.shotFrames);
+  const state = shotUid ? asObject(shotFrames[shotUid]) : {};
+  const selectedCandidateId = text(state.selectedCandidateId);
+  const candidates = arr(state.candidates)
+    .map((candidate, idx) => boardCandidateFromShotFrame(candidate, selectedCandidateId, idx))
+    .filter(Boolean);
+  if (candidates.length) return { candidates, selectedCandidateId };
+  if (coverUrl && rowIdx === 0) {
+    return {
+      selectedCandidateId: `first:${group.gIdx}:${shotIdx}`,
+      candidates: [{
+        id: `first:${group.gIdx}:${shotIdx}`,
+        url: coverUrl,
+        kind: 'segment-cover-placeholder',
+        label: '片段封面占位',
+        selected: true,
+        readOnly: true,
+      }],
+    };
+  }
+  return { candidates: [], selectedCandidateId: '' };
 }
 
 function groupsFromProject(project, opts) {
@@ -118,12 +159,18 @@ function buildSegments(project, opts) {
   return groupsFromProject(project, opts).map((group) => {
     const sb = asObject(storyboards[group.gIdx]);
     const coverUrl = firstFrameImageUrl(sb);
-    const shotRows = group.shotIndices.map((shotIdx) => ({
-      shotIdx,
-      shotUid: shotUidOf(project, shotIdx),
-      candidates: coverUrl ? [{ id: `first:${group.gIdx}:${shotIdx}`, url: coverUrl, kind: 'segment-cover-placeholder', label: '片段封面占位' }] : [],
-      coverUrl,
-    }));
+    const shotRows = group.shotIndices.map((shotIdx, rowIdx) => {
+      const shotUid = shotUidOf(project, shotIdx);
+      const shotFrames = shotFrameCandidatesForRow(sb, group, rowIdx, shotIdx, shotUid, coverUrl);
+      return {
+        shotIdx,
+        shotUid,
+        selectedCandidateId: shotFrames.selectedCandidateId,
+        candidates: shotFrames.candidates,
+        coverUrl,
+        readOnlyReason: shotUid ? '' : 'missing_shot_uid',
+      };
+    });
     return {
       gIdx: group.gIdx,
       shotIndices: group.shotIndices,

@@ -2,6 +2,10 @@ import { validateCharacterConsistencyForGroup, type CharacterConsistencyTarget }
 import { normalizeFirstFrameState, resolveStoryboardFirstFrameUrl } from './visual-reference-state';
 
 export type VideoPromptStatus = 'ready' | 'generating' | 'failed';
+export type VideoOutdatedReason =
+  | 'video_prompt_regeneration'
+  | 'video_prompt_failed'
+  | 'first_frame_candidate_changed';
 
 export type VideoPromptReadiness = {
   groupIdx: number;
@@ -138,7 +142,7 @@ export function assertVideoPromptReadyForGroups(
 
 export function markStoryboardVideoOutdated<T extends Record<string, any>>(
   storyboard: T,
-  reason: 'video_prompt_regeneration' | 'video_prompt_failed',
+  reason: VideoOutdatedReason,
   at = new Date().toISOString(),
 ): T {
   if (!storyboard || typeof storyboard !== 'object') return storyboard;
@@ -159,7 +163,7 @@ export function markStoryboardVideoOutdated<T extends Record<string, any>>(
 
 export function markVideoTaskOutdated<T extends Record<string, any>>(
   videoTask: T,
-  reason: 'video_prompt_regeneration' | 'video_prompt_failed',
+  reason: VideoOutdatedReason,
   at = new Date().toISOString(),
 ): T {
   if (!videoTask || typeof videoTask !== 'object') return videoTask;
