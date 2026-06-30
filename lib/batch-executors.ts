@@ -3122,7 +3122,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const payloadDecision: VideoPayloadDecision = resolveVideoPayloadDecision({
     submitMode: requestedVideoSubmitMode,
     firstLastFeatureEnabled: firstLastFrameVideoEnabled,
-    tailIntentRequested: sb?.tailFrameIntent === 'requested',
+    tailIntentRequested: sb?.tailFrameIntent === 'requested' || requestedVideoSubmitMode === 'first_last_frame',
     capabilityFirstLastSupported: videoCapability.firstLastFrameMode === 'supported',
     firstFramePath: referenceImagePath,
     tailFramePath: tailFrameLocalPath,

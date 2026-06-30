@@ -375,7 +375,7 @@ export function startVideoSegmentRun(args: {
       tailFramePath,
       tailFrameUrl,
       tailReferenceStatus: sb?.tailFrameReferenceStatus || sb?.frames?.tail?.referenceStatus,
-      tailIntentRequested: sb?.tailFrameIntent === 'requested',
+      tailIntentRequested: sb?.tailFrameIntent === 'requested' || submitMode === 'first_last_frame',
       independentMultiImageCapable,
       multiShotSegment: shotIndices.length > 1,
     });

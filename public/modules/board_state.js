@@ -23,6 +23,11 @@ function text(value) {
   return String(value == null ? '' : value).trim();
 }
 
+function numberOrZero(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function firstAssetUrl(...values) {
   for (const value of values) {
     const url = text(value);
@@ -72,6 +77,37 @@ function boardCandidateFromShotFrame(candidate, selectedCandidateId, idx) {
     label: text(item.label) || `候选 ${idx + 1}`,
     selected: id === selectedCandidateId,
     metadataTier: text(item.metadataTier),
+  };
+}
+
+function videoHistoryRowsForGroup(opts, groupIdx) {
+  const source = opts?.videoHistoriesByGroup;
+  if (!source) return [];
+  if (source instanceof Map) {
+    return arr(source.get(groupIdx) || source.get(String(groupIdx)));
+  }
+  if (typeof source === 'object') {
+    return arr(source[groupIdx] || source[String(groupIdx)]);
+  }
+  return [];
+}
+
+function videoCandidateFromHistory(row, selectedTaskId, idx) {
+  const item = asObject(row);
+  const taskId = text(item.taskId || item.task_id || item.id);
+  if (!taskId) return null;
+  return {
+    taskId,
+    coverUrl: text(item.coverUrl || item.cover_url),
+    playbackUrl: text(item.playbackUrl || item.url),
+    protectedUrl: text(item.protectedUrl || item.protected_url),
+    status: text(item.status) || 'completed',
+    durationSec: numberOrZero(item.durationSec ?? item.duration_sec),
+    prompt: text(item.prompt),
+    createdAt: text(item.createdAt || item.created_at),
+    isCurrent: item.isCurrent === true || item.is_current === true,
+    selected: taskId === selectedTaskId,
+    label: text(item.label || item.title || item.name) || `候选 ${idx + 1}`,
   };
 }
 
@@ -171,15 +207,22 @@ function buildSegments(project, opts) {
         readOnlyReason: shotUid ? '' : 'missing_shot_uid',
       };
     });
+    const videoTask = asObject(arr(project.videoTasks)[group.gIdx]);
+    const selectedTaskId = text(videoTask.taskId || sb.videoTaskId);
+    const videoCandidates = videoHistoryRowsForGroup(opts, group.gIdx)
+      .map((row, idx) => videoCandidateFromHistory(row, selectedTaskId, idx))
+      .filter(Boolean);
     return {
       gIdx: group.gIdx,
       shotIndices: group.shotIndices,
       shotRows,
       coverUrl,
       video: {
+        gIdx: group.gIdx,
         coverUrl: resolveVideoCoverUrl(project, group.gIdx),
         status: resolveVideoStatus(project, group.gIdx),
-        taskId: text(asObject(arr(project.videoTasks)[group.gIdx]).taskId || sb.videoTaskId),
+        selectedTaskId,
+        candidates: videoCandidates,
       },
     };
   });

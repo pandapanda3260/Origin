@@ -315,6 +315,17 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 	    return "片段 " + (gIdx + 1) + " 缺少可用视频提示词，请先去「视频提示词」页生成";
 	  }
 
+  function getVideoGenerateReadiness(gIdx) {
+    var n = _normalizeGroupIdx(gIdx);
+    var readiness = _videoPromptReadinessForGroup(n);
+    return {
+      canStart: !!(readiness && readiness.canStart),
+      reason: readiness && readiness.reason,
+      status: readiness && readiness.status,
+      message: readiness && readiness.canStart ? "" : _videoPromptNotReadyMessage(n, readiness),
+    };
+  }
+
 	  function _getVideoSegmentPreflightPayload(source) {
 	    var payload = source && source.payload ? source.payload : source;
 	    if (!payload || !payload.preflight) return null;
@@ -532,6 +543,30 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return true;
   }
 
+  function _bulkImportSkipReason(gIdx) {
+    if (!_hasCurrentVideoForGroup(gIdx)) return "missing_current_video";
+    var sb = project && project.storyboards && project.storyboards[gIdx];
+    if (sb && typeof sb.readyForEdit === "boolean" && sb.readyForEdit !== true) return "not_ready_for_edit";
+    return "";
+  }
+
+  function _bulkImportSkippedMessage(result, enteringEdit) {
+    var missing = Number(result && result.skippedMissingCurrent) || 0;
+    var notReady = Number(result && result.skippedNotReady) || 0;
+    if (missing > 0 && notReady > 0) return enteringEdit
+      ? "还有片段未选定视频或尚未通过剪辑就绪检查，暂不能进入剪辑"
+      : "有片段未选定视频或尚未通过剪辑就绪检查，已跳过";
+    if (missing > 0) return enteringEdit
+      ? "还有片段未选定当前视频，暂不能进入剪辑"
+      : "有片段未选定当前视频，已跳过";
+    if (notReady > 0) return enteringEdit
+      ? "还有片段已选视频但尚未通过剪辑就绪检查，暂不能进入剪辑"
+      : "有片段已选视频但尚未通过剪辑就绪检查，已跳过";
+    return enteringEdit
+      ? "还有片段未生成或未就绪，暂不能进入剪辑"
+      : "暂无新的可导入片段，未生成或未就绪的片段已跳过";
+  }
+
   function _videoWarningsForGroup(gIdx) {
     var vt = Array.isArray(project && project.videoTasks) ? project.videoTasks[gIdx] : null;
     if (vt && Array.isArray(vt.warnings)) return vt.warnings.filter(function (w) { return !_isObsoleteVideoWarning(w); });
@@ -649,8 +684,8 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return startBatchGeneration();
   }
 
-  async function generateVideoForGroup(gIdx) {
-    return regenSingleClip(gIdx);
+  async function generateVideoForGroup(gIdx, opts) {
+    return regenSingleClip(gIdx, opts);
   }
 
   async function openVideoHistoryForGroup(gIdx) {
@@ -794,10 +829,18 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var imported = 0;
     var already = 0;
     var skipped = 0;
+    var skippedMissingCurrent = 0;
+    var skippedNotReady = 0;
     var failed = 0;
     for (var i = 0; i < groups.length; i++) {
       if (!project.storyboards[i] || !project.storyboards[i].videoPrompt) continue;
-      if (!_canBulkImportGroup(i)) { skipped++; continue; }
+      var skipReason = _bulkImportSkipReason(i);
+      if (skipReason) {
+        skipped++;
+        if (skipReason === "missing_current_video") skippedMissingCurrent++;
+        if (skipReason === "not_ready_for_edit") skippedNotReady++;
+        continue;
+      }
       var isImported = false;
       try { isImported = isGroupImported(i); } catch (_e) { isImported = false; }
       if (isImported) { already++; continue; }
@@ -810,7 +853,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     }
     renderBatchClipList();
     updateBadge();
-    var summary = { imported: imported, already: already, skipped: skipped, failed: failed, total: imported + already + skipped + failed };
+    var summary = { imported: imported, already: already, skipped: skipped, skippedMissingCurrent: skippedMissingCurrent, skippedNotReady: skippedNotReady, failed: failed, total: imported + already + skipped + failed };
     if (options.silent) return summary;
     if (imported > 0) {
       showToast("已导入 " + imported + " 个片段" + (already ? "，跳过已导入 " + already + " 个" : ""), "ok");
@@ -819,7 +862,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     } else if (failed > 0) {
       showToast("导入失败，请重试或刷新", "warn");
     } else if (skipped > 0) {
-      showToast("暂无新的可导入片段，未生成或未就绪的片段已跳过", "warn");
+      showToast(_bulkImportSkippedMessage(summary, false), "warn");
     } else {
       showToast("暂无可导入片段，请先生成片段视频", "warn");
     }
@@ -844,7 +887,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     if (result && result.failed > 0) {
       showToast("片段导入失败，请刷新后重试", "warn");
     } else if (result && result.skipped > 0) {
-      showToast("还有片段未生成或未就绪，暂不能进入剪辑", "warn");
+      showToast(_bulkImportSkippedMessage(result, true), "warn");
     } else {
       showToast("暂无可进入剪辑的片段，请先生成片段视频", "warn");
     }
@@ -2945,6 +2988,12 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return Math.min(15, Math.max(5, n));
   }
 
+  function _normalizeVideoSubmitMode(value) {
+    var mode = String(value || "auto").trim();
+    if (mode === "auto" || mode === "strict_first_frame" || mode === "first_last_frame" || mode === "reference_images") return mode;
+    return "auto";
+  }
+
 	  async function createWorkflowVideoTask(gIdx, batchOpts) {
 	    _syncVideoRefs();
 	    if (activeTaskCount() >= MAX_CONCURRENT) throw new Error("同时处理数已达上限");
@@ -2993,6 +3042,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     var ratio = opts.ratio || _projectPreferredVideoRatio();
     var genAudio = opts.genAudio !== undefined ? opts.genAudio : true;
     var watermark = opts.watermark !== undefined ? opts.watermark : false;
+    var submitMode = _normalizeVideoSubmitMode(opts.submitMode);
 
     task.status = "submitting"; task.statusCn = "提交中"; task.statusEn = "提交中";
     updateTaskCard(task);
@@ -3019,6 +3069,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           ratio: ratio,
           genAudio: genAudio,
           watermark: watermark,
+          submitMode: submitMode,
         },
       });
       if (startResult && startResult.aborted) {
@@ -3729,6 +3780,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       quality: ($("batchQuality") && $("batchQuality").value) || "1080p",
       genAudio: $("batchAudio") ? $("batchAudio").checked : true,
       watermark: $("batchWatermark") ? $("batchWatermark").checked : false,
+      submitMode: _normalizeVideoSubmitMode($("batchSubmitMode") ? $("batchSubmitMode").value : "auto"),
       autoImport: $("batchAutoImport") ? $("batchAutoImport").checked : true
     };
   }
@@ -3930,7 +3982,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return false;
   }
 
-  async function regenSingleClip(gIdx) {
+  async function regenSingleClip(gIdx, batchOpts) {
     if (activeTaskCount() >= MAX_CONCURRENT) { showToast("最多同时运行 " + MAX_CONCURRENT + " 个任务", "warn"); return; }
     if (!_lockVideoGroup(gIdx)) { showToast(_inFlightMessage([gIdx]), "warn"); return; }
     var handedOffLock = false;
@@ -3940,7 +3992,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       showToast("正在检查相邻镜头衔接，通过后自动开始生成…", "info");
       var ok = await _runContinuityPreflight([gIdx], { count: 1 });
       if (!ok) return;
-      await createWorkflowVideoTask(gIdx, Object.assign({}, _getDefaultBatchOpts(), { _videoGroupLockHeld: true }));
+      await createWorkflowVideoTask(gIdx, Object.assign({}, _getDefaultBatchOpts(), batchOpts || {}, { _videoGroupLockHeld: true }));
       handedOffLock = true;
       renderBatchClipList();
     } catch (e) {
@@ -4113,6 +4165,7 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
           ratio: batchOpts.ratio,
           genAudio: batchOpts.genAudio,
           watermark: batchOpts.watermark,
+          submitMode: _normalizeVideoSubmitMode(batchOpts.submitMode),
         },
       });
       if (startResult && startResult.aborted) {
@@ -4514,6 +4567,7 @@ export {
   startBatchGeneration,
   generateAllVideos,
   generateVideoForGroup,
+  getVideoGenerateReadiness,
   getVideoResultState,
   subscribeVideoResultChanges,
   openVideoHistoryForGroup,

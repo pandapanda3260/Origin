@@ -152,7 +152,32 @@ const boardState = await import(dataModuleUrl(stateSrc));
       { coverUrl: '/api/images/file/v0', status: 'completed', filename: 'clip.mp4', taskId: 'vt0' },
     ],
   };
-  const vm = boardState.buildBoardViewModel(project, { groups: [{ gIdx: 0, shotIndices: [0, 1] }] });
+  const vm = boardState.buildBoardViewModel(project, {
+    groups: [{ gIdx: 0, shotIndices: [0, 1] }],
+    videoHistoriesByGroup: {
+      0: [
+        {
+          task_id: 'vt0',
+          cover_url: '/api/images/file/v0-history',
+          url: '/api/videos/file/v0',
+          protected_url: '/api/videos/protected/v0',
+          duration_sec: 6,
+          created_at: '2026-06-30T08:00:00.000Z',
+          is_current: true,
+          prompt: 'current video prompt',
+        },
+        {
+          task_id: 'vt-old',
+          cover_url: '/api/images/file/v-old',
+          url: '/api/videos/file/v-old',
+          duration_sec: 5,
+          created_at: '2026-06-29T08:00:00.000Z',
+          is_current: true,
+          prompt: 'old video prompt',
+        },
+      ],
+    },
+  });
   assert.equal(vm.reference.empty, false, 'reference is non-empty with one character');
   assert.equal(vm.shotPlan.shotCount, 2, 'shot plan counts shots');
   assert.equal(vm.segments.length, 1, 'one segment is projected');
@@ -171,6 +196,29 @@ const boardState = await import(dataModuleUrl(stateSrc));
     vm.segments[0].shotRows.every((row) => row.readOnlyReason === 'missing_shot_uid'),
     'rows without canonical shotUid are read-only',
   );
+  assert.equal(vm.segments[0].video.selectedTaskId, 'vt0', 'video selectedTaskId comes from project videoTasks current authority');
+  assert.equal(vm.segments[0].video.candidates.length, 2, 'video history rows are projected as flat candidates');
+  assert.deepEqual(
+    {
+      taskId: vm.segments[0].video.candidates[0].taskId,
+      coverUrl: vm.segments[0].video.candidates[0].coverUrl,
+      playbackUrl: vm.segments[0].video.candidates[0].playbackUrl,
+      protectedUrl: vm.segments[0].video.candidates[0].protectedUrl,
+      durationSec: vm.segments[0].video.candidates[0].durationSec,
+      selected: vm.segments[0].video.candidates[0].selected,
+    },
+    {
+      taskId: 'vt0',
+      coverUrl: '/api/images/file/v0-history',
+      playbackUrl: '/api/videos/file/v0',
+      protectedUrl: '/api/videos/protected/v0',
+      durationSec: 6,
+      selected: true,
+    },
+    'video history snake_case fields map to board camelCase candidate fields',
+  );
+  assert.equal(vm.segments[0].video.candidates[1].isCurrent, true, 'history is_current remains available for display/debug');
+  assert.equal(vm.segments[0].video.candidates[1].selected, false, 'cached is_current does not override selectedTaskId');
   assert.deepEqual(
     vm.edges.map((edge) => `${edge.from}->${edge.to}`),
     ['reference->shot-plan', 'shot-plan->segment:0', 'segment:0->video:0'],

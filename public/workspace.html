@@ -1256,6 +1256,15 @@
                 </div>
 
                 <div class="batch-config-group">
+                  <label for="batchSubmitMode">视频模式</label>
+                  <select id="batchSubmitMode" class="batch-quality-select">
+                    <option value="auto" selected>全能参考</option>
+                    <option value="reference_images">智能多帧</option>
+                    <option value="first_last_frame">首尾帧</option>
+                  </select>
+                </div>
+
+                <div class="batch-config-group">
                   <label>模型</label>
                   <div class="batch-model-display" id="batchVideoModelDisplay" data-video-model-status="loading">
                     <span class="material-symbols-outlined" aria-hidden="true">movie</span>

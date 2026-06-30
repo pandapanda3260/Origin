@@ -164,6 +164,20 @@ function tailUnavailableWarning(
   };
 }
 
+function explicitFirstLastFallbackWarning(reason: VideoPayloadDecisionReason): VideoPayloadDecisionWarning {
+  const messages: Partial<Record<VideoPayloadDecisionReason, string>> = {
+    capability_unsupported: '已选择首尾帧模式，但当前视频模型不支持首尾帧，已改用严格首帧通道。',
+    feature_disabled: '已选择首尾帧模式，但首尾帧视频模式当前未开启，已改用严格首帧通道。',
+    no_tail_intent: '已选择首尾帧模式，但片段未标记尾帧意图，已改用严格首帧通道。',
+  };
+  return {
+    key: 'first_last_frame_fallback',
+    level: 'warn',
+    reason,
+    message: messages[reason] || '已选择首尾帧模式，但当前条件不满足，已改用严格首帧通道。',
+  };
+}
+
 function referenceImagesDecision(
   submitMode: VideoSubmitMode,
   independentMultiImageCapable: boolean,
@@ -237,15 +251,30 @@ export function resolveVideoPayloadDecision(opts: {
 
   const explicitFirstLast = submitMode === 'first_last_frame';
   if (!opts.capabilityFirstLastSupported) {
-    return firstFrameDecision(submitMode, 'capability_unsupported', 'strict_first_frame');
+    return firstFrameDecision(
+      submitMode,
+      'capability_unsupported',
+      'strict_first_frame',
+      explicitFirstLast ? explicitFirstLastFallbackWarning('capability_unsupported') : undefined,
+    );
   }
 
   if (!opts.firstLastFeatureEnabled) {
-    return firstFrameDecision(submitMode, 'feature_disabled', 'strict_first_frame');
+    return firstFrameDecision(
+      submitMode,
+      'feature_disabled',
+      'strict_first_frame',
+      explicitFirstLast ? explicitFirstLastFallbackWarning('feature_disabled') : undefined,
+    );
   }
 
   if (!opts.tailIntentRequested) {
-    return firstFrameDecision(submitMode, 'no_tail_intent', 'strict_first_frame');
+    return firstFrameDecision(
+      submitMode,
+      'no_tail_intent',
+      'strict_first_frame',
+      explicitFirstLast ? explicitFirstLastFallbackWarning('no_tail_intent') : undefined,
+    );
   }
 
   if (tailStatus === 'ready' && tailFramePath) {

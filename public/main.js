@@ -24,7 +24,7 @@ import { initEpisodes, syncEpisodesProject,
   _renderEpisodeTabs, _openNewEpisodeDialog } from '/modules/episodes.js';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
   refreshBatchPage, startBatchGeneration, generateAllVideos, generateVideoForGroup,
-  getVideoResultState, subscribeVideoResultChanges, openVideoHistoryForGroup,
+  getVideoGenerateReadiness, getVideoResultState, subscribeVideoResultChanges, openVideoHistoryForGroup,
   downloadVideoForGroup, deleteVideoForGroup, importVideoForGroup,
   _initBatchPlayerEvents, handleVideoTaskAction,
   syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
@@ -8489,6 +8489,35 @@ var _scriptEditInitialText = "";
 	        await _reloadProjectFromServerForBoard();
 	        return resp;
 	      },
+	      getVideoCandidatesForGroup: async (payload) => {
+	        if (!project || !project.id) return { history: [] };
+	        var gIdx = Number(payload && payload.groupIdx);
+	        if (!Number.isInteger(gIdx) || gIdx < 0) return { history: [] };
+	        return await apiGet('/api/video-creation/videos/history?projectId=' + encodeURIComponent(project.id) + '&groupIdx=' + encodeURIComponent(String(gIdx)));
+	      },
+	      setVideoCandidateCurrent: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var gIdx = Number(payload && payload.groupIdx);
+	        var taskId = String(payload && payload.taskId || '').trim();
+	        if (!Number.isInteger(gIdx) || gIdx < 0 || !taskId) throw new Error('视频候选参数无效');
+	        var resp = await apiPost('/api/video-creation/videos/current', {
+	          projectId: project.id,
+	          groupIdx: gIdx,
+	          taskId: taskId,
+	        });
+	        await _reloadProjectFromServerForBoard();
+	        return resp;
+	      },
+	      generateVideoForGroup: async (payload) => {
+	        if (!project || !project.id) throw new Error('项目不存在');
+	        var gIdx = Number(payload && payload.groupIdx);
+	        if (!Number.isInteger(gIdx) || gIdx < 0) throw new Error('片段参数无效');
+	        return await generateVideoForGroup(gIdx, { submitMode: payload && payload.submitMode });
+	      },
+	      getVideoGenerateReadiness: (gIdx) => getVideoGenerateReadiness(gIdx),
+	      confirmSegmentsAndEnterEdit: async () => confirmSegmentsAndEnterEdit(),
+	      subscribeVideoResultChanges: (handler) => subscribeVideoResultChanges(handler),
+	      reloadProjectFromServer: async () => _reloadProjectFromServerForBoard(),
 	      uPrefix: _uPrefix,
 	    });
     initShotPlanDialog({

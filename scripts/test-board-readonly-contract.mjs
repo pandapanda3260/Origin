@@ -61,6 +61,13 @@ assert.deepEqual(
     'generateShotFrameCandidate',
     'generateStoryboardSheet',
     'uploadShotFrameCandidate',
+    'getVideoCandidatesForGroup',
+    'setVideoCandidateCurrent',
+    'generateVideoForGroup',
+    'getVideoGenerateReadiness',
+    'confirmSegmentsAndEnterEdit',
+    'subscribeVideoResultChanges',
+    'reloadProjectFromServer',
   ],
   'board ctx whitelist exposes only narrow injected actions',
 );
@@ -81,8 +88,27 @@ assert.match(boardSrc, /data-board-action="candidate-select"/, 'candidate cards 
 assert.match(boardSrc, /boardIconButton\('candidate-delete'/, 'candidate cards expose delete action');
 assert.match(boardSrc, /data-board-action="candidate-generate"/, 'candidate rows expose generate action');
 assert.match(boardSrc, /data-board-action="candidate-upload"/, 'candidate rows expose upload action');
+assert.match(boardSrc, /function renderVideoCandidateCard\(groupIdx, data, candidate, idx\)/, 'board renders flat video candidate cards');
+assert.match(boardSrc, /data-board-action="video-candidate-current"/, 'video candidates expose current-selection radio action');
+assert.match(boardSrc, /videoHistoryCacheKey\(project, groupIdx\)/, 'video history cache is keyed by project id, version and group');
+assert.match(boardSrc, /function pruneVideoHistoryCacheForCurrentVersion\(project\)/, 'board prunes stale video history cache versions');
+assert.match(functionBody(boardSrc, 'syncBoardProject'), /_lastProjectVersion !== projectVersion/, 'board detects project version changes');
+assert.match(functionBody(boardSrc, 'ensureVideoHistories'), /videoHistoryCacheKey\(currentProject\(\), groupIdx\) !== key/, 'stale video history responses do not repopulate old version keys');
+assert.match(boardSrc, /function renderVideoModeSelector\(groupIdx\)/, 'board renders video submit mode selector');
+assert.match(boardSrc, /data-board-action="video-mode-select"/, 'video mode selector is a local board action');
+assert.match(boardSrc, /data-board-action="video-generate"/, 'video cards expose generate action');
+assert.match(boardSrc, /function videoGenerateReadinessForGroup\(groupIdx\)/, 'board reads video generate readiness from injected ctx');
+assert.match(functionBody(boardSrc, 'renderVideoNode'), /board-btn board-btn--disabled/, 'video generate button is disabled when prompt is not ready');
+assert.match(boardSrc, /boardActionButton\('确认视频，进入下一步', 'arrow_forward', 'confirm-enter-edit'\)/, 'board topbar exposes confirm-enter-edit action');
 assert.match(functionBody(boardSrc, 'runBoardAction'), /_ctx\.selectShotFrameCandidate/, 'select action goes through injected ctx');
 assert.match(functionBody(boardSrc, 'runBoardAction'), /_ctx\.uploadShotFrameCandidate/, 'upload action goes through injected ctx');
+assert.match(functionBody(boardSrc, 'runBoardAction'), /_ctx\.setVideoCandidateCurrent/, 'video current action goes through injected ctx');
+assert.match(functionBody(boardSrc, 'runBoardAction'), /_ctx\.generateVideoForGroup/, 'video generate action goes through injected ctx');
+assert.match(functionBody(boardSrc, 'runBoardAction'), /_ctx\.confirmSegmentsAndEnterEdit/, 'confirm action goes through injected ctx');
+assert.match(boardSrc, /function bindVideoResultSubscription\(\)/, 'board subscribes to video result changes');
+assert.match(functionBody(boardSrc, 'scheduleVideoResultReload'), /_ctx\.reloadProjectFromServer\(\)/, 'video result changes reload the project through injected ctx');
+assert.match(functionBody(boardSrc, 'shouldReloadForVideoResult'), /reason === 'current' \|\| reason === 'failed' \|\| reason === 'delete'/, 'board ignores noisy video progress events');
+assert.match(functionBody(boardSrc, 'handleBoardAction'), /action !== 'confirm-enter-edit' && action !== 'segment-generate-all' && action !== 'video-candidate-current' && action !== 'video-mode-select' && action !== 'video-generate' && !payload\.shotUid/, 'video and confirm actions do not require shotUid');
 assert.match(boardSrc, /function onCandidateDrop\(event\)/, 'candidate rows support drag reorder');
 assert.match(functionBody(boardSrc, 'onCandidateDrop'), /_ctx\.reorderShotFrameCandidates/, 'drag reorder goes through injected ctx');
 assert.match(boardSrc, /data-board-minimap/, 'board renders a native minimap surface');

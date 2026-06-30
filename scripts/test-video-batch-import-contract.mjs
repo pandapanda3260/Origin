@@ -50,15 +50,39 @@ assert.match(
 assertBefore(
   videoTasksSource,
   'showToast("导入失败，请重试或刷新", "warn");',
-  'showToast("暂无新的可导入片段，未生成或未就绪的片段已跳过", "warn");',
+  'showToast(_bulkImportSkippedMessage(summary, false), "warn");',
   'bulk import must report import failures before skipped-not-ready segments',
 );
 
 assertBefore(
   videoTasksSource,
   'showToast("片段导入失败，请刷新后重试", "warn");',
-  'showToast("还有片段未生成或未就绪，暂不能进入剪辑", "warn");',
+  'showToast(_bulkImportSkippedMessage(result, true), "warn");',
   'confirm-enter-edit must report import failures before skipped-not-ready segments',
+);
+
+assert.match(
+  videoTasksSource,
+  /skippedMissingCurrent: skippedMissingCurrent, skippedNotReady: skippedNotReady/,
+  'bulk import summary must preserve skipped reason counters',
+);
+
+assert.match(
+  videoTasksSource,
+  /missing_current_video/,
+  'bulk import distinguishes groups with no selected current video',
+);
+
+assert.match(
+  videoTasksSource,
+  /not_ready_for_edit/,
+  'bulk import distinguishes groups blocked by readyForEdit=false',
+);
+
+assert.match(
+  videoTasksSource,
+  /还有片段未选定视频或尚未通过剪辑就绪检查，暂不能进入剪辑/,
+  'confirm-enter-edit skipped toast must name both missing-current and readiness cases',
 );
 
 assert.match(

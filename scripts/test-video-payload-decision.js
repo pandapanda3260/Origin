@@ -134,11 +134,16 @@ function testCapabilityAndFeature() {
       hardFail: false,
       failureCode: undefined,
       hasFirstLast: false,
-      warningReason: undefined,
+      warningReason: 'capability_unsupported',
     },
-    'explicit capability unsupported silently falls back',
+    'explicit capability unsupported falls back with a warning',
   );
   eq(pick(decision({ firstLastFeatureEnabled: false })).reason, 'feature_disabled', 'feature disabled reason');
+  eq(
+    pick(decision({ submitMode: 'first_last_frame', firstLastFeatureEnabled: false })).warningReason,
+    'feature_disabled',
+    'explicit first-last warns when feature is disabled',
+  );
 }
 
 function testFirstFrameAndIntent() {
@@ -162,9 +167,18 @@ function testFirstFrameAndIntent() {
     'auto without tail intent stays strict-first-frame',
   );
   eq(
-    pick(decision({ submitMode: 'first_last_frame', tailIntentRequested: false })).hardFail,
-    false,
-    'explicit first-last without tail intent silently falls back',
+    pick(decision({ submitMode: 'first_last_frame', tailIntentRequested: false })),
+    {
+      submitMode: 'first_last_frame',
+      payloadMode: 'first_frame_multi_ref',
+      effectiveStrategy: 'strict_first_frame',
+      reason: 'no_tail_intent',
+      hardFail: false,
+      failureCode: undefined,
+      hasFirstLast: false,
+      warningReason: 'no_tail_intent',
+    },
+    'explicit first-last without tail intent falls back with a warning',
   );
 }
 

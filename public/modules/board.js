@@ -17,6 +17,13 @@ export const BOARD_CTX_KEYS = [
   'generateShotFrameCandidate',
   'generateStoryboardSheet',
   'uploadShotFrameCandidate',
+  'getVideoCandidatesForGroup',
+  'setVideoCandidateCurrent',
+  'generateVideoForGroup',
+  'getVideoGenerateReadiness',
+  'confirmSegmentsAndEnterEdit',
+  'subscribeVideoResultChanges',
+  'reloadProjectFromServer',
 ];
 
 let _ctx = {};
@@ -36,6 +43,7 @@ let _viewport = null;
 let _nodeEls = new Map();
 let _selectedId = '';
 let _lastProjectId = '';
+let _lastProjectVersion = '';
 let _cameraReadyProjectId = '';
 let _handMode = false;
 let _helpOpen = false;
@@ -52,6 +60,13 @@ let _boardImageActive = 0;
 let _boardImageHydrateRaf = 0;
 let _boardActionBusy = false;
 let _dragCandidate = null;
+let _videoHistoryCache = new Map();
+let _videoHistoryInflight = new Map();
+let _videoHistoryRefreshRaf = 0;
+let _videoSubmitModesByGroup = new Map();
+let _videoResultUnsubscribe = null;
+let _videoResultReloading = false;
+let _videoResultReloadQueued = false;
 
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -198,6 +213,12 @@ function actionButton(label, icon, action) {
     '<span>' + escapeHtml(label) + '</span></button>';
 }
 
+function boardActionButton(label, icon, action, attrs) {
+  return '<button type="button" class="board-btn" data-board-control data-board-action="' + escapeHtml(action) + '" ' + (attrs || '') + '>' +
+    (icon ? '<span class="material-symbols-outlined">' + escapeHtml(icon) + '</span>' : '') +
+    '<span>' + escapeHtml(label) + '</span></button>';
+}
+
 function boardIconButton(action, icon, title, attrs) {
   return '<button type="button" class="board-icon-btn" data-board-control data-board-action="' + escapeHtml(action) + '" ' + (attrs || '') + ' title="' + escapeHtml(title || '') + '" aria-label="' + escapeHtml(title || '') + '">' +
     '<span class="material-symbols-outlined">' + escapeHtml(icon) + '</span></button>';
@@ -209,8 +230,101 @@ function boardActionAttrs(groupIdx, shotUid, candidateId) {
   return attrs;
 }
 
+function videoActionAttrs(groupIdx, taskId) {
+  return 'data-group-idx="' + escapeHtml(groupIdx) + '" data-task-id="' + escapeHtml(taskId || '') + '"';
+}
+
+function normalizeVideoSubmitMode(value) {
+  const mode = String(value || 'auto').trim();
+  if (mode === 'auto' || mode === 'reference_images' || mode === 'first_last_frame') return mode;
+  return 'auto';
+}
+
+function videoSubmitModeForGroup(groupIdx) {
+  return normalizeVideoSubmitMode(_videoSubmitModesByGroup.get(Number(groupIdx)) || 'auto');
+}
+
+function videoSubmitModeLabel(mode) {
+  const labels = {
+    auto: '全能参考',
+    reference_images: '智能多帧',
+    first_last_frame: '首尾帧',
+  };
+  return labels[normalizeVideoSubmitMode(mode)] || labels.auto;
+}
+
 function projectIdOf(project) {
   return String(project && project.id ? project.id : 'draft');
+}
+
+function projectVersionOf(project) {
+  return String(project && project.version != null ? project.version : 0);
+}
+
+function videoHistoryCacheKey(project, groupIdx) {
+  return projectIdOf(project) + ':' + projectVersionOf(project) + ':' + String(groupIdx);
+}
+
+function pruneVideoHistoryCacheForCurrentVersion(project) {
+  const prefix = projectIdOf(project) + ':' + projectVersionOf(project) + ':';
+  Array.from(_videoHistoryCache.keys()).forEach((key) => {
+    if (!String(key).startsWith(prefix)) _videoHistoryCache.delete(key);
+  });
+  Array.from(_videoHistoryInflight.keys()).forEach((key) => {
+    if (!String(key).startsWith(prefix)) _videoHistoryInflight.delete(key);
+  });
+}
+
+function videoHistoryRowsFromResponse(response) {
+  if (Array.isArray(response)) return response;
+  if (response && Array.isArray(response.history)) return response.history;
+  if (response && Array.isArray(response.items)) return response.items;
+  if (response && Array.isArray(response.tasks)) return response.tasks;
+  return [];
+}
+
+function videoHistoriesForView(project, groups) {
+  const result = {};
+  (Array.isArray(groups) ? groups : []).forEach((group) => {
+    const groupIdx = Number(group && (group.gIdx ?? group.groupIdx));
+    if (!Number.isInteger(groupIdx) || groupIdx < 0) return;
+    const key = videoHistoryCacheKey(project, groupIdx);
+    if (_videoHistoryCache.has(key)) result[groupIdx] = _videoHistoryCache.get(key);
+  });
+  return result;
+}
+
+function scheduleVideoHistoryRefresh() {
+  if (_videoHistoryRefreshRaf) return;
+  _videoHistoryRefreshRaf = requestBoardFrame(() => {
+    _videoHistoryRefreshRaf = 0;
+    refreshBoardPage();
+  });
+}
+
+function ensureVideoHistories(project, groups) {
+  if (!project || !project.id || typeof _ctx.getVideoCandidatesForGroup !== 'function') return;
+  (Array.isArray(groups) ? groups : []).forEach((group) => {
+    const groupIdx = Number(group && (group.gIdx ?? group.groupIdx));
+    if (!Number.isInteger(groupIdx) || groupIdx < 0) return;
+    const key = videoHistoryCacheKey(project, groupIdx);
+    if (_videoHistoryCache.has(key) || _videoHistoryInflight.has(key)) return;
+    const request = Promise.resolve(_ctx.getVideoCandidatesForGroup({ projectId: project.id, groupIdx }))
+      .then((response) => {
+        if (videoHistoryCacheKey(currentProject(), groupIdx) !== key) return;
+        _videoHistoryCache.set(key, videoHistoryRowsFromResponse(response));
+        scheduleVideoHistoryRefresh();
+      })
+      .catch(() => {
+        if (videoHistoryCacheKey(currentProject(), groupIdx) !== key) return;
+        _videoHistoryCache.set(key, []);
+        scheduleVideoHistoryRefresh();
+      })
+      .finally(() => {
+        _videoHistoryInflight.delete(key);
+      });
+    _videoHistoryInflight.set(key, request);
+  });
 }
 
 function cameraKey(projectId) {
@@ -252,6 +366,46 @@ function ensureCtx(ctx) {
   BOARD_CTX_KEYS.forEach((key) => {
     if (Object.prototype.hasOwnProperty.call(input, key)) _ctx[key] = input[key];
   });
+  bindVideoResultSubscription();
+}
+
+function shouldReloadForVideoResult(evt) {
+  const reason = String(evt && evt.reason || '').trim();
+  return reason === 'current' || reason === 'failed' || reason === 'delete';
+}
+
+function scheduleVideoResultReload(evt) {
+  if (!shouldReloadForVideoResult(evt)) return;
+  if (typeof _ctx.reloadProjectFromServer !== 'function') {
+    scheduleVideoHistoryRefresh();
+    return;
+  }
+  if (_videoResultReloading) {
+    _videoResultReloadQueued = true;
+    return;
+  }
+  _videoResultReloading = true;
+  Promise.resolve(_ctx.reloadProjectFromServer()).then((ok) => {
+    if (ok === false) scheduleVideoHistoryRefresh();
+    else refreshBoardPage();
+  }).catch(() => {
+    scheduleVideoHistoryRefresh();
+  }).finally(() => {
+    _videoResultReloading = false;
+    if (_videoResultReloadQueued) {
+      _videoResultReloadQueued = false;
+      scheduleVideoResultReload({ reason: 'current' });
+    }
+  });
+}
+
+function bindVideoResultSubscription() {
+  if (_videoResultUnsubscribe) {
+    try { _videoResultUnsubscribe(); } catch (_) {}
+    _videoResultUnsubscribe = null;
+  }
+  if (typeof _ctx.subscribeVideoResultChanges !== 'function') return;
+  _videoResultUnsubscribe = _ctx.subscribeVideoResultChanges(scheduleVideoResultReload);
 }
 
 function ensureRoot() {
@@ -262,7 +416,7 @@ function ensureRoot() {
     '<div class="board-shell">',
     '  <header class="board-topbar" data-board-control>',
     '    <div><h1>画板</h1><p>参考图、镜头计划、首帧和视频片段</p></div>',
-    '    ' + disabledButton('确认视频，进入下一步', 'arrow_forward'),
+    '    ' + boardActionButton('确认视频，进入下一步', 'arrow_forward', 'confirm-enter-edit'),
     '  </header>',
     '  <div class="board-viewport" data-board-viewport>',
     '    <div class="board-world" data-board-world>',
@@ -471,6 +625,8 @@ function boardActionPayload(el) {
     groupIdx: Number(el && el.dataset ? el.dataset.groupIdx : NaN),
     shotUid: String(el && el.dataset ? el.dataset.shotUid || '' : '').trim(),
     candidateId: String(el && el.dataset ? el.dataset.candidateId || '' : '').trim(),
+    taskId: String(el && el.dataset ? el.dataset.taskId || '' : '').trim(),
+    submitMode: normalizeVideoSubmitMode(el && el.dataset ? el.dataset.submitMode || '' : ''),
   };
 }
 
@@ -512,6 +668,20 @@ async function runBoardAction(action, payload) {
   } else if (action === 'segment-generate-all') {
     if (!_ctx.generateStoryboardSheet) throw new Error('segment_generate_not_available');
     await _ctx.generateStoryboardSheet(payload.groupIdx);
+  } else if (action === 'video-candidate-current') {
+    if (!_ctx.setVideoCandidateCurrent) throw new Error('video_current_not_available');
+    await _ctx.setVideoCandidateCurrent(payload);
+  } else if (action === 'video-mode-select') {
+    _videoSubmitModesByGroup.set(payload.groupIdx, normalizeVideoSubmitMode(payload.submitMode));
+  } else if (action === 'video-generate') {
+    if (!_ctx.generateVideoForGroup) throw new Error('video_generate_not_available');
+    await _ctx.generateVideoForGroup({
+      groupIdx: payload.groupIdx,
+      submitMode: videoSubmitModeForGroup(payload.groupIdx),
+    });
+  } else if (action === 'confirm-enter-edit') {
+    if (!_ctx.confirmSegmentsAndEnterEdit) throw new Error('confirm_edit_not_available');
+    await _ctx.confirmSegmentsAndEnterEdit();
   }
 }
 
@@ -519,12 +689,13 @@ async function handleBoardAction(actionEl) {
   const action = String(actionEl && actionEl.dataset ? actionEl.dataset.boardAction || '' : '').trim();
   if (!action || _boardActionBusy) return;
   const payload = boardActionPayload(actionEl);
-  if (!Number.isInteger(payload.groupIdx) || payload.groupIdx < 0) return;
-  if (action !== 'segment-generate-all' && !payload.shotUid) {
+  if (action !== 'confirm-enter-edit' && (!Number.isInteger(payload.groupIdx) || payload.groupIdx < 0)) return;
+  if (action !== 'confirm-enter-edit' && action !== 'segment-generate-all' && action !== 'video-candidate-current' && action !== 'video-mode-select' && action !== 'video-generate' && !payload.shotUid) {
     if (_ctx.showToast) _ctx.showToast('该镜头缺少 shotUid，不能写入候选', 'error');
     return;
   }
   if ((action === 'candidate-select' || action === 'candidate-delete') && !payload.candidateId) return;
+  if (action === 'video-candidate-current' && !payload.taskId) return;
   _boardActionBusy = true;
   actionEl.disabled = true;
   try {
@@ -533,10 +704,18 @@ async function handleBoardAction(actionEl) {
       if (_ctx.showToast) _ctx.showToast('已开始生成首帧候选', 'success');
     } else if (action === 'candidate-upload') {
       if (_ctx.showToast) _ctx.showToast('已上传首帧候选', 'success');
+    } else if (action === 'video-candidate-current') {
+      if (_ctx.showToast) _ctx.showToast('当前视频已更新', 'success');
+    } else if (action === 'video-mode-select') {
+      if (_ctx.showToast) _ctx.showToast('视频模式已切换为' + videoSubmitModeLabel(payload.submitMode), 'success');
+    } else if (action === 'video-generate') {
+      if (_ctx.showToast) _ctx.showToast('已开始生成视频', 'success');
+    } else if (action === 'confirm-enter-edit') {
+      // confirmSegmentsAndEnterEdit owns its import result toasts.
     } else {
       if (_ctx.showToast) _ctx.showToast('候选已更新', 'success');
     }
-    refreshBoardPage();
+    if (action !== 'confirm-enter-edit') refreshBoardPage();
   } catch (err) {
     const msg = ((err && err.message) || err || '操作失败').toString().slice(0, 160);
     if (_ctx.showToast) _ctx.showToast(msg, 'error');
@@ -770,12 +949,75 @@ function statusLabel(status) {
   return map[status] || '待生成';
 }
 
+function videoCandidateMeta(candidate) {
+  const parts = [];
+  const duration = Number(candidate && candidate.durationSec);
+  if (Number.isFinite(duration) && duration > 0) parts.push(Math.round(duration) + 's');
+  const createdAt = String(candidate && candidate.createdAt ? candidate.createdAt : '').trim();
+  if (createdAt) parts.push(createdAt.slice(0, 10));
+  return parts.join(' · ');
+}
+
+function renderVideoCandidateCard(groupIdx, data, candidate, idx) {
+  const taskId = candidate && candidate.taskId ? candidate.taskId : '';
+  const selected = !!(taskId && taskId === (data && data.selectedTaskId));
+  const attrs = videoActionAttrs(groupIdx, taskId);
+  const prompt = String(candidate && candidate.prompt ? candidate.prompt : '').trim();
+  const meta = videoCandidateMeta(candidate);
+  return '<div class="board-video-candidate ' + (selected ? 'is-selected' : '') + '">' +
+    '<button type="button" class="board-video-candidate-thumb" data-board-control data-board-action="video-candidate-current" ' + attrs + ' aria-pressed="' + (selected ? 'true' : 'false') + '" title="设为当前视频">' +
+    assetImg((candidate && candidate.coverUrl) || (data && data.coverUrl), '视频候选' + (idx + 1)) +
+    '<span class="board-radio" aria-hidden="true"></span>' +
+    '</button>' +
+    '<div class="board-video-candidate-meta">' +
+    '<strong>' + escapeHtml(candidate && candidate.label ? candidate.label : ('候选 ' + (idx + 1))) + '</strong>' +
+    (meta ? '<span>' + escapeHtml(meta) + '</span>' : '') +
+    (prompt ? '<p>' + escapeHtml(prompt) + '</p>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+function renderVideoModeSelector(groupIdx) {
+  const current = videoSubmitModeForGroup(groupIdx);
+  const modes = [
+    ['auto', '全能参考'],
+    ['reference_images', '智能多帧'],
+    ['first_last_frame', '首尾帧'],
+  ];
+  return '<div class="board-video-mode" role="group" aria-label="视频生成模式">' +
+    modes.map(([mode, label]) => {
+      const active = mode === current;
+      return '<button type="button" class="' + (active ? 'is-active' : '') + '" data-board-control data-board-action="video-mode-select" data-group-idx="' + escapeHtml(groupIdx) + '" data-submit-mode="' + escapeHtml(mode) + '" aria-pressed="' + (active ? 'true' : 'false') + '">' + escapeHtml(label) + '</button>';
+    }).join('') +
+  '</div>';
+}
+
+function videoGenerateReadinessForGroup(groupIdx) {
+  if (typeof _ctx.getVideoGenerateReadiness !== 'function') return { canStart: true, message: '' };
+  const readiness = _ctx.getVideoGenerateReadiness(groupIdx) || {};
+  return {
+    canStart: readiness.canStart !== false,
+    message: String(readiness.message || '').trim(),
+  };
+}
+
 function renderVideoNode(data) {
   const status = data && data.status ? data.status : 'missing';
+  const candidates = Array.isArray(data && data.candidates) ? data.candidates : [];
+  const groupIdx = Number(data && data.gIdx);
+  const generateReadiness = videoGenerateReadinessForGroup(groupIdx);
+  const generateDisabled = generateReadiness.canStart
+    ? ''
+    : ' disabled aria-disabled="true" title="' + escapeHtml(generateReadiness.message || '视频提示词未就绪') + '"';
+  const generateClass = generateReadiness.canStart ? 'board-btn' : 'board-btn board-btn--disabled';
+  const candidateList = candidates.length
+    ? '<div class="board-video-candidate-list">' + candidates.map((candidate, idx) => renderVideoCandidateCard(groupIdx, data, candidate, idx)).join('') + '</div>'
+    : '<div class="board-video-empty"><div class="board-video-cover">' + assetImg(data && data.coverUrl, '视频封面') + '<span class="board-radio" aria-hidden="true"></span></div><span>暂无视频候选</span></div>';
   return '<div class="board-node-card board-node-card--video">' +
     '<div class="board-node-head"><h2>视频</h2><span class="board-status board-status--' + escapeHtml(status) + '">' + escapeHtml(statusLabel(status)) + '</span></div>' +
-    '<div class="board-video-cover">' + assetImg(data && data.coverUrl, '视频封面') + '<span class="board-radio" aria-hidden="true"></span></div>' +
-    disabledButton('生成新视频', 'movie') +
+    candidateList +
+    renderVideoModeSelector(groupIdx) +
+    '<button type="button" class="' + generateClass + '" data-board-control data-board-action="video-generate" data-group-idx="' + escapeHtml(groupIdx) + '"' + generateDisabled + '><span class="material-symbols-outlined">movie</span><span>生成新视频</span></button>' +
   '</div>';
 }
 
@@ -868,10 +1110,18 @@ export function initBoard(ctx) {
 export function syncBoardProject(project) {
   _project = project || null;
   const projectId = projectIdOf(_project);
+  const projectVersion = projectVersionOf(_project);
   if (_lastProjectId !== projectId) {
     _lastProjectId = projectId;
+    _lastProjectVersion = projectVersion;
     _cameraReadyProjectId = '';
     _selectedId = '';
+    _videoHistoryCache = new Map();
+    _videoHistoryInflight = new Map();
+    _videoSubmitModesByGroup = new Map();
+  } else if (_lastProjectVersion !== projectVersion) {
+    _lastProjectVersion = projectVersion;
+    pruneVideoHistoryCacheForCurrentVersion(_project);
   }
 }
 
@@ -887,7 +1137,8 @@ export function refreshBoardPage() {
     return;
   }
   const groups = typeof _ctx.getStoryboardGroups === 'function' ? _ctx.getStoryboardGroups() : [];
-  const vm = buildBoardViewModel(project, { groups });
+  ensureVideoHistories(project, groups);
+  const vm = buildBoardViewModel(project, { groups, videoHistoriesByGroup: videoHistoriesForView(project, groups) });
   setSurfaceBounds(vm.bounds);
   removeStaleNodes(vm.nodes.map((node) => node.id));
   vm.nodes.forEach(ensureNodeElement);
