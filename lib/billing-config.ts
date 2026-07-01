@@ -40,9 +40,9 @@ export const PLANS = [
   },
 ];
 
-// 积分包（永久积分，进 topup 桶不过期）。2026-06-10 新定价拍板，旧 topup_500/2000/10000 直接删不留兼容。
+// 积分包（永久积分，进 topup 桶不过期）。旧 topup_500/2000/10000 直接删不留兼容；基础包 2026-07-01 调整为 ¥100 / 4,000 积分。
 export const TOPUP_PACKS = [
-  { code: 'topup_basic', title: '基础积分包', credits: 40000, price_cents: 100000 },
+  { code: 'topup_basic', title: '基础积分包', credits: 4000, price_cents: 10000 },
   { code: 'topup_advanced', title: '进阶积分包', credits: 120000, price_cents: 300000 },
   { code: 'topup_enterprise', title: '企业积分包', credits: 2000000, price_cents: 4000000 },
 ];

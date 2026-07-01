@@ -38,7 +38,7 @@ export const MOCK_BILLING_PLANS_LIST = [
 ];
 
 export const MOCK_TOPUP_PACKS = [
-  { code: 'topup_basic', title: '基础积分包', credits: 40000, price_cents: 100000 },
+  { code: 'topup_basic', title: '基础积分包', credits: 4000, price_cents: 10000 },
   { code: 'topup_advanced', title: '进阶积分包', credits: 120000, price_cents: 300000 },
   { code: 'topup_enterprise', title: '企业积分包', credits: 2000000, price_cents: 4000000 },
 ];

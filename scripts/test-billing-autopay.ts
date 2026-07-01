@@ -28,11 +28,14 @@ import {
 import { fulfillPaidOrder } from '../lib/billing-fulfill';
 import { toBillingOrderPayload } from '../lib/billing-order-payload';
 
+const BASIC_TOPUP_CREDITS = 4000;
+const BASIC_TOPUP_PRICE_CENTS = 10000;
+
 function setNodeEnv(value: string) {
   (process.env as Record<string, string | undefined>)['NODE_ENV'] = value;
 }
 
-// —— 新定价数值锁（2026-06-10 拍板）——
+// —— 新定价数值锁（基础包 2026-07-01 调整为 ¥100 / 4,000 积分）——
 assert.equal(getPlan('plus')?.price_cents, 159900);
 assert.equal(getPlan('plus')?.monthly_credits, 80000);
 assert.equal(getPlan('pro')?.price_cents, 799900);
@@ -41,7 +44,7 @@ assert.equal(getPlan('free')?.monthly_credits, 100);
 assert.deepEqual(
   TOPUP_PACKS.map((p) => [p.code, p.credits, p.price_cents]),
   [
-    ['topup_basic', 40000, 100000],
+    ['topup_basic', BASIC_TOPUP_CREDITS, BASIC_TOPUP_PRICE_CENTS],
     ['topup_advanced', 120000, 300000],
     ['topup_enterprise', 2000000, 4000000],
   ],
@@ -100,13 +103,13 @@ const pack = getTopupPack('topup_basic')!;
 const topupOrder = insertOrder('topup', pack.code, pack.credits);
 const r1 = fulfillPaidOrder({ userId: uid, orderId: topupOrder, via: '模拟支付' });
 assert.equal(r1.alreadyApplied, false);
-assert.equal(r1.creditsAdded, 40000);
+assert.equal(r1.creditsAdded, BASIC_TOPUP_CREDITS);
 bal = getBalance(uid);
-assert.equal(bal.topupCredits, 40000);
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS);
 assert.equal((db.prepare('SELECT status FROM billing_orders WHERE id = ?').get(topupOrder) as any).status, 'applied');
 const r1b = fulfillPaidOrder({ userId: uid, orderId: topupOrder, via: '模拟支付' });
 assert.equal(r1b.alreadyApplied, true);
-assert.equal(getBalance(uid).topupCredits, 40000); // 不双发
+assert.equal(getBalance(uid).topupCredits, BASIC_TOPUP_CREDITS); // 同一订单不双发
 
 // —— 订阅到账：升档 + 订阅桶覆盖重置 + period_end 未来 ——
 const subOrder = insertOrder('subscription', 'plus', getPlan('plus')!.monthly_credits);
@@ -115,7 +118,7 @@ assert.equal(r2.kind, 'subscription');
 bal = getBalance(uid);
 assert.equal(bal.planCode, 'plus');
 assert.equal(bal.subscriptionCredits, 80000); // 覆盖重置（开户 100 不叠加）
-assert.equal(bal.topupCredits, 40000); // topup 桶不动
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS); // topup 桶不动
 assert.ok(Date.parse(String(bal.periodEnd)) > Date.now());
 assert.equal(bal.cancelAtPeriodEnd, false);
 
@@ -124,7 +127,7 @@ assert.equal(topupPayload.id, topupOrder);
 assert.equal(topupPayload.kind, 'topup');
 assert.equal(topupPayload.status, 'applied');
 assert.equal(topupPayload.title, '购买 基础积分包');
-assert.equal(topupPayload.creditsAdded, 40000);
+assert.equal(topupPayload.creditsAdded, BASIC_TOPUP_CREDITS);
 assert.equal(topupPayload.periodEnd, null);
 
 const subscriptionPayload = toBillingOrderPayload(orderRow(subOrder), uid);
@@ -139,13 +142,13 @@ assert.equal(subscriptionPayload.periodEnd, bal.periodEnd);
 chargeCredits({ userId: uid, amount: 1000, kind: 'video', reason: 'test charge' });
 bal = getBalance(uid);
 assert.equal(bal.subscriptionCredits, 79000); // 先烧订阅桶
-assert.equal(bal.topupCredits, 40000); // 永久积分纹丝不动
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS); // 永久积分纹丝不动
 grantCredits({ userId: uid, amount: 100, kind: 'gift', bucket: 'bonus', reason: 'test bonus' });
 chargeCredits({ userId: uid, amount: 79050, kind: 'video', reason: 'test charge 2' });
 bal = getBalance(uid);
 assert.equal(bal.subscriptionCredits, 0); // 订阅桶烧光
 assert.equal(bal.bonusCredits, 50); // 再烧 bonus 50
-assert.equal(bal.topupCredits, 40000); // topup 仍未动
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS); // topup 仍未动
 
 // —— 惰性月度续费：period_end 过期 + 未取消 → 重置 80000 + 顺延 ——
 db.prepare(`UPDATE user_credits SET period_end = ? WHERE user_id = ?`)
@@ -164,8 +167,17 @@ assert.equal(settleExpiredSubscription(uid), true);
 bal = getBalance(uid);
 assert.equal(bal.planCode, 'free');
 assert.equal(bal.subscriptionCredits, 0);
-assert.equal(bal.topupCredits, 40000); // 永久积分降级不回收
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS); // 永久积分降级不回收
 assert.equal(bal.bonusCredits, 50);
+
+// —— 同一用户同一积分包可重复购买：新订单累加到账 ——
+const secondTopupOrder = insertOrder('topup', pack.code, pack.credits);
+const r3 = fulfillPaidOrder({ userId: uid, orderId: secondTopupOrder, via: '模拟支付' });
+assert.equal(r3.alreadyApplied, false);
+assert.equal(r3.creditsAdded, BASIC_TOPUP_CREDITS);
+bal = getBalance(uid);
+assert.equal(bal.topupCredits, BASIC_TOPUP_CREDITS * 2);
+assert.equal((db.prepare('SELECT status FROM billing_orders WHERE id = ?').get(secondTopupOrder) as any).status, 'applied');
 
 // —— 开关关掉：到期也不续 ——
 activatePlanSubscription(uid, 'pro');
