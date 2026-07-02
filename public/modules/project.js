@@ -679,6 +679,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    * 选项：
    *   - `debounce: true` → 延迟 1500ms 合并后续编辑再真正 PUT（saveProject 路径）
    *   - `silent: true`   → 409 stale_version 时不弹 toast（后台静默同步用）
+   *   - `onStaleReload` → 409 reload 后由调用方把必须保留的本地 delta 重放回内存
    *
    * 后端 app/api/projects/[id]/route.ts + lib/projects-db.ts::updateProjectForUser
    * 看到客户端 `If-Match: "v<version>"` 落后服务器时返回
@@ -697,7 +698,7 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
       return new Promise(function (resolve) {
         _serverSaveTimer = setTimeout(function () {
           _serverSaveTimer = null;
-          _serverSave({ silent: opts.silent }).then(resolve);
+          _serverSave(Object.assign({}, opts, { debounce: false })).then(resolve);
         }, 1500);
       });
     }
@@ -731,10 +732,31 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
           if (proj && proj.id) {
             try { await _loadProjectFromServer(proj.id); } catch (_) {}
           }
+          var replayed = false;
+          if (typeof opts.onStaleReload === "function") {
+            try {
+              await opts.onStaleReload({
+                serverVersion: j.serverVersion,
+                clientVersion: j.clientVersion,
+              });
+              replayed = true;
+            } catch (e) {
+              console.warn("[ServerSave] stale replay failed:", e);
+              return { ok: false, stale: true, replayError: e, serverVersion: j.serverVersion };
+            }
+          }
+          var retryLimit = Number.isFinite(opts.staleRetryLimit) ? Math.max(0, Math.floor(opts.staleRetryLimit)) : 0;
+          var retryCount = Number.isFinite(opts._staleRetryCount) ? Math.max(0, Math.floor(opts._staleRetryCount)) : 0;
+          if (retryCount < retryLimit) {
+            return _serverSave(Object.assign({}, opts, {
+              debounce: false,
+              _staleRetryCount: retryCount + 1,
+            }));
+          }
           if (!opts.silent) {
             showToast("已同步到服务器最新版本", "info");
           }
-          return { ok: false, stale: true, serverVersion: j.serverVersion };
+          return { ok: false, stale: true, replayed: replayed, serverVersion: j.serverVersion };
         });
       }
       if (!resp.ok) {
@@ -768,12 +790,12 @@ function _updateLegacyStoryboardArchiveEntry(proj) {
    *
    * 返回 Promise，多数 caller 用 fire-and-forget；切项目路径必须 await。
    */
-  function _flushServerSave() {
+  function _flushServerSave(opts) {
     if (_serverSaveTimer) {
       clearTimeout(_serverSaveTimer);
       _serverSaveTimer = null;
     }
-    return _serverSave();
+    return _serverSave(opts || {});
   }
 
   function flushPendingProjectSaveOnUnload() {

@@ -196,7 +196,7 @@ const boardState = await import(dataModuleUrl(stateSrc));
     vm.segments[0].shotRows.every((row) => row.readOnlyReason === 'missing_shot_uid'),
     'rows without canonical shotUid are read-only',
   );
-  assert.equal(vm.segments[0].video.selectedTaskId, 'vt0', 'video selectedTaskId comes from project videoTasks current authority');
+  assert.equal(vm.segments[0].video.selectedTaskId, 'vt0', 'video selectedTaskId falls back to project videoTasks when storyboard has no current pointer');
   assert.equal(vm.segments[0].video.candidates.length, 2, 'video history rows are projected as flat candidates');
   assert.deepEqual(
     {
@@ -226,6 +226,30 @@ const boardState = await import(dataModuleUrl(stateSrc));
   );
   assert.ok(vm.nodes.find((node) => node.id === 'reference'), 'reference node exists');
   assert.ok(vm.nodes.find((node) => node.id === 'video:0'), 'video node exists');
+}
+
+{
+  const project = {
+    shots: [{ shotUid: 's1' }],
+    storyboards: [
+      { shotIndices: [0], videoTaskId: 'sb-current' },
+    ],
+    videoTasks: [
+      { taskId: 'vt-stale', status: 'completed', filename: 'stale.mp4' },
+    ],
+  };
+  const vm = boardState.buildBoardViewModel(project, {
+    groups: [{ gIdx: 0, shotIndices: [0] }],
+    videoHistoriesByGroup: {
+      0: [
+        { task_id: 'sb-current', cover_url: '/api/images/file/current', url: '/api/videos/file/current' },
+        { task_id: 'vt-stale', cover_url: '/api/images/file/stale', url: '/api/videos/file/stale' },
+      ],
+    },
+  });
+  assert.equal(vm.segments[0].video.selectedTaskId, 'sb-current', 'storyboard videoTaskId is the board current-video authority when it differs from videoTasks');
+  assert.equal(vm.segments[0].video.candidates[0].selected, true, 'candidate selection follows storyboard current-video authority');
+  assert.equal(vm.segments[0].video.candidates[1].selected, false, 'stale videoTasks taskId does not override storyboard current-video authority');
 }
 
 {

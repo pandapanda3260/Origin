@@ -79,12 +79,19 @@ assert.match(prebootFlag, /value === "1"[\s\S]*return true/, 'preboot originBoar
 assert.match(prebootFlag, /value === "0"[\s\S]*return false/, 'preboot originBoard=0 keeps local rollback');
 assert.match(prebootFlag, /host === "localhost"[\s\S]*host === "127\.0\.0\.1"[\s\S]*host === "::1"/, 'preboot enables board by default on local development hosts');
 
-assert.match(workspace, /if \(page === "images"\) page = "shots";\s*if \(page === "prompts" && boardEnabled\(\)\) page = "shots";/, 'preboot keeps images->shots unconditional and gates prompts->shots');
+assert.match(workspace, /if \(page === "images"\) page = "shots";\s*if \(page === "batch"\) page = "prompts";\s*if \(page === "prompts" && boardEnabled\(\)\) page = "shots";/, 'preboot keeps images->shots unconditional, maps retired batch to prompts, and gates prompts->shots');
 assert.match(workspace, /data-board-boot/, 'workspace preboot marks board boot');
 assert.match(workspace, /id="boardRoot" hidden/, 'workspace contains hidden boardRoot');
-assert.match(workspace, /main\.js\?v=372/, 'workspace bumps main.js after runtime flag change');
-assert.match(workspace, /styles\.css\?v=263/, 'workspace bumps styles.css after board route chrome change');
+assert.match(workspace, /main\.js\?v=374/, 'workspace bumps main.js after runtime flag change');
+assert.match(workspace, /styles\.css\?v=268/, 'workspace bumps styles.css after board route chrome change');
+assert.match(workspace, /id="announceToggle"[\s\S]*aria-label="暂停顶部提示"[\s\S]*aria-pressed="false"/, 'announcement banner exposes a pause control');
+assert.match(workspace, /id="announceDismiss"[\s\S]*aria-label="隐藏顶部提示"/, 'announcement banner exposes a hide control');
+assert.match(workspace, /#announceBanner:hover #announceTrack,[\s\S]*#announceBanner:focus-within #announceTrack,[\s\S]*#announceTrack\.is-paused\s*\{animation-play-state:paused\}/, 'announcement banner can pause scrolling');
+assert.match(workspace, /@media \(prefers-reduced-motion: reduce\)\{[\s\S]*#announceTrack\{animation:none!important;transform:none!important\}/, 'announcement banner honors reduced motion');
+assert.match(workspace, /matchMedia\('\(prefers-reduced-motion: reduce\)'\)/, 'announcement banner initializes pause state from reduced motion preference');
+assert.match(workspace, /banner\.hidden = true;/, 'announcement banner hide control removes the moving content');
 assert.match(styles, /body\.is-online-editor-page #sidebar,\s*body\.is-online-editor-page #announceBanner,\s*body\.is-online-editor-page #maintenanceBanner\s*\{\s*display:\s*none !important;\s*\}/, 'online editor keeps sidebar and banners hidden');
+assert.match(styles, /body\.spd-open #announceBanner\s*\{\s*display:\s*none !important;\s*\}/, 'shot plan dialog hides announcement banner above the modal');
 assert.doesNotMatch(styles, /is-online-editor-page[^{}]*\.agent-fab/, 'online editor route must not hide agent fab in CSS');
 assert.doesNotMatch(styles, /is-online-editor-page[^{}]*\.agent-panel/, 'online editor route must not hide agent panel in CSS');
 assert.doesNotMatch(styles, /is-board-workbench-page[^{}]*\.agent-fab/, 'board route must not hide agent fab in CSS');

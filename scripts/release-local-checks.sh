@@ -67,6 +67,7 @@ run_isolated npm run check:admin-governance
 run_isolated npm run test:image-provider-routing
 run_isolated npm run test:image-svg-fallback
 run_isolated npm run test:frame-workflow-state
+run_isolated npm run test:frame-workflow-merge
 run_isolated npm run test:shot-structure-lock
 run_isolated npm run test:group-slot-write-guard
 run_isolated npm run test:segment-planning
@@ -82,10 +83,13 @@ run_isolated npm run test:responses-input-role-mapping
 run_isolated npm run test:project-dependency-state
 run_isolated npm run test:video-payload-decision
 run_isolated npm run test:video-reference-manifest
+run_isolated npm run test:video-keyframes
+run_isolated npm run test:video-multi-keyframe-builder
 run_isolated npm run test:video-prompt-lifecycle
 run_isolated npm run test:video-prompt-dialogue-regression
 run_isolated npm run test:visual-reference-state
 run_isolated npm run test:style-bible-runs
+run_isolated npm run check:video-capabilities
 run_isolated npm run test:provider-recovery
 run_isolated npm run test:online-editor-expiry
 run_isolated npm run test:production-secret-safety

@@ -37,6 +37,7 @@ import type { TargetEndStrategy } from './video-provider-capabilities';
 import { resolveVideoModelCapability } from './video-provider-capabilities';
 import { hashString, resolveGenerationDurationSec } from './video-reference-manifest';
 import type { DialoguePolicy } from './video-reference-manifest';
+import type { VideoKeyframeReference } from './video-keyframes';
 import {
   buildTailRushedWarning,
   shouldMarkTailRushedAfterProbe,
@@ -167,6 +168,18 @@ export type VideoGenInput = {
     firstFramePath: string;
     lastFramePath: string;
     /** 透传到 audit.modeReason，典型值：tail_ready */
+    modeReason?: string;
+  };
+  /**
+   * Builder C: ordered per-shot keyframes plus asset references.
+   * Enabled only after upstream capability/schema checks select payloadMode
+   * multi_keyframe_multi_ref.
+   */
+  multiKeyframeMode?: {
+    keyframes: VideoKeyframeReference[];
+    references: VideoReferenceImage[];
+    referenceBudget: number;
+    maxImages: number;
     modeReason?: string;
   };
   assetLibrary?: {
@@ -514,7 +527,8 @@ export type VideoGenCompletedResult = {
      *     no reference_image permitted by provider's mutual exclusion rule)
      *   - first_frame_multi_ref: Builder B (legacy multi-reference path)
      */
-    payloadMode?: 'first_last_frame' | 'first_frame_multi_ref';
+    payloadMode?: 'first_last_frame' | 'first_frame_multi_ref' | 'multi_keyframe_multi_ref';
+    multiKeyframeAdapterVersion?: string;
     /** Why the above mode was chosen, e.g. tail_ready, tail_unresolvable_degraded, no_tail_intent. */
     modeReason?: string;
     /** From VideoModelCapability.verifiedAt at the time of the request. */
@@ -1048,6 +1062,273 @@ export async function generateVideo(
 	      });
     }
   } else if (isVolcano) {
+    if (input.multiKeyframeMode) {
+      try {
+        onProgress?.(5, '提交火山 Seedance 多关键帧任务…');
+        const capability = resolveVideoModelCapability(cfg.model);
+        const keyframes = input.multiKeyframeMode.keyframes.slice(0, input.multiKeyframeMode.maxImages);
+        const remainingSlots = Math.max(0, input.multiKeyframeMode.maxImages - keyframes.length);
+        const references = (input.multiKeyframeMode.references || [])
+          .filter((ref) => ref?.path && !keyframes.some((keyframe) => keyframe.path === ref.path))
+          .slice(0, Math.min(input.multiKeyframeMode.referenceBudget, remainingSlots));
+        const keyframeLines = keyframes.map((keyframe, idx) =>
+          `Image ${idx + 1}: keyframe | shotUid=${keyframe.shotUid} | at=${keyframe.atSecHint}s | 必须按时间顺序自然经过该镜头关键帧。`
+        );
+        const referenceLines = references.map((ref, idx) => {
+          const imageNo = keyframes.length + idx + 1;
+          const name = ref.assetName || ref.label || ref.role;
+          return `Image ${imageNo}: reference_image | ${ref.role} | ${name} | ${ref.promptHint || ref.referenceBrief || '作为资产一致性参考。'}`;
+        });
+        const basePrompt = buildSeedancePromptParts({
+          ...input,
+          referenceImages: [],
+          ratio: aspectRatio,
+          durationSec: dur,
+          shotPlan: input.shotPlan,
+          tailReserveSec: input.tempoBudget?.endingReserveSec,
+        }).finalPrompt;
+        const finalPrompt = [
+          basePrompt,
+          '多关键帧时序约束：下列 keyframe 图片是片段内各镜头的时间锚点，视频必须按 Image 编号顺序自然连续经过，不得跳切、不得把参考图当作新镜头。',
+          ...keyframeLines,
+          ...(referenceLines.length ? ['资产参考图：', ...referenceLines] : []),
+        ].join('\n');
+
+        const body = await buildSeedanceMultiKeyframeBody({
+          model: cfg.model || 'doubao-seedance-2-0-260128',
+          prompt: finalPrompt,
+          keyframes,
+          references,
+          ratio: aspectRatio,
+          durationSec: dur,
+          resolution: seedanceResolution,
+          watermark: false,
+          generateAudio,
+          referenceBudget: input.multiKeyframeMode.referenceBudget,
+          maxImages: input.multiKeyframeMode.maxImages,
+        });
+        const submitted = body.__submittedImages;
+        delete body.__submittedImages;
+        const bodyJson = stringifySeedanceRequestBody(body);
+
+        videoAudit = {
+          provider: 'seedance',
+          model: cfg.model,
+          finalPromptPreview: finalPrompt.slice(0, 500),
+          finalPromptHash: hashString(finalPrompt),
+          finalPromptLength: finalPrompt.length,
+          dialoguePolicy: 'budget_check_only',
+          payloadMode: 'multi_keyframe_multi_ref',
+          modeReason: input.multiKeyframeMode.modeReason || 'multi_keyframe_ready',
+          capabilityVerifiedAt: capability.verifiedAt,
+          multiKeyframeAdapterVersion: submitted?.adapterVersion,
+          referenceImages: [
+            ...(submitted?.keyframes || []).map(({ ref, image }: { ref: VideoKeyframeReference; image: VideoSubmitImageDataUrl }, idx: number) => ({
+              role: 'keyframe' as const,
+              path: ref.path,
+              label: `shot ${ref.orderIndex + 1} keyframe`,
+              sourceUrl: ref.url,
+              assetId: ref.shotUid,
+              assetName: ref.shotUid,
+              promptHint: `Keyframe at about ${ref.atSecHint}s`,
+              apiRole: 'keyframe',
+              apiContentIndex: idx + 1,
+              imageContentHash: hashFile(ref.path),
+              originalBytes: image.originalBytes,
+              submittedBytes: image.submittedBytes,
+              submittedWidth: image.width,
+              submittedHeight: image.height,
+              submittedMime: image.mime,
+              warnings: image.warnings,
+            })),
+            ...(submitted?.references || []).map(({ ref, image }: { ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }, idx: number) => ({
+              role: ref.role,
+              viewRole: ref.viewRole,
+              path: ref.path,
+              label: ref.label,
+              sourceUrl: ref.sourceUrl,
+              assetId: ref.assetId,
+              assetName: ref.assetName,
+              promptHint: ref.promptHint,
+              useFor: ref.useFor,
+              immutable: ref.immutable,
+              panelInfo: ref.panelInfo,
+              referenceBrief: ref.referenceBrief,
+              apiRole: 'reference_image',
+              apiContentIndex: keyframes.length + idx + 1,
+              imageContentHash: hashFile(ref.path),
+              originalBytes: image.originalBytes,
+              submittedBytes: image.submittedBytes,
+              submittedWidth: image.width,
+              submittedHeight: image.height,
+              submittedMime: image.mime,
+              warnings: image.warnings,
+            })),
+          ],
+          fallbackReason: submitted?.droppedReferenceCount
+            ? `multi_keyframe_reference_budget_dropped_${submitted.droppedReferenceCount}`
+            : undefined,
+        };
+
+        const submit: any = await withVideoSubmitSlot('[seedance multi-keyframe submit]', () => retryFetch(
+          `${cfg.baseUrl}/contents/generations/tasks`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.apiKey}` },
+            body: bodyJson,
+          },
+          '[seedance multi-keyframe submit]',
+        ));
+        const remoteId = submit.id;
+        if (!remoteId) throw new Error('Seedance API 返回缺 id');
+        console.log(`[video-gen][seedance][multi-keyframe] task created id=${remoteId}`);
+        db.prepare(`UPDATE video_tasks SET provider_task=? WHERE id=? AND status IN ('queued','running')`).run(remoteId, taskId);
+        input.onProviderTaskCreated?.({
+          provider: 'volcengine_seedance_video',
+          providerTaskId: remoteId,
+          localVideoTaskId: taskId,
+          idempotencyKey: input.idempotencyKey,
+          deferProviderPolling: input.deferProviderPolling,
+        });
+        if (videoAudit) videoAudit.providerTaskId = remoteId;
+        if (input.deferProviderPolling) {
+          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(15, taskId);
+          patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+          return {
+            taskId,
+            status: 'upstream_pending',
+            provider: 'volcengine_seedance_video',
+            providerTaskId: remoteId,
+            filename: videoNames.filename,
+            displayName: videoNames.displayName,
+            downloadFilename: videoNames.downloadFilename,
+            durationSec: dur,
+            mode: 'real',
+            videoAudit,
+          };
+        }
+
+        const deadline = Date.now() + 15 * 60 * 1000;
+        let status = (submit.status || '').toLowerCase();
+        let videoUrl = '';
+        let pollCount = 0;
+        let lastErrorPayload = '';
+        while (!['succeeded', 'failed', 'cancelled'].includes(status)) {
+          if (Date.now() > deadline) {
+            throw new Error('Seedance 排队过久（>15 分钟未返回），请稍后重试此片段');
+          }
+          await sleep(6000);
+          pollCount += 1;
+          const j: any = await retryFetch(
+            `${cfg.baseUrl}/contents/generations/tasks/${remoteId}`,
+            { headers: { Authorization: `Bearer ${cfg.apiKey}` } },
+            `[seedance multi-keyframe poll #${pollCount}]`,
+          );
+          status = (j.status || '').toLowerCase();
+          videoUrl = j?.content?.video_url || videoUrl;
+          if (status === 'failed' || status === 'cancelled') {
+            lastErrorPayload =
+              j?.error?.message ||
+              j?.error?.code ||
+              j?.fail_reason ||
+              JSON.stringify(j?.error || {}).slice(0, 300);
+          }
+          const stageHint = status === 'queued' ? 20 : (status === 'running' || status === 'in_progress') ? Math.min(70, 30 + pollCount * 3) : 85;
+          onProgress?.(stageHint, `Seedance 多关键帧状态：${status}`);
+          db.prepare(`UPDATE video_tasks SET progress=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND status IN ('queued','running')`).run(stageHint, taskId);
+        }
+        if (status !== 'succeeded') throw new Error(lastErrorPayload || `任务结束状态: ${status}`);
+        if (!videoUrl) throw new Error('Seedance 完成但没返回 video_url');
+        console.log(`[video-gen][seedance][multi-keyframe] succeeded after ${pollCount} polls`);
+
+        onProgress?.(90, '下载视频…');
+        const buf = await retryDownload(videoUrl);
+        writeFileSync(fullPath, buf);
+
+        let coverImageId: string | null = null;
+        let coverUrl: string | null = null;
+        try {
+          const coverPath = join(ownerDir, `${taskId}.cover.png`);
+          await extractCover({ videoPath: fullPath, outputPath: coverPath });
+          coverImageId = randomUUID();
+          const stat = statSync(coverPath);
+          db.prepare(
+            `INSERT INTO images (id, owner_id, project_id, kind, asset_ref, filename, mime, size_bytes, width, height, prompt, style)
+             VALUES (?, ?, ?, 'other', ?, ?, 'image/png', ?, 1080, 1920, ?, 'video-cover')`,
+          ).run(
+            coverImageId,
+            user.id,
+            input.projectId || null,
+            `video-cover/${taskId}`,
+            `${taskId}.cover.png`,
+            stat.size,
+            (input.prompt || '').slice(0, 200),
+          );
+          coverUrl = `/api/images/file/${coverImageId}`;
+          db.prepare(`UPDATE video_tasks SET cover_image_id=? WHERE id=? AND status IN ('queued','running')`).run(coverImageId, taskId);
+        } catch (e: any) {
+          console.warn('[video-gen][seedance][multi-keyframe] extract cover failed:', e?.message);
+        }
+
+        const tempoProbe = await probeVideoTempoBudget(fullPath, input.tempoBudget);
+        const finalDurationSec = tempoProbe.realDurationSec || dur;
+        patchVideoPromptSnapshotFinalPromptHash(db, taskId, videoAudit?.finalPromptHash);
+        const completeInfo = markVideoCompletedAndSettle({
+          user,
+          taskId,
+          durationSec: finalDurationSec,
+          cfg,
+          input,
+          filename,
+          coverImageId,
+        });
+        if (!completeInfo.completed) {
+          console.warn('[video-gen] completion ignored because task is no longer active:', taskId);
+          return { taskId, status: 'failed', url: '', protectedUrl: '', coverUrl, durationSec: dur, mode, videoAudit };
+        }
+
+        onProgress?.(100, '完成');
+        const protectedUrl = `/api/videos/file/${taskId}`;
+        recordCompletedVideoAsset({
+          user,
+          input,
+          taskId,
+          filename,
+          fullPath,
+          coverUrl,
+          durationSec: finalDurationSec,
+        });
+        return {
+          taskId,
+          status: 'completed',
+          url: buildSignedVideoUrl(taskId, user.id).url,
+          protectedUrl,
+          filename: videoNames.filename,
+          displayName: videoNames.displayName,
+          downloadFilename: videoNames.downloadFilename,
+          coverUrl,
+          durationSec: finalDurationSec,
+          realDurationSec: tempoProbe.realDurationSec,
+          mode,
+          videoWarnings: tempoProbe.videoWarnings,
+          videoAudit,
+        };
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        console.warn('[video-gen][seedance][multi-keyframe] failed:', msg.slice(0, 300));
+        try { require('node:fs').unlinkSync(fullPath); } catch (_) {}
+        db.prepare(
+          `UPDATE video_tasks SET status='failed', error_msg=?,
+             updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?`,
+        ).run(msg.slice(0, 1000), taskId);
+        throw new VideoGenerationError(msg.slice(0, 400), {
+          taskId,
+          videoAudit,
+          failureStage: classifyVideoFailureStage(e),
+          cause: e,
+        });
+      }
+    }
     // ===============================================================
     // Builder A — first+last frame mode (mutually exclusive with
     // Builder B's multi-reference mode, per Seedance's official rule).
@@ -2164,6 +2445,95 @@ export async function buildSeedanceFirstLastFrameBody(opts: {
     __submittedImages: {
       first: firstImage,
       last: lastImage,
+    },
+  };
+}
+
+/**
+ * Seedance 2.5 multi-keyframe adapter.
+ *
+ * This shape is intentionally isolated while schemaVerificationStatus remains
+ * unverified. Before enabling C-mode for 2.5, run the live schema probe and
+ * update the field names in this function first.
+ */
+export async function buildSeedanceMultiKeyframeBody(opts: {
+  model: string;
+  prompt: string;
+  keyframes: VideoKeyframeReference[];
+  references?: VideoReferenceImage[];
+  ratio: string;
+  durationSec: number;
+  resolution?: string;
+  watermark?: boolean;
+  generateAudio?: boolean;
+  referenceBudget: number;
+  maxImages: number;
+}): Promise<any> {
+  const {
+    model,
+    prompt,
+    keyframes,
+    references = [],
+    ratio,
+    durationSec,
+    resolution = '720p',
+    watermark = false,
+    generateAudio = true,
+  } = opts;
+  const maxImages = Math.max(1, Math.floor(Number(opts.maxImages || 1)));
+  const referenceBudget = Math.max(0, Math.floor(Number(opts.referenceBudget || 0)));
+  const selectedKeyframes = keyframes.slice(0, maxImages);
+  const remainingSlots = Math.max(0, maxImages - selectedKeyframes.length);
+  const selectedReferences = references
+    .filter((ref) => ref?.path && !selectedKeyframes.some((keyframe) => keyframe.path === ref.path))
+    .slice(0, Math.min(referenceBudget, remainingSlots));
+
+  const content: any[] = [{ type: 'text', text: prompt }];
+  const submittedKeyframes: Array<{ ref: VideoKeyframeReference; image: VideoSubmitImageDataUrl }> = [];
+  const submittedReferences: Array<{ ref: VideoReferenceImage; image: VideoSubmitImageDataUrl }> = [];
+
+  for (const keyframe of selectedKeyframes) {
+    const image = await buildVideoSubmitImageDataUrl(keyframe.path, {
+      lowBytesPerPixelMessage: lowQualitySubmitImageMessage('keyframe'),
+    });
+    submittedKeyframes.push({ ref: keyframe, image });
+    content.push({
+      type: 'image_url',
+      image_url: { url: image.dataUrl },
+      role: 'keyframe',
+      at_sec: keyframe.atSecHint,
+      shot_uid: keyframe.shotUid,
+      order_index: keyframe.orderIndex,
+    });
+  }
+
+  for (const ref of selectedReferences) {
+    const image = await buildVideoSubmitImageDataUrl(ref.path, {
+      lowBytesPerPixelMessage: lowQualitySubmitImageMessage(ref.role),
+    });
+    submittedReferences.push({ ref, image });
+    content.push({
+      type: 'image_url',
+      image_url: { url: image.dataUrl },
+      role: 'reference_image',
+    });
+  }
+
+  return {
+    model,
+    content,
+    ratio,
+    duration: durationSec,
+    resolution,
+    watermark,
+    generate_audio: generateAudio,
+    __submittedImages: {
+      keyframes: submittedKeyframes,
+      references: submittedReferences,
+      droppedReferenceCount: Math.max(0, references.length - selectedReferences.length),
+      maxImages,
+      referenceBudget,
+      adapterVersion: 'seedance_multi_keyframe_v1_unverified',
     },
   };
 }

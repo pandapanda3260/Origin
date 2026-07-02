@@ -46,13 +46,14 @@ export function resolveTargetEndStrategy(videoCfg: {
 // or regexes; look up the capability here or fall back to the conservative
 // default (everything unsupported / unverified).
 //
-// verifiedBy / verifiedAt are maintained manually. When you extend this table
-// for a new model, either paste a runtime-verified curl signature or cite the
-// official doc revision you read.
+// verifiedBy / verifiedAt are maintained manually and describe coarse provider
+// capability source. Multi-keyframe request schema readiness is tracked
+// separately by schemaVerificationStatus.
 // ============================================================================
 export type VideoModelCapability = {
   firstLastFrameMode: 'supported' | 'unsupported';
   multiReferenceMode: 'supported' | 'unsupported';
+  supportsMultiKeyframe: boolean;
   /**
    * When true, a single request body cannot mix first_last_frame inputs with
    * reference_image inputs. Callers must branch payload construction instead
@@ -60,17 +61,38 @@ export type VideoModelCapability = {
    */
   modesAreMutuallyExclusive: boolean;
   supportsReturnLastFrame: boolean;
+  /** Provider hard limit for a single video generation duration. */
+  maxSingleGenSec: number;
+  /** Auto-segmentation lower target used when creating shot-plan storyboard slots. */
+  segmentTargetMinSec: number;
+  /** Auto-segmentation upper target used when creating shot-plan storyboard slots. */
+  segmentTargetMaxSec: number;
+  /** Matcher-side reference image budget; in Builder B this includes the storyboard first frame. */
+  referenceBudget: number;
+  /** Provider hard limit for all submitted images in one request. */
+  maxImages: number;
   bodyShape: 'openai_content_array';
-  verifiedBy: 'runtime_verified' | 'official_doc';
+  multiKeyframeBodyShape: 'unsupported' | 'seedance_content_keyframes_adapter';
+  schemaVerificationStatus: 'not_applicable' | 'unverified' | 'runtime_verified' | 'official_doc';
+  verifiedTaskId?: string;
+  verifiedBy: 'runtime_verified' | 'official_doc' | 'public_capability_claim';
   verifiedAt: string;
 };
 
 const CAPABILITY_DEFAULT: VideoModelCapability = {
   firstLastFrameMode: 'unsupported',
   multiReferenceMode: 'unsupported',
+  supportsMultiKeyframe: false,
   modesAreMutuallyExclusive: true,
   supportsReturnLastFrame: false,
+  maxSingleGenSec: 15,
+  segmentTargetMinSec: 4,
+  segmentTargetMaxSec: 15,
+  referenceBudget: 9,
+  maxImages: 9,
   bodyShape: 'openai_content_array',
+  multiKeyframeBodyShape: 'unsupported',
+  schemaVerificationStatus: 'not_applicable',
   verifiedBy: 'official_doc',
   verifiedAt: '',
 };
@@ -81,9 +103,17 @@ const CAPABILITIES: Record<string, VideoModelCapability> = {
   sora: {
     firstLastFrameMode: 'unsupported',
     multiReferenceMode: 'unsupported',
+    supportsMultiKeyframe: false,
     modesAreMutuallyExclusive: true,
     supportsReturnLastFrame: false,
+    maxSingleGenSec: 15,
+    segmentTargetMinSec: 4,
+    segmentTargetMaxSec: 15,
+    referenceBudget: 9,
+    maxImages: 9,
     bodyShape: 'openai_content_array',
+    multiKeyframeBodyShape: 'unsupported',
+    schemaVerificationStatus: 'not_applicable',
     verifiedBy: 'official_doc',
     verifiedAt: '2026-05-19',
   },
@@ -96,19 +126,58 @@ const CAPABILITIES: Record<string, VideoModelCapability> = {
   'doubao-seedance-2-0-260128': {
     firstLastFrameMode: 'supported',
     multiReferenceMode: 'supported',
+    supportsMultiKeyframe: false,
     modesAreMutuallyExclusive: true,
     supportsReturnLastFrame: true,
+    maxSingleGenSec: 15,
+    segmentTargetMinSec: 4,
+    segmentTargetMaxSec: 15,
+    referenceBudget: 9,
+    maxImages: 9,
     bodyShape: 'openai_content_array',
+    multiKeyframeBodyShape: 'unsupported',
+    schemaVerificationStatus: 'not_applicable',
     verifiedBy: 'runtime_verified',
     verifiedAt: '2026-05-09',
+  },
+  // Seedance 2.5 provisional model id. Replace this temporary id with the
+  // official ModelArk id once published. Public capability claims cover longer
+  // generations and larger multimodal image budgets, but the exact keyframe
+  // request schema is not yet runtime-verified in this repo. Keep
+  // schemaVerificationStatus='unverified' so callers can derive segment/budget
+  // limits while routing C only after the one-order schema probe flips it.
+  'doubao-seedance-2-5': {
+    firstLastFrameMode: 'supported',
+    multiReferenceMode: 'supported',
+    supportsMultiKeyframe: true,
+    modesAreMutuallyExclusive: false,
+    supportsReturnLastFrame: true,
+    maxSingleGenSec: 30,
+    segmentTargetMinSec: 20,
+    segmentTargetMaxSec: 25,
+    referenceBudget: 50,
+    maxImages: 50,
+    bodyShape: 'openai_content_array',
+    multiKeyframeBodyShape: 'seedance_content_keyframes_adapter',
+    schemaVerificationStatus: 'unverified',
+    verifiedBy: 'public_capability_claim',
+    verifiedAt: '2026-06-30',
   },
   // Seedance 2.0 fast — official doc lists the same schema; not yet live-verified.
   'doubao-seedance-2-0-fast-260128': {
     firstLastFrameMode: 'supported',
     multiReferenceMode: 'supported',
+    supportsMultiKeyframe: false,
     modesAreMutuallyExclusive: true,
     supportsReturnLastFrame: true,
+    maxSingleGenSec: 15,
+    segmentTargetMinSec: 4,
+    segmentTargetMaxSec: 15,
+    referenceBudget: 9,
+    maxImages: 9,
     bodyShape: 'openai_content_array',
+    multiKeyframeBodyShape: 'unsupported',
+    schemaVerificationStatus: 'not_applicable',
     verifiedBy: 'official_doc',
     verifiedAt: '2026-05-09',
   },
@@ -116,9 +185,17 @@ const CAPABILITIES: Record<string, VideoModelCapability> = {
   'doubao-seedance-1-5-pro-251215': {
     firstLastFrameMode: 'supported',
     multiReferenceMode: 'supported',
+    supportsMultiKeyframe: false,
     modesAreMutuallyExclusive: true,
     supportsReturnLastFrame: true,
+    maxSingleGenSec: 15,
+    segmentTargetMinSec: 4,
+    segmentTargetMaxSec: 15,
+    referenceBudget: 9,
+    maxImages: 9,
     bodyShape: 'openai_content_array',
+    multiKeyframeBodyShape: 'unsupported',
+    schemaVerificationStatus: 'not_applicable',
     verifiedBy: 'official_doc',
     verifiedAt: '2026-05-09',
   },
@@ -133,6 +210,12 @@ export function resolveVideoModelCapability(modelId: string | undefined | null):
   const id = String(modelId || '').trim();
   if (!id) return CAPABILITY_DEFAULT;
   return CAPABILITIES[id] || CAPABILITY_DEFAULT;
+}
+
+export function isVideoMultiKeyframeSchemaVerified(capability: VideoModelCapability): boolean {
+  if (!capability.supportsMultiKeyframe) return false;
+  return capability.schemaVerificationStatus === 'runtime_verified' ||
+    capability.schemaVerificationStatus === 'official_doc';
 }
 
 /**

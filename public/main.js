@@ -23,11 +23,11 @@ import { initEpisodes, syncEpisodesProject,
   _getCurrentEpisodeTitle, _getPreviousEpisodeAssets,
   _renderEpisodeTabs, _openNewEpisodeDialog } from '/modules/episodes.js';
 import { initVideoTasks, syncVideoTasksProject, _restoreVideoTasks, reconcileVideoTasksOnWake,
-  refreshBatchPage, startBatchGeneration, generateAllVideos, generateVideoForGroup,
+  refreshBatchPage, generateAllVideos, generateVideoForGroup,
   getVideoGenerateReadiness, getVideoResultState, subscribeVideoResultChanges, openVideoHistoryForGroup,
   downloadVideoForGroup, deleteVideoForGroup, importVideoForGroup,
   _initBatchPlayerEvents, handleVideoTaskAction,
-  syncTaskListVisibility, updateBadge, createWorkflowVideoTask, importAllGeneratedSegments,
+  syncTaskListVisibility, updateBadge, createWorkflowVideoTask,
   confirmSegmentsAndEnterEdit } from '/modules/videoTasks.js';
 import { initVideoPrompts, syncVideoPromptsProject, vpFetchAndCache, vpGetCache,
   refreshPromptsPage, renderVideoPromptList, renderVideoResultCard, updateVpCard, checkVideoPromptsConfirm,
@@ -158,10 +158,10 @@ var _scriptEditInitialText = "";
   };
   // 注意：billing 不再是独立 page，而是顶层 modal（#billingModal），所以不放进 PAGES。
   // 顶部任务列表卡片走 data-goto="overview"，会员升级按钮走 switchPage("billing")。
-  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
+  var PAGES = ["overview", "script", "style", "assets", "shots", "images", "prompts", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
   // 下线但暂不删除的工作台旧页面。保留 DOM/模块，统一阻止导航、hash 直达和历史恢复。
   var DISABLED_WORKSPACE_PAGES = ["profile", "settings"];
-  var SIDEBAR_PIPELINE_PAGES = ["script", "style", "assets", "shots", "prompts", "batch", "edit"];
+  var SIDEBAR_PIPELINE_PAGES = ["script", "style", "assets", "shots", "prompts", "edit"];
   var settings = {
     models: {
       text:       { key: "", base: "", model: "" },
@@ -184,9 +184,9 @@ var _scriptEditInitialText = "";
   var _swLoad = { projectId: "", token: 0, status: "loading" };
   var _swActiveLoadFailed = false;
   var _swStartupToken = 0;
-  var _swLoadingUI = createSwLoading({ pages: ["assets", "shots", "prompts", "batch", "edit"] });
+  var _swLoadingUI = createSwLoading({ pages: ["assets", "shots", "prompts", "edit"] });
   function _isSwLoadCurrent(t) { return t === _swLoadToken; }
-  function _pageUsesInlineLoader(p) { return p === "assets" || p === "shots" || p === "prompts" || p === "batch" || p === "edit"; }
+  function _pageUsesInlineLoader(p) { return p === "assets" || p === "shots" || p === "prompts" || p === "edit"; }
   function _swActivationRetryOptions(options) {
     options = options || {};
     return {
@@ -263,6 +263,7 @@ var _scriptEditInitialText = "";
     page = String(page || "");
     if (page === "online-editor") page = "onlineEditor";
     if (page === "images") page = "shots";
+    if (page === "batch") page = "prompts";
     if (page === "prompts" && isBoardEnabled()) page = "shots";
     if (DISABLED_WORKSPACE_PAGES.indexOf(page) !== -1) return "";
     if (PAGES.indexOf(page) === -1) return "";
@@ -1975,7 +1976,6 @@ var _scriptEditInitialText = "";
         _refreshShotsSurface();
       }
       if (page === "prompts") refreshPromptsPage();
-      if (page === "batch") refreshBatchPage();
       if (page === "edit") refreshEditPage();
       if (page === "onlineEditor") {
         onOnlineEditorPageEnter();
@@ -2211,23 +2211,6 @@ var _scriptEditInitialText = "";
       }
     });
 
-    // Batch switch status labels
-    var batchAudio = $("batchAudio");
-    var batchWatermark = $("batchWatermark");
-    if (batchAudio) {
-      batchAudio.addEventListener("change", function () {
-        batchAudio.dataset.userTouched = "1";
-        var statusEl = document.querySelector(".batch-switch-status[data-for='batchAudio']");
-        if (statusEl) statusEl.textContent = batchAudio.checked ? "有音频" : "无音频";
-      });
-    }
-    if (batchWatermark) {
-      batchWatermark.addEventListener("change", function () {
-        batchWatermark.dataset.userTouched = "1";
-        var statusEl = document.querySelector(".batch-switch-status[data-for='batchWatermark']");
-        if (statusEl) statusEl.textContent = batchWatermark.checked ? "有水印" : "无水印";
-      });
-    }
   }
 
   /* ================================================================
@@ -8523,6 +8506,7 @@ var _scriptEditInitialText = "";
     initShotPlanDialog({
       getProject: () => project,
       saveProject: () => saveProject(),
+      flushServerSave: (opts) => _flushServerSave(opts),
       renderShotList: () => renderShotList(),
       refreshBoardPage: () => refreshBoardPage(),
       markDownstreamStale: (scope, detail) => _markDownstreamStale(scope, detail),
@@ -8965,12 +8949,6 @@ var _scriptEditInitialText = "";
       });
     }
 
-    /* Segment generation page */
-    _bindClick("btnStartBatch", confirmSegmentsAndEnterEdit);
-    var btnGenerateAllSegments = $("btnGenerateAllSegments");
-    if (btnGenerateAllSegments) btnGenerateAllSegments.addEventListener("click", startBatchGeneration);
-    var btnImportAllSegments = $("btnImportAllSegments");
-    if (btnImportAllSegments) btnImportAllSegments.addEventListener("click", importAllGeneratedSegments);
     _initBatchPlayerEvents();
 
     /* Library page */

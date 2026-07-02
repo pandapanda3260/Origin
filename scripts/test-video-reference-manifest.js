@@ -427,6 +427,15 @@ async function testDynamicPriorityChain() {
   );
 }
 
+async function testCapabilityBudgetCanExceedLegacyNine() {
+  const project = makeProject({ characterCount: 5, propCount: 4, includeScene: true });
+  const result = build(project, img('first-frame'), {}, { budget: 12 });
+  assertEqual(result.budget, 12, 'capability budget can exceed legacy 9');
+  assert(result.manifest.length > 9, 'budget 12 allows more than nine images');
+  assert(result.manifest.length <= 12, 'budget 12 remains the hard selection cap');
+  assertEqual(result.manifest[0].role, 'first_frame', 'first frame still occupies the first budget slot in B mode');
+}
+
 async function testSceneTopdownAnchorSurvivesSelection() {
   const project = makeProject({ characterCount: 5, propCount: 2, includeScene: true });
   project.assets.scenes[0] = {
@@ -997,6 +1006,7 @@ async function testVisibleBindingMergesSameCharacterPanels() {
 async function run() {
   const tests = [
     ['dynamic priority chain', testDynamicPriorityChain],
+    ['capability budget can exceed legacy nine', testCapabilityBudgetCanExceedLegacyNine],
     ['scene topdown anchor survives selection', testSceneTopdownAnchorSurvivesSelection],
     ['close-up entity boost', testCloseUpEntityBoost],
     ['close-up focus character sheet headshot pair', testCloseUpFocusCharacterGetsSheetHeadshotPair],

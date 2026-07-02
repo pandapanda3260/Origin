@@ -22,12 +22,13 @@ import {
   resolveVideoPayloadDecision,
   warnIfFirstLastConfigIgnored,
 } from '@/lib/video-payload-decision';
-import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
+import { isVideoMultiKeyframeSchemaVerified, resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { logVideoPromptTrace } from '@/lib/video-prompt-observability';
 import { markStoryboardVideoOutdated, markVideoTaskOutdated } from '@/lib/video-prompt-state';
 import { getVideoSubmitMode } from '@/lib/feature-flags';
 import { readExpectedShotBinding, writeGroupSlot } from '@/lib/group-slot-write-guard';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
+import { collectSelectedShotKeyframes } from '@/lib/video-keyframes';
 import {
   assertVideoCanStart,
   canDraftSatisfyVideoPromptBlock,
@@ -347,6 +348,7 @@ export function startVideoSegmentRun(args: {
   const videoCfg = resolveLLMConfig(args.user, 'video');
   const capability = resolveVideoModelCapability(videoCfg.model);
   const storyboards = Array.isArray((project as any)?.storyboards) ? (project as any).storyboards : [];
+  const shots = Array.isArray((project as any)?.shots) ? (project as any).shots : [];
   const adminAllowsFirstLast = isFirstLastFrameVideoModeEnabled();
   warnIfFirstLastConfigIgnored({ configuredSubmitMode, adminAllowsFirstLast });
   const firstLastFeatureEnabled = computeFirstLastFeatureEnabled({
@@ -367,6 +369,13 @@ export function startVideoSegmentRun(args: {
     const firstFramePath = firstFrameUrl ? (resolveLocalImagePath(firstFrameUrl, args.user.id) || undefined) : undefined;
     const tailFrameUrl = String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
     const tailFramePath = tailFrameUrl ? (resolveLocalImagePath(tailFrameUrl, args.user.id) || undefined) : undefined;
+    const selectedKeyframes = collectSelectedShotKeyframes({
+      project,
+      storyboard: sb,
+      shots,
+      groupShotIndices: shotIndices,
+      ownerId: args.user.id,
+    });
     const decision = resolveVideoPayloadDecision({
       submitMode,
       firstLastFeatureEnabled,
@@ -378,6 +387,11 @@ export function startVideoSegmentRun(args: {
       tailIntentRequested: sb?.tailFrameIntent === 'requested' || submitMode === 'first_last_frame',
       independentMultiImageCapable,
       multiShotSegment: shotIndices.length > 1,
+      multiKeyframeCapable: capability.supportsMultiKeyframe,
+      multiKeyframeSchemaVerified: isVideoMultiKeyframeSchemaVerified(capability),
+      multiKeyframeCount: selectedKeyframes.keyframes.length,
+      referenceBudget: capability.referenceBudget,
+      maxImages: capability.maxImages,
     });
     if (decision.hardFail) {
       payloadBlocked.push(formatVideoPayloadPreflightItem({

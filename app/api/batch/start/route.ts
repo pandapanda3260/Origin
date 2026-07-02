@@ -14,6 +14,7 @@ import {
   computeShotPlanSourceSnapshot,
   type ShotPlanSourceSnapshot,
 } from '@/lib/project-dependency-state';
+import { ensureProjectShotUids } from '@/lib/shot-plan-normalize';
 import { artifactUsageBlockedPayload } from '@/lib/sentinel';
 import {
   collectBatchPreflight,
@@ -32,9 +33,34 @@ import {
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const SHOT_UID_REPAIR_BATCH_TYPES = new Set([
+  'storyboard_images',
+  'tail_frame_images',
+  'video_prompts',
+  'video_segments',
+  'videos',
+]);
+
 function videoCreationStartResponse(outcome: VideoCreationStartOutcome) {
   if (outcome.status === 200) return jsonOk(outcome.body);
   return Response.json(outcome.body, { status: outcome.status });
+}
+
+function shouldRepairShotUidsForBatch(batchType: string) {
+  return SHOT_UID_REPAIR_BATCH_TYPES.has(batchType);
+}
+
+function ensureShotUidsBeforeBatchStart(projectId: string, userId: number) {
+  const project = getProjectByIdForUser(projectId, userId);
+  if (!project) return null;
+  const preview = ensureProjectShotUids(project as any);
+  if (!preview.changed) return project;
+  const patched = patchProjectForUser(projectId, userId, (fresh) => {
+    const repair = ensureProjectShotUids(fresh);
+    if (!repair.changed) return {};
+    return { shots: repair.shots };
+  });
+  return patched || null;
 }
 
 function markShotPlanBatchStarted(opts: {
@@ -85,8 +111,14 @@ export async function POST(req: NextRequest) {
 
   if (!targets.length) return jsonError('targets 不能为空', 400);
 
+  let projectForBatch: any = null;
+  if (shouldRepairShotUidsForBatch(batchType)) {
+    projectForBatch = ensureShotUidsBeforeBatchStart(projectId, user.id);
+    if (!projectForBatch) return jsonError('项目不存在', 404);
+  }
+
   if (batchType === 'storyboard_images' && isPerShotFirstFrameEnabled()) {
-    const projForFirstFrames = getProjectByIdForUser(projectId, user.id);
+    const projForFirstFrames = projectForBatch || getProjectByIdForUser(projectId, user.id);
     if (!projForFirstFrames) return jsonError('项目不存在', 404);
     try {
       targets = expandStoryboardImageTargetsForPerShot(projForFirstFrames as any, targets);

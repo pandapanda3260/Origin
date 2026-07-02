@@ -8,7 +8,7 @@ export const DEFAULT_SHOT_DURATION_SEC = 4;
 export const DIALOGUE_WARNING_CHARS_PER_SEC = 4.5;
 export const DIALOGUE_STRIP_PATTERN = /[\s「」『』""''，。！？、,.!?；;：:（）()[\]【】《》<>]/g;
 
-export type VideoReferenceRole = 'first_frame' | 'target_end' | 'scene' | 'character' | 'prop';
+export type VideoReferenceRole = 'first_frame' | 'target_end' | 'keyframe' | 'scene' | 'character' | 'prop';
 
 export type DialoguePolicy =
   | 'truncate_200_chars'
@@ -243,11 +243,13 @@ function referenceDisplayName(ref: Pick<ReferenceManifestItem, 'assetName' | 'la
     ? '片段首帧'
     : ref.role === 'target_end'
       ? '片段尾帧'
-      : ref.role === 'scene'
-        ? '场景参考'
-        : ref.role === 'prop'
-          ? '道具参考'
-          : '角色参考';
+      : ref.role === 'keyframe'
+        ? '镜头关键帧'
+        : ref.role === 'scene'
+          ? '场景参考'
+          : ref.role === 'prop'
+            ? '道具参考'
+            : '角色参考';
   return compactBriefText(ref.assetName || ref.label || fallback, fallback).slice(0, 80);
 }
 
@@ -280,6 +282,11 @@ export function buildReferenceBriefLine(ref: ReferenceManifestItem, refs: Refere
   }
   if (role === 'target_end') {
     return `${imageLabel} | target_end | ${name} | 用于结尾落点、姿态和画面收束；过程要自然抵达，禁止硬切。`;
+  }
+  if (role === 'keyframe') {
+    const atSec = Number((ref as any).atSecHint);
+    const timing = Number.isFinite(atSec) && atSec >= 0 ? `约第 ${atSec}s` : '按镜头顺序';
+    return `${imageLabel} | keyframe | ${name} | ${timing} 的镜头关键帧；视频必须按时间顺序自然经过该画面，不得跳切。`;
   }
   if (role === 'scene') {
     if (ref.viewRole === 'topdown') {

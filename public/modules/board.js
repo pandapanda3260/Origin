@@ -67,6 +67,7 @@ let _videoSubmitModesByGroup = new Map();
 let _videoResultUnsubscribe = null;
 let _videoResultReloading = false;
 let _videoResultReloadQueued = false;
+let _miniMapPointerId = null;
 
 function escapeHtml(value) {
   return String(value == null ? '' : value)
@@ -110,8 +111,13 @@ function isImageNearViewport(img) {
     imageRect.top <= viewportRect.bottom + margin;
 }
 
+function isOverviewThumb(img) {
+  return !!(img && img.closest && img.closest('.board-overview-cover'));
+}
+
 function shouldLoadThumb(img) {
-  return currentLodLevel() !== 'overview' && isImageNearViewport(img);
+  if (currentLodLevel() === 'overview' && !isOverviewThumb(img)) return false;
+  return isImageNearViewport(img);
 }
 
 function pumpBoardImageQueue() {
@@ -201,12 +207,6 @@ function scheduleBoardImageHydration() {
   });
 }
 
-function disabledButton(label, icon) {
-  return '<button type="button" class="board-btn board-btn--disabled" disabled aria-disabled="true" title="下一阶段接入">' +
-    (icon ? '<span class="material-symbols-outlined">' + escapeHtml(icon) + '</span>' : '') +
-    '<span>' + escapeHtml(label) + '</span></button>';
-}
-
 function actionButton(label, icon, action) {
   return '<button type="button" class="board-btn" data-action="' + escapeHtml(action) + '">' +
     (icon ? '<span class="material-symbols-outlined">' + escapeHtml(icon) + '</span>' : '') +
@@ -240,17 +240,20 @@ function normalizeVideoSubmitMode(value) {
   return 'auto';
 }
 
+const VIDEO_SUBMIT_MODES = [
+  ['auto', '自动'],
+  ['reference_images', '智能多帧'],
+  ['first_last_frame', '首尾帧'],
+];
+
 function videoSubmitModeForGroup(groupIdx) {
   return normalizeVideoSubmitMode(_videoSubmitModesByGroup.get(Number(groupIdx)) || 'auto');
 }
 
 function videoSubmitModeLabel(mode) {
-  const labels = {
-    auto: '全能参考',
-    reference_images: '智能多帧',
-    first_last_frame: '首尾帧',
-  };
-  return labels[normalizeVideoSubmitMode(mode)] || labels.auto;
+  const normalized = normalizeVideoSubmitMode(mode);
+  const found = VIDEO_SUBMIT_MODES.find(([candidate]) => candidate === normalized);
+  return found ? found[1] : '自动';
 }
 
 function projectIdOf(project) {
@@ -429,9 +432,6 @@ function ensureRoot() {
     '    <svg class="board-minimap-svg" data-board-minimap-svg viewBox="0 0 ' + MINIMAP_W + ' ' + MINIMAP_H + '" aria-hidden="true"></svg>',
     '  </div>',
     '  <div class="board-tools" data-board-control>',
-    '    <button type="button" class="board-tool" data-board-tool="undo" disabled title="下一阶段接入"><span class="material-symbols-outlined">undo</span></button>',
-    '    <button type="button" class="board-tool" data-board-tool="redo" disabled title="下一阶段接入"><span class="material-symbols-outlined">redo</span></button>',
-    '    <span class="board-tool-divider"></span>',
     '    <button type="button" class="board-tool" data-board-tool="hand" title="抓手"><span class="material-symbols-outlined">pan_tool</span></button>',
     '    <button type="button" class="board-tool" data-board-tool="zoom-out" title="缩小"><span class="material-symbols-outlined">remove</span></button>',
     '    <button type="button" class="board-tool board-tool-scale" data-board-tool="fit" title="全览"><span data-board-scale>100%</span></button>',
@@ -486,7 +486,13 @@ function ensureRoot() {
 	  _root.addEventListener('dragover', onCandidateDragOver);
 	  _root.addEventListener('drop', onCandidateDrop);
 	  _root.addEventListener('dragend', onCandidateDragEnd);
-	  if (_miniMapEl) _miniMapEl.addEventListener('pointerdown', onMiniMapPointerDown);
+	  if (_miniMapEl) {
+	    _miniMapEl.addEventListener('pointerdown', onMiniMapPointerDown);
+	    _miniMapEl.addEventListener('pointermove', onMiniMapPointerMove);
+	    _miniMapEl.addEventListener('pointerup', onMiniMapPointerEnd);
+	    _miniMapEl.addEventListener('pointercancel', onMiniMapPointerEnd);
+	    _miniMapEl.addEventListener('lostpointercapture', onMiniMapPointerEnd);
+	  }
 	  return true;
 	}
 
@@ -589,13 +595,13 @@ function updateMiniMapViewport() {
   viewEl.setAttribute('height', r.h.toFixed(2));
 }
 
-function onMiniMapPointerDown(event) {
+function centerMiniMapAtClientPoint(clientX, clientY) {
   if (!_viewport || !_viewportRoot || !_miniMapSvgEl || !_lastViewModel) return;
   const rect = _miniMapSvgEl.getBoundingClientRect ? _miniMapSvgEl.getBoundingClientRect() : null;
   if (!rect || !rect.width || !rect.height) return;
   const metrics = minimapMetrics(_lastViewModel.bounds);
-  const px = (Number(event.clientX) - rect.left) * (MINIMAP_W / rect.width);
-  const py = (Number(event.clientY) - rect.top) * (MINIMAP_H / rect.height);
+  const px = (Number(clientX) - rect.left) * (MINIMAP_W / rect.width);
+  const py = (Number(clientY) - rect.top) * (MINIMAP_H / rect.height);
   const worldX = clampValue(metrics.bounds.x + (px - metrics.ox) / metrics.scale, metrics.bounds.x, metrics.bounds.x + metrics.bounds.w);
   const worldY = clampValue(metrics.bounds.y + (py - metrics.oy) / metrics.scale, metrics.bounds.y, metrics.bounds.y + metrics.bounds.h);
   const rootRect = _viewportRoot && _viewportRoot.getBoundingClientRect ? _viewportRoot.getBoundingClientRect() : null;
@@ -607,6 +613,31 @@ function onMiniMapPointerDown(event) {
     x: vw / 2 - worldX * transform.k,
     y: vh / 2 - worldY * transform.k,
   });
+}
+
+function onMiniMapPointerDown(event) {
+  if (!_viewport || !_viewportRoot || !_miniMapSvgEl || !_lastViewModel) return;
+  if (event.button != null && event.button !== 0) return;
+  _miniMapPointerId = event.pointerId;
+  if (_miniMapEl && typeof _miniMapEl.setPointerCapture === 'function') {
+    try { _miniMapEl.setPointerCapture(event.pointerId); } catch (_) {}
+  }
+  centerMiniMapAtClientPoint(event.clientX, event.clientY);
+  event.preventDefault();
+}
+
+function onMiniMapPointerMove(event) {
+  if (_miniMapPointerId !== event.pointerId) return;
+  centerMiniMapAtClientPoint(event.clientX, event.clientY);
+  event.preventDefault();
+}
+
+function onMiniMapPointerEnd(event) {
+  if (_miniMapPointerId !== event.pointerId) return;
+  if (_miniMapEl && typeof _miniMapEl.releasePointerCapture === 'function') {
+    try { _miniMapEl.releasePointerCapture(event.pointerId); } catch (_) {}
+  }
+  _miniMapPointerId = null;
   event.preventDefault();
 }
 
@@ -691,7 +722,7 @@ async function handleBoardAction(actionEl) {
   const payload = boardActionPayload(actionEl);
   if (action !== 'confirm-enter-edit' && (!Number.isInteger(payload.groupIdx) || payload.groupIdx < 0)) return;
   if (action !== 'confirm-enter-edit' && action !== 'segment-generate-all' && action !== 'video-candidate-current' && action !== 'video-mode-select' && action !== 'video-generate' && !payload.shotUid) {
-    if (_ctx.showToast) _ctx.showToast('该镜头缺少 shotUid，不能写入候选', 'error');
+    if (_ctx.showToast) _ctx.showToast('该镜头标识缺失，请先对片段执行一键全生成，或重新生成镜头计划', 'error');
     return;
   }
   if ((action === 'candidate-select' || action === 'candidate-delete') && !payload.candidateId) return;
@@ -855,8 +886,7 @@ function referenceSection(label, items) {
 function renderReferenceNode(data) {
   if (!data || data.empty) {
     return '<div class="board-node-card board-node-card--reference board-empty-reference">' +
-      '<h2>参考图</h2><p>点击导入参考图</p>' +
-      disabledButton('导入参考图', 'add_photo_alternate') +
+      '<h2>参考图</h2><p>暂无参考图</p>' +
     '</div>';
   }
   return '<div class="board-node-card board-node-card--reference">' +
@@ -866,7 +896,6 @@ function renderReferenceNode(data) {
     referenceSection('角色', data.characters) +
     referenceSection('场景', data.scenes) +
     referenceSection('道具', data.props) +
-    disabledButton('生成镜头计划', 'auto_awesome') +
   '</div>';
 }
 
@@ -905,7 +934,7 @@ function renderCandidateCard(groupIdx, row, candidate, idx) {
 }
 
 function renderRowActions(groupIdx, row, hasCandidates) {
-  if (!row.shotUid) return '<div class="board-frame-actions"><span class="board-muted">缺 shotUid</span></div>';
+  if (!row.shotUid) return '<div class="board-frame-actions"><span class="board-muted">镜头标识缺失，可先点片段一键全生成修复</span></div>';
   const attrs = boardActionAttrs(groupIdx, row.shotUid);
   const generateLabel = hasCandidates ? '重新生成' : '生成图片';
   return '<div class="board-frame-actions">' +
@@ -933,6 +962,7 @@ function renderSegmentNode(data) {
 	  }).join('');
 	  return '<div class="board-node-card board-node-card--segment">' +
 	    '<div class="board-node-head"><h2>片段 ' + escapeHtml((data && data.gIdx) + 1) + '</h2><span>' + escapeHtml(badgeText) + '</span></div>' +
+	    '<div class="board-overview-cover">' + assetImg(data && data.coverUrl, '片段' + (((data && data.gIdx) || 0) + 1) + '封面') + '</div>' +
 	    '<div class="board-shot-rows">' + (rows || '<p class="board-muted">暂无镜头</p>') + '</div>' +
 	    (allReady ? '' : '<button type="button" class="board-btn" data-board-control data-board-action="segment-generate-all" data-group-idx="' + escapeHtml((data && data.gIdx) || 0) + '"><span class="material-symbols-outlined">auto_awesome</span><span>一键全生成</span></button>') +
 	  '</div>';
@@ -968,6 +998,7 @@ function renderVideoCandidateCard(groupIdx, data, candidate, idx) {
     '<button type="button" class="board-video-candidate-thumb" data-board-control data-board-action="video-candidate-current" ' + attrs + ' aria-pressed="' + (selected ? 'true' : 'false') + '" title="设为当前视频">' +
     assetImg((candidate && candidate.coverUrl) || (data && data.coverUrl), '视频候选' + (idx + 1)) +
     '<span class="board-radio" aria-hidden="true"></span>' +
+    (selected ? '<span class="board-video-current-badge">当前使用</span>' : '') +
     '</button>' +
     '<div class="board-video-candidate-meta">' +
     '<strong>' + escapeHtml(candidate && candidate.label ? candidate.label : ('候选 ' + (idx + 1))) + '</strong>' +
@@ -979,17 +1010,19 @@ function renderVideoCandidateCard(groupIdx, data, candidate, idx) {
 
 function renderVideoModeSelector(groupIdx) {
   const current = videoSubmitModeForGroup(groupIdx);
-  const modes = [
-    ['auto', '全能参考'],
-    ['reference_images', '智能多帧'],
-    ['first_last_frame', '首尾帧'],
-  ];
   return '<div class="board-video-mode" role="group" aria-label="视频生成模式">' +
-    modes.map(([mode, label]) => {
+    VIDEO_SUBMIT_MODES.map(([mode, label]) => {
       const active = mode === current;
       return '<button type="button" class="' + (active ? 'is-active' : '') + '" data-board-control data-board-action="video-mode-select" data-group-idx="' + escapeHtml(groupIdx) + '" data-submit-mode="' + escapeHtml(mode) + '" aria-pressed="' + (active ? 'true' : 'false') + '">' + escapeHtml(label) + '</button>';
     }).join('') +
   '</div>';
+}
+
+function renderVideoAdvanced(groupIdx) {
+  return '<details class="board-video-advanced">' +
+    '<summary><span>更多参数</span><strong>生成模式：' + escapeHtml(videoSubmitModeLabel(videoSubmitModeForGroup(groupIdx))) + '</strong></summary>' +
+    renderVideoModeSelector(groupIdx) +
+  '</details>';
 }
 
 function videoGenerateReadinessForGroup(groupIdx) {
@@ -1005,6 +1038,8 @@ function renderVideoNode(data) {
   const status = data && data.status ? data.status : 'missing';
   const candidates = Array.isArray(data && data.candidates) ? data.candidates : [];
   const groupIdx = Number(data && data.gIdx);
+  const currentCandidate = candidates.find((candidate) => candidate && candidate.taskId && candidate.taskId === (data && data.selectedTaskId)) || candidates[0] || null;
+  const overviewCoverUrl = (currentCandidate && currentCandidate.coverUrl) || (data && data.coverUrl);
   const generateReadiness = videoGenerateReadinessForGroup(groupIdx);
   const generateDisabled = generateReadiness.canStart
     ? ''
@@ -1014,9 +1049,10 @@ function renderVideoNode(data) {
     ? '<div class="board-video-candidate-list">' + candidates.map((candidate, idx) => renderVideoCandidateCard(groupIdx, data, candidate, idx)).join('') + '</div>'
     : '<div class="board-video-empty"><div class="board-video-cover">' + assetImg(data && data.coverUrl, '视频封面') + '<span class="board-radio" aria-hidden="true"></span></div><span>暂无视频候选</span></div>';
   return '<div class="board-node-card board-node-card--video">' +
-    '<div class="board-node-head"><h2>视频</h2><span class="board-status board-status--' + escapeHtml(status) + '">' + escapeHtml(statusLabel(status)) + '</span></div>' +
+    '<div class="board-node-head"><h2>视频</h2><span class="board-status board-status--' + escapeHtml(status) + '">' + escapeHtml(statusLabel(status) + ' · 候选 ' + candidates.length) + '</span></div>' +
+    '<div class="board-overview-cover board-overview-cover--video">' + assetImg(overviewCoverUrl, '片段' + (groupIdx + 1) + '视频封面') + '</div>' +
     candidateList +
-    renderVideoModeSelector(groupIdx) +
+    renderVideoAdvanced(groupIdx) +
     '<button type="button" class="' + generateClass + '" data-board-control data-board-action="video-generate" data-group-idx="' + escapeHtml(groupIdx) + '"' + generateDisabled + '><span class="material-symbols-outlined">movie</span><span>生成新视频</span></button>' +
   '</div>';
 }

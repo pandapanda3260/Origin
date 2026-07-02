@@ -7,8 +7,8 @@ import { subscribeTask, subscribeBatch } from '/modules/backend_stream.js';
 import { extractSubtitleLinesFromPrompt, resolveSubtitleLayoutSpec, splitSubtitleDialogueLines, subtitleVisibleCharCount } from '/modules/subtitle_format.js';
 import { assertModuleSingleton } from '/modules/module_singleton_guard.js';
 
-// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 118" 才能确认新代码加载到。
-console.log('%c[EDIT_JS_VERSION] 118 —— 下载按钮仅在成片完成后可用', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
+// 版本探针：让用户在 console 看到 "EDIT_JS_VERSION 119" 才能确认新代码加载到。
+console.log('%c[EDIT_JS_VERSION] 119 —— 候选视频进入剪辑素材库', 'background:#0e7c4a;color:#fff;padding:2px 6px;border-radius:3px;');
 assertModuleSingleton("edit", import.meta.url);
 
 let _ctx = {};
@@ -1080,7 +1080,7 @@ function _teardownProjectScopedEditUi() {
     _initDoubleBuffer();
     _scheduleTimelineVideoUrlHydration();
 
-    _loadUploadedMedia().then(function () { _renderMediaLibrary(); });
+    Promise.all([_loadUploadedMedia(), _loadCandidateMedia()]).then(function () { _renderMediaLibrary(); });
     _renderMediaLibrary();
 
     // 刷新时也要把 BGM 选择器渲出来——之前只在 _analyzeEditSegments / _generateEditEdl
@@ -4601,6 +4601,7 @@ function _teardownProjectScopedEditUi() {
 
   var _mediaActiveTab = "clips";
   var _uploadedMedia = [];
+  var _candidateMedia = [];
   var _mediaPreviewBlobCache = {};
   var _mediaPreviewBlobPending = {};
 
@@ -4701,7 +4702,7 @@ function _teardownProjectScopedEditUi() {
 	        });
         list.appendChild(card);
       });
-    } else {
+    } else if (_mediaActiveTab === "uploads") {
       if (!_uploadedMedia.length) {
         list.innerHTML = '<p class="text-[10px] text-on-surface-variant/30 text-center mt-8">点击右上角上传素材</p>';
         return;
@@ -4721,6 +4722,31 @@ function _teardownProjectScopedEditUi() {
           duration: m.duration || 0,
           mediaId: m.id,
           kind: uploadKind,
+        });
+        list.appendChild(card);
+      });
+    } else {
+      if (!_candidateMedia.length) {
+        list.innerHTML = '<p class="text-[10px] text-on-surface-variant/30 text-center mt-8">暂无未选候选视频</p>';
+        return;
+      }
+      _candidateMedia.forEach(function (m, i) {
+        var card = _buildMediaCard({
+          type: "candidate",
+          idx: i,
+          name: m.name || "候选 " + (i + 1),
+          thumbUrl: m.thumbnailUrl || "",
+          videoUrl: m.url || "",
+          protectedUrl: m.protectedUrl || m.url || "",
+          duration: m.duration || 0,
+          mediaId: m.id,
+          videoTaskId: m.videoTaskId || m.id,
+          kind: "video",
+          groupIdx: m.groupIdx,
+          filename: m.filename || "",
+          displayName: m.displayName || "",
+          downloadFilename: m.downloadFilename || "",
+          source: m.source || "video_candidate",
         });
         list.appendChild(card);
       });
@@ -4775,6 +4801,9 @@ function _teardownProjectScopedEditUi() {
 	        displayName: info.displayName,
 	        downloadFilename: info.downloadFilename,
 	        kind: info.kind,
+	        source: info.source,
+	        groupIdx: info.groupIdx,
+	        videoTaskId: info.videoTaskId,
       }));
       ev.dataTransfer.effectAllowed = "copy";
     });
@@ -4919,6 +4948,62 @@ function _teardownProjectScopedEditUi() {
     }
   }
 
+  async function _loadCandidateMedia() {
+    if (!project || !project.id) {
+      _candidateMedia = [];
+      return;
+    }
+    var storyboards = Array.isArray(project.storyboards) ? project.storyboards : [];
+    if (!storyboards.length) {
+      _candidateMedia = [];
+      return;
+    }
+    try {
+      var batches = await Promise.all(storyboards.map(function (_sb, groupIdx) {
+        return apiGet("/api/video-creation/videos/history?projectId=" + encodeURIComponent(project.id) + "&groupIdx=" + encodeURIComponent(groupIdx))
+          .then(function (resp) {
+            var history = Array.isArray(resp && resp.history) ? resp.history : [];
+            return history.map(function (item) {
+              item = item || {};
+              item._groupIdx = groupIdx;
+              return item;
+            });
+          })
+          .catch(function () { return []; });
+      }));
+      var seen = {};
+      _candidateMedia = [];
+      batches.forEach(function (items) {
+        items.forEach(function (item) {
+          var taskId = String(item.task_id || item.taskId || item.id || "").trim();
+          if (!taskId || item.is_current === true || seen[taskId]) return;
+          var protectedUrl = item.protected_url || item.protectedUrl || "";
+          var url = item.url || protectedUrl || "";
+          if (!url && !protectedUrl) return;
+          seen[taskId] = true;
+          _candidateMedia.push({
+            id: taskId,
+            videoTaskId: taskId,
+            mediaId: taskId,
+            source: "video_candidate",
+            name: item.displayName || item.display_name || item.title || item.name || ("候选 " + taskId),
+            filename: item.filename || "",
+            displayName: item.displayName || item.display_name || item.title || item.name || "",
+            downloadFilename: item.downloadFilename || item.download_filename || item.filename || "",
+            url: url,
+            protectedUrl: protectedUrl || url,
+            thumbnailUrl: item.cover_url || item.coverUrl || "",
+            duration: Number(item.duration_sec || item.durationSec || item.duration || 0) || 0,
+            kind: "video",
+            groupIdx: Number.isFinite(Number(item.target_idx)) ? Number(item.target_idx) : Number(item._groupIdx),
+          });
+        });
+      });
+    } catch (e) {
+      _candidateMedia = [];
+    }
+  }
+
   function _normalizeMediaLibraryItem(item) {
     item = item || {};
     var mime = item.mime || "";
@@ -5013,14 +5098,38 @@ function _teardownProjectScopedEditUi() {
       showToast("暂不支持图片素材，请拖入视频片段", "warn");
       return;
     }
+    if (info.type === "candidate") {
+      _registerCandidateVideoMaterial(info);
+    }
     // A2：上传视频后端未落时长，拖入前先探测真实 metadata，探测不到再兜底 5s
-    if (info.type === "upload" && !(Number(info.duration) > 0) && info.videoUrl) {
+    if ((info.type === "upload" || info.type === "candidate") && !(Number(info.duration) > 0) && info.videoUrl) {
       _probeVideoDuration(info.videoUrl, function (dur) {
         _commitMediaToTimeline(Object.assign({}, info, { duration: dur > 0 ? dur : 5 }), insertIndex);
       });
       return;
     }
     _commitMediaToTimeline(info, insertIndex);
+  }
+
+  function _registerCandidateVideoMaterial(info) {
+    var taskId = String((info && (info.videoTaskId || info.mediaId)) || "").trim();
+    if (!taskId) return;
+    fetch("/api/volcengine/import", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, getAuthHeaders()),
+      body: JSON.stringify({
+        projectId: project ? project.id : "",
+        resourceIds: [taskId],
+        autoRegister: true,
+        async: true,
+      }),
+    })
+      .then(function (resp) {
+        if (!resp || !resp.ok) throw new Error("HTTP " + (resp && resp.status));
+      })
+      .catch(function (e) {
+        console.warn("[Edit] 候选视频 VevDemo 注册触发失败:", (e && e.message) || e);
+      });
   }
 
   /** 判断拖入素材是否为图片（优先 kind，其次按扩展名兜底） */
@@ -5066,12 +5175,14 @@ function _teardownProjectScopedEditUi() {
       outPoint: info.duration || 5,
       duration: info.duration || 5,
 	      transitionIn: { type: "cut", duration: 0 },
-	      _isExternalMedia: info.type === "upload",
+	      _isExternalMedia: info.type === "upload" || info.type === "candidate",
 	      _mediaName: info.name,
 	      filename: info.filename || "",
 	      displayName: info.displayName || info.name || "",
 	      downloadFilename: info.downloadFilename || info.filename || "",
 	      mediaId: info.mediaId || "",
+	      videoTaskId: info.videoTaskId || "",
+	      source: info.source || "",
     };
     _editState.edl.timeline.splice(targetIndex, 0, newEntry);
 

@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import { getCurrentUser } from '@/lib/auth';
 import { sseResponse } from '@/lib/sse';
-import { chatStream } from '@/lib/llm';
+import { chatStream, resolveLLMConfig } from '@/lib/llm';
 import { buildVideoPromptMessages } from '@/lib/prompts';
 import { projectWorldContextForStage } from '@/lib/world-template-context';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
@@ -31,6 +31,7 @@ import {
 import { buildVideoReferenceManifest } from '@/lib/reference-matcher';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
 import { normalizeSceneViewRole } from '@/lib/scene-views';
+import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -511,10 +512,16 @@ function evaluateVideoPromptConsistencyGate(project: any, groupIdx: number, shot
   }
 }
 
-function buildReferenceManifestFromRequest(body: any, groupIdx: number): ReferenceManifestItem[] {
+function normalizeReferenceBudget(value: unknown): number {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : VIDEO_REFERENCE_IMAGE_BUDGET;
+}
+
+function buildReferenceManifestFromRequest(body: any, groupIdx: number, budget = VIDEO_REFERENCE_IMAGE_BUDGET): ReferenceManifestItem[] {
+  const referenceBudget = normalizeReferenceBudget(budget);
   if (Array.isArray(body?.referenceManifest) && body.referenceManifest.length) {
     return body.referenceManifest
-      .slice(0, VIDEO_REFERENCE_IMAGE_BUDGET)
+      .slice(0, referenceBudget)
       .map((item: any, idx: number) => {
         const role = normalizeRole(item?.role) || 'prop';
         const viewRole = normalizeSceneViewRole(item?.viewRole) || undefined;
@@ -538,7 +545,7 @@ function buildReferenceManifestFromRequest(body: any, groupIdx: number): Referen
   const assetRefs = Array.isArray(body?.assetRefs) ? body.assetRefs : [];
   if (assetRefs.length) {
     return assetRefs
-      .slice(0, VIDEO_REFERENCE_IMAGE_BUDGET)
+      .slice(0, referenceBudget)
       .map((ref: any, idx: number) => {
         const role = normalizeRole(ref?.role || ref?.type) || 'prop';
         const viewRole = normalizeSceneViewRole(ref?.viewRole) || undefined;
@@ -582,7 +589,7 @@ function buildReferenceManifestFromRequest(body: any, groupIdx: number): Referen
   }
 
   for (const ref of assetRefs) {
-    if (manifest.length >= VIDEO_REFERENCE_IMAGE_BUDGET) break;
+    if (manifest.length >= referenceBudget) break;
     const role = normalizeRole(ref?.role || ref?.type);
     if (!role || role === 'first_frame') continue;
     const url = compactText(ref?.url);
@@ -617,6 +624,9 @@ export async function POST(req: NextRequest) {
   if (!user) return new Response(JSON.stringify({ detail: 'unauthorized' }), { status: 401 });
 
   const body = await req.json().catch(() => ({} as any));
+  const videoCfg = resolveLLMConfig(user, 'video');
+  const videoCapability = resolveVideoModelCapability(videoCfg.model);
+  const referenceBudget = videoCapability.referenceBudget || VIDEO_REFERENCE_IMAGE_BUDGET;
   const projectId: string | undefined = body.projectId;
   const shots: any[] = Array.isArray(body.shots) ? body.shots : [];
   const styleBible: any = body.styleBible || {};
@@ -628,7 +638,7 @@ export async function POST(req: NextRequest) {
   const groupIdx: number = Number.isInteger(body.groupIdx) ? body.groupIdx : 0;
   const totalGroups: number = Number.isInteger(body.totalGroups) ? body.totalGroups : 1;
   let timelineStartSec = plannedTimelineStartFromGroups(allGroupsShots, groupIdx);
-  let referenceManifest = buildReferenceManifestFromRequest(body, groupIdx);
+  let referenceManifest = buildReferenceManifestFromRequest(body, groupIdx, referenceBudget);
 	  let droppedReferences = Array.isArray(body.droppedReferences) ? body.droppedReferences : [];
 	  const promptRunId = compactText(body.videoPromptRunId) || randomUUID();
 	  let planMeta = body.planMeta || null;
@@ -665,6 +675,7 @@ export async function POST(req: NextRequest) {
           groupIdx,
           ownerId: user.id,
           storyboardImageUrl: resolveStoryboardFirstFrameUrl(sb) || null,
+          budget: referenceBudget,
         });
         referenceManifest = canonicalReferenceBuild.manifest;
         droppedReferences = canonicalReferenceBuild.droppedReferences;

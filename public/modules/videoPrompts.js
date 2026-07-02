@@ -2452,7 +2452,7 @@ export async function confirmVideoPrompts() {
   } else {
     saveProject();
   }
-  switchPage("batch");
+  switchPage("prompts");
 }
 
 export async function prepareVideoPromptsForVideoGeneration(groupIdxs) {

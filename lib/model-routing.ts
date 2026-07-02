@@ -65,6 +65,8 @@ export function listKnownVideoModelIds(): string[] {
     // Fallback video model id used when no real video provider is configured.
     'sora',
     // Volcengine Seedance models that the product can route to via VIDEO_MODEL / MODEL_VIDEO_PRIMARY.
+    // The 2.5 id is provisional; replace it with the official ModelArk id when published.
+    'doubao-seedance-2-5',
     'doubao-seedance-2-0-260128',
     'doubao-seedance-2-0-fast-260128',
     'doubao-seedance-1-5-pro-251215',

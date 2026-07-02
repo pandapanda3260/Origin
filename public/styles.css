@@ -27,7 +27,7 @@
    统一页面内加载层 (Phase 0: assets / shots / prompts / batch / edit)
    遮罩默认可见，治 JS-ready 前的预启动闪屏；由 main.js 权威态显隐。
    ═══════════════════════════════════════════ */
-#pageAssets, #pageShots, #pagePrompts, #pageBatch, #pageEdit {
+#pageAssets, #pageShots, #pagePrompts, #pageEdit {
   position: relative;
   isolation: isolate;
   min-height: calc(100vh - var(--top-announcement-height));
@@ -1176,6 +1176,10 @@ body.is-online-editor-page #pageOnlineEditor:not([hidden]) {
 body.is-online-editor-page #sidebar,
 body.is-online-editor-page #announceBanner,
 body.is-online-editor-page #maintenanceBanner {
+  display: none !important;
+}
+
+body.spd-open #announceBanner {
   display: none !important;
 }
 
@@ -20813,9 +20817,15 @@ html.is-board-workbench-page #pageShots #boardRoot {
 .board-viewport.is-lod-overview .board-video-cover,
 .board-viewport.is-lod-overview .board-video-candidate-list,
 .board-viewport.is-lod-overview .board-video-empty,
+.board-viewport.is-lod-overview .board-video-advanced,
 .board-viewport.is-lod-overview .board-video-mode,
 .board-viewport.is-lod-overview .board-node-card > .board-btn {
   display: none !important;
+}
+
+.board-viewport.is-lod-overview .board-overview-cover {
+  display: block;
+  margin-top: 14px;
 }
 
 .board-node-card--reference {
@@ -21084,6 +21094,17 @@ html.is-board-workbench-page #pageShots #boardRoot {
   margin-bottom: 14px;
 }
 
+.board-overview-cover {
+  display: none;
+}
+
+.board-overview-cover .board-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  object-fit: cover;
+}
+
 .board-video-candidate-list {
   display: grid;
   gap: 10px;
@@ -21162,10 +21183,41 @@ html.is-board-workbench-page #pageShots #boardRoot {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
   padding: 4px;
-  margin-bottom: 10px;
+  margin-top: 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: rgba(255,255,255,0.64);
+}
+
+.board-video-advanced {
+  margin-bottom: 10px;
+}
+
+.board-video-advanced summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.68);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+}
+
+.board-video-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.board-video-advanced summary strong {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 800;
 }
 
 .board-video-mode button {
@@ -21203,6 +21255,24 @@ html.is-board-workbench-page #pageShots #boardRoot {
   inset: 3px;
   border-radius: 50%;
   background: #fff;
+}
+
+.board-video-current-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.74);
+  color: #fff;
+  padding: 3px 7px;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.18);
 }
 
 .board-status--ready {
@@ -21268,7 +21338,13 @@ html.is-board-workbench-page #pageShots #boardRoot {
   box-shadow: 0 18px 48px rgba(11,19,32,0.10);
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
-  cursor: crosshair;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.board-minimap:active {
+  cursor: grabbing;
 }
 
 .board-minimap-svg {
@@ -21607,21 +21683,33 @@ body.spd-open {
   padding: 14px;
 }
 
+.spd-shot-list-row {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  padding: 6px;
+}
+
+.spd-shot-list-row + .spd-shot-list-row {
+  margin-top: 6px;
+}
+
+.spd-shot-list-row.is-active {
+  border-color: rgba(56, 189, 248, 0.42);
+  background: rgba(56, 189, 248, 0.12);
+}
+
 .spd-shot-list-item {
   display: grid;
   width: 100%;
   grid-template-columns: 42px minmax(0, 1fr);
   gap: 3px 10px;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 8px;
   background: transparent;
   color: #e2e8f0;
-  padding: 10px;
+  padding: 6px;
   text-align: left;
-}
-
-.spd-shot-list-item + .spd-shot-list-item {
-  margin-top: 6px;
 }
 
 .spd-shot-list-item strong {
@@ -21646,19 +21734,59 @@ body.spd-open {
   white-space: nowrap;
 }
 
-.spd-shot-list-item.is-active {
-  border-color: rgba(56, 189, 248, 0.42);
-  background: rgba(56, 189, 248, 0.12);
-}
-
-.spd-shot-list-item.is-dirty span::after {
-  content: "未应用";
+.spd-shot-list-row.is-saving .spd-shot-list-item span::after {
+  content: "保存中";
   margin-left: 8px;
   border-radius: 999px;
-  background: rgba(245, 158, 11, 0.18);
-  color: #fde68a;
+  background: rgba(56, 189, 248, 0.18);
+  color: #bae6fd;
   padding: 2px 6px;
   font-size: 10px;
+}
+
+.spd-shot-list-row.is-save-error .spd-shot-list-item span::after {
+  content: "保存失败";
+  margin-left: 8px;
+  border-radius: 999px;
+  background: rgba(239, 68, 68, 0.18);
+  color: #fecaca;
+  padding: 2px 6px;
+  font-size: 10px;
+}
+
+.spd-structure-menu {
+  margin-top: 6px;
+}
+
+.spd-structure-menu summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #cbd5e1;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+}
+
+.spd-structure-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.spd-structure-menu summary strong {
+  color: #93a4b8;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.spd-structure-menu[open] summary {
+  border-color: rgba(56, 189, 248, 0.42);
+  color: #bae6fd;
+  background: rgba(56, 189, 248, 0.12);
 }
 
 .spd-detail-panel {
@@ -21790,20 +21918,40 @@ body.spd-open {
 .spd-row-actions {
   display: grid;
   grid-column: 1 / -1;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-content: end;
   gap: 6px;
+  margin-top: 8px;
 }
 
 .spd-row-actions button {
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
   padding: 7px 10px;
+  text-align: left;
 }
 
 .spd-row-actions button:disabled,
-.spd-more-btn:disabled,
-.spd-apply-btn:disabled {
+.spd-more-btn:disabled {
   cursor: not-allowed;
-  opacity: 0.42;
+  border-color: rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.18);
+  color: #94a3b8;
+}
+
+.spd-row-actions button small {
+  overflow: hidden;
+  max-width: 100%;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .spd-detail-footer {
@@ -21822,14 +21970,35 @@ body.spd-open {
   font-weight: 700;
 }
 
-.spd-apply-btn {
-  border: 0;
+.spd-save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spd-save-state::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
   border-radius: 999px;
+  background: #22c55e;
+}
+
+.spd-save-state.is-saving {
+  color: #bae6fd;
+}
+
+.spd-save-state.is-saving::before {
   background: #38bdf8;
-  color: #082f49;
-  font-size: 13px;
-  font-weight: 900;
-  padding: 9px 16px;
+}
+
+.spd-save-state.is-save-error {
+  color: #fecaca;
+}
+
+.spd-save-state.is-save-error::before {
+  background: #ef4444;
 }
 
 .spd-empty {

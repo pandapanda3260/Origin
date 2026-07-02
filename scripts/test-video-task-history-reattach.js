@@ -18,7 +18,7 @@ assert(helper.includes('cleanupTask(t);'), 'superseded group cleanup should remo
 assert(helper.includes("videoState.tasks.splice(i, 1);"), 'superseded group cleanup should remove stale in-memory tasks');
 assert(helper.includes("querySelector('[data-group-idx=\"' + n + '\"]')"), 'superseded group cleanup should remove stale mirror rows by group');
 
-const historyBlock = section(videoTasks, '// Step 2: completed history', 'syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();');
+const historyBlock = section(videoTasks, '// Step 2: authoritative video-creation state', 'syncTaskListVisibility(); updateBadge(); _updateBatchTotalProgress();');
 const cleanupIdx = historyBlock.indexOf('_dropSupersededGroupTasks(gIdx);');
 const createIdx = historyBlock.indexOf('var task = createVideoTaskObj("片段 " + (gIdx + 1), false);');
 assert(cleanupIdx >= 0, 'history reattach should clear stale group tasks');
@@ -28,6 +28,6 @@ const finder = section(videoTasks, 'function _findTaskByGroup', 'async function 
 assert(finder.includes('task._killed'), '_findTaskByGroup should ignore cleaned tasks');
 assert(finder.includes("task._projectId && project && task._projectId !== project.id"), '_findTaskByGroup should ignore tasks from other projects');
 
-assert(workspace.includes('"/modules/videoTasks.js": "/modules/videoTasks.js?v=307"'), 'workspace import map should bump videoTasks.js cache version');
+assert(workspace.includes('"/modules/videoTasks.js": "/modules/videoTasks.js?v=310"'), 'workspace import map should bump videoTasks.js cache version');
 
 console.log('video task history reattach contract ok');

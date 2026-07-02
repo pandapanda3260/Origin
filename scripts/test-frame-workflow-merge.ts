@@ -68,6 +68,31 @@ setFlag(true);
   ok('ON 全≥MIN→全 solo', solo.length === 4 && solo.every((s, i) => s.shotIndices.length === 1 && s.shotIndices[0] === i));
 }
 
+// ===== flag ON：显式分段 options 必须同时控制初次建槽与对齐修复 =====
+setFlag(true);
+{
+  const options = { targetMinSec: 20, targetMaxSec: 25, hardMaxSec: 30 };
+  const shots = S(7, 7, 7, 7, 7, 7);
+  const slots: any[] = makeSingleShotStoryboardSlots(shots, options);
+  ok('ON options 20/25/30 初次建槽=2段', JSON.stringify(slots.map((s) => s.shotIndices)) === '[[0,1,2],[3,4,5]]');
+  const patch = buildFrameWorkflowNormalizationPatch({
+    frameWorkflowSchemaVersion: 3,
+    autoSegmentPlanSnapshot: {
+      version: 1,
+      segmentationMode: 'auto',
+      modelRole: 'video',
+      modelId: 'future-seedance-2-5',
+      options,
+      createdAt: '2026-06-30T00:00:00.000Z',
+    },
+    shots,
+    storyboards: [{ shotIndices: [0] }],
+    videoTasks: [],
+  } as any, 1);
+  const repaired = patch?.storyboards || [];
+  ok('ON repair 复用 autoSegmentPlanSnapshot options', JSON.stringify(repaired.map((s: any) => s.shotIndices)) === '[[0,1,2],[3,4,5]]');
+}
+
 // ===== flag ON：保存前自愈重复/缺失的 shotIndices =====
 setFlag(true);
 {

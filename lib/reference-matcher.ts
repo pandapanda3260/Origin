@@ -52,6 +52,7 @@ export type BuildVideoReferenceManifestInput = {
   ownerId: number;
   storyboardImageUrl?: string | null;
   budget?: number;
+  includeStoryboardFirstFrame?: boolean;
 };
 
 export type BuildVideoReferenceManifestResult = {
@@ -536,12 +537,15 @@ export function buildVideoReferenceManifest(input: BuildVideoReferenceManifestIn
   const normText = normalizeReferenceName(text);
   const explicitCharNames = firstChars(shots);
   const explicitCharNorms = new Set(explicitCharNames.map(normalizeReferenceName).filter(Boolean));
-  const budget = Math.max(1, Math.min(Number(input.budget || VIDEO_REFERENCE_IMAGE_BUDGET), VIDEO_REFERENCE_IMAGE_BUDGET));
+  const requestedBudget = Number(input.budget || VIDEO_REFERENCE_IMAGE_BUDGET);
+  const budget = Math.max(1, Math.floor(Number.isFinite(requestedBudget) ? requestedBudget : VIDEO_REFERENCE_IMAGE_BUDGET));
 
   const candidates: Candidate[] = [];
   const dropped: DroppedReference[] = [];
 
-  addFirstFrameCandidate(candidates, input);
+  if (input.includeStoryboardFirstFrame !== false) {
+    addFirstFrameCandidate(candidates, input);
+  }
 
   const chars: any[] = collectCharacters(project, assets);
 

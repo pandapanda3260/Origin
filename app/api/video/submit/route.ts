@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/auth';
-import { generateVideo, normalizeGenerateAudio, type VideoReferenceImage } from '@/lib/video-gen';
+import { generateVideo, normalizeGenerateAudio, type VideoGenInput, type VideoReferenceImage } from '@/lib/video-gen';
 import { jsonError, jsonOk } from '@/lib/api-helpers';
 import { getProjectByIdForUser, patchProjectForUser } from '@/lib/projects-db';
 import { resolveLLMConfig } from '@/lib/llm';
@@ -24,8 +24,9 @@ import {
   warnIfFirstLastConfigIgnored,
 } from '@/lib/video-payload-decision';
 import { resolveStoryboardFirstFrameUrl } from '@/lib/visual-reference-state';
-import { resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
+import { isVideoMultiKeyframeSchemaVerified, resolveVideoModelCapability } from '@/lib/video-provider-capabilities';
 import { buildVideoReferenceManifest } from '@/lib/reference-matcher';
+import { collectSelectedShotKeyframes } from '@/lib/video-keyframes';
 import { isPrimarySceneRef } from '@/lib/scene-views';
 import { buildReferenceBriefLine, resolveGenerationDurationSec } from '@/lib/video-reference-manifest';
 import { maybeAssertStoryboardsAlignedWithShots, storyboardShotIndices } from '@/lib/frame-workflow-state';
@@ -115,6 +116,7 @@ export async function POST(req: NextRequest) {
   let payloadModeReason: string | undefined;
   let decisionWarnings: any[] = [];
   let referenceImages: VideoReferenceImage[] | undefined;
+  let multiKeyframeMode: VideoGenInput['multiKeyframeMode'];
   let sceneReferencePath: string | undefined;
   let characterReferencePaths: string[] | undefined;
   let propReferencePaths: string[] | undefined;
@@ -157,7 +159,17 @@ export async function POST(req: NextRequest) {
     if (!prompt) return codedError('missing_video_prompt', '缺少视频提示词，请先生成视频提示词。', 400);
 
     const firstFrameUrl = resolveStoryboardFirstFrameUrl(sb);
-    const canonicalRefs = buildVideoReferenceManifest({
+    const cfg = resolveLLMConfig(user, 'video');
+    const capability = resolveVideoModelCapability(cfg.model);
+    const selectedKeyframes = collectSelectedShotKeyframes({
+      project,
+      storyboard: sb,
+      shots,
+      groupShotIndices,
+      ownerId: user.id,
+      durationSec,
+    });
+    let canonicalRefs = buildVideoReferenceManifest({
       project,
       assets: (project as any).assets || {},
       shots,
@@ -165,8 +177,9 @@ export async function POST(req: NextRequest) {
       groupIdx,
       ownerId: user.id,
       storyboardImageUrl: firstFrameUrl || null,
+      budget: capability.referenceBudget,
     });
-    const manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
+    let manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
     const firstFrameItem = manifestInImageOrder.find((ref) => ref.role === 'first_frame' && ref.localPath);
     referenceImagePath = firstFrameItem?.localPath || (resolveLocalImagePath(firstFrameUrl, user.id) || undefined);
     referenceImageRole = referenceImagePath ? 'first_frame' : undefined;
@@ -179,8 +192,6 @@ export async function POST(req: NextRequest) {
       .map((ref) => ref.localPath as string);
     const tailFrameUrl = String(sb?.frames?.tail?.url || sb?.tailFrameUrl || '').trim();
     const tailFramePath = tailFrameUrl ? (resolveLocalImagePath(tailFrameUrl, user.id) || undefined) : undefined;
-    const cfg = resolveLLMConfig(user, 'video');
-    const capability = resolveVideoModelCapability(cfg.model);
     const configuredSubmitMode = getVideoSubmitMode();
     const adminAllowsFirstLast = isFirstLastFrameVideoModeEnabled();
     const independentMultiImageCapable = isMultiRefVideoModeEnabled() && isIndependentMultiImageModeEnabled();
@@ -201,6 +212,11 @@ export async function POST(req: NextRequest) {
       tailIntentRequested: sb?.tailFrameIntent === 'requested',
       independentMultiImageCapable,
       multiShotSegment: groupShotIndices.length > 1,
+      multiKeyframeCapable: capability.supportsMultiKeyframe,
+      multiKeyframeSchemaVerified: isVideoMultiKeyframeSchemaVerified(capability),
+      multiKeyframeCount: selectedKeyframes.keyframes.length,
+      referenceBudget: capability.referenceBudget,
+      maxImages: capability.maxImages,
     });
     if (decision.hardFail) {
       return codedError(
@@ -215,6 +231,31 @@ export async function POST(req: NextRequest) {
     const submitInputMode = deriveVideoSubmitInputMode(decision);
     seedanceImageMode = submitInputMode.seedanceImageMode;
     const independentMultiImageMode = submitInputMode.useIndependentReferenceImages;
+    if (decision.payloadMode === 'multi_keyframe_multi_ref') {
+      const effectiveReferenceBudget = Math.max(0, Math.min(
+        capability.referenceBudget,
+        Math.max(0, capability.maxImages - selectedKeyframes.keyframes.length),
+      ));
+      canonicalRefs = buildVideoReferenceManifest({
+        project,
+        assets: (project as any).assets || {},
+        shots,
+        groupShotIndices,
+        groupIdx,
+        ownerId: user.id,
+        storyboardImageUrl: null,
+        includeStoryboardFirstFrame: false,
+        budget: effectiveReferenceBudget,
+      });
+      manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
+    }
+    sceneReferencePath = manifestInImageOrder.find((ref) => isPrimarySceneRef(ref) && ref.localPath)?.localPath;
+    characterReferencePaths = manifestInImageOrder
+      .filter((ref) => ref.role === 'character' && ref.localPath)
+      .map((ref) => ref.localPath as string);
+    propReferencePaths = manifestInImageOrder
+      .filter((ref) => ref.role === 'prop' && ref.localPath)
+      .map((ref) => ref.localPath as string);
 	    referenceImages = independentMultiImageMode
 	      ? manifestInImageOrder
 	          .filter((ref) => ref.localPath)
@@ -234,6 +275,15 @@ export async function POST(req: NextRequest) {
 	            priority: ref.priority || ref.score,
 	          }))
 	      : undefined;
+    multiKeyframeMode = decision.multiKeyframeMode
+      ? {
+          keyframes: selectedKeyframes.keyframes,
+          references: referenceImages || [],
+          referenceBudget: Math.max(0, Math.min(capability.referenceBudget, Math.max(0, capability.maxImages - selectedKeyframes.keyframes.length))),
+          maxImages: capability.maxImages,
+          modeReason: decision.multiKeyframeMode.modeReason,
+        }
+      : undefined;
 	    plannedDurationSec = plannedDurationForSegment(shots, groupShotIndices);
 	    durationSec = resolveGenerationDurationSec({
 	      plannedDurationSec,
@@ -390,6 +440,7 @@ export async function POST(req: NextRequest) {
       seedanceImageMode,
       payloadModeReason,
       firstLastFrameMode,
+      multiKeyframeMode,
       assetLibrary: {
         batchId: assetBatchId,
         stage: projectId ? 'video_segment' : 'toolbox_video',

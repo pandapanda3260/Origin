@@ -152,7 +152,13 @@ import {
   TailFrameDraftValidationException,
 } from './tail-frame-edit-draft';
 import { buildCharacterLockRoster, joinPromptValues } from './frame-prompt-helpers';
-import { resolveTargetEndStrategy, resolveVideoModelCapability } from './video-provider-capabilities';
+import {
+  isVideoMultiKeyframeSchemaVerified,
+  resolveTargetEndStrategy,
+  resolveVideoModelCapability,
+} from './video-provider-capabilities';
+import { buildAutoSegmentPlanSnapshot } from './video-segment-capability';
+import { collectSelectedShotKeyframes } from './video-keyframes';
 import { captionTailFrameForVideo, hashImageFileContent, type TailFrameCaption } from './image-caption';
 import {
   completeShotPlanGenerationPatch,
@@ -3049,8 +3055,17 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     }
   }
 
+  const videoCapability = resolveVideoModelCapability(videoCfg.model);
+  const selectedKeyframes = collectSelectedShotKeyframes({
+    project: proj,
+    storyboard: sb,
+    shots,
+    groupShotIndices,
+    ownerId: ctx.user.id,
+    durationSec,
+  });
   const referenceImages: VideoReferenceImage[] = [];
-  let referenceImageBudget = VIDEO_REFERENCE_IMAGE_BUDGET;
+  let referenceImageBudget = videoCapability.referenceBudget || VIDEO_REFERENCE_IMAGE_BUDGET;
   const addReferenceImage = (ref: VideoReferenceImage) => {
     if (!independentMultiImageMode || !ref.path) return;
     if (referenceImages.some((item) => item.path === ref.path)) return;
@@ -3058,7 +3073,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     referenceImages.push(ref);
   };
 
-  const canonicalRefs = buildVideoReferenceManifest({
+  let canonicalRefs = buildVideoReferenceManifest({
     project: proj,
     assets: (proj as any).assets || {},
     shots,
@@ -3066,10 +3081,11 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     groupIdx,
     ownerId: ctx.user.id,
     storyboardImageUrl: resolvedFirstFrameUrl || null,
+    budget: referenceImageBudget,
   });
-  referenceImageBudget = canonicalRefs.budget || VIDEO_REFERENCE_IMAGE_BUDGET;
+  referenceImageBudget = canonicalRefs.budget || videoCapability.referenceBudget || VIDEO_REFERENCE_IMAGE_BUDGET;
   let manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
-  const canonicalFirstFrame = manifestInImageOrder.find((ref) => ref.role === 'first_frame');
+  let canonicalFirstFrame = manifestInImageOrder.find((ref) => ref.role === 'first_frame');
   if (refreshedTailCaption) {
     patchProjectForUser(ctx.projectId, ctx.user.id, (fresh) => {
       if (!fresh) return null;
@@ -3118,7 +3134,6 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
 
   const firstFrameItem = manifestInImageOrder.find((ref) => ref.role === 'first_frame' && ref.localPath);
   if (firstFrameItem?.localPath) referenceImagePath = firstFrameItem.localPath;
-  const videoCapability = resolveVideoModelCapability(videoCfg.model);
   const payloadDecision: VideoPayloadDecision = resolveVideoPayloadDecision({
     submitMode: requestedVideoSubmitMode,
     firstLastFeatureEnabled: firstLastFrameVideoEnabled,
@@ -3130,6 +3145,11 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     tailReferenceStatus: String(sb?.tailFrameReferenceStatus || '').toLowerCase(),
     independentMultiImageCapable,
     multiShotSegment: groupShotIndices.length > 1,
+    multiKeyframeCapable: videoCapability.supportsMultiKeyframe,
+    multiKeyframeSchemaVerified: isVideoMultiKeyframeSchemaVerified(videoCapability),
+    multiKeyframeCount: selectedKeyframes.keyframes.length,
+    referenceBudget: videoCapability.referenceBudget,
+    maxImages: videoCapability.maxImages,
   });
   if (payloadDecision.hardFail) {
     throw errorWithFailureStage(
@@ -3144,8 +3164,27 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
   const payloadModeReason = payloadDecision.reason;
   const submitInputMode = deriveVideoSubmitInputMode(payloadDecision);
   independentMultiImageMode = submitInputMode.useIndependentReferenceImages;
+  if (payloadModeDecision === 'multi_keyframe_multi_ref') {
+    referenceImageBudget = Math.max(0, Math.min(
+      videoCapability.referenceBudget || VIDEO_REFERENCE_IMAGE_BUDGET,
+      Math.max(0, (videoCapability.maxImages || VIDEO_REFERENCE_IMAGE_BUDGET) - selectedKeyframes.keyframes.length),
+    ));
+    canonicalRefs = buildVideoReferenceManifest({
+      project: proj,
+      assets: (proj as any).assets || {},
+      shots,
+      groupShotIndices,
+      groupIdx,
+      ownerId: ctx.user.id,
+      storyboardImageUrl: null,
+      includeStoryboardFirstFrame: false,
+      budget: referenceImageBudget,
+    });
+    manifestInImageOrder = [...canonicalRefs.manifest].sort((a, b) => a.imageNo - b.imageNo);
+    canonicalFirstFrame = undefined;
+  }
   if (payloadDecision.warning) videoWarnings.push(payloadDecision.warning);
-  if (independentMultiImageMode && !canonicalFirstFrame?.localPath) {
+  if (independentMultiImageMode && payloadModeDecision !== 'multi_keyframe_multi_ref' && !canonicalFirstFrame?.localPath) {
     throw errorWithFailureStage(
       `片段 ${groupIdx + 1} 首帧参考图缺失或无法解析为本地文件，已阻止视频生成。` +
         `请先重新生成该片段首帧，再生成视频。`,
@@ -3220,6 +3259,15 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
       priority: ref.priority || ref.score,
     });
   }
+  const multiKeyframeMode = payloadDecision.multiKeyframeMode
+    ? {
+        keyframes: selectedKeyframes.keyframes,
+        references: referenceImages,
+        referenceBudget: referenceImageBudget,
+        maxImages: videoCapability.maxImages || VIDEO_REFERENCE_IMAGE_BUDGET,
+        modeReason: payloadDecision.multiKeyframeMode.modeReason,
+      }
+    : undefined;
 
   // ===== 角色一致性主档（跨片段保持形象、表演和声音一致） =====
   const characterLockContextText = [
@@ -3322,6 +3370,7 @@ registerExecutor('video_segments', async (ctx: BatchExecCtx) => {
     characterReferencePanels,
     propReferencePaths,
 	    referenceImages: independentMultiImageMode ? referenceImages : undefined,
+    multiKeyframeMode,
       seedanceImageMode,
     targetEndStrategy,
     targetEndCaption: targetEndCaption || undefined,
@@ -3983,7 +4032,15 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
 
   ctx.progress({ stage: 'assembling', percent: 95, hint: '正在保存镜头表…' });
 
-  const storyboards = makeSingleShotStoryboardSlots(shotsArr);
+  const segmentVideoCfg = resolveLLMConfig(ctx.user, 'video');
+  const segmentVideoCapability = resolveVideoModelCapability(segmentVideoCfg.model);
+  const autoSegmentPlanSnapshot = buildAutoSegmentPlanSnapshot({
+    modelId: segmentVideoCfg.model,
+    capability: segmentVideoCapability,
+    createdAt: generatedAt,
+  });
+  const segmentPlanOptions = autoSegmentPlanSnapshot.options;
+  const storyboards = makeSingleShotStoryboardSlots(shotsArr, segmentPlanOptions);
   maybeAssertStoryboardsAlignedWithShots(
     { shots: shotsArr, storyboards, videoTasks: [] },
     'shots-batch-executor',
@@ -4013,6 +4070,7 @@ registerExecutor('shots', async (ctx: BatchExecCtx) => {
       shots: shotsArr,
       planMeta,
       storyboards,
+      autoSegmentPlanSnapshot,
       sourceSnapshot,
       sourceHash,
       now: generatedAt,
@@ -4157,18 +4215,22 @@ registerExecutor('video_prompts', async (ctx: BatchExecCtx) => {
 	  const timelineStartSec = plannedTimelineStartFromGroups(plannedTimelineGroupsFromProject(proj), groupIdx);
 	  const styleBible = (proj as any).styleBible || {};
 	  const assets = (proj as any).assets || {};
-	  const promptStyleBible = sanitizePromptObject(styleBibleForVideoPrompt(styleBible));
-	  const promptAssets = sanitizePromptObject(assets);
-	  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
-  const referenceBuild = buildVideoReferenceManifest({
-    project: proj,
-    assets,
-    shots,
-    groupShotIndices: shotIndices,
-    groupIdx,
-    ownerId: ctx.user.id,
-    storyboardImageUrl: resolveStoryboardFirstFrameUrl(sb) || null,
-  });
+		  const promptStyleBible = sanitizePromptObject(styleBibleForVideoPrompt(styleBible));
+		  const promptAssets = sanitizePromptObject(assets);
+		  const narrations: any[] = Array.isArray((proj as any).narrations) ? (proj as any).narrations : [];
+  const promptVideoCfg = resolveLLMConfig(ctx.user, 'video');
+  const promptVideoCapability = resolveVideoModelCapability(promptVideoCfg.model);
+  const promptReferenceBudget = promptVideoCapability.referenceBudget || VIDEO_REFERENCE_IMAGE_BUDGET;
+	  const referenceBuild = buildVideoReferenceManifest({
+	    project: proj,
+	    assets,
+	    shots,
+	    groupShotIndices: shotIndices,
+	    groupIdx,
+	    ownerId: ctx.user.id,
+	    storyboardImageUrl: resolveStoryboardFirstFrameUrl(sb) || null,
+    budget: promptReferenceBudget,
+	  });
   const referenceManifest = referenceBuild.manifest;
   const droppedReferences = referenceBuild.droppedReferences;
 

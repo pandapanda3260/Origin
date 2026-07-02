@@ -3,6 +3,8 @@
 // 沙箱里跑：tsc 编译成 JS 后 node 执行（见执行报告）。
 
 import { planSegments, shotIndexToSegment } from '../lib/segment-planning';
+import { resolveVideoModelCapability } from '../lib/video-provider-capabilities';
+import { segmentPlanOptionsFromCapability } from '../lib/video-segment-capability';
 
 let failed = 0;
 function eq(name: string, got: unknown, want: unknown): void {
@@ -60,6 +62,17 @@ eq('min5-5s-solo（5≥5 单独）', planSegments(S(5, 5), { minDurationSec: 5 }
   eq('target20-25-tail-hardmax（末段过短但不能并成 35s）', segs, [[0, 1, 2], [3, 4]]);
   eq('target20-25-tail-sums', segmentSums(segs, durs), [21, 14]);
 }
+
+eq(
+  'capability 2.0 → plan options',
+  segmentPlanOptionsFromCapability(resolveVideoModelCapability('doubao-seedance-2-0-260128')),
+  { targetMinSec: 4, targetMaxSec: 15, hardMaxSec: 15 },
+);
+eq(
+  'capability 2.5 → plan options',
+  segmentPlanOptionsFromCapability(resolveVideoModelCapability('doubao-seedance-2-5')),
+  { targetMinSec: 20, targetMaxSec: 25, hardMaxSec: 30 },
+);
 
 if (failed) {
   console.error(`\nFAILED: ${failed} 个用例不通过`);

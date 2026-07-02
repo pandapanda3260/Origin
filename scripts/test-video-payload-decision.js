@@ -260,6 +260,67 @@ function testOtherModes() {
   );
 }
 
+function testMultiKeyframeMode() {
+  eq(
+    pick(decision({
+      submitMode: 'reference_images',
+      firstFramePath: '',
+      multiKeyframeCapable: true,
+      multiKeyframeSchemaVerified: true,
+      multiKeyframeCount: 3,
+      referenceBudget: 50,
+      maxImages: 50,
+    })),
+    {
+      submitMode: 'reference_images',
+      payloadMode: 'multi_keyframe_multi_ref',
+      effectiveStrategy: 'multi_keyframe_multi_ref',
+      reason: 'multi_keyframe_ready',
+      hardFail: false,
+      failureCode: undefined,
+      hasFirstLast: false,
+      warningReason: undefined,
+    },
+    'reference_images uses multi-keyframe when capability/schema/keyframes are ready',
+  );
+  eq(
+    pick(decision({
+      submitMode: 'auto',
+      multiKeyframeCapable: true,
+      multiKeyframeSchemaVerified: true,
+      multiKeyframeCount: 2,
+      referenceBudget: 50,
+      maxImages: 50,
+    })).payloadMode,
+    'multi_keyframe_multi_ref',
+    'auto prefers multi-keyframe when keyframes are ready',
+  );
+  eq(
+    pick(decision({
+      submitMode: 'strict_first_frame',
+      multiKeyframeCapable: true,
+      multiKeyframeSchemaVerified: true,
+      multiKeyframeCount: 3,
+      referenceBudget: 50,
+      maxImages: 50,
+    })).payloadMode,
+    'first_frame_multi_ref',
+    'strict_first_frame never enters multi-keyframe mode',
+  );
+  eq(
+    pick(decision({
+      submitMode: 'reference_images',
+      multiKeyframeCapable: true,
+      multiKeyframeSchemaVerified: false,
+      multiKeyframeCount: 3,
+      referenceBudget: 50,
+      maxImages: 50,
+    })).payloadMode,
+    'first_frame_multi_ref',
+    'unverified multi-keyframe schema falls back to existing reference-images payload',
+  );
+}
+
 function testSubmitInputModeHelper() {
   eq(
     deriveVideoSubmitInputMode(decision({ tailReferenceStatus: 'missing', tailFramePath: null })),
@@ -284,6 +345,21 @@ function testSubmitInputModeHelper() {
       useIndependentReferenceImages: false,
     },
     'first-last payload does not use independent reference image submit input',
+  );
+  eq(
+    deriveVideoSubmitInputMode(decision({
+      submitMode: 'reference_images',
+      multiKeyframeCapable: true,
+      multiKeyframeSchemaVerified: true,
+      multiKeyframeCount: 2,
+      referenceBudget: 50,
+      maxImages: 50,
+    })),
+    {
+      seedanceImageMode: 'reference_images',
+      useIndependentReferenceImages: true,
+    },
+    'multi-keyframe payload uses reference_images submit input',
   );
 }
 
@@ -317,6 +393,7 @@ testExplicitFirstLastMatrix();
 testCapabilityAndFeature();
 testFirstFrameAndIntent();
 testOtherModes();
+testMultiKeyframeMode();
 testSubmitInputModeHelper();
 
 console.log('test-video-payload-decision: ok');

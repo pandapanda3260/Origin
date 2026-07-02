@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { AutoSegmentPlanSnapshot } from './video-segment-capability';
 
 export const SHOT_PLAN_STALE_FLAG = 'shotPlan';
 export const SHOT_PLAN_ARCHIVE_CONTEXTS = ['pre_regen'] as const;
@@ -445,6 +446,7 @@ export function completeShotPlanGenerationPatch(project: any, opts: {
   shots: any[];
   planMeta?: any;
   storyboards: any[];
+  autoSegmentPlanSnapshot?: AutoSegmentPlanSnapshot | null;
   sourceHash?: string;
   sourceSnapshot?: ShotPlanSourceSnapshot;
   now?: string;
@@ -485,6 +487,7 @@ export function completeShotPlanGenerationPatch(project: any, opts: {
     shotPlanGeneratedAt: now,
     shotPlanSourceHash: sourceHash,
     shotPlanSourceSnapshot: sourceSnapshot,
+    autoSegmentPlanSnapshot: opts.autoSegmentPlanSnapshot || undefined,
     shotPlanGenerationSourceHash: undefined,
     shotPlanGenerationSourceSnapshot: undefined,
     shotPlanGenerationStartedAt: undefined,

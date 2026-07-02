@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolveLocalImagePath } from './image-gen';
-import { planSegments } from './segment-planning';
+import { planSegments, type SegmentPlanOptions } from './segment-planning';
 import { isMultiShotSegmentEnabled } from './feature-flags';
 import { computeWorldHash } from './project-dependency-state';
 import { inferTailFrameDependencyForShots } from './tail-frame-dependency';
+import { normalizeAutoSegmentPlanOptions } from './video-segment-capability';
 
 export const FRAME_WORKFLOW_SCHEMA_VERSION = 3;
 export type TailFrameIntent = 'none' | 'requested';
@@ -101,14 +102,14 @@ function makeStoryboardSlotForGroup(groupIdx: number, shotIndices: number[]): an
   };
 }
 
-export function makeSingleShotStoryboardSlots(shotsOrProject: any): any[] {
+export function makeSingleShotStoryboardSlots(shotsOrProject: any, options?: SegmentPlanOptions): any[] {
   const shots = Array.isArray(shotsOrProject?.shots)
     ? shotsOrProject.shots
     : (Array.isArray(shotsOrProject) ? shotsOrProject : []);
   // flag OFF：维持 1:1（与历史完全一致）；flag ON：按时长把相邻短镜头合并成段。
   // 注意：本函数 flag ON 后会产出 storyboards.length < shots.length，需配合 P2c 放开对齐不变量。
   if (isMultiShotSegmentEnabled()) {
-    const segments = planSegments(shots);
+    const segments = planSegments(shots, options);
     return segments.map((shotIndices, gIdx) => makeStoryboardSlotForGroup(gIdx, shotIndices));
   }
   return shots.map((_: any, idx: number) => makeEmptyStoryboardSlot(idx));
@@ -802,9 +803,10 @@ function buildFrameWorkflowAlignmentRepairPatch(project: any, userId: number, re
   const archive = Array.isArray(project.legacyStoryboardArchive)
     ? [...project.legacyStoryboardArchive]
     : [];
+  const autoSegmentPlanOptions = normalizeAutoSegmentPlanOptions(project?.autoSegmentPlanSnapshot?.options);
   const expectedSlots = isManualSegmentation(project)
     ? makeManualRepairStoryboardSlots(project)
-    : makeSingleShotStoryboardSlots(shots);
+    : makeSingleShotStoryboardSlots(shots, autoSegmentPlanOptions);
   const usedStoryboards = new Set<number>();
   const groupIdxRemap = new Map<number, number>();
   const repairedStoryboards: any[] = [];

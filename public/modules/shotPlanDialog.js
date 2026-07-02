@@ -49,11 +49,14 @@ let _ctx = {};
 let _overlay = null;
 let _expanded = new Set();
 let _selectedShotIdx = 0;
-let _draftsByShot = new Map();
+let _autosaveTimers = new Map();
+let _autosaveDeltasByShot = new Map();
+let _saveStateByShot = new Map();
 let _bound = false;
 let _lockState = { locked: false, reason: '' };
 let _lockSeq = 0;
 let _returnFocusEl = null;
+const AUTOSAVE_DELAY_MS = 700;
 
 const DETAIL_TEXT_FIELDS = [
   { field: 'visual', label: '画面描述' },
@@ -81,7 +84,9 @@ export function openShotPlanDialog(triggerEl) {
   const project = currentProject();
   const shots = Array.isArray(project && project.shots) ? project.shots : [];
   _selectedShotIdx = Math.min(Math.max(0, _selectedShotIdx || 0), Math.max(0, shots.length - 1));
-  _draftsByShot = new Map();
+  clearAutosaveTimers();
+  _autosaveDeltasByShot = new Map();
+  _saveStateByShot = new Map();
   _returnFocusEl = triggerEl && typeof triggerEl.focus === 'function' ? triggerEl : document.activeElement;
   _overlay.hidden = false;
   document.body.classList.add('spd-open');
@@ -92,9 +97,9 @@ export function openShotPlanDialog(triggerEl) {
 
 export function closeShotPlanDialog() {
   if (!_overlay) return;
+  flushPendingAutosaves();
   _overlay.hidden = true;
   document.body.classList.remove('spd-open');
-  _draftsByShot = new Map();
   const target = _returnFocusEl && document.contains(_returnFocusEl) ? _returnFocusEl : null;
   _returnFocusEl = null;
   if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
@@ -106,6 +111,11 @@ function currentProject() {
 
 function saveProject() {
   if (typeof _ctx.saveProject === 'function') return _ctx.saveProject();
+}
+
+function flushServerSave(opts) {
+  if (typeof _ctx.flushServerSave === 'function') return _ctx.flushServerSave(opts);
+  return Promise.resolve();
 }
 
 function renderShotList() {
@@ -139,6 +149,7 @@ function ensureOverlay() {
   _overlay.addEventListener('click', onOverlayClick);
   _overlay.addEventListener('change', onOverlayChange);
   _overlay.addEventListener('input', onOverlayInput);
+  _overlay.addEventListener('focusout', onOverlayFocusOut);
 }
 
 function focusInitialControl() {
@@ -243,8 +254,6 @@ function onOverlayClick(event) {
     refreshShotPlanPanels();
   } else if (action === 'select-shot') {
     selectShot(idx);
-  } else if (action === 'apply-current') {
-    applyDraftToShot(idx);
   } else if (action === 'merge-next') {
     regroup('merge-next', idx);
   } else if (action === 'split-out') {
@@ -263,49 +272,44 @@ function onOverlayClick(event) {
 function onOverlayChange(event) {
   const select = event.target && event.target.closest ? event.target.closest('[data-spd-field]') : null;
   if (!select || select.tagName !== 'SELECT') return;
-  updateDraftField(select);
+  applyFieldAutosave(select, { immediate: true });
 }
 
 function onOverlayInput(event) {
   const field = event.target && event.target.closest ? event.target.closest('[data-spd-field]') : null;
   if (!field || field.tagName !== 'TEXTAREA') return;
-  updateDraftField(field);
+  applyFieldAutosave(field, { immediate: false });
 }
 
-function updateDraftField(fieldEl) {
+function onOverlayFocusOut(event) {
+  const field = event.target && event.target.closest ? event.target.closest('[data-spd-field]') : null;
+  if (!field) return;
+  const row = field.closest('[data-shot-idx]');
+  const idx = Number(row && row.getAttribute('data-shot-idx'));
+  if (Number.isInteger(idx)) flushAutosaveForShot(idx);
+}
+
+function applyFieldAutosave(fieldEl, opts) {
+  opts = opts || {};
   const row = fieldEl.closest('[data-shot-idx]');
   const idx = Number(row && row.getAttribute('data-shot-idx'));
   const field = fieldEl.getAttribute('data-spd-field');
   if (!Number.isInteger(idx) || !field) return;
-  const draft = ensureDraft(idx);
-  if (!draft) return;
-  draft.fields[field] = fieldEl.value;
-  syncDraftIndicators(idx);
-}
-
-function applyDraftToShot(idx) {
   const project = currentProject();
   const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
-  const draft = _draftsByShot.get(idx);
-  if (!shot || !draft) return;
-  let changed = false;
-  Object.keys(draft.fields).forEach(function (field) {
-    const before = _shotFieldCurrent(shot, field);
-    const value = draft.fields[field];
-    if (String(before) === String(value)) return;
-    _applyShotFieldValue(shot, field, value);
-    changed = true;
-  });
-  if (!changed) {
-    syncDraftIndicators(idx);
+  if (!shot) return;
+  const before = _shotFieldCurrent(shot, field);
+  const value = fieldEl.value;
+  if (String(before) === String(value)) {
+    syncSaveIndicators(idx);
     return;
   }
+  _applyShotFieldValue(shot, field, value);
+  recordAutosaveDelta(idx, field, value);
   markShotStale(idx);
-  saveProject();
   renderShotList();
   refreshBoardPage();
-  _draftsByShot.set(idx, makeDraftFromShot(shot));
-  refreshShotPlanPanels();
+  scheduleAutosave(idx, { immediate: !!opts.immediate });
 }
 
 function editableFieldNames() {
@@ -313,38 +317,62 @@ function editableFieldNames() {
     .concat(DETAIL_TEXT_FIELDS.map(function (spec) { return spec.field; }));
 }
 
-function makeDraftFromShot(shot) {
-  const fields = {};
-  editableFieldNames().forEach(function (field) {
-    fields[field] = _shotFieldCurrent(shot, field);
-  });
-  return { fields };
-}
-
-function ensureDraft(idx) {
-  if (_draftsByShot.has(idx)) return _draftsByShot.get(idx);
-  const project = currentProject();
-  const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
-  if (!shot) return null;
-  const draft = makeDraftFromShot(shot);
-  _draftsByShot.set(idx, draft);
-  return draft;
-}
-
-function draftValue(shot, idx, field) {
-  const draft = ensureDraft(idx);
-  if (draft && Object.prototype.hasOwnProperty.call(draft.fields, field)) return draft.fields[field];
+function fieldValue(shot, field) {
+  if (editableFieldNames().indexOf(field) < 0) return '';
   return _shotFieldCurrent(shot, field);
 }
 
-function isDraftDirty(idx) {
-  const project = currentProject();
-  const shot = project && Array.isArray(project.shots) ? project.shots[idx] : null;
-  const draft = _draftsByShot.get(idx);
-  if (!shot || !draft) return false;
-  return Object.keys(draft.fields).some(function (field) {
-    return String(_shotFieldCurrent(shot, field)) !== String(draft.fields[field]);
+function clearAutosaveTimers() {
+  _autosaveTimers.forEach(function (timer) { clearTimeout(timer); });
+  _autosaveTimers = new Map();
+}
+
+function recordAutosaveDelta(idx, field, value) {
+  if (!Number.isInteger(idx) || editableFieldNames().indexOf(field) < 0) return;
+  const delta = _autosaveDeltasByShot.get(idx) || {};
+  delta[field] = value;
+  _autosaveDeltasByShot.set(idx, delta);
+}
+
+function autosaveDeltaSnapshot(indexes) {
+  return indexes.map(function (idx) {
+    const delta = _autosaveDeltasByShot.get(idx) || {};
+    const fields = {};
+    Object.keys(delta).forEach(function (field) {
+      if (editableFieldNames().indexOf(field) >= 0) fields[field] = delta[field];
+    });
+    return { idx: idx, fields: fields };
+  }).filter(function (entry) {
+    return Object.keys(entry.fields).length > 0;
   });
+}
+
+function clearAutosaveDeltaSnapshot(snapshot) {
+  snapshot.forEach(function (entry) {
+    const current = _autosaveDeltasByShot.get(entry.idx);
+    if (!current) return;
+    Object.keys(entry.fields).forEach(function (field) {
+      if (String(current[field]) === String(entry.fields[field])) delete current[field];
+    });
+    if (!Object.keys(current).length) _autosaveDeltasByShot.delete(entry.idx);
+  });
+}
+
+function replayAutosaveDeltaSnapshot(snapshot) {
+  const project = currentProject();
+  const shots = Array.isArray(project && project.shots) ? project.shots : [];
+  snapshot.forEach(function (entry) {
+    const shot = shots[entry.idx];
+    if (!shot) return;
+    Object.keys(entry.fields).forEach(function (field) {
+      _applyShotFieldValue(shot, field, entry.fields[field]);
+      recordAutosaveDelta(entry.idx, field, entry.fields[field]);
+    });
+    markShotStale(entry.idx);
+  });
+  renderShotList();
+  refreshBoardPage();
+  refreshShotPlanPanels();
 }
 
 function selectShot(idx) {
@@ -352,22 +380,108 @@ function selectShot(idx) {
   const shots = Array.isArray(project && project.shots) ? project.shots : [];
   if (!Number.isInteger(idx) || idx < 0 || idx >= shots.length) return;
   _selectedShotIdx = idx;
-  ensureDraft(idx);
   refreshShotPlanPanels();
 }
 
-function syncDraftIndicators(idx) {
+function getSaveState(idx) {
+  return _saveStateByShot.get(idx) || { state: 'saved', label: '已保存' };
+}
+
+function setSaveState(idx, state, label) {
+  if (!Number.isInteger(idx)) return;
+  _saveStateByShot.set(idx, { state: state || 'saved', label: label || '已保存' });
+  syncSaveIndicators(idx);
+}
+
+function syncSaveIndicators(idx) {
   if (!_overlay) return;
-  const dirty = isDraftDirty(idx);
-  const applyBtn = _overlay.querySelector('[data-spd-action="apply-current"][data-shot-idx="' + idx + '"]');
-  if (applyBtn) {
-    applyBtn.disabled = !dirty;
-    applyBtn.setAttribute('aria-disabled', dirty ? 'false' : 'true');
+  const listBtn = _overlay.querySelector('.spd-shot-list-row[data-shot-idx="' + idx + '"]');
+  const saveState = getSaveState(idx);
+  if (listBtn) {
+    listBtn.classList.toggle('is-saving', saveState.state === 'saving');
+    listBtn.classList.toggle('is-save-error', saveState.state === 'error');
   }
-  const listBtn = _overlay.querySelector('[data-spd-action="select-shot"][data-shot-idx="' + idx + '"]');
-  if (listBtn) listBtn.classList.toggle('is-dirty', dirty);
-  const dirtyState = _overlay.querySelector('[data-spd-dirty-state][data-shot-idx="' + idx + '"]');
-  if (dirtyState) dirtyState.textContent = dirty ? '有未应用修改' : '当前镜头未修改';
+  const stateEl = _overlay.querySelector('[data-spd-save-state][data-shot-idx="' + idx + '"]');
+  if (stateEl) {
+    stateEl.textContent = saveState.label || '已保存';
+    stateEl.classList.toggle('is-saving', saveState.state === 'saving');
+    stateEl.classList.toggle('is-save-error', saveState.state === 'error');
+  }
+}
+
+function persistAutosave(indexes) {
+  indexes = indexes.filter(function (idx, pos) {
+    return Number.isInteger(idx) && indexes.indexOf(idx) === pos;
+  });
+  if (!indexes.length) return Promise.resolve({ ok: true });
+  const deltaSnapshot = autosaveDeltaSnapshot(indexes);
+  indexes.forEach(function (idx) { setSaveState(idx, 'saving', '保存中'); });
+  try {
+    saveProject();
+  } catch (e) {
+    indexes.forEach(function (idx) { setSaveState(idx, 'error', '保存失败，已保留在当前页面'); });
+    showToast('镜头计划保存失败，请稍后重试', 'error');
+    return Promise.resolve({ ok: false, error: e });
+  }
+  return Promise.resolve(flushServerSave({
+    silent: true,
+    staleRetryLimit: 1,
+    onStaleReload: function () {
+      replayAutosaveDeltaSnapshot(deltaSnapshot);
+    },
+  })).then(function (result) {
+    if (result && result.ok === false && result.stale) {
+      indexes.forEach(function (idx) { setSaveState(idx, 'error', '保存冲突，已保留在当前页面，请稍后重试'); });
+      return result;
+    }
+    if (result && result.ok === false) {
+      indexes.forEach(function (idx) { setSaveState(idx, 'error', '保存失败，已保留在当前页面'); });
+      showToast('镜头计划保存失败，请稍后重试', 'error');
+      return result;
+    }
+    clearAutosaveDeltaSnapshot(deltaSnapshot);
+    indexes.forEach(function (idx) { setSaveState(idx, 'saved', '已保存'); });
+    return result || { ok: true };
+  }).catch(function (e) {
+    indexes.forEach(function (idx) { setSaveState(idx, 'error', '保存失败，已保留在当前页面'); });
+    showToast('镜头计划保存失败，请稍后重试', 'error');
+    return { ok: false, error: e };
+  });
+}
+
+function scheduleAutosave(idx, opts) {
+  opts = opts || {};
+  if (!Number.isInteger(idx)) return Promise.resolve({ ok: false });
+  const existing = _autosaveTimers.get(idx);
+  if (existing) clearTimeout(existing);
+  _autosaveTimers.delete(idx);
+  setSaveState(idx, 'saving', '保存中');
+  if (opts.immediate) return persistAutosave([idx]);
+  const timer = setTimeout(function () {
+    _autosaveTimers.delete(idx);
+    persistAutosave([idx]);
+  }, AUTOSAVE_DELAY_MS);
+  _autosaveTimers.set(idx, timer);
+  return Promise.resolve({ ok: true, queued: true });
+}
+
+function flushAutosaveForShot(idx) {
+  const timer = _autosaveTimers.get(idx);
+  if (!timer) return Promise.resolve({ ok: true });
+  clearTimeout(timer);
+  _autosaveTimers.delete(idx);
+  return persistAutosave([idx]);
+}
+
+function flushPendingAutosaves() {
+  const indexes = Array.from(_autosaveTimers.keys());
+  if (!indexes.length) return Promise.resolve({ ok: true });
+  indexes.forEach(function (idx) {
+    const timer = _autosaveTimers.get(idx);
+    if (timer) clearTimeout(timer);
+  });
+  _autosaveTimers.clear();
+  return persistAutosave(indexes);
 }
 
 function refreshShotPlanPanels() {
@@ -545,7 +659,7 @@ function applyGroupsToProject(project, groups) {
 }
 
 function fieldSelect(spec, shot, idx) {
-  const current = draftValue(shot, idx, spec.field);
+  const current = fieldValue(shot, spec.field);
   let options = '';
   if (spec.type === 'duration') options = _buildDurationOptions(current);
   else if (spec.type === 'pace') options = _buildPaceOptions(current);
@@ -554,24 +668,38 @@ function fieldSelect(spec, shot, idx) {
 }
 
 function textareaField(label, field, shot, idx) {
-  return '<label class="spd-textfield"><span>' + escapeHtml(label) + '</span><textarea rows="3" data-spd-field="' + escapeHtml(field) + '">' + escapeHtml(draftValue(shot, idx, field)) + '</textarea></label>';
+  return '<label class="spd-textfield"><span>' + escapeHtml(label) + '</span><textarea rows="3" data-spd-field="' + escapeHtml(field) + '">' + escapeHtml(fieldValue(shot, field)) + '</textarea></label>';
+}
+
+function structureActionButton(action, label, enabled, disabledReason, locked) {
+  const reason = locked ? (_lockState.reason || '生成中暂不能修改结构') : (disabledReason || '');
+  const disabled = locked || !enabled;
+  return '<button type="button" data-spd-action="' + escapeHtml(action) + '"' +
+    (disabled ? ' disabled aria-disabled="true"' : '') +
+    (reason ? ' data-disabled-reason="' + escapeHtml(reason) + '"' : '') +
+    '><span>' + escapeHtml(label) + '</span>' +
+    (disabled && reason ? '<small>' + escapeHtml(reason) + '</small>' : '') +
+  '</button>';
 }
 
 function groupActions(groups, shotIdx, locked) {
   const gIdx = findGroup(groups, shotIdx);
   const group = groups[gIdx] || [shotIdx];
+  const totalShots = groups.reduce(function (acc, item) { return acc + item.length; }, 0);
   const canMovePrev = group.length > 1 && group[0] === shotIdx && gIdx > 0;
   const canMoveNext = group.length > 1 && group[group.length - 1] === shotIdx && gIdx + 1 < groups.length;
   const canSplit = group.length > 1;
   const canMerge = group[group.length - 1] === shotIdx && gIdx + 1 < groups.length;
-  const dis = locked ? ' disabled aria-disabled="true"' : '';
-  return '<div class="spd-row-actions">' +
-    '<button type="button" data-spd-action="swap-up"' + (shotIdx > 0 ? dis : ' disabled aria-disabled="true"') + '>上移</button>' +
-    '<button type="button" data-spd-action="swap-down"' + (shotIdx + 1 < groups.reduce(function (acc, item) { return acc + item.length; }, 0) ? dis : ' disabled aria-disabled="true"') + '>下移</button>' +
-    '<button type="button" data-spd-action="merge-next"' + (canMerge ? dis : ' disabled aria-disabled="true"') + '>与下一镜合并</button>' +
-    '<button type="button" data-spd-action="split-out"' + (canSplit ? dis : ' disabled aria-disabled="true"') + '>拆出片段</button>' +
-    '<button type="button" data-spd-action="move-prev"' + (canMovePrev ? dis : ' disabled aria-disabled="true"') + '>并入上一段</button>' +
-    '<button type="button" data-spd-action="move-next"' + (canMoveNext ? dis : ' disabled aria-disabled="true"') + '>并入下一段</button>' +
+  const mergeReason = group[group.length - 1] !== shotIdx ? '只能从片段最后一镜合并' : '没有下一段可合并';
+  const movePrevReason = group.length <= 1 ? '单镜头片段不能并段' : (group[0] !== shotIdx ? '只有片段第一镜可并入上一段' : '没有上一段');
+  const moveNextReason = group.length <= 1 ? '单镜头片段不能并段' : (group[group.length - 1] !== shotIdx ? '只有片段最后一镜可并入下一段' : '没有下一段');
+  return '<div class="spd-row-actions" data-spd-structure-actions>' +
+    structureActionButton('swap-up', '上移', shotIdx > 0, '已经是第一个镜头', locked) +
+    structureActionButton('swap-down', '下移', shotIdx + 1 < totalShots, '已经是最后一个镜头', locked) +
+    structureActionButton('merge-next', '与下一镜合并', canMerge, mergeReason, locked) +
+    structureActionButton('split-out', '拆出片段', canSplit, '单镜头片段不能拆分', locked) +
+    structureActionButton('move-prev', '并入上一段', canMovePrev, movePrevReason, locked) +
+    structureActionButton('move-next', '并入下一段', canMoveNext, moveNextReason, locked) +
   '</div>';
 }
 
@@ -579,14 +707,21 @@ function renderShotListItem(project, shot, idx, groups) {
   const groupIdx = findGroup(groups, idx);
   const group = groups[groupIdx] || [idx];
   const active = idx === _selectedShotIdx;
-  const dirty = isDraftDirty(idx);
+  const saveState = getSaveState(idx);
   const visual = String(_shotFieldCurrent(shot, 'visual') || '').trim();
-  return '<button type="button" class="spd-shot-list-item' + (active ? ' is-active' : '') + (dirty ? ' is-dirty' : '') + '" data-spd-action="select-shot" data-shot-idx="' + idx + '" aria-selected="' + (active ? 'true' : 'false') + '">' +
-    '<strong>' + String(idx + 1).padStart(2, '0') + '</strong>' +
-    '<span>镜头 ' + escapeHtml(idx + 1) + '</span>' +
-    '<small>片段 ' + escapeHtml(groupIdx + 1) + ' · ' + escapeHtml(group.map(function (n) { return n + 1; }).join(' / ')) + '</small>' +
-    '<em>' + escapeHtml(visual || '暂无画面描述') + '</em>' +
-  '</button>';
+  const locked = !!_lockState.locked;
+  return '<div class="spd-shot-list-row' + (active ? ' is-active' : '') + (saveState.state === 'saving' ? ' is-saving' : '') + (saveState.state === 'error' ? ' is-save-error' : '') + '" data-shot-idx="' + idx + '">' +
+    '<button type="button" class="spd-shot-list-item" data-spd-action="select-shot" aria-selected="' + (active ? 'true' : 'false') + '">' +
+      '<strong>' + String(idx + 1).padStart(2, '0') + '</strong>' +
+      '<span>镜头 ' + escapeHtml(idx + 1) + '</span>' +
+      '<small>片段 ' + escapeHtml(groupIdx + 1) + ' · ' + escapeHtml(group.map(function (n) { return n + 1; }).join(' / ')) + '</small>' +
+      '<em>' + escapeHtml(visual || '暂无画面描述') + '</em>' +
+    '</button>' +
+    '<details class="spd-structure-menu">' +
+      '<summary aria-label="镜头' + escapeHtml(idx + 1) + '结构操作"><span>结构</span><strong>···</strong></summary>' +
+      groupActions(groups, idx, locked) +
+    '</details>' +
+  '</div>';
 }
 
 function renderShotListItems(project, shots, groups) {
@@ -594,7 +729,6 @@ function renderShotListItems(project, shots, groups) {
 }
 
 function renderShotDetail(project, shot, idx, groups) {
-  ensureDraft(idx);
   const groupIdx = findGroup(groups, idx);
   const group = groups[groupIdx] || [idx];
   const expanded = _expanded.has(idx);
@@ -602,7 +736,7 @@ function renderShotDetail(project, shot, idx, groups) {
   const storyboard = groupIdx >= 0 ? storyboards[groupIdx] : null;
   const videoPrompt = String((storyboard && storyboard.videoPrompt) || '').trim();
   const locked = !!_lockState.locked;
-  const dirty = isDraftDirty(idx);
+  const saveState = getSaveState(idx);
   return '<article class="spd-row spd-row--detail" data-shot-idx="' + idx + '">' +
     '<div class="spd-row-main">' +
       '<div class="spd-shot-no"><strong>' + String(idx + 1).padStart(2, '0') + '</strong><span>镜头</span></div>' +
@@ -616,10 +750,65 @@ function renderShotDetail(project, shot, idx, groups) {
     '<div class="spd-row-detail">' +
       DETAIL_TEXT_FIELDS.map(function (spec) { return textareaField(spec.label, spec.field, shot, idx); }).join('') +
       '<label class="spd-textfield spd-textfield--readonly"><span>最终提示词</span><textarea rows="2" readonly>' + escapeHtml(videoPrompt || '未生成') + '</textarea></label>' +
-      groupActions(groups, idx, locked) +
-      '<div class="spd-detail-footer"><span data-spd-dirty-state data-shot-idx="' + idx + '">' + (dirty ? '有未应用修改' : '当前镜头未修改') + '</span><button type="button" class="spd-apply-btn" data-spd-action="apply-current" data-shot-idx="' + idx + '"' + (dirty ? '' : ' disabled aria-disabled="true"') + '>应用本镜头</button></div>' +
+      '<div class="spd-detail-footer"><span class="spd-save-state' + (saveState.state === 'saving' ? ' is-saving' : '') + (saveState.state === 'error' ? ' is-save-error' : '') + '" data-spd-save-state data-shot-idx="' + idx + '">' + escapeHtml(saveState.label || '已保存') + '</span></div>' +
     '</div>' +
   '</article>';
+}
+
+function cleanText(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function shotUidOf(shot) {
+  return cleanText(shot && (shot.shotUid || shot.shot_uid));
+}
+
+function hasFirstFrameCandidate(storyboard, shotUid) {
+  const frames = storyboard && storyboard.shotFrames && typeof storyboard.shotFrames === 'object' ? storyboard.shotFrames : {};
+  const state = shotUid ? frames[shotUid] : null;
+  if (state && Array.isArray(state.candidates) && state.candidates.some(function (candidate) {
+    return !!cleanText(candidate && candidate.url);
+  })) return true;
+  return !!cleanText(storyboard && (storyboard.firstFrameUrl || storyboard.imageUrl || storyboard.coverUrl || storyboard.selectedImageUrl));
+}
+
+function hasReadyVideo(project, groupIdx) {
+  const storyboards = Array.isArray(project && project.storyboards) ? project.storyboards : [];
+  const videoTasks = Array.isArray(project && project.videoTasks) ? project.videoTasks : [];
+  const sb = storyboards[groupIdx] || {};
+  const vt = videoTasks[groupIdx] || {};
+  const status = cleanText(sb.videoStatus || vt.status).toLowerCase();
+  if (status === 'failed' || status === 'timeout' || status === 'error') return false;
+  if (status === 'generating' || status === 'running' || status === 'queued') return false;
+  return !!cleanText(sb.videoTaskId || vt.taskId || sb.videoUrl || vt.url || vt.protectedUrl);
+}
+
+function renderProgressStatus(project, shots, groups) {
+  const storyboards = Array.isArray(project && project.storyboards) ? project.storyboards : [];
+  let firstFrameReady = 0;
+  let missingUid = 0;
+  shots.forEach(function (shot, idx) {
+    const uid = shotUidOf(shot);
+    if (!uid) missingUid += 1;
+    const gIdx = findGroup(groups, idx);
+    const sb = gIdx >= 0 ? storyboards[gIdx] : null;
+    if (hasFirstFrameCandidate(sb, uid)) firstFrameReady += 1;
+  });
+  const videoReady = groups.filter(function (_, groupIdx) {
+    return hasReadyVideo(project, groupIdx);
+  }).length;
+  const bits = [
+    '镜头 ' + shots.length + ' 个',
+    '片段 ' + groups.length + ' 个',
+    '首帧 ' + firstFrameReady + '/' + shots.length,
+    '视频 ' + videoReady + '/' + groups.length,
+  ];
+  if (missingUid > 0) bits.push('待修复 ' + missingUid + ' 个镜头标识');
+  let next = '→ 下一步：准备首帧';
+  if (missingUid > 0) next = '→ 下一步：补齐镜头标识';
+  else if (shots.length && firstFrameReady >= shots.length) next = '→ 下一步：生成视频';
+  if (groups.length && videoReady >= groups.length) next = '→ 已完成，可进入剪辑';
+  return '<div class="spd-progress"><span>' + escapeHtml(bits.join(' · ')) + '</span><strong>' + escapeHtml(next) + '</strong></div>';
 }
 
 function render() {
@@ -631,7 +820,6 @@ function render() {
   const groups = readGroups(project || {});
   if (shots.length) {
     _selectedShotIdx = Math.min(Math.max(0, _selectedShotIdx || 0), shots.length - 1);
-    ensureDraft(_selectedShotIdx);
   }
   const lockHtml = _lockState.locked
     ? '<div class="spd-lock"><span class="material-symbols-outlined">lock</span>' + escapeHtml(_lockState.reason || '生成中暂不能修改镜头结构') + '</div>'
@@ -641,7 +829,7 @@ function render() {
       '<div><p>镜头计划</p><h2 id="spdTitle">' + escapeHtml(shots.length || 0) + ' 个镜头 · ' + escapeHtml(groups.length || 0) + ' 个片段</h2></div>' +
       '<button type="button" class="spd-close" data-spd-close aria-label="关闭"><span class="material-symbols-outlined">close</span></button>' +
     '</header>' +
-    '<div class="spd-progress"><span>1/3 完成后可批量生视频</span><strong>→ 下一步：准备资产</strong></div>' +
+    renderProgressStatus(project || {}, shots, groups) +
     lockHtml +
     (shots.length
       ? '<section class="spd-workbench"><aside class="spd-shot-list" data-spd-list>' + renderShotListItems(project, shots, groups) + '</aside><section class="spd-detail-panel" data-spd-detail>' + renderShotDetail(project, shots[_selectedShotIdx], _selectedShotIdx, groups) + '</section></section>'

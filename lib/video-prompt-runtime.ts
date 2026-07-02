@@ -10,7 +10,7 @@ import {
 import type { SceneViewRole } from './scene-views';
 
 export type VideoReferenceImage = {
-  role: 'first_frame' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
+  role: 'first_frame' | 'keyframe' | 'character' | 'scene' | 'prop' | 'storyboard_sketch' | 'previous_tail' | 'target_end';
   viewRole?: SceneViewRole;
   path: string;
   label: string;

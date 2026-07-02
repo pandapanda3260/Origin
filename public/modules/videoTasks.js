@@ -180,10 +180,6 @@ function isRunningBatchStatus(status) {
   return normalized === "queued" || normalized === "running";
 }
 function _setBatchStartDisabled(disabled) {
-  ["btnStartBatch", "btnGenerateAllSegments"].forEach(function (id) {
-    var btn = $(id);
-    if (btn) btn.disabled = !!disabled;
-  });
   // 任何把按钮恢复可点的路径，都顺手清掉准备阶段提示，避免文案残留
   if (!disabled) _setBatchGenerateHint("");
 }
@@ -3333,19 +3329,6 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
       });
     }
 
-    var ratioGrid = $("batchRatioGrid");
-    if (ratioGrid && !ratioGrid._bound) {
-      ratioGrid._bound = true;
-      ratioGrid.addEventListener("click", function (e) {
-        var btn = e.target.closest("[data-ratio]");
-        if (!btn) return;
-        var ratio = btn.dataset.ratio;
-        _setBatchRatioValue(ratio, true);
-      });
-    }
-
-    _syncBatchRatioDefault();
-    _syncBatchSwitchDefaults();
     _refreshCurrentVideoModelDisplay();
 
     _initBatchClipScroll();
@@ -3700,6 +3683,11 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
 
   var _BATCH_RATIO_MAP = { "16:9": true, "9:16": true, "1:1": true, "21:9": true, "4:3": true, "3:4": true };
 
+  function _normalizeBatchRatioValue(value) {
+    value = String(value || "");
+    return _BATCH_RATIO_MAP[value] ? value : _projectPreferredVideoRatio();
+  }
+
   function _projectPreferredVideoRatio() {
     var opts = (project && project.styleOptions) || {};
     var sb = (project && project.styleBible) || {};
@@ -3708,80 +3696,16 @@ async function _reloadProjectFromServerForVideoBatch(hintEl) {
     return _BATCH_RATIO_MAP[value] ? value : "9:16";
   }
 
-  function _setBatchRatioValue(ratio, markUser) {
-    ratio = _BATCH_RATIO_MAP[ratio] ? ratio : _projectPreferredVideoRatio();
-    var input = $("batchRatio");
-    var ratioGrid = $("batchRatioGrid");
-    if (input) input.value = ratio;
-    if (videoState && videoState.form) videoState.form.ratio = ratio;
-    if (ratioGrid) {
-      if (markUser) ratioGrid.dataset.userTouched = "1";
-      ratioGrid.querySelectorAll("button").forEach(function (b) {
-        var isActive = b.dataset.ratio === ratio;
-        b.className = "py-3 rounded-lg text-xs transition-colors " +
-          (isActive ? "border-2 border-primary-fixed-dim bg-surface-container-low text-primary font-bold"
-                    : "border border-outline-variant/20 hover:border-primary-fixed-dim text-on-surface-variant font-medium");
-      });
-    }
-  }
-
-  function _syncBatchRatioDefault() {
-    var ratioGrid = $("batchRatioGrid");
-    var projectId = project && project.id ? String(project.id) : "";
-    if (ratioGrid && ratioGrid.dataset.projectId !== projectId) {
-      ratioGrid.dataset.projectId = projectId;
-      delete ratioGrid.dataset.userTouched;
-    }
-    var input = $("batchRatio");
-    var current = input ? String(input.value || "") : "";
-    if (!ratioGrid || !ratioGrid.dataset.userTouched || !_BATCH_RATIO_MAP[current]) {
-      _setBatchRatioValue(_projectPreferredVideoRatio(), false);
-    }
-  }
-
-  function _setBatchSwitchStatus(inputId, checked) {
-    var statusEl = document.querySelector(".batch-switch-status[data-for='" + inputId + "']");
-    if (!statusEl) return;
-    if (inputId === "batchAudio") {
-      statusEl.textContent = checked ? "有音频" : "无音频";
-    } else if (inputId === "batchWatermark") {
-      statusEl.textContent = checked ? "有水印" : "无水印";
-    }
-  }
-
-  function _syncBatchSwitchDefaults() {
-    var projectId = project && project.id ? String(project.id) : "";
-    var audio = $("batchAudio");
-    var watermark = $("batchWatermark");
-    if (audio) {
-      if (audio.dataset.projectId !== projectId) {
-        audio.dataset.projectId = projectId;
-        delete audio.dataset.userTouched;
-      }
-      if (!audio.dataset.userTouched) audio.checked = true;
-      _setBatchSwitchStatus("batchAudio", audio.checked);
-    }
-    if (watermark) {
-      if (watermark.dataset.projectId !== projectId) {
-        watermark.dataset.projectId = projectId;
-        delete watermark.dataset.userTouched;
-      }
-      if (!watermark.dataset.userTouched) watermark.checked = false;
-      _setBatchSwitchStatus("batchWatermark", watermark.checked);
-    }
-  }
-
   function _getDefaultBatchOpts() {
-    _syncBatchRatioDefault();
-    _syncBatchSwitchDefaults();
+    var form = (videoState && videoState.form) || {};
     return {
       videoModel: _currentVideoModelAlias(),
-      ratio: ($("batchRatio") && $("batchRatio").value) || _projectPreferredVideoRatio(),
-      quality: ($("batchQuality") && $("batchQuality").value) || "1080p",
-      genAudio: $("batchAudio") ? $("batchAudio").checked : true,
-      watermark: $("batchWatermark") ? $("batchWatermark").checked : false,
-      submitMode: _normalizeVideoSubmitMode($("batchSubmitMode") ? $("batchSubmitMode").value : "auto"),
-      autoImport: $("batchAutoImport") ? $("batchAutoImport").checked : true
+      ratio: _normalizeBatchRatioValue(form.ratio),
+      quality: String(form.quality || "1080p"),
+      genAudio: form.genAudio === false ? false : true,
+      watermark: form.watermark === true,
+      submitMode: "auto",
+      autoImport: form.autoImport === false ? false : true
     };
   }
 

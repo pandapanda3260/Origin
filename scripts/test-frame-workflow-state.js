@@ -35,6 +35,11 @@ function loadFrameWorkflowState() {
     if (id === './feature-flags') {
       return { isMultiShotSegmentEnabled: () => false };
     }
+    if (id === './video-segment-capability') {
+      return {
+        normalizeAutoSegmentPlanOptions: (value) => value || { targetMinSec: 4, targetMaxSec: 15, hardMaxSec: 15 },
+      };
+    }
     if (id === './tail-frame-dependency') {
       const dependencyCompiled = compileTs('lib/tail-frame-dependency.ts');
       const dependencyModule = { exports: {} };

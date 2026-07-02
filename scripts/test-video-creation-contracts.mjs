@@ -227,7 +227,7 @@ assert.match(
 
 assert.match(
   workspaceSource,
-  /"\/modules\/videoTasks\.js":\s*"\/modules\/videoTasks\.js\?v=309"/,
+  /"\/modules\/videoTasks\.js":\s*"\/modules\/videoTasks\.js\?v=310"/,
   'workspace import map must cache-bust updated videoTasks module',
 );
 

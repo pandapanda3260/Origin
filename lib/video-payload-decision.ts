@@ -8,8 +8,8 @@ export type TailFrameReferenceStatus =
   | 'failed'
   | 'file_missing';
 
-export type VideoPayloadMode = 'first_last_frame' | 'first_frame_multi_ref';
-export type VideoEffectiveStrategy = 'first_last_frame' | 'reference_images' | 'strict_first_frame';
+export type VideoPayloadMode = 'first_last_frame' | 'first_frame_multi_ref' | 'multi_keyframe_multi_ref';
+export type VideoEffectiveStrategy = 'first_last_frame' | 'reference_images' | 'strict_first_frame' | 'multi_keyframe_multi_ref';
 
 export type VideoSubmitInputMode = {
   seedanceImageMode: 'reference_images' | 'strict_first_frame';
@@ -27,7 +27,8 @@ export type VideoPayloadDecisionReason =
   | 'tail_file_missing'
   | 'feature_disabled'
   | 'capability_unsupported'
-  | 'first_frame_missing';
+  | 'first_frame_missing'
+  | 'multi_keyframe_ready';
 
 export type VideoPayloadDecisionWarningReason =
   | VideoPayloadDecisionReason
@@ -53,6 +54,12 @@ export type VideoPayloadDecision = {
     firstFramePath: string;
     lastFramePath: string;
     modeReason: 'tail_ready';
+  };
+  multiKeyframeMode?: {
+    keyframeCount: number;
+    referenceBudget: number;
+    maxImages: number;
+    modeReason: 'multi_keyframe_ready';
   };
 };
 
@@ -191,8 +198,31 @@ function referenceImagesDecision(
   );
 }
 
+function multiKeyframeDecision(
+  submitMode: VideoSubmitMode,
+  opts: {
+    keyframeCount: number;
+    referenceBudget: number;
+    maxImages: number;
+  },
+): VideoPayloadDecision {
+  return {
+    submitMode,
+    payloadMode: 'multi_keyframe_multi_ref',
+    effectiveStrategy: 'multi_keyframe_multi_ref',
+    reason: 'multi_keyframe_ready',
+    hardFail: false,
+    multiKeyframeMode: {
+      keyframeCount: opts.keyframeCount,
+      referenceBudget: opts.referenceBudget,
+      maxImages: opts.maxImages,
+      modeReason: 'multi_keyframe_ready',
+    },
+  };
+}
+
 export function deriveVideoSubmitInputMode(decision: VideoPayloadDecision): VideoSubmitInputMode {
-  if (decision.effectiveStrategy === 'reference_images') {
+  if (decision.effectiveStrategy === 'reference_images' || decision.effectiveStrategy === 'multi_keyframe_multi_ref') {
     return {
       seedanceImageMode: 'reference_images',
       useIndependentReferenceImages: true,
@@ -216,6 +246,11 @@ export function resolveVideoPayloadDecision(opts: {
   independentMultiImageCapable: boolean;
   /** 合并段（多镜头一段）：true 时强制参考模式（首帧+参考图），不进首尾帧。 */
   multiShotSegment?: boolean;
+  multiKeyframeCapable?: boolean;
+  multiKeyframeSchemaVerified?: boolean;
+  multiKeyframeCount?: number;
+  referenceBudget?: number;
+  maxImages?: number;
 }): VideoPayloadDecision {
   const submitMode = normalizeVideoSubmitMode(opts.submitMode, 'auto');
   const firstFramePath = String(opts.firstFramePath || '').trim();
@@ -225,6 +260,20 @@ export function resolveVideoPayloadDecision(opts: {
     tailFrameUrl: opts.tailFrameUrl,
     tailFramePath,
   });
+  const canUseMultiKeyframe =
+    (submitMode === 'auto' || submitMode === 'reference_images') &&
+    opts.independentMultiImageCapable &&
+    !!opts.multiKeyframeCapable &&
+    !!opts.multiKeyframeSchemaVerified &&
+    Number(opts.multiKeyframeCount || 0) >= 2;
+
+  if (canUseMultiKeyframe) {
+    return multiKeyframeDecision(submitMode, {
+      keyframeCount: Math.floor(Number(opts.multiKeyframeCount || 0)),
+      referenceBudget: Math.max(1, Math.floor(Number(opts.referenceBudget || 1))),
+      maxImages: Math.max(1, Math.floor(Number(opts.maxImages || opts.referenceBudget || 1))),
+    });
+  }
 
   if (!firstFramePath) {
     return hardFail(

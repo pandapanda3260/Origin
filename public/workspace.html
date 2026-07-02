@@ -12,7 +12,7 @@
     <link rel="icon" href="/originrise-logo.png" />
     <script>
       (function () {
-        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "batch", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
+        var pages = ["overview", "script", "style", "assets", "shots", "images", "prompts", "edit", "library", "characterCustom", "sceneCustom", "propCustom", "toolbox", "profile", "settings", "onlineEditor"];
         var disabledPages = ["profile", "settings"];
         var hashKey = "workspacePage";
         function boardEnabled() {
@@ -28,6 +28,7 @@
           page = String(page || "");
           if (page === "online-editor") page = "onlineEditor";
           if (page === "images") page = "shots";
+          if (page === "batch") page = "prompts";
           if (page === "prompts" && boardEnabled()) page = "shots";
           if (disabledPages.indexOf(page) !== -1) return "";
           if (pages.indexOf(page) === -1) return "";
@@ -59,7 +60,6 @@
       html[data-workspace-boot-page="assets"]:not([data-workspace-boot-ready]) #pageAssets,
       html[data-workspace-boot-page="shots"]:not([data-workspace-boot-ready]) #pageShots,
       html[data-workspace-boot-page="prompts"]:not([data-workspace-boot-ready]) #pagePrompts,
-      html[data-workspace-boot-page="batch"]:not([data-workspace-boot-ready]) #pageBatch,
       html[data-workspace-boot-page="edit"]:not([data-workspace-boot-ready]) #pageEdit,
       html[data-workspace-boot-page="library"]:not([data-workspace-boot-ready]) #pageLibrary,
       html[data-workspace-boot-page="characterCustom"]:not([data-workspace-boot-ready]) #pageCharacterCustom,
@@ -80,7 +80,7 @@
     </style>
     <link rel="stylesheet" href="fonts.css?v=1" />
     <link rel="stylesheet" href="workspace-tailwind.css?v=1" />
-    <link rel="stylesheet" href="styles.css?v=263" />
+    <link rel="stylesheet" href="styles.css?v=268" />
     <style>
       body { font-family: 'Inter', sans-serif; }
       .material-symbols-outlined {
@@ -100,12 +100,26 @@
   <body class="bg-background text-on-background min-h-screen selection:bg-primary/20" style="padding-top:var(--top-announcement-height);min-height:calc(100vh - var(--top-announcement-height))">
 
     <!-- ===== Scrolling Announcement Banner ===== -->
-    <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:var(--top-announcement-height);display:flex;align-items:center;">
+    <div id="announceBanner" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(90deg,#0B1320 0%,#1a2740 50%,#0B1320 100%);border-bottom:1px solid rgba(144,164,174,0.15);overflow:hidden;height:var(--top-announcement-height);display:flex;align-items:center;padding-right:72px;">
       <div id="announceTrack" style="display:inline-block;white-space:nowrap;animation:bannerScroll var(--announcement-scroll-duration,72s) linear infinite;font-size:13px;color:rgba(255,255,255,0.75);letter-spacing:0.05em;font-weight:400;"></div>
+      <div id="announceControls" aria-label="顶部提示控制">
+        <button id="announceToggle" type="button" aria-label="暂停顶部提示" aria-pressed="false" title="暂停顶部提示"><span class="material-symbols-outlined" aria-hidden="true">pause</span></button>
+        <button id="announceDismiss" type="button" aria-label="隐藏顶部提示" title="隐藏顶部提示"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
+      </div>
     </div>
     <style>
       #announceTrack .announce-item{margin-right:80px}
+      #announceBanner:hover #announceTrack,
+      #announceBanner:focus-within #announceTrack,
+      #announceTrack.is-paused{animation-play-state:paused}
+      #announceControls{position:absolute;right:8px;top:0;bottom:0;display:flex;align-items:center;gap:4px;background:linear-gradient(90deg,rgba(11,19,32,0),#0B1320 24px);padding-left:28px}
+      #announceControls button{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid rgba(255,255,255,0.22);border-radius:999px;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.82);cursor:pointer}
+      #announceControls button:focus-visible{outline:2px solid rgba(56,189,248,0.9);outline-offset:2px}
+      #announceControls .material-symbols-outlined{font-size:16px}
       @keyframes bannerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+      @media (prefers-reduced-motion: reduce){
+        #announceTrack{animation:none!important;transform:none!important}
+      }
     </style>
     <script>
       (function(){
@@ -123,8 +137,16 @@
         ];
         var repetitionsPerHalf = 4;
         var scrollPixelsPerSecond = 60;
+        var paused = false;
+        var reduceMotion = false;
+        var banner = document.getElementById('announceBanner');
         var track = document.getElementById('announceTrack');
+        var toggle = document.getElementById('announceToggle');
+        var dismiss = document.getElementById('announceDismiss');
         if (!track) return;
+        try {
+          reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        } catch (_) {}
 
         function appendMessages(hidden) {
           for (var repeat = 0; repeat < repetitionsPerHalf; repeat += 1) {
@@ -150,6 +172,29 @@
         updateScrollDuration();
         if (document.fonts && document.fonts.ready) {
           document.fonts.ready.then(updateScrollDuration).catch(function(){});
+        }
+
+        function setPaused(nextPaused) {
+          paused = !!nextPaused;
+          track.classList.toggle('is-paused', paused);
+          if (!toggle) return;
+          toggle.setAttribute('aria-pressed', paused ? 'true' : 'false');
+          toggle.setAttribute('aria-label', paused ? '继续顶部提示' : '暂停顶部提示');
+          toggle.setAttribute('title', paused ? '继续顶部提示' : '暂停顶部提示');
+          var icon = toggle.querySelector('.material-symbols-outlined');
+          if (icon) icon.textContent = paused ? 'play_arrow' : 'pause';
+        }
+
+        if (toggle) {
+          toggle.addEventListener('click', function () {
+            setPaused(!paused);
+          });
+        }
+        if (reduceMotion) setPaused(true);
+        if (dismiss && banner) {
+          dismiss.addEventListener('click', function () {
+            banner.hidden = true;
+          });
         }
       })();
     </script>
@@ -238,11 +283,6 @@
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
               <span class="material-symbols-outlined">movie_creation</span>
               <span>视频</span>
-            </button>
-            <button type="button" id="navBatch" data-page="batch" title="片段" hidden data-retired-surface="batch"
-              class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
-              <span class="material-symbols-outlined">layers</span>
-              <span>片段</span>
             </button>
             <button type="button" id="navEdit" data-page="edit" title="自动剪辑"
               class="sw-nav-item flex items-center gap-3 px-6 py-3 w-full text-left rounded-[3rem] transition-all duration-200 active:scale-[0.97] cursor-pointer text-sm font-bold tracking-wide">
@@ -1127,207 +1167,6 @@
         </div>
       </div>
 
-      <!-- ══════ 6. 片段生成 ══════ -->
-      <div class="page-scroll overflow-y-auto" id="pageBatch" hidden>
-        <div class="sw-page-loading" data-loading-for="batch" role="status" aria-live="polite">
-          <div class="sw-load-body">
-            <div class="sw-pixel-o" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <span class="sw-load-text">加载中…</span>
-          </div>
-        </div>
-          <div class="batch-page-shell px-12 pt-10 pb-20 max-w-[1600px] mx-auto">
-
-          <!-- Guard: need prompts first -->
-          <div id="batchNeedPrompts">
-            <section class="batch-redesign-hero batch-redesign-hero--guard">
-              <div class="batch-redesign-title">
-                <h2>片段生成</h2>
-                <span>BATCH GENERATION</span>
-              </div>
-            </section>
-            <div class="workflow-empty-state workflow-empty-state--page-center">
-              <div class="workflow-empty-state__icon">
-                <span class="material-symbols-outlined">psychology</span>
-              </div>
-              <h3 class="workflow-empty-state__title">暂时还没有可用的视频提示词。</h3>
-              <p class="workflow-empty-state__text">在「提示词」页完成并确认视频提示词后，即可生成片段。</p>
-              <div class="workflow-empty-state__actions">
-                <button type="button" class="workflow-empty-state__button" data-goto="prompts">去写提示词</button>
-              </div>
-            </div>
-          </div>
-
-          <div id="batchReady" class="batch-redesign" hidden>
-            <!-- UI redesign according to high-fidelity mockup: header, stats, progress, config and unified segment workbench. -->
-            <section class="batch-redesign-hero">
-              <div class="batch-redesign-title">
-                <h2>片段生成</h2>
-                <span>BATCH GENERATION</span>
-              </div>
-              <div class="batch-redesign-hero-actions">
-                <button type="button" id="btnGenerateAllSegments" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">I</span>
-                  <span>生成全部片段</span>
-                </button>
-                <button type="button" id="btnImportAllSegments" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">II</span>
-                  <span>全部导入剪辑</span>
-                </button>
-                <button type="button" id="btnStartBatch" class="batch-primary-action" data-write-action>
-                  <span class="batch-action-step" aria-hidden="true">III</span>
-                  <span>确认片段视频，进入下一步</span>
-                  <span class="material-symbols-outlined">arrow_forward</span>
-                </button>
-              </div>
-            </section>
-            <p id="batchGenerateHint" class="batch-generate-hint" hidden></p>
-
-            <section class="batch-stat-grid" aria-label="片段生成统计">
-              <div class="batch-stat-card">
-                <span class="material-symbols-outlined batch-stat-icon is-total">calendar_month</span>
-                <div>
-                  <p>总片段</p>
-                  <strong id="batchStatTotal">0 个</strong>
-                </div>
-              </div>
-              <div class="batch-stat-card">
-                <span class="material-symbols-outlined batch-stat-icon is-done" style="font-variation-settings: 'FILL' 1;">check_circle</span>
-                <div>
-                  <p>已完成</p>
-                  <strong id="batchStatDone">0 个</strong>
-                </div>
-              </div>
-              <div class="batch-stat-card">
-                <span class="material-symbols-outlined batch-stat-icon is-running">motion_photos_auto</span>
-                <div>
-                  <p>进行中</p>
-                  <strong id="batchStatRunning">0 个</strong>
-                </div>
-              </div>
-              <div class="batch-stat-card">
-                <span class="material-symbols-outlined batch-stat-icon is-pending" style="font-variation-settings: 'FILL' 1;">radio_button_checked</span>
-                <div>
-                  <p>未开始</p>
-                  <strong id="batchStatPending">0 个</strong>
-                </div>
-              </div>
-              <div class="batch-stat-card">
-                <span class="material-symbols-outlined batch-stat-icon is-time">schedule</span>
-                <div>
-                  <p>预计时长</p>
-                  <strong id="batchStatEstimate">计算中…</strong>
-                </div>
-              </div>
-            </section>
-
-            <section id="batchTotalProgressWrap" class="batch-progress-card" hidden>
-              <div class="batch-progress-head">
-                <div>
-                  <span class="material-symbols-outlined">tune</span>
-                  <strong>整体进度</strong>
-                </div>
-                <em id="batchProgressPercent">0%</em>
-              </div>
-              <div class="batch-progress-track">
-                <div id="batchTotalProgressBar" class="batch-progress-fill" style="width:0%"></div>
-              </div>
-              <div class="batch-progress-meta">
-                <p id="batchTotalProgressLabel"></p>
-                <p id="batchTotalProgressEta"></p>
-              </div>
-            </section>
-
-            <div class="batch-layout-grid">
-              <section class="batch-config-panel" aria-label="全局配置">
-                <div class="batch-panel-head">
-                  <span class="material-symbols-outlined">tune</span>
-                  <h3>全局配置</h3>
-                </div>
-
-                <input type="hidden" id="batchRatio" value="9:16" />
-
-                <div class="batch-config-group">
-                  <label for="batchQuality">画质</label>
-                  <select id="batchQuality" class="batch-quality-select">
-                    <option value="1080p" selected>高清 1080p</option>
-                    <option value="4k">超清 4K</option>
-                    <option value="720p">标清 720p</option>
-                  </select>
-                </div>
-
-                <div class="batch-config-group">
-                  <label for="batchSubmitMode">视频模式</label>
-                  <select id="batchSubmitMode" class="batch-quality-select">
-                    <option value="auto" selected>全能参考</option>
-                    <option value="reference_images">智能多帧</option>
-                    <option value="first_last_frame">首尾帧</option>
-                  </select>
-                </div>
-
-                <div class="batch-config-group">
-                  <label>模型</label>
-                  <div class="batch-model-display" id="batchVideoModelDisplay" data-video-model-status="loading">
-                    <span class="material-symbols-outlined" aria-hidden="true">movie</span>
-                    <span class="batch-model-copy">
-                      <strong id="batchVideoModelName">读取中…</strong>
-                      <small id="batchVideoModelMeta">正在读取当前调用模型</small>
-                    </span>
-                  </div>
-                  <input type="hidden" id="batchVideoModel" value="grok" />
-                  <p class="batch-config-note">由系统配置统一调度；当前调用模型仅供查看。</p>
-                </div>
-
-                <div class="batch-switch-list">
-                  <label><span class="material-symbols-outlined">volume_up</span><span>生成音频</span><input type="checkbox" id="batchAudio" checked /><span class="batch-switch-status" data-for="batchAudio">有音频</span></label>
-                  <label><span class="material-symbols-outlined">water_drop</span><span>水印</span><input type="checkbox" id="batchWatermark" /><span class="batch-switch-status" data-for="batchWatermark">无水印</span></label>
-                </div>
-
-
-              </section>
-
-              <section class="batch-workbench" aria-label="片段工作台">
-                <div class="batch-workbench-head">
-                  <div>
-                    <span class="material-symbols-outlined">movie</span>
-                    <h3>片段工作台</h3>
-                  </div>
-                  <div class="batch-workbench-summary">
-                    <span id="batchClipCount"></span>
-                    <span id="batchTasksSummary">暂无任务</span>
-                  </div>
-                </div>
-
-                <div class="batch-workbench-tabs" aria-label="片段状态统计">
-                  <div class="batch-workbench-tab-list">
-                    <span class="is-active">全部 <b id="batchTabAll">0</b></span>
-                    <span>进行中 <b id="batchTabRunning">0</b></span>
-                    <span>已完成 <b id="batchTabDone">0</b></span>
-                    <span>未开始 <b id="batchTabPending">0</b></span>
-                    <span>异常 <b id="batchTabFailed">0</b></span>
-                  </div>
-                </div>
-
-                <div class="batch-table-head" aria-hidden="true">
-                  <span>片段信息</span>
-                  <span>状态 / 进度</span>
-                  <span>操作</span>
-                </div>
-
-                <div class="batch-workbench-scroll">
-                  <div id="batchClipList" class="batch-segment-list no-scrollbar" style="overflow-x:auto;overflow-y:visible;"></div>
-                  <div id="batchTaskListWrap" class="batch-segment-list"></div>
-                  <div id="batchTasksEmpty" class="batch-empty-state">
-                    <span class="material-symbols-outlined">hourglass_empty</span>
-                    <p>提交后任务将在这里实时显示</p>
-                  </div>
-                </div>
-
-              </section>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <!-- ══════ 7. 自动剪辑工作台 ══════ -->
       <div class="page-scroll edit-page-shell !p-0 !overflow-hidden" id="pageEdit" hidden>
         <div class="sw-page-loading" data-loading-for="edit" role="status" aria-live="polite">
@@ -1397,6 +1236,10 @@
                   <button type="button" class="edit-media-tab" data-tab="uploads" role="tab" aria-selected="false">
                     <span class="edit-media-tab-cn">上传</span>
                     <span class="edit-media-tab-en">Upload</span>
+                  </button>
+                  <button type="button" class="edit-media-tab" data-tab="candidates" role="tab" aria-selected="false">
+                    <span class="edit-media-tab-cn">候选</span>
+                    <span class="edit-media-tab-en">Alt</span>
                   </button>
                 </div>
                 <div class="flex-1 overflow-y-auto edit-hide-scrollbar px-3 pb-3 space-y-3" id="editMediaList">
@@ -1883,8 +1726,8 @@
                     "/modules/assets.js": "/modules/assets.js?v=186",
                     "/modules/backend_stream.js": "/modules/backend_stream.js?v=301",
                     "/modules/billing.js": "/modules/billing.js?v=119",
-                    "/modules/board.js": "/modules/board.js?v=8",
-                    "/modules/board_state.js": "/modules/board_state.js?v=4",
+                    "/modules/board.js": "/modules/board.js?v=12",
+                    "/modules/board_state.js": "/modules/board_state.js?v=5",
                     "/modules/board_viewport.js": "/modules/board_viewport.js?v=3",
                     "/modules/character_custom.js": "/modules/character_custom.js?v=222",
                     "/modules/scene_custom.js": "/modules/scene_custom.js?v=100",
@@ -1901,7 +1744,7 @@
                     "/modules/module_singleton_guard.js": "/modules/module_singleton_guard.js?v=1",
                     "/modules/online_editor.js": "/modules/online_editor.js?v=30",
                     "/modules/pixel_card.js": "/modules/pixel_card.js?v=300",
-                    "/modules/project.js": "/modules/project.js?v=111",
+                    "/modules/project.js": "/modules/project.js?v=112",
                     "/modules/render_hooks.js": "/modules/render_hooks.js?v=302",
                     "/modules/script.js": "/modules/script.js?v=121",
                     "/modules/script_consult_state.js": "/modules/script_consult_state.js?v=300",
@@ -1909,7 +1752,7 @@
                     "/modules/scroll_anchor_guard.js": "/modules/scroll_anchor_guard.js?v=1",
                     "/modules/settings.js": "/modules/settings.js?v=301",
                     "/modules/shotSchema.js": "/modules/shotSchema.js?v=300",
-    "/modules/shotPlanDialog.js": "/modules/shotPlanDialog.js?v=5",
+    "/modules/shotPlanDialog.js": "/modules/shotPlanDialog.js?v=8",
                     "/modules/shots.js": "/modules/shots.js?v=116",
                     "/modules/store.js": "/modules/store.js?v=301",
                     "/modules/storyboard.js": "/modules/storyboard.js?v=159",
@@ -1918,14 +1761,14 @@
                     "/modules/toolbox.js": "/modules/toolbox.js?v=206",
                     "/modules/utils.js": "/modules/utils.js?v=302",
                     "/modules/videoPrompts.js": "/modules/videoPrompts.js?v=121",
-                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=309",
+                    "/modules/videoTasks.js": "/modules/videoTasks.js?v=310",
                     "/modules/video_model_status.js": "/modules/video_model_status.js?v=1"
             }
     }
     </script>
     <script type="module" src="modules/store.js?v=301"></script>
     <script type="module" src="modules/utils.js?v=302"></script>
-    <script type="module" src="main.js?v=372"></script>
+    <script type="module" src="main.js?v=374"></script>
     <script>
     (function () {
       var canvas = document.getElementById("dotMatrixCanvas");

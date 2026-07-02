@@ -208,7 +208,7 @@ function buildSegments(project, opts) {
       };
     });
     const videoTask = asObject(arr(project.videoTasks)[group.gIdx]);
-    const selectedTaskId = text(videoTask.taskId || sb.videoTaskId);
+    const selectedTaskId = text(sb.videoTaskId || videoTask.taskId);
     const videoCandidates = videoHistoryRowsForGroup(opts, group.gIdx)
       .map((row, idx) => videoCandidateFromHistory(row, selectedTaskId, idx))
       .filter(Boolean);

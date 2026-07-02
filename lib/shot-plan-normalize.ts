@@ -97,6 +97,49 @@ function resolveShotUid(source: any, index: number, opts: NormalizeGeneratedShot
   return `shot_${hash}`;
 }
 
+export function ensureProjectShotUids(project: any) {
+  const shots = Array.isArray(project?.shots) ? project.shots : [];
+  const generatedAt = cleanFirst(
+    project?.planMeta?.generatedAt,
+    project?.shotPlanGeneratedAt,
+    'legacy-shot-plan',
+  );
+  let repairedCount = 0;
+  const nextShots = shots.map((shot: any, index: number) => {
+    const source = shot && typeof shot === 'object' ? shot : {};
+    if (normalizeShotUid(source.shotUid ?? source.shot_uid)) return shot;
+    const visual = cleanFirst(source.visual, source.description, source.desc).slice(0, 300);
+    const dialogue = cleanFirst(source.dialogue, source.dialog) || '——';
+    const duration = clampDuration(source.duration ?? source.durationSec);
+    const pace = PACES.includes(cleanFirst(source.pace, source.narrativePace))
+      ? cleanFirst(source.pace, source.narrativePace)
+      : 'normal';
+    const emotion = EMOTIONS.includes(cleanFirst(source.emotion)) ? cleanFirst(source.emotion) : 'rising';
+    const fields = resolveShotFieldsForPrompt({ ...source, emotion }, project?.styleBible);
+    const { sceneId } = normalizeScene(source, visual, project?.assets);
+    repairedCount += 1;
+    return {
+      ...source,
+      shotUid: resolveShotUid(source, index, { generatedAt }, {
+        visual,
+        dialogue,
+        duration,
+        pace,
+        sceneId,
+        shotType: fields.shotType,
+        angle: fields.angle,
+        camera: fields.camera,
+      }),
+    };
+  });
+  return {
+    changed: repairedCount > 0,
+    repairedCount,
+    generatedAt,
+    shots: repairedCount > 0 ? nextShots : shots,
+  };
+}
+
 function normalizeCharacters(value: any): string[] {
   if (!Array.isArray(value)) return [];
   return value.map((item) => cleanShotText(item)).filter(Boolean);

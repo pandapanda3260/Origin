@@ -271,6 +271,14 @@ function testGenerationStateMachine() {
 	    shots: [{ id: 'shot_1', idx: 1, visual: '新镜头' }],
 	    planMeta: { version: 4, shotCount: 1, plannedDurationSec: 4 },
 	    storyboards: [{ idx: 0, shotIdx: 1, shotIndices: [0] }],
+    autoSegmentPlanSnapshot: {
+      version: 1,
+      segmentationMode: 'auto',
+      modelRole: 'video',
+      modelId: 'doubao-seedance-2-0-260128',
+      options: { targetMinSec: 4, targetMaxSec: 15, hardMaxSec: 15 },
+      createdAt: '2026-05-19T06:01:00.000Z',
+    },
     sourceSnapshot,
     sourceHash,
     now: '2026-05-19T06:01:00.000Z',
@@ -281,6 +289,11 @@ function testGenerationStateMachine() {
   assert.equal(done.patch._staleFlags.video_prompt_0, undefined, 'fresh completion clears old video prompt stale flag');
 	  assert.equal(done.patch.shotPlanBatchId, undefined, 'active batch id is cleared');
 	  assert.deepEqual(done.patch.planMeta, { version: 4, shotCount: 1, plannedDurationSec: 4 }, 'completion writes planMeta');
+  assert.deepEqual(
+    done.patch.autoSegmentPlanSnapshot.options,
+    { targetMinSec: 4, targetMaxSec: 15, hardMaxSec: 15 },
+    'completion writes auto segment plan snapshot from opts',
+  );
 	  assert.equal(done.patch.shotsManuallyEditedAt, null, 'AI full generation clears manual edit marker');
 
   const staleProject = {

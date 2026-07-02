@@ -14,7 +14,21 @@ const required = new Set(listKnownVideoModelIds());
 const missing = [...required].filter((model) => !registered.has(model)).sort();
 const invalid = [...required].filter((model) => {
   const capability = resolveVideoModelCapability(model);
-  return !capability.verifiedBy || !capability.bodyShape || !capability.verifiedAt;
+  return !capability.verifiedBy ||
+    !capability.bodyShape ||
+    !capability.verifiedAt ||
+    !Number.isFinite(capability.maxSingleGenSec) ||
+    !Number.isFinite(capability.segmentTargetMinSec) ||
+    !Number.isFinite(capability.segmentTargetMaxSec) ||
+    !Number.isFinite(capability.referenceBudget) ||
+    !Number.isFinite(capability.maxImages) ||
+    capability.referenceBudget < 1 ||
+    capability.maxImages < 1 ||
+    capability.segmentTargetMinSec < 1 ||
+    capability.segmentTargetMaxSec < capability.segmentTargetMinSec ||
+    capability.maxSingleGenSec < capability.segmentTargetMaxSec ||
+    !capability.multiKeyframeBodyShape ||
+    !capability.schemaVerificationStatus;
 });
 
 if (missing.length || invalid.length) {
