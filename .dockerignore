@@ -22,3 +22,7 @@ vevdemo-1.0.6/fe/.env.local
 vevdemo-1.0.6/fe/dist
 vevdemo-1.0.6/fe/node_modules
 vevdemo-1.0.6/nodejs/node_modules
+# 安全：服务器快照(含线上env明文)与备份目录，严禁进镜像
+_server_snapshot
+_pull_server_snapshot.sh
+backups

@@ -19,9 +19,11 @@ services:
       ORIGIN_EXPECT_WORKER: "1"
       ORIGIN_DATA_DIR: /var/lib/origin/data
       DB_PATH: /var/lib/origin/data/qd.sqlite
+      ORIGIN_SQLITE_BACKUP_DIR: /var/lib/origin/backups
     volumes:
       - ./.env:/app/.env:ro
       - ./data:/var/lib/origin/data
+      - ./backups:/var/lib/origin/backups
     ports:
       - "127.0.0.1:3000:3000"
     healthcheck:
@@ -49,9 +51,11 @@ services:
       ORIGIN_INLINE_ONLINE_EDITOR_DOWNLOAD: "1"
       ORIGIN_DATA_DIR: /var/lib/origin/data
       DB_PATH: /var/lib/origin/data/qd.sqlite
+      ORIGIN_SQLITE_BACKUP_DIR: /var/lib/origin/backups
     volumes:
       - ./.env:/app/.env:ro
       - ./data:/var/lib/origin/data
+      - ./backups:/var/lib/origin/backups
     command: ["npm", "run", "worker"]
 
   vevdemo-api:

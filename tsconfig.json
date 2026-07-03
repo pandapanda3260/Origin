@@ -39,6 +39,7 @@
     "node_modules",
     "reference-site",
     "vevdemo-1.0.6",
-    "_server_snapshot"
+    "_server_snapshot",
+    "data"
   ]
 }
